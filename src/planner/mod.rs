@@ -685,55 +685,118 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
 
 /// Apply a WHERE predicate to a `Scan` plan, choosing the cheapest access path:
 ///
-/// - If the predicate is `rowid_alias_col = value` (or `rowid/_rowid_/oid = value`),
-///   replace the Scan with a `RowidLookup` (single B+tree point lookup).
+/// - If the predicate is `rowid_alias_col = value`, use `RowidLookup`.
+/// - Else if the predicate is an AND-chain of range conjuncts on the rowid-alias
+///   column (`col > v`, `col >= v`, `col < v`, `col <= v`, `col BETWEEN a AND b`),
+///   use `RowidRange` with the tightest (start, end) bounds and a residual
+///   predicate for any conjuncts that can't be expressed as a bound.
 /// - Else if the predicate is `indexed_col = value` for some index whose first
-///   column is `col`, replace the Scan with an `IndexLookup`.
+///   column is `col`, use `IndexLookup`.
 /// - Else wrap the Scan in a `Filter` (full scan + per-row predicate eval).
 ///
 /// This is shared between the SELECT planner and the UPDATE/DELETE planners
 /// so that `UPDATE t SET ... WHERE id = ?` doesn't fall through to a full
 /// table scan — a bug that previously made UPDATE-by-PK ~743x slower than
 /// SQLite.
-///
-/// The function is conservative: it only inspects the *top-level* shape of
-/// the predicate. `WHERE id = ? AND name = 'foo'` is treated as a Filter
-/// because the top-level op is `And`, not `Eq`. A future improvement is to
-/// split AND-chains and try each conjunct.
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
     if let Plan::Scan { table, alias, .. } = &plan {
-        if let Some((col_name, value_expr)) = extract_eq_predicate(predicate) {
-            // Check if it's the rowid alias.
-            if let Some(idx) = table.rowid_alias {
-                if table.columns[idx].name.eq_ignore_ascii_case(&col_name) {
+        // Split AND-chains so we can pick the best access path per-conjunct.
+        let conjuncts = split_and_chain(predicate);
+        // Try to construct a RowidRange from conjuncts that reference the
+        // rowid-alias column. Returns (start, end, residual_conjuncts).
+        if let Some((start, end, residual)) = try_rowid_range(&conjuncts, table) {
+            // If we have a single equality `id = ?`, RowidLookup is preferable
+            // (one B+tree seek vs a range walk).
+            if let (Some(s), Some(e)) = (&start, &end) {
+                // Structural compare via Debug string — Expr doesn't impl PartialEq
+                // and adding it would be a wider change. This is planning-only,
+                // not per-row, so the format!() cost is negligible.
+                if format!("{:?}", s) == format!("{:?}", e) {
                     return Plan::RowidLookup {
+                        table: table.clone(),
+                        alias: alias.clone(),
+                        rowid: s.clone(),
+                    };
+                }
+            }
+            return Plan::RowidRange {
+                table: table.clone(),
+                alias: alias.clone(),
+                start,
+                end,
+                residual,
+            };
+        }
+        // Fall back to per-conjunct equality handling (original path).
+        for conjunct in &conjuncts {
+            if let Some((col_name, value_expr)) = extract_eq_predicate(conjunct) {
+                // Check if it's the rowid alias.
+                if let Some(idx) = table.rowid_alias {
+                    if table.columns[idx].name.eq_ignore_ascii_case(&col_name) {
+                        // For `id = ? AND other = ?`, use RowidLookup for `id = ?`
+                        // and put the remaining conjuncts in a top-level Filter.
+                        let other_conjuncts: Vec<Expr> = conjuncts.iter()
+                            .filter(|c| !exprs_equal_conjunct(c, conjunct))
+                            .cloned()
+                            .collect();
+                        let lookup = Plan::RowidLookup {
+                            table: table.clone(),
+                            alias: alias.clone(),
+                            rowid: value_expr,
+                        };
+                        if other_conjuncts.is_empty() {
+                            return lookup;
+                        }
+                        return Plan::Filter {
+                            input: Box::new(lookup),
+                            predicate: combine_and(&other_conjuncts),
+                        };
+                    }
+                }
+                // Check if "rowid" or "_rowid_" is the column.
+                if col_name.eq_ignore_ascii_case("rowid")
+                    || col_name.eq_ignore_ascii_case("_rowid_")
+                    || col_name.eq_ignore_ascii_case("oid")
+                {
+                    let other_conjuncts: Vec<Expr> = conjuncts.iter()
+                        .filter(|c| !exprs_equal_conjunct(c, conjunct))
+                        .cloned()
+                        .collect();
+                    let lookup = Plan::RowidLookup {
                         table: table.clone(),
                         alias: alias.clone(),
                         rowid: value_expr,
                     };
+                    if other_conjuncts.is_empty() {
+                        return lookup;
+                    }
+                    return Plan::Filter {
+                        input: Box::new(lookup),
+                        predicate: combine_and(&other_conjuncts),
+                    };
                 }
-            }
-            // Check if "rowid" or "_rowid_" is the column.
-            if col_name.eq_ignore_ascii_case("rowid")
-                || col_name.eq_ignore_ascii_case("_rowid_")
-                || col_name.eq_ignore_ascii_case("oid")
-            {
-                return Plan::RowidLookup {
-                    table: table.clone(),
-                    alias: alias.clone(),
-                    rowid: value_expr,
-                };
-            }
-            // Check if any index has this column as its first column.
-            for index in catalog.indexes_on_table(&table.name) {
-                if let Some(first_col) = index.columns.first() {
-                    if first_col.name.eq_ignore_ascii_case(&col_name) {
-                        return Plan::IndexLookup {
-                            table: table.clone(),
-                            alias: alias.clone(),
-                            index,
-                            key_exprs: vec![value_expr],
-                        };
+                // Check if any index has this column as its first column.
+                for index in catalog.indexes_on_table(&table.name) {
+                    if let Some(first_col) = index.columns.first() {
+                        if first_col.name.eq_ignore_ascii_case(&col_name) {
+                            let other_conjuncts: Vec<Expr> = conjuncts.iter()
+                                .filter(|c| !exprs_equal_conjunct(c, conjunct))
+                                .cloned()
+                                .collect();
+                            let lookup = Plan::IndexLookup {
+                                table: table.clone(),
+                                alias: alias.clone(),
+                                index,
+                                key_exprs: vec![value_expr],
+                            };
+                            if other_conjuncts.is_empty() {
+                                return lookup;
+                            }
+                            return Plan::Filter {
+                                input: Box::new(lookup),
+                                predicate: combine_and(&other_conjuncts),
+                            };
+                        }
                     }
                 }
             }
@@ -741,6 +804,167 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
     }
     // Default: wrap in a Filter.
     Plan::Filter { input: Box::new(plan), predicate: predicate.clone() }
+}
+
+/// Compare two expressions for structural equality (used to filter out the
+/// conjunct that became the access-path predicate from the residual list).
+fn exprs_equal_conjunct(a: &Expr, b: &Expr) -> bool {
+    // Cheap structural compare via Debug string. Good enough — this is
+    // only called during planning, not per-row.
+    format!("{:?}", a) == format!("{:?}", b)
+}
+
+/// Try to build a RowidRange (start, end, residual) from a list of conjuncts
+/// where at least one references the rowid-alias column (or rowid/_rowid_/oid).
+///
+/// Returns `None` if no conjunct references the rowid-alias column, or if the
+/// only such reference is an equality `id = ?` (which RowidLookup handles
+/// better than RowidRange).
+///
+/// Recognized conjunct forms on the rowid-alias column:
+/// - `col BETWEEN ? AND ?` — sets both start and end
+/// - `col > ?` / `col >= ?`  — sets start
+/// - `col < ?` / `col <= ?`  — sets end
+/// - `? > col` / `? >= col` — sets end (col on right)
+/// - `? < col` / `? <= col` — sets start
+///
+/// For an equality `col = ?` we DO take it as setting both start and end to
+/// the same value (so RowidRange degenerates to a point). The caller checks
+/// for this case and prefers RowidLookup.
+fn try_rowid_range(conjuncts: &[Expr], table: &Table) -> Option<(Option<Expr>, Option<Expr>, Option<Expr>)> {
+    let rowid_col_name = table.rowid_alias
+        .and_then(|idx| table.columns.get(idx))
+        .map(|c| c.name.clone());
+    let mut start: Option<Expr> = None;
+    let mut end: Option<Expr> = None;
+    let mut residual: Vec<Expr> = Vec::new();
+    let mut saw_rowid_ref = false;
+
+    for conjunct in conjuncts {
+        // Try `col BETWEEN ? AND ?`
+        if let Some((col, lo, hi)) = extract_between(conjunct) {
+            if is_rowid_col(&col, &rowid_col_name) {
+                saw_rowid_ref = true;
+                start = Some(lo);
+                end = Some(hi);
+                continue;
+            }
+        }
+        // Try `col OP value` or `value OP col` for <, <=, >, >=
+        if let Some((col, op, val)) = extract_range(conjunct) {
+            if is_rowid_col(&col, &rowid_col_name) {
+                saw_rowid_ref = true;
+                match op.as_str() {
+                    ">" => {
+                        // col > v  → start = v + 1 (inclusive)
+                        // We model as start = v with strict flag, but RowidRange
+                        // is inclusive. To keep semantics correct we transform
+                        // `col > v` into `col >= v + 1` at execution time via
+                        // a residual predicate; here we set start = v as a hint
+                        // and push the strict `col > v` back into residual.
+                        start = Some(val.clone());
+                        residual.push(conjunct.clone());
+                    }
+                    ">=" => {
+                        start = Some(val);
+                    }
+                    "<" => {
+                        end = Some(val.clone());
+                        residual.push(conjunct.clone());
+                    }
+                    "<=" => {
+                        end = Some(val);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        // Equality `col = ?` — if this is the rowid-alias, set both start and
+        // end to the same value (degenerate range). The caller will prefer
+        // RowidLookup, but if there are other conjuncts we still want the
+        // residual to capture them.
+        if let Some((col, val)) = extract_eq_predicate(conjunct) {
+            if is_rowid_col(&col, &rowid_col_name) {
+                saw_rowid_ref = true;
+                start = Some(val.clone());
+                end = Some(val);
+                continue;
+            }
+        }
+        // Otherwise it's a residual predicate.
+        residual.push(conjunct.clone());
+    }
+
+    if !saw_rowid_ref {
+        return None;
+    }
+    let residual_opt = if residual.is_empty() {
+        None
+    } else {
+        Some(combine_and(&residual))
+    };
+    Some((start, end, residual_opt))
+}
+
+/// Check if a column name (possibly with table qualifier) refers to the
+/// rowid-alias column or to the magic `rowid`/`_rowid_`/`oid` names.
+fn is_rowid_col(col_name: &str, rowid_alias_name: &Option<String>) -> bool {
+    // Strip any table qualifier: "u.id" → "id".
+    let bare = col_name.rsplit('.').next().unwrap_or(col_name);
+    if let Some(alias) = rowid_alias_name {
+        if bare.eq_ignore_ascii_case(alias) {
+            return true;
+        }
+    }
+    bare.eq_ignore_ascii_case("rowid")
+        || bare.eq_ignore_ascii_case("_rowid_")
+        || bare.eq_ignore_ascii_case("oid")
+}
+
+/// Extract `col BETWEEN lo AND hi` from an expression.
+/// Returns (col_name, lo, hi) on match.
+fn extract_between(expr: &Expr) -> Option<(String, Expr, Expr)> {
+    if let Expr::Between { expr, low, high, .. } = expr {
+        if let Expr::Column { name, .. } = expr.as_ref() {
+            return Some((name.clone(), *low.clone(), *high.clone()));
+        }
+    }
+    None
+}
+
+/// Extract a range comparison `col OP value` or `value OP col` where OP is
+/// one of `<`, `<=`, `>`, `>=`. Returns (col_name, op_string, value_expr).
+fn extract_range(expr: &Expr) -> Option<(String, String, Expr)> {
+    if let Expr::Binary { op, left, right } = expr {
+        let op_str = match op {
+            BinaryOp::Lt => "<",
+            BinaryOp::LtEq => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::GtEq => ">=",
+            _ => return None,
+        };
+        // `col OP value`
+        if let (Expr::Column { name: col, .. }, rhs) = (left.as_ref(), right.as_ref()) {
+            if !matches!(rhs, Expr::Column { .. }) {
+                return Some((col.clone(), op_str.to_string(), *right.clone()));
+            }
+        }
+        // `value OP col` — flip the direction.
+        if let (Expr::Column { name: col, .. }, lhs) = (right.as_ref(), left.as_ref()) {
+            if !matches!(lhs, Expr::Column { .. }) {
+                let flipped = match op_str {
+                    "<" => ">",
+                    "<=" => ">=",
+                    ">" => "<",
+                    ">=" => "<=",
+                    _ => return None,
+                };
+                return Some((col.clone(), flipped.to_string(), *left.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Split a predicate that may be an AND-chain into its individual conjuncts.

@@ -26,6 +26,20 @@ pub enum Plan {
         alias: Option<String>,
         rowid: Expr,
     },
+    /// A range scan via the table's rowid (used for `WHERE rowid BETWEEN ? AND ?`,
+    /// `rowid > ?`, `rowid < ?`, `rowid >= ?`, `rowid <= ?`, or any AND-chain
+    /// of these on the rowid-alias column). Starts and ends are inclusive.
+    /// If either bound is `None`, it means -∞ or +∞ respectively.
+    RowidRange {
+        table: Arc<Table>,
+        alias: Option<String>,
+        start: Option<Expr>,
+        end: Option<Expr>,
+        /// Remaining predicates that can't be expressed as a range bound
+        /// (e.g. `id > 5 AND id < 100 AND name = 'foo'` → start=Some(5),
+        /// end=Some(100), residual=Some(name='foo')).
+        residual: Option<Expr>,
+    },
     /// A point lookup via a secondary index (used for `WHERE indexed_col = ?`).
     /// Returns matching rows from the table by rowid.
     IndexLookup {

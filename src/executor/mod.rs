@@ -145,6 +145,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::Except { left, right } => exec_except(ctx, left, right),
         Plan::Subquery { plan } => execute(plan, ctx),
         Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
+        Plan::RowidRange { table, alias: _, start, end, residual } => exec_rowid_range(ctx, table.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
         Plan::Insert { table, source, columns, on_conflict } => exec_insert(ctx, table.clone(), source, columns.clone(), *on_conflict),
         Plan::Update { table, source, assignments } => exec_update(ctx, table.clone(), source, assignments),
@@ -739,41 +740,96 @@ fn exec_hash_join(
         return exec_join(ctx, left, right, join_type, condition);
     }
 
-    // Build a hash table on the right side: hash(right key values) -> Vec<row_index>.
+    // Build a hash table on the smaller side to minimize build cost.
+    // For INNER joins we can freely pick which side to build on; for outer
+    // joins we must preserve the side that's preserved by the join type, so
+    // we fall back to the (correct-but-slower) right-side-build path. This
+    // is the common case (real OLTP joins are overwhelmingly inner).
+    let is_inner = matches!(join_type, crate::planner::plan::JoinType::Inner | crate::planner::plan::JoinType::Cross);
+    let left_is_smaller = left_res.rows.len() <= right_res.rows.len();
+    let build_left = is_inner && left_is_smaller;
+
+    // Build the hash on the chosen build side. Key = concatenated `Value::encode()`
+    // bytes of the build-side key columns. Vec<u8> implements Hash+Eq natively,
+    // and `Value::encode()` produces a stable, collision-resistant form that
+    // respects SQL type semantics (Integer/Real/Text/Blob each get a distinct
+    // leading tag byte). This replaces the prior `format!("{:?}", v)` approach
+    // which allocated a String per value per row — ~30× slower than byte encode
+    // for the common Integer case.
     use std::collections::HashMap as StdHashMap;
-    let mut right_hash: StdHashMap<String, Vec<usize>> = StdHashMap::new();
-    for (ri, row) in right_res.rows.iter().enumerate() {
-        let mut key = String::new();
-        for (left_idx, _right_idx) in &eq_pairs {
-            let _ = left_idx;
-        }
-        for (_, right_idx) in &eq_pairs {
-            if let Some(v) = row.get(*right_idx) {
-                key.push_str(&format!("{:?}", v));
-                key.push('|');
+    let mut hash: StdHashMap<Vec<u8>, Vec<usize>> = StdHashMap::new();
+
+    let (build_rows, build_key_indices): (&Vec<Row>, Vec<usize>) = if build_left {
+        // Build on left; eq_pairs gives (left_idx, right_idx), take left_idx.
+        let idxs: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
+        (&left_res.rows, idxs)
+    } else {
+        // Build on right; take right_idx.
+        let idxs: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
+        (&right_res.rows, idxs)
+    };
+
+    for (row_idx, row) in build_rows.iter().enumerate() {
+        let mut key: Vec<u8> = Vec::with_capacity(24);
+        for &ci in &build_key_indices {
+            if let Some(v) = row.get(ci) {
+                key.extend_from_slice(&v.encode());
+            } else {
+                // Missing column — treat as NULL.
+                key.push(0);
             }
+            // Separator byte to disambiguate adjacent variable-length encodings.
+            key.push(0xff);
         }
-        right_hash.entry(key).or_default().push(ri);
+        hash.entry(key).or_default().push(row_idx);
     }
 
-    let mut out_rows = Vec::new();
-    let mut right_matched = vec![false; right_res.rows.len()];
+    let mut out_rows: Vec<Row> = Vec::new();
+    let mut build_matched = vec![false; build_rows.len()];
 
-    // Probe with the left side.
-    for left_row in &left_res.rows {
-        let mut key = String::new();
-        for (left_idx, _) in &eq_pairs {
-            if let Some(v) = left_row.get(*left_idx) {
-                key.push_str(&format!("{:?}", v));
-                key.push('|');
+    // Probe with the other (probe) side. Determine which rows to iterate and
+    // which key indices to extract from them.
+    let (probe_rows, probe_key_indices, probe_is_left): (&Vec<Row>, Vec<usize>, bool) = if build_left {
+        // Build was left; probe is right. Take right_idx from eq_pairs.
+        let idxs: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
+        (&right_res.rows, idxs, false)
+    } else {
+        // Build was right; probe is left. Take left_idx from eq_pairs.
+        let idxs: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
+        (&left_res.rows, idxs, true)
+    };
+
+    // Allocate NULL rows for unmatched emission (LEFT/RIGHT/FULL).
+    let nulls_right = vec![Value::Null; n_right];
+    let nulls_left = vec![Value::Null; n_left];
+
+    for probe_row in probe_rows.iter() {
+        let mut key: Vec<u8> = Vec::with_capacity(24);
+        for &ci in &probe_key_indices {
+            if let Some(v) = probe_row.get(ci) {
+                key.extend_from_slice(&v.encode());
+            } else {
+                key.push(0);
             }
+            key.push(0xff);
         }
         let mut matched = false;
-        if let Some(candidates) = right_hash.get(&key) {
-            for &ri in candidates {
-                let right_row = &right_res.rows[ri];
-                let mut combined = left_row.clone();
-                combined.extend(right_row.clone());
+        if let Some(candidates) = hash.get(&key) {
+            for &bi in candidates {
+                let build_row = &build_rows[bi];
+                // Emit combined row in [left, right] order regardless of which
+                // side was the build side.
+                let combined: Row = if probe_is_left {
+                    // probe = left, build = right → [probe, build]
+                    let mut c = probe_row.clone();
+                    c.extend(build_row.clone());
+                    c
+                } else {
+                    // probe = right, build = left → [build, probe]
+                    let mut c = build_row.clone();
+                    c.extend(probe_row.clone());
+                    c
+                };
                 // Verify the full condition (in case there are non-equi predicates).
                 let ok = if let Some(cond) = condition {
                     let v = eval_row(cond, &combined, &combined_cols, &params)?;
@@ -784,24 +840,46 @@ fn exec_hash_join(
                 if ok {
                     out_rows.push(combined);
                     matched = true;
-                    right_matched[ri] = true;
+                    build_matched[bi] = true;
                 }
             }
         }
-        if !matched && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
-            let mut combined = left_row.clone();
-            combined.extend(vec![Value::Null; n_right]);
-            out_rows.push(combined);
+        // Unmatched handling for LEFT/RIGHT/FULL joins.
+        // If probe is left and the join preserves left (LEFT/FULL), emit [probe, NULLs].
+        // If probe is right and the join preserves right (RIGHT/FULL), emit [NULLs, probe].
+        if !matched {
+            if probe_is_left && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
+                let mut c = probe_row.clone();
+                c.extend(nulls_right.clone());
+                out_rows.push(c);
+            } else if !probe_is_left && matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
+                let mut c = nulls_left.clone();
+                c.extend(probe_row.clone());
+                out_rows.push(c);
+            }
+            // For INNER/CROSS, unmatched probe rows are dropped.
         }
     }
 
-    // RIGHT and FULL: emit unmatched right rows with NULL left.
-    if matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
-        for (ri, right_row) in right_res.rows.iter().enumerate() {
-            if !right_matched[ri] {
-                let mut combined = vec![Value::Null; n_left];
-                combined.extend(right_row.clone());
-                out_rows.push(combined);
+    // Emit unmatched build-side rows for the outer-join case where the build
+    // side is the preserved side (LEFT preserved by LEFT/FULL if build was left;
+    // RIGHT preserved by RIGHT/FULL if build was right).
+    if build_left && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
+        // Build was left; unmatched left rows are [left, NULLs].
+        for (bi, build_row) in build_rows.iter().enumerate() {
+            if !build_matched[bi] {
+                let mut c = build_row.clone();
+                c.extend(nulls_right.clone());
+                out_rows.push(c);
+            }
+        }
+    } else if !build_left && matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
+        // Build was right; unmatched right rows are [NULLs, right].
+        for (bi, build_row) in build_rows.iter().enumerate() {
+            if !build_matched[bi] {
+                let mut c = nulls_left.clone();
+                c.extend(build_row.clone());
+                out_rows.push(c);
             }
         }
     }
@@ -997,6 +1075,61 @@ fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &
         columns: table.columns.iter().map(|c| c.name.clone()).collect(),
         rows: vec![row],
     })
+}
+
+// ============================================================================
+// RowidRange (WHERE id BETWEEN ? AND ?, id > ?, id < ?, id >= ?, id <= ?)
+// ============================================================================
+
+fn exec_rowid_range(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    start_expr: Option<&Expr>,
+    end_expr: Option<&Expr>,
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params);
+
+    // Evaluate the bounds. None means unbounded (-∞ or +∞).
+    let start: i64 = match start_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+        None => i64::MIN,
+    };
+    let end: i64 = match end_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+        None => i64::MAX,
+    };
+
+    let root = ctx.table_root(&table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let n_cols = table.n_columns();
+    let mut rows: Vec<Row> = Vec::new();
+    // `scan_table_range` is inclusive on both ends. For strict `>` / `<`
+    // conjuncts, the planner kept a residual predicate that re-checks the
+    // strict comparison; we apply it here so we don't accidentally include
+    // the boundary.
+    bt.scan_table_range(start, end, |_rowid, payload| {
+        if let Ok(row) = decode_row(payload, n_cols) {
+            rows.push(row);
+        }
+        true
+    })?;
+
+    // Apply residual predicate (strict < / > bounds, or additional filters).
+    let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    if let Some(res) = residual {
+        let params = ctx.params.clone();
+        rows.retain(|row| {
+            match eval_row(res, row, &columns, &params) {
+                Ok(v) => v.is_truthy(),
+                Err(_) => false,
+            }
+        });
+    }
+
+    Ok(ExecResult { columns, rows })
 }
 
 // ============================================================================

@@ -15,6 +15,7 @@
 //! Run with: `cargo run --release --example bench_compare`
 
 use rusqlite::params;
+use rustqlite::Value;
 use std::time::{Duration, Instant};
 
 // ===========================================================================
@@ -345,26 +346,28 @@ fn rustqlite_create_index(db: &mut rustqlite::Database) {
 }
 
 fn rustqlite_insert_single(db: &mut rustqlite::Database, n: usize) -> Duration {
+    let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
     let start = Instant::now();
     for i in 1..=n as i64 {
-        let sql = format!(
-            "INSERT INTO t (name, val, score) VALUES ('name{}', {}, {})",
-            i, i * 2, i as f64 * 1.5
-        );
-        db.execute(&sql, []).unwrap();
+        db.execute(sql, [
+            Value::Text(format!("name{}", i)),
+            Value::Integer(i * 2),
+            Value::Real(i as f64 * 1.5),
+        ]).unwrap();
     }
     start.elapsed()
 }
 
 fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Duration {
+    let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
     let start = Instant::now();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=n as i64 {
-        let sql = format!(
-            "INSERT INTO t (name, val, score) VALUES ('name{}', {}, {})",
-            i, i * 2, i as f64 * 1.5
-        );
-        db.execute(&sql, []).unwrap();
+        db.execute(sql, [
+            Value::Text(format!("name{}", i)),
+            Value::Integer(i * 2),
+            Value::Real(i as f64 * 1.5),
+        ]).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     start.elapsed()
@@ -388,32 +391,35 @@ fn rustqlite_insert_multirow(db: &mut rustqlite::Database, n: usize) -> Duration
 }
 
 fn rustqlite_point_lookup_rowid(db: &mut rustqlite::Database, n: usize) -> Duration {
+    // Use `?` placeholder so the statement cache can amortize parse+plan
+    // across all N calls — mirrors SQLite's prepared-statement loop below.
+    let sql = "SELECT name, val, score FROM t WHERE id = ?";
     let start = Instant::now();
     for i in 1..=n as i64 {
         let target = (i % 1000) + 1;
-        let sql = format!("SELECT name, val, score FROM t WHERE id = {}", target);
-        let _ = db.query(&sql, []).unwrap();
+        let _ = db.query(sql, [Value::Integer(target)]).unwrap();
     }
     start.elapsed()
 }
 
 fn rustqlite_point_lookup_indexed(db: &mut rustqlite::Database, n: usize) -> Duration {
+    let sql = "SELECT id, name, score FROM t WHERE val = ?";
     let start = Instant::now();
     for i in 1..=n as i64 {
         let target = ((i % 1000) + 1) * 2;
-        let sql = format!("SELECT id, name, score FROM t WHERE val = {}", target);
-        let _ = db.query(&sql, []).unwrap();
+        let _ = db.query(sql, [Value::Integer(target)]).unwrap();
     }
     start.elapsed()
 }
 
 fn rustqlite_range_scan(db: &mut rustqlite::Database, range: usize) -> Duration {
-    let sql = format!(
-        "SELECT name, val, score FROM t WHERE id BETWEEN 1000 AND {}",
-        1000 + range as i64 - 1
-    );
+    // Use placeholders so the cache amortizes parse+plan across all range sizes.
+    let sql = "SELECT name, val, score FROM t WHERE id BETWEEN ? AND ?";
     let start = Instant::now();
-    let _ = db.query(&sql, []).unwrap();
+    let _ = db.query(
+        sql,
+        [Value::Integer(1000), Value::Integer(1000 + range as i64 - 1)],
+    ).unwrap();
     start.elapsed()
 }
 
@@ -464,16 +470,16 @@ fn rustqlite_setup_join(db: &mut rustqlite::Database) {
 }
 
 fn rustqlite_join_2table(db: &mut rustqlite::Database) -> Duration {
-    let sql = "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 500";
+    let sql = "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
     let start = Instant::now();
-    let _ = db.query(sql, []).unwrap();
+    let _ = db.query(sql, [Value::Integer(500)]).unwrap();
     start.elapsed()
 }
 
 fn rustqlite_join_3table(db: &mut rustqlite::Database) -> Duration {
-    let sql = "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = 500";
+    let sql = "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = ?";
     let start = Instant::now();
-    let _ = db.query(sql, []).unwrap();
+    let _ = db.query(sql, [Value::Integer(500)]).unwrap();
     start.elapsed()
 }
 
@@ -485,13 +491,12 @@ fn rustqlite_join_full_scan(db: &mut rustqlite::Database) -> Duration {
 }
 
 fn rustqlite_update_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
+    let sql = "UPDATE t SET score = ? WHERE id = ?";
     let start = Instant::now();
     for i in 1..=n as i64 {
-        let sql = format!(
-            "UPDATE t SET score = {} WHERE id = {}",
-            i as f64 * 2.5, (i % 1000) + 1
-        );
-        db.execute(&sql, []).unwrap();
+        let score = i as f64 * 2.5;
+        let id = (i % 1000) + 1;
+        db.execute(sql, [Value::Real(score), Value::Integer(id)]).unwrap();
     }
     start.elapsed()
 }
@@ -507,44 +512,45 @@ fn rustqlite_delete_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
     let mut del_db = rustqlite::Database::open_in_memory().unwrap();
     del_db.execute("CREATE TABLE t_del (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
     del_db.execute("BEGIN", []).unwrap();
+    let ins_sql = "INSERT INTO t_del (x) VALUES (?)";
     for i in 1..=n as i64 {
-        let sql = format!("INSERT INTO t_del (x) VALUES ({})", i);
-        del_db.execute(&sql, []).unwrap();
+        del_db.execute(ins_sql, [Value::Integer(i)]).unwrap();
     }
     del_db.execute("COMMIT", []).unwrap();
+    let del_sql = "DELETE FROM t_del WHERE id = ?";
     let start = Instant::now();
     for i in 1..=n as i64 {
-        let sql = format!("DELETE FROM t_del WHERE id = {}", i);
-        del_db.execute(&sql, []).unwrap();
+        del_db.execute(del_sql, [Value::Integer(i)]).unwrap();
     }
     start.elapsed()
 }
 
 fn rustqlite_mixed_workload(db: &mut rustqlite::Database, ops: usize) -> Duration {
+    let q_sql = "SELECT name, val FROM t WHERE id = ?";
+    let ins_sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
+    let upd_sql = "UPDATE t SET score = ? WHERE id = ?";
     let start = Instant::now();
     let mut next_id = 100_001i64;
     for i in 0..ops {
         let phase = i % 5;
         match phase {
             0..=3 => {
-                let target = (i % 1000) + 1;
-                let sql = format!("SELECT name, val FROM t WHERE id = {}", target);
-                let _ = db.query(&sql, []).unwrap();
+                let target = ((i % 1000) + 1) as i64;
+                let _ = db.query(q_sql, [Value::Integer(target)]).unwrap();
             }
             4 => {
                 if i % 2 == 0 {
                     next_id += 1;
-                    let sql = format!(
-                        "INSERT INTO t (name, val, score) VALUES ('new{}', {}, {})",
-                        next_id, next_id * 2, next_id as f64
-                    );
-                    let _ = db.execute(&sql, []).unwrap();
+                    let _ = db.execute(ins_sql, [
+                        Value::Text(format!("new{}", next_id)),
+                        Value::Integer(next_id * 2),
+                        Value::Real(next_id as f64),
+                    ]).unwrap();
                 } else {
-                    let sql = format!(
-                        "UPDATE t SET score = {} WHERE id = {}",
-                        i as f64, (i % 1000) + 1
-                    );
-                    let _ = db.execute(&sql, []).unwrap();
+                    let _ = db.execute(upd_sql, [
+                        Value::Real(i as f64),
+                        Value::Integer(((i % 1000) + 1) as i64),
+                    ]).unwrap();
                 }
             }
             _ => unreachable!(),

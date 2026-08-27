@@ -45,7 +45,24 @@ pub struct Database {
     root_overrides: HashMap<String, u32>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
     max_rowids: HashMap<String, i64>,
+    /// Prepared-statement cache: SQL text -> (Statement, Option<Plan>).
+    /// Eliminates the parse+plan cost on repeated calls with the same SQL
+    /// (the common case in real workloads: `INSERT INTO t VALUES (?)` is
+    /// called N times in a loop, and `SELECT … WHERE id = ?` is called per
+    /// request). The cache is invalidated on any DDL statement (CREATE/DROP/
+    /// ALTER) because Plans hold `Arc<Table>` / `Arc<Index>` references that
+    /// become stale when the schema changes.
+    stmt_cache: HashMap<String, (Statement, Option<crate::planner::plan::Plan>)>,
+    /// FIFO order of insertion into `stmt_cache`, used for eviction when the
+    /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
+    /// oldest entry and the next to be evicted.
+    stmt_cache_order: Vec<String>,
+    /// Maximum number of entries in the statement cache. Default 64.
+    stmt_cache_capacity: usize,
 }
+
+/// Default capacity of the statement cache.
+const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
 
 impl Database {
     /// Open or create a database at the given path.
@@ -56,7 +73,18 @@ impl Database {
         catalog.schema_cookie = pager.schema_cookie();
         // Load the schema from page 0 (the schema table root).
         load_schema(&mut pager, &mut catalog)?;
-        Ok(Self { pager, catalog, path, in_transaction: false, txn_snapshot: None, root_overrides: HashMap::new(), max_rowids: HashMap::new() })
+        Ok(Self {
+            pager,
+            catalog,
+            path,
+            in_transaction: false,
+            txn_snapshot: None,
+            root_overrides: HashMap::new(),
+            max_rowids: HashMap::new(),
+            stmt_cache: HashMap::new(),
+            stmt_cache_order: Vec::new(),
+            stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
+        })
     }
 
     /// Open an in-memory database (no file). The data is lost when the
@@ -70,9 +98,63 @@ impl Database {
         Ok(db)
     }
 
+    /// Set the statement cache capacity. A larger cache uses more memory but
+    /// reduces parse+plan overhead on more unique SQL strings. Set to 0 to
+    /// disable caching entirely.
+    pub fn set_stmt_cache_capacity(&mut self, capacity: usize) {
+        self.stmt_cache_capacity = capacity;
+        // If shrinking, evict excess entries (FIFO).
+        while self.stmt_cache.len() > capacity && !self.stmt_cache_order.is_empty() {
+            let oldest = self.stmt_cache_order.remove(0);
+            self.stmt_cache.remove(&oldest);
+        }
+    }
+
+    /// Look up the statement cache; on miss, parse + plan, store, and return.
+    /// The cached plan is cloned — cheap because `Plan` is `Clone` with only
+    /// `Arc` references internally (no deep copies of large structures).
+    ///
+    /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
+    /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
+    /// don't conflict.
+    fn get_or_cache_stmt(&mut self, sql: &str) -> Result<(Statement, Option<crate::planner::plan::Plan>)> {
+        if self.stmt_cache_capacity == 0 {
+            // Caching disabled — parse + plan every time.
+            let stmt = parse(sql)?;
+            let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
+            return Ok((stmt, plan_opt));
+        }
+        if let Some((stmt, plan_opt)) = self.stmt_cache.get(sql) {
+            return Ok((stmt.clone(), plan_opt.clone()));
+        }
+        // Miss: parse + plan.
+        let stmt = parse(sql)?;
+        let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
+        // Evict FIFO if at capacity.
+        if self.stmt_cache.len() >= self.stmt_cache_capacity {
+            if let Some(oldest) = self.stmt_cache_order.first().cloned() {
+                self.stmt_cache.remove(&oldest);
+                self.stmt_cache_order.remove(0);
+            }
+        }
+        self.stmt_cache.insert(sql.to_string(), (stmt.clone(), plan_opt.clone()));
+        self.stmt_cache_order.push(sql.to_string());
+        Ok((stmt, plan_opt))
+    }
+
+    /// Invalidate the statement cache. Called after any DDL statement
+    /// (CREATE/DROP TABLE/INDEX/VIEW/TRIGGER) because the cached Plans hold
+    /// `Arc<Table>` / `Arc<Index>` references that become stale when the
+    /// schema changes.
+    fn invalidate_stmt_cache(&mut self) {
+        self.stmt_cache.clear();
+        self.stmt_cache_order.clear();
+    }
+
     /// Execute a statement that does not return rows (INSERT/UPDATE/DELETE/CREATE/...).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
-        let stmt = parse(sql)?;
+        let is_ddl = is_ddl_sql(sql);
+        let (stmt, _plan_opt) = self.get_or_cache_stmt(sql)?;
         let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
         let in_txn = self.in_transaction;
         let txn_snap = self.txn_snapshot.take();
@@ -89,13 +171,16 @@ impl Database {
         self.txn_snapshot = ctx.txn_snapshot;
         self.root_overrides = std::mem::take(&mut ctx.root_overrides);
         self.max_rowids = std::mem::take(&mut ctx.max_rowids);
+        // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
+        if result.is_ok() && is_ddl {
+            self.invalidate_stmt_cache();
+        }
         result
     }
 
     /// Execute a query and return all rows.
     pub fn query<P: Params>(&mut self, sql: &str, params: P) -> Result<Vec<Row>> {
-        let stmt = parse(sql)?;
-        let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
+        let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
         if let Some(plan) = plan_opt {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction;
@@ -118,8 +203,7 @@ impl Database {
 
     /// Execute a query and return (column_names, rows).
     pub fn query_with_columns<P: Params>(&mut self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)> {
-        let stmt = parse(sql)?;
-        let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
+        let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
         if let Some(plan) = plan_opt {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction;
@@ -602,6 +686,23 @@ fn load_schema(pager: &mut Pager, catalog: &mut Catalog) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Heuristic: does this SQL string start a DDL statement (CREATE/DROP/ALTER)?
+/// Used to invalidate the statement cache after schema changes. We only need
+/// a cheap prefix check — the parser is the source of truth, and the cache
+/// will be re-populated on the next call.
+fn is_ddl_sql(sql: &str) -> bool {
+    let s = sql.trim_start();
+    let s = s.trim_start_matches('('); // tolerate leading paren around INSERT etc.
+    let s = s.trim_start();
+    let upper = s.to_ascii_uppercase();
+    upper.starts_with("CREATE ")
+        || upper.starts_with("DROP ")
+        || upper.starts_with("ALTER ")
+        || upper.starts_with("ATTACH ")
+        || upper.starts_with("DETACH ")
+        || upper.starts_with("VACUUM")
 }
 
 /// A trait for things that can be converted into a sequence of bound parameters.

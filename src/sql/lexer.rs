@@ -75,6 +75,14 @@ pub struct Lexer<'a> {
     pos: usize,
     line: usize,
     col: usize,
+    /// Next anonymous-`?` index. Each `?` token (without explicit digits)
+    /// consumes this number and increments the counter so that successive
+    /// `?` placeholders refer to distinct parameters. This mirrors SQLite's
+    /// semantics: `WHERE a = ? AND b = ?` binds `a` to the first param and
+    /// `b` to the second, NOT both to the first param (which was the prior
+    /// behavior and caused incorrect query results whenever more than one
+    /// anonymous `?` appeared in a single statement).
+    next_anon_param: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -84,6 +92,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             col: 1,
+            next_anon_param: 0,
         }
     }
 
@@ -351,7 +360,14 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
             if name.is_empty() {
-                name = "0".to_string(); // anonymous `?`
+                // Anonymous `?` — assign the next incrementing index so that
+                // successive `?` tokens in the same statement bind to distinct
+                // parameters. The name is the decimal string of the index
+                // (e.g. "0", "1", "2"), which `Database::execute` and
+                // `ExecContext::bind` look up by string key.
+                let idx = self.next_anon_param;
+                self.next_anon_param += 1;
+                name = idx.to_string();
             }
         } else {
             name.push(prefix);
@@ -511,5 +527,24 @@ mod tests {
         assert_eq!(toks[2], Token::Parameter(":name".into()));
         assert_eq!(toks[3], Token::Parameter("@col".into()));
         assert_eq!(toks[4], Token::Parameter("$var".into()));
+    }
+
+    #[test]
+    fn multiple_anonymous_placeholders_get_distinct_indices() {
+        // Regression: previously every anonymous `?` lexed to Parameter("0"),
+        // so `WHERE a = ? AND b = ?` bound both predicates to the first
+        // parameter, silently masking the second value. Now each `?` gets
+        // the next incrementing index.
+        let toks = lex("? ? ?");
+        assert_eq!(toks[0], Token::Parameter("0".into()));
+        assert_eq!(toks[1], Token::Parameter("1".into()));
+        assert_eq!(toks[2], Token::Parameter("2".into()));
+
+        // Mixed `?` and `?N` — explicit N does NOT advance the anonymous
+        // counter, so a later `?` continues from the last assigned index.
+        let toks = lex("? ?1 ?");
+        assert_eq!(toks[0], Token::Parameter("0".into()));
+        assert_eq!(toks[1], Token::Parameter("1".into()));
+        assert_eq!(toks[2], Token::Parameter("1".into()));
     }
 }
