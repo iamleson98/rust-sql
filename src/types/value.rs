@@ -226,23 +226,56 @@ impl Affinity {
         match (*self, v) {
             (Affinity::Integer, Value::Integer(i)) => Value::Integer(i),
             (Affinity::Integer, Value::Real(f)) => Value::Integer(f as i64),
-            (Affinity::Integer, Value::Text(s)) => match s.trim().parse::<i64>() {
-                Ok(i) => Value::Integer(i),
-                Err(_) => Value::Real(s.trim().parse::<f64>().unwrap_or(0.0)),
+            (Affinity::Integer, Value::Text(s)) => {
+                // SQLite affinity rules: try to parse the (trimmed) text as
+                // an integer; if that fails, try as a real; if BOTH fail,
+                // store the text as-is (SQLite quirk: non-numeric text
+                // retains its TEXT type even in an INTEGER column).
+                let trimmed = s.trim();
+                if let Ok(i) = trimmed.parse::<i64>() {
+                    Value::Integer(i)
+                } else if let Ok(f) = trimmed.parse::<f64>() {
+                    // Real-looking value in an integer column: SQLite stores
+                    // it as REAL (NOT as a truncated integer).
+                    Value::Real(f)
+                } else {
+                    Value::Text(s)
+                }
             },
-            (Affinity::Integer, Value::Blob(b)) => Value::Integer(
-                std::str::from_utf8(&b).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0),
-            ),
+            (Affinity::Integer, Value::Blob(b)) => {
+                let s = std::str::from_utf8(&b).unwrap_or("");
+                let trimmed = s.trim();
+                if let Ok(i) = trimmed.parse::<i64>() {
+                    Value::Integer(i)
+                } else if let Ok(f) = trimmed.parse::<f64>() {
+                    Value::Real(f)
+                } else {
+                    Value::Blob(b)
+                }
+            },
             (Affinity::Integer, Value::Null) => Value::Null,
 
             (Affinity::Real, Value::Integer(i)) => Value::Real(i as f64),
             (Affinity::Real, Value::Real(f)) => Value::Real(f),
             (Affinity::Real, Value::Text(s)) => {
-                Value::Real(s.trim().parse::<f64>().unwrap_or(0.0))
+                // SQLite affinity: REAL column with TEXT input — convert if
+                // the text looks like a number; otherwise keep as Text.
+                let trimmed = s.trim();
+                if let Ok(f) = trimmed.parse::<f64>() {
+                    Value::Real(f)
+                } else {
+                    Value::Text(s)
+                }
             }
-            (Affinity::Real, Value::Blob(b)) => Value::Real(
-                std::str::from_utf8(&b).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0),
-            ),
+            (Affinity::Real, Value::Blob(b)) => {
+                let s = std::str::from_utf8(&b).unwrap_or("");
+                let trimmed = s.trim();
+                if let Ok(f) = trimmed.parse::<f64>() {
+                    Value::Real(f)
+                } else {
+                    Value::Blob(b)
+                }
+            },
             (Affinity::Real, Value::Null) => Value::Null,
 
             (Affinity::Text, Value::Integer(i)) => Value::Text(i.to_string()),
@@ -304,16 +337,28 @@ impl fmt::Display for Value {
     }
 }
 
-/// Format a real number with SQLite-style rounding (up to 15 significant digits).
+/// Format a real number with SQLite-style rounding.
+///
+/// SQLite uses the shortest round-trippable representation: the fewest digits
+/// such that parsing the resulting string back into an f64 yields a value
+/// equal to the original. We try digits=1, 2, 3, … and return the first one
+/// that round-trips. If none do (which can happen for subnormals / NaN), we
+/// fall back to Rust's default `{}` formatter.
 pub fn format_real(f: f64) -> String {
     if f.is_nan() {
         return "".to_string();
     }
+    if f.is_infinite() {
+        return if f > 0.0 { "Inf".to_string() } else { "-Inf".to_string() };
+    }
     if f == 0.0 {
+        // SQLite prints "0.0" for both +0.0 and -0.0.
         return "0.0".to_string();
     }
-    // Use the shortest round-trippable representation, like SQLite.
-    for digits in (1..=15).rev() {
+
+    // Shortest round-trippable: try digits=0, 1, 2, …, 17 and return the
+    // first one whose textual form parses back to the same f64.
+    for digits in 0..=17usize {
         let candidate = format!("{:.*}", digits, f);
         if let Ok(parsed) = candidate.parse::<f64>() {
             if parsed == f {

@@ -37,6 +37,9 @@ pub struct Database {
     catalog: Catalog,
     path: PathBuf,
     in_transaction: bool,
+    /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager's
+    /// state to the pre-transaction point.
+    txn_snapshot: Option<crate::storage::pager::PagerSnapshot>,
     /// Root page overrides (table_name -> current root). Updated when B+tree
     /// splits change the root, since the catalog's Arc<Table> is immutable.
     root_overrides: HashMap<String, u32>,
@@ -53,7 +56,7 @@ impl Database {
         catalog.schema_cookie = pager.schema_cookie();
         // Load the schema from page 0 (the schema table root).
         load_schema(&mut pager, &mut catalog)?;
-        Ok(Self { pager, catalog, path, in_transaction: false, root_overrides: HashMap::new(), max_rowids: HashMap::new() })
+        Ok(Self { pager, catalog, path, in_transaction: false, txn_snapshot: None, root_overrides: HashMap::new(), max_rowids: HashMap::new() })
     }
 
     /// Open an in-memory database (no file). The data is lost when the
@@ -72,8 +75,10 @@ impl Database {
         let stmt = parse(sql)?;
         let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
         let in_txn = self.in_transaction;
+        let txn_snap = self.txn_snapshot.take();
         let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
+        ctx.txn_snapshot = txn_snap;
         ctx.root_overrides = std::mem::take(&mut self.root_overrides);
         ctx.max_rowids = std::mem::take(&mut self.max_rowids);
         for (i, v) in params.into_iter().enumerate() {
@@ -81,6 +86,7 @@ impl Database {
         }
         let result = Self::execute_statement_static(stmt, &mut ctx, &mut self.catalog, sql);
         self.in_transaction = ctx.in_transaction;
+        self.txn_snapshot = ctx.txn_snapshot;
         self.root_overrides = std::mem::take(&mut ctx.root_overrides);
         self.max_rowids = std::mem::take(&mut ctx.max_rowids);
         result
@@ -92,14 +98,18 @@ impl Database {
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
         if let Some(plan) = plan_opt {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+            let in_txn = self.in_transaction;
+            let txn_snap = self.txn_snapshot.take();
             let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
-            ctx.in_transaction = self.in_transaction;
+            ctx.in_transaction = in_txn;
+            ctx.txn_snapshot = txn_snap;
             ctx.root_overrides = self.root_overrides.clone();
             ctx.max_rowids = self.max_rowids.clone();
             for (i, v) in params.into_iter().enumerate() {
                 ctx.bind(&format!("{}", i), v);
             }
             let res = execute(&plan, &mut ctx)?;
+            self.txn_snapshot = ctx.txn_snapshot;
             Ok(res.rows)
         } else {
             Ok(Vec::new())
@@ -112,14 +122,18 @@ impl Database {
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
         if let Some(plan) = plan_opt {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+            let in_txn = self.in_transaction;
+            let txn_snap = self.txn_snapshot.take();
             let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
-            ctx.in_transaction = self.in_transaction;
+            ctx.in_transaction = in_txn;
+            ctx.txn_snapshot = txn_snap;
             ctx.root_overrides = self.root_overrides.clone();
             ctx.max_rowids = self.max_rowids.clone();
             for (i, v) in params.into_iter().enumerate() {
                 ctx.bind(&format!("{}", i), v);
             }
             let res = execute(&plan, &mut ctx)?;
+            self.txn_snapshot = ctx.txn_snapshot;
             Ok((res.columns, res.rows))
         } else {
             Ok((Vec::new(), Vec::new()))
@@ -277,16 +291,30 @@ impl Database {
             Statement::Create(c) => Self::execute_create(c, ctx, catalog, original_sql),
             Statement::Drop(d) => Self::execute_drop(d, ctx, catalog),
             Statement::Begin(_) => {
+                // Snapshot the pager's mutable state NOW so ROLLBACK can
+                // restore to this point. We also flip in_transaction so the
+                // executor's INSERT/UPDATE/DELETE skip per-statement flushes
+                // (so dirty pages stay in cache only, never reaching disk).
                 ctx.in_transaction = true;
+                ctx.txn_snapshot = Some(ctx.pager.snapshot());
                 Ok(())
             }
             Statement::Commit => {
                 ctx.in_transaction = false;
+                ctx.txn_snapshot = None;
                 ctx.pager.flush()?;
                 Ok(())
             }
             Statement::Rollback(_) => {
+                // Restore the pager to the snapshot taken at BEGIN.
+                if let Some(snap) = ctx.txn_snapshot.take() {
+                    ctx.pager.rollback_to(&snap)?;
+                }
                 ctx.in_transaction = false;
+                // Root overrides and max_rowids cached during the txn are
+                // now stale; clear them so the next op rescans.
+                ctx.root_overrides.clear();
+                ctx.max_rowids.clear();
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p, ctx),

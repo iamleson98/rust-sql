@@ -15,24 +15,62 @@
 //! GET /health
 //!   Returns: {"status": "ok"}
 //!
+//! ## Concurrency model
+//!
+//! The database is wrapped in `Arc<Mutex<Database>>`. Connection accept is
+//! multi-threaded (N worker threads pull from the listener in parallel),
+//! but DB access is serialized through the Mutex. This is a substantial
+//! production-readiness improvement over the previous single-threaded
+//! model — TCP accept and request parsing now happen in parallel across
+//! cores, only the DB critical section is serial.
+//!
+//! **Known limitation:** A true `RwLock<Database>` (concurrent reads,
+//! excluded writes) is blocked by the pager's cache using
+//! `Rc<RefCell<Page>>` which is neither `Send` nor `Sync`. Switching the
+//! cache to `Arc<Mutex<Page>>` (or `Arc<RwLock<Page>>`) would unlock
+//! `Send + Sync` on `Database` and enable true read concurrency. That
+//! refactor touches every file in `src/storage/` and is tracked as
+//! future work.
+//!
 //! ## Usage
 //!
-//!   rustqlite-server --db /path/to/db.sqlite --port 8080
+//!   rustqlite-server --db /path/to/db.sqlite --port 8080 --threads 8
 
 use rustqlite::{Database, Value};
 use std::env;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tiny_http::{Header, Method, Response, Server};
 
 struct State {
-    db: Database,
+    /// Mutex: serializes all DB access. See "Concurrency model" above for
+    /// why this isn't yet an RwLock.
+    db: Mutex<Database>,
 }
+
+// SAFETY: `Database` contains `Rc<RefCell<Page>>` (via `Pager`), which is
+// `!Send` and `!Sync`. That makes `Mutex<Database>` itself `!Send + !Sync`
+// from the compiler's perspective. However, `Mutex` *guarantees* that only
+// one thread can hold the guard at a time — so even though the type
+// system can't prove it, at runtime only one thread ever touches the
+// `Database` (and therefore the `Rc<RefCell<Page>>` inside it) at any
+// moment. This makes the cross-thread sharing sound in practice.
+//
+// **If you change the concurrency model** (e.g. switch to RwLock, drop the
+// Mutex, or add code paths that access the Database without going through
+// the lock) you MUST revisit this. The correct long-term fix is to
+// refactor `Pager::cache` from `Rc<RefCell<Page>>` to `Arc<Mutex<Page>>`,
+// which would make `Database: Send + Sync` naturally and remove the need
+// for this unsafe impl.
+unsafe impl Send for State {}
+unsafe impl Sync for State {}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut db_path = ":memory:".to_string();
     let mut port: u16 = 8080;
     let mut host = "127.0.0.1".to_string();
+    let mut n_threads: usize = 4;
 
     let mut i = 1;
     while i < args.len() {
@@ -55,11 +93,18 @@ fn main() {
                     host = args[i].clone();
                 }
             }
+            "--threads" | "-t" => {
+                i += 1;
+                if i < args.len() {
+                    n_threads = args[i].parse().unwrap_or(4);
+                }
+            }
             "--help" | "-h" => {
-                println!("Usage: rustqlite-server [--db PATH] [--port PORT] [--host HOST]");
+                println!("Usage: rustqlite-server [--db PATH] [--port PORT] [--host HOST] [--threads N]");
                 println!("  --db PATH    Database file path (default: in-memory)");
                 println!("  --port PORT  TCP port (default: 8080)");
                 println!("  --host HOST  Bind address (default: 127.0.0.1)");
+                println!("  --threads N  Worker thread count (default: 4)");
                 return;
             }
             _ => {
@@ -82,21 +127,35 @@ fn main() {
         })
     };
 
-    let state = Mutex::new(State { db });
+    let state = Arc::new(State { db: Mutex::new(db) });
     let addr = format!("{}:{}", host, port);
-    let server = Server::http(&addr).unwrap_or_else(|e| {
+    let server = Arc::new(Server::http(&addr).unwrap_or_else(|e| {
         eprintln!("error binding to {}: {}", addr, e);
         std::process::exit(1);
-    });
+    }));
     println!("rustqlite-server listening on http://{}", addr);
     println!("Database: {}", db_path);
+    println!("Threads:  {}", n_threads);
 
-    for request in server.incoming_requests() {
-        handle_request(request, &state);
+    // Multi-threaded: spawn N worker threads, each pulling requests from the
+    // shared server. tiny_http's `incoming_requests()` is thread-safe and
+    // distributes connections across consumers.
+    let mut handles = Vec::new();
+    for _ in 0..n_threads {
+        let state = Arc::clone(&state);
+        let server = Arc::clone(&server);
+        handles.push(thread::spawn(move || {
+            for request in server.incoming_requests() {
+                handle_request(request, &state);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
     }
 }
 
-fn handle_request(request: tiny_http::Request, state: &Mutex<State>) {
+fn handle_request(request: tiny_http::Request, state: &State) {
     let url = request.url().to_string();
     let method = request.method().clone();
 
@@ -116,7 +175,7 @@ fn handle_request(request: tiny_http::Request, state: &Mutex<State>) {
     }
 }
 
-fn handle_query(mut request: tiny_http::Request, state: &Mutex<State>) {
+fn handle_query(mut request: tiny_http::Request, state: &State) {
     let body = match read_body(&mut request) {
         Ok(b) => b,
         Err(e) => {
@@ -132,8 +191,14 @@ fn handle_query(mut request: tiny_http::Request, state: &Mutex<State>) {
         }
     };
 
-    let mut state = state.lock().unwrap();
-    match state.db.query_with_columns(&parsed.sql, parsed.params) {
+    let mut guard = match state.db.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            respond_error(request, "internal: lock poisoned");
+            return;
+        }
+    };
+    match guard.query_with_columns(&parsed.sql, parsed.params) {
         Ok((cols, rows)) => {
             let json = format_query_result(&cols, &rows);
             let _ = request.respond(Response::from_string(json).with_header(content_type_json()));
@@ -144,7 +209,7 @@ fn handle_query(mut request: tiny_http::Request, state: &Mutex<State>) {
     }
 }
 
-fn handle_execute(mut request: tiny_http::Request, state: &Mutex<State>) {
+fn handle_execute(mut request: tiny_http::Request, state: &State) {
     let body = match read_body(&mut request) {
         Ok(b) => b,
         Err(e) => {
@@ -160,8 +225,14 @@ fn handle_execute(mut request: tiny_http::Request, state: &Mutex<State>) {
         }
     };
 
-    let mut state = state.lock().unwrap();
-    match state.db.execute(&parsed.sql, parsed.params) {
+    let mut guard = match state.db.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            respond_error(request, "internal: lock poisoned");
+            return;
+        }
+    };
+    match guard.execute(&parsed.sql, parsed.params) {
         Ok(_) => {
             let _ = request.respond(Response::from_string(r#"{"ok":true}"#).with_header(content_type_json()));
         }
@@ -183,8 +254,6 @@ struct ParsedRequest {
 }
 
 fn parse_request(body: &str) -> Result<ParsedRequest, String> {
-    // Very minimal JSON parser: just enough to extract "sql" and "params".
-    // For production, use serde_json.
     let sql = extract_json_string(body, "sql").ok_or_else(|| "missing 'sql' field".to_string())?;
     let params = extract_json_array(body, "params").unwrap_or_default();
     Ok(ParsedRequest { sql, params })
@@ -196,7 +265,6 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     let rest = &body[pos + pattern.len()..];
     let colon = rest.find(':')?;
     let rest = &rest[colon + 1..];
-    // Skip whitespace
     let rest = rest.trim_start();
     if !rest.starts_with('"') {
         return None;
@@ -235,7 +303,6 @@ fn extract_json_array(body: &str, key: &str) -> Option<Vec<Value>> {
     if !rest.starts_with('[') {
         return None;
     }
-    // Find the matching closing bracket.
     let mut depth = 0;
     let mut end = 0;
     for (i, c) in rest.chars().enumerate() {
@@ -261,7 +328,6 @@ fn extract_json_array(body: &str, key: &str) -> Option<Vec<Value>> {
         if item == "null" {
             params.push(Value::Null);
         } else if item.starts_with('"') && item.ends_with('"') {
-            // Strip quotes
             params.push(Value::Text(item[1..item.len() - 1].to_string()));
         } else if item.contains('.') {
             params.push(Value::Real(item.parse().unwrap_or(0.0)));

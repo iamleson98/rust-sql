@@ -1110,6 +1110,12 @@ impl<'a> Btree<'a> {
 
     /// Look up all rowids matching a given key in an index B+tree.
     /// Returns a list of rowids (usually 1, but may be more for non-unique indexes).
+    ///
+    /// **Prefix matching**: when the search `key` is SHORTER than the stored
+    /// index key (i.e., a composite index lookup where only the leading
+    /// columns are constrained), we treat it as a prefix match. This is what
+    /// makes `WHERE a = 1` use the index `(a, b)` correctly: the stored keys
+    /// are `encode(a) || encode(b)` and the search key is just `encode(a)`.
     pub fn lookup_index(&mut self, key: &[u8]) -> Result<Vec<i64>> {
         let mut results = Vec::new();
         let mut bt = Btree {
@@ -1118,13 +1124,24 @@ impl<'a> Btree<'a> {
             is_index: true,
         };
         bt.scan_index(|cell_rowid, cell_key| {
-            if cell_key == key {
+            let matched = if key.len() > cell_key.len() {
+                // Search key is longer than stored — no match (shouldn't happen
+                // for a well-formed index lookup).
+                false
+            } else if key.len() == cell_key.len() {
+                // Exact match.
+                cell_key == key
+            } else {
+                // Prefix match: stored key starts with the search key.
+                // This handles composite-index lookups where the query only
+                // constrains the leading columns.
+                cell_key.starts_with(key)
+            };
+            if matched {
                 results.push(cell_rowid);
             }
-            // Continue scanning — there may be more matches (non-unique index).
-            // For a sorted B+tree we could stop early once cell_key > key,
-            // but our simplified index is keyed by rowid, not by key, so we
-            // must scan all entries.
+            // Continue scanning — there may be more matches (non-unique index
+            // or multiple prefix matches).
             true
         })?;
         Ok(results)

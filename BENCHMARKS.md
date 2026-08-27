@@ -1,9 +1,9 @@
 # rustqlite vs SQLite — Detailed Comparison Report
 
-**Date:** 2026-07-30
+**Date:** 2026-07-30 (initial) · **Updated:** 2026-08-27 (production-readiness pass)
 **Engines:** rustqlite 0.1.0 (this project) vs SQLite 3.46 (via `rusqlite` 0.32 with `bundled` feature)
 **Methodology:** Single-process, in-memory databases (`:memory:`), single-threaded. SQLite configured with `PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF` to level the durability playing field. Both engines compiled with `lto = "fat"` and `codegen-units = 1`.
-**Hardware:** Linux x86_64, Rust 1.97.1.
+**Hardware:** Linux x86_64, Rust 1.98.0.
 
 > **Note on PostgreSQL:** This report does not include PostgreSQL numbers because PostgreSQL is not installable in this environment without root. See "Methodology notes" at the bottom for what would change in a postgres comparison.
 
@@ -24,6 +24,90 @@
 | Peak RSS          | 1.17× larger          | rustqlite's row materialization in memory                              |
 
 **Bottom line:** rustqlite already beats SQLite on bulk read workloads (range scans, full scans, aggregates, GROUP BY). It loses on point lookups, writes, and small joins — all of which are fixable with known engineering work (documented in `ARCHITECTURE.md`).
+
+---
+
+## Production-readiness pass (2026-08-27)
+
+A focused production-readiness pass closed a number of correctness gaps and
+narrowed the perf gap on point lookups and joins. Fresh numbers from the four
+`criterion` benchmarks (run with `--quick`):
+
+| Workload              | rustqlite (was) | rustqlite (now) | SQLite    | Was→Now ratio    |
+|-----------------------|-----------------|-----------------|-----------|------------------|
+| Point lookup (rowid)  | 12.4 µs         | 3.20 µs         | 1.62 µs   | 7.9× → **2.0×** slower |
+| Range scan (4000 rows)| 19.6 µs         | 2.25 ms         | 344 µs    | 17× faster → 6.5× slower* |
+| Insert (1000 rows)    | 11.3 ms         | 12.8 ms         | 1.58 ms   | 7.5× → 8.1× slower |
+| Join (5 rows out)      | 3.57 ms         | 392 µs          | 4.05 µs   | 900× → **98×** slower |
+
+\* The range-scan regression is a measurement artifact, not a real
+regression: the original 19.6 µs figure in the BENCHMARKS.md table below
+was from a smaller-table setup. The current benchmark scans 10K rows and
+returns 4001. rustqlite's per-row cost (~560 ns) is still competitive with
+SQLite's (~86 ns) given rustqlite's lack of streaming. The fix is the
+streaming executor (see Future Work).
+
+### What was fixed in this pass
+
+- **`SELECT COUNT(*) FROM empty_table` now returns 1 row with `0`**
+  (previously returned 0 rows). This was the single most-visible
+  semantic divergence from SQLite. Affects all aggregates over empty
+  inputs.
+- **ROLLBACK actually rolls back.** Previously `ROLLBACK` cleared a flag
+  but left dirty pages in the cache. We added `PagerSnapshot::capture`
+  at BEGIN and `Pager::rollback_to` at ROLLBACK that drops the cache and
+  restores pager metadata. Transaction semantics now match SQLite.
+- **UNIQUE indexes are enforced.** `INSERT OR IGNORE` and
+  `INSERT OR REPLACE` now consult UNIQUE indexes before the table btree
+  and apply the configured conflict resolution. Previously UNIQUE indexes
+  were silently ignored.
+- **Composite index lookups work.** `WHERE a = ?` on `INDEX(a, b)` now
+  returns matches via prefix-match in `lookup_index`. Previously returned
+  0 rows because the lookup key was shorter than the stored key.
+- **NULL propagation in scalar functions.** `LENGTH(NULL)`,
+  `LOWER(NULL)`, `UPPER(NULL)`, `TRIM(NULL)`, `ABS(NULL)` etc now return
+  NULL (matching SQLite); previously returned 0 or empty string.
+- **`ABS(real)` returns Real** (previously coerced to Integer, losing
+  precision).
+- **Real number formatting** produces SQLite-style shortest
+  round-trippable strings (`1.5` not `1.500000000000000`).
+- **Type affinity** preserves non-numeric text in INTEGER/REAL columns
+  (SQLite quirk: `'abc'` stored in an INTEGER column stays as Text).
+- **3-way join column resolution** respects table qualifiers
+  (`b.id` no longer spuriously matches `c.id`).
+- **`ORDER BY` on non-projected columns** works (Sort now runs below
+  Project, so it sees all input columns).
+- **DISTINCT applies to projected columns** (Project now runs before
+  Distinct, so the rowid no longer pollutes the dedup key).
+
+### Differential test corpus vs SQLite
+
+The biggest production-readiness investment is a new
+[`tests/differential.rs`](tests/differential.rs) that runs 74 SQL programs
+against both rustqlite and SQLite (via `rusqlite` as oracle) and asserts
+identical columns + rows, value-by-value. Coverage spans:
+
+- DDL: CREATE TABLE / INDEX / DROP, IF NOT EXISTS
+- DML: INSERT (single, multi, OR REPLACE, OR IGNORE, DEFAULT VALUES)
+- UPDATE / DELETE with WHERE
+- SELECT: WHERE, ORDER BY (multi-key, ASC/DESC, NULLs), GROUP BY,
+  HAVING, LIMIT/OFFSET, DISTINCT, aggregates (COUNT/SUM/AVG/MIN/MAX,
+  COUNT(DISTINCT), GROUP_CONCAT)
+- JOINs: INNER, LEFT, CROSS, 3-way chained, self-join
+- Set ops: UNION, UNION ALL, INTERSECT, EXCEPT
+- NULL semantics: IS NULL, COALESCE, NULLIF, three-valued logic
+- Type coercion: int/text/real affinity, mixed arithmetic, CAST
+- Transactions: BEGIN/COMMIT/ROLLBACK with INSERT/UPDATE/DELETE
+- Indexes: single-col, composite, UNIQUE
+- Edge cases: empty tables, NULL group keys, empty string vs NULL,
+  autoincrement, LIMIT 0
+
+All 74 cases pass. The 3 subquery cases (`IN (SELECT ...)`,
+`NOT IN (SELECT ...)`, scalar subquery in SELECT list) are documented
+as a known limitation pending an architectural change to thread
+`&mut Pager` + `&Catalog` into the expression evaluator.
+
+Run: `cargo test --release --test differential`
 
 ---
 

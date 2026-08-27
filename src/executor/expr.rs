@@ -254,36 +254,39 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
 pub fn call_scalar(name: &str, args: &[Value]) -> Value {
     let fname = name.to_ascii_lowercase();
     match fname.as_str() {
-        "abs" => args
-            .first()
-            .map(|v| Value::Integer(v.as_integer().abs()))
-            .unwrap_or(Value::Null),
-        "length" => args
-            .first()
-            .map(|v| Value::Integer(v.length()))
-            .unwrap_or(Value::Null),
-        "lower" => args
-            .first()
-            .map(|v| Value::Text(v.as_text().to_lowercase()))
-            .unwrap_or(Value::Null),
-        "upper" => args
-            .first()
-            .map(|v| Value::Text(v.as_text().to_uppercase()))
-            .unwrap_or(Value::Null),
-        "trim" => args
-            .first()
-            .map(|v| Value::Text(v.as_text().trim().to_string()))
-            .unwrap_or(Value::Null),
-        "ltrim" => args
-            .first()
-            .map(|v| Value::Text(v.as_text().trim_start().to_string()))
-            .unwrap_or(Value::Null),
-        "rtrim" => args
-            .first()
-            .map(|v| Value::Text(v.as_text().trim_end().to_string()))
-            .unwrap_or(Value::Null),
+        "abs" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(Value::Integer(i)) => Value::Integer(i.abs()),
+            Some(Value::Real(f)) => Value::Real(f.abs()),
+            // Numeric-looking text gets coerced; everything else: SQLite returns 0.
+            Some(other) => Value::Integer(other.as_integer().abs()),
+        },
+        "length" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Integer(v.length()),
+        },
+        "lower" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Text(v.as_text().to_lowercase()),
+        },
+        "upper" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Text(v.as_text().to_uppercase()),
+        },
+        "trim" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Text(v.as_text().trim().to_string()),
+        },
+        "ltrim" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Text(v.as_text().trim_start().to_string()),
+        },
+        "rtrim" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Text(v.as_text().trim_end().to_string()),
+        },
         "replace" => {
-            if args.len() == 3 {
+            if args.len() == 3 && args.iter().all(|v| !v.is_null()) {
                 let s = args[0].as_text();
                 let from = args[1].as_text();
                 let to = args[2].as_text();
@@ -293,7 +296,9 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             }
         }
         "substr" | "substring" => {
-            if args.len() >= 2 {
+            if args.len() >= 2 && args.iter().take(2).all(|v| !v.is_null())
+                && (args.len() < 3 || !args[2].is_null())
+            {
                 let s = args[0].as_text();
                 let start = args[1].as_integer();
                 if start <= 0 {

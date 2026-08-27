@@ -5,6 +5,7 @@
 //! - Cache pages in memory (LRU eviction)
 //! - Allocate new pages (and maintain a freelist)
 //! - Coordinate with the WAL for durability
+//! - Snapshot/restore for transaction ROLLBACK
 //!
 //! Pages are returned via `PageRef` (an `Rc<RefCell<Page>>`) so that the
 //! B+tree can hold multiple references to the same page during splits and
@@ -23,6 +24,35 @@ use std::rc::Rc;
 
 /// A shared mutable reference to a page.
 pub type PageRef = Rc<RefCell<Page>>;
+
+/// Snapshot of mutable pager state, captured at BEGIN. Used by ROLLBACK to
+/// restore the in-memory state to the pre-transaction point.
+///
+/// We do NOT deep-copy the page cache — that would be O(N * page_size).
+/// Instead we capture the metadata (page count, freelist, schema cookie) and
+/// on ROLLBACK we drop ALL cached pages so the next read repopulates from
+/// disk. This works because during a transaction, no writes go through to
+/// disk (the executor's `if !ctx.in_transaction { flush() }` guard ensures
+/// that), so the file still holds the pre-BEGIN state.
+#[derive(Clone, Debug)]
+pub struct PagerSnapshot {
+    pub n_pages: u32,
+    pub freelist_head: PageId,
+    pub freelist_count: u32,
+    pub schema_cookie: u32,
+}
+
+impl PagerSnapshot {
+    /// Snapshot the pager's mutable metadata at the current point in time.
+    pub fn capture(pager: &Pager) -> Self {
+        Self {
+            n_pages: pager.n_pages,
+            freelist_head: pager.freelist_head,
+            freelist_count: pager.freelist_count,
+            schema_cookie: pager.schema_cookie,
+        }
+    }
+}
 
 /// LRU cache of pages. We use a HashMap for O(1) lookup and a doubly-linked
 /// list (via `VecDeque` + indices) for LRU ordering.
@@ -296,6 +326,46 @@ impl Pager {
         }
         self.file.sync_all()?;
         Ok(())
+    }
+
+    /// Rollback to the state captured by `PagerSnapshot::capture` at BEGIN.
+    ///
+    /// This discards all in-memory dirty pages (their contents were never
+    /// written to disk during the transaction — see `ExecContext::in_transaction`
+    /// guard), restores the pager's mutable metadata to the pre-BEGIN values,
+    /// and truncates the file back to `n_pages` if the transaction allocated
+    /// new pages.
+    pub fn rollback_to(&mut self, snap: &PagerSnapshot) -> Result<()> {
+        // 1. Drop the entire cache — every cached page may have been modified
+        //    during the transaction, and we have no per-page dirty tracking.
+        //    Next reads will repopulate the cache from disk, which still
+        //    holds the pre-BEGIN state (because no flush occurred during txn).
+        self.cache.clear();
+        self.lru.clear();
+
+        // 2. Restore mutable metadata.
+        self.n_pages = snap.n_pages;
+        self.freelist_head = snap.freelist_head;
+        self.freelist_count = snap.freelist_count;
+        self.schema_cookie = snap.schema_cookie;
+
+        // 3. Truncate the file back if pages were allocated during the txn.
+        //    We don't strictly need to do this for correctness (the truncated
+        //    tail is now beyond n_pages and won't be read), but it keeps the
+        //    file size honest and prevents unbounded growth on repeated
+        //    begin/insert/rollback cycles.
+        let target_size = self.n_pages as u64 * self.page_size as u64;
+        let current_size = self.file.metadata()?.len();
+        if current_size > target_size {
+            self.file.set_len(target_size)?;
+        }
+
+        Ok(())
+    }
+
+    /// Take a snapshot of the pager's mutable state, for use with ROLLBACK.
+    pub fn snapshot(&self) -> PagerSnapshot {
+        PagerSnapshot::capture(self)
     }
 
     /// Evict pages from the cache until we're under capacity.

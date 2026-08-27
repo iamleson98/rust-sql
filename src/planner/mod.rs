@@ -41,8 +41,13 @@ impl<'a> Planner<'a> {
 
         let plan = self.plan_select_body(&stmt.body)?;
 
+        // Insert Sort BELOW Project / Distinct so it can see all input
+        // columns (not just the projected ones). This is required for
+        // `SELECT a FROM t ORDER BY b` where `b` is in the table but not
+        // in the projection. SQLite semantics: ORDER BY may reference any
+        // column in the FROM clause, or any projection alias.
         let plan = if !stmt.order_by.is_empty() {
-            Plan::Sort { input: Box::new(plan), terms: stmt.order_by.clone() }
+            insert_sort_below_top(plan, stmt.order_by.clone())
         } else {
             plan
         };
@@ -172,14 +177,18 @@ impl<'a> Planner<'a> {
             plan = Plan::Window { input: Box::new(plan), windows };
         }
 
-        if s.distinct {
-            plan = Plan::Distinct { input: Box::new(plan) };
-        }
-
+        // Project FIRST, then DISTINCT. SQLite semantics: DISTINCT applies
+        // to the projected columns, not the underlying row. If we put
+        // Distinct before Project, the full row (including the rowid alias)
+        // would be the dedup key, and every row would be unique.
         plan = Plan::Project {
             input: Box::new(plan),
             columns: s.columns.iter().map(|c| self.result_column_to_project(c)).collect::<Result<_>>()?,
         };
+
+        if s.distinct {
+            plan = Plan::Distinct { input: Box::new(plan) };
+        }
 
         Ok(plan)
     }
@@ -697,4 +706,41 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
         }
     }
     None
+}
+
+/// Insert a Sort node below the topmost Project / Distinct node in the plan,
+/// so the Sort can see all input columns (not just the projected ones).
+///
+/// Transformation:
+///   - `Project { input: X, cols }` → `Project { input: Sort { input: X, terms }, cols }`
+///   - `Distinct { input: Project { input: X, cols } }` →
+///     `Distinct { input: Project { input: Sort { input: X, terms }, cols } }`
+///   - Any other plan: `Sort { input: plan, terms }` (the original behaviour).
+///
+/// This preserves correctness for `SELECT a FROM t ORDER BY b` where `b` is
+/// not in the projection but is in the underlying table. SQLite semantics:
+/// ORDER BY may reference any column in the FROM clause or any projection alias.
+pub fn insert_sort_below_top(plan: Plan, terms: Vec<OrderTerm>) -> Plan {
+    match plan {
+        Plan::Project { input, columns } => {
+            let sorted = Plan::Sort { input, terms };
+            Plan::Project { input: Box::new(sorted), columns }
+        }
+        Plan::Distinct { input } => {
+            // Distinct wraps a Project. Push Sort inside the Project.
+            match *input {
+                Plan::Project { input: proj_input, columns } => {
+                    let sorted = Plan::Sort { input: proj_input, terms };
+                    let new_proj = Plan::Project { input: Box::new(sorted), columns };
+                    Plan::Distinct { input: Box::new(new_proj) }
+                }
+                // Distinct over something else — wrap in Sort above Distinct.
+                other_inner => {
+                    let distinct = Plan::Distinct { input: Box::new(other_inner) };
+                    Plan::Sort { input: Box::new(distinct), terms }
+                }
+            }
+        }
+        other => Plan::Sort { input: Box::new(other), terms },
+    }
 }

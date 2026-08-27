@@ -34,6 +34,8 @@ pub struct ExecContext<'a> {
     pub changes: i64,
     /// When true (inside BEGIN..COMMIT), DML operators skip per-statement flushes.
     pub in_transaction: bool,
+    /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager.
+    pub txn_snapshot: Option<crate::storage::pager::PagerSnapshot>,
     /// Catalog snapshot taken before the statement started. Used to look up
     /// tables and indexes for DML. This is a raw pointer to avoid lifetime
     /// conflicts with the mutable catalog borrow in api.rs. The caller
@@ -57,6 +59,7 @@ impl<'a> ExecContext<'a> {
             last_insert_rowid: 0,
             changes: 0,
             in_transaction: false,
+            txn_snapshot: None,
             catalog_ptr: catalog,
             root_overrides: HashMap::new(),
             max_rowids: HashMap::new(),
@@ -395,6 +398,17 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
             };
             update_agg_state(&mut entry.1[i], &agg.func, &arg_val, agg.distinct);
         }
+    }
+
+    // SQLite semantics: if there is no GROUP BY clause AND no rows were
+    // produced by the input, the aggregate still emits ONE row (with
+    // COUNT=0, SUM=NULL, AVG=NULL, MIN=NULL, MAX=NULL). This handles the
+    // common `SELECT COUNT(*) FROM empty_table` case.
+    if group_by.is_empty() && groups.is_empty() && !aggregates.is_empty() {
+        let empty_key: Vec<Value> = Vec::new();
+        let empty_states = vec![AggState::default(); aggregates.len()];
+        groups.insert(String::new(), (empty_key, empty_states));
+        group_order.push(String::new());
     }
 
     let mut out_rows = Vec::with_capacity(group_order.len());
@@ -812,24 +826,54 @@ fn collect_eq_pairs(
 
 /// Find the index of a column reference in a column list.
 /// Handles both qualified (`alias.col`) and unqualified (`col`) references.
+///
+/// **Qualifier semantics** (matches SQLite): when the expression carries a
+/// table qualifier (e.g. `b.id`), we ONLY match columns whose prefix matches
+/// that qualifier. This prevents `b.id` from spuriously matching `c.id` in a
+/// 3-way join where both sides have a column named `id`.
 fn col_index(expr: &Expr, cols: &[String]) -> Option<usize> {
-    if let Expr::Column { table: _, name } = expr {
-        // Exact match first.
-        for (i, c) in cols.iter().enumerate() {
-            if c.eq_ignore_ascii_case(name) {
-                return Some(i);
-            }
-        }
-        // Suffix match (e.g. "u.id" matches "id").
-        for (i, c) in cols.iter().enumerate() {
-            if let Some(pos) = c.rfind('.') {
-                if c[pos + 1..].eq_ignore_ascii_case(name) {
-                    return Some(i);
+    if let Expr::Column { table, name } = expr {
+        match table {
+            // Qualified reference: only consider columns whose table prefix
+            // matches `table`.
+            Some(t) => {
+                for (i, c) in cols.iter().enumerate() {
+                    // c is typically "table.column" — split off the prefix.
+                    if let Some(pos) = c.rfind('.') {
+                        let (prefix, col_name) = (&c[..pos], &c[pos + 1..]);
+                        if prefix.eq_ignore_ascii_case(t)
+                            && col_name.eq_ignore_ascii_case(name)
+                        {
+                            return Some(i);
+                        }
+                    }
                 }
+                None
+            }
+            // Unqualified: exact match first (handles names like "id" against
+            // "id" — but our cols are usually "alias.id"). Then suffix match.
+            None => {
+                // Exact match on the whole column string.
+                for (i, c) in cols.iter().enumerate() {
+                    if c.eq_ignore_ascii_case(name) {
+                        return Some(i);
+                    }
+                }
+                // Suffix match (e.g. "u.id" matches "id"). On ambiguity, the
+                // FIRST match wins — SQLite's behaviour is similar.
+                for (i, c) in cols.iter().enumerate() {
+                    if let Some(pos) = c.rfind('.') {
+                        if c[pos + 1..].eq_ignore_ascii_case(name) {
+                            return Some(i);
+                        }
+                    }
+                }
+                None
             }
         }
+    } else {
+        None
     }
-    None
 }
 
 // ============================================================================
@@ -1021,6 +1065,60 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             max_rowid += 1;
             max_rowid
         };
+
+        // UNIQUE-index constraint check: before touching the table btree, look
+        // up the new row's key in every UNIQUE index on this table. If any
+        // index already contains the key, the row is a duplicate and we apply
+        // the configured conflict resolution (IGNORE → skip, REPLACE → delete
+        // the conflicting row first, ABORT/FAIL/ROLLBACK → error).
+        if !index_roots.is_empty() {
+            let mut conflict_rowid: Option<i64> = None;
+            for (idx, idx_root) in &index_roots {
+                if !idx.unique {
+                    continue;
+                }
+                let key_bytes = encode_index_key(idx, &table, &full_row);
+                let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                let matches = ibt.lookup_index(&key_bytes)?;
+                if !matches.is_empty() {
+                    conflict_rowid = Some(matches[0]);
+                    break;
+                }
+            }
+            if let Some(existing_rowid) = conflict_rowid {
+                match on_conflict {
+                    ConflictResolution::Ignore => continue,
+                    ConflictResolution::Replace => {
+                        // Delete the conflicting row from the table and from
+                        // all indexes (we'll re-insert the new row below).
+                        let mut bt = Btree::new(ctx.pager, current_root, false);
+                        let old_payload_opt = match bt.lookup_table(existing_rowid)? {
+                            LookupResult::Found(p) => Some(p),
+                            LookupResult::NotFound => None,
+                        };
+                        bt.delete_table(existing_rowid)?;
+                        current_root = bt.root;
+                        ctx.set_table_root(&table.name, current_root);
+                        if let Some(old_payload) = old_payload_opt {
+                            if let Ok(old_row) = decode_row(&old_payload, table.n_columns()) {
+                                for (idx, idx_root) in &mut index_roots {
+                                    let _ = idx;
+                                    let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                                    ibt.delete_index(existing_rowid)?;
+                                    *idx_root = ibt.root;
+                                }
+                                // Suppress unused-variable warning.
+                                let _ = &old_row;
+                            }
+                        }
+                    }
+                    _ => return Err(Error::semantic(format!(
+                        "UNIQUE constraint failed: {}",
+                        table.name
+                    ))),
+                }
+            }
+        }
 
         let payload = encode_row(&full_row);
         let old_payload_opt;
