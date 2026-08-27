@@ -353,7 +353,17 @@ pub fn rewrite_aggregates_and_groups(
     for (i, g) in group_by.iter().enumerate() {
         let g_display = format!("{:?}", g);
         if g_display == e_display {
-            return Expr::Column { table: None, name: format!("col{}", i + 1) };
+            // Match the column-naming convention used by exec_aggregate
+            // (named after the source expression, falling back to "colN").
+            // Without this consistency, the rewritten column reference
+            // wouldn't resolve in the Aggregate's output and the Project
+            // would emit NULLs for what should be the group key.
+            let name = match g {
+                Expr::Column { table: None, name } => name.clone(),
+                Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+                _ => format!("col{}", i + 1),
+            };
+            return Expr::Column { table: None, name };
         }
     }
     // Otherwise, rewrite aggregates and recurse.

@@ -230,17 +230,36 @@ fn evaluate_in(
     ctx: &EvalContext<'_>,
 ) -> Result<Value> {
     let v = evaluate(expr, ctx)?;
-    let found = match source {
+    // SQL three-valued logic for IN:
+    //   - If v is NULL: result is NULL (regardless of list contents).
+    //   - If v matches a non-NULL list element: result is TRUE (FALSE if negated).
+    //   - If v doesn't match any list element AND the list contains NULL:
+    //     result is NULL (because we can't rule out that v == NULL).
+    //   - If v doesn't match any list element AND the list has no NULL:
+    //     result is FALSE (TRUE if negated).
+    // Previously we treated Null == Null as true via our PartialEq, which
+    // made `WHERE v IN (NULL)` match every NULL row — caught by the
+    // differential test 'null_in_list_with_null_returns_null_only_for_null_row'.
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let (found, list_has_null) = match source {
         InSource::List(list) => {
             let mut found = false;
+            let mut list_has_null = false;
             for e in list {
                 let candidate = evaluate(e, ctx)?;
+                if candidate.is_null() {
+                    list_has_null = true;
+                    continue;
+                }
                 if v == candidate {
                     found = true;
-                    break;
+                    // Keep iterating to detect NULLs (we need list_has_null
+                    // accurate even after a match, for the negated case).
                 }
             }
-            found
+            (found, list_has_null)
         }
         InSource::Subquery(_) | InSource::Table(_) => {
             return Err(Error::Unsupported(
@@ -248,7 +267,17 @@ fn evaluate_in(
             ));
         }
     };
-    Ok(Value::Integer(if found ^ negated { 1 } else { 0 }))
+    if found {
+        // v matches a list element → result is TRUE / FALSE (NOT IN).
+        Ok(Value::Integer(if negated { 0 } else { 1 }))
+    } else if list_has_null {
+        // v didn't match any non-NULL element, but list has a NULL —
+        // we can't rule out a match against NULL, so the result is NULL.
+        Ok(Value::Null)
+    } else {
+        // v definitely doesn't match any element → FALSE / TRUE (NOT IN).
+        Ok(Value::Integer(if negated { 1 } else { 0 }))
+    }
 }
 
 fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result<Value> {

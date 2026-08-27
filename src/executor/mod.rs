@@ -423,8 +423,21 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     }
 
     let mut out_cols = Vec::new();
-    for (i, _) in group_by.iter().enumerate() {
-        out_cols.push(format!("col{}", i + 1));
+    for (i, g) in group_by.iter().enumerate() {
+        // Name the group-by output column after the source expression so
+        // that downstream Sort / Filter operators can find it by name. For
+        // `GROUP BY cat` we name the column "cat"; for `GROUP BY t.cat` we
+        // name it "t.cat". For non-column group-by exprs (e.g.
+        // `GROUP BY x+y`), fall back to "colN" since there's no obvious name.
+        // Without this, ORDER BY cat on an Aggregate plan would fail to
+        // resolve the column and sort by NULLs only — surfacing as
+        // "GROUP BY with NULL keys puts NULL group in the wrong order".
+        let name = match g {
+            Expr::Column { table: None, name } => name.clone(),
+            Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+            _ => format!("col{}", i + 1),
+        };
+        out_cols.push(name);
     }
     for (i, agg) in aggregates.iter().enumerate() {
         // Use a synthetic name that the planner's rewrite_aggregates() can find.
@@ -442,7 +455,14 @@ fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool)
     if distinct && !state.distinct.insert(key) {
         return;
     }
-    state.seen_value = true;
+    // Only mark "seen_value" for non-NULL inputs. This makes SUM of all
+    // NULLs return NULL (matching SQLite), rather than the previous
+    // behavior of returning Integer(0) because seen_value was set
+    // unconditionally before the per-func match. Bug surfaced by the
+    // differential test 'sum_of_all_nulls_is_null'.
+    if !v.is_null() {
+        state.seen_value = true;
+    }
     match func {
         // SQLite semantics: COUNT(*) counts all rows; COUNT(col) counts
         // non-NULL values of col. For COUNT(*) the planner passes a
