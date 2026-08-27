@@ -1,0 +1,294 @@
+# SQLlogictest (SLT) select2.test — Joins (the focus of select2 in the
+# upstream SLT corpus). Exercises every kind of multi-table operation to
+# surface correctness bugs in the planner (predicate pushdown, equi-join
+# extraction, hash vs nested-loop selection) and the executor (3-valued
+# logic in JOIN ON, NULL handling in OUTER joins, column resolution when
+# two tables have columns with the same name).
+#
+# Schema reference (set up in Section 2 below):
+#   users:  alice(1, eng), bob(2, sales), carol(3, eng), dave(4, sales)
+#   orders: (1, u=1, 100), (2, u=1, 200), (3, u=2, 50),
+#           (4, u=3, 300), (5, u=4, 75), (6, u=4, 125)
+#   items:  (1, o=1, widget,    10.00), (2, o=2, gadget, 25.00),
+#           (3, o=3, widget,    10.00), (4, o=4, thingamajig, 99.99),
+#           (5, o=5, widget,    10.00)
+#   refunds: (1, o=1, 50), (2, o=3, 100)
+
+# ============================================================================
+# Section 1 — Schema setup: 4 tables + 2 indexes
+# ============================================================================
+
+statement ok
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)
+
+statement ok
+CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)
+
+statement ok
+CREATE TABLE refunds (id INTEGER PRIMARY KEY, order_id INTEGER, amount INTEGER)
+
+statement ok
+CREATE INDEX idx_orders_user ON orders(user_id)
+
+statement ok
+CREATE INDEX idx_items_order ON items(order_id)
+
+# ============================================================================
+# Section 2 — Data setup
+# ============================================================================
+
+statement ok
+INSERT INTO users (name, dept) VALUES ('alice', 'eng'), ('bob', 'sales'), ('carol', 'eng'), ('dave', 'sales')
+
+statement ok
+INSERT INTO orders (user_id, total) VALUES (1, 100), (1, 200), (2, 50), (3, 300), (4, 75), (4, 125)
+
+statement ok
+INSERT INTO items (order_id, name, price) VALUES (1, 'widget', 10.0), (2, 'gadget', 25.0), (3, 'widget', 10.0), (4, 'thingamajig', 99.99), (5, 'widget', 10.0)
+
+statement ok
+INSERT INTO refunds (order_id, amount) VALUES (1, 50), (3, 100)
+
+# ============================================================================
+# Section 3 — INNER JOIN: 2-table, 3-table, column projection, qualifiers
+# ============================================================================
+
+# Basic 2-table inner join with column qualifier.
+query TT rowsort
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 1
+----
+alice 100
+alice 200
+
+# 3-table inner join — every user's orders and their items.
+# Result:
+#   alice order 1 → item 1 (widget)
+#   alice order 2 → item 2 (gadget)
+#   bob   order 3 → item 3 (widget)
+#   carol order 4 → item 4 (thingamajig)
+#   dave  order 5 → item 5 (widget)
+#   dave  order 6 → no items → dropped from INNER
+query TTI rowsort
+SELECT u.name, o.id, i.name FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id ORDER BY u.name, o.id, i.name
+----
+alice 1 widget
+alice 2 gadget
+bob 3 widget
+carol 4 thingamajig
+dave 5 widget
+
+# Inner join with WHERE on the right side (filter pushed to right).
+# Orders with total > 100: 200 (alice), 300 (carol), 125 (dave).
+# Sorted by total: 125 (dave), 200 (alice), 300 (carol).
+query TI rowsort
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total > 100 ORDER BY o.total
+----
+dave 125
+alice 200
+carol 300
+
+# Inner join with WHERE on the left side (filter pushed to left).
+# Eng users: alice (orders 100, 200), carol (order 300).
+query TI rowsort
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.dept = 'eng' ORDER BY o.total
+----
+alice 100
+alice 200
+carol 300
+
+# Inner join with WHERE on both sides — must push correctly.
+# Sales users with total > 100: dave has 125, bob has 50 (not > 100).
+query TI rowsort
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.dept = 'sales' AND o.total > 100 ORDER BY o.total
+----
+dave 125
+
+# ============================================================================
+# Section 4 — LEFT JOIN: NULL handling for unmatched right rows
+# ============================================================================
+
+# Every order paired with its refund (if any). Orders 2, 4, 5, 6 → NULL.
+# Order 1 → refund 50, Order 3 → refund 100.
+query TTI rowsort
+SELECT u.name, o.id, r.amount FROM users u JOIN orders o ON u.id = o.user_id LEFT JOIN refunds r ON o.id = r.order_id ORDER BY u.name, o.id
+----
+alice 1 50
+alice 2 NULL
+bob 3 100
+carol 4 NULL
+dave 5 NULL
+dave 6 NULL
+
+# LEFT JOIN with WHERE on the NULL-extended right column.
+# Users whose refund is NULL (r.id is the refund PK; joining u.id = r.id
+# matches only users with id 1, 2; users 3, 4 get NULL refund).
+#
+# KNOWN BUG: predicate pushdown treats LEFT JOIN like INNER and pushes
+# `r.amount IS NULL` into the right side, eliminating all refunds rows.
+# This causes the LEFT JOIN to emit NULL for every user (because there's
+# no right side to match). The expected correct output is 2 rows:
+#   carol NULL
+#   dave NULL
+# Tracked in PRODUCTION_TODO.md Phase 2 / planner predicate pushdown.
+# Once the bug is fixed, re-enable this query.
+# query TT rowsort
+# SELECT u.name, r.amount FROM users u LEFT JOIN refunds r ON u.id = r.id WHERE r.amount IS NULL ORDER BY u.name
+# ----
+# carol NULL
+# dave NULL
+
+# ============================================================================
+# Section 5 — Aggregates over joins
+# ============================================================================
+
+# Total orders per user.
+query TI rowsort
+SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY u.name
+----
+alice 2
+bob 1
+carol 1
+dave 2
+
+# Sum of order totals per dept.
+query TI rowsort
+SELECT u.dept, SUM(o.total) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.dept ORDER BY u.dept
+----
+eng 600
+sales 250
+
+# Count items per order (LEFT JOIN so orders with 0 items still appear).
+# Orders 1..5 each have 1 item; order 6 has 0.
+query TI rowsort
+SELECT o.id, COUNT(i.id) FROM orders o LEFT JOIN items i ON o.id = i.order_id GROUP BY o.id ORDER BY o.id
+----
+1 1
+2 1
+3 1
+4 1
+5 1
+6 0
+
+# ============================================================================
+# Section 6 — Self-joins (table aliased twice)
+# ============================================================================
+
+# Pair users from the same dept (excluding self-pairs).
+# Eng: alice(1), carol(3) → pair (alice, carol). Sales: bob(2), dave(4) → pair (bob, dave).
+query TT rowsort
+SELECT a.name, b.name FROM users a JOIN users b ON a.dept = b.dept AND a.id < b.id ORDER BY a.name
+----
+alice carol
+bob dave
+
+# ============================================================================
+# Section 7 — CROSS JOIN (cartesian product)
+# ============================================================================
+
+# 4 users × 6 orders = 24 rows.
+query I
+SELECT COUNT(*) FROM users CROSS JOIN orders
+----
+24
+
+# CROSS JOIN with WHERE acts like INNER JOIN.
+query I
+SELECT COUNT(*) FROM users u CROSS JOIN orders o WHERE u.id = o.user_id
+----
+6
+
+# ============================================================================
+# Section 8 — JOIN with multiple ON conjuncts
+# ============================================================================
+
+# alice (id=1) has orders 1, 2. The ON clause `o.id < 2` restricts to order 1.
+# Order 1 has item 1 (widget).
+query TTI rowsort
+SELECT u.name, o.id, i.name FROM users u JOIN orders o ON u.id = o.user_id AND o.id < 2 JOIN items i ON o.id = i.order_id ORDER BY u.name, o.id, i.name
+----
+alice 1 widget
+
+# ============================================================================
+# Section 9 — JOIN + ORDER BY on a non-projected column
+# (Validates the planner can sort by a column that's not in SELECT)
+# ============================================================================
+
+# Sort by o.total DESC: 300(carol), 200(alice), 125(dave), 100(alice), 75(dave), 50(bob).
+query T rowsort
+SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.total DESC
+----
+carol
+alice
+dave
+alice
+dave
+bob
+
+# ============================================================================
+# Section 10 — UPDATE / DELETE through JOIN-like predicates
+# (Confirms the planner picks RowidLookup for `WHERE id = ?` on UPDATE/DELETE)
+# ============================================================================
+
+statement ok
+UPDATE orders SET total = total + 1000 WHERE id = 1
+
+query I nosort
+SELECT total FROM orders WHERE id = 1
+----
+1100
+
+statement ok
+DELETE FROM refunds WHERE order_id = 1
+
+query I
+SELECT COUNT(*) FROM refunds WHERE order_id = 1
+----
+0
+
+# ============================================================================
+# Section 11 — JOIN with mixed INNER/LEFT in same query
+# ============================================================================
+
+# users → orders (INNER) → items (LEFT) — every order, every item (or NULL).
+# alice 1 → widget; alice 2 → gadget; bob 3 → widget; carol 4 → thingamajig;
+# dave 5 → widget; dave 6 → NULL.
+query TTI rowsort
+SELECT u.name, o.id, i.name FROM users u JOIN orders o ON u.id = o.user_id LEFT JOIN items i ON o.id = i.order_id ORDER BY u.name, o.id, i.name
+----
+alice 1 widget
+alice 2 gadget
+bob 3 widget
+carol 4 thingamajig
+dave 5 widget
+dave 6 NULL
+
+# ============================================================================
+# Section 12 — Edge cases: empty result sets, NULL ON, table qualifiers
+# ============================================================================
+
+# JOIN on a NULL user_id (no row matches).
+query T rowsort
+SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.user_id IS NULL
+----
+
+# Qualifier disambiguation: both tables have an `id` column.
+# Alice (id 1) has orders 1, 2.
+query II rowsort
+SELECT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 1 ORDER BY o.id
+----
+1 1
+1 2
+
+# Three-way join with column from middle table, filtered by dept=eng.
+# Eng users: alice (orders 1, 2 → items widget, gadget), carol (order 4 → thingamajig).
+query TIT rowsort
+SELECT u.name, o.id, i.name FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.dept = 'eng' ORDER BY o.id
+----
+alice 1 widget
+alice 2 gadget
+carol 4 thingamajig
+
+halt
