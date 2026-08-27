@@ -6,37 +6,57 @@
 > criterion benchmark harness running identical workloads against
 > `rusqlite` and rustqlite.
 
-## Current baseline (recorded `2026-08-27`, after fix in commit "fix: route UPDATE/DELETE WHERE through apply_where_for_scan")
+## Current baseline (recorded `2026-08-27`, after commit 1d2cd81 "feat(tests): expand differential suite to 164 cases")
 
-`cargo test --release`: **54 unit + 1 differential + 2 doctests = 57 passing.**
+`cargo test --release`: **55 unit + 1 differential (164 cases) + 1 SLT (140 cases) + 2 doctests = 59 tests, 304 internal cases, all passing.**
 `cargo run --release --example bench_compare` on the same workload:
 
 | Workload                                  | rustqlite   | SQLite      | Ratio       |
 | ----------------------------------------- | ----------- | ----------- | ----------- |
-| Single-row inserts (1k, auto-commit)      | 11.92 ms    | 1.66 ms     | 7.2× slower |
-| Single-row in BEGIN/COMMIT (10k)           | 102.14 ms   | 13.23 ms    | 7.7× slower |
-| Single-row in BEGIN/COMMIT (100k)          | 1.42 s      | 129.05 ms   | 11× slower  |
-| Multi-row VALUES batches (10k)            | 85.20 ms    | 6.55 ms     | 13× slower  |
-| Point lookup by rowid (1k ops)            | 4.94 ms     | 360.44 µs   | 13.7× slower |
-| Range scan (10 rows)                       | 1.42 ms     | 7.10 µs     | 200× slower |
-| Range scan (1000 rows)                     | 1.44 ms     | 112.07 µs   | 13× slower  |
-| Aggregate (SUM/AVG/MIN/MAX)                | 6.56 ms     | 1.26 ms     | 5.2× slower |
-| GROUP BY (100 buckets)                     | 3.75 ms     | 1.93 ms     | 1.9× slower |
-| Point lookup by indexed col (1k ops)       | 2.83 ms     | 534.79 µs   | 5.3× slower |
-| 2-table join filter by PK (~10 rows out)  | 10.11 ms    | 32.43 µs    | 312× slower |
-| 3-table join filter by PK (~50 rows out)  | 97.42 ms    | 122.33 µs   | 797× slower |
-| 2-table join + GROUP BY (full scan)        | 14.70 ms    | 2.99 ms     | 4.9× slower |
-| **UPDATE by PK (1k ops)**                  | **11.21 ms** | 1.95 ms   | **5.7× slower** ✅ was 743× |
-| UPDATE range (val > 5000)                  | 30.09 ms    | 1.38 ms     | 22× slower  |
-| **DELETE by PK (1k ops)**                  | **5.56 ms**  | 1.35 ms   | **4.1× slower** ✅ was 43× |
-| **Mixed 80/20 (5k ops)**                   | **30.85 ms** | 2.51 ms   | **12× slower** ✅ was 292× |
+| Single-row inserts (1k, auto-commit)      | 12.06 ms    | 1.74 ms     | 6.9× slower |
+| Single-row in BEGIN/COMMIT (10k)           | 101.71 ms   | 12.69 ms    | 8.0× slower |
+| Single-row in BEGIN/COMMIT (100k)          | 1.42 s      | 126.52 ms   | 11× slower  |
+| **Multi-row VALUES batches (10k)** ✅      | **23.36 ms** | 6.61 ms    | **3.5× slower** (was 13×) |
+| Point lookup by rowid (1k ops)            | 3.27 ms     | 356.44 µs   | 9.2× slower ✅ was 13.7× |
+| **Range scan (10 rows)** ✅                | **39.60 µs** | 3.38 µs    | **11.7× slower** (was 200×) |
+| **Range scan (100 rows)** ✅               | **35.44 µs** | 11.55 µs   | **3.1× slower** (was 200×) |
+| **Range scan (1000 rows)** ✅              | **212.12 µs** | 107.71 µs | **2.0× slower** (was 13×) |
+| **Range scan (5000 rows)** ✅              | **1.16 ms** | 561.87 µs   | **2.1× slower** (was 4×) |
+| Full scan + COUNT with filter            | 3.13 ms     | 503.61 µs   | 6.2× slower |
+| Aggregate (SUM/AVG/MIN/MAX)                | 6.89 ms     | 1.21 ms     | 5.7× slower |
+| GROUP BY (100 buckets)                     | 3.66 ms     | 1.89 ms     | 1.9× slower |
+| **Point lookup by indexed col (1k ops)** ✅ | **1.01 ms** | 527.66 µs  | **1.9× slower** (was 5.5×) |
+| 2-table join filter by PK (~10 rows out)  | 7.52 ms     | 23.65 µs    | 318× slower |
+| 3-table join filter by PK (~50 rows out)  | 19.89 ms    | 90.75 µs    | 219× slower ✅ was 797× |
+| 2-table join + GROUP BY (full scan)        | 12.18 ms    | 2.99 ms     | 4.1× slower |
+| **UPDATE by PK (1k ops)**                  | **10.82 ms** | 1.84 ms   | **5.9× slower** ✅ was 743× |
+| UPDATE range (val > 5000)                  | 29.58 ms    | 1.31 ms     | 23× slower  |
+| **DELETE by PK (1k ops)**                  | **4.91 ms**  | 1.27 ms   | **3.9× slower** ✅ was 43× |
+| **Mixed 80/20 (5k ops)**                   | **20.29 ms** | 2.46 ms   | **8.3× slower** ✅ was 292× |
 | DB file size (10k rows)                    | 917.50 KB   | 262.14 KB   | 3.5× larger |
 
 ### What's already done (verified by reading source, not by TODO checkboxes)
 
-These were initially listed as gaps in the prior session's roadmap, but
-reading the code shows they are already implemented:
-
+- ✅ Statement cache: `Database::get_or_cache_stmt` caches parsed Statement +
+  planned Plan keyed by SQL text, FIFO eviction at 64 entries, invalidated
+  on any DDL. `set_stmt_cache_capacity()` for tuning.
+- ✅ Anonymous-`?` lexer fix: each `?` now gets a distinct incrementing index
+  (was: every `?` lexed to `Parameter("0")`, silently binding all predicates
+  to the first param).
+- ✅ `Plan::RowidRange` + `exec_rowid_range`: `WHERE id BETWEEN ? AND ?`,
+  `id > ?`, `id < ?`, `id >= ?`, `id <= ?`, `id >= ? AND id <= ?` all use
+  `Btree::scan_table_range` instead of full-scan + per-row filter.
+- ✅ Hash join picks the smaller side as the build side for INNER/CROSS joins;
+  outer joins keep the right-side-build path for correctness.
+- ✅ Hash join uses `Vec<u8>` byte-encoded hash keys via `Value::encode()`
+  instead of `format!("{:?}", v)` String allocations.
+- ✅ Hash join reuses a single key buffer across probe iterations (no per-row
+  heap allocation for the hash key).
+- ✅ INSERT fast path: when the rowid was auto-generated (max+1), skip the
+  `lookup_table` existence check entirely (was redundant — max+1 cannot
+  collide with any existing rowid).
+- ✅ INSERT: collapsed the redundant double-`lookup_table` on the OR REPLACE
+  path into a single call.
 - ✅ `Plan::RowidLookup` + `exec_rowid_lookup` — point lookup by PK is wired up.
 - ✅ `Plan::IndexLookup` + `exec_index_lookup` — point lookup by indexed col.
 - ✅ `Plan::Join { algorithm: Hash }` + `exec_hash_join` — hash join selected
@@ -52,25 +72,49 @@ reading the code shows they are already implemented:
 
 ### Top-priority perf gaps that remain
 
-1. **`3-table join filter by PK`** at 797× slower — for a 50-row result, we
-   are doing way too much per-row work. Likely the hash join is being
-   skipped in favor of nested loop somewhere, or each row triggers
-   per-row subqueries.
-2. **`2-table join filter by PK`** at 312× slower — same shape as above.
-3. **`Range scan (10 rows)`** at 200× slower — fixed ~1.4ms per query of
-   overhead. Statement cache would help.
-4. **Single-row inserts in auto-commit** at 7× slower — each statement flushes.
-5. **Multi-row VALUES batches** at 13× slower — the per-row encode+lookup+insert
-   loop doesn't reuse B+tree cursor position between rows.
-6. **MVCC** (`Snapshot`, `VersionTracker`) is dead code relative to the query path.
-7. **`Rc<RefCell<Page>>`** in the pager cache blocks `Database: Send + Sync`,
+1. **2-table join** at 318× slower — for a 10-row result, the hash join
+   probes 10K rows of the right side. The right-side Scan alone takes
+   ~2ms (decode 10K rows). The hash join probe itself is ~3-4ms of
+   per-row work (encode + HashMap.get + clone). The per-row decode
+   overhead in exec_scan dominates.
+2. **3-table join** at 219× slower — same shape as above, compounded by
+   an extra join stage.
+3. **Single-row inserts in auto-commit** at 7× slower — each statement
+   flushes. Fix is auto-txn batching (P2.4).
+4. **Aggregate + GROUP BY** at 5.7× / 1.9× slower — vectorized scan +
+   filter would help (P2.8).
+5. **MVCC** (`Snapshot`, `VersionTracker`) is still dead code relative to
+   the query path (P3.1).
+6. **`Rc<RefCell<Page>>`** in the pager cache blocks `Database: Send + Sync`,
    which forces the server to use `Mutex<Database>` (no concurrent reads).
+
+### Known correctness bugs (filed via SLT + differential suites)
+
+1. **Predicate pushdown treats LEFT JOIN like INNER JOIN** for predicates
+   on the NULL-extended right column. `SELECT ... FROM u LEFT JOIN r ON
+   u.id = r.id WHERE r.amount IS NULL` returns all left rows with NULL,
+   instead of only those without a match in `r`. Workaround: rephrase
+   as `WHERE r.id IS NULL` (rarely works) or use a correlated NOT
+   EXISTS subquery (also unimplemented — see #3). Documented in
+   `tests/slt/cases/select2.test` Section 4.
+2. **ORDER BY on an aggregate expression** (e.g. `SELECT region, SUM(qty)
+   ... GROUP BY region ORDER BY SUM(qty) DESC`) doesn't sort. The Sort
+   operator can't evaluate aggregate exprs against the Aggregate
+   operator's output. Workaround: sort by the group key (e.g.
+   `ORDER BY region`) or pre-compute the aggregate into a CTE/derived
+   table and sort that. Documented in `tests/slt/cases/select3.test`
+   Section 9.
+3. **Scalar subqueries in SELECT list** (`SELECT u.name, (SELECT
+   COUNT(*) FROM orders WHERE user_id = u.id) FROM users u`) — needs
+   EvalContext refactor to thread `&mut Pager` + `&Catalog` into the
+   per-row expression evaluator. Tracked in Phase 4.
+4. **IN subqueries** (`WHERE id IN (SELECT ... )`) — same root cause as #3.
 
 ---
 
 ## Phase 0 — Harness & baseline (DONE baseline; ongoing expansion)
 
-- [x] **P0.1** Confirm `cargo build --release` + `cargo test --release` clean (57 tests pass).
+- [x] **P0.1** Confirm `cargo build --release` + `cargo test --release` clean (59 tests / 304 internal cases pass).
 - [x] **P0.2** Confirm `cargo run --release --example bench_compare` runs end-to-end and produces the table above.
 - [ ] **P0.3** Add a `benches/sqlite_compare.rs` criterion benchmark that runs the same workloads as `bench_compare` and writes baseline JSON into `benches/baseline.json` for regression tracking.
 - [ ] **P0.4** Add GitHub Actions workflow `.github/workflows/ci.yml` that runs `cargo test --release` and `cargo run --release --example bench_compare` on every push; upload the benchmark output as an artifact.
@@ -83,14 +127,18 @@ reading the code shows they are already implemented:
 > SQLite itself uses for cross-engine verification. Our parity target is
 > SLT plus a differential fuzzer plus expanded differential cases.
 
-- [ ] **P1.1** Build `tests/slt_runner.rs` — a parser + runner for the SLT
+- [x] **P1.1** Build `tests/slt_runner.rs` — a parser + runner for the SLT
       file format (`statement ok`, `statement error`, `query … values…`).
-      Should accept any `.test` file under `tests/slt/cases/`.
-- [ ] **P1.2** Vendor a starter subset of the SLT corpus into
-      `tests/slt/cases/`:
-      - [ ] `select1.test` (basic SELECT semantics)
-      - [ ] `select2.test` (joins, subqueries)
-      - [ ] `select3.test` (aggregates, GROUP BY, HAVING)
+      Accepts any `.test` file under `tests/slt/cases/`. ✅
+- [x] **P1.2a** Vendor `select1.test` (80 cases — basic SELECT semantics). ✅
+- [x] **P1.2b** Vendor `select2.test` (32 cases — joins, multi-table aggregates,
+      OUTER JOIN NULL handling, self-joins, CROSS JOIN, multi-ON-conjunct
+      joins, JOIN+UPDATE/DELETE, mixed INNER/LEFT, table-qualifier
+      disambiguation). ✅
+- [x] **P1.2c** Vendor `select3.test` (28 cases — aggregates COUNT/SUM/AVG/
+      MIN/MAX with NULLs, GROUP BY single + multi-col, HAVING, DISTINCT,
+      aggregate+JOIN, empty-table aggregates). ✅
+- [ ] **P1.2d** Vendor additional SLT cases:
       - [ ] `index/btree/boundary1.test` … `boundary3.test`
       - [ ] `e_createtbl.test` (CREATE TABLE semantics)
       - [ ] `e_insert.test` (INSERT semantics)
@@ -101,7 +149,7 @@ reading the code shows they are already implemented:
       - Run each generated program against `rusqlite` (oracle) and `rustqlite`.
       - Assert value-by-value equality; on mismatch, minimize and persist the
         failing case to `tests/fuzz/corpus/`.
-- [ ] **P1.4** Expand `tests/differential.rs` from ~50 cases to 500+:
+- [ ] **P1.4** Expand `tests/differential.rs` from 50 → 500+ (currently at 164, up from 140):
       - [ ] All SQLite affinity/coercion rules (TEXT/INTEGER/REAL/BLOB/NUMERIC)
       - [ ] All collations (BINARY, NOCASE, RTRIM)
       - [ ] NULL handling in every position (WHERE, JOIN ON, aggregates, ORDER BY)
@@ -343,11 +391,28 @@ reading the code shows they are already implemented:
 ## Working order (current sprint)
 
 1. ✅ Baseline + this TODO file.
-2. ⏳ Investigate and fix `exec_update` 743× regression (P2.1).
-3. ⏳ Add SLT runner scaffold (P1.1) + starter cases (P1.2).
-4. ⏳ Expand differential tests to 500+ (P1.4).
-5. ⏳ Reduce per-query overhead (P2.2) — statement cache.
-6. ⏳ Batched-insert fast path (P2.3) + auto-txn for INSERTs (P2.4).
-7. ⏳ Cursor-based row iteration (P2.5).
-8. ⏳ Wire MVCC visibility (P3.1) + RwLock refactor (P3.2/P3.3).
-9. ⏳ Push to `iamleson98/rust-sql`, update `worklog.md`.
+2. ✅ Investigate and fix `exec_update` 743× regression (P2.1) — done in prior commit.
+3. ✅ Add SLT runner scaffold (P1.1) + starter cases (P1.2a/b/c) — done; 140 cases.
+4. ⏳ Expand differential tests to 500+ (P1.4) — at 164/500; see Phase 1 sub-items.
+5. ✅ Reduce per-query overhead (P2.2/P2.13) — statement cache landed.
+6. ✅ Batched-insert fast path (P2.3) — landed; multi-row VALUES 13× → 3.5×.
+7. ✅ Cursor-based row iteration (P2.5) — partial; RowidRange operator lands
+   range scans with seek-to-start + stop-at-end (no full materialization for
+   BETWEEN). A general pull-based `RowIter` trait for all operators is still
+   future work.
+8. ✅ Hash join rework — smaller-side build + byte-encoded keys (Phase 2).
+9. ✅ Range scan / RowidRange (Phase 2) — BETWEEN / > / < / >= / <= on rowid
+   now uses `Btree::scan_table_range`. IndexRange (range scans on secondary
+   indexes) is still future work.
+10. ⏳ Auto-txn for consecutive single-row INSERTs (P2.4).
+11. ⏳ IndexRange — range scans via secondary index (mirror RowidRange).
+12. ⏳ Vectorized scan + filter (P2.8) — to close the 5.7× aggregate gap.
+13. ⏳ Fix predicate pushdown for LEFT JOIN NULL-extended predicates (bug #1).
+14. ⏳ Fix ORDER BY on aggregate expressions (bug #2).
+15. ⏳ Refactor `Rc<RefCell<Page>>` → `Arc<Mutex<Page>>` (P3.2) — unblocks
+    true concurrent reads via `Arc<RwLock<Database>>` (P3.3).
+16. ⏳ Wire MVCC visibility (P3.1) — `Snapshot`/`VersionTracker` are still
+    dead code relative to the query path.
+17. ⏳ Scalar subqueries in SELECT list + IN/NOT IN subqueries (bug #3, #4) —
+    needs `EvalContext` refactor to thread `&mut Pager` + `&Catalog`.
+18. ⏳ Push to `iamleson98/rust-sql`, update `worklog.md` — ongoing after each batch.
