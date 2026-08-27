@@ -115,6 +115,15 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             let v = evaluate(expr, ctx)?;
             let lo = evaluate(low, ctx)?;
             let hi = evaluate(high, ctx)?;
+            // SQL three-valued logic: BETWEEN is sugar for `expr >= low AND
+            // expr <= high`. If any operand is NULL, the AND result is NULL
+            // (UNKNOWN), which WHERE filters out. So a NULL val yields NULL
+            // — meaning `val BETWEEN 20 AND 40` returns no row for NULL val,
+            // and `val NOT BETWEEN 20 AND 40` ALSO returns no row (because
+            // NOT NULL is still NULL).
+            if v.is_null() || lo.is_null() || hi.is_null() {
+                return Ok(Value::Null);
+            }
             let in_range = v >= lo && v <= hi;
             Ok(Value::Integer(if in_range ^ negated { 1 } else { 0 }))
         }
@@ -475,12 +484,54 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
         BitXor => Value::Integer(l.as_integer() ^ r.as_integer()),
         ShiftLeft => Value::Integer(l.as_integer() << (r.as_integer() & 63)),
         ShiftRight => Value::Integer(l.as_integer() >> (r.as_integer() & 63)),
-        Eq => Value::Integer(if l == r { 1 } else { 0 }),
-        NotEq => Value::Integer(if l != r { 1 } else { 0 }),
-        Lt => Value::Integer(if l < r { 1 } else { 0 }),
-        LtEq => Value::Integer(if l <= r { 1 } else { 0 }),
-        Gt => Value::Integer(if l > r { 1 } else { 0 }),
-        GtEq => Value::Integer(if l >= r { 1 } else { 0 }),
+        // SQL three-valued logic: any comparison with NULL on either side
+        // produces NULL (UNKNOWN), which is filtered out by WHERE.
+        // Previously we did `if l == r { 1 } else { 0 }`, which — combined
+        // with our `PartialEq` treating `Null == Null` as true — caused
+        // `WHERE col = NULL` to match every row where col was NULL.
+        // This bug was caught by the SLT test suite.
+        Eq => {
+            if l.is_null() || r.is_null() {
+                Value::Null
+            } else {
+                Value::Integer(if l == r { 1 } else { 0 })
+            }
+        }
+        NotEq => {
+            if l.is_null() || r.is_null() {
+                Value::Null
+            } else {
+                Value::Integer(if l != r { 1 } else { 0 })
+            }
+        }
+        Lt => {
+            if l.is_null() || r.is_null() {
+                Value::Null
+            } else {
+                Value::Integer(if l < r { 1 } else { 0 })
+            }
+        }
+        LtEq => {
+            if l.is_null() || r.is_null() {
+                Value::Null
+            } else {
+                Value::Integer(if l <= r { 1 } else { 0 })
+            }
+        }
+        Gt => {
+            if l.is_null() || r.is_null() {
+                Value::Null
+            } else {
+                Value::Integer(if l > r { 1 } else { 0 })
+            }
+        }
+        GtEq => {
+            if l.is_null() || r.is_null() {
+                Value::Null
+            } else {
+                Value::Integer(if l >= r { 1 } else { 0 })
+            }
+        }
         And => Value::Integer(if l.is_truthy() && r.is_truthy() { 1 } else { 0 }),
         Or => Value::Integer(if l.is_truthy() || r.is_truthy() { 1 } else { 0 }),
     }

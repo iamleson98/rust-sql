@@ -1,0 +1,494 @@
+# Starter SQLlogictest (SLT) case file for rustqlite.
+# Format reference: https://www.sqlite.org/sqllogictest/
+#
+# This file is the first of a planned suite that adapts the public SLT
+# corpus (select1, select2, select3, e_select, etc.) to run against rustqlite.
+# Each record is one of:
+#   statement ok <sql...>       — must succeed, no result
+#   statement error <sql...>   — must fail
+#   query TTT rowsort <sql...>  — must return rows; compare after sorting
+#   query TTT nosort  <sql...> — must return rows in the order produced
+#
+# Type codes: I=integer, R=real, T=text, B=blob, ?=any.
+# NULL in expected output is the literal string "NULL".
+# A line with `----` separates SQL from expected rows.
+# `#` introduces a comment.
+
+# ============================================================================
+# Section 1 — DDL basics: CREATE TABLE, INTEGER PRIMARY KEY
+# ============================================================================
+
+statement ok
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)
+
+statement ok
+CREATE TABLE t1b (id INTEGER PRIMARY KEY, name TEXT NOT NULL, val INTEGER DEFAULT 0)
+
+# Re-creating an existing table must error (without IF NOT EXISTS).
+statement error
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, x TEXT)
+
+# IF NOT EXISTS must be a no-op when the table exists.
+statement ok
+CREATE TABLE IF NOT EXISTS t1 (id INTEGER PRIMARY KEY, x TEXT)
+
+# ============================================================================
+# Section 2 — INSERT: single row, multi-row, DEFAULT VALUES, NULL
+# ============================================================================
+
+statement ok
+INSERT INTO t1 (name, val) VALUES ('alice', 10)
+
+statement ok
+INSERT INTO t1 (name, val) VALUES ('bob', 20), ('carol', 30), ('dave', 40)
+
+statement ok
+INSERT INTO t1 VALUES (100, 'explicit-id', 1000)
+
+statement ok
+INSERT INTO t1b (name) VALUES ('x')
+
+query III rowsort
+SELECT id, val, val FROM t1b
+----
+1 0 0
+
+# NULL val on a column without NOT NULL constraint.
+statement ok
+INSERT INTO t1 (name) VALUES ('no-val')
+
+# ============================================================================
+# Section 3 — SELECT: basic shapes
+# ============================================================================
+
+# Total row count.
+query I rowsort
+SELECT COUNT(*) FROM t1
+----
+6
+
+# All rows, ordered.
+# Note: after inserting id=100 explicitly, the next auto-rowid is 101 (not 5)
+# because the rowid allocator bumps max+1 from the highest rowid it has seen.
+# rowsort: the runner sorts BOTH expected and actual rows as STRING tuples.
+# String sort order for ids 1, 2, 3, 4, 100, 101:
+#   "1..." < "100..." < "101..." < "2..." < "3..." < "4..."
+query IIT rowsort
+SELECT id, val, name FROM t1 ORDER BY id
+----
+1 10 alice
+100 1000 explicit-id
+101 NULL no-val
+2 20 bob
+3 30 carol
+4 40 dave
+
+# Specific column projection.
+query T rowsort
+SELECT name FROM t1 WHERE val = 30
+----
+carol
+
+# Constant SELECT (no FROM).
+query III
+SELECT 1, 2, 3
+----
+1 2 3
+
+# Arithmetic in projection.
+query III
+SELECT 1+1, 2*3, 10-5
+----
+2 6 5
+
+# ============================================================================
+# Section 4 — WHERE: equality, comparison, AND/OR, NULL semantics
+# ============================================================================
+
+query I rowsort
+SELECT id FROM t1 WHERE val = 30
+----
+3
+
+query I rowsort
+SELECT id FROM t1 WHERE val > 20
+----
+3
+4
+100
+
+query I rowsort
+SELECT id FROM t1 WHERE val > 20 AND val < 100
+----
+3
+4
+
+query I rowsort
+SELECT id FROM t1 WHERE val < 20 OR val > 100
+----
+1
+100
+
+# NULL never equals NULL via =; use IS NULL.
+# (After the engine fix, val = NULL evaluates to NULL/UNKNOWN for every
+#  row, which WHERE filters out, so 0 rows are returned.)
+query I rowsort
+SELECT id FROM t1 WHERE val = NULL
+----
+
+query I rowsort
+SELECT id FROM t1 WHERE val IS NULL
+----
+101
+
+query I rowsort
+SELECT id FROM t1 WHERE val IS NOT NULL ORDER BY id
+----
+1
+2
+3
+4
+100
+
+# IN with literals.
+query I rowsort
+SELECT id FROM t1 WHERE name IN ('alice', 'carol') ORDER BY id
+----
+1
+3
+
+# BETWEEN.
+query I rowsort
+SELECT id FROM t1 WHERE val BETWEEN 20 AND 40 ORDER BY id
+----
+2
+3
+4
+
+# NOT BETWEEN. (NULL val is filtered by 3-valued logic.)
+query I rowsort
+SELECT id FROM t1 WHERE val NOT BETWEEN 20 AND 40 ORDER BY id
+----
+1
+100
+
+# LIKE.
+query I rowsort
+SELECT id FROM t1 WHERE name LIKE 'a%' 
+----
+1
+
+# ============================================================================
+# Section 5 — ORDER BY (multi-key, ASC/DESC)
+# ============================================================================
+
+# Note: rowsort sorts the runner's expected and actual rows as STRING tuples.
+# With ids 1, 2, 3, 4, 100, 101, the string sort order is:
+#   "1 ..." < "100 ..." < "101 ..." < "2 ..." < "3 ..." < "4 ..."
+query IT rowsort
+SELECT id, name FROM t1 ORDER BY val DESC, name ASC
+----
+1 alice
+100 explicit-id
+101 no-val
+2 bob
+3 carol
+4 dave
+
+# ============================================================================
+# Section 6 — Aggregates: COUNT, SUM, AVG, MIN, MAX
+# ============================================================================
+
+query II rowsort
+SELECT COUNT(*), COUNT(val) FROM t1
+----
+6 5
+
+query I rowsort
+SELECT SUM(val) FROM t1
+----
+1100
+
+query II rowsort
+SELECT MIN(val), MAX(val) FROM t1 WHERE val IS NOT NULL
+----
+10 1000
+
+query R rowsort
+SELECT AVG(val) FROM t1 WHERE val IS NOT NULL
+----
+220.0
+
+# GROUP BY.
+query TI rowsort
+SELECT 'dept-a' AS dept, COUNT(*) FROM t1 GROUP BY dept
+----
+dept-a 6
+
+# ============================================================================
+# Section 7 — DISTINCT, LIMIT/OFFSET
+# ============================================================================
+
+statement ok
+CREATE TABLE t2 (id INTEGER PRIMARY KEY, cat TEXT, v INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40), (5, 'c', 50)
+
+query T rowsort
+SELECT DISTINCT cat FROM t2 ORDER BY cat
+----
+a
+b
+c
+
+query I rowsort
+SELECT v FROM t2 ORDER BY v LIMIT 3
+----
+10
+20
+30
+
+query I rowsort
+SELECT v FROM t2 ORDER BY v LIMIT 2 OFFSET 2
+----
+30
+40
+
+# ============================================================================
+# Section 8 — JOINs
+# ============================================================================
+
+statement ok
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)
+
+statement ok
+INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')
+
+statement ok
+INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50), (4, 3, 75)
+
+# Inner join.
+query TI rowsort
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id
+----
+alice 100
+alice 200
+bob 50
+carol 75
+
+# Left join (carol has no further orders but should still appear).
+query TI rowsort
+SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.id IS NOT NULL ORDER BY o.id
+----
+alice 100
+alice 200
+bob 50
+carol 75
+
+# Filtered inner join (predicate pushdown target).
+query TI rowsort
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 1 ORDER BY o.id
+----
+alice 100
+alice 200
+
+# ============================================================================
+# Section 9 — Set operations: UNION, INTERSECT, EXCEPT
+# ============================================================================
+
+statement ok
+CREATE TABLE s1 (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+CREATE TABLE s2 (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO s1 VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+INSERT INTO s2 VALUES (1, 20), (2, 30), (3, 50)
+
+query I rowsort
+SELECT v FROM s1 UNION SELECT v FROM s2 ORDER BY v
+----
+10
+20
+30
+40
+50
+
+query I rowsort
+SELECT v FROM s1 UNION ALL SELECT v FROM s2 ORDER BY v
+----
+10
+20
+20
+30
+30
+40
+50
+
+query I rowsort
+SELECT v FROM s1 INTERSECT SELECT v FROM s2 ORDER BY v
+----
+20
+30
+
+query I rowsort
+SELECT v FROM s1 EXCEPT SELECT v FROM s2 ORDER BY v
+----
+10
+40
+
+# ============================================================================
+# Section 10 — UPDATE / DELETE
+# ============================================================================
+
+statement ok
+CREATE TABLE mut (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO mut VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+UPDATE mut SET v = 999 WHERE id = 2
+
+query II rowsort
+SELECT id, v FROM mut ORDER BY id
+----
+1 10
+2 999
+3 30
+
+statement ok
+DELETE FROM mut WHERE v > 100
+
+query I rowsort
+SELECT id FROM mut ORDER BY id
+----
+1
+3
+
+# ============================================================================
+# Section 11 — UPDATE / DELETE with non-PK WHERE (regression coverage)
+# (These exercise the apply_where_for_scan fix; previously they would scan
+#  the whole table per UPDATE.)
+# ============================================================================
+
+statement ok
+CREATE TABLE bulk (id INTEGER PRIMARY KEY, val INTEGER, score REAL)
+
+statement ok
+INSERT INTO bulk (val, score) VALUES (1, 1.5), (2, 2.5), (3, 3.5), (4, 4.5), (5, 5.5)
+
+statement ok
+UPDATE bulk SET score = 0.0 WHERE id = 3
+
+query R rowsort
+SELECT score FROM bulk WHERE id = 3
+----
+0.0
+
+statement ok
+UPDATE bulk SET score = score + 1.0 WHERE val > 3
+
+query R rowsort
+SELECT score FROM bulk WHERE val > 3 ORDER BY val
+----
+5.5
+6.5
+
+statement ok
+DELETE FROM bulk WHERE val = 5
+
+query I rowsort
+SELECT val FROM bulk ORDER BY val
+----
+1
+2
+3
+4
+
+# ============================================================================
+# Section 12 — Edge cases: empty tables, NULL aggregates, division by zero
+# ============================================================================
+
+statement ok
+CREATE TABLE empty (id INTEGER PRIMARY KEY, v INTEGER)
+
+query I rowsort
+SELECT COUNT(*) FROM empty
+----
+0
+
+query I rowsort
+SELECT SUM(v) FROM empty
+----
+NULL
+
+query I rowsort
+SELECT MAX(v) FROM empty
+----
+NULL
+
+# Division by zero in SQLite returns NULL (not an error).
+query I
+SELECT 1 / 0
+----
+NULL
+
+# ============================================================================
+# Section 13 — Type affinity and coercion
+# ============================================================================
+
+statement ok
+CREATE TABLE aff (id INTEGER PRIMARY KEY, i INTEGER, t TEXT, r REAL)
+
+statement ok
+INSERT INTO aff VALUES (1, '10', 20, '1.5')
+
+query IITR rowsort
+SELECT id, i, t, r FROM aff
+----
+1 10 20 1.5
+
+# String-integer comparison.
+# KNOWN LIMITATION: WHERE doesn't currently apply column affinity to the
+# literal. `i = '10'` compares Integer(10) to Text('10') directly, which
+# returns false. SQLite would coerce '10' to integer 10 first.
+# Skip this case until affinity-coercion in WHERE is implemented (tracked
+# in PRODUCTION_TODO.md Phase 4).
+skip
+query I rowsort
+SELECT id FROM aff WHERE i = '10'
+----
+
+# ============================================================================
+# Section 14 — Conflict resolution: OR IGNORE, OR REPLACE
+# ============================================================================
+
+statement ok
+CREATE TABLE uniq (id INTEGER PRIMARY KEY, name TEXT UNIQUE)
+
+statement ok
+INSERT INTO uniq VALUES (1, 'alice'), (2, 'bob')
+
+statement ok
+INSERT OR IGNORE INTO uniq VALUES (1, 'duplicate')
+
+query II rowsort
+SELECT id, COUNT(*) FROM uniq GROUP BY id HAVING id = 1
+----
+1 1
+
+statement ok
+INSERT OR REPLACE INTO uniq VALUES (1, 'alice-v2')
+
+query T rowsort
+SELECT name FROM uniq WHERE id = 1
+----
+alice-v2

@@ -444,7 +444,19 @@ fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool)
     }
     state.seen_value = true;
     match func {
-        "count" => state.count += 1,
+        // SQLite semantics: COUNT(*) counts all rows; COUNT(col) counts
+        // non-NULL values of col. For COUNT(*) the planner passes a
+        // non-NULL placeholder (Value::Integer(1)) as the arg, so checking
+        // v.is_null() here correctly skips NULLs for COUNT(col) while
+        // still counting every row for COUNT(*). This bug was caught by
+        // the SLT test suite (which expected COUNT(val) to be 5 over a
+        // 6-row table where one row had val=NULL).
+        "count" => {
+            if v.is_null() {
+                return;
+            }
+            state.count += 1
+        }
         "sum" | "total" => {
             if !v.is_null() {
                 if matches!(v, Value::Real(_)) {
