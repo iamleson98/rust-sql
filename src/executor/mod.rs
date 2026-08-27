@@ -803,18 +803,25 @@ fn exec_hash_join(
     let nulls_right = vec![Value::Null; n_right];
     let nulls_left = vec![Value::Null; n_left];
 
+    // Reuse a single key buffer across all probes to avoid allocating a
+    // fresh Vec<u8> per probe row. Previously this allocated ~N times for
+    // N probe rows (10000 allocs in the join benchmark → ~1ms of pure alloc
+    // overhead). The buffer is cleared and refilled per iteration; capacity
+    // is retained so subsequent iterations don't reallocate.
+    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+
     for probe_row in probe_rows.iter() {
-        let mut key: Vec<u8> = Vec::with_capacity(24);
+        key_buf.clear();
         for &ci in &probe_key_indices {
             if let Some(v) = probe_row.get(ci) {
-                key.extend_from_slice(&v.encode());
+                key_buf.extend_from_slice(&v.encode());
             } else {
-                key.push(0);
+                key_buf.push(0);
             }
-            key.push(0xff);
+            key_buf.push(0xff);
         }
         let mut matched = false;
-        if let Some(candidates) = hash.get(&key) {
+        if let Some(candidates) = hash.get(&key_buf) {
             for &bi in candidates {
                 let build_row = &build_rows[bi];
                 // Emit combined row in [left, right] order regardless of which
