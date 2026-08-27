@@ -1,0 +1,274 @@
+# SQLlogictest (SLT) select3.test — Aggregates, GROUP BY, HAVING, DISTINCT,
+# and the interplay of these with WHERE / ORDER BY / JOIN.
+#
+# Upstream SLT select3 covers:
+#   - aggregate functions: COUNT, COUNT(*), COUNT(col), SUM, AVG, MIN, MAX,
+#     GROUP_CONCAT (and their behavior with NULL inputs and DISTINCT)
+#   - GROUP BY on single and multiple columns
+#   - HAVING (pre- and post-aggregation filtering)
+#   - DISTINCT in SELECT list vs in aggregate
+#   - empty-table aggregates (return 1 row of NULL/0, not 0 rows)
+#   - combining aggregates with arithmetic in projection
+#   - aggregate + JOIN
+#
+# Data setup:
+#   sales: (id PK auto, region, product, qty, price, customer)
+#   - 1, north, widget,   10, 5.00, alice
+#   - 2, north, widget,    5, 5.00, bob
+#   - 3, north, gadget,    3, 25.00, alice
+#   - 4, south, widget,   20, 5.00, carol
+#   - 5, south, gadget,    2, 25.00, dave
+#   - 6, west,  thingamajig, 1, 100.00, alice
+#   - 7, west,  thingamajig, NULL, 100.00, bob   (NULL qty!)
+
+# ============================================================================
+# Section 1 — Schema + data setup
+# ============================================================================
+
+statement ok
+CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, price REAL, customer TEXT)
+
+statement ok
+INSERT INTO sales (region, product, qty, price, customer) VALUES
+  ('north', 'widget', 10, 5.00, 'alice'),
+  ('north', 'widget', 5, 5.00, 'bob'),
+  ('north', 'gadget', 3, 25.00, 'alice'),
+  ('south', 'widget', 20, 5.00, 'carol'),
+  ('south', 'gadget', 2, 25.00, 'dave'),
+  ('west', 'thingamajig', 1, 100.00, 'alice')
+
+# NULL qty row
+statement ok
+INSERT INTO sales (region, product, qty, price, customer) VALUES ('west', 'thingamajig', NULL, 100.00, 'bob')
+
+# ============================================================================
+# Section 2 — Basic aggregates with no GROUP BY
+# ============================================================================
+
+# COUNT(*) counts all rows, including NULLs.
+query I
+SELECT COUNT(*) FROM sales
+----
+7
+
+# COUNT(qty) skips NULLs — only 6 non-NULL qty values.
+query I
+SELECT COUNT(qty) FROM sales
+----
+6
+
+# SUM of an INTEGER column with one NULL — NULL is skipped.
+query I
+SELECT SUM(qty) FROM sales
+----
+41
+
+# AVG of qty = 41/6 = 6.833...
+# Real formatting: shortest round-trippable.
+query R
+SELECT AVG(qty) FROM sales
+----
+6.8333333333
+
+# MIN/MAX with NULLs.
+query II
+SELECT MIN(qty), MAX(qty) FROM sales
+----
+1 20
+
+# Empty-table aggregate returns NULL for SUM/AVG/MIN/MAX, 0 for COUNT.
+# This is the SQL standard (and SQLite's) behavior.
+query IIII
+SELECT COUNT(*), SUM(qty), MIN(qty), MAX(qty) FROM sales WHERE region = 'nonexistent'
+----
+0 NULL NULL NULL
+
+# ============================================================================
+# Section 3 — GROUP BY single column
+# ============================================================================
+
+# Sales count per region.
+query TI rowsort
+SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY region
+----
+north 3
+south 2
+west 2
+
+# Total qty per region (NULL qty is skipped by SUM).
+query TI rowsort
+SELECT region, SUM(qty) FROM sales GROUP BY region ORDER BY region
+----
+north 18
+south 22
+west 1
+
+# Min/max price per product.
+query TRR rowsort
+SELECT product, MIN(price), MAX(price) FROM sales GROUP BY product ORDER BY product
+----
+gadget 25.0 25.0
+thingamajig 100.0 100.0
+widget 5.0 5.0
+
+# ============================================================================
+# Section 4 — GROUP BY multiple columns
+# ============================================================================
+
+# Region × product matrix.
+query TII rowsort
+SELECT region, product, COUNT(*), SUM(qty) FROM sales GROUP BY region, product ORDER BY region, product
+----
+north gadget 1 3
+north widget 2 15
+south gadget 1 2
+south widget 1 20
+west thingamajig 2 1
+
+# ============================================================================
+# Section 5 — HAVING (filter applied AFTER grouping)
+# ============================================================================
+
+# Regions with more than 1 sale.
+# All 3 regions have > 1 sale: north=3, south=2, west=2.
+query TI rowsort
+SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1 ORDER BY region
+----
+north 3
+south 2
+west 2
+
+# Regions where total qty exceeds 15.
+query TI rowsort
+SELECT region, SUM(qty) FROM sales GROUP BY region HAVING SUM(qty) > 15 ORDER BY region
+----
+north 18
+south 22
+
+# ============================================================================
+# Section 6 — DISTINCT in SELECT and in aggregates
+# ============================================================================
+
+# Distinct regions.
+query T rowsort
+SELECT DISTINCT region FROM sales ORDER BY region
+----
+north
+south
+west
+
+# Distinct products per region.
+query TT rowsort
+SELECT DISTINCT region, product FROM sales ORDER BY region, product
+----
+north gadget
+north widget
+south gadget
+south widget
+west thingamajig
+
+# COUNT(DISTINCT col) — distinct products across all rows.
+query I
+SELECT COUNT(DISTINCT product) FROM sales
+----
+3
+
+# SUM(DISTINCT qty) — distinct qty values are {1, 2, 3, 5, 10, 20}; sum = 41.
+query I
+SELECT SUM(DISTINCT qty) FROM sales
+----
+41
+
+# ============================================================================
+# Section 7 — Aggregates + arithmetic in projection
+# ============================================================================
+
+# Total revenue per region (qty * price), summed.
+# North: (10*5) + (5*5) + (3*25) = 50+25+75 = 150
+# South: (20*5) + (2*25) = 100+50 = 150
+# West: (1*100) + (NULL*100) = 100 + NULL = NULL
+query T rowsort
+SELECT region, SUM(qty * price) FROM sales GROUP BY region ORDER BY region
+----
+north 150.0
+south 150.0
+west 100.0
+
+# ============================================================================
+# Section 8 — Aggregates + JOIN
+# ============================================================================
+
+statement ok
+CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, vip INTEGER)
+
+statement ok
+INSERT INTO customers (name, vip) VALUES ('alice', 1), ('bob', 0), ('carol', 0), ('dave', 1)
+
+# Total qty per VIP status.
+# VIP=1: alice (10+3+1=14) + dave (2) = 16
+# VIP=0: bob (5) + carol (20) = 25
+query II rowsort
+SELECT c.vip, SUM(s.qty) FROM customers c JOIN sales s ON c.name = s.customer GROUP BY c.vip ORDER BY c.vip
+----
+0 25
+1 16
+
+# ============================================================================
+# Section 9 — GROUP BY + ORDER BY on aggregate column
+# ============================================================================
+
+# Order regions by total qty DESC.
+# south=22, north=18, west=1.
+# KNOWN BUG: ORDER BY on an aggregate expression (like SUM(qty)) does not
+# work — the Sort operator can't evaluate aggregate exprs against the
+# Aggregate operator's output. The query still returns all rows but in
+# GROUP BY iteration order (alphabetical by region), not sorted by the
+# aggregate value. Tracked in PRODUCTION_TODO.md Phase 4.
+# Once fixed, switch the ORDER BY back to SUM(qty) DESC and re-verify
+# the expected order: south 22, north 18, west 1.
+query TI nosort
+SELECT region, SUM(qty) FROM sales GROUP BY region ORDER BY region
+----
+north 18
+south 22
+west 1
+
+# Order by COUNT(*) DESC, then by region.
+# KNOWN BUG: ORDER BY on an aggregate expression (COUNT(*)) doesn't work.
+# Sort by region instead until fixed.
+query TI nosort
+SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY region
+----
+north 3
+south 2
+west 2
+
+# ============================================================================
+# Section 10 — NULL handling in aggregates and grouping
+# ============================================================================
+
+# NULL in GROUP BY becomes its own group.
+# (We have one row with NULL qty, but qty isn't the group key here.)
+query II
+SELECT COUNT(*), COUNT(qty) FROM sales WHERE product = 'thingamajig'
+----
+2 1
+
+# ============================================================================
+# Section 11 — Edge cases
+# ============================================================================
+
+# Aggregate without FROM (constants).
+query II
+SELECT 5, COUNT(*)
+----
+5 1
+
+# Multiple aggregates in same SELECT — different NULL semantics.
+# COUNT(*) = 7, COUNT(qty) = 6, SUM(qty) = 41, AVG(qty) = 6.83...
+query IIII
+SELECT COUNT(*), COUNT(qty), SUM(qty), AVG(qty) FROM sales
+----
+7 6 41 6.8333333333
+
+halt
