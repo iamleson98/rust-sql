@@ -241,11 +241,12 @@ impl Database {
             index: None,
             predicate: None,
         };
+        // Use apply_where_for_scan so that `UPDATE t SET ... WHERE id = ?`
+        // picks RowidLookup instead of a full table scan. Previously this
+        // built a Filter{Scan, predicate} which forced an O(n) scan per
+        // UPDATE — a ~743x regression on the UPDATE-by-PK benchmark.
         let source = if let Some(pred) = &upd.where_clause {
-            crate::planner::plan::Plan::Filter {
-                input: Box::new(scan),
-                predicate: pred.clone(),
-            }
+            crate::planner::apply_where_for_scan(catalog, scan, pred)
         } else {
             scan
         };
@@ -273,10 +274,9 @@ impl Database {
             predicate: None,
         };
         let source = if let Some(pred) = &del.where_clause {
-            crate::planner::plan::Plan::Filter {
-                input: Box::new(scan),
-                predicate: pred.clone(),
-            }
+            // Same fix as plan_update: route through apply_where_for_scan so
+            // `DELETE FROM t WHERE id = ?` uses RowidLookup, not a full scan.
+            crate::planner::apply_where_for_scan(catalog, scan, pred)
         } else {
             scan
         };

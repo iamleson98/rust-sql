@@ -203,47 +203,12 @@ impl<'a> Planner<'a> {
     /// - Otherwise, push the predicate into the scan as a `Filter` (which
     ///   the executor evaluates per row).
     fn apply_where(&self, plan: Plan, predicate: &Expr) -> Plan {
-        // Try to find a usable equality predicate.
-        if let Plan::Scan { table, alias, .. } = &plan {
-            if let Some((col_name, value_expr)) = extract_eq_predicate(predicate) {
-                // Check if it's the rowid alias.
-                if let Some(idx) = table.rowid_alias {
-                    if table.columns[idx].name.eq_ignore_ascii_case(&col_name) {
-                        return Plan::RowidLookup {
-                            table: table.clone(),
-                            alias: alias.clone(),
-                            rowid: value_expr,
-                        };
-                    }
-                }
-                // Check if "rowid" or "_rowid_" is the column.
-                if col_name.eq_ignore_ascii_case("rowid")
-                    || col_name.eq_ignore_ascii_case("_rowid_")
-                    || col_name.eq_ignore_ascii_case("oid")
-                {
-                    return Plan::RowidLookup {
-                        table: table.clone(),
-                        alias: alias.clone(),
-                        rowid: value_expr,
-                    };
-                }
-                // Check if any index has this column as its first column.
-                for index in self.catalog.indexes_on_table(&table.name) {
-                    if let Some(first_col) = index.columns.first() {
-                        if first_col.name.eq_ignore_ascii_case(&col_name) {
-                            return Plan::IndexLookup {
-                                table: table.clone(),
-                                alias: alias.clone(),
-                                index,
-                                key_exprs: vec![value_expr],
-                            };
-                        }
-                    }
-                }
-            }
-        }
-        // Default: wrap in a Filter.
-        Plan::Filter { input: Box::new(plan), predicate: predicate.clone() }
+        // Delegate to the free function so that plan_update / plan_delete in
+        // api.rs can share the exact same predicate-matching logic without
+        // needing a `Planner` instance. This fixes a critical perf bug where
+        // `UPDATE t SET ... WHERE id = ?` was falling through to a full
+        // table scan instead of a RowidLookup.
+        apply_where_for_scan(self.catalog, plan, predicate)
     }
 
     fn plan_table_expression(&mut self, te: &TableExpression) -> Result<Plan> {
@@ -706,6 +671,66 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
         }
     }
     None
+}
+
+/// Apply a WHERE predicate to a `Scan` plan, choosing the cheapest access path:
+///
+/// - If the predicate is `rowid_alias_col = value` (or `rowid/_rowid_/oid = value`),
+///   replace the Scan with a `RowidLookup` (single B+tree point lookup).
+/// - Else if the predicate is `indexed_col = value` for some index whose first
+///   column is `col`, replace the Scan with an `IndexLookup`.
+/// - Else wrap the Scan in a `Filter` (full scan + per-row predicate eval).
+///
+/// This is shared between the SELECT planner and the UPDATE/DELETE planners
+/// so that `UPDATE t SET ... WHERE id = ?` doesn't fall through to a full
+/// table scan — a bug that previously made UPDATE-by-PK ~743x slower than
+/// SQLite.
+///
+/// The function is conservative: it only inspects the *top-level* shape of
+/// the predicate. `WHERE id = ? AND name = 'foo'` is treated as a Filter
+/// because the top-level op is `And`, not `Eq`. A future improvement is to
+/// split AND-chains and try each conjunct.
+pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+    if let Plan::Scan { table, alias, .. } = &plan {
+        if let Some((col_name, value_expr)) = extract_eq_predicate(predicate) {
+            // Check if it's the rowid alias.
+            if let Some(idx) = table.rowid_alias {
+                if table.columns[idx].name.eq_ignore_ascii_case(&col_name) {
+                    return Plan::RowidLookup {
+                        table: table.clone(),
+                        alias: alias.clone(),
+                        rowid: value_expr,
+                    };
+                }
+            }
+            // Check if "rowid" or "_rowid_" is the column.
+            if col_name.eq_ignore_ascii_case("rowid")
+                || col_name.eq_ignore_ascii_case("_rowid_")
+                || col_name.eq_ignore_ascii_case("oid")
+            {
+                return Plan::RowidLookup {
+                    table: table.clone(),
+                    alias: alias.clone(),
+                    rowid: value_expr,
+                };
+            }
+            // Check if any index has this column as its first column.
+            for index in catalog.indexes_on_table(&table.name) {
+                if let Some(first_col) = index.columns.first() {
+                    if first_col.name.eq_ignore_ascii_case(&col_name) {
+                        return Plan::IndexLookup {
+                            table: table.clone(),
+                            alias: alias.clone(),
+                            index,
+                            key_exprs: vec![value_expr],
+                        };
+                    }
+                }
+            }
+        }
+    }
+    // Default: wrap in a Filter.
+    Plan::Filter { input: Box::new(plan), predicate: predicate.clone() }
 }
 
 /// Insert a Sort node below the topmost Project / Distinct node in the plan,
