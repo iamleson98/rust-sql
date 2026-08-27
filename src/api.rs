@@ -188,13 +188,22 @@ impl Database {
             let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
-            ctx.root_overrides = self.root_overrides.clone();
-            ctx.max_rowids = self.max_rowids.clone();
+            // Move (not clone) root_overrides and max_rowids into the ctx for
+            // the duration of the call, then restore them after. SELECT
+            // statements don't mutate these (no B+tree splits happen on a
+            // read), so we're just borrowing the HashMap — no need to clone
+            // the entries. Previously this was `.clone()`, which allocated
+            // ~N entries per call (one per cached table) and was a measurable
+            // fraction of per-query overhead on the point-lookup benchmark.
+            ctx.root_overrides = std::mem::take(&mut self.root_overrides);
+            ctx.max_rowids = std::mem::take(&mut self.max_rowids);
             for (i, v) in params.into_iter().enumerate() {
                 ctx.bind(&format!("{}", i), v);
             }
             let res = execute(&plan, &mut ctx)?;
             self.txn_snapshot = ctx.txn_snapshot;
+            self.root_overrides = std::mem::take(&mut ctx.root_overrides);
+            self.max_rowids = std::mem::take(&mut ctx.max_rowids);
             Ok(res.rows)
         } else {
             Ok(Vec::new())
@@ -211,13 +220,16 @@ impl Database {
             let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
-            ctx.root_overrides = self.root_overrides.clone();
-            ctx.max_rowids = self.max_rowids.clone();
+            // See comment in `query` — move (not clone) these.
+            ctx.root_overrides = std::mem::take(&mut self.root_overrides);
+            ctx.max_rowids = std::mem::take(&mut self.max_rowids);
             for (i, v) in params.into_iter().enumerate() {
                 ctx.bind(&format!("{}", i), v);
             }
             let res = execute(&plan, &mut ctx)?;
             self.txn_snapshot = ctx.txn_snapshot;
+            self.root_overrides = std::mem::take(&mut ctx.root_overrides);
+            self.max_rowids = std::mem::take(&mut ctx.max_rowids);
             Ok((res.columns, res.rows))
         } else {
             Ok((Vec::new(), Vec::new()))
