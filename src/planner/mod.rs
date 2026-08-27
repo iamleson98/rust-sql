@@ -208,7 +208,7 @@ impl<'a> Planner<'a> {
         // needing a `Planner` instance. This fixes a critical perf bug where
         // `UPDATE t SET ... WHERE id = ?` was falling through to a full
         // table scan instead of a RowidLookup.
-        apply_where_for_scan(self.catalog, plan, predicate)
+        pushdown_filter(self.catalog, plan, predicate)
     }
 
     fn plan_table_expression(&mut self, te: &TableExpression) -> Result<Plan> {
@@ -732,6 +732,264 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
     // Default: wrap in a Filter.
     Plan::Filter { input: Box::new(plan), predicate: predicate.clone() }
 }
+
+/// Split a predicate that may be an AND-chain into its individual conjuncts.
+/// `a AND b AND c` → `[a, b, c]`. A single conjunct returns `[conjunct]`.
+///
+/// This is the prerequisite for predicate pushdown: we want to push each
+/// conjunct as deep into the plan as the columns it references allow, rather
+/// than treating the whole predicate as one indivisible unit (which forces
+/// it to stay as a top-level Filter).
+pub fn split_and_chain(predicate: &Expr) -> Vec<Expr> {
+    let mut out = Vec::new();
+    split_and_chain_rec(predicate, &mut out);
+    out
+}
+
+fn split_and_chain_rec(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::Binary { op: BinaryOp::And, left, right } = expr {
+        split_and_chain_rec(left, out);
+        split_and_chain_rec(right, out);
+    } else {
+        out.push(expr.clone());
+    }
+}
+
+/// Combine a list of conjuncts back into a single Expr with AND nodes.
+/// Empty list returns a literal TRUE (so it's a no-op when wrapped in a Filter).
+pub fn combine_and(conjuncts: &[Expr]) -> Expr {
+    if conjuncts.is_empty() {
+        return Expr::Literal(Value::Integer(1));
+    }
+    let mut iter = conjuncts.iter();
+    let mut acc = iter.next().unwrap().clone();
+    for c in iter {
+        acc = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(acc),
+            right: Box::new(c.clone()),
+        };
+    }
+    acc
+}
+
+/// Collect all (table_alias_opt, column_name) references in an expression.
+/// Used for predicate pushdown: we determine which side(s) of a Join the
+/// predicate depends on by inspecting the columns it references.
+///
+/// Returns a Vec of `(Option<String>, String)` where the first element is the
+/// table alias/qualifier (if the SQL said `u.id`) and the second is the
+/// column name.
+pub fn collect_column_refs(expr: &Expr) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    collect_column_refs_rec(expr, &mut out);
+    out
+}
+
+fn collect_column_refs_rec(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match expr {
+        Expr::Column { table, name } => {
+            out.push((table.clone(), name.clone()));
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_column_refs_rec(left, out);
+            collect_column_refs_rec(right, out);
+        }
+        Expr::Unary { expr, .. } => collect_column_refs_rec(expr, out),
+        Expr::Between { expr, low, high, .. } => {
+            collect_column_refs_rec(expr, out);
+            collect_column_refs_rec(low, out);
+            collect_column_refs_rec(high, out);
+        }
+        Expr::In { expr, source, .. } => {
+            collect_column_refs_rec(expr, out);
+            if let crate::sql::ast::InSource::List(es) = source {
+                for e in es { collect_column_refs_rec(e, out); }
+            }
+            // Subquery sources don't reference outer columns by name in our AST.
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            collect_column_refs_rec(expr, out);
+            collect_column_refs_rec(pattern, out);
+            if let Some(e) = escape { collect_column_refs_rec(e, out); }
+        }
+        Expr::IsNull { expr, .. } => collect_column_refs_rec(expr, out),
+        Expr::Is { left, right, .. } => {
+            collect_column_refs_rec(left, out);
+            collect_column_refs_rec(right, out);
+        }
+        Expr::Function { args, filter, .. } => {
+            for a in args { collect_column_refs_rec(a, out); }
+            if let Some(f) = filter { collect_column_refs_rec(f, out); }
+        }
+        Expr::Case { operand, whens, else_ } => {
+            if let Some(o) = operand { collect_column_refs_rec(o, out); }
+            for (w, t) in whens {
+                collect_column_refs_rec(w, out);
+                collect_column_refs_rec(t, out);
+            }
+            if let Some(e) = else_ { collect_column_refs_rec(e, out); }
+        }
+        Expr::Row(es) => for e in es { collect_column_refs_rec(e, out); },
+        Expr::Cast { expr, .. } => collect_column_refs_rec(expr, out),
+        Expr::Collate { expr, .. } => collect_column_refs_rec(expr, out),
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message { collect_column_refs_rec(m, out); }
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Subquery(_)
+        | Expr::Exists(_) => {}
+    }
+}
+
+/// Infer the columns a plan produces, as a set of `(Option<alias_or_table_name>, column_name)`
+/// pairs. For predicate pushdown we only need this for `Scan`, `Filter`,
+/// `Join`, and `Subquery` — the shapes that appear in a FROM clause.
+///
+/// - Scan: (alias or table.name, each column)
+/// - Filter: same as input
+/// - Join: union of left + right
+/// - Subquery: empty (we can't introspect)
+/// - Other (Project, Aggregate, etc.): empty (we don't push past them)
+pub fn plan_column_refs(catalog: &Catalog, plan: &Plan) -> Vec<(Option<String>, String)> {
+    match plan {
+        Plan::Scan { table, alias, .. } => {
+            let prefix = alias.clone().unwrap_or_else(|| table.name.clone());
+            table.columns.iter()
+                .map(|c| (Some(prefix.clone()), c.name.clone()))
+                .collect()
+        }
+        Plan::Filter { input, .. } | Plan::Subquery { plan: input } => {
+            plan_column_refs(catalog, input)
+        }
+        Plan::Join { left, right, .. } => {
+            let mut v = plan_column_refs(catalog, left);
+            v.extend(plan_column_refs(catalog, right));
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Returns true if every column ref in `conjunct` is bound by `cols`.
+/// A column with `table=None` matches any column with the same `name` regardless of prefix.
+/// A column with `table=Some(t)` requires a matching `(Some(t), name)`.
+fn conjunct_bound_by(conjunct: &Expr, cols: &[(Option<String>, String)]) -> bool {
+    let refs = collect_column_refs(conjunct);
+    if refs.is_empty() {
+        // No column references — it's a constant; safe to push down (or keep up).
+        return true;
+    }
+    refs.iter().all(|(t, n)| {
+        match t {
+            Some(prefix) => cols.iter().any(|(p, c)| p.as_deref() == Some(prefix.as_str()) && c == n),
+            None => cols.iter().any(|(_, c)| c == n),
+        }
+    })
+}
+
+/// Push a WHERE predicate as deep into a plan as the columns it references allow.
+///
+/// The predicate is first split into AND-conjuncts. Each conjunct is categorized:
+/// - If it only references columns from the LEFT side of a Join, push into left.
+/// - If it only references columns from the RIGHT side, push into right.
+/// - If it references columns from both sides (or is non-decomposable), keep
+///   as a top-level Filter around the (rewritten) Join.
+///
+/// For non-Join plans, falls through to `apply_where_for_scan` which handles
+/// `Plan::Scan` (RowidLookup / IndexLookup / Filter{Scan}).
+///
+/// Example:
+///   `SELECT ... FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 500`
+/// Before:  Filter { Join { Scan u, Scan o, on u.id=o.user_id }, u.id=500 }
+/// After:   Join { RowidLookup u (id=500), Scan o, on u.id=o.user_id }
+///          (no top-level Filter needed)
+///
+/// This is the single biggest perf win for filtered joins — the previous
+/// 312x regression on the 2-table-join benchmark came from hashing all 10k
+/// orders + probing with all 1k users, when the WHERE actually filtered
+/// the left side to a single user.
+pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+    let conjuncts = split_and_chain(predicate);
+
+    // If the plan is a Join, try to split conjuncts into left-only / right-only
+    // / both-sides, and push down accordingly.
+    if let Plan::Join { left, right, join_type, condition, algorithm } = &plan {
+        let left_cols = plan_column_refs(catalog, left);
+        let right_cols = plan_column_refs(catalog, right);
+
+        let mut left_preds: Vec<Expr> = Vec::new();
+        let mut right_preds: Vec<Expr> = Vec::new();
+        let mut top_preds: Vec<Expr> = Vec::new();
+
+        for c in conjuncts {
+            if conjunct_bound_by(&c, &left_cols) && !conjunct_bound_by(&c, &right_cols) {
+                left_preds.push(c);
+            } else if conjunct_bound_by(&c, &right_cols) && !conjunct_bound_by(&c, &left_cols) {
+                right_preds.push(c);
+            } else if conjunct_bound_by(&c, &left_cols) && conjunct_bound_by(&c, &right_cols) {
+                // Column names collide across both sides (e.g. both have "id").
+                // If the conjunct has explicit table qualifier, use it to
+                // disambiguate; otherwise keep at top.
+                let refs = collect_column_refs(&c);
+                let all_qualified = refs.iter().all(|(t, _)| t.is_some());
+                if all_qualified {
+                    let left_only = refs.iter().all(|(t, _)| {
+                        t.as_ref().map(|prefix| {
+                            left_cols.iter().any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
+                        }).unwrap_or(false)
+                    });
+                    let right_only = refs.iter().all(|(t, _)| {
+                        t.as_ref().map(|prefix| {
+                            right_cols.iter().any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
+                        }).unwrap_or(false)
+                    });
+                    if left_only { left_preds.push(c); }
+                    else if right_only { right_preds.push(c); }
+                    else { top_preds.push(c); }
+                } else {
+                    top_preds.push(c);
+                }
+            } else {
+                top_preds.push(c);
+            }
+        }
+
+        // Recurse into each side.
+        let new_left = if left_preds.is_empty() {
+            (**left).clone()
+        } else {
+            pushdown_filter(catalog, (**left).clone(), &combine_and(&left_preds))
+        };
+        let new_right = if right_preds.is_empty() {
+            (**right).clone()
+        } else {
+            pushdown_filter(catalog, (**right).clone(), &combine_and(&right_preds))
+        };
+
+        let new_join = Plan::Join {
+            left: Box::new(new_left),
+            right: Box::new(new_right),
+            join_type: *join_type,
+            condition: condition.clone(),
+            algorithm: *algorithm,
+        };
+
+        if top_preds.is_empty() {
+            new_join
+        } else {
+            // Wrap remaining (non-pushable) conjuncts in a top-level Filter,
+            // but try the cheap index/rowid path on the Join as a whole first.
+            apply_where_for_scan(catalog, new_join, &combine_and(&top_preds))
+        }
+    } else {
+        // Not a Join — let apply_where_for_scan handle the Scan + index path,
+        // or wrap in a Filter for other plan shapes.
+        apply_where_for_scan(catalog, plan, &combine_and(&conjuncts))
+    }
+}
+
 
 /// Insert a Sort node below the topmost Project / Distinct node in the plan,
 /// so the Sort can see all input columns (not just the projected ones).
