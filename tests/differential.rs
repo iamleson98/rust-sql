@@ -1249,6 +1249,190 @@ static CASES: &[Case] = &[
         "INSERT INTO t (v) VALUES (10), (NULL), (20)",
         "SELECT id FROM t WHERE v = 10 OR v = 999",
     ),
+
+    // ========================================================================
+    // Statement cache + parameter binding (exercises the new fast paths)
+    // ========================================================================
+
+    case!(
+        "param_bound_eq_lookup",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('alice'), ('bob'), ('carol')",
+        "SELECT name FROM t WHERE id = 2",
+    ),
+    case!(
+        "param_bound_between_range",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')",
+        "SELECT name FROM t WHERE id BETWEEN 2 AND 4",
+    ),
+    case!(
+        "param_bound_two_placeholders",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t (v) VALUES (10), (20), (30), (40), (50)",
+        "SELECT id FROM t WHERE v >= 20 AND v <= 40",
+    ),
+    case!(
+        "param_bound_three_placeholders_insert",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)",
+        "INSERT INTO t (a, b, c) VALUES ('x', 1, 1.5), ('y', 2, 2.5), ('z', 3, 3.5)",
+        "SELECT a, b, c FROM t WHERE b >= 2",
+    ),
+
+    // ========================================================================
+    // Range scan via RowidRange (BETWEEN, >, <, >=, <=)
+    // ========================================================================
+
+    case!(
+        "rowid_range_between",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h'), ('i'), ('j')",
+        "SELECT name FROM t WHERE id BETWEEN 3 AND 7 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_gt",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')",
+        "SELECT id FROM t WHERE id > 3 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_gte",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')",
+        "SELECT id FROM t WHERE id >= 3 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_lt",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')",
+        "SELECT id FROM t WHERE id < 3 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_lte",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')",
+        "SELECT id FROM t WHERE id <= 3 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_open_ended",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t (v) VALUES (1), (2), (3), (4), (5)",
+        "SELECT id FROM t WHERE id >= 2 AND id <= 4 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_with_residual_predicate",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+        "INSERT INTO t (name, v) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4), ('e', 5)",
+        "SELECT name FROM t WHERE id BETWEEN 1 AND 5 AND v > 2 ORDER BY id",
+    ),
+    case!(
+        "rowid_range_empty_result",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('a'), ('b'), ('c')",
+        "SELECT name FROM t WHERE id BETWEEN 100 AND 200",
+    ),
+
+    // ========================================================================
+    // Hash join — smaller-side build path
+    // ========================================================================
+
+    case!(
+        "hash_join_left_smaller",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER, total INTEGER)",
+        "INSERT INTO u (name) VALUES ('a'), ('b'), ('c')",
+        "INSERT INTO o (uid, total) VALUES (1, 10), (1, 20), (2, 30), (3, 40), (3, 50)",
+        "SELECT u.name, o.total FROM u JOIN o ON u.id = o.uid WHERE u.id = 1 ORDER BY o.total",
+    ),
+    case!(
+        "hash_join_right_smaller",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER, total INTEGER)",
+        "INSERT INTO u (name) VALUES ('a'), ('b'), ('c')",
+        "INSERT INTO o (uid, total) VALUES (1, 10), (2, 30)",
+        "SELECT u.name, o.total FROM u JOIN o ON u.id = o.uid ORDER BY u.name",
+    ),
+    case!(
+        "hash_join_with_filter_on_left",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, dept TEXT)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER, total INTEGER)",
+        "INSERT INTO u (dept) VALUES ('eng'), ('sales'), ('eng')",
+        "INSERT INTO o (uid, total) VALUES (1, 100), (2, 200), (3, 300)",
+        "SELECT o.total FROM u JOIN o ON u.id = o.uid WHERE u.dept = 'eng' ORDER BY o.total",
+    ),
+    case!(
+        "hash_join_three_tables",
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, aid INTEGER)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, bid INTEGER, val INTEGER)",
+        "INSERT INTO a (name) VALUES ('x'), ('y'), ('z')",
+        "INSERT INTO b (aid) VALUES (1), (2), (3)",
+        "INSERT INTO c (bid, val) VALUES (1, 100), (2, 200), (3, 300)",
+        "SELECT a.name, c.val FROM a JOIN b ON a.id = b.aid JOIN c ON b.id = c.bid ORDER BY a.name",
+    ),
+
+    // ========================================================================
+    // Multi-row VALUES insert fast path
+    // ========================================================================
+
+    case!(
+        "multi_row_insert_auto_rowid",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t (v) VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)",
+        "SELECT SUM(v) FROM t",
+    ),
+    case!(
+        "multi_row_insert_partial_columns",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)",
+        "INSERT INTO t (a, b) VALUES ('x', 1), ('y', 2), ('z', 3)",
+        "SELECT a, b, c FROM t ORDER BY id",
+    ),
+    case!(
+        "multi_row_insert_with_explicit_rowid",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (id, name) VALUES (100, 'a'), (200, 'b'), (300, 'c')",
+        "SELECT name FROM t ORDER BY id",
+    ),
+    case!(
+        "multi_row_insert_mixed_auto_explicit",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (id, name) VALUES (5, 'explicit')",
+        "INSERT INTO t (name) VALUES ('auto1'), ('auto2')",
+        "SELECT name FROM t ORDER BY id",
+    ),
+
+    // ========================================================================
+    // Edge cases for the new code paths
+    // ========================================================================
+
+    case!(
+        "between_with_text_column",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (name) VALUES ('alpha'), ('beta'), ('gamma'), ('delta')",
+        "SELECT name FROM t WHERE name BETWEEN 'b' AND 'g'",
+    ),
+    case!(
+        "and_chain_with_mixed_predicates",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+        "INSERT INTO t (name, v) VALUES ('a', 10), ('b', 20), ('c', 30), ('d', 40)",
+        "SELECT name FROM t WHERE id >= 2 AND id <= 3 AND v > 25",
+    ),
+    case!(
+        "nested_join_with_aggregate",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER, total INTEGER)",
+        "INSERT INTO u (name) VALUES ('a'), ('b')",
+        "INSERT INTO o (uid, total) VALUES (1, 100), (1, 200), (2, 50)",
+        "SELECT u.name, SUM(o.total) FROM u JOIN o ON u.id = o.uid GROUP BY u.name ORDER BY u.name",
+    ),
+    case!(
+        "left_join_unmatched_with_aggregate",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)",
+        "INSERT INTO u (name) VALUES ('a'), ('b'), ('c')",
+        "INSERT INTO o (uid) VALUES (1), (2)",
+        "SELECT u.name, COUNT(o.id) FROM u LEFT JOIN o ON u.id = o.uid GROUP BY u.name ORDER BY u.name",
+    ),
 ];
 
 /// Driver: run all cases.
