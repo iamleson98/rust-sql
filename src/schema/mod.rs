@@ -49,6 +49,10 @@ pub struct Table {
     /// if any. INSERTs to this column are stored as the B+tree key.
     pub rowid_alias: Option<usize>,
     pub create_sql: String,
+    /// CHECK constraints (column-level and table-level). Evaluated against
+    /// the full row after defaults are applied; a NULL or false result
+    /// rejects the write with `CHECK constraint failed: <table>`.
+    pub check_exprs: Vec<crate::sql::ast::Expr>,
 }
 
 impl Table {
@@ -361,6 +365,21 @@ pub fn build_table(
         }
     }
 
+    // Collect CHECK constraints: column-level first, then table-level.
+    let mut check_exprs = Vec::new();
+    for col in columns {
+        for constraint in &col.constraints {
+            if let ColumnConstraint::Check(e) = constraint {
+                check_exprs.push(e.clone());
+            }
+        }
+    }
+    for c in constraints {
+        if let TableConstraint::Check(e) = c {
+            check_exprs.push(e.clone());
+        }
+    }
+
     Ok(Table {
         name: name.to_string(),
         columns: table_columns,
@@ -369,6 +388,7 @@ pub fn build_table(
         strict,
         rowid_alias,
         create_sql: create_sql.to_string(),
+        check_exprs,
     })
 }
 

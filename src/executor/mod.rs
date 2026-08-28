@@ -11,6 +11,7 @@
 //! for shared state, but that adds complexity that doesn't pay off until you
 //! have working code in the first place.
 
+pub mod datetime;
 pub mod expr;
 
 pub use expr::{apply_binary, evaluate, EvalContext};
@@ -208,9 +209,9 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
         Plan::RowidRange { table, alias: _, start, end, residual } => exec_rowid_range(ctx, table.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
-        Plan::Insert { table, source, columns, on_conflict } => exec_insert(ctx, table.clone(), source, columns.clone(), *on_conflict),
-        Plan::Update { table, source, assignments } => exec_update(ctx, table.clone(), source, assignments),
-        Plan::Delete { table, source } => exec_delete(ctx, table.clone(), source),
+        Plan::Insert { table, source, columns, on_conflict, upsert, returning } => exec_insert(ctx, table.clone(), source, columns.clone(), *on_conflict, upsert.as_ref(), returning.as_deref()),
+        Plan::Update { table, source, assignments, returning } => exec_update(ctx, table.clone(), source, assignments, returning.as_deref()),
+        Plan::Delete { table, source, returning } => exec_delete(ctx, table.clone(), source, returning.as_deref()),
     }
 }
 
@@ -218,6 +219,79 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
 fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], named_params: &HashMap<String, Value>) -> Result<Value> {
     let ctx = EvalContext::new(row, col_names, params, named_params);
     evaluate(expr, &ctx)
+}
+
+/// Enforce NOT NULL and CHECK constraints on a (new or updated) row.
+/// Returns a semantic error naming the offending column / table.
+fn enforce_row_constraints(
+    table: &Table,
+    row: &[Value],
+    col_names: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<()> {
+    for (i, col) in table.columns.iter().enumerate() {
+        if !col.nullable && row.get(i).map(|v| v.is_null()).unwrap_or(true) {
+            return Err(Error::semantic(format!(
+                "NOT NULL constraint failed: {}.{}",
+                table.name, col.name
+            )));
+        }
+    }
+    for expr in &table.check_exprs {
+        let v = eval_row(expr, row, col_names, params, named_params)?;
+        if !v.is_truthy() {
+            return Err(Error::semantic(format!(
+                "CHECK constraint failed: {}",
+                table.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Project the RETURNING clause for one affected row.
+/// `Star` expands to all columns; `Expr` is evaluated against the row.
+fn project_returning_row(
+    returning: &[crate::sql::ast::ResultColumn],
+    row: &[Value],
+    col_names: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(returning.len());
+    for rc in returning {
+        match rc {
+            crate::sql::ast::ResultColumn::Star => out.extend_from_slice(row),
+            crate::sql::ast::ResultColumn::TableStar(_) => out.extend_from_slice(row),
+            crate::sql::ast::ResultColumn::Expr { expr, .. } => {
+                out.push(eval_row(expr, row, col_names, params, named_params)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Column names for a RETURNING result (used for `query_with_columns`).
+fn returning_column_names(
+    returning: &[crate::sql::ast::ResultColumn],
+    col_names: &[String],
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(returning.len());
+    for rc in returning {
+        match rc {
+            crate::sql::ast::ResultColumn::Star => out.extend_from_slice(col_names),
+            crate::sql::ast::ResultColumn::TableStar(_) => out.extend_from_slice(col_names),
+            crate::sql::ast::ResultColumn::Expr { expr, alias } => {
+                if let Some(a) = alias {
+                    out.push(a.clone());
+                } else {
+                    out.push(expr_display_name(expr, col_names));
+                }
+            }
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -1848,7 +1922,7 @@ fn exec_index_lookup(
 // INSERT
 // ============================================================================
 
-fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, columns: Option<Vec<usize>>, on_conflict: ConflictResolution) -> Result<ExecResult> {
+fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, columns: Option<Vec<usize>>, on_conflict: ConflictResolution, upsert: Option<&crate::sql::ast::UpsertClause>, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
     let target_indices: Vec<usize> = columns.unwrap_or_else(|| (0..table.n_columns()).collect());
     // Track the current root page — it may change if the B+tree splits.
     let mut current_root = ctx.table_root(&table);
@@ -1875,6 +1949,19 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
     let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
+
+    // Column names — needed only when constraints or RETURNING are present.
+    let needs_col_names = !table.check_exprs.is_empty()
+        || table.columns.iter().any(|c| !c.nullable)
+        || returning.is_some();
+    let col_names: Vec<String> = if needs_col_names {
+        table.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
+    // RETURNING output buffer.
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
     // Fast path: source is a Plan::Values. Skip exec_values' column-name
     // String allocations (which INSERT doesn't need) and the intermediate
@@ -1906,20 +1993,45 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
                 }
             }
 
-            if let Some(_) = exec_insert_one_row(
+            // Assign the rowid BEFORE constraint enforcement so that a NULL
+            // rowid-alias (auto-assign) doesn't trip NOT NULL (SQLite treats
+            // NULL on INTEGER PRIMARY KEY as "allocate a new rowid").
+            if let Some(idx) = table.rowid_alias {
+                if full_row[idx].is_null() {
+                    max_rowid += 1;
+                    full_row[idx] = Value::Integer(max_rowid);
+                }
+            }
+
+            // NOT NULL + CHECK constraints.
+            if needs_col_names {
+                enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+            }
+
+            let outcome = exec_insert_one_row(
                 ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-                &mut full_row, &mut payload_buf, &mut index_roots, on_conflict,
-            )? {
-                inserted += 1;
+                &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert,
+            )?;
+            match outcome {
+                InsertOutcome::Inserted => {
+                    inserted += 1;
+                    if let Some(ret) = returning {
+                        returning_rows.push(project_returning_row(ret, &full_row, &col_names, &ctx.params, &ctx.named_params)?);
+                    }
+                }
+                InsertOutcome::UpdatedExisting => {
+                    inserted += 1;
+                    if let Some(ret) = returning {
+                        returning_rows.push(project_returning_row(ret, &full_row, &col_names, &ctx.params, &ctx.named_params)?);
+                    }
+                }
+                InsertOutcome::Skipped => {}
             }
         }
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
-        return Ok(ExecResult {
-            columns: vec!["inserted".to_string()],
-            rows: vec![vec![Value::Integer(inserted)]],
-        });
+        return Ok(finish_insert_result(inserted, returning, &col_names, returning_rows));
     }
 
     // Slow path: source is something else (subquery, etc.) — go through
@@ -1949,28 +2061,79 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             }
         }
 
-        if let Some(_) = exec_insert_one_row(
+        // Assign the rowid BEFORE constraint enforcement (see fast path).
+        if let Some(idx) = table.rowid_alias {
+            if full_row[idx].is_null() {
+                max_rowid += 1;
+                full_row[idx] = Value::Integer(max_rowid);
+            }
+        }
+
+        // NOT NULL + CHECK constraints.
+        if needs_col_names {
+            enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+        }
+
+        let outcome = exec_insert_one_row(
             ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-            &mut full_row, &mut payload_buf, &mut index_roots, on_conflict,
-        )? {
-            inserted += 1;
+            &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert,
+        )?;
+        match outcome {
+            InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
+                inserted += 1;
+                if let Some(ret) = returning {
+                    returning_rows.push(project_returning_row(ret, &full_row, &col_names, &ctx.params, &ctx.named_params)?);
+                }
+            }
+            InsertOutcome::Skipped => {}
         }
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
-    Ok(ExecResult {
-        columns: vec!["inserted".to_string()],
-        rows: vec![vec![Value::Integer(inserted)]],
-    })
+    Ok(finish_insert_result(inserted, returning, &col_names, returning_rows))
+}
+
+/// Build the final ExecResult for an INSERT (with or without RETURNING).
+fn finish_insert_result(
+    inserted: i64,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+    col_names: &[String],
+    returning_rows: Vec<Vec<Value>>,
+) -> ExecResult {
+    if let Some(ret) = returning {
+        ExecResult {
+            columns: returning_column_names(ret, col_names),
+            rows: returning_rows,
+        }
+    } else {
+        ExecResult {
+            columns: vec!["inserted".to_string()],
+            rows: vec![vec![Value::Integer(inserted)]],
+        }
+    }
+}
+
+/// What happened to one row in an INSERT statement.
+#[derive(Clone, Copy, PartialEq)]
+enum InsertOutcome {
+    /// A brand-new row was inserted.
+    Inserted,
+    /// UPSERT DO UPDATE modified an existing row.
+    UpdatedExisting,
+    /// The row was skipped (OR IGNORE / DO NOTHING).
+    Skipped,
 }
 
 /// Insert a single row into the table B+tree + maintain indexes.
-/// Returns `Some(rowid)` if the row was inserted, or `None` if it was
-/// skipped (e.g. OR IGNORE on a duplicate).
+/// Returns the `InsertOutcome` describing what happened (inserted /
+/// upsert-updated / skipped).
 ///
 /// Extracted from exec_insert's loop body so the fast-path (Plan::Values)
 /// and slow-path (generic source) can both call it.
+///
+/// On UPSERT DO UPDATE, `full_row` is REPLACED with the merged (updated)
+/// row so the caller can project RETURNING from it.
 fn exec_insert_one_row(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -1981,7 +2144,8 @@ fn exec_insert_one_row(
     payload_buf: &mut Vec<u8>,
     index_roots: &mut Vec<(Arc<crate::schema::Index>, u32)>,
     on_conflict: ConflictResolution,
-) -> Result<Option<i64>> {
+    upsert: Option<&crate::sql::ast::UpsertClause>,
+) -> Result<InsertOutcome> {
     // Compute rowid. `rowid_was_autogenerated` tracks whether WE assigned
     // the rowid (vs. the user providing it explicitly). This is used below
     // to skip the redundant `lookup_table` check when we KNOW the rowid is
@@ -2013,54 +2177,116 @@ fn exec_insert_one_row(
         *max_rowid
     };
 
+    // Determine which constraint the UPSERT target refers to:
+    //  - `Some(i)` — the unique index at position i
+    //  - `RowidPk` — the INTEGER PRIMARY KEY (rowid)
+    //  - `Any`     — empty target list (any uniqueness constraint)
+    enum UpsertTarget {
+        Any,
+        RowidPk,
+        Index(usize),
+    }
+    let upsert_target = match upsert {
+        Some(u) if u.target.is_empty() => UpsertTarget::Any,
+        Some(u) => {
+            let idx_pos = index_roots.iter().position(|(idx, _)| {
+                idx.unique
+                    && idx.columns.len() == u.target.len()
+                    && u.target.iter().all(|t| {
+                        idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&t.name))
+                    })
+            });
+            match idx_pos {
+                Some(i) => UpsertTarget::Index(i),
+                None => {
+                    // Single-column target on the rowid alias (INTEGER PK)?
+                    if u.target.len() == 1 {
+                        if let Some(col_idx) = table.find_column(&u.target[0].name) {
+                            if table.rowid_alias == Some(col_idx) {
+                                UpsertTarget::RowidPk
+                            } else {
+                                return Err(Error::semantic(
+                                    "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                                ));
+                            }
+                        } else {
+                            return Err(Error::semantic(
+                                "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                            ));
+                        }
+                    } else {
+                        return Err(Error::semantic(
+                            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                        ));
+                    }
+                }
+            }
+        }
+        None => UpsertTarget::Any,
+    };
+
     // UNIQUE-index constraint check: before touching the table btree, look
     // up the new row's key in every UNIQUE index on this table. If any
     // index already contains the key, the row is a duplicate and we apply
     // the configured conflict resolution (IGNORE → skip, REPLACE → delete
-    // the conflicting row first, ABORT/FAIL/ROLLBACK → error).
-    if !index_roots.is_empty() {
-        let mut conflict_rowid: Option<i64> = None;
-        for (idx, idx_root) in index_roots.iter() {
-            if !idx.unique {
-                continue;
-            }
-            let key_bytes = encode_index_key(idx, table, full_row);
-            let mut ibt = Btree::new(ctx.pager, *idx_root, true);
-            let matches = ibt.lookup_index(&key_bytes)?;
-            if !matches.is_empty() {
-                conflict_rowid = Some(matches[0]);
-                break;
+    // the conflicting row first, ABORT/FAIL/ROLLBACK → error,
+    // UPSERT → DO NOTHING / DO UPDATE).
+    let mut conflict_rowid: Option<i64> = None;
+    let mut conflict_on_target = false;
+    for (i, (idx, idx_root)) in index_roots.iter().enumerate() {
+        if !idx.unique {
+            continue;
+        }
+        let key_bytes = encode_index_key(idx, table, full_row);
+        let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+        let matches = ibt.lookup_index(&key_bytes)?;
+        if !matches.is_empty() {
+            conflict_rowid = Some(matches[0]);
+            conflict_on_target = matches!(
+                upsert_target,
+                UpsertTarget::Any | UpsertTarget::Index(_)
+            ) && (matches!(upsert_target, UpsertTarget::Any) || {
+                if let UpsertTarget::Index(t) = &upsert_target { *t == i } else { false }
+            });
+            break;
+        }
+    }
+    if let Some(existing_rowid) = conflict_rowid {
+        // UPSERT path: conflicts on the targeted index take the upsert
+        // action; conflicts on OTHER constraints are plain errors.
+        if conflict_on_target {
+            if let Some(u) = upsert {
+                return exec_upsert_row(
+                    ctx, table, table_name_lc, current_root, full_row, payload_buf,
+                    index_roots, existing_rowid, u,
+                );
             }
         }
-        if let Some(existing_rowid) = conflict_rowid {
-            match on_conflict {
-                ConflictResolution::Ignore => return Ok(None),
-                ConflictResolution::Replace => {
-                    // Delete the conflicting row from the table and from
-                    // all indexes (we'll re-insert the new row below).
-                    let mut bt = Btree::new(ctx.pager, *current_root, false);
-                    let old_payload_opt = match bt.lookup_table(existing_rowid)? {
-                        LookupResult::Found(p) => Some(p),
-                        LookupResult::NotFound => None,
-                    };
-                    bt.delete_table(existing_rowid)?;
-                    *current_root = bt.root;
-                    ctx.set_table_root_lc(table_name_lc, *current_root);
-                    if let Some(old_payload) = old_payload_opt {
-                        if let Ok(_old_row) = decode_row(&old_payload, table.n_columns()) {
-                            for (_idx, idx_root) in index_roots.iter_mut() {
-                                let mut ibt = Btree::new(ctx.pager, *idx_root, true);
-                                ibt.delete_index(existing_rowid)?;
-                                *idx_root = ibt.root;
-                            }
-                        }
+        match on_conflict {
+            ConflictResolution::Ignore => return Ok(InsertOutcome::Skipped),
+            ConflictResolution::Replace => {
+                // Delete the conflicting row from the table and from
+                // all indexes (we'll re-insert the new row below).
+                let mut bt = Btree::new(ctx.pager, *current_root, false);
+                let old_payload_opt = match bt.lookup_table(existing_rowid)? {
+                    LookupResult::Found(p) => Some(p),
+                    LookupResult::NotFound => None,
+                };
+                bt.delete_table(existing_rowid)?;
+                *current_root = bt.root;
+                ctx.set_table_root_lc(table_name_lc, *current_root);
+                if old_payload_opt.is_some() {
+                    for (_idx, idx_root) in index_roots.iter_mut() {
+                        let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                        ibt.delete_index(existing_rowid)?;
+                        *idx_root = ibt.root;
                     }
                 }
-                _ => return Err(Error::semantic(format!(
-                    "UNIQUE constraint failed: {}",
-                    table.name
-                ))),
             }
+            _ => return Err(Error::semantic(format!(
+                "UNIQUE constraint failed: {}",
+                table.name
+            ))),
         }
     }
 
@@ -2096,13 +2322,24 @@ fn exec_insert_one_row(
             let lookup = bt.lookup_table(rowid)?;
             match lookup {
                 LookupResult::Found(existing_payload) => {
+                    // Rowid conflict. UPSERT applies when the target is
+                    // empty (any constraint) or the rowid PK itself.
+                    if let Some(u) = upsert {
+                        if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk) {
+                            drop_payload(existing_payload);
+                            return exec_upsert_row(
+                                ctx, table, table_name_lc, current_root, full_row, payload_buf,
+                                index_roots, rowid, u,
+                            );
+                        }
+                    }
                     match on_conflict {
                         ConflictResolution::Replace => {
                             old_payload_opt = Some(existing_payload);
                             bt.delete_table(rowid)?;
                             bt.insert_table(rowid, payload)?;
                         }
-                        ConflictResolution::Ignore => return Ok(None),
+                        ConflictResolution::Ignore => return Ok(InsertOutcome::Skipped),
                         _ => return Err(Error::semantic(format!("UNIQUE constraint failed: rowid={}", rowid))),
                     }
                 }
@@ -2138,7 +2375,131 @@ fn exec_insert_one_row(
     ctx.last_insert_rowid = rowid;
     ctx.changes += 1;
     ctx.set_max_rowid_lc(table_name_lc, rowid);
-    Ok(Some(rowid))
+    Ok(InsertOutcome::Inserted)
+}
+
+/// Consume an unused payload (helper to make the control flow above clear).
+#[inline]
+fn drop_payload(_p: Vec<u8>) {}
+
+/// Execute the UPSERT action (`ON CONFLICT ... DO NOTHING / DO UPDATE SET`).
+///
+/// Reads the existing row, evaluates the SET assignments with unqualified
+/// column refs bound to the EXISTING row and `excluded.<col>` refs bound to
+/// the proposed (new) row, applies the optional WHERE guard, rewrites the
+/// row in the B+tree, and maintains indexes.
+///
+/// On success, `full_row` is replaced with the merged row (for RETURNING).
+fn exec_upsert_row(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    table_name_lc: &str,
+    current_root: &mut u32,
+    full_row: &mut Vec<Value>,
+    payload_buf: &mut Vec<u8>,
+    index_roots: &mut Vec<(Arc<crate::schema::Index>, u32)>,
+    existing_rowid: i64,
+    upsert: &crate::sql::ast::UpsertClause,
+) -> Result<InsertOutcome> {
+    match &upsert.action {
+        crate::sql::ast::UpsertAction::DoNothing => {
+            return Ok(InsertOutcome::Skipped);
+        }
+        crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } => {
+            // Read the existing row.
+            let mut bt = Btree::new(ctx.pager, *current_root, false);
+            let old_payload = match bt.lookup_table(existing_rowid)? {
+                LookupResult::Found(p) => p,
+                LookupResult::NotFound => {
+                    // Shouldn't happen (index said it exists) — treat as insert.
+                    return Ok(InsertOutcome::Skipped);
+                }
+            };
+            let n_cols = table.n_columns();
+            let old_row = match decode_row(&old_payload, n_cols) {
+                Ok(r) => r,
+                Err(_) => return Ok(InsertOutcome::Skipped),
+            };
+
+            // Build a combined evaluation context: unqualified refs → the
+            // existing row; `excluded.<col>` → the proposed row.
+            let mut comb_names: Vec<String> = Vec::with_capacity(n_cols * 2);
+            let mut comb_row: Vec<Value> = Vec::with_capacity(n_cols * 2);
+            for (i, c) in table.columns.iter().enumerate() {
+                comb_names.push(c.name.clone());
+                comb_row.push(old_row.get(i).cloned().unwrap_or(Value::Null));
+            }
+            for (i, c) in table.columns.iter().enumerate() {
+                comb_names.push(format!("excluded.{}", c.name));
+                comb_row.push(full_row.get(i).cloned().unwrap_or(Value::Null));
+            }
+
+            // Apply SET assignments onto the old row.
+            let mut new_row = old_row.clone();
+            for (col_name, expr) in set {
+                let col_idx = table
+                    .find_column(col_name)
+                    .ok_or_else(|| Error::semantic(format!("no such column: {}", col_name)))?;
+                let v = eval_row(expr, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
+                let aff = table.columns[col_idx].affinity;
+                new_row[col_idx] = aff.coerce(v);
+            }
+
+            // WHERE guard: if false, the conflict is left in place (no-op).
+            // Column refs bind to the PRE-update row (SQLite semantics).
+            if let Some(w) = where_clause {
+                let v = eval_row(w, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
+                if !v.is_truthy() {
+                    return Ok(InsertOutcome::Skipped);
+                }
+            }
+
+            // Enforce NOT NULL + CHECK on the merged row.
+            let plain_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+            enforce_row_constraints(table, &new_row, &plain_names, &ctx.params, &ctx.named_params)?;
+
+            // Rowid alias must stay consistent (it's the B+tree key).
+            if let Some(idx) = table.rowid_alias {
+                new_row[idx] = Value::Integer(existing_rowid);
+            }
+
+            // Rewrite the row: in-place when the payload size is unchanged,
+            // otherwise delete + insert.
+            payload_buf.clear();
+            encode_row_into(&new_row, payload_buf);
+            {
+                let mut bt = Btree::new(ctx.pager, *current_root, false);
+                let did_in_place = bt.update_table(existing_rowid, payload_buf).unwrap_or(false);
+                if !did_in_place {
+                    bt.delete_table(existing_rowid)?;
+                    bt.insert_table(existing_rowid, payload_buf)?;
+                }
+                *current_root = bt.root;
+                ctx.set_table_root_lc(table_name_lc, *current_root);
+            }
+
+            // Index maintenance: update entries whose key changed.
+            for (idx, idx_root) in index_roots.iter_mut() {
+                let old_key = encode_index_key(idx, table, &old_row);
+                let new_key = encode_index_key(idx, table, &new_row);
+                if old_key == new_key {
+                    continue;
+                }
+                let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                ibt.delete_index(existing_rowid)?;
+                *idx_root = ibt.root;
+                let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                ibt.insert_index(&new_key, existing_rowid)?;
+                *idx_root = ibt.root;
+            }
+
+            // Replace full_row with the merged row for RETURNING.
+            *full_row = new_row;
+            ctx.changes += 1;
+            ctx.last_insert_rowid = existing_rowid;
+            Ok(InsertOutcome::UpdatedExisting)
+        }
+    }
 }
 
 /// Encode the index key for a row, given the table's column layout.
@@ -2191,7 +2552,7 @@ fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
 // UPDATE
 // ============================================================================
 
-fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assignments: &[(usize, Expr)]) -> Result<ExecResult> {
+fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assignments: &[(usize, Expr)], returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
     // Streaming UPDATE fast path: when the source is a bare `Scan`, a
     // `Filter { Scan, predicate }`, or a `RowidRange`, iterate the B+tree
     // directly with a reusable row buffer. This avoids the materialize-all
@@ -2205,7 +2566,7 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     // across rows) and ONE Vec<u8> allocation for the encoded payload
     // (also reused). Cuts ~80% of the allocations on a 10k-row UPDATE,
     // closing the 23× UPDATE-range gap vs SQLite.
-    if let Some(result) = try_streaming_update(ctx, &table, source, assignments)? {
+    if let Some(result) = try_streaming_update(ctx, &table, source, assignments, returning)? {
         return Ok(result);
     }
 
@@ -2214,6 +2575,7 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     let mut updated = 0i64;
 
     let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
     for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
@@ -2228,6 +2590,8 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
             let aff = table.columns[*col_idx].affinity;
             new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
         }
+        // NOT NULL + CHECK constraints on the updated row.
+        enforce_row_constraints(&table, &new_row, &col_names, &ctx.params, &ctx.named_params)?;
         let payload = encode_row(&new_row);
         let root = ctx.table_root(&table);
         let new_root;
@@ -2270,9 +2634,18 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
         }
         ctx.changes += 1;
         updated += 1;
+        if let Some(ret) = returning {
+            returning_rows.push(project_returning_row(ret, &new_row, &col_names, &ctx.params, &ctx.named_params)?);
+        }
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
+    }
+    if let Some(ret) = returning {
+        return Ok(ExecResult {
+            columns: returning_column_names(ret, &col_names),
+            rows: returning_rows,
+        });
     }
     Ok(ExecResult {
         columns: vec!["updated".to_string()],
@@ -2307,6 +2680,7 @@ fn try_streaming_update(
     table: &Arc<Table>,
     source: &Plan,
     assignments: &[(usize, Expr)],
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<Option<ExecResult>> {
     // Detect the source shape and extract (table, filter_predicate, range, rowid).
     enum StreamingSource<'a> {
@@ -2397,42 +2771,60 @@ fn try_streaming_update(
     // heap allocations per row, which is the dominant cost on a 10k-row
     // UPDATE.
     let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
+    // RETURNING: stash decoded new rows too (only when needed).
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    // First constraint error encountered during the scan (if any).
+    let mut first_error: Option<crate::error::Error> = None;
 
     let mut bt = Btree::new(ctx.pager, root, false);
     if let Some(rowid) = lookup_rowid {
         // RowidLookup source — fetch exactly one row by rowid.
         match bt.lookup_table(rowid)? {
             LookupResult::Found(payload) => {
-                process_update_row(
+                if let Err(e) = process_update_row(
                     &payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
-                    residual_pred, &mut updates,
-                );
+                    residual_pred, &mut updates, &mut returning_rows, returning,
+                ) {
+                    first_error = Some(e);
+                }
             }
             LookupResult::NotFound => {}
         }
         Ok::<(), crate::error::Error>(())
     } else if matches!(src, StreamingSource::RowidRange { .. }) {
         bt.scan_table_range_borrowed(range_start, range_end, |_rowid, payload| {
-            process_update_row(
+            if let Err(e) = process_update_row(
                 payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
-                residual_pred, &mut updates,
-            );
+                residual_pred, &mut updates, &mut returning_rows, returning,
+            ) {
+                first_error = Some(e);
+                return false; // stop the scan
+            }
             true
         })
     } else {
         bt.scan_table_borrowed(|_rowid, payload| {
-            process_update_row(
+            if let Err(e) = process_update_row(
                 payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
-                residual_pred, &mut updates,
-            );
+                residual_pred, &mut updates, &mut returning_rows, returning,
+            ) {
+                first_error = Some(e);
+                return false; // stop the scan
+            }
             true
         })
     }?;
     let new_root = bt.root;
     ctx.set_table_root(&table.name, new_root);
+
+    // Surface any constraint error BEFORE applying updates (statement
+    // aborts atomically — the pager snapshot/rollback handles the rest).
+    if let Some(e) = first_error {
+        return Err(e);
+    }
 
     // Phase 2: apply the updates. For each (rowid, new_payload):
     //   1. If any index exists AND the SET assignments touch an indexed
@@ -2518,6 +2910,12 @@ fn try_streaming_update(
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
+    if let Some(ret) = returning {
+        return Ok(Some(ExecResult {
+            columns: returning_column_names(ret, &col_names),
+            rows: returning_rows,
+        }));
+    }
     Ok(Some(ExecResult {
         columns: vec!["updated".to_string()],
         rows: vec![vec![Value::Integer(updated)]],
@@ -2526,8 +2924,8 @@ fn try_streaming_update(
 
 /// Per-row processing for the streaming UPDATE: decode the payload into
 /// `row_buf`, apply the filter predicate, build the new row in `new_row`,
-/// encode it into `payload_buf`, and push the (rowid, payload) tuple into
-/// `updates`. Buffers are reused across rows.
+/// enforce constraints, encode it into `payload_buf`, and push the
+/// (rowid, payload) tuple into `updates`. Buffers are reused across rows.
 #[allow(clippy::too_many_arguments)]
 fn process_update_row(
     payload: &[u8],
@@ -2542,10 +2940,12 @@ fn process_update_row(
     table: &Arc<Table>,
     residual_pred: Option<&Expr>,
     updates: &mut Vec<(i64, Vec<u8>)>,
-) {
+    returning_rows: &mut Vec<Vec<Value>>,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+) -> Result<()> {
     row_buf.clear();
     if decode_row_into(payload, n_cols, row_buf).is_err() {
-        return;
+        return Ok(());
     }
     // Extract rowid from the rowid-alias column (or _rowid_).
     let rowid = if let Some(idx) = table.rowid_alias {
@@ -2558,45 +2958,54 @@ fn process_update_row(
         match eval_row(pred, row_buf, col_names, params, named_params) {
             Ok(v) => {
                 if !v.is_truthy() {
-                    return;
+                    return Ok(());
                 }
             }
-            Err(_) => return,
+            Err(e) => return Err(e),
         }
     }
     // Build the new row: copy old values, apply SET assignments.
     new_row.clear();
     new_row.extend_from_slice(row_buf);
     for (col_idx, expr) in assignments {
-        match eval_row(expr, row_buf, col_names, params, named_params) {
-            Ok(v) => {
-                let aff = table.columns[*col_idx].affinity;
-                new_row[*col_idx] = aff.coerce(v);
-            }
-            Err(_) => return,
-        }
+        let v = eval_row(expr, row_buf, col_names, params, named_params)?;
+        let aff = table.columns[*col_idx].affinity;
+        new_row[*col_idx] = aff.coerce(v);
     }
+    // NOT NULL + CHECK constraints on the updated row.
+    enforce_row_constraints(table, new_row, col_names, params, named_params)?;
     // Encode the new row.
     payload_buf.clear();
     encode_row_into(new_row, payload_buf);
+    // RETURNING: project now (the row is final).
+    if let Some(ret) = returning {
+        returning_rows.push(project_returning_row(ret, new_row, col_names, params, named_params)?);
+    }
     // Stash the (rowid, payload) for phase 2.
     updates.push((rowid, payload_buf.clone()));
+    Ok(())
 }
 
 // ============================================================================
 // DELETE
 // ============================================================================
 
-fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan) -> Result<ExecResult> {
+fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
     let source_res = execute(source, ctx)?;
     let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let mut deleted = 0i64;
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else {
             return Err(Error::Unsupported("DELETE on a table without INTEGER PRIMARY KEY"));
         };
+        // RETURNING: project the pre-delete row.
+        if let Some(ret) = returning {
+            returning_rows.push(project_returning_row(ret, row, &col_names, &ctx.params, &ctx.named_params)?);
+        }
         let root = ctx.table_root(&table);
         let new_root;
         {
@@ -2614,6 +3023,12 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan) -> R
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
+    }
+    if let Some(ret) = returning {
+        return Ok(ExecResult {
+            columns: returning_column_names(ret, &col_names),
+            rows: returning_rows,
+        });
     }
     Ok(ExecResult {
         columns: vec!["deleted".to_string()],

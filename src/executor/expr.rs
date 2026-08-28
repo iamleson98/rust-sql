@@ -438,39 +438,13 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             }
             .to_string(),
         ),
-        "date" | "time" | "datetime" | "strftime" | "julianday" => {
-            // Minimal date support: just return current time.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            match fname.as_str() {
-                "date" => Value::Text(format!("1970-01-01")),
-                "time" => Value::Text(format!(
-                    "{:02}:{:02}:{:02}",
-                    (now / 3600) % 24,
-                    (now / 60) % 60,
-                    now % 60
-                )),
-                "datetime" => Value::Text(format!(
-                    "1970-01-01 {:02}:{:02}:{:02}",
-                    (now / 3600) % 24,
-                    (now / 60) % 60,
-                    now % 60
-                )),
-                "julianday" => Value::Real(2440587.5 + now as f64 / 86400.0),
-                _ => Value::Null,
-            }
+        "date" | "time" | "datetime" | "strftime" | "julianday" | "unixepoch" | "timediff" => {
+            // Full SQLite-compatible date/time engine (see datetime.rs).
+            crate::executor::datetime::call_datetime_function(&fname, args)
         }
-        "current_date" => Value::Text("1970-01-01".to_string()),
-        "current_time" => Value::Text("00:00:00".to_string()),
-        "current_timestamp" => Value::Text("1970-01-01 00:00:00".to_string()),
-        "unixepoch" => Value::Integer(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-        ),
+        "current_date" | "current_time" | "current_timestamp" => {
+            crate::executor::datetime::call_datetime_function(&fname, args)
+        }
         "last_insert_rowid" => Value::Integer(0), // overridden by executor
         "changes" => Value::Integer(0),
         "total_changes" => Value::Integer(0),

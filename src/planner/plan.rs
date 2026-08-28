@@ -119,15 +119,21 @@ pub enum Plan {
         source: Box<Plan>,
         columns: Option<Vec<usize>>,
         on_conflict: crate::sql::ast::ConflictResolution,
+        /// `ON CONFLICT ... DO NOTHING / DO UPDATE SET ...` (UPSERT).
+        upsert: Option<crate::sql::ast::UpsertClause>,
+        /// `RETURNING <cols>` — if present, output one row per affected row.
+        returning: Option<Vec<crate::sql::ast::ResultColumn>>,
     },
     Update {
         table: Arc<Table>,
         source: Box<Plan>,
         assignments: Vec<(usize, Expr)>,
+        returning: Option<Vec<crate::sql::ast::ResultColumn>>,
     },
     Delete {
         table: Arc<Table>,
         source: Box<Plan>,
+        returning: Option<Vec<crate::sql::ast::ResultColumn>>,
     },
 }
 

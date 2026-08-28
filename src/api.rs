@@ -372,7 +372,19 @@ impl Database {
                 ctx.bind_positional(v);
             }
             let res = execute(&plan, &mut ctx)?;
-            // For SELECT, root_overrides/max_rowids don't change. Don't write back.
+            // For SELECT, root_overrides/max_rowids don't change. For DML
+            // with RETURNING (INSERT..RETURNING etc. via the query path),
+            // the root pages may have moved due to B+tree splits — write
+            // them back so subsequent statements see the new roots.
+            if matches!(
+                plan.as_ref(),
+                crate::planner::plan::Plan::Insert { .. }
+                    | crate::planner::plan::Plan::Update { .. }
+                    | crate::planner::plan::Plan::Delete { .. }
+            ) {
+                *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
+                *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
+            }
             Ok(res.rows)
         } else {
             Ok(Vec::new())
@@ -408,6 +420,15 @@ impl Database {
                 ctx.bind_positional(v);
             }
             let res = execute(&plan, &mut ctx)?;
+            if matches!(
+                plan.as_ref(),
+                crate::planner::plan::Plan::Insert { .. }
+                    | crate::planner::plan::Plan::Update { .. }
+                    | crate::planner::plan::Plan::Delete { .. }
+            ) {
+                *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
+                *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
+            }
             Ok((res.columns, res.rows))
         } else {
             Ok((Vec::new(), Vec::new()))
@@ -500,6 +521,8 @@ impl Database {
             source: Box::new(source_plan),
             columns,
             on_conflict,
+            upsert: ins.upsert.clone(),
+            returning: ins.returning.clone(),
         })
     }
 
@@ -532,6 +555,7 @@ impl Database {
             table,
             source: Box::new(source),
             assignments,
+            returning: upd.returning.clone(),
         })
     }
 
@@ -557,6 +581,7 @@ impl Database {
         Ok(crate::planner::plan::Plan::Delete {
             table,
             source: Box::new(source),
+            returning: del.returning.clone(),
         })
     }
 
@@ -638,7 +663,86 @@ impl Database {
                     &table.create_sql,
                 );
                 insert_schema_row(ctx.pager, &schema_row)?;
-                catalog.add_table(table);
+                catalog.add_table(table.clone());
+
+                // Implicit UNIQUE indexes — mirrors SQLite's
+                // `sqlite_autoindex_<table>_<n>` behavior:
+                //   1. Column-level UNIQUE constraints.
+                //   2. Table-level UNIQUE (a, b, ...) constraints.
+                //   3. Table-level PRIMARY KEY that is NOT a rowid alias
+                //      (composite PKs, or a single non-INTEGER PK column).
+                //
+                // Without these, UNIQUE constraints in CREATE TABLE were
+                // silently unenforced (no index → no conflict detection).
+                // We synthesize a parseable `CREATE UNIQUE INDEX` statement
+                // as the schema SQL so the index round-trips on reopen.
+                let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
+                for col in &columns {
+                    if col.constraints.iter().any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique)) {
+                        implicit.push(vec![crate::sql::ast::IndexedColumn {
+                            name: col.name.clone(),
+                            order: crate::sql::ast::Order::Asc,
+                            collation: None,
+                        }]);
+                    }
+                }
+                for c in &constraints {
+                    match c {
+                        crate::sql::ast::TableConstraint::Unique(cols) => {
+                            implicit.push(cols.clone());
+                        }
+                        crate::sql::ast::TableConstraint::PrimaryKey { columns: cols } => {
+                            // Skip the single INTEGER PK (rowid alias).
+                            let is_rowid_alias = cols.len() == 1
+                                && table.rowid_alias.is_some()
+                                && columns
+                                    .iter()
+                                    .position(|cc| cc.name.eq_ignore_ascii_case(&cols[0].name))
+                                    .map(|ci| table.rowid_alias == Some(ci))
+                                    .unwrap_or(false);
+                            if !is_rowid_alias {
+                                implicit.push(cols.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (n, cols) in implicit.iter().enumerate() {
+                    let idx_name = format!("sqlite_autoindex_{}_{}", name.name, n + 1);
+                    let col_list = cols
+                        .iter()
+                        .map(|ic| format!("\"{}\"", ic.name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let idx_sql = format!(
+                        "CREATE UNIQUE INDEX \"{}\" ON \"{}\"({})",
+                        idx_name, name.name, col_list
+                    );
+                    let idx_root = ctx.pager.allocate_page()?;
+                    {
+                        let page = ctx.pager.get_page(idx_root)?;
+                        page.lock().init_leaf_index();
+                    }
+                    let idx_columns = crate::schema::build_index_columns(cols, &table)?;
+                    let index = crate::schema::Index {
+                        name: idx_name.clone(),
+                        table: table.name.clone(),
+                        columns: idx_columns,
+                        root_page: idx_root,
+                        unique: true,
+                        partial_expr: None,
+                        create_sql: idx_sql.clone(),
+                    };
+                    let schema_row = crate::schema::encode_schema_row(
+                        "index",
+                        &index.name,
+                        &index.table,
+                        idx_root,
+                        &index.create_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                    catalog.add_index(index);
+                }
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -731,9 +835,33 @@ impl Database {
     fn execute_drop(d: DropStatement, ctx: &mut ExecContext, catalog: &mut Catalog) -> Result<()> {
         match d.kind {
             DropKind::Table => {
+                // Capture indexes BEFORE the catalog drop removes them.
+                let indexes_on_it = catalog.indexes_on_table(&d.name);
                 let table = catalog.drop_table(&d.name).ok_or_else(|| Error::NotFound(format!("table: {}", d.name)))?;
                 ctx.pager.free_page(table.root_page)?;
                 delete_schema_row(ctx.pager, "table", &d.name)?;
+                // Also free root pages and delete schema rows for every
+                // index on this table — including implicit UNIQUE indexes.
+                // Previously these rows survived, so reopening the file
+                // resurrected orphaned indexes pointing at freed pages.
+                for idx in &indexes_on_it {
+                    let _ = ctx.pager.free_page(idx.root_page);
+                }
+                let mut bt = Btree::new(ctx.pager, 0, false);
+                let mut to_delete = Vec::new();
+                bt.scan_table(|rowid, payload| {
+                    if let Ok(row) = decode_row(payload, 5) {
+                        if let Some((kind, _n, tbl_name, _rootpage, _sql)) = crate::schema::decode_schema_row(&row) {
+                            if kind == "index" && tbl_name.eq_ignore_ascii_case(&d.name) {
+                                to_delete.push(rowid);
+                            }
+                        }
+                    }
+                    true
+                })?;
+                for rowid in to_delete {
+                    bt.delete_table(rowid)?;
+                }
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -1032,5 +1160,238 @@ mod tests {
         let mut db = Database::open(tmp.path()).unwrap();
         let rows = db.query("SELECT name FROM t", []).unwrap();
         assert_eq!(rows[0][0], Value::Text("Alice".into()));
+    }
+
+    // ========================================================================
+    // UPSERT / RETURNING / CHECK / NOT NULL / date-time integration tests
+    // ========================================================================
+
+    #[test]
+    fn upsert_do_nothing() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)", []).unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')", []).unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO NOTHING",
+            [],
+        ).unwrap();
+        let rows = db.query("SELECT id, val FROM t", []).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::Text("a".into()));
+    }
+
+    #[test]
+    fn upsert_do_update() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, n INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a', 10)", []).unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'b', 5) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n",
+            [],
+        ).unwrap();
+        let rows = db.query("SELECT id, val, n FROM t", []).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SET doesn't touch val → old value 'a'; n = 10 + 5 = 15.
+        assert_eq!(rows[0][1], Value::Text("a".into()));
+        assert_eq!(rows[0][2], Value::Integer(15));
+
+        // Upsert with a direct excluded reference replacing the column.
+        db.execute(
+            "INSERT INTO t VALUES (1, 'z', 100) ON CONFLICT (id) DO UPDATE SET val = excluded.val, n = excluded.n",
+            [],
+        ).unwrap();
+        let rows = db.query("SELECT val, n FROM t", []).unwrap();
+        assert_eq!(rows[0][0], Value::Text("z".into()));
+        assert_eq!(rows[0][1], Value::Integer(100));
+    }
+
+    #[test]
+    fn upsert_unique_index_target() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)", []).unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a@x.com', 'Alice')", []).unwrap();
+        // Conflict on the UNIQUE(email) index — targeted upsert.
+        db.execute(
+            "INSERT INTO t VALUES (2, 'a@x.com', 'Bob') ON CONFLICT (email) DO UPDATE SET name = excluded.name",
+            [],
+        ).unwrap();
+        let rows = db.query("SELECT id, name FROM t", []).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(1));
+        assert_eq!(rows[0][1], Value::Text("Bob".into()));
+    }
+
+    #[test]
+    fn upsert_where_guard() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)", []).unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n < 50",
+            [],
+        ).unwrap();
+        let rows = db.query("SELECT n FROM t", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(99));
+        // Guard fails (99 >= 50) → no-op.
+        db.execute(
+            "INSERT INTO t VALUES (1, 1000) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n < 50",
+            [],
+        ).unwrap();
+        let rows = db.query("SELECT n FROM t", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(99));
+    }
+
+    #[test]
+    fn upsert_bad_target_errors() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)", []).unwrap();
+        let err = db.execute(
+            "INSERT INTO t VALUES (1, 1, 1) ON CONFLICT (a, b) DO NOTHING",
+            [],
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn insert_returning() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        let rows = db.query(
+            "INSERT INTO t (x) VALUES (10), (20) RETURNING id, x",
+            [],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Integer(1));
+        assert_eq!(rows[0][1], Value::Integer(10));
+        assert_eq!(rows[1][0], Value::Integer(2));
+        assert_eq!(rows[1][1], Value::Integer(20));
+    }
+
+    #[test]
+    fn insert_returning_star() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        let rows = db.query(
+            "INSERT INTO t (x) VALUES (7) RETURNING *",
+            [],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(7)]);
+    }
+
+    #[test]
+    fn update_returning() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+        let rows = db.query(
+            "UPDATE t SET x = x * 2 WHERE x > 15 RETURNING id, x",
+            [],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Integer(2));
+        assert_eq!(rows[0][1], Value::Integer(40));
+        assert_eq!(rows[1][1], Value::Integer(60));
+    }
+
+    #[test]
+    fn delete_returning() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+        let rows = db.query(
+            "DELETE FROM t WHERE x <= 20 RETURNING x",
+            [],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Integer(10));
+        assert_eq!(rows[1][0], Value::Integer(20));
+        let left = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(left[0][0], Value::Integer(1));
+    }
+
+    #[test]
+    fn check_constraint_enforced() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0))", []).unwrap();
+        db.execute("INSERT INTO t (age) VALUES (25)", []).unwrap();
+        let err = db.execute("INSERT INTO t (age) VALUES (-1)", []);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("CHECK constraint failed"));
+        // UPDATE violating the CHECK fails too.
+        let err = db.execute("UPDATE t SET age = -5 WHERE age = 25", []);
+        assert!(err.is_err());
+        // Table still has the valid row.
+        let rows = db.query("SELECT age FROM t", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(25));
+    }
+
+    #[test]
+    fn table_level_check_constraint() {
+        let mut db = memdb();
+        db.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a < b))",
+            [],
+        ).unwrap();
+        let ok = db.execute("INSERT INTO t VALUES (1, 2)", []);
+        assert!(ok.is_ok());
+        let err = db.execute("INSERT INTO t VALUES (2, 1)", []);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn not_null_constraint_enforced() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", []).unwrap();
+        let err = db.execute("INSERT INTO t (name) VALUES (NULL)", []);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("NOT NULL constraint failed"));
+        // UPDATE to NULL also fails.
+        db.execute("INSERT INTO t (name) VALUES ('a')", []).unwrap();
+        let err = db.execute("UPDATE t SET name = NULL", []);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn datetime_functions_end_to_end() {
+        let mut db = memdb();
+        let rows = db.query("SELECT date('2023-07-14'), datetime('2023-07-14 13:45:28'), time('23:59:59')", []).unwrap();
+        assert_eq!(rows[0][0], Value::Text("2023-07-14".into()));
+        assert_eq!(rows[0][1], Value::Text("2023-07-14 13:45:28".into()));
+        assert_eq!(rows[0][2], Value::Text("23:59:59".into()));
+
+        let rows = db.query("SELECT julianday('1970-01-01'), unixepoch('2023-01-01 00:00:00')", []).unwrap();
+        match &rows[0][0] {
+            Value::Real(f) => assert!((f - 2440587.5).abs() < 1e-6),
+            v => panic!("expected real, got {:?}", v),
+        }
+        assert_eq!(rows[0][1], Value::Integer(1672531200));
+
+        let rows = db.query(
+            "SELECT date('2023-01-31', '+1 day'), date('2023-07-14', 'start of month', '+2 days')",
+            [],
+        ).unwrap();
+        assert_eq!(rows[0][0], Value::Text("2023-02-01".into()));
+        assert_eq!(rows[0][1], Value::Text("2023-07-03".into()));
+
+        let rows = db.query(
+            "SELECT strftime('%Y|%m|%d %H:%M:%S', '2023-07-14 09:08:07'), strftime('%s', '1970-01-01 00:00:00')",
+            [],
+        ).unwrap();
+        assert_eq!(rows[0][0], Value::Text("2023|07|14 09:08:07".into()));
+        assert_eq!(rows[0][1], Value::Text("0".into()));
+    }
+
+    #[test]
+    fn datetime_where_filter() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, day TEXT)", []).unwrap();
+        db.execute("INSERT INTO events (day) VALUES ('2023-01-01'), ('2023-06-15'), ('2024-03-20')", []).unwrap();
+        let rows = db.query(
+            "SELECT day FROM events WHERE day > date('2023-01-01', '+90 days') ORDER BY day",
+            [],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Text("2023-06-15".into()));
     }
 }
