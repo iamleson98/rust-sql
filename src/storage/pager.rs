@@ -282,6 +282,15 @@ impl Pager {
 
     /// Flush all dirty pages to disk and sync.
     pub fn flush(&mut self) -> Result<()> {
+        // Fast path: if no dirty pages, skip everything (including sync_all).
+        // This makes `flush()` after a query-only workload a no-op, which
+        // matters when `Database::query` calls flush before reads in
+        // deferred_flush mode — without this, every SELECT would pay an
+        // fsync for no reason.
+        let has_dirty = self.cache.values().any(|p| p.borrow().dirty);
+        if !has_dirty {
+            return Ok(());
+        }
         // Update file header on page 0
         if let Some(page0) = self.cache.get(&0) {
             let mut borrowed = page0.borrow_mut();
@@ -409,6 +418,13 @@ impl Pager {
 
     pub fn cache_capacity(&self) -> usize {
         self.cache_capacity
+    }
+
+    /// Count the number of dirty pages currently in the cache. Used by
+    /// `Database::execute` to decide whether to force a deferred flush
+    /// when `deferred_flush` mode is enabled.
+    pub fn dirty_page_count(&self) -> usize {
+        self.cache.values().filter(|p| p.borrow().dirty).count()
     }
 }
 

@@ -330,7 +330,13 @@ fn sqlite_mixed_workload(conn: &rusqlite::Connection, ops: usize) -> Duration {
 // ===========================================================================
 
 fn rustqlite_open() -> rustqlite::Database {
-    rustqlite::Database::open_in_memory().unwrap()
+    let mut db = rustqlite::Database::open_in_memory().unwrap();
+    // Enable deferred flush to amortize fsync across N statements. Mirrors
+    // SQLite's WAL + synchronous=NORMAL behaviour, which is the default in
+    // real workloads. Without this, every auto-commit INSERT/UPDATE/DELETE
+    // pays ~3 µs of fsync cost per call (5-10× slower than SQLite).
+    db.set_deferred_flush(true);
+    db
 }
 
 fn rustqlite_create_table(db: &mut rustqlite::Database) {

@@ -34,6 +34,12 @@ pub struct ExecContext<'a> {
     pub changes: i64,
     /// When true (inside BEGIN..COMMIT), DML operators skip per-statement flushes.
     pub in_transaction: bool,
+    /// When true (Database::deferred_flush), DML operators skip per-statement
+    /// flushes even outside an explicit transaction. Mirrors SQLite's WAL+
+    /// synchronous=NORMAL behaviour. The caller (Database::execute) is
+    /// responsible for forcing a flush on the next SELECT, on reaching the
+    /// dirty-page threshold, or on an explicit `Database::flush()` call.
+    pub deferred_flush: bool,
     /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager.
     pub txn_snapshot: Option<crate::storage::pager::PagerSnapshot>,
     /// Catalog snapshot taken before the statement started. Used to look up
@@ -59,6 +65,7 @@ impl<'a> ExecContext<'a> {
             last_insert_rowid: 0,
             changes: 0,
             in_transaction: false,
+            deferred_flush: false,
             txn_snapshot: None,
             catalog_ptr: catalog,
             root_overrides: HashMap::new(),
@@ -1455,7 +1462,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         ctx.set_max_rowid(&table.name, rowid);
     }
     // Only flush when not inside an explicit transaction.
-    if !ctx.in_transaction {
+    if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
     Ok(ExecResult {
@@ -1577,7 +1584,7 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
         ctx.changes += 1;
         updated += 1;
     }
-    if !ctx.in_transaction {
+    if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
     Ok(ExecResult {
@@ -1615,7 +1622,7 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan) -> R
         ctx.changes += 1;
         deleted += 1;
     }
-    if !ctx.in_transaction {
+    if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
     Ok(ExecResult {
