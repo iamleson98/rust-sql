@@ -25,6 +25,11 @@ for row in &rows {
 
 - **DDL**: `CREATE TABLE`, `CREATE INDEX` (unique + partial), `CREATE VIEW`, `CREATE TRIGGER`, `DROP TABLE/INDEX/VIEW/TRIGGER`, `ALTER TABLE` (parsed, not fully implemented)
 - **DML**: `INSERT` (with `OR REPLACE/IGNORE`, `... RETURNING`, `UPSERT`), `UPDATE`, `DELETE` (with `RETURNING`)
+- **UPSERT**: `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE SET ... [WHERE ...]` with `excluded.*` references (SQLite semantics)
+- **RETURNING**: `INSERT/UPDATE/DELETE ... RETURNING * | exprs` on all three write paths
+- **CHECK + NOT NULL constraints**: enforced on INSERT, UPDATE, and UPSERT merges (column-level and table-level)
+- **Implicit UNIQUE indexes**: column/table-level UNIQUE and non-rowid PKs create `sqlite_autoindex_*` (actually enforced)
+- **Subqueries**: uncorrelated scalar / `IN (SELECT ...)` / `EXISTS (SELECT ...)` — executed once per statement, arbitrarily nested
 - **Queries**: `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`
 - **Joins**: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`, with `ON` / `USING`
 - **Set operations**: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
@@ -33,14 +38,16 @@ for row in &rows {
 - **Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM() OVER (...)`, etc.
 - **Aggregates**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`, with `DISTINCT`
 - **Expressions**: arithmetic, string concat (`||`), bitwise, `CASE WHEN`, `CAST`, `LIKE`, `GLOB`, `BETWEEN`, `IN`, `IS NULL`, `IS`, etc.
-- **Functions**: `ABS`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTR`, `COALESCE`, `NULLIF`, `IIF`, `ROUND`, `RANDOM`, `HEX`, `TYPEOF`, date/time, and more
+- **Functions**: `ABS`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTR`, `COALESCE`, `NULLIF`, `IIF`, `ROUND`, `RANDOM`, `HEX`, `TYPEOF`, `INSTR`, `PRINTF`, scalar `MIN`/`MAX`, math functions, and more
+- **Date/time (full SQLite compatibility)**: `date()`, `time()`, `datetime()`, `julianday()`, `unixepoch()`, `strftime()`, `timediff()` with all modifiers (`+N days/months/years`, `start of month/year/day`, `end of month`, `weekday N`, `unixepoch`, `localtime`/`utc`, `subsec`) — a faithful port of SQLite's `date.c`
 - **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` (auto-commit per statement; full transaction semantics still being wired up)
 - **Pragmas**: `PRAGMA` (most are no-ops; honored: none yet)
 
 ### Storage
 
 - **Page format**: 4 KiB pages (configurable), 100-byte file header on page 0
-- **B+tree**: clustered table B+tree (key = rowid) and index B+tree (key = encoded values)
+- **B+tree**: clustered table B+tree (key = rowid) and index B+tree sorted by (key, rowid) with an order-preserving key encoding — O(log N) index seeks, prefix lookups for composite indexes, and range scans
+- **Index range scans**: `WHERE indexed_col > ?` / `BETWEEN` plans an `IndexRange` (index seek + fetch only matching rows)
 - **Pager**: LRU cache, freelist, page allocation, dirty page tracking
 - **WAL**: write-ahead log with CRC32 checksums, salt-based recovery, frame-level integrity
 - **MVCC**: snapshot isolation via WAL frame indexing (foundation in place)
@@ -181,6 +188,8 @@ This is a proof-of-concept. Known gaps:
 - **Date/time**: Minimal stubs — `CURRENT_TIMESTAMP` always returns the Unix epoch.
 - **Collations**: Only `BINARY` is honored.
 - **Pragmas**: All no-ops.
+- **Correlated subqueries**: clean "unsupported" errors (uncorrelated ones work).
+- **UPDATE/DELETE without INTEGER PRIMARY KEY**: not supported (rowid tracking).
 
 ## License
 
