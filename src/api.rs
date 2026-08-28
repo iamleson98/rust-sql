@@ -311,10 +311,21 @@ impl Database {
         // containing Plan::Values { Vec<Vec<Expr>> }, several heap
         // allocations). With the cached plan, we skip all of that.
         let result = if let Some(plan) = plan_opt {
-            // Execute the cached plan directly. Only Insert/Update/Delete/
+            // Substitute uncorrelated subqueries (scalar / IN / EXISTS) with
+            // their materialized results before execution — mirrors
+            // SQLite's OP_Once evaluation. Skipped entirely (zero cost)
+            // when the plan has no subquery expressions.
+            let plan_local;
+            let plan_ref: &crate::planner::plan::Plan = if crate::executor::plan_has_subqueries(&plan) {
+                plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+                &plan_local
+            } else {
+                &plan
+            };
+            // Execute the (possibly rewritten) plan directly. Only Insert/Update/Delete/
             // Select produce plans (DDL returns None), so this branch only
             // fires for those statement types.
-            execute(&plan, &mut ctx).map(|_| ())
+            execute(plan_ref, &mut ctx).map(|_| ())
         } else {
             // No cached plan — DDL statement. execute_statement_static
             // handles DDL directly (CREATE/DROP/ALTER/ATTACH/DETACH/
@@ -371,7 +382,15 @@ impl Database {
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
-            let res = execute(&plan, &mut ctx)?;
+            // Substitute uncorrelated subqueries before execution.
+            let plan_local;
+            let plan_ref: &crate::planner::plan::Plan = if crate::executor::plan_has_subqueries(&plan) {
+                plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+                &plan_local
+            } else {
+                &plan
+            };
+            let res = execute(plan_ref, &mut ctx)?;
             // For SELECT, root_overrides/max_rowids don't change. For DML
             // with RETURNING (INSERT..RETURNING etc. via the query path),
             // the root pages may have moved due to B+tree splits — write
@@ -419,7 +438,15 @@ impl Database {
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
-            let res = execute(&plan, &mut ctx)?;
+            // Substitute uncorrelated subqueries before execution.
+            let plan_local;
+            let plan_ref: &crate::planner::plan::Plan = if crate::executor::plan_has_subqueries(&plan) {
+                plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+                &plan_local
+            } else {
+                &plan
+            };
+            let res = execute(plan_ref, &mut ctx)?;
             if matches!(
                 plan.as_ref(),
                 crate::planner::plan::Plan::Insert { .. }
@@ -1393,5 +1420,107 @@ mod tests {
         ).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Text("2023-06-15".into()));
+    }
+
+    // ========================================================================
+    // Subquery tests (scalar / IN / EXISTS)
+    // ========================================================================
+
+    #[test]
+    fn scalar_subquery_in_select() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+        let rows = db.query("SELECT (SELECT MAX(x) FROM t) AS m", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(30));
+        // Scalar subquery in WHERE.
+        let rows = db.query("SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t)", []).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(30));
+    }
+
+    #[test]
+    fn scalar_subquery_empty_returns_null() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        let rows = db.query("SELECT (SELECT x FROM t WHERE id = 99)", []).unwrap();
+        assert_eq!(rows[0][0], Value::Null);
+    }
+
+    #[test]
+    fn in_subquery() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("INSERT INTO a (v) VALUES (1), (2), (3), (4)", []).unwrap();
+        db.execute("INSERT INTO b (v) VALUES (2), (4), (6)", []).unwrap();
+        let rows = db.query("SELECT v FROM a WHERE v IN (SELECT v FROM b) ORDER BY v", []).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Integer(2));
+        assert_eq!(rows[1][0], Value::Integer(4));
+        // NOT IN
+        let rows = db.query("SELECT v FROM a WHERE v NOT IN (SELECT v FROM b) ORDER BY v", []).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Integer(1));
+        assert_eq!(rows[1][0], Value::Integer(3));
+    }
+
+    #[test]
+    fn exists_subquery() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("INSERT INTO a (v) VALUES (1), (2)", []).unwrap();
+        // Empty b → EXISTS false, NOT EXISTS true.
+        let rows = db.query("SELECT EXISTS (SELECT 1 FROM b)", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(0));
+        let rows = db.query("SELECT NOT EXISTS (SELECT 1 FROM b)", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(1));
+        db.execute("INSERT INTO b (v) VALUES (5)", []).unwrap();
+        let rows = db.query("SELECT EXISTS (SELECT 1 FROM b)", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(1));
+        // EXISTS in WHERE.
+        let rows = db.query("SELECT v FROM a WHERE EXISTS (SELECT 1 FROM b)", []).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn nested_subqueries() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (5), (15), (25)", []).unwrap();
+        // Subquery within a subquery: inner MIN=5, middle MIN(x WHERE x>5)=15.
+        let rows = db.query(
+            "SELECT x FROM t WHERE x > (SELECT MIN(x) FROM t WHERE x > (SELECT MIN(x) FROM t)) ORDER BY x",
+            [],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(25));
+    }
+
+    #[test]
+    fn subquery_with_parameters() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+        let rows = db.query(
+            "SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t WHERE x < ?)",
+            vec![Value::Integer(30)],
+        ).unwrap();
+        // Subquery: AVG over rows where x < 30 → 15. Rows where x > 15: 20, 30.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Integer(20));
+        assert_eq!(rows[1][0], Value::Integer(30));
+    }
+
+    #[test]
+    fn correlated_subquery_errors_cleanly() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("INSERT INTO a (v) VALUES (1)", []).unwrap();
+        // Correlated (a.v referenced inside subquery) → clean error, not a panic.
+        let result = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = a.v)", []);
+        assert!(result.is_err());
     }
 }

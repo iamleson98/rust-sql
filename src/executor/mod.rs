@@ -295,6 +295,843 @@ fn returning_column_names(
 }
 
 // ============================================================================
+// Subquery substitution (uncorrelated scalar / IN / EXISTS subqueries)
+// ============================================================================
+
+/// Does this expression tree contain any subquery expression nodes?
+pub fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) | Expr::Exists(_) => true,
+        Expr::In { source: InSource::Subquery(_), .. } => true,
+        _ => {
+            let mut found = false;
+            map_expr_children(e, &mut |child| {
+                if expr_has_subquery(child) {
+                    found = true;
+                }
+                Ok(child.clone())
+            })
+            .ok();
+            found
+        }
+    }
+}
+
+/// Apply a function to each immediate child expression of `e`, rebuilding
+/// the node with the (possibly replaced) children.
+fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Expr> {
+    macro_rules! r {
+        ($x:expr) => {
+            f($x)?
+        };
+    }
+    Ok(match e {
+        Expr::Literal(v) => Expr::Literal(v.clone()),
+        Expr::Parameter(p) => Expr::Parameter(p.clone()),
+        Expr::Column { table, name } => Expr::Column { table: table.clone(), name: name.clone() },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(r!(left)),
+            right: Box::new(r!(right)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary { op: *op, expr: Box::new(r!(expr)) },
+        Expr::Between { expr, low, high, negated } => Expr::Between {
+            expr: Box::new(r!(expr)),
+            low: Box::new(r!(low)),
+            high: Box::new(r!(high)),
+            negated: *negated,
+        },
+        Expr::In { expr, source, negated } => {
+            let new_source = match source {
+                InSource::List(list) => {
+                    let mut new_list = Vec::with_capacity(list.len());
+                    for item in list {
+                        new_list.push(r!(item));
+                    }
+                    InSource::List(new_list)
+                }
+                other => other.clone(),
+            };
+            Expr::In { expr: Box::new(r!(expr)), source: new_source, negated: *negated }
+        }
+        Expr::Like { op, expr, pattern, escape, negated } => {
+            let new_escape = match escape.as_ref() {
+                Some(es) => Some(Box::new(r!(es.as_ref()))),
+                None => None,
+            };
+            Expr::Like {
+                op: *op,
+                expr: Box::new(r!(expr)),
+                pattern: Box::new(r!(pattern)),
+                escape: new_escape,
+                negated: *negated,
+            }
+        }
+        Expr::IsNull { expr, negated } => Expr::IsNull { expr: Box::new(r!(expr)), negated: *negated },
+        Expr::Is { left, right, negated } => Expr::Is {
+            left: Box::new(r!(left)),
+            right: Box::new(r!(right)),
+            negated: *negated,
+        },
+        Expr::Function { name, distinct, args, filter, over } => {
+            let mut new_args = Vec::with_capacity(args.len());
+            for a in args {
+                new_args.push(r!(a));
+            }
+            let new_filter = match filter.as_ref() {
+                Some(ftr) => Some(Box::new(r!(ftr.as_ref()))),
+                None => None,
+            };
+            Expr::Function {
+                name: name.clone(),
+                distinct: *distinct,
+                args: new_args,
+                filter: new_filter,
+                over: over.clone(),
+            }
+        }
+        Expr::Case { operand, whens, else_ } => {
+            let new_operand = match operand.as_ref() {
+                Some(o) => Some(Box::new(r!(o.as_ref()))),
+                None => None,
+            };
+            let mut new_whens = Vec::with_capacity(whens.len());
+            for (w, v) in whens {
+                new_whens.push((r!(w), r!(v)));
+            }
+            let new_else = match else_.as_ref() {
+                Some(el) => Some(Box::new(r!(el.as_ref()))),
+                None => None,
+            };
+            Expr::Case { operand: new_operand, whens: new_whens, else_: new_else }
+        }
+        Expr::Row(items) => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for i in items {
+                new_items.push(r!(i));
+            }
+            Expr::Row(new_items)
+        }
+        Expr::Subquery(sel) => Expr::Subquery(sel.clone()),
+        Expr::Exists(sel) => Expr::Exists(sel.clone()),
+        Expr::Cast { expr, type_name } => Expr::Cast { expr: Box::new(r!(expr)), type_name: type_name.clone() },
+        Expr::Collate { expr, collation } => Expr::Collate { expr: Box::new(r!(expr)), collation: collation.clone() },
+        Expr::Raise { action, message } => {
+            let new_message = match message.as_ref() {
+                Some(m) => Some(Box::new(r!(m.as_ref()))),
+                None => None,
+            };
+            Expr::Raise {
+                action: *action,
+                message: new_message,
+            }
+        }
+    })
+}
+
+/// Rewrite all UNCORRELATED subquery expressions in a plan into literals /
+/// IN-lists by executing them once (mirrors SQLite's OP_Once caching).
+/// Correlated subqueries are left untouched (they error at eval time).
+pub fn rewrite_plan_subqueries(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<Plan> {
+    let mut new_plan = plan.clone();
+    rewrite_plan_subqueries_in_place(&mut new_plan, ctx)?;
+    Ok(new_plan)
+}
+
+/// Quick scan: does this plan contain any subquery expressions?
+pub fn plan_has_subqueries(plan: &Plan) -> bool {
+    fn exprs_in_plan<'a>(p: &'a Plan, out: &mut Vec<&'a Expr>) {
+        match p {
+            Plan::Scan { predicate, .. } => {
+                if let Some(e) = predicate.as_ref() {
+                    out.push(e);
+                }
+            }
+            Plan::RowidLookup { rowid, .. } => out.push(rowid),
+            Plan::RowidRange { start, end, residual, .. } => {
+                if let Some(s) = start.as_ref() {
+                    out.push(s);
+                }
+                if let Some(e) = end.as_ref() {
+                    out.push(e);
+                }
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
+            Plan::IndexLookup { key_exprs, .. } => {
+                for k in key_exprs {
+                    out.push(k);
+                }
+            }
+            Plan::Values { rows } => {
+                for row in rows {
+                    for e in row {
+                        out.push(e);
+                    }
+                }
+            }
+            Plan::Filter { input, predicate } => {
+                out.push(predicate);
+                exprs_in_plan(input, out);
+            }
+            Plan::Project { input, columns } => {
+                for c in columns {
+                    out.push(&c.expr);
+                }
+                exprs_in_plan(input, out);
+            }
+            Plan::Sort { input, terms } => {
+                for t in terms {
+                    out.push(&t.expr);
+                }
+                exprs_in_plan(input, out);
+            }
+            Plan::Limit { input, count, offset } => {
+                out.push(count);
+                out.push(offset);
+                exprs_in_plan(input, out);
+            }
+            Plan::Aggregate { input, group_by, aggregates } => {
+                for g in group_by {
+                    out.push(g);
+                }
+                for a in aggregates {
+                    if let Some(arg) = a.arg.as_ref() {
+                        out.push(arg);
+                    }
+                }
+                exprs_in_plan(input, out);
+            }
+            Plan::Window { input, windows } => {
+                for w in windows {
+                    if let Some(arg) = w.arg.as_ref() {
+                        out.push(arg);
+                    }
+                    for p in &w.partition_by {
+                        out.push(p);
+                    }
+                    for t in &w.order_by {
+                        out.push(&t.expr);
+                    }
+                }
+                exprs_in_plan(input, out);
+            }
+            Plan::Join { left, right, condition, .. } => {
+                if let Some(c) = condition.as_ref() {
+                    out.push(c);
+                }
+                exprs_in_plan(left, out);
+                exprs_in_plan(right, out);
+            }
+            Plan::IndexNestedLoopJoin { outer, .. } => exprs_in_plan(outer, out),
+            Plan::Subquery { plan } => exprs_in_plan(plan, out),
+            Plan::Distinct { input } => exprs_in_plan(input, out),
+            Plan::Union { left, right, .. } => {
+                exprs_in_plan(left, out);
+                exprs_in_plan(right, out);
+            }
+            Plan::Intersect { left, right } => {
+                exprs_in_plan(left, out);
+                exprs_in_plan(right, out);
+            }
+            Plan::Except { left, right } => {
+                exprs_in_plan(left, out);
+                exprs_in_plan(right, out);
+            }
+            Plan::Insert { source, .. } => exprs_in_plan(source, out),
+            Plan::Update { source, assignments, .. } => {
+                for (_i, e) in assignments {
+                    out.push(e);
+                }
+                exprs_in_plan(source, out);
+            }
+            Plan::Delete { source, .. } => exprs_in_plan(source, out),
+        }
+    }
+    let mut exprs = Vec::new();
+    exprs_in_plan(plan, &mut exprs);
+    exprs.iter().any(|e| expr_has_subquery(e))
+}
+
+fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) -> Result<()> {
+    match plan {
+        Plan::Scan { predicate, .. } => {
+            if let Some(p) = predicate.as_mut() {
+                rewrite_expr_in_place(p, ctx)?;
+            }
+        }
+        Plan::RowidLookup { rowid, .. } => {
+            rewrite_expr_in_place(rowid, ctx)?;
+        }
+        Plan::RowidRange { start, end, residual, .. } => {
+            if let Some(s) = start.as_mut() {
+                rewrite_expr_in_place(s, ctx)?;
+            }
+            if let Some(e) = end.as_mut() {
+                rewrite_expr_in_place(e, ctx)?;
+            }
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
+            }
+        }
+        Plan::IndexLookup { key_exprs, .. } => {
+            for k in key_exprs.iter_mut() {
+                rewrite_expr_in_place(k, ctx)?;
+            }
+        }
+        Plan::Values { rows } => {
+            for row in rows.iter_mut() {
+                for e in row.iter_mut() {
+                    rewrite_expr_in_place(e, ctx)?;
+                }
+            }
+        }
+        Plan::Filter { input, predicate } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+            rewrite_expr_in_place(predicate, ctx)?;
+        }
+        Plan::Project { input, columns } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+            for c in columns.iter_mut() {
+                rewrite_expr_in_place(&mut c.expr, ctx)?;
+            }
+        }
+        Plan::Sort { input, terms } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+            for t in terms.iter_mut() {
+                rewrite_expr_in_place(&mut t.expr, ctx)?;
+            }
+        }
+        Plan::Limit { input, count, offset } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+            rewrite_expr_in_place(count, ctx)?;
+            rewrite_expr_in_place(offset, ctx)?;
+        }
+        Plan::Aggregate { input, group_by, aggregates } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+            for g in group_by.iter_mut() {
+                rewrite_expr_in_place(g, ctx)?;
+            }
+            for a in aggregates.iter_mut() {
+                if let Some(arg) = a.arg.as_mut() {
+                    rewrite_expr_in_place(arg, ctx)?;
+                }
+            }
+        }
+        Plan::Window { input, windows } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+            for w in windows.iter_mut() {
+                if let Some(arg) = w.arg.as_mut() {
+                    rewrite_expr_in_place(arg, ctx)?;
+                }
+                for p in w.partition_by.iter_mut() {
+                    rewrite_expr_in_place(p, ctx)?;
+                }
+                for t in w.order_by.iter_mut() {
+                    rewrite_expr_in_place(&mut t.expr, ctx)?;
+                }
+            }
+        }
+        Plan::Join { left, right, condition, .. } => {
+            rewrite_plan_subqueries_in_place(left, ctx)?;
+            rewrite_plan_subqueries_in_place(right, ctx)?;
+            if let Some(c) = condition.as_mut() {
+                rewrite_expr_in_place(c, ctx)?;
+            }
+        }
+        Plan::IndexNestedLoopJoin { outer, .. } => {
+            rewrite_plan_subqueries_in_place(outer, ctx)?;
+        }
+        Plan::Subquery { plan } => {
+            rewrite_plan_subqueries_in_place(plan, ctx)?;
+        }
+        Plan::Distinct { input } => {
+            rewrite_plan_subqueries_in_place(input, ctx)?;
+        }
+        Plan::Union { left, right, .. } => {
+            rewrite_plan_subqueries_in_place(left, ctx)?;
+            rewrite_plan_subqueries_in_place(right, ctx)?;
+        }
+        Plan::Intersect { left, right } => {
+            rewrite_plan_subqueries_in_place(left, ctx)?;
+            rewrite_plan_subqueries_in_place(right, ctx)?;
+        }
+        Plan::Except { left, right } => {
+            rewrite_plan_subqueries_in_place(left, ctx)?;
+            rewrite_plan_subqueries_in_place(right, ctx)?;
+        }
+        Plan::Insert { source, .. } => {
+            rewrite_plan_subqueries_in_place(source, ctx)?;
+        }
+        Plan::Update { source, assignments, .. } => {
+            rewrite_plan_subqueries_in_place(source, ctx)?;
+            for (_idx, e) in assignments.iter_mut() {
+                rewrite_expr_in_place(e, ctx)?;
+            }
+        }
+        Plan::Delete { source, .. } => {
+            rewrite_plan_subqueries_in_place(source, ctx)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite subqueries inside a single expression, in place.
+fn rewrite_expr_in_place(expr: &mut Expr, ctx: &mut ExecContext<'_>) -> Result<()> {
+    if !expr_has_subquery(expr) {
+        return Ok(());
+    }
+    let rewritten = rewrite_subqueries_rec(expr, ctx)?;
+    *expr = rewritten;
+    Ok(())
+}
+
+/// Bottom-up rewrite of subquery nodes in an expression.
+fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
+    // First, rewrite children.
+    let e = map_expr_children(e, &mut |child| rewrite_subqueries_rec(child, ctx))?;
+    // Then, handle this node if it is a subquery node.
+    match e {
+        Expr::Subquery(sel) => {
+            // Rewrite any NESTED subqueries inside this subquery first.
+            let mut sel = *sel;
+            rewrite_select_subqueries(&mut sel, ctx)?;
+            if subquery_is_correlated(&sel, ctx.catalog()) {
+                Ok(Expr::Subquery(Box::new(sel)))
+            } else {
+                let res = exec_select_statement(&sel, ctx)?;
+                let v = res
+                    .rows
+                    .first()
+                    .and_then(|r| r.first().cloned())
+                    .unwrap_or(Value::Null);
+                Ok(Expr::Literal(v))
+            }
+        }
+        Expr::Exists(sel) => {
+            let mut sel = *sel;
+            rewrite_select_subqueries(&mut sel, ctx)?;
+            if subquery_is_correlated(&sel, ctx.catalog()) {
+                Ok(Expr::Exists(Box::new(sel)))
+            } else {
+                let res = exec_select_statement(&sel, ctx)?;
+                Ok(Expr::Literal(Value::Integer(if res.rows.is_empty() { 0 } else { 1 })))
+            }
+        }
+        Expr::In { expr, source, negated } => {
+            let inner = match source {
+                InSource::Subquery(sel) => {
+                    let mut sel = *sel;
+                    rewrite_select_subqueries(&mut sel, ctx)?;
+                    if subquery_is_correlated(&sel, ctx.catalog()) {
+                        InSource::Subquery(Box::new(sel))
+                    } else {
+                        let res = exec_select_statement(&sel, ctx)?;
+                        let list: Vec<Expr> = res
+                            .rows
+                            .iter()
+                            .map(|r| Expr::Literal(r.first().cloned().unwrap_or(Value::Null)))
+                            .collect();
+                        InSource::List(list)
+                    }
+                }
+                other => other,
+            };
+            Ok(Expr::In { expr, source: inner, negated })
+        }
+        other => Ok(other),
+    }
+}
+
+/// Rewrite subquery expressions inside a SELECT statement (its WHERE,
+/// projection, HAVING, GROUP BY, ORDER BY, LIMIT, join conditions —
+/// including nested subqueries).
+fn rewrite_select_subqueries(sel: &mut SelectStatement, ctx: &mut ExecContext<'_>) -> Result<()> {
+    rewrite_body_subqueries(&mut sel.body, ctx)?;
+    for t in sel.order_by.iter_mut() {
+        rewrite_expr_in_place(&mut t.expr, ctx)?;
+    }
+    if let Some(l) = sel.limit.as_mut() {
+        rewrite_expr_in_place(l, ctx)?;
+    }
+    if let Some(o) = sel.offset.as_mut() {
+        rewrite_expr_in_place(o, ctx)?;
+    }
+    Ok(())
+}
+
+fn rewrite_body_subqueries(body: &mut SelectBody, ctx: &mut ExecContext<'_>) -> Result<()> {
+    match body {
+        SelectBody::Simple(s) => {
+            for c in s.columns.iter_mut() {
+                if let ResultColumn::Expr { expr, .. } = c {
+                    rewrite_expr_in_place(expr, ctx)?;
+                }
+            }
+            if let Some(w) = s.where_clause.as_mut() {
+                rewrite_expr_in_place(w, ctx)?;
+            }
+            for g in s.group_by.iter_mut() {
+                rewrite_expr_in_place(g, ctx)?;
+            }
+            if let Some(h) = s.having.as_mut() {
+                rewrite_expr_in_place(h, ctx)?;
+            }
+            if let Some(from) = s.from.as_mut() {
+                rewrite_table_expression_subqueries(from, ctx)?;
+            }
+        }
+        SelectBody::Binary { left, right, .. } => {
+            rewrite_body_subqueries(left, ctx)?;
+            rewrite_body_subqueries(right, ctx)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_table_expression_subqueries(te: &mut TableExpression, ctx: &mut ExecContext<'_>) -> Result<()> {
+    match te {
+        TableExpression::Table { .. } => {}
+        TableExpression::Subquery { select, .. } => {
+            rewrite_select_subqueries(select, ctx)?;
+        }
+        TableExpression::Join { left, right, constraint, .. } => {
+            rewrite_table_expression_subqueries(left, ctx)?;
+            rewrite_table_expression_subqueries(right, ctx)?;
+            if let JoinConstraint::On(e) = constraint {
+                rewrite_expr_in_place(e, ctx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plan + execute a SELECT statement (used by subquery substitution).
+fn exec_select_statement(sel: &SelectStatement, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
+    let catalog = ctx.catalog();
+    let mut planner = crate::planner::Planner::new(catalog);
+    let plan = planner.plan_select(sel)?;
+    execute(&plan, ctx)
+}
+
+/// Conservative correlated-subquery detector: collect every column ref in
+/// the subquery (including nested subqueries) and every source name (also
+/// including nested sources). If any ref's qualifier isn't a local source,
+/// or any unqualified ref doesn't match a local source column, treat the
+/// subquery as correlated (outer refs present).
+fn subquery_is_correlated(sel: &SelectStatement, catalog: &crate::schema::Catalog) -> bool {
+    let mut sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut source_tables: Vec<Arc<Table>> = Vec::new();
+    collect_select_sources(sel, catalog, &mut sources, &mut source_tables);
+    let refs = collect_select_refs(sel);
+    for (qual, name) in refs {
+        if let Some(q) = qual {
+            if !sources.contains(&q.to_ascii_lowercase()) {
+                return true;
+            }
+        } else {
+            // Unqualified: must match a local source column.
+            let known = source_tables
+                .iter()
+                .any(|t| t.find_column(&name).is_some());
+            if !known {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collect source aliases/table names from a SELECT's FROM clause,
+/// including join trees and nested subqueries-in-FROM.
+fn collect_select_sources(
+    sel: &SelectStatement,
+    catalog: &crate::schema::Catalog,
+    sources: &mut std::collections::HashSet<String>,
+    source_tables: &mut Vec<Arc<Table>>,
+) {
+    collect_body_sources(&sel.body, catalog, sources, source_tables);
+    // Nested subqueries inside expressions of this SELECT also bring their
+    // own sources into scope for their own refs — collect them too so a
+    // ref to a nested alias isn't misclassified as outer.
+    let mut refs_and_subs: Vec<&SelectStatement> = Vec::new();
+    collect_nested_selects(sel, &mut refs_and_subs);
+    for s in refs_and_subs {
+        collect_body_sources(&s.body, catalog, sources, source_tables);
+    }
+}
+
+fn collect_body_sources(
+    body: &SelectBody,
+    catalog: &crate::schema::Catalog,
+    sources: &mut std::collections::HashSet<String>,
+    source_tables: &mut Vec<Arc<Table>>,
+) {
+    match body {
+        SelectBody::Simple(s) => {
+            if let Some(from) = &s.from {
+                collect_table_expression_sources(from, catalog, sources, source_tables);
+            }
+        }
+        SelectBody::Binary { left, right, .. } => {
+            collect_body_sources(left, catalog, sources, source_tables);
+            collect_body_sources(right, catalog, sources, source_tables);
+        }
+    }
+}
+
+fn collect_table_expression_sources(
+    te: &TableExpression,
+    catalog: &crate::schema::Catalog,
+    sources: &mut std::collections::HashSet<String>,
+    source_tables: &mut Vec<Arc<Table>>,
+) {
+    match te {
+        TableExpression::Table { name, alias, .. } => {
+            sources.insert(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| name.clone())
+                    .to_ascii_lowercase(),
+            );
+            if let Some(t) = catalog.get_table(name) {
+                source_tables.push(t);
+            }
+        }
+        TableExpression::Subquery { alias, select, .. } => {
+            if let Some(a) = alias {
+                sources.insert(a.to_ascii_lowercase());
+            }
+            // The derived table's columns come from its own SELECT —
+            // collect its output names so unqualified refs can match.
+            collect_body_sources(&select.body, catalog, sources, source_tables);
+        }
+        TableExpression::Join { left, right, .. } => {
+            collect_table_expression_sources(left, catalog, sources, source_tables);
+            collect_table_expression_sources(right, catalog, sources, source_tables);
+        }
+    }
+}
+
+/// Collect every column reference in a SELECT statement (all clauses,
+/// including nested subqueries).
+fn collect_select_refs(sel: &SelectStatement) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    collect_body_refs(&sel.body, &mut out);
+    for t in &sel.order_by {
+        collect_expr_refs(&t.expr, &mut out);
+    }
+    if let Some(l) = &sel.limit {
+        collect_expr_refs(l, &mut out);
+    }
+    if let Some(o) = &sel.offset {
+        collect_expr_refs(o, &mut out);
+    }
+    out
+}
+
+fn collect_body_refs(body: &SelectBody, out: &mut Vec<(Option<String>, String)>) {
+    match body {
+        SelectBody::Simple(s) => {
+            for c in &s.columns {
+                if let ResultColumn::Expr { expr, .. } = c {
+                    collect_expr_refs(expr, out);
+                }
+            }
+            if let Some(w) = &s.where_clause {
+                collect_expr_refs(w, out);
+            }
+            for g in &s.group_by {
+                collect_expr_refs(g, out);
+            }
+            if let Some(h) = &s.having {
+                collect_expr_refs(h, out);
+            }
+            if let Some(from) = &s.from {
+                collect_table_expression_refs(from, out);
+            }
+        }
+        SelectBody::Binary { left, right, .. } => {
+            collect_body_refs(left, out);
+            collect_body_refs(right, out);
+        }
+    }
+}
+
+fn collect_table_expression_refs(te: &TableExpression, out: &mut Vec<(Option<String>, String)>) {
+    match te {
+        TableExpression::Table { .. } => {}
+        TableExpression::Subquery { select, .. } => {
+            collect_body_refs(&select.body, out);
+            for t in &select.order_by {
+                collect_expr_refs(&t.expr, out);
+            }
+            if let Some(l) = &select.limit {
+                collect_expr_refs(l, out);
+            }
+        }
+        TableExpression::Join { left, right, constraint, .. } => {
+            collect_table_expression_refs(left, out);
+            collect_table_expression_refs(right, out);
+            if let JoinConstraint::On(e) = constraint {
+                collect_expr_refs(e, out);
+            }
+        }
+    }
+}
+
+fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match e {
+        Expr::Column { table, name } => {
+            out.push((table.clone(), name.clone()));
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_expr_refs(left, out);
+            collect_expr_refs(right, out);
+        }
+        Expr::Unary { expr, .. } => collect_expr_refs(expr, out),
+        Expr::Between { expr, low, high, .. } => {
+            collect_expr_refs(expr, out);
+            collect_expr_refs(low, out);
+            collect_expr_refs(high, out);
+        }
+        Expr::In { expr, source, .. } => {
+            collect_expr_refs(expr, out);
+            match source {
+                InSource::List(list) => {
+                    for item in list {
+                        collect_expr_refs(item, out);
+                    }
+                }
+                InSource::Subquery(sel) => {
+                    collect_body_refs(&sel.body, out);
+                }
+                InSource::Table(_) => {}
+            }
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            collect_expr_refs(expr, out);
+            collect_expr_refs(pattern, out);
+            if let Some(es) = escape {
+                collect_expr_refs(es, out);
+            }
+        }
+        Expr::IsNull { expr, .. } => collect_expr_refs(expr, out),
+        Expr::Is { left, right, .. } => {
+            collect_expr_refs(left, out);
+            collect_expr_refs(right, out);
+        }
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                collect_expr_refs(a, out);
+            }
+            if let Some(f) = filter {
+                collect_expr_refs(f, out);
+            }
+        }
+        Expr::Case { operand, whens, else_ } => {
+            if let Some(o) = operand {
+                collect_expr_refs(o, out);
+            }
+            for (w, v) in whens {
+                collect_expr_refs(w, out);
+                collect_expr_refs(v, out);
+            }
+            if let Some(e) = else_ {
+                collect_expr_refs(e, out);
+            }
+        }
+        Expr::Row(items) => {
+            for i in items {
+                collect_expr_refs(i, out);
+            }
+        }
+        Expr::Subquery(sel) => {
+            collect_body_refs(&sel.body, out);
+        }
+        Expr::Exists(sel) => {
+            collect_body_refs(&sel.body, out);
+        }
+        Expr::Cast { expr, .. } => collect_expr_refs(expr, out),
+        Expr::Collate { expr, .. } => collect_expr_refs(expr, out),
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message {
+                collect_expr_refs(m, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect nested SELECT statements inside a SELECT's expressions.
+fn collect_nested_selects<'a>(sel: &'a SelectStatement, out: &mut Vec<&'a SelectStatement>) {
+    let mut body_stack: Vec<&'a SelectBody> = vec![&sel.body];
+    while let Some(body) = body_stack.pop() {
+        match body {
+            SelectBody::Simple(s) => {
+                for c in &s.columns {
+                    if let ResultColumn::Expr { expr, .. } = c {
+                        collect_expr_selects(expr, out);
+                    }
+                }
+                if let Some(w) = &s.where_clause {
+                    collect_expr_selects(w, out);
+                }
+                for g in &s.group_by {
+                    collect_expr_selects(g, out);
+                }
+                if let Some(h) = &s.having {
+                    collect_expr_selects(h, out);
+                }
+            }
+            SelectBody::Binary { left, right, .. } => {
+                body_stack.push(left);
+                body_stack.push(right);
+            }
+        }
+    }
+}
+
+fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
+    match e {
+        Expr::Subquery(sel) | Expr::Exists(sel) => {
+            out.push(sel);
+            collect_nested_selects(sel, out);
+        }
+        Expr::In { source, .. } => {
+            if let InSource::Subquery(sel) = source {
+                out.push(sel);
+                collect_nested_selects(sel, out);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_expr_selects(left, out);
+            collect_expr_selects(right, out);
+        }
+        Expr::Unary { expr, .. } => collect_expr_selects(expr, out),
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_expr_selects(a, out);
+            }
+        }
+        Expr::Case { operand, whens, else_ } => {
+            if let Some(o) = operand {
+                collect_expr_selects(o, out);
+            }
+            for (w, v) in whens {
+                collect_expr_selects(w, out);
+                collect_expr_selects(v, out);
+            }
+            if let Some(e) = else_ {
+                collect_expr_selects(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
 // Scan
 // ============================================================================
 
