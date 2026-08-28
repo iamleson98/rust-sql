@@ -321,9 +321,9 @@ impl<'a> Btree<'a> {
         let root = pager.allocate_page()?;
         let page = pager.get_page(root)?;
         if is_index {
-            page.borrow_mut().init_leaf_index();
+            page.lock().init_leaf_index();
         } else {
-            page.borrow_mut().init_leaf_table();
+            page.lock().init_leaf_table();
         }
         Ok(Self {
             pager,
@@ -347,11 +347,11 @@ impl<'a> Btree<'a> {
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;
-            let pt = page.borrow().page_type()?;
+            let pt = page.lock().page_type()?;
             match pt {
                 PageType::LeafTable => {
                     // Single immutable borrow for the whole leaf scan.
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let n = borrowed.n_cells() as usize;
                     // Binary search by rowid (cells are stored sorted).
                     let mut lo = 0usize;
@@ -378,7 +378,7 @@ impl<'a> Btree<'a> {
                     return Ok(LookupResult::NotFound);
                 }
                 PageType::InteriorTable => {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let n = borrowed.n_cells() as usize;
                     // Binary search the interior cells for the right child.
                     // Cells are sorted by key; cell (left_child, key) means
@@ -448,7 +448,7 @@ impl<'a> Btree<'a> {
                 let new_root = self.pager.allocate_page()?;
                 {
                     let page_ref = self.pager.get_page(new_root)?;
-                    let mut page = page_ref.borrow_mut();
+                    let mut page = page_ref.lock();
                     page.init_interior_table();
                     page.set_right_most_pointer(new_page);
                 }
@@ -488,7 +488,7 @@ impl<'a> Btree<'a> {
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;
-            let pt = page.borrow().page_type()?;
+            let pt = page.lock().page_type()?;
             match pt {
                 PageType::LeafTable => {
                     // First pass: find the matching cell, record its offset
@@ -496,10 +496,10 @@ impl<'a> Btree<'a> {
                     // across the mutable write below.
                     let mut match_offset: Option<usize> = None;
                     let mut match_old_len: Option<usize> = None;
-                    let n = page.borrow().n_cells();
+                    let n = page.lock().n_cells();
                     for i in 0..n {
-                        let cell_ptr = page.borrow().cell_pointer(i) as usize;
-                        let borrowed = page.borrow();
+                        let cell_ptr = page.lock().cell_pointer(i) as usize;
+                        let borrowed = page.lock();
                         let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                         if let Cell::TableLeaf {
                             rowid: rid,
@@ -537,7 +537,7 @@ impl<'a> Btree<'a> {
                     // Overwrite the payload bytes — single mutable borrow,
                     // no immutable borrows outstanding.
                     {
-                        let mut borrowed = page.borrow_mut();
+                        let mut borrowed = page.lock();
                         borrowed.data[payload_offset..payload_offset + new_payload.len()]
                             .copy_from_slice(new_payload);
                         borrowed.dirty = true;
@@ -545,7 +545,7 @@ impl<'a> Btree<'a> {
                     return Ok(true);
                 }
                 PageType::InteriorTable => {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let n = borrowed.n_cells();
                     let mut next = borrowed.right_most_pointer();
                     for i in 0..n {
@@ -573,12 +573,12 @@ impl<'a> Btree<'a> {
     /// Insert a cell into a page (and propagate splits if needed).
     fn insert_into_page(&mut self, page_id: PageId, cell: Cell) -> Result<InsertResult> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
+        let pt = page.lock().page_type()?;
 
         if pt.is_leaf() {
             // Leaf: insert directly.
             let cell_size = cell.encoded_size();
-            let free = page.borrow().free_space();
+            let free = page.lock().free_space();
             // Need space for the cell + a 2-byte pointer.
             if free < cell_size as u32 + 2 {
                 drop(page);
@@ -591,7 +591,7 @@ impl<'a> Btree<'a> {
             // Convention: cell (left_child, key) means left_child contains
             // rowids <= key. right_most_pointer contains rowids > last cell's key.
             let child_id = {
-                let borrowed = page.borrow();
+                let borrowed = page.lock();
                 let n = borrowed.n_cells();
                 let k = cell.key();
                 let mut next = borrowed.right_most_pointer();
@@ -683,7 +683,7 @@ impl<'a> Btree<'a> {
                     // with two new ones, and rewrite.
                     let (n_cells, pt2) = {
                         let p = self.pager.get_page(page_id)?;
-                        let b = p.borrow();
+                        let b = p.lock();
                         (b.n_cells(), b.page_type()?)
                     };
 
@@ -693,7 +693,7 @@ impl<'a> Btree<'a> {
                     let mut found_idx: Option<usize> = None;
                     {
                         let p = self.pager.get_page(page_id)?;
-                        let borrowed = p.borrow();
+                        let borrowed = p.lock();
                         right_most = borrowed.right_most_pointer();
                         for i in 0..n_cells {
                             let cell_ptr = borrowed.cell_pointer(i) as usize;
@@ -752,7 +752,7 @@ impl<'a> Btree<'a> {
                     // Rewrite the page.
                     {
                         let p = self.pager.get_page(page_id)?;
-                        let mut borrowed = p.borrow_mut();
+                        let mut borrowed = p.lock();
                         borrowed.init_interior_table();
                         borrowed.set_right_most_pointer(right_most);
                     }
@@ -769,13 +769,13 @@ impl<'a> Btree<'a> {
     /// Insert a cell into a leaf or interior page. Cells are kept sorted by key.
     fn insert_cell_into_page(&mut self, page_id: PageId, cell: &Cell) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
+        let pt = page.lock().page_type()?;
         let cell_size = cell.encoded_size();
-        let n = page.borrow().n_cells();
+        let n = page.lock().n_cells();
 
         // Find insertion position by key.
         let pos = {
-            let borrowed = page.borrow();
+            let borrowed = page.lock();
             let mut lo = 0;
             let mut hi = n;
             while lo < hi {
@@ -793,13 +793,13 @@ impl<'a> Btree<'a> {
 
         // Allocate space at the cell content area.
         let new_content_start = {
-            let borrowed = page.borrow();
+            let borrowed = page.lock();
             borrowed.cell_content_start() - cell_size as u32
         };
 
         // Write the cell bytes.
         {
-            let mut borrowed = page.borrow_mut();
+            let mut borrowed = page.lock();
             let mut buf = Vec::with_capacity(cell_size);
             cell.encode(&mut buf);
             let off = new_content_start as usize;
@@ -835,12 +835,12 @@ impl<'a> Btree<'a> {
     fn split_leaf(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
         // Read all existing cells + the new one.
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
-        let n = page.borrow().n_cells();
+        let pt = page.lock().page_type()?;
+        let n = page.lock().n_cells();
         let mut cells: Vec<Cell> = Vec::with_capacity(n as usize + 1);
         // let mut new_pos = n as usize;
         for i in 0..n {
-            let borrowed = page.borrow();
+            let borrowed = page.lock();
             let cell_ptr = borrowed.cell_pointer(i) as usize;
             let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
             if c.key() < new_cell.key() {
@@ -876,15 +876,15 @@ impl<'a> Btree<'a> {
         // "unexpected page type in index scan: LeafTable").
         let is_index = matches!(pt, PageType::LeafIndex);
         if is_index {
-            new_page.borrow_mut().init_leaf_index();
+            new_page.lock().init_leaf_index();
         } else {
-            new_page.borrow_mut().init_leaf_table();
+            new_page.lock().init_leaf_table();
         }
 
         // Clear the old page and re-insert the first half.
         {
             let page_ref = self.pager.get_page(page_id)?;
-            let mut borrowed = page_ref.borrow_mut();
+            let mut borrowed = page_ref.lock();
             if is_index {
                 borrowed.init_leaf_index();
             } else {
@@ -913,14 +913,14 @@ impl<'a> Btree<'a> {
     /// Split an interior page. Same idea but the middle cell moves up.
     // fn split_interior(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
     //     let page = self.pager.get_page(page_id)?;
-    //     let pt = page.borrow().page_type()?;
-    //     let n = page.borrow().n_cells();
-    //     let right = page.borrow().right_most_pointer();
+    //     let pt = page.lock().page_type()?;
+    //     let n = page.lock().n_cells();
+    //     let right = page.lock().right_most_pointer();
 
     //     let mut cells: Vec<Cell> = Vec::with_capacity(n as usize + 1);
     //     let mut inserted = false;
     //     for i in 0..n {
-    //         let borrowed = page.borrow();
+    //         let borrowed = page.lock();
     //         let cell_ptr = borrowed.cell_pointer(i) as usize;
     //         let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
     //         if !inserted && new_cell.key() < c.key() {
@@ -941,12 +941,12 @@ impl<'a> Btree<'a> {
 
     //     let new_page_id = self.pager.allocate_page()?;
     //     let new_page = self.pager.get_page(new_page_id)?;
-    //     new_page.borrow_mut().init_interior_table();
+    //     new_page.lock().init_interior_table();
 
     //     // Clear old page.
     //     {
     //         let page_ref = self.pager.get_page(page_id)?;
-    //         let mut borrowed = page_ref.borrow_mut();
+    //         let mut borrowed = page_ref.lock();
     //         borrowed.init_interior_table();
     //         // Right pointer of old page becomes the left child of the split cell.
     //         if let Cell::TableInterior { left_child, .. } = &split_cell {
@@ -963,7 +963,7 @@ impl<'a> Btree<'a> {
     //         self.insert_cell_into_page(new_page_id, c)?;
     //     }
     //     // Right pointer of new page is the original right pointer.
-    //     self.pager.get_page(new_page_id)?.borrow_mut().set_right_most_pointer(right);
+    //     self.pager.get_page(new_page_id)?.lock().set_right_most_pointer(right);
 
     //     Ok(InsertResult::Split { new_page: new_page_id, split_key })
     // }
@@ -978,12 +978,12 @@ impl<'a> Btree<'a> {
 
     fn delete_from_page(&mut self, page_id: PageId, rowid: i64) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
+        let pt = page.lock().page_type()?;
         match pt {
             PageType::LeafTable | PageType::LeafIndex => {
-                let n = page.borrow().n_cells();
+                let n = page.lock().n_cells();
                 let pos = {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let mut lo = 0;
                     let mut hi = n;
                     while lo < hi {
@@ -1006,7 +1006,7 @@ impl<'a> Btree<'a> {
                 }
                 // Verify the cell at pos has the right key.
                 let key_matches = {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
                     let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     c.key() == rowid
@@ -1022,7 +1022,7 @@ impl<'a> Btree<'a> {
                 };
                 let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
                 {
-                    let mut borrowed = page.borrow_mut();
+                    let mut borrowed = page.lock();
                     let pos_usize = pos as usize;
                     let n_usize = n as usize;
                     for i in pos_usize..n_usize - 1 {
@@ -1038,7 +1038,7 @@ impl<'a> Btree<'a> {
             }
             PageType::InteriorTable | PageType::InteriorIndex => {
                 let child_id = {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let n = borrowed.n_cells();
                     let mut next = borrowed.right_most_pointer();
                     for i in 0..n {
@@ -1076,8 +1076,8 @@ impl<'a> Btree<'a> {
     /// maintenance when a child splits and we need to replace a cell).
     // fn delete_cell_from_interior(&mut self, page_id: PageId, idx: u16) -> Result<()> {
     //     let page = self.pager.get_page(page_id)?;
-    //     let pt = page.borrow().page_type()?;
-    //     let n = page.borrow().n_cells();
+    //     let pt = page.lock().page_type()?;
+    //     let n = page.lock().n_cells();
     //     if idx >= n {
     //         return Ok(());
     //     }
@@ -1088,7 +1088,7 @@ impl<'a> Btree<'a> {
     //     };
     //     let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
     //     {
-    //         let mut borrowed = page.borrow_mut();
+    //         let mut borrowed = page.lock();
     //         let pos_usize = idx as usize;
     //         let n_usize = n as usize;
     //         for i in pos_usize..n_usize - 1 {
@@ -1116,13 +1116,13 @@ impl<'a> Btree<'a> {
         f: &mut F,
     ) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
+        let pt = page.lock().page_type()?;
         match pt {
             PageType::LeafTable => {
-                let n = page.borrow().n_cells();
+                let n = page.lock().n_cells();
                 for i in 0..n {
-                    let cell_ptr = page.borrow().cell_pointer(i) as usize;
-                    let borrowed = page.borrow();
+                    let cell_ptr = page.lock().cell_pointer(i) as usize;
+                    let borrowed = page.lock();
                     let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     if let Cell::TableLeaf { rowid, payload } = cell {
                         if !f(rowid, &payload) {
@@ -1133,10 +1133,10 @@ impl<'a> Btree<'a> {
                 Ok(())
             }
             PageType::InteriorTable => {
-                let n = page.borrow().n_cells();
-                let right = page.borrow().right_most_pointer();
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
                 let cells: Vec<PageId> = {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
@@ -1179,13 +1179,13 @@ impl<'a> Btree<'a> {
         f: &mut F,
     ) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
+        let pt = page.lock().page_type()?;
         match pt {
             PageType::LeafTable => {
-                let n = page.borrow().n_cells();
+                let n = page.lock().n_cells();
                 for i in 0..n {
-                    let cell_ptr = page.borrow().cell_pointer(i) as usize;
-                    let borrowed = page.borrow();
+                    let cell_ptr = page.lock().cell_pointer(i) as usize;
+                    let borrowed = page.lock();
                     let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     if let Cell::TableLeaf { rowid, payload } = cell {
                         if rowid > end {
@@ -1201,10 +1201,10 @@ impl<'a> Btree<'a> {
                 Ok(())
             }
             PageType::InteriorTable => {
-                let n = page.borrow().n_cells();
-                let right = page.borrow().right_most_pointer();
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
                 let cells: Vec<(PageId, i64)> = {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
@@ -1269,7 +1269,7 @@ impl<'a> Btree<'a> {
                 let new_root = self.pager.allocate_page()?;
                 {
                     let page_ref = self.pager.get_page(new_root)?;
-                    let mut page = page_ref.borrow_mut();
+                    let mut page = page_ref.lock();
                     page.init_interior_index();
                     page.set_right_most_pointer(new_page);
                 }
@@ -1343,13 +1343,13 @@ impl<'a> Btree<'a> {
         f: &mut F,
     ) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.borrow().page_type()?;
+        let pt = page.lock().page_type()?;
         match pt {
             PageType::LeafIndex => {
-                let n = page.borrow().n_cells();
+                let n = page.lock().n_cells();
                 for i in 0..n {
-                    let cell_ptr = page.borrow().cell_pointer(i) as usize;
-                    let borrowed = page.borrow();
+                    let cell_ptr = page.lock().cell_pointer(i) as usize;
+                    let borrowed = page.lock();
                     let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     if let Cell::IndexLeaf { key, rowid } = cell {
                         if !f(rowid, &key) {
@@ -1360,10 +1360,10 @@ impl<'a> Btree<'a> {
                 Ok(())
             }
             PageType::InteriorIndex => {
-                let n = page.borrow().n_cells();
-                let right = page.borrow().right_most_pointer();
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
                 let cells: Vec<PageId> = {
-                    let borrowed = page.borrow();
+                    let borrowed = page.lock();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;

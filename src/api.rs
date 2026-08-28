@@ -543,7 +543,7 @@ impl Database {
                 let root_page = ctx.pager.allocate_page()?;
                 {
                     let page = ctx.pager.get_page(root_page)?;
-                    page.borrow_mut().init_leaf_table();
+                    page.lock().init_leaf_table();
                 }
                 let table = build_table(&name.name, &columns, &constraints, root_page, without_rowid, strict, original_sql)?;
                 let schema_row = crate::schema::encode_schema_row(
@@ -569,7 +569,7 @@ impl Database {
                 let root_page = ctx.pager.allocate_page()?;
                 {
                     let page = ctx.pager.get_page(root_page)?;
-                    page.borrow_mut().init_leaf_index();
+                    page.lock().init_leaf_index();
                 }
                 let idx_columns = crate::schema::build_index_columns(&columns, &table)?;
                 let index = crate::schema::Index {

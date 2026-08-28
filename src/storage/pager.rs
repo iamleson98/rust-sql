@@ -7,23 +7,41 @@
 //! - Coordinate with the WAL for durability
 //! - Snapshot/restore for transaction ROLLBACK
 //!
-//! Pages are returned via `PageRef` (an `Rc<RefCell<Page>>`) so that the
+//! Pages are returned via `PageRef` (an `Arc<Mutex<Page>>`) so that the
 //! B+tree can hold multiple references to the same page during splits and
-//! merges without copying.
+//! merges without copying, and so the cache (and hence `Pager` and
+//! `Database`) is `Send + Sync` — enabling the multi-threaded server to
+//! hold `Arc<RwLock<Database>>` and let N readers run concurrently.
 
 use crate::error::{Error, Result};
 use crate::storage::page::{
     FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAGE_SIZE, FIRST_PAGE_ID,
 };
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// A shared mutable reference to a page.
-pub type PageRef = Rc<RefCell<Page>>;
+///
+/// `Arc<Mutex<Page>>` makes `PageRef` `Send + Sync`, which in turn makes
+/// `Pager` (and therefore `Database`) `Send + Sync`. This unlocks true
+/// concurrent reads when `Database` is wrapped in `Arc<RwLock<Database>>`:
+/// N readers can hold `&Database` simultaneously, each calling `query()`
+/// without serializing against other readers.
+///
+/// We use `parking_lot::Mutex` rather than `std::sync::Mutex` because:
+///  - It's ~2× faster on the uncontended fast path (~10 ns vs ~25 ns on x86_64 Linux).
+///  - It never poisons (so a panicking thread doesn't take the DB down with it).
+///  - It's futex-based on Linux, which has lower scheduling overhead than std's `Mutex`.
+///
+/// The lock is held only briefly during each page operation (a few hundred ns
+/// for a leaf scan, a few µs for a split). The performance cost relative to
+/// the previous `Rc<RefCell<Page>>` (~10 ns per access) is negligible compared
+/// to the cost of a single B+tree seek (~1 µs).
+pub type PageRef = Arc<Mutex<Page>>;
 
 /// Snapshot of mutable pager state, captured at BEGIN. Used by ROLLBACK to
 /// restore the in-memory state to the pre-transaction point.
@@ -280,7 +298,7 @@ impl Pager {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut page.data)?;
 
-        let page_ref = Rc::new(RefCell::new(page));
+        let page_ref = Arc::new(Mutex::new(page));
         self.maybe_evict();
         self.cache.insert(id, page_ref.clone());
         self.lru.push_back(id);
@@ -292,19 +310,21 @@ impl Pager {
         if self.freelist_count > 0 {
             // Pop a page from the freelist
             let page = self.get_page(self.freelist_head)?;
-            let borrowed = page.borrow();
-            // First 4 bytes of a freelist page point to the next free page.
-            let next = u32::from_le_bytes(borrowed.data[..4].try_into().unwrap());
-            drop(borrowed);
+            let next = {
+                let borrowed = page.lock();
+                // First 4 bytes of a freelist page point to the next free page.
+                u32::from_le_bytes(borrowed.data[..4].try_into().unwrap())
+            };
             let freed = self.freelist_head;
             self.freelist_head = next;
             self.freelist_count -= 1;
 
             // Clear the page before reuse
-            let mut borrowed = page.borrow_mut();
-            borrowed.data.fill(0);
-            borrowed.dirty = true;
-            drop(borrowed);
+            {
+                let mut borrowed = page.lock();
+                borrowed.data.fill(0);
+                borrowed.dirty = true;
+            }
             // A page was dirtied (the recycled freelist page).
             self.note_write();
             Ok(freed)
@@ -313,7 +333,7 @@ impl Pager {
             let id = self.n_pages;
             let mut page = Page::new(id, self.page_size);
             page.dirty = true;
-            let page_ref = Rc::new(RefCell::new(page));
+            let page_ref = Arc::new(Mutex::new(page));
             self.maybe_evict();
             self.cache.insert(id, page_ref);
             self.lru.push_back(id);
@@ -331,7 +351,7 @@ impl Pager {
             return Err(Error::InvalidArgument("cannot free page 0".into()));
         }
         let page = self.get_page(id)?;
-        let mut borrowed = page.borrow_mut();
+        let mut borrowed = page.lock();
         borrowed.data.fill(0);
         // Write the previous freelist head into the first 4 bytes.
         borrowed.data[..4].copy_from_slice(&self.freelist_head.to_le_bytes());
@@ -362,7 +382,7 @@ impl Pager {
         }
         // Update file header on page 0
         if let Some(page0) = self.cache.get(&0) {
-            let mut borrowed = page0.borrow_mut();
+            let mut borrowed = page0.lock();
             FileHeader::write(
                 &mut borrowed.data,
                 self.page_size,
@@ -389,18 +409,17 @@ impl Pager {
         let dirty_ids: Vec<PageId> = self
             .cache
             .iter()
-            .filter(|(_, p)| p.borrow().dirty)
+            .filter(|(_, p)| p.lock().dirty)
             .map(|(id, _)| *id)
             .collect();
 
         for id in dirty_ids {
             let page = self.cache.get(&id).unwrap().clone();
-            let borrowed = page.borrow();
+            let mut borrowed = page.lock();
             let offset = id as u64 * self.page_size as u64;
             self.file.seek(SeekFrom::Start(offset))?;
             self.file.write_all(&borrowed.data)?;
-            drop(borrowed);
-            page.borrow_mut().dirty = false;
+            borrowed.dirty = false;
         }
         self.file.sync_all()?;
         // All dirty pages have been written and their dirty flags cleared.
@@ -462,7 +481,7 @@ impl Pager {
                 None => break,
             };
             let should_evict = match self.cache.get(&evict_id) {
-                Some(p) => !p.borrow().dirty,
+                Some(p) => !p.lock().dirty,
                 None => true,
             };
             if should_evict {
@@ -529,15 +548,18 @@ mod tests {
             let id = pager.allocate_page().unwrap();
             assert_eq!(id, 1);
             let page = pager.get_page(id).unwrap();
-            page.borrow_mut().data[0] = 42;
-            page.borrow_mut().mark_dirty();
+            {
+                let mut p = page.lock();
+                p.data[0] = 42;
+                p.mark_dirty();
+            }
             pager.flush().unwrap();
         }
         // Reopen and verify
         let mut pager = Pager::open(tmp.path(), 64).unwrap();
         assert_eq!(pager.n_pages(), 2);
         let page = pager.get_page(1).unwrap();
-        assert_eq!(page.borrow().data[0], 42);
+        assert_eq!(page.lock().data[0], 42);
     }
 
     #[test]

@@ -31,6 +31,10 @@ crc32fast = "1.4"
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 # Temp file for in-memory mode (always needed by api.rs)
 tempfile = "3"
+# Fast Mutex/RwLock (much faster than std::sync — futex-based, never poisoned).
+# Used by Pager cache (Arc<Mutex<Page>>) so Database becomes Send+Sync,
+# enabling true concurrent reads via Arc<RwLock<Database>>.
+parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
