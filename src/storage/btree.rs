@@ -1110,6 +1110,51 @@ impl<'a> Btree<'a> {
         self.scan_subtree(self.root, &mut f)
     }
 
+    /// Count all rows in a table B+tree WITHOUT decoding any cell payloads.
+    /// Much faster than `scan_table` + count — for `SELECT COUNT(*) FROM t`
+    /// this skips the per-row decode_row_into overhead (which dominates
+    /// the scan cost for wide rows). Returns the total number of leaf
+    /// table cells, which is the row count for a table B+tree.
+    pub fn count_rows(&mut self) -> Result<u64> {
+        self.count_subtree(self.root)
+    }
+
+    fn count_subtree(&mut self, page_id: PageId) -> Result<u64> {
+        let page = self.pager.get_page(page_id)?;
+        let (pt, n, right) = {
+            let borrowed = page.lock();
+            (borrowed.page_type()?, borrowed.n_cells(), borrowed.right_most_pointer())
+        };
+        match pt {
+            PageType::LeafTable => Ok(n as u64),
+            PageType::InteriorTable => {
+                let mut total: u64 = 0;
+                let cells: Vec<PageId> = {
+                    let borrowed = page.lock();
+                    let mut v = Vec::with_capacity(n as usize + 1);
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        if let Cell::TableInterior { left_child, .. } = c {
+                            v.push(left_child);
+                        }
+                    }
+                    v.push(right);
+                    v
+                };
+                drop(page);
+                for child in cells {
+                    total += self.count_subtree(child)?;
+                }
+                Ok(total)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in count: {:?}",
+                pt
+            ))),
+        }
+    }
+
     fn scan_subtree<F: FnMut(i64, &[u8]) -> bool>(
         &mut self,
         page_id: PageId,

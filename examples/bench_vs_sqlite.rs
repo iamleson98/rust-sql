@@ -237,6 +237,32 @@ fn bench_aggregate() -> Result {
     }
 }
 
+fn bench_count_star() -> Result {
+    let db = setup_rustqlite(N_ROWS);
+    let conn = setup_rusqlite(N_ROWS);
+    let n = 500;
+
+    let (rq_ops, _) = measure("rust-sql COUNT(*)", || {
+        for _ in 0..n {
+            let _ = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        }
+    }, n as usize);
+
+    let (rs_ops, _) = measure("rusqlite COUNT(*)", || {
+        for _ in 0..n {
+            let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(_) = rows.next().unwrap() {}
+        }
+    }, n as usize);
+
+    Result {
+        name: "COUNT(*) only (no row decode)".into(),
+        rustqlite_ops_per_sec: rq_ops,
+        rusqlite_ops_per_sec: rs_ops,
+    }
+}
+
 fn bench_concurrent_8_readers() -> Result {
     let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS)));
     let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS)));
@@ -378,6 +404,7 @@ fn main() {
         bench_point_lookup(),
         bench_range_scan(),
         bench_aggregate(),
+        bench_count_star(),
         bench_concurrent_8_readers(),
         bench_mixed_rw_4r_1w(),
     ];
