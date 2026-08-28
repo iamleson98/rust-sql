@@ -2529,8 +2529,8 @@ fn exec_index_nested_loop_join(
             None => continue, // NULL join key — no matches in INNER join.
         };
 
-        // Encode the key for index lookup.
-        let key_bytes = key_value.encode();
+        // Encode the key for index lookup (order-preserving form).
+        let key_bytes = key_value.encode_order_key();
 
         // Look up matching rowids in the index B+tree.
         let mut index_bt = Btree::new(ctx.pager, inner_index.root_page, true);
@@ -2730,10 +2730,11 @@ fn exec_index_lookup(
         .map(|e| evaluate(e, &eval_ctx))
         .collect::<Result<_>>()?;
 
-    // Encode the key: concatenate the encoded form of each indexed column value.
+    // Encode the key: concatenate the order-preserving encoded form of each
+    // indexed column value (must match encode_index_key's encoding).
     let mut key_bytes = Vec::new();
     for v in &key_values {
-        key_bytes.extend_from_slice(&v.encode());
+        v.encode_order_key_into(&mut key_bytes);
     }
 
     // Look up matching rowids in the index.
@@ -3112,11 +3113,14 @@ fn exec_insert_one_row(
                 bt.delete_table(existing_rowid)?;
                 *current_root = bt.root;
                 ctx.set_table_root_lc(table_name_lc, *current_root);
-                if old_payload_opt.is_some() {
-                    for (_idx, idx_root) in index_roots.iter_mut() {
-                        let mut ibt = Btree::new(ctx.pager, *idx_root, true);
-                        ibt.delete_index(existing_rowid)?;
-                        *idx_root = ibt.root;
+                if let Some(old_payload) = old_payload_opt {
+                    if let Ok(old_row) = decode_row(&old_payload, table.n_columns()) {
+                        for (idx, idx_root) in index_roots.iter_mut() {
+                            let old_key = encode_index_key(idx, table, &old_row);
+                            let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                            ibt.delete_index(&old_key, existing_rowid)?;
+                            *idx_root = ibt.root;
+                        }
                     }
                 }
             }
@@ -3193,10 +3197,11 @@ fn exec_insert_one_row(
     // On conflict: delete the old row's index entries first.
     if let Some(old_payload) = old_payload_opt {
         if !index_roots.is_empty() {
-            if let Ok(_old_row) = decode_row(&old_payload, table.n_columns()) {
-                for (_idx, idx_root) in index_roots.iter_mut() {
+            if let Ok(old_row) = decode_row(&old_payload, table.n_columns()) {
+                for (idx, idx_root) in index_roots.iter_mut() {
+                    let old_key = encode_index_key(idx, table, &old_row);
                     let mut ibt = Btree::new(ctx.pager, *idx_root, true);
-                    ibt.delete_index(rowid)?;
+                    ibt.delete_index(&old_key, rowid)?;
                     *idx_root = ibt.root;
                 }
             }
@@ -3323,7 +3328,7 @@ fn exec_upsert_row(
                     continue;
                 }
                 let mut ibt = Btree::new(ctx.pager, *idx_root, true);
-                ibt.delete_index(existing_rowid)?;
+                ibt.delete_index(&old_key, existing_rowid)?;
                 *idx_root = ibt.root;
                 let mut ibt = Btree::new(ctx.pager, *idx_root, true);
                 ibt.insert_index(&new_key, existing_rowid)?;
@@ -3340,12 +3345,15 @@ fn exec_upsert_row(
 }
 
 /// Encode the index key for a row, given the table's column layout.
+/// Uses the ORDER-PRESERVING key encoding (see `Value::encode_order_key_into`)
+/// so that the index B+tree's byte order matches SQL value ordering —
+/// required for range scans and binary-search equality lookups.
 fn encode_index_key(index: &crate::schema::Index, table: &Table, row: &[Value]) -> Vec<u8> {
     let mut key_bytes = Vec::new();
     for col in &index.columns {
         if let Some(pos) = table.find_column(&col.name) {
             if let Some(v) = row.get(pos) {
-                key_bytes.extend_from_slice(&v.encode());
+                v.encode_order_key_into(&mut key_bytes);
             }
         }
     }
@@ -3361,10 +3369,9 @@ fn insert_index_entry(pager: &Pager, index: &crate::schema::Index, table: &Table
 
 /// Delete an entry from an index for a given row.
 fn delete_index_entry(pager: &Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
-    let _ = row;
-    let _ = table;
+    let key_bytes = encode_index_key(index, table, row);
     let mut bt = Btree::new(pager, index.root_page, true);
-    bt.delete_index(rowid)?;
+    bt.delete_index(&key_bytes, rowid)?;
     Ok(())
 }
 

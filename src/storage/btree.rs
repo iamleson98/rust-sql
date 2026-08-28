@@ -141,6 +141,29 @@ impl Cell {
         }
     }
 
+    /// Left child page of an interior cell (table or index).
+    pub fn left_child(&self) -> PageId {
+        match self {
+            Cell::TableInterior { left_child, .. } => *left_child,
+            Cell::IndexInterior { left_child, .. } => *left_child,
+            _ => 0,
+        }
+    }
+
+    /// Encoded key bytes of an index cell (empty for table cells).
+    pub fn index_key(&self) -> &[u8] {
+        match self {
+            Cell::IndexLeaf { key, .. } | Cell::IndexInterior { key, .. } => key,
+            _ => &[],
+        }
+    }
+
+    /// Compare an index cell against a target (key, rowid).
+    /// Index pages are sorted by (key bytes, rowid).
+    pub fn cmp_index_target(&self, key: &[u8], rowid: i64) -> std::cmp::Ordering {
+        self.index_key().cmp(key).then(self.key().cmp(&rowid))
+    }
+
     pub fn encoded_size(&self) -> usize {
         let mut buf = [0u8; 10];
         match self {
@@ -295,10 +318,22 @@ pub struct Btree<'a> {
 }
 
 /// Result of inserting into a page: either the insert succeeded, or the
-/// page split and a new key needs to be propagated up.
+/// page split and a separator needs to be propagated up.
+///
+/// For TABLE splits, `split_key` is the FIRST key of the new (right) page;
+/// the parent uses `split_key - 1` as the left child's separator (a safe
+/// over-estimate within the inter-page key gap).
+///
+/// For INDEX splits, `(split_key_bytes, split_key)` is the EXACT last
+/// entry of the left page — the left child's separator for the parent.
 enum InsertResult {
     Done,
-    Split { new_page: PageId, split_key: i64 },
+    Split {
+        new_page: PageId,
+        split_key: i64,
+        /// For index splits: the key bytes of the left page's max entry.
+        split_key_bytes: Option<Vec<u8>>,
+    },
 }
 
 /// A point lookup result.
@@ -442,6 +477,7 @@ impl<'a> Btree<'a> {
             InsertResult::Split {
                 new_page,
                 split_key,
+                split_key_bytes,
             } => {
                 // The root split: create a new root pointing to the old and new pages.
                 let old_root = self.root;
@@ -456,6 +492,7 @@ impl<'a> Btree<'a> {
                 // Convention: cell (left_child, key) means left_child has rowids <= key.
                 // split_key = first key of new page. Old root has keys < split_key.
                 // So the cell key should be split_key - 1 (max key in old root).
+                let _ = split_key_bytes;
                 let cell = Cell::TableInterior {
                     left_child: old_root,
                     key: split_key - 1,
@@ -697,21 +734,27 @@ impl<'a> Btree<'a> {
             Ok(InsertResult::Done)
         } else {
             // Interior: find the child to descend into.
-            // Convention: cell (left_child, key) means left_child contains
-            // rowids <= key. right_most_pointer contains rowids > last cell's key.
+            // Convention: cell (left_child, sep) means left_child contains
+            // entries <= sep. Descent: take the FIRST cell whose separator is
+            // >= the target; go to its left_child. If none, go to right_most.
+            // Table pages compare by i64 key; index pages by (key, rowid).
+            let is_idx = pt.is_index();
             let child_id = {
                 let borrowed = page.lock();
                 let n = borrowed.n_cells();
-                let k = cell.key();
                 let mut next = borrowed.right_most_pointer();
                 for i in 0..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
                     let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    if let Cell::TableInterior { left_child, key } = c {
-                        if k <= key {
-                            next = left_child;
-                            break;
-                        }
+                    let target_le_sep = if is_idx {
+                        c.cmp_index_target(cell.index_key(), cell.key())
+                            != std::cmp::Ordering::Less
+                    } else {
+                        cell.key() <= c.key()
+                    };
+                    if target_le_sep {
+                        next = c.left_child();
+                        break;
                     }
                 }
                 next
@@ -722,81 +765,28 @@ impl<'a> Btree<'a> {
                 InsertResult::Split {
                     new_page,
                     split_key,
+                    split_key_bytes,
                 } => {
-                    // The child split: old child has keys < split_key,
-                    // new page has keys >= split_key.
-                    // We add a new interior cell (new_page, split_key - 1).
-                    // This means: new_page contains keys <= split_key - 1.
-                    // But new_page actually contains keys >= split_key!
+                    // The child split. We must replace the cell that pointed
+                    // to `child_id` with TWO cells:
+                    //   cell1 = (child_id, left_max)   — the child now holds
+                    //                                  entries <= left_max
+                    //   cell2 = (new_page, old_sep)   — the new page holds
+                    //                                  entries in (left_max, old_sep]
+                    // (or, if child_id was right_most: add cell1 and make
+                    //  new_page the new right_most.)
                     //
-                    // This is intentionally WRONG for the <= convention, but
-                    // we work around it by also updating the old cell. Since
-                    // we can't update in place, we use a different approach:
-                    //
-                    // Actually, let's use split_key as the separator. The cell
-                    // (new_page, split_key) with <= convention means new_page
-                    // has keys <= split_key. But new_page has keys >= split_key.
-                    // The ONLY key that's in both is split_key itself (the first
-                    // key of new_page). So this is wrong for all keys > split_key.
-                    //
-                    // REAL FIX: The separator should be the MAX key of the OLD
-                    // child (split_key - 1). We add cell (new_page, old_max_key)
-                    // where old_max_key is what the old cell had. But we need to
-                    // also update the old cell's key to split_key - 1.
-                    //
-                    // Since tracking and updating the old cell is complex, let's
-                    // use a simpler model: the B+tree interior cell key is the
-                    // MIN key of the RIGHT child (i.e., the separator). Descent:
-                    // find the first cell where key > search_key; go to left_child.
-                    // If no such cell, go to right_most.
-                    //
-                    // With this model:
-                    // - Cell (A, 50): A has keys < 50
-                    // - Cell (B, 100): B has keys 50-99
-                    // - right_most: keys >= 100
-                    //
-                    // After splitting B (50-99) into B1 (50-74) and B2 (75-99):
-                    // - split_key = 75 (first key of B2)
-                    // - Add cell (B2, 75): B2 has keys 75-99
-                    // - Old cell (B, 100) still points to B1 (which now has 50-74)
-                    //   but the key 100 is wrong — it should be 75.
-                    //
-                    // Hmm, this still requires updating the old cell.
-                    //
-                    // OK, final approach: DON'T modify the old cell. Instead,
-                    // the new cell has key = split_key, and the old cell keeps
-                    // its old key. During descent, we use < (strict less than):
-                    // find the first cell where key > search_key; go to left_child.
-                    //
-                    // - Cell (A, 50): search_key < 50 → go to A. A has keys < 50.
-                    // - Cell (B, 100): search_key < 100 → go to B. B has keys 50-99 (but now 50-74).
-                    // - right_most: search_key >= 100.
-                    //
-                    // After split, add cell (B2, 75):
-                    // - Cell (A, 50): search_key < 50 → A.
-                    // - Cell (B2, 75): search_key < 75 → B2. But B2 has 75-99!
-                    //   search_key = 60: 60 < 75 → B2. But 60 is in B1!
-                    //
-                    // This is STILL wrong. The fundamental issue is that without
-                    // updating the old cell, we can't correctly route.
-                    //
-                    // FINAL APPROACH: Use split_key - 1 as the new cell's key.
-                    // Cell (new_page, split_key - 1) means: with < convention,
-                    // search_key < split_key → new_page. But new_page has keys >= split_key.
-                    // So search_key < split_key goes to new_page, which is wrong.
-                    //
-                    // I give up on the clever approaches. Let me just update the
-                    // old cell in place by rewriting the entire page.
-
-                    // Read ALL cells from the interior page, replace the old cell
-                    // with two new ones, and rewrite.
+                    // left_max for table trees is split_key - 1 (an
+                    // over-estimate inside the key gap — safe); for index
+                    // trees it is the EXACT (split_key_bytes, split_key).
                     let (n_cells, pt2) = {
                         let p = self.pager.get_page(page_id)?;
                         let b = p.lock();
                         (b.n_cells(), b.page_type()?)
                     };
+                    let is_idx_page = pt2.is_index();
 
-                    // Find which cell pointed to child_id (or if it's right_most).
+                    // Read all cells + the right_most pointer.
                     let mut cells: Vec<Cell> = Vec::new();
                     let mut right_most = 0u32;
                     let mut found_idx: Option<usize> = None;
@@ -807,44 +797,72 @@ impl<'a> Btree<'a> {
                         for i in 0..n_cells {
                             let cell_ptr = borrowed.cell_pointer(i) as usize;
                             let c = Cell::decode(&borrowed.data[cell_ptr..], pt2)?;
-                            if let Cell::TableInterior { left_child, .. } = &c {
-                                if *left_child == child_id {
-                                    found_idx = Some(i as usize);
-                                }
+                            if c.left_child() == child_id {
+                                found_idx = Some(i as usize);
                             }
                             cells.push(c);
                         }
                     }
 
                     if let Some(idx) = found_idx {
-                        // Replace cells[idx] with two cells.
-                        let old_key = if let Cell::TableInterior { key, .. } = &cells[idx] {
-                            *key
+                        if is_idx_page {
+                            let (old_key, old_rowid) = match &cells[idx] {
+                                Cell::IndexInterior { key, rowid, .. } => (key.clone(), *rowid),
+                                _ => (Vec::new(), i64::MAX),
+                            };
+                            let cell1 = Cell::IndexInterior {
+                                left_child: child_id,
+                                key: split_key_bytes.clone().unwrap_or_default(),
+                                rowid: split_key,
+                            };
+                            let cell2 = Cell::IndexInterior {
+                                left_child: new_page,
+                                key: old_key,
+                                rowid: old_rowid,
+                            };
+                            cells.remove(idx);
+                            cells.insert(idx, cell2);
+                            cells.insert(idx, cell1);
                         } else {
-                            i64::MAX
-                        };
-                        let cell1 = Cell::TableInterior {
-                            left_child: child_id,
-                            key: split_key - 1,
-                        };
-                        let cell2 = Cell::TableInterior {
-                            left_child: new_page,
-                            key: old_key,
-                        };
-                        cells.remove(idx);
-                        cells.insert(idx, cell2);
-                        cells.insert(idx, cell1);
+                            let old_key = if let Cell::TableInterior { key, .. } = &cells[idx] {
+                                *key
+                            } else {
+                                i64::MAX
+                            };
+                            let cell1 = Cell::TableInterior {
+                                left_child: child_id,
+                                key: split_key - 1,
+                            };
+                            let cell2 = Cell::TableInterior {
+                                left_child: new_page,
+                                key: old_key,
+                            };
+                            cells.remove(idx);
+                            cells.insert(idx, cell2);
+                            cells.insert(idx, cell1);
+                        }
                     } else {
                         // right_most case: child_id was right_most.
-                        let cell1 = Cell::TableInterior {
-                            left_child: child_id,
-                            key: split_key - 1,
-                        };
-                        cells.push(cell1);
-                        right_most = new_page;
+                        if is_idx_page {
+                            let cell1 = Cell::IndexInterior {
+                                left_child: child_id,
+                                key: split_key_bytes.clone().unwrap_or_default(),
+                                rowid: split_key,
+                            };
+                            cells.push(cell1);
+                            right_most = new_page;
+                        } else {
+                            let cell1 = Cell::TableInterior {
+                                left_child: child_id,
+                                key: split_key - 1,
+                            };
+                            cells.push(cell1);
+                            right_most = new_page;
+                        }
                     }
 
-                    // Check if we need to split the interior page.
+                    // Does the rewritten page still fit? If not, split this
+                    // interior page too and propagate upward.
                     let total_size: usize = cells.iter().map(|c| c.encoded_size() + 2).sum();
                     let page_size = self.pager.page_size() as usize;
                     let header_offset = if page_id == 0 {
@@ -854,15 +872,78 @@ impl<'a> Btree<'a> {
                     };
                     let available = page_size - header_offset - PAGE_HEADER_SIZE as usize;
                     if total_size > available {
-                        // Need to split — for now, just rewrite what fits.
-                        // This is a known limitation.
+                        // Split the interior page: keep the left half, move
+                        // the right half to a new page, and propagate the
+                        // left half's LAST separator upward (the left page
+                        // contains entries <= that separator).
+                        let total = cells.len();
+                        let mid = total / 2;
+                        // Separator to propagate = cells[mid-1]'s separator.
+                        let (prop_rowid, prop_key_bytes) = if is_idx_page {
+                            match &cells[mid - 1] {
+                                Cell::IndexInterior { key, rowid, .. } => {
+                                    (*rowid, Some(key.clone()))
+                                }
+                                _ => (cells[mid - 1].key(), None),
+                            }
+                        } else {
+                            // For table pages the propagated value follows the
+                            // leaf-split convention: split_key = "first key of
+                            // the right page", and the parent applies -1 to
+                            // get the left separator. The left half's max
+                            // separator is cells[mid-1].key(), so the right
+                            // page's minimum entry is that + 1.
+                            (cells[mid - 1].key() + 1, None)
+                        };
+
+                        let new_interior = self.pager.allocate_page()?;
+                        {
+                            let p = self.pager.get_page(new_interior)?;
+                            if is_idx_page {
+                                p.lock().init_interior_index();
+                            } else {
+                                p.lock().init_interior_table();
+                            }
+                        }
+
+                        // Rewrite the left page with cells[..mid].
+                        {
+                            let p = self.pager.get_page(page_id)?;
+                            let mut borrowed = p.lock();
+                            if is_idx_page {
+                                borrowed.init_interior_index();
+                            } else {
+                                borrowed.init_interior_table();
+                            }
+                        }
+                        for c in &cells[..mid] {
+                            self.insert_cell_into_page(page_id, c)?;
+                        }
+                        // Right page gets cells[mid..] and the old right_most.
+                        for c in &cells[mid..] {
+                            self.insert_cell_into_page(new_interior, c)?;
+                        }
+                        self.pager
+                            .get_page(new_interior)?
+                            .lock()
+                            .set_right_most_pointer(right_most);
+
+                        return Ok(InsertResult::Split {
+                            new_page: new_interior,
+                            split_key: prop_rowid,
+                            split_key_bytes: prop_key_bytes,
+                        });
                     }
 
-                    // Rewrite the page.
+                    // Rewrite the page in place (fits).
                     {
                         let p = self.pager.get_page(page_id)?;
                         let mut borrowed = p.lock();
-                        borrowed.init_interior_table();
+                        if is_idx_page {
+                            borrowed.init_interior_index();
+                        } else {
+                            borrowed.init_interior_table();
+                        }
                         borrowed.set_right_most_pointer(right_most);
                     }
                     for c in &cells {
@@ -875,14 +956,16 @@ impl<'a> Btree<'a> {
         }
     }
 
-    /// Insert a cell into a leaf or interior page. Cells are kept sorted by key.
+    /// Insert a cell into a leaf or interior page. Cells are kept sorted:
+    /// table pages by i64 key, index pages by (key bytes, rowid).
     fn insert_cell_into_page(&mut self, page_id: PageId, cell: &Cell) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
         let cell_size = cell.encoded_size();
         let n = page.lock().n_cells();
+        let is_idx = pt.is_index();
 
-        // Find insertion position by key.
+        // Find insertion position by the page's sort order.
         let pos = {
             let borrowed = page.lock();
             let mut lo = 0;
@@ -891,7 +974,14 @@ impl<'a> Btree<'a> {
                 let mid = (lo + hi) / 2;
                 let cell_ptr = borrowed.cell_pointer(mid) as usize;
                 let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                if c.key() < cell.key() {
+                let existing_before_new = if is_idx {
+                    // Compare (key, rowid) pairs.
+                    c.cmp_index_target(cell.index_key(), cell.key())
+                        == std::cmp::Ordering::Less
+                } else {
+                    c.key() < cell.key()
+                };
+                if existing_before_new {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -941,31 +1031,37 @@ impl<'a> Btree<'a> {
         Ok(())
     }
 
-    /// Split a leaf page. Returns the new page ID and the split key.
+    /// Split a leaf page. Returns the new page ID and the separator info.
     fn split_leaf(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
-        // Read all existing cells + the new one.
+        // Read all existing cells + the new one, merged in sort order.
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
+        let is_idx = pt.is_index();
         let n = page.lock().n_cells();
         let mut cells: Vec<Cell> = Vec::with_capacity(n as usize + 1);
-        // let mut new_pos = n as usize;
         for i in 0..n {
             let borrowed = page.lock();
             let cell_ptr = borrowed.cell_pointer(i) as usize;
             let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-            if c.key() < new_cell.key() {
-                cells.push(c);
+            let existing_before_new = if is_idx {
+                c.cmp_index_target(new_cell.index_key(), new_cell.key())
+                    == std::cmp::Ordering::Less
             } else {
-                // new_pos = cells.len();
+                c.key() < new_cell.key()
+            };
+            if !existing_before_new {
+                drop(borrowed);
                 cells.push(new_cell.clone());
-                // Continue reading remaining cells
+                // Continue reading remaining cells.
                 for j in i..n {
+                    let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(j) as usize;
                     let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     cells.push(c);
                 }
                 break;
             }
+            cells.push(c);
         }
         if cells.len() == n as usize {
             cells.push(new_cell);
@@ -1014,14 +1110,26 @@ impl<'a> Btree<'a> {
             self.insert_cell_into_page(new_page_id, c)?;
         }
 
-        // The split key is the FIRST key of the new page (the min key in the
-        // second half). This is used as the separator in the parent: keys <
-        // split_key go to the old page, keys >= split_key go to the new page.
-        let split_key = cells[mid].key();
-        Ok(InsertResult::Split {
-            new_page: new_page_id,
-            split_key,
-        })
+        if is_idx {
+            // For index splits, return the EXACT separator: the last entry
+            // of the left page. The parent uses it verbatim as the left
+            // child's separator.
+            let left_max = &cells[mid - 1];
+            Ok(InsertResult::Split {
+                new_page: new_page_id,
+                split_key: left_max.key(),
+                split_key_bytes: Some(left_max.index_key().to_vec()),
+            })
+        } else {
+            // The split key is the FIRST key of the new page (the min key in
+            // the second half). The parent applies the -1 gap convention.
+            let split_key = cells[mid].key();
+            Ok(InsertResult::Split {
+                new_page: new_page_id,
+                split_key,
+                split_key_bytes: None,
+            })
+        }
     }
 
     /// Split an interior page. Same idea but the middle cell moves up.
@@ -1586,21 +1694,18 @@ impl<'a> Btree<'a> {
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
         // Notify the pager that a write is about to happen.
         self.pager.note_write();
-        // We store index entries keyed by rowid (so duplicates of the same
-        // rowid are prevented), with the encoded key as part of the cell payload.
+        // Index entries are sorted by (key, rowid): the cell's btree order
+        // is the byte-encoded key first, then the rowid as tiebreaker.
         let cell = Cell::IndexLeaf {
             key: key.to_vec(),
             rowid,
         };
-        // For now, we treat the index B+tree like a table B+tree keyed by rowid.
-        // The encoded `key` is stored in the cell payload and scanned linearly
-        // during lookups. A future optimization would build a real B+tree over
-        // the encoded key.
         match self.insert_into_page(self.root, cell)? {
             InsertResult::Done => Ok(()),
             InsertResult::Split {
                 new_page,
                 split_key,
+                split_key_bytes,
             } => {
                 let old_root = self.root;
                 let new_root = self.pager.allocate_page()?;
@@ -1610,9 +1715,11 @@ impl<'a> Btree<'a> {
                     page.init_interior_index();
                     page.set_right_most_pointer(new_page);
                 }
+                // Cell (old_root, sep) where sep = the EXACT max entry of
+                // the old root after the split: (split_key_bytes, split_key).
                 let cell = Cell::IndexInterior {
                     left_child: old_root,
-                    key: Vec::new(), // key not used for routing in this simplified design
+                    key: split_key_bytes.unwrap_or_default(),
                     rowid: split_key,
                 };
                 self.insert_cell_into_page(new_root, &cell)?;
@@ -1623,11 +1730,101 @@ impl<'a> Btree<'a> {
     }
 
     /// Delete a (key, rowid) pair from an index B+tree.
-    pub fn delete_index(&mut self, rowid: i64) -> Result<bool> {
+    /// The key is required because index pages are sorted by (key, rowid).
+    pub fn delete_index(&mut self, key: &[u8], rowid: i64) -> Result<bool> {
         // Notify the pager that a write is about to happen.
         self.pager.note_write();
-        // Same as table delete (since we key by rowid).
-        self.delete_from_page(self.root, rowid)
+        self.delete_index_from_page(self.root, key, rowid)
+    }
+
+    /// Recursive delete by exact (key, rowid) on index pages.
+    fn delete_index_from_page(&mut self, page_id: PageId, key: &[u8], rowid: i64) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let pt = page.lock().page_type()?;
+        match pt {
+            PageType::LeafIndex => {
+                let n = page.lock().n_cells();
+                // Binary search for the first cell >= (key, rowid).
+                let pos = {
+                    let borrowed = page.lock();
+                    let mut lo = 0;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        if c.cmp_index_target(key, rowid) == std::cmp::Ordering::Less {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                };
+                if pos >= n {
+                    return Ok(false);
+                }
+                let key_matches = {
+                    let borrowed = page.lock();
+                    let cell_ptr = borrowed.cell_pointer(pos) as usize;
+                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    c.index_key() == key && c.key() == rowid
+                };
+                if !key_matches {
+                    return Ok(false);
+                }
+                drop(page);
+                self.remove_cell_at(page_id, pos, n)
+            }
+            PageType::InteriorIndex => {
+                let child_id = {
+                    let borrowed = page.lock();
+                    let n = borrowed.n_cells();
+                    let mut next = borrowed.right_most_pointer();
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        if c.cmp_index_target(key, rowid) != std::cmp::Ordering::Less {
+                            next = c.left_child();
+                            break;
+                        }
+                    }
+                    next
+                };
+                drop(page);
+                self.delete_index_from_page(child_id, key, rowid)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in index delete: {:?}",
+                pt
+            ))),
+        }
+    }
+
+    /// Remove the cell at index `pos` from a leaf page (pointer shift only).
+    fn remove_cell_at(&mut self, page_id: PageId, pos: u16, n: u16) -> Result<bool> {
+        let header_offset = if page_id == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+        {
+            let page = self.pager.get_page(page_id)?;
+            let mut borrowed = page.lock();
+            let pos_usize = pos as usize;
+            let n_usize = n as usize;
+            for i in pos_usize..n_usize - 1 {
+                let src = ptr_array_start + (i + 1) * 2;
+                let dst = ptr_array_start + i * 2;
+                let v = u16::from_be_bytes(borrowed.data[src..src + 2].try_into().unwrap());
+                borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
+            }
+            borrowed.set_n_cells(n - 1);
+            borrowed.dirty = true;
+        }
+        self.pager.note_dirty(page_id);
+        Ok(true)
     }
 
     /// Look up all rowids matching a given key in an index B+tree.
@@ -1636,37 +1833,136 @@ impl<'a> Btree<'a> {
     /// **Prefix matching**: when the search `key` is SHORTER than the stored
     /// index key (i.e., a composite index lookup where only the leading
     /// columns are constrained), we treat it as a prefix match. This is what
-    /// makes `WHERE a = 1` use the index `(a, b)` correctly: the stored keys
+    /// makes `WHERE a = 1` use the index (a, b) correctly: the stored keys
     /// are `encode(a) || encode(b)` and the search key is just `encode(a)`.
+    ///
+    /// Index pages are sorted by (key, rowid), so this is an O(log N) seek
+    /// followed by a forward scan over the matching prefix (which may span
+    /// multiple leaves). Previously this was a full O(N) scan of every
+    /// index page — the main reason indexed point lookups lagged SQLite.
     pub fn lookup_index(&mut self, key: &[u8]) -> Result<Vec<i64>> {
-        // The index B+tree is currently sorted by rowid (not by key bytes) —
-        // see the comment in `insert_index`. So we can't binary-search by key;
-        // we have to scan all entries and check each.
-        //
-        // TODO: restructure the index B+tree to be sorted by (key, rowid) so
-        // we can do an O(log N) binary search instead of O(N). For now this
-        // is O(N) which is why the "Index lookup" benchmark is 23x slower
-        // than SQLite.
         let mut results = Vec::new();
-        let mut bt = Btree {
-            pager: self.pager,
-            root: self.root,
-            is_index: true,
-        };
-        bt.scan_index(|cell_rowid, cell_key| {
-            let matched = if key.len() > cell_key.len() {
-                false
-            } else if key.len() == cell_key.len() {
-                cell_key == key
-            } else {
-                cell_key.starts_with(key)
-            };
-            if matched {
+        self.scan_index_from(key, |cell_rowid, cell_key| {
+            if cell_key.starts_with(key) {
                 results.push(cell_rowid);
+                true // keep scanning (duplicates / composite prefix)
+            } else {
+                false // past the prefix range — stop
             }
-            true
         })?;
         Ok(results)
+    }
+
+    /// Scan index entries in (key, rowid) order, starting at the first entry
+    /// whose key is >= `start_key`. Calls `f(rowid, key)` for each; stops
+    /// early when `f` returns false. Left subtrees entirely below the start
+    /// key are pruned via interior-page binary search.
+    pub fn scan_index_from<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        start_key: &[u8],
+        f: F,
+    ) -> Result<()> {
+        let mut f = f;
+        self.scan_index_range_subtree(self.root, start_key, &mut f, &mut false)
+    }
+
+    /// Recursive range scan. `started` tracks whether we've passed the start
+    /// key yet (once true, every entry is visited).
+    fn scan_index_range_subtree<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        page_id: PageId,
+        start_key: &[u8],
+        f: &mut F,
+        started: &mut bool,
+    ) -> Result<()> {
+        let page = self.pager.get_page(page_id)?;
+        let pt = page.lock().page_type()?;
+        match pt {
+            PageType::LeafIndex => {
+                let n = page.lock().n_cells();
+                let begin = if *started {
+                    0
+                } else {
+                    // Binary search for the first cell >= (start_key, MIN).
+                    let borrowed = page.lock();
+                    let mut lo = 0u16;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        if c.cmp_index_target(start_key, i64::MIN)
+                            == std::cmp::Ordering::Less
+                        {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                };
+                drop(page);
+                for i in begin..n {
+                    let page = self.pager.get_page(page_id)?;
+                    let borrowed = page.lock();
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    if let Cell::IndexLeaf { key, rowid } = c {
+                        if !f(rowid, &key) {
+                            return Ok(());
+                        }
+                    }
+                }
+                *started = true;
+                Ok(())
+            }
+            PageType::InteriorIndex => {
+                // Find the first child that can contain entries >= start_key.
+                let (n, first_cell_idx, right_most) = {
+                    let borrowed = page.lock();
+                    let n = borrowed.n_cells();
+                    let mut first_cell_idx = n; // default: right_most only
+                    if !*started {
+                        let mut lo = 0u16;
+                        let mut hi = n;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2;
+                            let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                            let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                            if c.cmp_index_target(start_key, i64::MIN)
+                                == std::cmp::Ordering::Less
+                            {
+                                lo = mid + 1;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        first_cell_idx = lo;
+                    }
+                    (n, first_cell_idx, borrowed.right_most_pointer())
+                };
+                drop(page);
+                // Visit children from first_cell_idx onward.
+                for i in first_cell_idx..n {
+                    let page = self.pager.get_page(page_id)?;
+                    let borrowed = page.lock();
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    let child = c.left_child();
+                    drop(borrowed);
+                    drop(page);
+                    self.scan_index_range_subtree(child, start_key, f, started)?;
+                }
+                if right_most != 0 {
+                    self.scan_index_range_subtree(right_most, start_key, f, started)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in index range scan: {:?}",
+                pt
+            ))),
+        }
     }
 
     /// Scan all entries in an index B+tree, calling `f(rowid, key)` for each.
@@ -1855,7 +2151,7 @@ mod tests {
         let mut bt = Btree::create(&mut pager, true).unwrap();
         // Insert enough entries to force multiple splits.
         for i in 1..=500i64 {
-            let key = Value::Integer(i).encode();
+            let key = Value::Integer(i).encode_order_key();
             bt.insert_index(&key, i).unwrap();
         }
         // Verify scan_index works (no panic).
@@ -1869,10 +2165,92 @@ mod tests {
         assert_eq!(seen_rowids, (1..=500).collect::<Vec<_>>());
         // Verify lookup_index finds every entry.
         for i in 1..=500i64 {
-            let key = Value::Integer(i).encode();
+            let key = Value::Integer(i).encode_order_key();
             let matches = bt.lookup_index(&key).unwrap();
             assert_eq!(matches, vec![i], "lookup_index for value {} failed", i);
         }
+    }
+
+    /// The index B+tree is now sorted by (key, rowid) — verify that RANDOM
+    /// (non-monotonic) insertion order still produces a correct, seekable
+    /// tree with multi-level splits. This exercises:
+    ///   - interior-page descent with (key, rowid) comparisons
+    ///   - interior-page splits (500+ shuffled entries force 2+ levels)
+    ///   - lookup_index binary search after splits
+    #[test]
+    fn index_btree_random_insertion_order() {
+        let mut pager = open_pager();
+        let mut bt = Btree::create(&mut pager, true).unwrap();
+        // Simple LCG shuffle of 1..=600.
+        let mut vals: Vec<i64> = (1..=600).collect();
+        let mut seed: u64 = 0x2545F4914F6CDD1D;
+        for i in (1..vals.len()).rev() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (seed >> 33) as usize % (i + 1);
+            vals.swap(i, j);
+        }
+        for &i in &vals {
+            let key = Value::Integer(i).encode_order_key();
+            bt.insert_index(&key, i).unwrap();
+        }
+        // Every entry findable.
+        for i in 1..=600i64 {
+            let key = Value::Integer(i).encode_order_key();
+            let matches = bt.lookup_index(&key).unwrap();
+            assert_eq!(matches, vec![i], "lookup_index for value {} failed", i);
+        }
+        // scan_index visits entries in (key, rowid) order → sorted keys.
+        let mut seen: Vec<i64> = Vec::new();
+        bt.scan_index(|rowid, _key| {
+            seen.push(rowid);
+            true
+        })
+        .unwrap();
+        let mut expected: Vec<i64> = (1..=600).collect();
+        expected.sort();
+        assert_eq!(seen, expected, "index scan should be in sorted key order");
+        // Deletions remove exactly the right entry.
+        for i in (1..=600i64).step_by(3) {
+            let key = Value::Integer(i).encode_order_key();
+            assert!(bt.delete_index(&key, i).unwrap(), "delete {} failed", i);
+        }
+        for i in 1..=600i64 {
+            let key = Value::Integer(i).encode_order_key();
+            let matches = bt.lookup_index(&key).unwrap();
+            // step_by(3) from 1: deleted set = 1, 4, 7, ...
+            let deleted = (i - 1) % 3 == 0;
+            if deleted {
+                assert!(matches.is_empty(), "value {} should be deleted", i);
+            } else {
+                assert_eq!(matches, vec![i], "value {} should remain", i);
+            }
+        }
+    }
+
+    /// scan_index_from: range scans start at the first key >= start.
+    #[test]
+    fn index_range_scan_from() {
+        let mut pager = open_pager();
+        let mut bt = Btree::create(&mut pager, true).unwrap();
+        for i in 1..=500i64 {
+            let key = Value::Integer(i * 2).encode_order_key();
+            bt.insert_index(&key, i).unwrap();
+        }
+        // All entries with key >= 700 (values 700, 702, ..., 1000).
+        let mut seen: Vec<i64> = Vec::new();
+        bt.scan_index_from(&Value::Integer(700).encode_order_key(), |rowid, key| {
+            // Collect rowids whose key is < 800, then stop.
+            if key > &Value::Integer(800).encode_order_key()[..] {
+                return false;
+            }
+            seen.push(rowid);
+            true
+        })
+        .unwrap();
+        // 700..=800 step 2 → 51 entries, rowids 350..=400.
+        assert_eq!(seen.len(), 51, "range scan count wrong: {:?}", seen);
+        assert_eq!(seen[0], 350);
+        assert_eq!(seen[50], 400);
     }
 
     /// Regression test for `delete_from_page` index page handling.
@@ -1888,10 +2266,10 @@ mod tests {
         let mut pager = open_pager();
         let mut bt = Btree::create(&mut pager, true).unwrap();
         // Insert a single entry.
-        let key = Value::Integer(42).encode();
+        let key = Value::Integer(42).encode_order_key();
         bt.insert_index(&key, 7).unwrap();
         // Delete it.
-        assert!(bt.delete_index(7).unwrap());
+        assert!(bt.delete_index(&key, 7).unwrap());
         // Re-insert with the same key+rowid.
         bt.insert_index(&key, 7).unwrap();
         // Lookup should return exactly one rowid, not two.

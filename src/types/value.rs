@@ -150,6 +150,74 @@ impl Value {
         }
     }
 
+    /// Order-preserving encoding used for SECONDARY INDEX KEYS.
+    ///
+    /// Unlike `encode_into` (a compact storage codec), this encoding's
+    /// lexicographic byte order matches `Value`'s SQL ordering exactly:
+    ///
+    ///   NULL < all numerics (integers AND reals interleaved numerically)
+    ///       < TEXT (memcmp, shorter-prefix first) < BLOB (same)
+    ///
+    /// This is what allows the index B+tree — which sorts entries by raw
+    /// key bytes — to serve range scans (`col > ?`) and ordered scans
+    /// (`ORDER BY col`) correctly, and to binary-search for equality.
+    ///
+    /// Layout per value:
+    ///   Null      -> [0x00]
+    ///   numeric   -> [0x01] + 8-byte total-order double key
+    ///                (|i| <= 2^53 integers and all reals)
+    ///   large int -> [0x01] + 8-byte floor-double key + 2-byte delta
+    ///                (|i| > 2^53, exact within the double bucket)
+    ///   Text      -> [0x02] + BE u32 length + bytes
+    ///   Blob      -> [0x03] + BE u32 length + bytes
+    pub fn encode_order_key_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Null => out.push(0x00),
+            Value::Integer(i) => {
+                out.push(0x01);
+                if i.unsigned_abs() <= (1u64 << 53) {
+                    out.extend_from_slice(&double_order_key(*i as f64).to_be_bytes());
+                } else {
+                    // Find the largest double <= i (the bucket floor).
+                    let mut lo = *i as f64; // round-to-nearest
+                    if (lo as i128) > (*i as i128) {
+                        // Rounded up — step down one ULP.
+                        let b = lo.to_bits();
+                        lo = if lo > 0.0 {
+                            f64::from_bits(b - 1)
+                        } else {
+                            f64::from_bits(b + 1)
+                        };
+                    }
+                    let delta = (*i as i128 - lo as i128) as u16;
+                    out.extend_from_slice(&double_order_key(lo).to_be_bytes());
+                    out.extend_from_slice(&delta.to_be_bytes());
+                }
+            }
+            Value::Real(f) => {
+                out.push(0x01);
+                out.extend_from_slice(&double_order_key(*f).to_be_bytes());
+            }
+            Value::Text(s) => {
+                out.push(0x02);
+                out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Value::Blob(b) => {
+                out.push(0x03);
+                out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                out.extend_from_slice(b);
+            }
+        }
+    }
+
+    /// Order-preserving encoding (see `encode_order_key_into`).
+    pub fn encode_order_key(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12);
+        self.encode_order_key_into(&mut out);
+        out
+    }
+
     /// Decode a value from bytes. Returns (value, bytes consumed).
     pub fn decode(buf: &[u8]) -> Result<(Value, usize), &'static str> {
         if buf.is_empty() {
@@ -302,6 +370,19 @@ impl Affinity {
             // BLOB and None: leave as-is
             (_, v) => v,
         }
+    }
+}
+
+/// Map a finite f64 to a u64 whose big-endian byte order matches the
+/// numeric order (the classic sign-flip trick):
+///   negative: !bits   (more negative → larger u64)
+///   positive: bits | sign bit
+fn double_order_key(f: f64) -> u64 {
+    let bits = f.to_bits();
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | 0x8000_0000_0000_0000
     }
 }
 
