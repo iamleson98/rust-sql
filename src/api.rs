@@ -277,27 +277,33 @@ impl Database {
         let stmt_ref: &Statement = &stmt;
         let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
         let in_txn = self.in_transaction.load(Ordering::Acquire);
-        let txn_snap = self.txn_snapshot.lock().take();
+        let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
         let deferred_flush_threshold = self.deferred_flush_threshold;
         // Move root_overrides/max_rowids out of the RwLock into a local; we'll
         // write them back after the statement completes. The write lock on the
         // outer `RwLock<Database>` (held by the caller's `execute(&mut self)`)
         // guarantees exclusive access, so we can safely move.
+        //
+        // OPTIMIZATION: use `RwLock::get_mut()` instead of `.write()` to skip
+        // the lock acquisition. Since we have `&mut self`, we have exclusive
+        // access — the lock is redundant. For a 1k-row INSERT batch (each
+        // statement goes through this path), that's 4k avoided lock
+        // acquisitions on `root_overrides` + `max_rowids`.
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
         ctx.txn_snapshot = txn_snap;
-        ctx.root_overrides = std::mem::take(&mut *self.root_overrides.write());
-        ctx.max_rowids = std::mem::take(&mut *self.max_rowids.write());
+        ctx.root_overrides = std::mem::take(self.root_overrides.get_mut());
+        ctx.max_rowids = std::mem::take(self.max_rowids.get_mut());
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
         let result = Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql);
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
-        *self.txn_snapshot.lock() = ctx.txn_snapshot;
-        *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
-        *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
+        *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
+        *self.max_rowids.get_mut() = std::mem::take(&mut ctx.max_rowids);
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
         if result.is_ok() && is_ddl {
             self.invalidate_stmt_cache();
@@ -856,16 +862,46 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
 /// a cheap prefix check — the parser is the source of truth, and the cache
 /// will be re-populated on the next call.
 fn is_ddl_sql(sql: &str) -> bool {
-    let s = sql.trim_start();
-    let s = s.trim_start_matches('('); // tolerate leading paren around INSERT etc.
-    let s = s.trim_start();
-    let upper = s.to_ascii_uppercase();
-    upper.starts_with("CREATE ")
-        || upper.starts_with("DROP ")
-        || upper.starts_with("ALTER ")
-        || upper.starts_with("ATTACH ")
-        || upper.starts_with("DETACH ")
-        || upper.starts_with("VACUUM")
+    // Fast path: scan at most ~10 chars, case-insensitive ASCII compare
+    // without allocating a new String. The previous version called
+    // `to_ascii_uppercase()` which allocated a String per call — for a
+    // 1k-statement INSERT batch, that was 1k String allocations just for
+    // DDL detection.
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    // Skip leading whitespace + '(' repeats.
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' || b == b'(' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    // Now compare case-insensitively against the DDL keywords.
+    let rest = &bytes[i..];
+    fn eq_ci(p: &[u8], kw: &[u8]) -> bool {
+        if p.len() < kw.len() {
+            return false;
+        }
+        for j in 0..kw.len() {
+            let mut c = p[j];
+            // ASCII to_upper
+            if c >= b'a' && c <= b'z' {
+                c -= 32;
+            }
+            if c != kw[j] {
+                return false;
+            }
+        }
+        true
+    }
+    eq_ci(rest, b"CREATE ")
+        || eq_ci(rest, b"DROP ")
+        || eq_ci(rest, b"ALTER ")
+        || eq_ci(rest, b"ATTACH ")
+        || eq_ci(rest, b"DETACH ")
+        || eq_ci(rest, b"VACUUM")
 }
 
 /// A trait for things that can be converted into a sequence of bound parameters.

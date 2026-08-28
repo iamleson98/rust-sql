@@ -1774,7 +1774,10 @@ fn exec_rowid_range(
     // conjuncts, the planner kept a residual predicate that re-checks the
     // strict comparison; we apply it here so we don't accidentally include
     // the boundary.
-    // Use borrowed scan — skip per-row Cell::decode Vec allocation.
+    // Use borrowed scan — skip per-row Cell::decode Vec<u8> allocation.
+    // decode_row itself still allocates a Vec<Value> per row (unavoidable
+    // without restructuring the API to return iterators), but the payload
+    // borrow eliminates one allocation per row.
     bt.scan_table_range_borrowed(start, end, |_rowid, payload| {
         if let Ok(row) = decode_row(payload, n_cols) {
             rows.push(row);
