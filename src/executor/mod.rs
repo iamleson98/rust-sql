@@ -438,12 +438,17 @@ impl Default for AggState {
 /// in-place, same total allocation count as exec_scan but no per-row
 /// Vec allocation overhead).
 ///
+/// If `filter_predicate` is `Some(pred)`, applies the predicate inline
+/// (skipping rows that don't match) — handles the
+/// `SELECT COUNT(*) FROM t WHERE x > 0` pattern without materializing.
+///
 /// Returns the same `ExecResult` shape as `exec_aggregate` so the rest
 /// of the executor pipeline (Sort, Project, Limit) doesn't notice.
 fn exec_aggregate_streaming_scan(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
     alias: Option<String>,
+    filter_predicate: Option<&Expr>,
     group_by: &[Expr],
     aggregates: &[AggExpr],
 ) -> Result<ExecResult> {
@@ -469,6 +474,18 @@ fn exec_aggregate_streaming_scan(
         row_buf.clear();
         if decode_row_into(payload, n_cols, &mut row_buf).is_err() {
             return true; // skip corrupt rows
+        }
+        // Apply the filter predicate inline (if any). Skips rows that
+        // don't match — no materialization.
+        if let Some(pred) = filter_predicate {
+            match eval_row(pred, &row_buf, &columns, &params, &named_params) {
+                Ok(v) => {
+                    if !v.is_truthy() {
+                        return true; // skip — predicate false
+                    }
+                }
+                Err(_) => return true,
+            }
         }
         // Compute the group-by key (if any).
         let key: Vec<Value> = match group_by.iter().map(|e| eval_row(e, &row_buf, &columns, &params, &named_params)).collect::<Result<Vec<_>>>() {
@@ -530,18 +547,19 @@ fn exec_aggregate_streaming_scan(
 }
 
 fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], aggregates: &[AggExpr]) -> Result<ExecResult> {
-    // Fast path: if the input is a bare Scan (no Filter, no Project, etc.),
-    // iterate the B+tree directly and decode each row into a reusable
-    // buffer. This avoids materializing Vec<Vec<Value>> in exec_scan,
-    // which was ~3-4 ms of pure allocation overhead on a 10k-row SUM()
-    // benchmark — the dominant cost in the 5.7× aggregate gap vs SQLite.
-    //
-    // The fast path handles the common `SELECT SUM/AVG/MIN/MAX/COUNT(*)
-    // FROM t` and `SELECT col, COUNT(*) FROM t GROUP BY col` patterns. For
-    // anything more complex (Filter, Join, subquery), we fall back to the
-    // materializing path below.
+    // Fast path #1: input is a bare Scan.
+    // Handles: `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t`
+    //          `SELECT col, COUNT(*) FROM t GROUP BY col`
     if let Plan::Scan { table, alias, index: None, predicate: None } = input {
-        return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), group_by, aggregates);
+        return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), None, group_by, aggregates);
+    }
+    // Fast path #2: input is Filter(Scan, predicate).
+    // Handles: `SELECT COUNT(*) FROM t WHERE val > 5000`
+    //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
+    if let Plan::Filter { input: inner, predicate } = input {
+        if let Plan::Scan { table, alias, index: None, predicate: None } = inner.as_ref() {
+            return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), Some(predicate), group_by, aggregates);
+        }
     }
     let inner = execute(input, ctx)?;
     let params = ctx.params.clone();
