@@ -479,6 +479,224 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             let v = args.first().cloned().unwrap_or(Value::Null);
             Value::Text(quote_value(&v))
         }
+        // INSTR(s, sub) — returns the 1-indexed position of `sub` in `s`,
+        // or 0 if not found. NULL inputs return NULL.
+        "instr" => {
+            if args.len() != 2 || args[0].is_null() || args[1].is_null() {
+                return Value::Null;
+            }
+            let s = args[0].as_text();
+            let sub = args[1].as_text();
+            if sub.is_empty() {
+                return Value::Integer(1);
+            }
+            match s.find(&sub) {
+                Some(pos) => Value::Integer((pos + 1) as i64),
+                None => Value::Integer(0),
+            }
+        }
+        // PRINTF — minimal SQLite printf implementation. Supports %d, %s,
+        // %f, %x, %c, %% substitutions. NULL format returns NULL.
+        "printf" => {
+            if args.is_empty() || args[0].is_null() {
+                return Value::Null;
+            }
+            let fmt = args[0].as_text();
+            let mut out = String::with_capacity(fmt.len());
+            let mut chars = fmt.chars().peekable();
+            let mut arg_idx = 1;
+            while let Some(c) = chars.next() {
+                if c != '%' {
+                    out.push(c);
+                    continue;
+                }
+                // Consume format spec until a conversion char.
+                let mut spec = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next.is_ascii_alphabetic() && "diouxXeEfFgGcs%".contains(next) {
+                        chars.next();
+                        spec.push(next);
+                        break;
+                    }
+                    chars.next();
+                    spec.push(next);
+                }
+                if spec.is_empty() {
+                    out.push('%');
+                    continue;
+                }
+                let conv = spec.chars().last().unwrap();
+                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                arg_idx += 1;
+                match conv {
+                    '%' => out.push('%'),
+                    'd' | 'i' => out.push_str(&arg.as_integer().to_string()),
+                    'u' => out.push_str(&(arg.as_integer() as u64).to_string()),
+                    'x' => out.push_str(&format!("{:x}", arg.as_integer() as u64)),
+                    'X' => out.push_str(&format!("{:X}", arg.as_integer() as u64)),
+                    'o' => out.push_str(&format!("{:o}", arg.as_integer() as u64)),
+                    'f' | 'F' => out.push_str(&format!("{:.*}", 6, arg.as_real())),
+                    'e' | 'E' => out.push_str(&format!("{:e}", arg.as_real())),
+                    'g' | 'G' => out.push_str(&format!("{}", arg.as_real())),
+                    's' => out.push_str(&arg.as_text()),
+                    'c' => {
+                        let n = arg.as_integer() as u32;
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                        }
+                    }
+                    _ => {
+                        // Unknown conversion: emit verbatim.
+                        out.push('%');
+                        out.push_str(&spec);
+                    }
+                }
+            }
+            Value::Text(out)
+        }
+        // MIN(a, b, c, ...) — scalar form (not the aggregate form).
+        // Returns the smallest argument. SQLite semantics: if ANY arg is
+        // NULL, the result is NULL (the comparison short-circuits).
+        "min" if args.len() > 1 => {
+            if args.iter().any(|v| v.is_null()) {
+                return Value::Null;
+            }
+            let mut best: Option<Value> = None;
+            for v in args {
+                if best.is_none() || v < best.as_ref().unwrap() {
+                    best = Some(v.clone());
+                }
+            }
+            best.unwrap_or(Value::Null)
+        }
+        // MAX(a, b, c, ...) — scalar form.
+        // Same NULL semantics as MIN: any NULL arg → result is NULL.
+        "max" if args.len() > 1 => {
+            if args.iter().any(|v| v.is_null()) {
+                return Value::Null;
+            }
+            let mut best: Option<Value> = None;
+            for v in args {
+                if best.is_none() || v > best.as_ref().unwrap() {
+                    best = Some(v.clone());
+                }
+            }
+            best.unwrap_or(Value::Null)
+        }
+        // SIGN(x) — returns -1, 0, or +1 depending on the sign of x.
+        // NULL input returns NULL.
+        "sign" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let r = v.as_real();
+                if r > 0.0 {
+                    Value::Integer(1)
+                } else if r < 0.0 {
+                    Value::Integer(-1)
+                } else {
+                    Value::Integer(0)
+                }
+            }
+        },
+        // POWER(x, y) — x^y.
+        "power" => {
+            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
+                Value::Real(args[0].as_real().powf(args[1].as_real()))
+            } else {
+                Value::Null
+            }
+        }
+        // SQRT(x).
+        "sqrt" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let x = v.as_real();
+                if x < 0.0 { Value::Null } else { Value::Real(x.sqrt()) }
+            }
+        },
+        // FLOOR / CEIL / CEILING.
+        "floor" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(v.as_real().floor()),
+        },
+        "ceil" | "ceiling" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(v.as_real().ceil()),
+        },
+        // TRUNC(x) — truncate toward zero.
+        "trunc" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(v.as_real().trunc()),
+        },
+        // PI() — 3.141592653589793.
+        "pi" => Value::Real(std::f64::consts::PI),
+        // EXP(x) — e^x.
+        "exp" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(std::f64::consts::E.powf(v.as_real())),
+        },
+        // LN(x) — natural log.
+        "ln" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let x = v.as_real();
+                if x <= 0.0 { Value::Null } else { Value::Real(x.ln()) }
+            }
+        },
+        // LOG(x) / LOG10(x) — base-10 log. With two args, LOG(b, x) is base-b.
+        "log" | "log10" => {
+            if args.is_empty() || args[0].is_null() {
+                return Value::Null;
+            }
+            if args.len() == 2 && !args[1].is_null() {
+                let b = args[0].as_real();
+                let x = args[1].as_real();
+                if b <= 0.0 || b == 1.0 || x <= 0.0 {
+                    return Value::Null;
+                }
+                return Value::Real(x.log(b));
+            }
+            let x = args[0].as_real();
+            if x <= 0.0 { Value::Null } else { Value::Real(x.log10()) }
+        }
+        // LOG2(x) — base-2 log.
+        "log2" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let x = v.as_real();
+                if x <= 0.0 { Value::Null } else { Value::Real(x.log2()) }
+            }
+        },
+        // ABS already defined above.
+        // ZEROBLOB(n) — n zero bytes.
+        "zeroblob" => {
+            let n = args.first().map(|v| v.as_integer()).unwrap_or(0).max(0) as usize;
+            Value::Blob(vec![0u8; n])
+        }
+        // CHAR(c1, c2, ...) — construct a string from code points.
+        "char" => {
+            let mut s = String::new();
+            for v in args {
+                if let Some(ch) = char::from_u32(v.as_integer() as u32) {
+                    s.push(ch);
+                }
+            }
+            Value::Text(s)
+        }
+        // UNICODE(s) — code point of the first character of s.
+        "unicode" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let s = v.as_text();
+                match s.chars().next() {
+                    Some(c) => Value::Integer(c as i64),
+                    None => Value::Null,
+                }
+            }
+        }
+        // TRUE() / FALSE() — SQLite 3.23+ boolean literals.
+        "true" => Value::Integer(1),
+        "false" => Value::Integer(0),
         _ => Value::Null,
     }
 }

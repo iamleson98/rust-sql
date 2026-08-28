@@ -509,11 +509,31 @@ pub fn expr_has_window(e: &Expr) -> bool {
 }
 
 /// Returns true if the function name is an aggregate.
+///
+/// Note: `min` and `max` are *polymorphic* in SQLite — they're aggregates
+/// when called with a single argument (e.g. `MAX(score)` over all rows),
+/// but scalar functions when called with 2+ arguments (e.g. `MAX(1, 5, 3)`
+/// returns 5). The planner uses `is_aggregate_call(name, n_args)` to
+/// disambiguate.
 pub fn is_aggregate_fn(name: &str) -> bool {
     matches!(
         name,
         "count" | "sum" | "avg" | "min" | "max" | "total" | "group_concat"
     )
+}
+
+/// Returns true if the function name is an aggregate *when called with the
+/// given number of arguments*. This is what the planner should use — it
+/// correctly handles the polymorphic `min`/`max` distinction:
+///   - `MAX(col)`        → 1 arg → aggregate.
+///   - `MAX(1, 5, 3)`    → 3 args → scalar.
+pub fn is_aggregate_call(name: &str, n_args: usize) -> bool {
+    let lc = name.to_ascii_lowercase();
+    match lc.as_str() {
+        "count" | "sum" | "avg" | "total" | "group_concat" => true,
+        "min" | "max" => n_args <= 1,
+        _ => false,
+    }
 }
 
 /// Returns true if the function name is a window-only function.
@@ -525,7 +545,10 @@ pub fn is_window_only_fn(name: &str) -> bool {
 fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExpr>) {
     match e {
         Expr::Function { name, distinct, args, over, filter } => {
-            if over.is_none() && is_aggregate_fn(&name.to_ascii_lowercase()) {
+            // Use is_aggregate_call (not is_aggregate_fn) so that the
+            // polymorphic min/max distinction is respected: MAX(col) is
+            // an aggregate (1 arg), MAX(1, 5, 3) is a scalar call (3 args).
+            if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
                 let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column { name, .. } if name == "*")) {
                     None
                 } else if args.len() == 1 {

@@ -1433,6 +1433,93 @@ static CASES: &[Case] = &[
         "INSERT INTO o (uid) VALUES (1), (2)",
         "SELECT u.name, COUNT(o.id) FROM u LEFT JOIN o ON u.id = o.uid GROUP BY u.name ORDER BY u.name",
     ),
+    // ---------- New SQL function parity (P4.14) ----------
+    // Note: SQLite (via rusqlite) supports INSTR, PRINTF, scalar MIN/MAX,
+    // SIGN, CHAR, UNICODE, ZEROBLOB, ABS out of the box. Functions like
+    // FLOOR/CEIL/PI/EXP/LN/LOG/POWER/SQRT/TRUNC require SQLite's
+    // `extension-functions.c` which isn't compiled in by default — we
+    // implement them in rustqlite but can't differential-test against
+    // SQLite-without-extensions.
+    case!(
+        "instr_basic",
+        "SELECT INSTR('hello world', 'world')",
+    ),
+    case!(
+        "instr_not_found",
+        "SELECT INSTR('hello', 'xyz')",
+    ),
+    case!(
+        "instr_empty_substring",
+        "SELECT INSTR('abc', '')",
+    ),
+    case!(
+        "printf_simple",
+        "SELECT PRINTF('Hello %s, you are %d', 'Alice', 30)",
+    ),
+    case!(
+        "printf_hex",
+        "SELECT PRINTF('value: %x', 255)",
+    ),
+    case!(
+        "scalar_min_2_args",
+        "SELECT MIN(3, 7)",
+    ),
+    case!(
+        "scalar_max_3_args",
+        "SELECT MAX(1, 5, 3)",
+    ),
+    case!(
+        "scalar_min_with_null",
+        "SELECT MIN(NULL, 5, 3)",
+    ),
+    case!(
+        "scalar_max_with_null",
+        "SELECT MAX(NULL, 5, 3, 7)",
+    ),
+    case!(
+        "sign_function",
+        "SELECT SIGN(-5), SIGN(0), SIGN(3.14)",
+    ),
+    case!(
+        "char_function",
+        "SELECT CHAR(72, 105, 33)",
+    ),
+    case!(
+        "unicode_function",
+        "SELECT UNICODE('A')",
+    ),
+    case!(
+        "zeroblob_function",
+        "SELECT LENGTH(ZEROBLOB(5))",
+    ),
+    case!(
+        "abs_with_real",
+        "SELECT ABS(-3.14)",
+    ),
+    case!(
+        "abs_with_int",
+        "SELECT ABS(-7)",
+    ),
+    case!(
+        "round_with_precision",
+        "SELECT ROUND(3.14159, 2)",
+    ),
+    case!(
+        "substr_basic",
+        "SELECT SUBSTR('hello world', 7)",
+    ),
+    case!(
+        "substr_with_length",
+        "SELECT SUBSTR('hello world', 1, 5)",
+    ),
+    case!(
+        "replace_basic",
+        "SELECT REPLACE('hello world', 'world', 'rust')",
+    ),
+    case!(
+        "trim_ltrim_rtrim",
+        "SELECT TRIM('  hi  '), LTRIM('  hi  '), RTRIM('  hi  ')",
+    ),
 ];
 
 /// Driver: run all cases.
