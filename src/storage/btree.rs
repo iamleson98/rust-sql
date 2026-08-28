@@ -273,6 +273,20 @@ impl Cell {
     }
 }
 
+/// Decode just the rowid from a leaf-table cell, without allocating the
+/// payload. Used by `lookup_table`'s binary search to avoid O(N) heap
+/// allocations per lookup.
+///
+/// Cell layout (LeafTable):
+/// ```text
+/// [varint: rowid][varint: payload_len][payload bytes...]
+/// ```
+/// Returns `(rowid, bytes_consumed)` or `None` on truncation.
+fn decode_rowid_only(buf: &[u8]) -> Option<(i64, usize)> {
+    let (rowid, n) = varint::decode_signed(buf)?;
+    Some((rowid, n))
+}
+
 /// A B+tree over a pager. Trees are identified by their root page ID.
 pub struct Btree<'a> {
     pub pager: &'a mut Pager,
@@ -319,6 +333,16 @@ impl<'a> Btree<'a> {
     }
 
     /// Look up a rowid in a table B+tree. Returns the payload bytes.
+    /// Look up a row by rowid in a table B+tree. Walks interior pages
+    /// (binary-searching each one) and finally binary-searches the leaf.
+    ///
+    /// Performance: this used to do a linear scan of the leaf with
+    /// `Cell::decode` per cell — each decode allocates a `Vec<u8>` for the
+    /// payload, so an N-cell leaf did N heap allocations per lookup. With
+    /// the rowid-only fast path (`decode_rowid_only`) and binary search,
+    /// it's now O(log N) decodes (no allocations during the search) plus
+    /// one final allocation for the matched payload. For a 100-cell leaf,
+    /// that's ~7 decodes (vs ~50 avg) and 1 allocation (vs ~50).
     pub fn lookup_table(&mut self, rowid: i64) -> Result<LookupResult> {
         let mut page_id = self.root;
         loop {
@@ -326,38 +350,62 @@ impl<'a> Btree<'a> {
             let pt = page.borrow().page_type()?;
             match pt {
                 PageType::LeafTable => {
-                    let n = page.borrow().n_cells();
-                    for i in 0..n {
-                        let cell_ptr = page.borrow().cell_pointer(i) as usize;
-                        let borrowed = page.borrow();
-                        let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if let Cell::TableLeaf {
-                            rowid: rid,
-                            payload,
-                        } = cell
-                        {
-                            if rid == rowid {
+                    // Single immutable borrow for the whole leaf scan.
+                    let borrowed = page.borrow();
+                    let n = borrowed.n_cells() as usize;
+                    // Binary search by rowid (cells are stored sorted).
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        // Read just the rowid — no payload allocation.
+                        let (cell_rowid, _) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                            .ok_or_else(|| Error::corruption("truncated leaf rowid in lookup"))?;
+                        if cell_rowid == rowid {
+                            // Found — decode the full cell ONCE.
+                            let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                            if let Cell::TableLeaf { payload, .. } = cell {
                                 return Ok(LookupResult::Found(payload));
                             }
-                            if rid > rowid {
-                                return Ok(LookupResult::NotFound);
-                            }
+                            unreachable!();
+                        } else if cell_rowid < rowid {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
                         }
                     }
                     return Ok(LookupResult::NotFound);
                 }
                 PageType::InteriorTable => {
                     let borrowed = page.borrow();
-                    let n = borrowed.n_cells();
+                    let n = borrowed.n_cells() as usize;
+                    // Binary search the interior cells for the right child.
+                    // Cells are sorted by key; cell (left_child, key) means
+                    // left_child contains rowids <= key.
                     let mut next = borrowed.right_most_pointer();
-                    for i in 0..n {
-                        let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if let Cell::TableInterior { left_child, key } = cell {
-                            if rowid <= key {
-                                next = left_child;
-                                break;
-                            }
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        // Read just the key — no payload allocation.
+                        // Interior cell layout: [left_child: u32 BE][key: varint]
+                        if cell_ptr + 4 > borrowed.data.len() {
+                            break;
+                        }
+                        let _left_child = u32::from_be_bytes(
+                            borrowed.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                        );
+                        let (key, _) = varint::decode_signed(&borrowed.data[cell_ptr + 4..])
+                            .ok_or_else(|| Error::corruption("truncated interior key in lookup"))?;
+                        if rowid <= key {
+                            // This cell's left_child contains rowid.
+                            next = _left_child;
+                            // Continue searching left for a tighter bound.
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
                         }
                     }
                     drop(borrowed);
