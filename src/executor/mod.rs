@@ -2308,10 +2308,11 @@ fn try_streaming_update(
     source: &Plan,
     assignments: &[(usize, Expr)],
 ) -> Result<Option<ExecResult>> {
-    // Detect the source shape and extract (table, filter_predicate, range).
+    // Detect the source shape and extract (table, filter_predicate, range, rowid).
     enum StreamingSource<'a> {
         Scan { table: &'a Arc<Table>, filter: Option<&'a Expr> },
         RowidRange { table: &'a Arc<Table>, start: Option<&'a Expr>, end: Option<&'a Expr>, residual: Option<&'a Expr> },
+        RowidLookup { table: &'a Arc<Table>, rowid: &'a Expr },
     }
     let src = match source {
         Plan::Scan { table: t, .. } => StreamingSource::Scan { table: t, filter: None },
@@ -2325,6 +2326,9 @@ fn try_streaming_update(
         Plan::RowidRange { table: t, start, end, residual, .. } => {
             StreamingSource::RowidRange { table: t, start: start.as_ref(), end: end.as_ref(), residual: residual.as_ref() }
         }
+        Plan::RowidLookup { table: t, rowid, .. } => {
+            StreamingSource::RowidLookup { table: t, rowid }
+        }
         _ => return Ok(None),
     };
 
@@ -2334,6 +2338,7 @@ fn try_streaming_update(
     let src_table = match &src {
         StreamingSource::Scan { table: t, .. } => t.clone(),
         StreamingSource::RowidRange { table: t, .. } => t.clone(),
+        StreamingSource::RowidLookup { table: t, .. } => t.clone(),
     };
     if src_table.name.to_ascii_lowercase() != table.name.to_ascii_lowercase() {
         return Ok(None);
@@ -2361,6 +2366,18 @@ fn try_streaming_update(
     let residual_pred = match &src {
         StreamingSource::Scan { filter, .. } => *filter,
         StreamingSource::RowidRange { residual, .. } => *residual,
+        StreamingSource::RowidLookup { .. } => None,
+    };
+
+    // For RowidLookup, evaluate the rowid expression now.
+    let lookup_rowid: Option<i64> = match &src {
+        StreamingSource::RowidLookup { rowid, .. } => {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
+            Some(evaluate(rowid, &eval_ctx)?.as_integer())
+        }
+        _ => None,
     };
 
     // Reusable buffers — allocated once, reused per row.
@@ -2382,8 +2399,21 @@ fn try_streaming_update(
     let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
 
     let mut bt = Btree::new(ctx.pager, root, false);
-    let scan_result: Result<()> = if matches!(src, StreamingSource::RowidRange { .. }) {
-        bt.scan_table_range(range_start, range_end, |_rowid, payload| {
+    if let Some(rowid) = lookup_rowid {
+        // RowidLookup source — fetch exactly one row by rowid.
+        match bt.lookup_table(rowid)? {
+            LookupResult::Found(payload) => {
+                process_update_row(
+                    &payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
+                    assignments, &col_names, &params, &named_params, table,
+                    residual_pred, &mut updates,
+                );
+            }
+            LookupResult::NotFound => {}
+        }
+        Ok::<(), crate::error::Error>(())
+    } else if matches!(src, StreamingSource::RowidRange { .. }) {
+        bt.scan_table_range_borrowed(range_start, range_end, |_rowid, payload| {
             process_update_row(
                 payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
@@ -2392,7 +2422,7 @@ fn try_streaming_update(
             true
         })
     } else {
-        bt.scan_table(|_rowid, payload| {
+        bt.scan_table_borrowed(|_rowid, payload| {
             process_update_row(
                 payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
@@ -2400,8 +2430,7 @@ fn try_streaming_update(
             );
             true
         })
-    };
-    scan_result?;
+    }?;
     let new_root = bt.root;
     ctx.set_table_root(&table.name, new_root);
 
