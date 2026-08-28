@@ -238,8 +238,8 @@ impl Database {
         ctx.txn_snapshot = txn_snap;
         ctx.root_overrides = std::mem::take(&mut self.root_overrides);
         ctx.max_rowids = std::mem::take(&mut self.max_rowids);
-        for (i, v) in params.into_iter().enumerate() {
-            ctx.bind(&format!("{}", i), v);
+        for v in params.into_iter() {
+            ctx.bind_positional(v);
         }
         let result = Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql);
         self.in_transaction = ctx.in_transaction;
@@ -286,8 +286,8 @@ impl Database {
             // See comment in `query` — move (not clone) these.
             ctx.root_overrides = std::mem::take(&mut self.root_overrides);
             ctx.max_rowids = std::mem::take(&mut self.max_rowids);
-            for (i, v) in params.into_iter().enumerate() {
-                ctx.bind(&format!("{}", i), v);
+            for v in params.into_iter() {
+                ctx.bind_positional(v);
             }
             let res = execute(&plan, &mut ctx)?;
             self.txn_snapshot = ctx.txn_snapshot;
@@ -317,8 +317,8 @@ impl Database {
             // See comment in `query` — move (not clone) these.
             ctx.root_overrides = std::mem::take(&mut self.root_overrides);
             ctx.max_rowids = std::mem::take(&mut self.max_rowids);
-            for (i, v) in params.into_iter().enumerate() {
-                ctx.bind(&format!("{}", i), v);
+            for v in params.into_iter() {
+                ctx.bind_positional(v);
             }
             let res = execute(&plan, &mut ctx)?;
             self.txn_snapshot = ctx.txn_snapshot;

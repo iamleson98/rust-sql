@@ -29,7 +29,19 @@ use std::sync::Arc;
 /// Shared execution state.
 pub struct ExecContext<'a> {
     pub pager: &'a mut Pager,
-    pub params: HashMap<String, Value>,
+    /// Positional bound parameters (`?` placeholders), indexed 0..N.
+    /// Pushed by `bind_positional`. This is the common case — virtually
+    /// all real-world queries use `?` placeholders.
+    ///
+    /// Previously this was a `HashMap<String, Value>` keyed by the param
+    /// name (e.g. "0", "1"). The HashMap allocated a bucket array on first
+    /// insert (~200-500 ns per query) and required a hash + lookup per
+    /// evaluation. The Vec is allocated once per query (cheap) and indexed
+    /// by usize (single memory load).
+    pub params: Vec<Value>,
+    /// Named parameters (:name, @col, $var). Allocated lazily — empty for
+    /// the 99% case of purely positional `?` placeholders.
+    pub named_params: HashMap<String, Value>,
     pub last_insert_rowid: i64,
     pub changes: i64,
     /// When true (inside BEGIN..COMMIT), DML operators skip per-statement flushes.
@@ -61,7 +73,8 @@ impl<'a> ExecContext<'a> {
     pub fn new(pager: &'a mut Pager, catalog: *const crate::schema::Catalog) -> Self {
         Self {
             pager,
-            params: HashMap::new(),
+            params: Vec::new(),
+            named_params: HashMap::new(),
             last_insert_rowid: 0,
             changes: 0,
             in_transaction: false,
@@ -111,8 +124,31 @@ impl<'a> ExecContext<'a> {
         self.max_rowids.insert(table_name.to_ascii_lowercase(), rowid);
     }
 
+    /// Bind a positional parameter (the common `?` placeholder case).
+    /// Pushes to the params Vec. Cheaper than `bind(name, value)` because
+    /// it skips the String key allocation and HashMap insert.
+    pub fn bind_positional(&mut self, value: Value) {
+        self.params.push(value);
+    }
+
+    /// Bind a parameter by name. For numeric names (e.g. "0", "1"), pushes
+    /// to the positional Vec at the parsed index (extending with Nulls if
+    /// needed). For named params (:name, @col, $var), inserts into the
+    /// named_params HashMap.
+    ///
+    /// Kept for backwards compatibility with existing callers that pass
+    /// `&format!("{}", i)` as the name. New code should prefer
+    /// `bind_positional` for the positional case.
     pub fn bind(&mut self, name: &str, value: Value) {
-        self.params.insert(name.to_string(), value);
+        if let Ok(idx) = name.parse::<usize>() {
+            // Positional — extend the Vec with Nulls if needed.
+            while self.params.len() <= idx {
+                self.params.push(Value::Null);
+            }
+            self.params[idx] = value;
+        } else {
+            self.named_params.insert(name.to_string(), value);
+        }
     }
 }
 
@@ -164,8 +200,8 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
 }
 
 // Helper: evaluate an expression against a single row.
-fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &HashMap<String, Value>) -> Result<Value> {
-    let ctx = EvalContext::new(row, col_names, params);
+fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], named_params: &HashMap<String, Value>) -> Result<Value> {
+    let ctx = EvalContext::new(row, col_names, params, named_params);
     evaluate(expr, &ctx)
 }
 
@@ -207,7 +243,7 @@ fn exec_values(ctx: &mut ExecContext<'_>, rows: &[Vec<Expr>]) -> Result<ExecResu
     for exprs in rows {
         let mut row = Vec::with_capacity(exprs.len());
         for e in exprs {
-            row.push(evaluate(e, &EvalContext::new(&empty_row, &empty_cols, &ctx.params))?);
+            row.push(evaluate(e, &EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params))?);
         }
         out.push(row);
     }
@@ -222,7 +258,7 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     let inner = execute(input, ctx)?;
     let mut rows = Vec::new();
     for row in inner.rows {
-        let v = eval_row(predicate, &row, &inner.columns, &ctx.params)?;
+        let v = eval_row(predicate, &row, &inner.columns, &ctx.params, &ctx.named_params)?;
         if v.is_truthy() {
             rows.push(row);
         }
@@ -274,7 +310,7 @@ fn exec_project(ctx: &mut ExecContext<'_>, input: &Plan, columns: &[ProjectExpr]
                     continue;
                 }
             }
-            out.push(eval_row(&c.expr, row, &inner.columns, &ctx.params)?);
+            out.push(eval_row(&c.expr, row, &inner.columns, &ctx.params, &ctx.named_params)?);
             let _ = i;
         }
         out_rows.push(out);
@@ -313,11 +349,12 @@ fn expr_display_name(e: &Expr, input_cols: &[String]) -> String {
 fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Result<ExecResult> {
     let mut inner = execute(input, ctx)?;
     let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
     let columns = inner.columns.clone();
     inner.rows.sort_by(|a, b| {
         for term in terms {
-            let va = eval_row(&term.expr, a, &columns, &params).unwrap_or(Value::Null);
-            let vb = eval_row(&term.expr, b, &columns, &params).unwrap_or(Value::Null);
+            let va = eval_row(&term.expr, a, &columns, &params, &named_params).unwrap_or(Value::Null);
+            let vb = eval_row(&term.expr, b, &columns, &params, &named_params).unwrap_or(Value::Null);
             let ord = va.cmp(&vb);
             let ord = if term.order == Order::Desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
@@ -337,7 +374,7 @@ fn exec_limit(ctx: &mut ExecContext<'_>, input: &Plan, count: &Expr, offset: &Ex
     let mut inner = execute(input, ctx)?;
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
-    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params);
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     let count_val = evaluate(count, &eval_ctx)?.as_integer();
     let offset_val = evaluate(offset, &eval_ctx)?.as_integer();
     let offset = offset_val.max(0) as usize;
@@ -391,11 +428,12 @@ impl Default for AggState {
 fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], aggregates: &[AggExpr]) -> Result<ExecResult> {
     let inner = execute(input, ctx)?;
     let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
     let mut groups: HashMap<String, (Vec<Value>, Vec<AggState>)> = HashMap::new();
     let mut group_order: Vec<String> = Vec::new();
 
     for row in &inner.rows {
-        let key: Vec<Value> = group_by.iter().map(|e| eval_row(e, row, &inner.columns, &params)).collect::<Result<_>>()?;
+        let key: Vec<Value> = group_by.iter().map(|e| eval_row(e, row, &inner.columns, &params, &named_params)).collect::<Result<_>>()?;
         let key_str = key.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join("|");
         let entry = groups.entry(key_str.clone()).or_insert_with(|| {
             group_order.push(key_str.clone());
@@ -403,7 +441,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         });
         for (i, agg) in aggregates.iter().enumerate() {
             let arg_val = if let Some(arg) = &agg.arg {
-                eval_row(arg, row, &inner.columns, &params)?
+                eval_row(arg, row, &inner.columns, &params, &named_params)?
             } else {
                 Value::Integer(1)
             };
@@ -568,6 +606,7 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
 fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) -> Result<ExecResult> {
     let mut inner = execute(input, ctx)?;
     let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
     let n_rows = inner.rows.len();
 
     // For each window, compute values for each row.
@@ -578,7 +617,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
         let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
         let mut partition_map: HashMap<String, usize> = HashMap::new();
         for (i, row) in inner.rows.iter().enumerate() {
-            let key: Vec<Value> = w.partition_by.iter().map(|e| eval_row(e, row, &inner.columns, &params)).collect::<Result<_>>()?;
+            let key: Vec<Value> = w.partition_by.iter().map(|e| eval_row(e, row, &inner.columns, &params, &named_params)).collect::<Result<_>>()?;
             let key_str = key.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join("|");
             if let Some(&idx) = partition_map.get(&key_str) {
                 partitions[idx].1.push(i);
@@ -592,8 +631,8 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
             let mut sorted_indices = indices.clone();
             if !w.order_by.is_empty() {
                 sorted_indices.sort_by(|a, b| {
-                    let va = eval_row(&w.order_by[0].expr, &inner.rows[*a], &inner.columns, &params).unwrap_or(Value::Null);
-                    let vb = eval_row(&w.order_by[0].expr, &inner.rows[*b], &inner.columns, &params).unwrap_or(Value::Null);
+                    let va = eval_row(&w.order_by[0].expr, &inner.rows[*a], &inner.columns, &params, &named_params).unwrap_or(Value::Null);
+                    let vb = eval_row(&w.order_by[0].expr, &inner.rows[*b], &inner.columns, &params, &named_params).unwrap_or(Value::Null);
                     let ord = va.cmp(&vb);
                     if w.order_by[0].order == Order::Desc { ord.reverse() } else { ord }
                 });
@@ -607,7 +646,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
             for (pos_in_partition, &row_idx) in sorted_indices.iter().enumerate() {
                 row_num = (pos_in_partition + 1) as i64;
                 let row = &inner.rows[row_idx];
-                let key: Vec<Value> = w.order_by.iter().map(|t| eval_row(&t.expr, row, &inner.columns, &params)).collect::<Result<_>>()?;
+                let key: Vec<Value> = w.order_by.iter().map(|t| eval_row(&t.expr, row, &inner.columns, &params, &named_params)).collect::<Result<_>>()?;
                 if prev_key.as_ref() != Some(&key) {
                     rank += count_in_rank + 1;
                     count_in_rank = 0;
@@ -616,7 +655,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
                 count_in_rank += 1;
                 prev_key = Some(key);
 
-                let val = compute_window_value(w, row_num, rank, dense_rank, row, &inner.columns, &params)?;
+                let val = compute_window_value(w, row_num, rank, dense_rank, row, &inner.columns, &params, &named_params)?;
                 if extra_cols[row_idx].is_empty() {
                     extra_cols[row_idx] = vec![Value::Null; windows.len()];
                 }
@@ -649,9 +688,10 @@ fn compute_window_value(
     dense_rank: i64,
     row: &Row,
     column_names: &[String],
-    params: &HashMap<String, Value>,
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
 ) -> Result<Value> {
-    let eval_ctx = EvalContext::new(row, column_names, params);
+    let eval_ctx = EvalContext::new(row, column_names, params, named_params);
     match w.func.as_str() {
         "row_number" => Ok(Value::Integer(row_num)),
         "rank" => Ok(Value::Integer(rank)),
@@ -681,6 +721,7 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
     let n_left = left_res.columns.len();
     let n_right = right_res.columns.len();
     let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
 
     let mut out_rows = Vec::new();
     let mut right_matched = vec![false; right_res.rows.len()];
@@ -691,7 +732,7 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
             let mut combined = left_row.clone();
             combined.extend(right_row.clone());
             let ok = if let Some(cond) = condition {
-                let v = eval_row(cond, &combined, &combined_cols, &params)?;
+                let v = eval_row(cond, &combined, &combined_cols, &params, &named_params)?;
                 v.is_truthy()
             } else {
                 true
@@ -740,6 +781,7 @@ fn exec_hash_join(
     let n_left = left_res.columns.len();
     let n_right = right_res.columns.len();
     let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
 
     // Extract the equi-join keys from the condition.
     // We expect `left.col = right.col` (a single equality or an AND of equalities).
@@ -849,7 +891,7 @@ fn exec_hash_join(
                 };
                 // Verify the full condition (in case there are non-equi predicates).
                 let ok = if let Some(cond) = condition {
-                    let v = eval_row(cond, &combined, &combined_cols, &params)?;
+                    let v = eval_row(cond, &combined, &combined_cols, &params, &named_params)?;
                     v.is_truthy()
                 } else {
                     true
@@ -1151,7 +1193,7 @@ fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<E
 fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &Expr) -> Result<ExecResult> {
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
-    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params);
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     let rowid = evaluate(rowid_expr, &eval_ctx)?.as_integer();
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
@@ -1181,7 +1223,7 @@ fn exec_rowid_range(
 ) -> Result<ExecResult> {
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
-    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params);
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
 
     // Evaluate the bounds. None means unbounded (-∞ or +∞).
     let start: i64 = match start_expr {
@@ -1212,8 +1254,9 @@ fn exec_rowid_range(
     let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     if let Some(res) = residual {
         let params = ctx.params.clone();
+        let named_params = ctx.named_params.clone();
         rows.retain(|row| {
-            match eval_row(res, row, &columns, &params) {
+            match eval_row(res, row, &columns, &params, &named_params) {
                 Ok(v) => v.is_truthy(),
                 Err(_) => false,
             }
@@ -1236,7 +1279,7 @@ fn exec_index_lookup(
     // Evaluate the key expressions to get the lookup values.
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
-    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params);
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     let key_values: Vec<Value> = key_exprs.iter()
         .map(|e| evaluate(e, &eval_ctx))
         .collect::<Result<_>>()?;
@@ -1299,7 +1342,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             if full_row[i].is_null() && col.default.is_some() {
                 let empty_row: Vec<Value> = Vec::new();
                 let empty_cols: Vec<String> = Vec::new();
-                let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params);
+                let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 if let Some(default_expr) = &col.default {
                     full_row[i] = evaluate(default_expr, &eval_ctx)?;
                 }
@@ -1537,7 +1580,7 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
 
         let mut new_row = row.clone();
         for (col_idx, expr) in assignments {
-            new_row[*col_idx] = eval_row(expr, row, &col_names, &ctx.params)?;
+            new_row[*col_idx] = eval_row(expr, row, &col_names, &ctx.params, &ctx.named_params)?;
             let aff = table.columns[*col_idx].affinity;
             new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
         }
