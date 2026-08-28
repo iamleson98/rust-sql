@@ -571,6 +571,7 @@ impl<'a> Btree<'a> {
             borrowed.set_n_cells(n + 1);
             borrowed.dirty = true;
         }
+        self.pager.note_dirty(leaf_id);
         Ok(())
     }
 
@@ -649,6 +650,7 @@ impl<'a> Btree<'a> {
                             .copy_from_slice(new_payload);
                         borrowed.dirty = true;
                     }
+                    self.pager.note_dirty(page_id);
                     return Ok(true);
                 }
                 PageType::InteriorTable => {
@@ -935,6 +937,7 @@ impl<'a> Btree<'a> {
             borrowed.set_n_cells(n + 1);
             borrowed.dirty = true;
         }
+        self.pager.note_dirty(page_id);
         Ok(())
     }
 
@@ -987,6 +990,7 @@ impl<'a> Btree<'a> {
         } else {
             new_page.lock().init_leaf_table();
         }
+        // Note: new_page_id is already in dirty_pages via allocate_page.
 
         // Clear the old page and re-insert the first half.
         {
@@ -998,6 +1002,9 @@ impl<'a> Btree<'a> {
                 borrowed.init_leaf_table();
             }
         }
+        // init_leaf_table/index sets dirty=true directly; track it in the
+        // dirty_pages set so flush() will write it back.
+        self.pager.note_dirty(page_id);
 
         // Re-insert first half into old page, second half into new page.
         for c in &cells[..mid] {
@@ -1141,6 +1148,7 @@ impl<'a> Btree<'a> {
                     borrowed.set_n_cells(n - 1);
                     borrowed.dirty = true;
                 }
+                self.pager.note_dirty(page_id);
                 Ok(true)
             }
             PageType::InteriorTable | PageType::InteriorIndex => {

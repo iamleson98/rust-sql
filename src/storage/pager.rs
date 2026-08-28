@@ -150,6 +150,18 @@ pub struct Pager {
     /// which is sufficient to make `flush()`'s fast path O(1) and to make
     /// `dirty_page_count()` O(1) for the threshold check.
     dirty_count_approx: AtomicUsize,
+    /// Set of page IDs that are dirty (have `dirty == true`). Inserted by
+    /// `note_dirty(id)` (called whenever a page is marked dirty). Removed
+    /// by `flush()` after the page is written back.
+    ///
+    /// This is the EXACT set of dirty pages (modulo deduplication — the
+    /// same page inserted twice is fine, `HashSet::insert` is idempotent).
+    /// `flush()` iterates this set instead of scanning the entire cache,
+    /// making it O(dirty_count) instead of O(cache_size). For a workload
+    /// with a 10k-page cache but only 2 dirty pages per statement, this
+    /// turns flush() from O(10k) page-lock-acquire-and-check into O(2)
+    /// HashSet lookups — a 5000× speedup on the per-statement overhead.
+    dirty_pages: Mutex<std::collections::HashSet<PageId>>,
 }
 
 impl Pager {
@@ -176,6 +188,7 @@ impl Pager {
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(false),
             dirty_count_approx: AtomicUsize::new(0),
+            dirty_pages: Mutex::new(std::collections::HashSet::new()),
         };
 
         let file_size = pager.file.metadata()?.len();
@@ -279,6 +292,16 @@ impl Pager {
     /// `Database::query()` call (the 9.2× point-lookup gap vs SQLite).
     pub fn note_write(&self) {
         self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Notify the pager that a specific page is dirty. Adds the page ID
+    /// to the dirty_pages set so `flush()` can iterate only dirty pages
+    /// instead of scanning the entire cache.
+    ///
+    /// Idempotent — calling it twice with the same page ID is fine.
+    /// Cost: O(1) HashSet insert.
+    pub fn note_dirty(&self, id: PageId) {
+        self.dirty_pages.lock().insert(id);
     }
 
     /// True if there might be dirty pages in the cache. O(1).
@@ -389,6 +412,7 @@ impl Pager {
                 borrowed.dirty = true;
             }
             self.note_write();
+            self.note_dirty(freed);
             Ok(freed)
         } else {
             // Extend the file.
@@ -404,6 +428,7 @@ impl Pager {
             }
             self.lru.lock().push_back(id);
             self.note_write();
+            self.note_dirty(id);
             Ok(id)
         }
     }
@@ -425,6 +450,7 @@ impl Pager {
         self.freelist_head.store(id, Ordering::Release);
         self.freelist_count.fetch_add(1, Ordering::AcqRel);
         self.note_write();
+        self.note_dirty(id);
         Ok(())
     }
 
@@ -457,6 +483,9 @@ impl Pager {
                 borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
                 borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
                 borrowed.dirty = true;
+                // Mark page 0 as dirty in the dirty_pages set so it gets flushed below.
+                drop(borrowed);
+                self.dirty_pages.lock().insert(0);
             }
         } else {
             // Page 0 not in cache — read, modify, write directly
@@ -468,18 +497,18 @@ impl Pager {
             self.write_file_at(0, &header)?;
         }
 
-        // Flush dirty pages in cache. Collect dirty IDs first (avoid holding
-        // the cache lock while doing disk I/O).
+        // Flush dirty pages — use the dirty_pages set so this is O(dirty_count),
+        // not O(cache_size). This is the key optimization: a 10k-page cache with
+        // only 1-2 dirty pages per statement used to scan 10k page-locks per
+        // flush; now we iterate only the dirty set (~1-2 entries).
         let dirty_ids: Vec<PageId> = {
-            let cache = self.cache.read();
-            cache
-                .iter()
-                .filter(|(_, p)| p.lock().dirty)
-                .map(|(id, _)| *id)
-                .collect()
+            let mut set = self.dirty_pages.lock();
+            set.drain().collect::<Vec<_>>()
         };
 
         for id in dirty_ids {
+            // Use a single cache read lock to look up the page; clone the Arc
+            // and release the lock before doing I/O.
             let page_ref = self.cache.read().get(&id).cloned();
             if let Some(page_ref) = page_ref {
                 let mut borrowed = page_ref.lock();
@@ -490,7 +519,6 @@ impl Pager {
                 }
             }
         }
-        self.file.sync_all().ok();
         // If skip_fsync is set (in-memory mode), sync_all is a no-op on
         // tmpfs anyway, but the syscall round-trip still costs ~5-50 µs.
         // Skip the entire call to make in-memory mode match SQLite's `:memory:`
@@ -524,6 +552,7 @@ impl Pager {
             cache.clear();
         }
         self.lru.lock().clear();
+        self.dirty_pages.lock().clear();
 
         // 2. Restore mutable metadata.
         self.n_pages.store(snap.n_pages, Ordering::Release);

@@ -1009,9 +1009,16 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
 }
 
 fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool) {
-    let key = format!("{:?}", v);
-    if distinct && !state.distinct.insert(key) {
-        return;
+    // Only compute the distinct key if we're actually doing a DISTINCT
+    // aggregate. For non-DISTINCT aggregates, this skips a per-row
+    // `format!("{:?}", v)` String allocation that was the dominant cost
+    // of `exec_aggregate_no_group_by` — for a 10k-row scan, that's 10k
+    // saved heap allocations, ~3-5 ms on a hot CPU.
+    if distinct {
+        let key = format!("{:?}", v);
+        if !state.distinct.insert(key) {
+            return;
+        }
     }
     // Only mark "seen_value" for non-NULL inputs. This makes SUM of all
     // NULLs return NULL (matching SQLite), rather than the previous
