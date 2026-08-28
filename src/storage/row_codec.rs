@@ -28,8 +28,7 @@ pub fn encode_row(row: &Row) -> Vec<u8> {
 pub fn encode_row_into(row: &Row, out: &mut Vec<u8>) {
     out.clear();
     for v in row {
-        let bytes = v.encode();
-        out.extend_from_slice(&bytes);
+        v.encode_into(out);
     }
 }
 
@@ -87,6 +86,96 @@ pub fn apply_affinities(row: &mut Row, affinities: &[Affinity]) {
             *v = coerced;
         }
     }
+}
+
+/// Decode only a subset of columns from a row payload.
+///
+/// `col_indices` is a sorted list of column indices to extract (e.g.
+/// `[2, 4]` extracts columns 2 and 4). The result is placed in `out`,
+/// cleared and resized to `col_indices.len()`. Columns that don't exist
+/// in the encoded payload (short row) are filled with NULL.
+///
+/// This is the hot-path decoder for aggregate/scan queries that only
+/// touch a few columns of a wide table — e.g. `SELECT SUM(score) FROM t`
+/// on a 10-column table skips decoding 9 columns per row, which is the
+/// dominant cost for `exec_aggregate_no_group_by` and `Range scan`.
+///
+/// Cost: O(K + N_skip) where K = number of wanted columns and N_skip is
+/// the total encoded bytes of the skipped columns. We still have to walk
+/// the bytes of skipped columns (no length-prefix index in our format),
+/// but we skip the `String::from_utf8` / `Vec::from_slice` allocations
+/// that decode would otherwise do. For Text/Blob columns, the skip is
+/// pure pointer arithmetic — no heap traffic.
+pub fn decode_row_selective(
+    buf: &[u8],
+    n_cols_total: usize,
+    col_indices: &[usize],
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    out.clear();
+    out.resize(col_indices.len(), Value::Null);
+
+    if col_indices.is_empty() {
+        return Ok(());
+    }
+
+    // Walk through the encoded columns once. For each column index that's
+    // in `col_indices`, decode the value and place it in the right slot of
+    // `out`. For other columns, skip the bytes.
+    let mut pos = 0usize;
+    let mut col = 0usize;
+    let mut wanted_idx = 0usize;
+
+    while pos < buf.len() && col < n_cols_total && wanted_idx < col_indices.len() {
+        // Advance `wanted_idx` past any indices < col.
+        while wanted_idx < col_indices.len() && col_indices[wanted_idx] < col {
+            wanted_idx += 1;
+        }
+        if wanted_idx >= col_indices.len() {
+            break;
+        }
+        let target = col_indices[wanted_idx];
+
+        if col == target {
+            // Decode this value.
+            let (v, n) = Value::decode(&buf[pos..])
+                .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
+            out[wanted_idx] = v;
+            pos += n;
+            wanted_idx += 1;
+        } else {
+            // Skip this value: read the tag and length without allocating.
+            let n = value_encoded_len(&buf[pos..])?;
+            pos += n;
+        }
+        col += 1;
+    }
+    Ok(())
+}
+
+/// Compute the encoded length of a value at `buf[0..]` without allocating
+/// a `Value`. Returns the total number of bytes consumed by this value
+/// (tag + payload). Used by `decode_row_selective` to skip unwanted
+/// columns in O(1) per-column time without heap traffic.
+fn value_encoded_len(buf: &[u8]) -> Result<usize> {
+    if buf.is_empty() {
+        return Err(crate::error::Error::corruption("empty value"));
+    }
+    let tag = buf[0];
+    let rest_len = buf.len() - 1;
+    Ok(match tag {
+        0 => 1,                                       // Null
+        1 | 2 => 9,                                   // Integer / Real: 1 + 8
+        3 | 4 => {
+            // Text / Blob: 1 (tag) + 4 (len) + body
+            if rest_len < 4 {
+                return Err(crate::error::Error::corruption("truncated len prefix"));
+            }
+            let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            5 + len
+        }
+        _ => return Err(crate::error::Error::corruption("unknown value tag")),
+    })
 }
 
 fn affinity_apply_opt(aff: Affinity, v: Value) -> Option<Value> {

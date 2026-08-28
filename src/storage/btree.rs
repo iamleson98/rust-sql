@@ -467,6 +467,113 @@ impl<'a> Btree<'a> {
         }
     }
 
+    /// Bulk-append insert: like `insert_table` but optimized for sequential
+    /// rowid inserts (the common case for `INSERT INTO t VALUES (...)` with
+    /// an auto-generated INTEGER PRIMARY KEY). Walks the right_most_pointer
+    /// chain down to the rightmost leaf WITHOUT binary-searching interior
+    /// pages, then appends at the end of the leaf WITHOUT binary-searching
+    /// cell positions.
+    ///
+    /// Returns the new root (may differ from the old root if the tree split).
+    /// The caller must update its cached root.
+    ///
+    /// Mirrors SQLite's `BTREE_APPEND` optimization. For 1k sequential
+    /// inserts, this skips ~10k binary searches (each ~200 ns on a hot
+    /// CPU) — a ~2 ms saving.
+    ///
+    /// Precondition: `rowid > current_max_rowid` (caller's responsibility).
+    /// If the precondition is violated, this falls back to the normal path.
+    pub fn insert_table_append(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
+        self.pager.note_write();
+
+        // Walk right_most_pointer chain down to the rightmost leaf.
+        let mut page_id = self.root;
+        let leaf_id;
+        loop {
+            let page = self.pager.get_page(page_id)?;
+            let pt = page.lock().page_type()?;
+            match pt {
+                PageType::LeafTable => {
+                    leaf_id = page_id;
+                    break;
+                }
+                PageType::InteriorTable => {
+                    let right = page.lock().right_most_pointer();
+                    if right == 0 {
+                        // Shouldn't happen on a valid interior page, but fall back.
+                        return self.insert_table(rowid, payload);
+                    }
+                    page_id = right;
+                }
+                _ => {
+                    return self.insert_table(rowid, payload);
+                }
+            }
+        }
+
+        // Now at the rightmost leaf. Check the last cell's rowid to confirm
+        // this really is an append (caller's responsibility, but we verify).
+        let page = self.pager.get_page(leaf_id)?;
+        let n = page.lock().n_cells();
+        if n > 0 {
+            let borrowed = page.lock();
+            let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
+            if let Some((last_rowid, _)) = varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                if rowid <= last_rowid {
+                    // Not an append — fall back to the normal path.
+                    drop(borrowed);
+                    return self.insert_table(rowid, payload);
+                }
+            }
+        }
+
+        // Compute the cell bytes once.
+        let mut cell_buf = Vec::with_capacity(payload.len() + 12);
+        // Encode varint rowid.
+        let mut rid_buf = [0u8; 9];
+        let n_rid = varint::encode_signed(rowid, &mut rid_buf);
+        cell_buf.extend_from_slice(&rid_buf[..n_rid]);
+        // Encode varint payload length.
+        let mut plen_buf = [0u8; 9];
+        let n_plen = varint::encode(payload.len() as u64, &mut plen_buf);
+        cell_buf.extend_from_slice(&plen_buf[..n_plen]);
+        // Payload.
+        cell_buf.extend_from_slice(payload);
+
+        let cell_size = cell_buf.len() as u32;
+
+        // Check if the leaf has space.
+        let free = page.lock().free_space();
+        if free < cell_size + 2 {
+            // Need to split — fall back to the normal insert path, which
+            // handles splitting + propagating the split up the tree.
+            return self.insert_table(rowid, payload);
+        }
+
+        // Append: write cell at the new content start, write pointer at end.
+        {
+            let mut borrowed = page.lock();
+            let new_content_start = borrowed.cell_content_start() - cell_size;
+            let off = new_content_start as usize;
+            borrowed.data[off..off + cell_size as usize].copy_from_slice(&cell_buf);
+            borrowed.set_cell_content_start(new_content_start);
+
+            // Append the cell pointer at position `n` (end).
+            let header_offset = if leaf_id == 0 {
+                crate::storage::page::DB_HEADER_SIZE as usize
+            } else {
+                0
+            };
+            let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+            let dst = ptr_array_start + n as usize * 2;
+            borrowed.data[dst..dst + 2]
+                .copy_from_slice(&(new_content_start as u16).to_be_bytes());
+            borrowed.set_n_cells(n + 1);
+            borrowed.dirty = true;
+        }
+        Ok(())
+    }
+
     /// Update a row in a table B+tree in place when possible.
     ///
     /// If the new payload has the same length as the existing payload,
@@ -1110,6 +1217,93 @@ impl<'a> Btree<'a> {
         self.scan_subtree(self.root, &mut f)
     }
 
+    /// Zero-allocation table scan: callback receives `(rowid, payload_bytes)`
+    /// where `payload_bytes` is a BORROW into the cached page's data buffer.
+    ///
+    /// This bypasses `Cell::decode` which would allocate a fresh `Vec<u8>`
+    /// per row to copy the payload out. For a 10k-row scan, that's 10k
+    /// malloc+free pairs saved (~500μs on a hot CPU).
+    ///
+    /// The catch: the borrow is tied to the page lock. We hold the Mutex
+    /// guard for the whole leaf iteration, so the callback must NOT call
+    /// back into the pager (no `get_page`, no `allocate_page`). For pure
+    /// decode/transform callbacks this is fine.
+    pub fn scan_table_borrowed<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
+        self.scan_subtree_borrowed(self.root, &mut f)
+    }
+
+    fn scan_subtree_borrowed<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        page_id: PageId,
+        f: &mut F,
+    ) -> Result<()> {
+        let page = self.pager.get_page(page_id)?;
+        let pt = page.lock().page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                // Single lock for the whole leaf iteration. Inside the
+                // lock we read cell pointers and slice payload bytes
+                // directly into the page's data buffer — no allocation.
+                let borrowed = page.lock();
+                let n = borrowed.n_cells();
+                let psz = borrowed.data.len();
+                for i in 0..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    // Decode rowid varint + payload length varint, then
+                    // slice the payload bytes — all without allocating.
+                    let buf = &borrowed.data[cell_ptr..];
+                    let (rowid, n1) = varint::decode_signed(buf)
+                        .ok_or_else(|| Error::corruption("truncated leaf rowid in scan_borrowed"))?;
+                    let rest = &buf[n1..];
+                    let (plen, n2) = varint::decode(rest)
+                        .ok_or_else(|| Error::corruption("truncated leaf payload len in scan_borrowed"))?;
+                    let payload_start = n1 + n2;
+                    let plen = plen as usize;
+                    if payload_start + plen > buf.len() {
+                        return Err(Error::corruption("truncated leaf payload in scan_borrowed"));
+                    }
+                    let payload = &buf[payload_start..payload_start + plen];
+                    if !f(rowid, payload) {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            PageType::InteriorTable => {
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
+                let cells: Vec<PageId> = {
+                    let borrowed = page.lock();
+                    let mut v = Vec::with_capacity(n as usize + 1);
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        if let Cell::TableInterior { left_child, .. } = c {
+                            v.push(left_child);
+                        }
+                    }
+                    v.push(right);
+                    v
+                };
+                drop(page);
+                for child in cells {
+                    self.scan_subtree_borrowed(child, f)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in scan_borrowed: {:?}",
+                pt
+            ))),
+        }
+    }
+
     /// Count all rows in a table B+tree WITHOUT decoding any cell payloads.
     /// Much faster than `scan_table` + count — for `SELECT COUNT(*) FROM t`
     /// this skips the per-row decode_row_into overhead (which dominates
@@ -1214,6 +1408,96 @@ impl<'a> Btree<'a> {
         mut f: F,
     ) -> Result<()> {
         self.scan_range_subtree(self.root, start, end, &mut f)
+    }
+
+    /// Zero-allocation range scan: like `scan_table_range` but bypasses
+    /// `Cell::decode`'s per-row payload allocation by passing `&[u8]`
+    /// borrows directly into the page buffer. Used by `exec_rowid_range`
+    /// to speed up `WHERE id BETWEEN ? AND ?` queries.
+    pub fn scan_table_range_borrowed<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        start: i64,
+        end: i64,
+        mut f: F,
+    ) -> Result<()> {
+        self.scan_range_subtree_borrowed(self.root, start, end, &mut f)
+    }
+
+    fn scan_range_subtree_borrowed<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        page_id: PageId,
+        start: i64,
+        end: i64,
+        f: &mut F,
+    ) -> Result<()> {
+        let page = self.pager.get_page(page_id)?;
+        let pt = page.lock().page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                let borrowed = page.lock();
+                let n = borrowed.n_cells();
+                let psz = borrowed.data.len();
+                for i in 0..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    let buf = &borrowed.data[cell_ptr..];
+                    let (rowid, n1) = varint::decode_signed(buf)
+                        .ok_or_else(|| Error::corruption("truncated leaf rowid in range_borrowed"))?;
+                    if rowid > end {
+                        return Ok(());
+                    }
+                    if rowid >= start {
+                        let rest = &buf[n1..];
+                        let (plen, n2) = varint::decode(rest)
+                            .ok_or_else(|| Error::corruption("truncated payload len in range_borrowed"))?;
+                        let payload_start = n1 + n2;
+                        let plen_usize = plen as usize;
+                        if payload_start + plen_usize > buf.len() {
+                            return Err(Error::corruption("truncated payload in range_borrowed"));
+                        }
+                        let payload = &buf[payload_start..payload_start + plen_usize];
+                        if !f(rowid, payload) {
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            PageType::InteriorTable => {
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
+                let cells: Vec<(PageId, i64)> = {
+                    let borrowed = page.lock();
+                    let mut v = Vec::with_capacity(n as usize + 1);
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        if let Cell::TableInterior { left_child, key } = c {
+                            v.push((left_child, key));
+                        }
+                    }
+                    v.push((right, i64::MAX));
+                    v
+                };
+                drop(page);
+                for (child, key) in cells {
+                    if key < start {
+                        continue;
+                    }
+                    self.scan_range_subtree_borrowed(child, start, end, f)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in range scan: {:?}",
+                pt
+            ))),
+        }
     }
 
     fn scan_range_subtree<F: FnMut(i64, &[u8]) -> bool>(

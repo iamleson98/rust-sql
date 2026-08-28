@@ -37,9 +37,13 @@ fn setup_rustqlite(n: i64) -> Database {
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
     db.execute("BEGIN", []).unwrap();
+    // Use parameterized query so the statement cache hit makes it a fair
+    // comparison with rusqlite's prepared-statement path.
     for i in 1..=n {
-        let sql = format!("INSERT INTO t (name, val) VALUES ('name{}', {})", i, i * 2);
-        db.execute(&sql, []).unwrap();
+        db.execute(
+            "INSERT INTO t (name, val) VALUES (?, ?)",
+            [Value::Text(format!("name{}", i)), Value::Integer(i * 2)],
+        ).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db
@@ -99,9 +103,15 @@ fn bench_insert_autocommit() -> Result {
     let (rq_ops, _) = measure("rust-sql autocommit insert", || {
         let mut db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+        // Use parameterized query so the statement cache hit makes it a fair
+        // comparison with rusqlite's prepared-statement path. Without this,
+        // we'd be re-parsing the SQL string every iteration (since `format!`
+        // produces a different string each time).
         for i in 1..=n {
-            let sql = format!("INSERT INTO t (name, val) VALUES ('name{}', {})", i, i);
-            db.execute(&sql, []).unwrap();
+            db.execute(
+                "INSERT INTO t (name, val) VALUES (?, ?)",
+                [Value::Text(format!("name{}", i)), Value::Integer(i)],
+            ).unwrap();
         }
     }, n as usize);
 
@@ -129,9 +139,13 @@ fn bench_insert_transaction() -> Result {
         let mut db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
         db.execute("BEGIN", []).unwrap();
+        // Use parameterized query so the statement cache hit makes it a fair
+        // comparison with rusqlite's prepared-statement path.
         for i in 1..=n {
-            let sql = format!("INSERT INTO t (name, val) VALUES ('name{}', {})", i, i);
-            db.execute(&sql, []).unwrap();
+            db.execute(
+                "INSERT INTO t (name, val) VALUES (?, ?)",
+                [Value::Text(format!("name{}", i)), Value::Integer(i)],
+            ).unwrap();
         }
         db.execute("COMMIT", []).unwrap();
     }, n as usize);
