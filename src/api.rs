@@ -78,7 +78,7 @@ pub struct Database {
     ///
     /// RwLock so concurrent readers can hit the cache simultaneously; only
     /// a cache miss takes the brief write lock to insert.
-    stmt_cache: RwLock<HashMap<String, (Arc<Statement>, Option<crate::planner::plan::Plan>)>>,
+    stmt_cache: RwLock<HashMap<String, (Arc<Statement>, Option<Arc<crate::planner::plan::Plan>>)>>,
     /// FIFO order of insertion into `stmt_cache`, used for eviction when the
     /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
     /// oldest entry and the next to be evicted.
@@ -216,18 +216,23 @@ impl Database {
     /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
     /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
     /// don't conflict.
-    fn get_or_cache_stmt(&self, sql: &str) -> Result<(std::sync::Arc<Statement>, Option<crate::planner::plan::Plan>)> {
+    fn get_or_cache_stmt(&self, sql: &str) -> Result<(Arc<Statement>, Option<Arc<crate::planner::plan::Plan>>)> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let stmt = parse(sql)?;
             let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
-            return Ok((std::sync::Arc::new(stmt), plan_opt));
+            return Ok((Arc::new(stmt), plan_opt.map(Arc::new)));
         }
         // Fast path: read lock — concurrent readers can hit the cache
         // simultaneously without serializing.
         {
             let cache = self.stmt_cache.read();
             if let Some((stmt, plan_opt)) = cache.get(sql) {
+                // Clone the Arc, NOT the Plan — for an INSERT plan with
+                // Plan::Values { rows: Vec<Vec<Expr>> }, deep-cloning was
+                // 3+ heap allocations per cache hit. Arc clone is one atomic
+                // increment. For a 1k-statement INSERT batch, this saves
+                // ~3k heap allocations.
                 return Ok((stmt.clone(), plan_opt.clone()));
             }
         }
@@ -248,10 +253,11 @@ impl Database {
                 order.remove(0);
             }
         }
-        let stmt_arc = std::sync::Arc::new(stmt);
-        cache.insert(sql.to_string(), (stmt_arc.clone(), plan_opt.clone()));
+        let stmt_arc = Arc::new(stmt);
+        let plan_arc = plan_opt.map(Arc::new);
+        cache.insert(sql.to_string(), (stmt_arc.clone(), plan_arc.clone()));
         self.stmt_cache_order.lock().push(sql.to_string());
-        Ok((stmt_arc, plan_opt))
+        Ok((stmt_arc, plan_arc))
     }
 
     /// Invalidate the statement cache. Called after any DDL statement
@@ -271,7 +277,7 @@ impl Database {
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         let is_ddl = is_ddl_sql(sql);
-        let (stmt, _plan_opt) = self.get_or_cache_stmt(sql)?;
+        let (stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &stmt;
@@ -299,7 +305,22 @@ impl Database {
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
-        let result = Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql);
+        // Use the cached plan if available — execute_statement_static
+        // otherwise re-parses + re-plans, which for a 1k-row INSERT batch
+        // means 1k wasted planning passes (each builds a Plan::Insert
+        // containing Plan::Values { Vec<Vec<Expr>> }, several heap
+        // allocations). With the cached plan, we skip all of that.
+        let result = if let Some(plan) = plan_opt {
+            // Execute the cached plan directly. Only Insert/Update/Delete/
+            // Select produce plans (DDL returns None), so this branch only
+            // fires for those statement types.
+            execute(&plan, &mut ctx).map(|_| ())
+        } else {
+            // No cached plan — DDL statement. execute_statement_static
+            // handles DDL directly (CREATE/DROP/ALTER/ATTACH/DETACH/
+            // VACUUM/PRAGMA) without a Plan.
+            Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql)
+        };
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
