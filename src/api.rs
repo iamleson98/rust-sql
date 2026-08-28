@@ -23,6 +23,7 @@ use crate::storage::row_codec::{decode_row, encode_row};
 use crate::types::{Row, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The maximum number of pages cached in memory.
 const DEFAULT_CACHE_PAGES: usize = 2048;

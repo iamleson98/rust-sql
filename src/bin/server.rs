@@ -17,53 +17,38 @@
 //!
 //! ## Concurrency model
 //!
-//! The database is wrapped in `Arc<Mutex<Database>>`. Connection accept is
-//! multi-threaded (N worker threads pull from the listener in parallel),
-//! but DB access is serialized through the Mutex. This is a substantial
-//! production-readiness improvement over the previous single-threaded
-//! model — TCP accept and request parsing now happen in parallel across
-//! cores, only the DB critical section is serial.
+//! The database is wrapped in `Arc<RwLock<Database>>`. The TCP accept loop
+//! is multi-threaded (N worker threads pull from the listener in parallel),
+//! and request parsing happens in parallel across cores. Read (`/query`)
+//! and write (`/execute`) handlers both currently take the WRITE lock
+//! because `Database::query` requires `&mut self` (it mutates the page
+//! cache on misses and the statement cache on first sight of a SQL string).
 //!
-//! **Known limitation:** A true `RwLock<Database>` (concurrent reads,
-//! excluded writes) is blocked by the pager's cache using
-//! `Rc<RefCell<Page>>` which is neither `Send` nor `Sync`. Switching the
-//! cache to `Arc<Mutex<Page>>` (or `Arc<RwLock<Page>>`) would unlock
-//! `Send + Sync` on `Database` and enable true read concurrency. That
-//! refactor touches every file in `src/storage/` and is tracked as
-//! future work.
+//! After the `PageRef` refactor from `Rc<RefCell<Page>>` to
+//! `Arc<parking_lot::Mutex<Page>>`, `Database` is now naturally `Send +
+//! Sync` — the `unsafe impl Send/Sync for State` is gone. This sets the
+//! stage for true concurrent reads: once `Database::query` is refactored
+//! to take `&self` (interior mutability on the pager cache and statement
+//! cache), read handlers can take the READ lock and run concurrently.
 //!
 //! ## Usage
 //!
 //!   rustqlite-server --db /path/to/db.sqlite --port 8080 --threads 8
 
+use parking_lot::RwLock;
 use rustqlite::{Database, Value};
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use tiny_http::{Header, Method, Response, Server};
 
 struct State {
-    /// Mutex: serializes all DB access. See "Concurrency model" above for
-    /// why this isn't yet an RwLock.
-    db: Mutex<Database>,
+    /// RwLock: write-locked for both reads and writes today, but the type
+    /// is already `RwLock` (not `Mutex`) so we can switch read handlers to
+    /// take the READ lock once `Database::query` becomes `&self`-friendly
+    /// via interior mutability on the pager and statement caches.
+    db: RwLock<Database>,
 }
-
-// SAFETY: `Database` contains `Rc<RefCell<Page>>` (via `Pager`), which is
-// `!Send` and `!Sync`. That makes `Mutex<Database>` itself `!Send + !Sync`
-// from the compiler's perspective. However, `Mutex` *guarantees* that only
-// one thread can hold the guard at a time — so even though the type
-// system can't prove it, at runtime only one thread ever touches the
-// `Database` (and therefore the `Rc<RefCell<Page>>` inside it) at any
-// moment. This makes the cross-thread sharing sound in practice.
-//
-// **If you change the concurrency model** (e.g. switch to RwLock, drop the
-// Mutex, or add code paths that access the Database without going through
-// the lock) you MUST revisit this. The correct long-term fix is to
-// refactor `Pager::cache` from `Rc<RefCell<Page>>` to `Arc<Mutex<Page>>`,
-// which would make `Database: Send + Sync` naturally and remove the need
-// for this unsafe impl.
-unsafe impl Send for State {}
-unsafe impl Sync for State {}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -127,7 +112,7 @@ fn main() {
         })
     };
 
-    let state = Arc::new(State { db: Mutex::new(db) });
+    let state = Arc::new(State { db: RwLock::new(db) });
     let addr = format!("{}:{}", host, port);
     let server = Arc::new(Server::http(&addr).unwrap_or_else(|e| {
         eprintln!("error binding to {}: {}", addr, e);
@@ -191,13 +176,9 @@ fn handle_query(mut request: tiny_http::Request, state: &State) {
         }
     };
 
-    let mut guard = match state.db.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            respond_error(request, "internal: lock poisoned");
-            return;
-        }
-    };
+    // Write lock today: Database::query takes &mut self (it mutates the
+    // cache on misses). Switch to read lock after refactoring query to &self.
+    let mut guard = state.db.write();
     match guard.query_with_columns(&parsed.sql, parsed.params) {
         Ok((cols, rows)) => {
             let json = format_query_result(&cols, &rows);
@@ -225,13 +206,7 @@ fn handle_execute(mut request: tiny_http::Request, state: &State) {
         }
     };
 
-    let mut guard = match state.db.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            respond_error(request, "internal: lock poisoned");
-            return;
-        }
-    };
+    let mut guard = state.db.write();
     match guard.execute(&parsed.sql, parsed.params) {
         Ok(_) => {
             let _ = request.respond(Response::from_string(r#"{"ok":true}"#).with_header(content_type_json()));
