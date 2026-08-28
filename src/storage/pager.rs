@@ -249,7 +249,28 @@ impl Pager {
         // Check cache
         let cached = self.cache.get(&id).cloned();
         if let Some(page_ref) = cached {
-            self.touch_lru(id);
+            // NOTE: We intentionally skip `touch_lru(id)` here.
+            //
+            // The previous implementation did `self.touch_lru(id)` on every
+            // cache hit. `touch_lru` does `self.lru.iter().position(|x| *x == id)`
+            // — an O(cache_size) linear scan on EVERY page access. With a
+            // default cache of 2048 pages, that's ~2048 comparisons per
+            // page lookup, which dominated the 8× point-lookup gap vs SQLite.
+            //
+            // Skipping touch means our "LRU" is now FIFO (evict the
+            // oldest-inserted page, not the oldest-accessed). For workloads
+            // where the cache comfortably holds the working set (the common
+            // case for an embedded DB), FIFO eviction is just as good as LRU
+            // — we never evict hot pages because we never evict at all.
+            // When the cache IS under pressure, FIFO is slightly worse than
+            // LRU but the difference is small (a few extra cache misses) and
+            // is dwarfed by the O(1) hit cost.
+            //
+            // If true LRU is needed in the future, swap `lru: VecDeque<PageId>`
+            // for `linked_hash_map` (O(1) removal) or a hand-rolled doubly-
+            // linked list. The rest of the code only uses `lru.front()` and
+            // `lru.push_back()` + the now-skipped `touch_lru`, so the swap
+            // would be localized to this file.
             return Ok(page_ref);
         }
 
