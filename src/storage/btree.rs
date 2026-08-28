@@ -1639,6 +1639,14 @@ impl<'a> Btree<'a> {
     /// makes `WHERE a = 1` use the index `(a, b)` correctly: the stored keys
     /// are `encode(a) || encode(b)` and the search key is just `encode(a)`.
     pub fn lookup_index(&mut self, key: &[u8]) -> Result<Vec<i64>> {
+        // The index B+tree is currently sorted by rowid (not by key bytes) —
+        // see the comment in `insert_index`. So we can't binary-search by key;
+        // we have to scan all entries and check each.
+        //
+        // TODO: restructure the index B+tree to be sorted by (key, rowid) so
+        // we can do an O(log N) binary search instead of O(N). For now this
+        // is O(N) which is why the "Index lookup" benchmark is 23x slower
+        // than SQLite.
         let mut results = Vec::new();
         let mut bt = Btree {
             pager: self.pager,
@@ -1647,23 +1655,15 @@ impl<'a> Btree<'a> {
         };
         bt.scan_index(|cell_rowid, cell_key| {
             let matched = if key.len() > cell_key.len() {
-                // Search key is longer than stored — no match (shouldn't happen
-                // for a well-formed index lookup).
                 false
             } else if key.len() == cell_key.len() {
-                // Exact match.
                 cell_key == key
             } else {
-                // Prefix match: stored key starts with the search key.
-                // This handles composite-index lookups where the query only
-                // constrains the leading columns.
                 cell_key.starts_with(key)
             };
             if matched {
                 results.push(cell_rowid);
             }
-            // Continue scanning — there may be more matches (non-unique index
-            // or multiple prefix matches).
             true
         })?;
         Ok(results)
