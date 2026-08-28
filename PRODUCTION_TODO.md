@@ -13,33 +13,61 @@
 
 | Workload                                  | rustqlite   | SQLite      | Ratio       |
 | ----------------------------------------- | ----------- | ----------- | ----------- |
-| Single-row inserts (1k, auto-commit)      | 2.55 ms     | 1.82 ms     | **1.4× slower** ✅ was 6.9× |
-| Single-row in BEGIN/COMMIT (10k)           | 29.54 ms    | 13.05 ms    | 2.3× slower ✅ was 8.0× |
-| Single-row in BEGIN/COMMIT (100k)          | 563.21 ms   | 129.82 ms   | 4.3× slower ✅ was 11× |
-| **Multi-row VALUES batches (10k)** ✅      | **23.26 ms** | 6.60 ms    | **3.5× slower** (was 13×) |
-| Point lookup by rowid (1k ops)            | 3.24 ms     | 351.14 µs   | 9.2× slower |
-| **Range scan (10 rows)** ✅                | **38.45 µs** | 3.30 µs    | **11.7× slower** (was 200×) |
-| **Range scan (100 rows)** ✅               | **38.04 µs** | 11.46 µs   | **3.3× slower** (was 200×) |
-| **Range scan (1000 rows)** ✅              | **212.64 µs** | 114.70 µs | **1.9× slower** (was 13×) |
-| **Range scan (5000 rows)** ✅              | **1.18 ms** | 578.10 µs   | **2.0× slower** (was 4×) |
-| Full scan + COUNT with filter            | 3.23 ms     | 491.48 µs   | 6.6× slower |
-| Aggregate (SUM/AVG/MIN/MAX)                | 7.33 ms     | 1.34 ms     | 5.5× slower |
-| GROUP BY (100 buckets)                     | 4.95 ms     | 2.03 ms     | 2.4× slower |
-| **Point lookup by indexed col (1k ops)** ✅ | **1.00 ms** | 533.69 µs | **1.9× slower** (was 5.5×) |
-| **2-table join filter by PK (~10 rows out)** ✅ | **145.53 µs** | 20.68 µs | **7.0× slower** ✅ was 240× |
-| **3-table join filter by PK (~50 rows out)** ✅ | **156.32 µs** | 72.61 µs | **2.2× slower** ✅ was 177× |
-| 2-table join + GROUP BY (full scan)        | 13.77 ms    | 3.02 ms     | 4.6× slower |
-| **UPDATE by PK (1k ops)**                  | **7.57 ms** | 1.86 ms   | **4.1× slower** ✅ was 743× |
-| UPDATE range (val > 5000)                  | 30.93 ms    | 1.30 ms     | 24× slower  |
-| **DELETE by PK (1k ops)**                  | **5.24 ms**  | 1.36 ms   | **3.9× slower** ✅ was 43× |
-| **Mixed 80/20 (5k ops)**                   | **22.76 ms** | 2.47 ms   | **9.2× slower** ✅ was 292× |
+| Single-row inserts (1k, auto-commit)      | 2.00 ms     | 1.82 ms     | **1.10× slower** ✅ was 6.9× → 1.4× → 1.10× |
+| Single-row in BEGIN/COMMIT (10k)           | 22.5 ms    | 12.9 ms    | 1.74× slower ✅ was 8.0× → 2.3× → 1.74× |
+| Single-row in BEGIN/COMMIT (100k)          | 403 ms   | 130 ms   | 3.1× slower ✅ was 11× → 4.0× → 3.1× |
+| **Multi-row VALUES batches (10k)** ✅      | **22.3 ms** | 6.7 ms    | **3.3× slower** (was 13×) |
+| Point lookup by rowid (1k ops)            | 918 µs     | 360 µs   | **2.55× slower** ✅ was 9.2× → 2.7× → 2.55× |
+| **Range scan (10 rows)** ✅                | **39 µs** | 4.5 µs    | **8.7× slower** (was 200× → 11.7× → 8.7×) |
+| **Range scan (100 rows)** ✅               | **36 µs** | 12 µs   | **3.0× slower** (was 200× → 3.3× → 3.0×) |
+| **Range scan (1000 rows)** ✅              | **225 µs** | 108 µs | **2.1× slower** (was 13× → 1.9× → 2.1×) |
+| **Range scan (5000 rows)** ✅              | **1.20 ms** | 556 µs   | **2.16× slower** (was 4× → 2.0× → 2.16×) |
+| Full scan + COUNT with filter            | 2.81 ms     | 500 µs   | **5.6× slower** ✅ was 6.6× → 5.6× |
+| Aggregate (SUM/AVG/MIN/MAX)                | 6.73 ms     | 1.24 ms     | **5.4× slower** ✅ was 5.5× → 5.4× |
+| GROUP BY (100 buckets)                     | 3.51 ms     | 1.92 ms     | **1.83× slower** ✅ was 2.4× → 1.8× |
+| **Point lookup by indexed col (1k ops)** ✅ | **608 µs** | 564 µs | **1.08× slower** ✅ was 5.5× → 1.9× → 1.08× (at parity!) |
+| **2-table join filter by PK (~10 rows out)** ✅ | **140 µs** | 23 µs | **6.1× slower** ✅ was 240× → 7.0× → 6.1× |
+| **3-table join filter by PK (~50 rows out)** ✅ | **143 µs** | 57 µs | **2.5× slower** ✅ was 177× → 2.2× → 2.5× |
+| 2-table join + GROUP BY (full scan)        | 14.5 ms    | 2.97 ms     | 4.9× slower ✅ was 4.6× → 4.9× |
+| **UPDATE by PK (1k ops)**                  | **4.82 ms** | 1.86 ms   | **2.6× slower** ✅ was 743× → 4.1× → 2.6× |
+| UPDATE range (val > 5000)                  | 30.9 ms    | 1.31 ms     | 23.6× slower  |
+| **DELETE by PK (1k ops)**                  | **4.93 ms**  | 1.36 ms   | **3.6× slower** ✅ was 43× → 3.9× → 3.6× |
+| **Mixed 80/20 (5k ops)**                   | **10.65 ms** | 2.46 ms   | **4.3× slower** ✅ was 292× → 9.2× → 4.3× |
 | DB file size (10k rows)                    | 917.50 KB   | 262.14 KB   | 3.5× larger |
+| Peak RSS (100k insert)                     | 27.94 MB    | 21.21 MB    | **1.32× larger** ✅ was 2.2× → 1.32× |
 
 ### What's already done (verified by reading source, not by TODO checkboxes)
 
-- ✅ Statement cache: `Database::get_or_cache_stmt` caches parsed Statement +
-  planned Plan keyed by SQL text, FIFO eviction at 64 entries, invalidated
-  on any DDL. `set_stmt_cache_capacity()` for tuning.
+- ✅ Statement cache: `Database::get_or_cache_stmt` caches parsed `Arc<Statement>`
+  + planned Plan keyed by SQL text, FIFO eviction at 64 entries, invalidated
+  on any DDL. `set_stmt_cache_capacity()` for tuning. Cache hit is O(1)
+  (Arc refcount inc) — previously was a deep clone of the entire AST.
+- ✅ O(1) dirty-page counter: `Pager::dirty_count_approx` upper-bound
+  counter incremented by `note_write()` on every mutating Btree/Pager op,
+  reset to 0 by `flush()`. `flush()` fast path: `if dirty_count_approx == 0`
+  (was: O(cache_size) scan on every `Database::query()` call — ~5 µs of
+  pure overhead per SELECT). `Database::query()` skips flush entirely when
+  no writes happened since the last flush.
+- ✅ Pager cache hit: O(1) — `touch_lru` skipped on cache hits. Eviction
+  is FIFO (was: O(N) linear scan via `VecDeque::iter().position(...)` on
+  every page access — ~2k comparisons per page lookup).
+- ✅ Positional parameters use `Vec<Value>` indexed by usize (was:
+  `HashMap<String, Value>` with first-insert bucket allocation ~200-500 ns
+  per query). New `bind_positional(value)` method skips String key
+  allocation. Named params (`:name`, `@col`, `$var`) fall back to a
+  separate HashMap, allocated lazily.
+- ✅ `Btree::lookup_table` uses binary search by rowid (was: linear scan
+  with `Cell::decode` per cell — each decode allocates a `Vec<u8>` for the
+  payload, so N-cell leaf did N heap allocations per lookup). New
+  `decode_rowid_only(buf)` helper reads just the rowid varint, no
+  allocation. Only the matched cell is fully decoded.
+- ✅ Streaming-aggregate fast path: `exec_aggregate_streaming_scan` iterates
+  the B+tree directly when input is `Scan` or `Filter(Scan, pred)`, decoding
+  each row into a single reusable buffer. Avoids materializing
+  `Vec<Vec<Value>>` in `exec_scan` (was: ~3-4 ms of pure allocation overhead
+  on a 10k-row aggregate).
+- ✅ `decode_row_into(buf, n_cols, &mut Vec<Value>)`: zero-alloc row decode
+  into a caller-provided buffer. Used by the streaming-aggregate fast path.
 - ✅ Anonymous-`?` lexer fix: each `?` now gets a distinct incrementing index
   (was: every `?` lexed to `Parameter("0")`, silently binding all predicates
   to the first param).
@@ -72,20 +100,27 @@
 
 ### Top-priority perf gaps that remain
 
-1. **2-table join** at 318× slower — for a 10-row result, the hash join
-   probes 10K rows of the right side. The right-side Scan alone takes
-   ~2ms (decode 10K rows). The hash join probe itself is ~3-4ms of
-   per-row work (encode + HashMap.get + clone). The per-row decode
-   overhead in exec_scan dominates.
-2. **3-table join** at 219× slower — same shape as above, compounded by
-   an extra join stage.
-3. **Single-row inserts in auto-commit** at 7× slower — each statement
-   flushes. Fix is auto-txn batching (P2.4).
-4. **Aggregate + GROUP BY** at 5.7× / 1.9× slower — vectorized scan +
-   filter would help (P2.8).
-5. **MVCC** (`Snapshot`, `VersionTracker`) is still dead code relative to
+1. **2-table join (filter by PK)** at 6.1× slower — for a 10-row result,
+   the per-query setup cost dominates (parse + plan + execute setup).
+   SQLite's prepared-statement cache is more deeply integrated. Hard to
+   close further without a deeper prepared-statement refactor.
+2. **2-table join + GROUP BY (full scan)** at 4.9× slower — hash join
+   materializes 10K rows + aggregate over them. The streaming-aggregate
+   fast path doesn't yet handle Aggregate(Join(...), ...) — only
+   Aggregate(Scan) and Aggregate(Filter(Scan)).
+3. **Aggregate (SUM/AVG/MIN/MAX)** at 5.4× slower — 4 aggregates × 10K rows
+   = 40K eval_row calls. Each eval_row has EvalContext setup + column-name
+   string comparison per call. Caching column-name → index resolution in
+   the planner would help.
+4. **UPDATE range** at 23× slower — full table scan + filter + per-row
+   in-place update. SQLite uses a streaming UPDATE plan that avoids row
+   materialization. Refactor exec_update to use scan_table_with_callback.
+5. **DB file size** at 3.5× larger — no prefix compression on B+tree keys,
+   no row format optimization. SQLite uses record format with type-affinity
+   byte + varint lengths; we use a simpler 1-byte-tag + fixed-length encoding.
+6. **MVCC** (`Snapshot`, `VersionTracker`) is still dead code relative to
    the query path (P3.1).
-6. **`Rc<RefCell<Page>>`** in the pager cache blocks `Database: Send + Sync`,
+7. **`Rc<RefCell<Page>>`** in the pager cache blocks `Database: Send + Sync`,
    which forces the server to use `Mutex<Database>` (no concurrent reads).
 
 ### Known correctness bugs (filed via SLT + differential suites)
@@ -178,26 +213,24 @@
 
 ## Phase 2 — Performance parity (beat SQLite)
 
-- [ ] **P2.1** **Fix `UPDATE by PK` 743× regression** — likely a per-row
-      full-table scan in `exec_update`. Should be O(k log n) for k updated rows
-      on an n-row table, not O(k·n).
-- [ ] **P2.2** **Reduce per-query setup cost** — `Range scan (10 rows)` at
-      1.54 ms means ~1.5 ms per query of fixed overhead. Cache the parsed
-      statement, the planner output, and the Btree handle across calls.
-      Consider a statement cache keyed by SQL text.
-- [ ] **P2.3** **Batched INSERT fast path** — detect `INSERT INTO t VALUES
-      (?,?),…,(?,?)` with N rows and do a single B+tree traversal per batch
-      instead of N insert_table calls (current path already loops in one
-      statement, but each row does its own lookup + insert). Use a cursor
-      that retains leaf position between inserts.
+- [x] **P2.1** **Fix `UPDATE by PK` 743× regression** — DONE. Now 2.6× slower.
+      Used `apply_where_for_scan` to route `WHERE id = ?` to RowidLookup,
+      plus in-place B+tree cell overwrite for same-size payloads.
+- [x] **P2.2** **Reduce per-query setup cost** — DONE. Statement cache
+      (Arc<Statement> + Plan), O(1) cache hit. Was 1.5 ms per query of
+      fixed overhead, now ~50 ns.
+- [x] **P2.3** **Batched INSERT fast path** — DONE. Multi-row VALUES
+      13× → 3.3× slower. (Cursor that retains leaf position is still P2.5.)
 - [ ] **P2.4** **Auto-transaction for consecutive single-row INSERTs** —
       when the API detects N consecutive single-row INSERTs to the same table
       outside an explicit transaction, transparently wrap them in BEGIN/COMMIT.
       Mirrors SQLite's automatic batching when `synchronous=NORMAL` + WAL.
+      (Largely closed by `deferred_flush` mode + O(1) dirty-page counter.)
 - [ ] **P2.5** **Cursor-based range scan** — instead of materializing all
       matched rows into a `Vec<Row>` and returning them, expose a `RowIter`
       trait so the executor can pull rows lazily. Cuts peak memory and lets
       `LIMIT 10` short-circuit a 10k-row scan.
+      (Partial: streaming-aggregate fast path does this for SUM/AVG/COUNT.)
 - [ ] **P2.6** **Index-only scan** — for `SELECT indexed_col FROM t WHERE
       indexed_col > ?`, return rows directly from the index B+tree without
       the rowid→table lookup. Eliminates a disk seek per row.
@@ -208,6 +241,8 @@
 - [ ] **P2.8** **Vectorized scan + filter** — evaluate the WHERE predicate on
       a batch of decoded rows at once, not row-by-row. Cache-friendly for large
       scans; especially helps `Aggregate` and `GROUP BY`.
+      (Partial: streaming-aggregate fast path bypasses materialization,
+      but still uses per-row eval_row with EvalContext setup.)
 - [ ] **P2.9** **Merge join** — for equi-joins where both inputs are sorted
       on the join key (e.g. both sides are index scans), use merge join
       instead of hash join. Saves hash table build cost.
@@ -219,13 +254,22 @@
       results. Big win for `COUNT(*)`, `SUM(...)`, full scans.
 - [ ] **P2.12** **SIMD CRC32** — already in `crc32fast`; verify the WAL
       checksum path is using the SIMD code path and not falling back to scalar.
-- [ ] **P2.13** **Query plan cache** — parse + plan once per unique SQL text
-      (parameterized), reuse for subsequent calls. Mirror SQLite's
-      `sqlite3_prepare_v2` + stmt cache.
+- [x] **P2.13** **Query plan cache** — DONE. parse + plan once per unique SQL
+      text (parameterized), reuse for subsequent calls. Mirrors SQLite's
+      `sqlite3_prepare_v2` + stmt cache. Arc<Statement> makes the cache hit O(1).
 - [ ] **P2.14** **Coalesce single-stmt writes** — at the API level, allow
       `Database::execute_batch` to issue a single WAL flush for a sequence
       of INSERT/UPDATE/DELETE statements (already half-implemented via
       `in_transaction`; expose as the primary write path).
+- [ ] **P2.15** **Streaming UPDATE for range predicates** — `UPDATE t SET
+      score = score + 1 WHERE val > 5000` currently does scan → materialize
+      → filter → per-row in-place update. A streaming plan that uses
+      scan_table with an inline update callback would close the 23× gap.
+- [ ] **P2.16** **Pre-resolve column references in the planner** — replace
+      `Expr::Column { name: String }` with `Expr::ColumnIndex(usize)` at
+      plan time. Eliminates per-row column-name string comparison in
+      EvalContext::lookup. Would help Aggregate (5.4× gap) and any
+      expression-heavy scan.
 
 ## Phase 3 — Concurrency & MVCC
 
