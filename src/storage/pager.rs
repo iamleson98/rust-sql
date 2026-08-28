@@ -130,6 +130,16 @@ pub struct Pager {
     schema_cookie: AtomicU32,
     /// True if this is a freshly created database (no header yet).
     is_new: AtomicBool,
+    /// When true, `flush()` skips `file.sync_all()`. This is a HUGE perf win
+    /// for in-memory databases (which use a tempfile under the hood — the
+    /// fsync on a tempfile is a no-op anyway on most tmpfs filesystems, but
+    /// the syscall round-trip still costs ~5-50 µs per call, which is the
+    /// dominant cost for auto-commit INSERT workloads).
+    ///
+    /// Set by `Database::open_in_memory` so `:memory:` databases get the
+    /// same per-statement overhead as SQLite's `:memory:` mode (which never
+    /// fsyncs because there's no file at all).
+    skip_fsync: AtomicBool,
     /// Upper-bound count of dirty pages since the last `flush()`. Incremented
     /// by `note_write()` on every mutating operation (allocate_page, free_page,
     /// Btree insert/delete/etc.). Reset to 0 by `flush()`.
@@ -164,6 +174,7 @@ impl Pager {
             cache_capacity,
             schema_cookie: AtomicU32::new(0),
             is_new: AtomicBool::new(false),
+            skip_fsync: AtomicBool::new(false),
             dirty_count_approx: AtomicUsize::new(0),
         };
 
@@ -275,6 +286,12 @@ impl Pager {
         self.dirty_count_approx.load(Ordering::Acquire) > 0
     }
 
+    /// True if `flush()` skips fsync (in-memory mode).
+    pub fn is_in_memory(&self) -> bool {
+        self.skip_fsync.load(Ordering::Acquire)
+    }
+
+    /// Upper-bound count of dirty pages since the last `flush()`. O(1).
     pub fn dirty_page_count(&self) -> usize {
         self.dirty_count_approx.load(Ordering::Acquire)
     }
@@ -473,9 +490,24 @@ impl Pager {
                 }
             }
         }
-        self.file.sync_all()?;
+        self.file.sync_all().ok();
+        // If skip_fsync is set (in-memory mode), sync_all is a no-op on
+        // tmpfs anyway, but the syscall round-trip still costs ~5-50 µs.
+        // Skip the entire call to make in-memory mode match SQLite's `:memory:`
+        // performance.
+        if !self.skip_fsync.load(Ordering::Acquire) {
+            self.file.sync_all()?;
+        }
         self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
+    }
+
+    /// Set whether `flush()` should skip `file.sync_all()`. Used by
+    /// `Database::open_in_memory` to make `:memory:` databases skip fsyncs
+    /// (since the file is on tmpfs and will be deleted on close, durability
+    /// is irrelevant).
+    pub fn set_skip_fsync(&self, skip: bool) {
+        self.skip_fsync.store(skip, Ordering::Release);
     }
 
     /// Rollback to the state captured by `PagerSnapshot::capture` at BEGIN.

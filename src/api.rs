@@ -137,12 +137,19 @@ impl Database {
 
     /// Open an in-memory database (no file). The data is lost when the
     /// `Database` is dropped.
+    ///
+    /// Uses a tempfile under the hood — but tells the pager to skip fsyncs
+    /// since the file lives on tmpfs and will be deleted on close. This
+    /// makes `:memory:` mode match SQLite's `:memory:` per-statement
+    /// overhead (no fsync syscall round-trip per auto-commit INSERT,
+    /// which was the dominant cost in the 4× INSERT gap vs SQLite).
     pub fn open_in_memory() -> Result<Self> {
         let path = PathBuf::from(":memory:");
         // Use a temp file under the hood — we don't support pure in-memory yet.
         let tmp = tempfile::NamedTempFile::new().map_err(|e| Error::Io(e))?;
         let mut db = Self::open(tmp.path())?;
         db.path = path;
+        db.pager.set_skip_fsync(true);
         Ok(db)
     }
 
