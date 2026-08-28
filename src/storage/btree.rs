@@ -381,6 +381,10 @@ impl<'a> Btree<'a> {
 
     /// Insert a (rowid, payload) pair into a table B+tree.
     pub fn insert_table(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
+        // Notify the pager that a write is about to happen. This maintains
+        // the O(1) dirty-page counter used by `flush()`'s fast path
+        // (see `Pager::note_write`).
+        self.pager.note_write();
         let cell = Cell::TableLeaf {
             rowid,
             payload: payload.to_vec(),
@@ -431,6 +435,8 @@ impl<'a> Btree<'a> {
     /// For benchmark impact: `UPDATE by PK` 1k ops drops from ~11 ms
     /// (delete+insert) to ~5 ms (in-place), putting us within 3× of SQLite.
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
+        // Notify the pager that a write is about to happen (in-place UPDATE).
+        self.pager.note_write();
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;
@@ -917,6 +923,8 @@ impl<'a> Btree<'a> {
     /// Delete a (rowid) from a table B+tree. Does not rebalance (we leave
     /// pages underfull rather than risk concurrent-merge bugs).
     pub fn delete_table(&mut self, rowid: i64) -> Result<bool> {
+        // Notify the pager that a write is about to happen.
+        self.pager.note_write();
         self.delete_from_page(self.root, rowid)
     }
 
@@ -1191,6 +1199,8 @@ impl<'a> Btree<'a> {
     /// Insert a (key, rowid) pair into an index B+tree.
     /// The key is the encoded form of the indexed column value(s).
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
+        // Notify the pager that a write is about to happen.
+        self.pager.note_write();
         // We store index entries keyed by rowid (so duplicates of the same
         // rowid are prevented), with the encoded key as part of the cell payload.
         let cell = Cell::IndexLeaf {
@@ -1229,6 +1239,8 @@ impl<'a> Btree<'a> {
 
     /// Delete a (key, rowid) pair from an index B+tree.
     pub fn delete_index(&mut self, rowid: i64) -> Result<bool> {
+        // Notify the pager that a write is about to happen.
+        self.pager.note_write();
         // Same as table delete (since we key by rowid).
         self.delete_from_page(self.root, rowid)
     }

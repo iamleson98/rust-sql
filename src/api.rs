@@ -45,14 +45,22 @@ pub struct Database {
     root_overrides: HashMap<String, u32>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
     max_rowids: HashMap<String, i64>,
-    /// Prepared-statement cache: SQL text -> (Statement, Option<Plan>).
+    /// Prepared-statement cache: SQL text -> (Arc<Statement>, Option<Plan>).
     /// Eliminates the parse+plan cost on repeated calls with the same SQL
     /// (the common case in real workloads: `INSERT INTO t VALUES (?)` is
     /// called N times in a loop, and `SELECT … WHERE id = ?` is called per
     /// request). The cache is invalidated on any DDL statement (CREATE/DROP/
     /// ALTER) because Plans hold `Arc<Table>` / `Arc<Index>` references that
     /// become stale when the schema changes.
-    stmt_cache: HashMap<String, (Statement, Option<crate::planner::plan::Plan>)>,
+    ///
+    /// `Arc<Statement>` (not `Statement`) so cache hits are O(1) — just an
+    /// atomic refcount increment. Previously this was `Statement`, which
+    /// deep-cloned the entire AST (Strings, Vecs, nested Exprs) on every
+    /// call. For a simple `SELECT * FROM t WHERE id = ?`, that was 10-50
+    /// allocations per call, contributing to the 9× point-lookup gap vs
+    /// SQLite. The `Plan` is `Clone`-cheap because it only holds `Arc`
+    /// references internally.
+    stmt_cache: HashMap<String, (std::sync::Arc<Statement>, Option<crate::planner::plan::Plan>)>,
     /// FIFO order of insertion into `stmt_cache`, used for eviction when the
     /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
     /// oldest entry and the next to be evicted.
@@ -162,20 +170,29 @@ impl Database {
     }
 
     /// Look up the statement cache; on miss, parse + plan, store, and return.
-    /// The cached plan is cloned — cheap because `Plan` is `Clone` with only
-    /// `Arc` references internally (no deep copies of large structures).
+    /// Returns `(Arc<Statement>, Option<Plan>)` so the caller can:
+    /// - For SELECT (query path): use just the Plan (cheap Arc clone).
+    /// - For DML/DDL (execute path): use the Arc<Statement> (cheap Arc clone).
+    ///
+    /// The cached Plan is `Option<Plan>` and is cloned — cheap because
+    /// `Plan` is `Clone` with only `Arc` references internally (no deep
+    /// copies of large structures).
     ///
     /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
     /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
     /// don't conflict.
-    fn get_or_cache_stmt(&mut self, sql: &str) -> Result<(Statement, Option<crate::planner::plan::Plan>)> {
+    fn get_or_cache_stmt(&mut self, sql: &str) -> Result<(std::sync::Arc<Statement>, Option<crate::planner::plan::Plan>)> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let stmt = parse(sql)?;
             let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
-            return Ok((stmt, plan_opt));
+            return Ok((std::sync::Arc::new(stmt), plan_opt));
         }
         if let Some((stmt, plan_opt)) = self.stmt_cache.get(sql) {
+            // Cache hit: clone the Arc (atomic refcount inc, ~1 ns) and the
+            // Plan (Arc-only clone, ~10 ns). Previously this was a deep
+            // clone of the entire Statement AST (Strings, Vecs, nested Exprs
+            // — 10-50 allocations, ~500 ns each).
             return Ok((stmt.clone(), plan_opt.clone()));
         }
         // Miss: parse + plan.
@@ -188,9 +205,10 @@ impl Database {
                 self.stmt_cache_order.remove(0);
             }
         }
-        self.stmt_cache.insert(sql.to_string(), (stmt.clone(), plan_opt.clone()));
+        let stmt_arc = std::sync::Arc::new(stmt);
+        self.stmt_cache.insert(sql.to_string(), (stmt_arc.clone(), plan_opt.clone()));
         self.stmt_cache_order.push(sql.to_string());
-        Ok((stmt, plan_opt))
+        Ok((stmt_arc, plan_opt))
     }
 
     /// Invalidate the statement cache. Called after any DDL statement
@@ -206,6 +224,9 @@ impl Database {
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         let is_ddl = is_ddl_sql(sql);
         let (stmt, _plan_opt) = self.get_or_cache_stmt(sql)?;
+        // Deref the Arc<Statement> to a &Statement for execute_statement_static.
+        // (The Arc itself stays alive on the stack for the duration of the call.)
+        let stmt_ref: &Statement = &stmt;
         let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
         let in_txn = self.in_transaction;
         let txn_snap = self.txn_snapshot.take();
@@ -220,7 +241,7 @@ impl Database {
         for (i, v) in params.into_iter().enumerate() {
             ctx.bind(&format!("{}", i), v);
         }
-        let result = Self::execute_statement_static(stmt, &mut ctx, &mut self.catalog, sql);
+        let result = Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql);
         self.in_transaction = ctx.in_transaction;
         self.txn_snapshot = ctx.txn_snapshot;
         self.root_overrides = std::mem::take(&mut ctx.root_overrides);
@@ -244,8 +265,13 @@ impl Database {
     /// Execute a query and return all rows.
     pub fn query<P: Params>(&mut self, sql: &str, params: P) -> Result<Vec<Row>> {
         // In deferred_flush mode, a SELECT must see all writes that
-        // happened since the last flush. Force a flush before the read.
-        if self.deferred_flush {
+        // happened since the last flush. But only flush if writes actually
+        // happened — `has_dirty_pages()` is O(1) (maintained by
+        // `Pager::note_write()` on every mutating Btree/Pager op). The
+        // previous implementation called `flush()` unconditionally, which
+        // did an O(cache_size) scan to check for dirty pages. That scan
+        // was the dominant cost in the 9.2× point-lookup gap vs SQLite.
+        if self.deferred_flush && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
         let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
@@ -257,13 +283,7 @@ impl Database {
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush;
             ctx.txn_snapshot = txn_snap;
-            // Move (not clone) root_overrides and max_rowids into the ctx for
-            // the duration of the call, then restore them after. SELECT
-            // statements don't mutate these (no B+tree splits happen on a
-            // read), so we're just borrowing the HashMap — no need to clone
-            // the entries. Previously this was `.clone()`, which allocated
-            // ~N entries per call (one per cached table) and was a measurable
-            // fraction of per-query overhead on the point-lookup benchmark.
+            // See comment in `query` — move (not clone) these.
             ctx.root_overrides = std::mem::take(&mut self.root_overrides);
             ctx.max_rowids = std::mem::take(&mut self.max_rowids);
             for (i, v) in params.into_iter().enumerate() {
@@ -281,8 +301,9 @@ impl Database {
 
     /// Execute a query and return (column_names, rows).
     pub fn query_with_columns<P: Params>(&mut self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)> {
-        // Same flush-before-read as `query`.
-        if self.deferred_flush {
+        // Same flush-before-read as `query` — but skip when no writes
+        // happened since the last flush. See `query` for the rationale.
+        if self.deferred_flush && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
         let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
@@ -455,10 +476,10 @@ impl Database {
         })
     }
 
-    fn execute_statement_static(stmt: Statement, ctx: &mut ExecContext, catalog: &mut Catalog, original_sql: &str) -> Result<()> {
+    fn execute_statement_static(stmt: &Statement, ctx: &mut ExecContext, catalog: &mut Catalog, original_sql: &str) -> Result<()> {
         match stmt {
-            Statement::Create(c) => Self::execute_create(c, ctx, catalog, original_sql),
-            Statement::Drop(d) => Self::execute_drop(d, ctx, catalog),
+            Statement::Create(c) => Self::execute_create(c.clone(), ctx, catalog, original_sql),
+            Statement::Drop(d) => Self::execute_drop(d.clone(), ctx, catalog),
             Statement::Begin(_) => {
                 // Snapshot the pager's mutable state NOW so ROLLBACK can
                 // restore to this point. We also flip in_transaction so the
@@ -486,20 +507,20 @@ impl Database {
                 ctx.max_rowids.clear();
                 Ok(())
             }
-            Statement::Pragma(p) => Self::execute_pragma(p, ctx),
+            Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
             Statement::Explain(_) => Ok(()),
             Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 // These produce rows; for `execute`, we just discard them.
-                let plan_opt = match &stmt {
+                let plan_opt = match stmt {
                     Statement::Select(s) => {
                         let mut planner = Planner::new(catalog);
                         Some(planner.plan_select(s)?)
                     }
-                    Statement::Insert(_) => Some(Self::plan_insert(catalog, &stmt)?),
-                    Statement::Update(_) => Some(Self::plan_update(catalog, &stmt)?),
-                    Statement::Delete(_) => Some(Self::plan_delete(catalog, &stmt)?),
+                    Statement::Insert(_) => Some(Self::plan_insert(catalog, stmt)?),
+                    Statement::Update(_) => Some(Self::plan_update(catalog, stmt)?),
+                    Statement::Delete(_) => Some(Self::plan_delete(catalog, stmt)?),
                     _ => None,
                 };
                 if let Some(plan) = plan_opt {
