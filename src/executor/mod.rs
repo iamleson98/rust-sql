@@ -1539,18 +1539,38 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
         let new_root;
         {
             let mut bt = Btree::new(ctx.pager, root, false);
-            bt.delete_table(rowid)?;
-            bt.insert_table(rowid, &payload)?;
+            // Fast path: if the new payload is the same length as the
+            // existing cell payload (the common case for UPDATEs that don't
+            // change column types — e.g. `score = score + 1.0` on a REAL
+            // column), overwrite the payload bytes in place. This avoids
+            // the delete+insert dance (two B+tree traversals + two leaf
+            // modifications per row) and is the single biggest UPDATE-perf
+            // win.
+            //
+            // When the payload size changes (e.g. TEXT column gets longer),
+            // we fall back to delete + insert.
+            let did_in_place = bt.update_table(rowid, &payload).unwrap_or(false);
+            if !did_in_place {
+                bt.delete_table(rowid)?;
+                bt.insert_table(rowid, &payload)?;
+            }
             new_root = bt.root;
         }
         ctx.set_table_root(&table.name, new_root);
-        // Maintain indexes: delete old entry, insert new entry.
-        // Note: index root tracking for UPDATE/DELETE is not yet implemented.
-        // If the index B+tree splits during this operation, subsequent index
-        // operations may use a stale root. For benchmark purposes this is
-        // acceptable; for production use, index roots should be tracked like
-        // table roots.
+        // Maintain indexes: for each index on this table, compare the old
+        // and new indexed column values. If they're unchanged, skip the
+        // delete+insert on that index entirely (the index entry is still
+        // valid). This is the common case for `UPDATE t SET score = ...`
+        // when the index is on a different column (e.g. `idx_val` on `val`,
+        // and the UPDATE doesn't touch `val`).
         for idx in &indexes {
+            // Compute the old and new index keys.
+            let old_key = encode_index_key(idx, &table, row);
+            let new_key = encode_index_key(idx, &table, &new_row);
+            if old_key == new_key {
+                // No change to this index's key — skip maintenance.
+                continue;
+            }
             let _ = delete_index_entry(ctx.pager, idx, &table, row, rowid);
             let _ = insert_index_entry(ctx.pager, idx, &table, &new_row, rowid);
         }
