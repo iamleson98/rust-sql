@@ -107,6 +107,13 @@ impl<'a> ExecContext<'a> {
         self.root_overrides.insert(table_name.to_ascii_lowercase(), root);
     }
 
+    /// Fast-path set_table_root for callers that have already lower-cased
+    /// the table name (e.g. exec_insert hoists this out of the per-row
+    /// loop). Avoids the per-call `to_ascii_lowercase()` String allocation.
+    pub fn set_table_root_lc(&mut self, table_name_lc: &str, root: u32) {
+        self.root_overrides.insert(table_name_lc.to_string(), root);
+    }
+
     /// Get the cached max rowid for a table, or scan if not cached.
     pub fn get_or_scan_max_rowid(&mut self, table: &Table) -> Result<i64> {
         let key = table.name.to_ascii_lowercase();
@@ -122,6 +129,14 @@ impl<'a> ExecContext<'a> {
     /// Update the cached max rowid for a table.
     pub fn set_max_rowid(&mut self, table_name: &str, rowid: i64) {
         self.max_rowids.insert(table_name.to_ascii_lowercase(), rowid);
+    }
+
+    /// Fast-path set_max_rowid for callers that have already lower-cased
+    /// the table name. Avoids the per-call String allocation.
+    pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
+        // max_rowids is keyed by String, so we'd need to_string() anyway.
+        // But we still save the to_ascii_lowercase() work.
+        self.max_rowids.insert(table_name_lc.to_string(), rowid);
     }
 
     /// Bind a positional parameter (the common `?` placeholder case).
@@ -1844,8 +1859,25 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
     let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> = indexes
         .iter().map(|idx| (idx.clone(), idx.root_page)).collect();
 
+    // Pre-compute the lower-cased table name ONCE — set_table_root and
+    // set_max_rowid both call to_ascii_lowercase() per call, which
+    // allocates a fresh String per row. For a 1k-row INSERT batch, that's
+    // 2k wasted String allocations.
+    let table_name_lc = table.name.to_ascii_lowercase();
+
+    // Reusable row + payload buffers. Hoisted outside the loop to avoid
+    // a per-row Vec allocation. full_row is sized to table.n_columns() and
+    // filled with NULL at the start of each iteration.
+    let n_cols = table.n_columns();
+    let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
+
     for row in &source_res.rows {
-        let mut full_row = vec![Value::Null; table.n_columns()];
+        // Reset the row buffer to all-NULLs without releasing capacity.
+        // `Value::Null` is a no-op to drop, so this is just a memset.
+        for v in full_row.iter_mut() {
+            *v = Value::Null;
+        }
         for (i, val) in row.iter().enumerate() {
             if i < target_indices.len() {
                 let col_idx = target_indices[i];
@@ -1951,12 +1983,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             }
         }
 
-        // Use a reusable encode buffer (zero-alloc per-row).
-        // We could declare this OUTSIDE the row loop, but the buffer
-        // ownership is awkward since `payload` is borrowed by insert_table.
-        // Even allocating here saves the encode_row Vec allocation overhead
-        // when compared to allocating a fresh Vec per row.
-        let mut payload_buf: Vec<u8> = Vec::with_capacity(full_row.len() * 8);
+        // Reuse the hoisted payload_buf. encode_row_into clears it first.
         encode_row_into(&full_row, &mut payload_buf);
         let payload: &[u8] = &payload_buf;
         let old_payload_opt;
@@ -2006,7 +2033,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             }
             // Track the (possibly new) root page.
             current_root = bt.root;
-            ctx.set_table_root(&table.name, current_root);
+            ctx.set_table_root_lc(&table_name_lc, current_root);
         }
         // On conflict: delete the old row's index entries first.
         if let Some(old_payload) = old_payload_opt {
@@ -2030,7 +2057,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         ctx.last_insert_rowid = rowid;
         ctx.changes += 1;
         inserted += 1;
-        ctx.set_max_rowid(&table.name, rowid);
+        ctx.set_max_rowid_lc(&table_name_lc, rowid);
     }
     // Only flush when not inside an explicit transaction.
     if !ctx.in_transaction && !ctx.deferred_flush {
