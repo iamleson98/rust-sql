@@ -22,6 +22,10 @@ path = "src/bin/cli.rs"
 name = "rustqlite-server"
 path = "src/bin/server.rs"
 
+[[example]]
+name = "bench_vs_sqlite"
+path = "examples/bench_vs_sqlite.rs"
+
 [dependencies]
 # HTTP server (tiny, no async runtime — keeps binary size small)
 tiny_http = "0.12"
@@ -61,6 +65,10 @@ harness = false
 
 [[bench]]
 name = "join"
+harness = false
+
+[[bench]]
+name = "sqlite_comparison"
 harness = false
 
 [profile.release]
