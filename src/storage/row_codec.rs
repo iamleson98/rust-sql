@@ -38,6 +38,36 @@ pub fn decode_row(buf: &[u8], n_cols: usize) -> Result<Row> {
     Ok(row)
 }
 
+/// Decode a row into a caller-provided buffer. The buffer is cleared first;
+/// after the call, it contains exactly `n_cols` values (padded with NULLs
+/// if the encoded row was truncated).
+///
+/// This is a zero-allocation fast path for hot loops that consume many rows
+/// (e.g. `exec_aggregate_streaming_scan`). The buffer is reused across rows,
+/// avoiding the per-row `Vec::new()` + capacity allocation that `decode_row`
+/// would do.
+///
+/// Values within the buffer are overwritten in-place: `Vec::clear()` drops
+/// all existing elements (freeing any owned `String`/`Vec<u8>` data), then
+/// `push` appends new values. For Integer/Real/Null columns this is free
+/// (no heap allocation); for Text/Blob columns the per-value String/Vec
+/// allocation still happens (same as `decode_row`), but the outer Vec is
+/// reused.
+pub fn decode_row_into(buf: &[u8], n_cols: usize, out: &mut Vec<Value>) -> Result<()> {
+    out.clear();
+    let mut pos = 0;
+    while pos < buf.len() && out.len() < n_cols {
+        let (v, n) = Value::decode(&buf[pos..])
+            .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
+        out.push(v);
+        pos += n;
+    }
+    while out.len() < n_cols {
+        out.push(Value::Null);
+    }
+    Ok(())
+}
+
 /// Apply column affinities to a row in place.
 pub fn apply_affinities(row: &mut Row, affinities: &[Affinity]) {
     for (v, aff) in row.iter_mut().zip(affinities.iter()) {
