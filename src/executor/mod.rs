@@ -209,6 +209,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
         Plan::RowidRange { table, alias: _, start, end, residual } => exec_rowid_range(ctx, table.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
+        Plan::IndexRange { table, alias, index, start, end, residual } => exec_index_range(ctx, table.clone(), alias.clone(), index.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::Insert { table, source, columns, on_conflict, upsert, returning } => exec_insert(ctx, table.clone(), source, columns.clone(), *on_conflict, upsert.as_ref(), returning.as_deref()),
         Plan::Update { table, source, assignments, returning } => exec_update(ctx, table.clone(), source, assignments, returning.as_deref()),
         Plan::Delete { table, source, returning } => exec_delete(ctx, table.clone(), source, returning.as_deref()),
@@ -223,6 +224,10 @@ fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], 
 
 /// Enforce NOT NULL and CHECK constraints on a (new or updated) row.
 /// Returns a semantic error naming the offending column / table.
+///
+/// `col_names` is only needed when the table has CHECK constraints
+/// (NOT NULL checks work purely positionally) — pass an empty slice for
+/// tables without CHECKs to avoid building the name Vec on hot paths.
 fn enforce_row_constraints(
     table: &Table,
     row: &[Value],
@@ -464,6 +469,17 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                     out.push(k);
                 }
             }
+            Plan::IndexRange { start, end, residual, .. } => {
+                if let Some((s, _)) = start.as_ref() {
+                    out.push(s);
+                }
+                if let Some((e, _)) = end.as_ref() {
+                    out.push(e);
+                }
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
             Plan::Values { rows } => {
                 for row in rows {
                     for e in row {
@@ -578,6 +594,17 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::IndexLookup { key_exprs, .. } => {
             for k in key_exprs.iter_mut() {
                 rewrite_expr_in_place(k, ctx)?;
+            }
+        }
+        Plan::IndexRange { start, end, residual, .. } => {
+            if let Some((s, _)) = start.as_mut() {
+                rewrite_expr_in_place(s, ctx)?;
+            }
+            if let Some((e, _)) = end.as_mut() {
+                rewrite_expr_in_place(e, ctx)?;
+            }
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
             }
         }
         Plan::Values { rows } => {
@@ -2756,6 +2783,96 @@ fn exec_index_lookup(
     })
 }
 
+/// Compare an index entry key against a bound's encoded value, considering
+/// only the FIRST indexed column's worth of bytes (the bound constrains the
+/// leading column; composite keys with a matching prefix compare Equal).
+fn index_key_prefix_cmp(cell_key: &[u8], bound: &[u8]) -> std::cmp::Ordering {
+    let n = cell_key.len().min(bound.len());
+    match cell_key[..n].cmp(&bound[..n]) {
+        std::cmp::Ordering::Equal if cell_key.len() >= bound.len() => std::cmp::Ordering::Equal,
+        other => other,
+    }
+}
+
+/// Execute an IndexRange: scan the index B+tree between the (encoded) bounds,
+/// collect the matching rowids, fetch the rows by rowid, and apply any
+/// residual predicate. Rows come back in index order (ascending by the
+/// indexed value), matching SQLite's index-scan output order.
+#[allow(clippy::type_complexity)]
+fn exec_index_range(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    alias: Option<String>,
+    index: Arc<crate::schema::Index>,
+    start: Option<&(Expr, bool)>,
+    end: Option<&(Expr, bool)>,
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    // Evaluate the bound expressions (they are constants / parameters).
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let start_key: Option<(Vec<u8>, bool)> = match start {
+        Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+        None => None,
+    };
+    let end_key: Option<(Vec<u8>, bool)> = match end {
+        Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+        None => None,
+    };
+
+    // Scan the index from the start bound.
+    let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+    let mut rowids: Vec<i64> = Vec::new();
+    {
+        let mut index_bt = Btree::new(ctx.pager, index.root_page, true);
+        index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
+            // Exclusive lower bound: skip entries whose leading column
+            // equals the bound (they share the bound's key prefix).
+            if let Some((k, false)) = &start_key {
+                if cell_key.starts_with(k) {
+                    return true;
+                }
+            }
+            // Upper bound: stop past it.
+            if let Some((k, inc)) = &end_key {
+                match index_key_prefix_cmp(cell_key, k) {
+                    std::cmp::Ordering::Greater => return false,
+                    std::cmp::Ordering::Equal if !*inc => return false,
+                    _ => {}
+                }
+            }
+            rowids.push(rowid);
+            true
+        })?;
+    }
+
+    // Fetch the rows by rowid and apply the residual predicate.
+    let prefix = alias.as_deref().unwrap_or(&table.name);
+    let columns: Vec<String> = table
+        .columns
+        .iter()
+        .map(|c| format!("{}.{}", prefix, c.name))
+        .collect();
+    let plain_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    let mut rows = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        let mut table_bt = Btree::new(ctx.pager, table.root_page, false);
+        if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
+            let row = decode_row(&payload, table.n_columns())?;
+            if let Some(pred) = residual {
+                let v = eval_row(pred, &row, &plain_names, &ctx.params, &ctx.named_params)?;
+                if !v.is_truthy() {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+    }
+
+    Ok(ExecResult { columns, rows })
+}
+
 // ============================================================================
 // INSERT
 // ============================================================================
@@ -2788,10 +2905,11 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
 
-    // Column names — needed only when constraints or RETURNING are present.
-    let needs_col_names = !table.check_exprs.is_empty()
-        || table.columns.iter().any(|c| !c.nullable)
-        || returning.is_some();
+    // Column names — needed only for CHECK constraints or RETURNING
+    // (NOT NULL checks are purely positional, so the common case of a
+    // table with a NOT NULL PK but no CHECKs skips the per-statement
+    // Vec<String> allocation entirely).
+    let needs_col_names = !table.check_exprs.is_empty() || returning.is_some();
     let col_names: Vec<String> = if needs_col_names {
         table.columns.iter().map(|c| c.name.clone()).collect()
     } else {
@@ -2834,21 +2952,23 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             // Assign the rowid BEFORE constraint enforcement so that a NULL
             // rowid-alias (auto-assign) doesn't trip NOT NULL (SQLite treats
             // NULL on INTEGER PRIMARY KEY as "allocate a new rowid").
+            let mut rowid_autogen = false;
             if let Some(idx) = table.rowid_alias {
                 if full_row[idx].is_null() {
                     max_rowid += 1;
                     full_row[idx] = Value::Integer(max_rowid);
+                    rowid_autogen = true;
                 }
             }
 
-            // NOT NULL + CHECK constraints.
-            if needs_col_names {
-                enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
-            }
+            // NOT NULL + CHECK constraints. Always enforced: the NOT NULL
+            // loop is purely positional (no names needed); col_names is
+            // only consulted for CHECK expressions (empty when absent).
+            enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
 
             let outcome = exec_insert_one_row(
                 ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-                &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert,
+                &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert, rowid_autogen,
             )?;
             match outcome {
                 InsertOutcome::Inserted => {
@@ -2900,21 +3020,21 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         }
 
         // Assign the rowid BEFORE constraint enforcement (see fast path).
+        let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
                 max_rowid += 1;
                 full_row[idx] = Value::Integer(max_rowid);
+                rowid_autogen = true;
             }
         }
 
-        // NOT NULL + CHECK constraints.
-        if needs_col_names {
-            enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
-        }
+        // NOT NULL + CHECK constraints (see fast path).
+        enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
 
         let outcome = exec_insert_one_row(
             ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-            &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert,
+            &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert, rowid_autogen,
         )?;
         match outcome {
             InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
@@ -2983,22 +3103,22 @@ fn exec_insert_one_row(
     index_roots: &mut Vec<(Arc<crate::schema::Index>, u32)>,
     on_conflict: ConflictResolution,
     upsert: Option<&crate::sql::ast::UpsertClause>,
+    rowid_autogen_hint: bool,
 ) -> Result<InsertOutcome> {
     // Compute rowid. `rowid_was_autogenerated` tracks whether WE assigned
     // the rowid (vs. the user providing it explicitly). This is used below
     // to skip the redundant `lookup_table` check when we KNOW the rowid is
-    // new — but only when the conflict resolution doesn't need to know
-    // whether an existing row is being replaced (OR REPLACE) or skipped
-    // (OR IGNORE/ABORT/FAIL/ROLLBACK). For OR REPLACE on a fresh rowid,
-    // we still can't skip because the rowid could collide with a
-    // user-provided rowid in a later iteration... actually, since the
-    // rowid is freshly allocated (max+1), it CANNOT collide with any
-    // existing row, so we're safe to skip even for OR REPLACE.
+    // new, and to take the BTREE_APPEND fast path (right-most descent +
+    // leaf append without a binary search) — the single biggest win for
+    // bulk sequential inserts.
+    //
+    // The rowid may have been pre-assigned by the caller (for constraint
+    // enforcement); `rowid_autogen_hint` says whether that happened.
     let rowid_was_autogenerated;
     let rowid = if let Some(idx) = table.rowid_alias {
         match &full_row[idx] {
             Value::Integer(i) => {
-                rowid_was_autogenerated = false;
+                rowid_was_autogenerated = rowid_autogen_hint;
                 *i
             }
             Value::Null => {

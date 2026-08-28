@@ -49,6 +49,21 @@ pub enum Plan {
         /// The encoded key to look up.
         key_exprs: Vec<Expr>,
     },
+    /// A range scan via a secondary index (used for `WHERE indexed_col > ?`,
+    /// `indexed_col BETWEEN ? AND ?`, etc.). Scans the index B+tree from the
+    /// start bound to the end bound, then fetches matching rows by rowid.
+    /// Each bound is (value expression, inclusive).
+    IndexRange {
+        table: Arc<Table>,
+        alias: Option<String>,
+        index: Arc<Index>,
+        /// (lower bound, inclusive?) — None means -infinity.
+        start: Option<(Expr, bool)>,
+        /// (upper bound, inclusive?) — None means +infinity.
+        end: Option<(Expr, bool)>,
+        /// Remaining predicates that can't be expressed as a range bound.
+        residual: Option<Expr>,
+    },
     /// A constant single-row source. Columns are filled with the given expressions.
     /// Used for `SELECT 1+1` without a FROM clause.
     Values { rows: Vec<Vec<Expr>> },

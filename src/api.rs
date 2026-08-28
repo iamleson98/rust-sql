@@ -1523,4 +1523,91 @@ mod tests {
         let result = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = a.v)", []);
         assert!(result.is_err());
     }
+
+    // ========================================================================
+    // IndexRange tests (range predicates on indexed columns)
+    // ========================================================================
+
+    #[test]
+    fn index_range_scan_select() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+        db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
+        db.execute("INSERT INTO t (val) VALUES (3), (1), (4), (1), (5), (9), (2), (6)", []).unwrap();
+        // val > 3 → 4, 5, 6, 9 in index order.
+        let rows = db.query("SELECT val FROM t WHERE val > 3", []).unwrap();
+        let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+        assert_eq!(vals, vec![4, 5, 6, 9]);
+        // val >= 4 → same.
+        let rows = db.query("SELECT val FROM t WHERE val >= 4", []).unwrap();
+        assert_eq!(rows.len(), 4);
+        // val < 3 → 1, 1, 2.
+        let rows = db.query("SELECT val FROM t WHERE val < 3", []).unwrap();
+        let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+        assert_eq!(vals, vec![1, 1, 2]);
+        // val <= 2 → same.
+        let rows = db.query("SELECT val FROM t WHERE val <= 2", []).unwrap();
+        assert_eq!(rows.len(), 3);
+        // BETWEEN.
+        let rows = db.query("SELECT val FROM t WHERE val BETWEEN 2 AND 5", []).unwrap();
+        let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+        assert_eq!(vals, vec![2, 3, 4, 5]);
+        // Both bounds.
+        let rows = db.query("SELECT val FROM t WHERE val > 1 AND val < 5", []).unwrap();
+        let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+        assert_eq!(vals, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn index_range_with_residual() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, cat TEXT)", []).unwrap();
+        db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
+        db.execute("INSERT INTO t (val, cat) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a')", []).unwrap();
+        // Range on val + residual on cat.
+        let rows = db.query("SELECT val FROM t WHERE val > 1 AND cat = 'a'", []).unwrap();
+        let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+        assert_eq!(vals, vec![3, 5]);
+    }
+
+    #[test]
+    fn index_range_update() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, score REAL)", []).unwrap();
+        db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
+        let mut sql = String::from("INSERT INTO t (val, score) VALUES ");
+        for i in 0..100 {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({}, 0.0)", i + 1));
+        }
+        db.execute(&sql, []).unwrap();
+        // UPDATE with a range predicate on the indexed column.
+        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 90", []).unwrap();
+        let rows = db.query("SELECT COUNT(*) FROM t WHERE score > 0.5", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(10));
+        // Also verify all rows with val <= 90 still have score 0.
+        let rows = db.query("SELECT COUNT(*) FROM t WHERE score = 0.0", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(90));
+        // DELETE with a range predicate.
+        db.execute("DELETE FROM t WHERE val >= 95", []).unwrap();
+        let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(94));
+    }
+
+    #[test]
+    fn index_range_negative_and_real_values() {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x REAL)", []).unwrap();
+        db.execute("CREATE INDEX idx_x ON t(x)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (-5.5), (-2.0), (0.0), (1.5), (3.25), (7.0)", []).unwrap();
+        let rows = db.query("SELECT x FROM t WHERE x > -2.5", []).unwrap();
+        let vals: Vec<String> = rows.iter().map(|r| r[0].to_string()).collect();
+        assert_eq!(vals, vec!["-2.0", "0.0", "1.5", "3.25", "7.0"]);
+        let rows = db.query("SELECT x FROM t WHERE x < 1.5", []).unwrap();
+        assert_eq!(rows.len(), 3);
+        let rows = db.query("SELECT x FROM t WHERE x >= 1.5", []).unwrap();
+        assert_eq!(rows.len(), 3);
+    }
 }

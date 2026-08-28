@@ -829,6 +829,12 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 }
             }
         }
+        // No rowid/equality access path matched. Try an IndexRange from
+        // conjuncts that are range predicates on the first column of some
+        // index (e.g. `val > 5000` with idx_val, or `val BETWEEN 10 AND 20`).
+        if let Some(range_plan) = try_index_range(catalog, &conjuncts, table, alias) {
+            return range_plan;
+        }
     }
     // Default: wrap in a Filter.
     Plan::Filter { input: Box::new(plan), predicate: predicate.clone() }
@@ -948,6 +954,89 @@ fn is_rowid_col(col_name: &str, rowid_alias_name: &Option<String>) -> bool {
     bare.eq_ignore_ascii_case("rowid")
         || bare.eq_ignore_ascii_case("_rowid_")
         || bare.eq_ignore_ascii_case("oid")
+}
+
+/// Try to build an IndexRange plan from range predicates on the first
+/// column of some index on the table.
+///
+/// Recognized conjunct forms (on the index's FIRST column):
+/// - `col BETWEEN lo AND hi` — sets both bounds (inclusive)
+/// - `col > ?` / `col >= ?`  — sets the lower bound
+/// - `col < ?` / `col <= ?`  — sets the upper bound
+/// - `? > col` / `? >= col` — sets the upper bound (col on right)
+/// - `? < col` / `? <= col` — sets the lower bound
+///
+/// Equality conjuncts are NOT consumed here — the IndexLookup path in
+/// `apply_where_for_scan` handles those (and runs first).
+///
+/// Returns None when no indexed column has a range predicate.
+fn try_index_range(
+    catalog: &Catalog,
+    conjuncts: &[Expr],
+    table: &Arc<Table>,
+    alias: &Option<String>,
+) -> Option<Plan> {
+    let indexes = catalog.indexes_on_table(&table.name);
+    if indexes.is_empty() {
+        return None;
+    }
+    // For each index, try to collect bounds on its first column.
+    for index in &indexes {
+        let first_col = index.columns.first()?;
+        let first_name = first_col.name.to_ascii_lowercase();
+        let mut start: Option<(Expr, bool)> = None;
+        let mut end: Option<(Expr, bool)> = None;
+        let mut residual: Vec<Expr> = Vec::new();
+        let mut matched = false;
+
+        for conjunct in conjuncts {
+            let bare_col = |s: &str| -> String {
+                s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase()
+            };
+            // BETWEEN.
+            if let Some((col, lo, hi)) = extract_between(conjunct) {
+                if bare_col(&col) == first_name {
+                    matched = true;
+                    start = Some((lo, true));
+                    end = Some((hi, true));
+                    continue;
+                }
+            }
+            // Range ops.
+            if let Some((col, op, val)) = extract_range(conjunct) {
+                if bare_col(&col) == first_name {
+                    matched = true;
+                    match op.as_str() {
+                        ">" => start = Some((val, false)),
+                        ">=" => start = Some((val, true)),
+                        "<" => end = Some((val, false)),
+                        "<=" => end = Some((val, true)),
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
+            residual.push(conjunct.clone());
+        }
+
+        if !matched {
+            continue;
+        }
+        let residual_opt = if residual.is_empty() {
+            None
+        } else {
+            Some(combine_and(&residual))
+        };
+        return Some(Plan::IndexRange {
+            table: table.clone(),
+            alias: alias.clone(),
+            index: index.clone(),
+            start,
+            end,
+            residual: residual_opt,
+        });
+    }
+    None
 }
 
 /// Extract `col BETWEEN lo AND hi` from an expression.
@@ -1486,6 +1575,8 @@ fn resolve_outer_col_index(plan: &Plan, table_qualifier: Option<&str>, col_name:
 
         Plan::IndexLookup { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
 
+        Plan::IndexRange { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
+
         Plan::RowidRange { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
 
         Plan::Filter { input, .. } => {
@@ -1543,6 +1634,7 @@ fn plan_output_width(plan: &Plan) -> usize {
         Plan::Scan { table, .. } => table.n_columns(),
         Plan::RowidLookup { table, .. } => table.n_columns(),
         Plan::IndexLookup { table, .. } => table.n_columns(),
+        Plan::IndexRange { table, .. } => table.n_columns(),
         Plan::RowidRange { table, .. } => table.n_columns(),
         Plan::Values { rows } => rows.first().map(|r| r.len()).unwrap_or(0),
         Plan::Filter { input, .. } => plan_output_width(input),
