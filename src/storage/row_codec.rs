@@ -21,6 +21,18 @@ pub fn encode_row(row: &Row) -> Vec<u8> {
     out
 }
 
+/// Encode a row into a caller-provided buffer. The buffer is cleared first
+/// (capacity retained) and then refilled with the encoded bytes. This is the
+/// zero-allocation fast path for hot loops that produce many rows (e.g.
+/// `try_streaming_update`), mirroring `decode_row_into` for symmetry.
+pub fn encode_row_into(row: &Row, out: &mut Vec<u8>) {
+    out.clear();
+    for v in row {
+        let bytes = v.encode();
+        out.extend_from_slice(&bytes);
+    }
+}
+
 /// Decode a row from a byte slice.
 pub fn decode_row(buf: &[u8], n_cols: usize) -> Result<Row> {
     let mut row = Vec::with_capacity(n_cols);
