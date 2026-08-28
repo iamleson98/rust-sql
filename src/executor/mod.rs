@@ -139,6 +139,9 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 exec_join(ctx, left, right, *join_type, condition)
             }
         }
+        Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, inner_index, outer_key_col } => {
+            exec_index_nested_loop_join(ctx, outer, inner_table.clone(), inner_alias.clone(), inner_index.clone(), *outer_key_col)
+        }
         Plan::Distinct { input } => exec_distinct(ctx, input),
         Plan::Union { left, right, all } => exec_union(ctx, left, right, *all),
         Plan::Intersect { left, right } => exec_intersect(ctx, left, right),
@@ -991,6 +994,80 @@ fn col_index(expr: &Expr, cols: &[String]) -> Option<usize> {
     } else {
         None
     }
+}
+
+// ============================================================================
+// Index nested-loop join
+// ============================================================================
+
+/// Index nested-loop join: for each outer row, look up matching inner rows
+/// via the inner table's secondary index. This is the optimal plan for
+/// `JOIN inner ON outer.k = inner.k` when `inner.k` is indexed and the
+/// outer side is highly selective (e.g. filtered by `WHERE outer.k = ?`).
+///
+/// Unlike `exec_hash_join`, this never materializes the full inner table —
+/// it only fetches the inner rows that actually match an outer row. For
+/// the canonical case `SELECT ... FROM users u JOIN orders o ON u.id =
+/// o.user_id WHERE u.id = ?` with `idx_orders_user` on `orders(user_id)`,
+/// this means ~10 inner-row lookups instead of decoding all 10k orders.
+fn exec_index_nested_loop_join(
+    ctx: &mut ExecContext<'_>,
+    outer_plan: &Plan,
+    inner_table: Arc<Table>,
+    inner_alias: Option<String>,
+    inner_index: Arc<crate::schema::Index>,
+    outer_key_col: usize,
+) -> Result<ExecResult> {
+    let outer_res = execute(outer_plan, ctx)?;
+    let n_inner_cols = inner_table.n_columns();
+
+    // Output columns: outer.cols ++ inner.cols (with inner prefix from alias).
+    let inner_prefix = inner_alias.as_deref().unwrap_or(&inner_table.name);
+    let mut combined_cols = outer_res.columns.clone();
+    combined_cols.extend(
+        inner_table.columns.iter().map(|c| format!("{}.{}", inner_prefix, c.name)),
+    );
+
+    let mut out_rows: Vec<Row> = Vec::new();
+    let inner_root = ctx.table_root(&inner_table);
+
+    for outer_row in &outer_res.rows {
+        // Extract the join key from the outer row.
+        let key_value = match outer_row.get(outer_key_col) {
+            Some(v) => v.clone(),
+            None => continue, // NULL join key — no matches in INNER join.
+        };
+
+        // Encode the key for index lookup.
+        let key_bytes = key_value.encode();
+
+        // Look up matching rowids in the index B+tree.
+        let mut index_bt = Btree::new(ctx.pager, inner_index.root_page, true);
+        let rowids = index_bt.lookup_index(&key_bytes)?;
+
+        // Fetch each matching row from the inner table. Deduplicate rowids
+        // defensively — the index B+tree may (in pathological cases) contain
+        // duplicate entries if an UPDATE's index-maintenance delete missed
+        // the cell (older versions of the delete path didn't handle index
+        // page types). Deduplication here guarantees correctness even when
+        // the index is in an inconsistent state.
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for rowid in rowids {
+            if !seen.insert(rowid) {
+                continue;
+            }
+            let mut table_bt = Btree::new(ctx.pager, inner_root, false);
+            if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
+                if let Ok(inner_row) = decode_row(&payload, n_inner_cols) {
+                    let mut combined = outer_row.clone();
+                    combined.extend(inner_row);
+                    out_rows.push(combined);
+                }
+            }
+        }
+    }
+
+    Ok(ExecResult { columns: combined_cols, rows: out_rows })
 }
 
 // ============================================================================

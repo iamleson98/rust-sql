@@ -713,13 +713,28 @@ impl<'a> Btree<'a> {
         // Allocate a new leaf page.
         let new_page_id = self.pager.allocate_page()?;
         let new_page = self.pager.get_page(new_page_id)?;
-        new_page.borrow_mut().init_leaf_table();
+        // Preserve the leaf page type — index splits must produce LeafIndex
+        // pages, table splits must produce LeafTable pages. Previously this
+        // was hardcoded to `init_leaf_table()`, which silently corrupted
+        // index B+trees on the first split (turning a LeafIndex page into a
+        // LeafTable page; subsequent scan_index calls panic with
+        // "unexpected page type in index scan: LeafTable").
+        let is_index = matches!(pt, PageType::LeafIndex);
+        if is_index {
+            new_page.borrow_mut().init_leaf_index();
+        } else {
+            new_page.borrow_mut().init_leaf_table();
+        }
 
         // Clear the old page and re-insert the first half.
         {
             let page_ref = self.pager.get_page(page_id)?;
             let mut borrowed = page_ref.borrow_mut();
-            borrowed.init_leaf_table();
+            if is_index {
+                borrowed.init_leaf_index();
+            } else {
+                borrowed.init_leaf_table();
+            }
         }
 
         // Re-insert first half into old page, second half into new page.
@@ -808,7 +823,7 @@ impl<'a> Btree<'a> {
         let page = self.pager.get_page(page_id)?;
         let pt = page.borrow().page_type()?;
         match pt {
-            PageType::LeafTable => {
+            PageType::LeafTable | PageType::LeafIndex => {
                 let n = page.borrow().n_cells();
                 let pos = {
                     let borrowed = page.borrow();
@@ -864,7 +879,7 @@ impl<'a> Btree<'a> {
                 }
                 Ok(true)
             }
-            PageType::InteriorTable => {
+            PageType::InteriorTable | PageType::InteriorIndex => {
                 let child_id = {
                     let borrowed = page.borrow();
                     let n = borrowed.n_cells();
@@ -874,6 +889,15 @@ impl<'a> Btree<'a> {
                         let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                         if let Cell::TableInterior { left_child, key } = c {
                             if rowid <= key {
+                                next = left_child;
+                                break;
+                            }
+                        }
+                        // For index interior cells, the layout differs but
+                        // the routing logic is the same: rowid <= key → go
+                        // to left_child. IndexInterior also stores left_child.
+                        if let Cell::IndexInterior { left_child, rowid: cell_rowid, .. } = c {
+                            if rowid <= cell_rowid {
                                 next = left_child;
                                 break;
                             }
@@ -1212,6 +1236,7 @@ impl<'a> Btree<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Value;
     use tempfile::NamedTempFile;
 
     fn open_pager() -> Pager {
@@ -1310,5 +1335,69 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 101);
+    }
+
+    /// Regression test for `split_leaf` page-type preservation.
+    ///
+    /// Before the fix, `split_leaf` hardcoded `init_leaf_table()` for both
+    /// the old and new pages — even when the splitting page was a LeafIndex
+    /// page. After the first index split, the index B+tree was silently
+    /// corrupted (LeafIndex pages turned into LeafTable pages), and
+    /// subsequent `scan_index` calls panicked with
+    /// "unexpected page type in index scan: LeafTable".
+    ///
+    /// This test forces an index split by inserting enough rows to overflow
+    /// a single leaf page, then verifies that:
+    ///   1. scan_index still works (no panic).
+    ///   2. All inserted entries are still findable via lookup_index.
+    ///   3. The page types of leaf pages are LeafIndex, not LeafTable.
+    #[test]
+    fn index_split_preserves_page_type() {
+        let mut pager = open_pager();
+        let mut bt = Btree::create(&mut pager, true).unwrap();
+        // Insert enough entries to force multiple splits.
+        for i in 1..=500i64 {
+            let key = Value::Integer(i).encode();
+            bt.insert_index(&key, i).unwrap();
+        }
+        // Verify scan_index works (no panic).
+        let mut seen_rowids = Vec::new();
+        bt.scan_index(|rowid, _key| {
+            seen_rowids.push(rowid);
+            true
+        })
+        .unwrap();
+        seen_rowids.sort();
+        assert_eq!(seen_rowids, (1..=500).collect::<Vec<_>>());
+        // Verify lookup_index finds every entry.
+        for i in 1..=500i64 {
+            let key = Value::Integer(i).encode();
+            let matches = bt.lookup_index(&key).unwrap();
+            assert_eq!(matches, vec![i], "lookup_index for value {} failed", i);
+        }
+    }
+
+    /// Regression test for `delete_from_page` index page handling.
+    ///
+    /// Before the fix, `delete_from_page` only handled LeafTable and
+    /// InteriorTable page types. When called on an index B+tree (to delete
+    /// an entry during UPDATE), it fell through to the corruption-error
+    /// path. The error was swallowed by `let _ = delete_index_entry(...)`
+    /// in `exec_update`, so the old entry stayed in the index and the new
+    /// entry was inserted alongside it — producing duplicate index entries.
+    #[test]
+    fn index_delete_then_reinsert_no_duplicate() {
+        let mut pager = open_pager();
+        let mut bt = Btree::create(&mut pager, true).unwrap();
+        // Insert a single entry.
+        let key = Value::Integer(42).encode();
+        bt.insert_index(&key, 7).unwrap();
+        // Delete it.
+        assert!(bt.delete_index(7).unwrap());
+        // Re-insert with the same key+rowid.
+        bt.insert_index(&key, 7).unwrap();
+        // Lookup should return exactly one rowid, not two.
+        let matches = bt.lookup_index(&key).unwrap();
+        assert_eq!(matches, vec![7], "duplicate index entries after delete+reinsert");
     }
 }

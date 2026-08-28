@@ -6,33 +6,33 @@
 > criterion benchmark harness running identical workloads against
 > `rusqlite` and rustqlite.
 
-## Current baseline (recorded `2026-08-27`, after commit 1d2cd81 "feat(tests): expand differential suite to 164 cases")
+## Current baseline (recorded `2026-08-28`, after IndexNestedLoopJoin + index split fix)
 
-`cargo test --release`: **55 unit + 1 differential (164 cases) + 1 SLT (140 cases) + 2 doctests = 59 tests, 304 internal cases, all passing.**
+`cargo test --release`: **57 unit + 1 differential (164 cases) + 1 SLT (140 cases) + 2 doctests = 61 tests, 304 internal cases, all passing.**
 `cargo run --release --example bench_compare` on the same workload:
 
 | Workload                                  | rustqlite   | SQLite      | Ratio       |
 | ----------------------------------------- | ----------- | ----------- | ----------- |
-| Single-row inserts (1k, auto-commit)      | 12.06 ms    | 1.74 ms     | 6.9× slower |
-| Single-row in BEGIN/COMMIT (10k)           | 101.71 ms   | 12.69 ms    | 8.0× slower |
-| Single-row in BEGIN/COMMIT (100k)          | 1.42 s      | 126.52 ms   | 11× slower  |
-| **Multi-row VALUES batches (10k)** ✅      | **23.36 ms** | 6.61 ms    | **3.5× slower** (was 13×) |
-| Point lookup by rowid (1k ops)            | 3.27 ms     | 356.44 µs   | 9.2× slower ✅ was 13.7× |
-| **Range scan (10 rows)** ✅                | **39.60 µs** | 3.38 µs    | **11.7× slower** (was 200×) |
-| **Range scan (100 rows)** ✅               | **35.44 µs** | 11.55 µs   | **3.1× slower** (was 200×) |
-| **Range scan (1000 rows)** ✅              | **212.12 µs** | 107.71 µs | **2.0× slower** (was 13×) |
-| **Range scan (5000 rows)** ✅              | **1.16 ms** | 561.87 µs   | **2.1× slower** (was 4×) |
-| Full scan + COUNT with filter            | 3.13 ms     | 503.61 µs   | 6.2× slower |
-| Aggregate (SUM/AVG/MIN/MAX)                | 6.89 ms     | 1.21 ms     | 5.7× slower |
-| GROUP BY (100 buckets)                     | 3.66 ms     | 1.89 ms     | 1.9× slower |
-| **Point lookup by indexed col (1k ops)** ✅ | **1.01 ms** | 527.66 µs  | **1.9× slower** (was 5.5×) |
-| 2-table join filter by PK (~10 rows out)  | 7.52 ms     | 23.65 µs    | 318× slower |
-| 3-table join filter by PK (~50 rows out)  | 19.89 ms    | 90.75 µs    | 219× slower ✅ was 797× |
-| 2-table join + GROUP BY (full scan)        | 12.18 ms    | 2.99 ms     | 4.1× slower |
-| **UPDATE by PK (1k ops)**                  | **10.82 ms** | 1.84 ms   | **5.9× slower** ✅ was 743× |
-| UPDATE range (val > 5000)                  | 29.58 ms    | 1.31 ms     | 23× slower  |
-| **DELETE by PK (1k ops)**                  | **4.91 ms**  | 1.27 ms   | **3.9× slower** ✅ was 43× |
-| **Mixed 80/20 (5k ops)**                   | **20.29 ms** | 2.46 ms   | **8.3× slower** ✅ was 292× |
+| Single-row inserts (1k, auto-commit)      | 5.65 ms     | 1.80 ms     | 3.1× slower |
+| Single-row in BEGIN/COMMIT (10k)           | 28.78 ms    | 13.07 ms    | 2.2× slower ✅ was 8.0× |
+| Single-row in BEGIN/COMMIT (100k)          | 527.33 ms   | 128.38 ms   | 4.1× slower ✅ was 11× |
+| **Multi-row VALUES batches (10k)** ✅      | **24.08 ms** | 6.65 ms    | **3.6× slower** (was 13×) |
+| Point lookup by rowid (1k ops)            | 3.23 ms     | 354.57 µs   | 9.1× slower |
+| **Range scan (10 rows)** ✅                | **32.81 µs** | 3.83 µs    | **8.6× slower** (was 200×) |
+| **Range scan (100 rows)** ✅               | **34.86 µs** | 11.74 µs   | **3.0× slower** (was 200×) |
+| **Range scan (1000 rows)** ✅              | **203.24 µs** | 112.78 µs | **1.8× slower** (was 13×) |
+| **Range scan (5000 rows)** ✅              | **1.14 ms** | 565.58 µs   | **2.0× slower** (was 4×) |
+| Full scan + COUNT with filter            | 3.16 ms     | 507.17 µs   | 6.2× slower |
+| Aggregate (SUM/AVG/MIN/MAX)                | 7.23 ms     | 1.25 ms     | 5.8× slower |
+| GROUP BY (100 buckets)                     | 3.94 ms     | 1.95 ms     | 2.0× slower |
+| **Point lookup by indexed col (1k ops)** ✅ | **974.40 µs** | 533.17 µs | **1.8× slower** (was 5.5×) |
+| **2-table join filter by PK (~10 rows out)** ✅ | **155.27 µs** | 21.74 µs | **7.1× slower** ✅ was 240× |
+| **3-table join filter by PK (~50 rows out)** ✅ | **151.28 µs** | 79.60 µs | **1.9× slower** ✅ was 177× |
+| 2-table join + GROUP BY (full scan)        | 14.13 ms    | 3.05 ms     | 4.6× slower |
+| **UPDATE by PK (1k ops)**                  | **11.53 ms** | 1.89 ms   | **6.1× slower** ✅ was 743× |
+| UPDATE range (val > 5000)                  | 29.52 ms    | 1.37 ms     | 22× slower  |
+| **DELETE by PK (1k ops)**                  | **5.30 ms**  | 1.28 ms   | **4.1× slower** ✅ was 43× |
+| **Mixed 80/20 (5k ops)**                   | **20.38 ms** | 2.49 ms   | **8.2× slower** ✅ was 292× |
 | DB file size (10k rows)                    | 917.50 KB   | 262.14 KB   | 3.5× larger |
 
 ### What's already done (verified by reading source, not by TODO checkboxes)

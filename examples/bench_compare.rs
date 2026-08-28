@@ -445,6 +445,12 @@ fn rustqlite_setup_join(db: &mut rustqlite::Database) {
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)", []).unwrap();
     db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)", []).unwrap();
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)", []).unwrap();
+    // Create indexes on the join keys so the planner can pick IndexNestedLoopJoin.
+    // Without these, the 2-table join (filter by PK) runs as a hash join that
+    // fully materializes the inner side (~10k rows decoded) — 240× slower than
+    // SQLite. With indexes, the INLJ path fetches only the ~10 matching rows.
+    db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
+    db.execute("CREATE INDEX idx_items_order ON items(order_id)", []).unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=1000 {
         let sql = format!(
