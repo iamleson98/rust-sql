@@ -2,34 +2,57 @@
 //!
 //! Responsibilities:
 //! - Read/write fixed-size pages from the database file
-//! - Cache pages in memory (LRU eviction)
+//! - Cache pages in memory (FIFO eviction — see `get_page` comment)
 //! - Allocate new pages (and maintain a freelist)
 //! - Coordinate with the WAL for durability
 //! - Snapshot/restore for transaction ROLLBACK
 //!
-//! Pages are returned via `PageRef` (an `Arc<Mutex<Page>>`) so that the
-//! B+tree can hold multiple references to the same page during splits and
-//! merges without copying, and so the cache (and hence `Pager` and
-//! `Database`) is `Send + Sync` — enabling the multi-threaded server to
-//! hold `Arc<RwLock<Database>>` and let N readers run concurrently.
+//! ## Concurrency model
+//!
+//! `Pager` is `Send + Sync` and all public methods take `&self` — the entire
+//! pager is wrapped in interior mutability. This means N reader threads can
+//! share a single `&Pager` and call `get_page` concurrently.
+//!
+//! - The page cache is `RwLock<HashMap<PageId, PageRef>>` — cache hits take
+//!   a brief read lock and clone the `Arc<Mutex<Page>>`, cache misses take
+//!   a brief write lock to insert the new entry.
+//! - The LRU list (FIFO actually — see `get_page` comment) is a
+//!   `Mutex<VecDeque<PageId>>` because we only push/pop from one end.
+//! - The file is `File` + positioned I/O (`read_at` / `write_at`) so no
+//!   shared file offset state needs synchronization. The kernel still has
+//!   an internal offset for the file description but `pread`/`pwrite`
+//!   don't touch it.
+//! - The page itself is `Arc<Mutex<Page>>`, so the cache lock is held only
+//!   briefly during the lookup/insert; the page lock is held during the
+//!   actual decode/encode work.
+//!
+//! Writes are serialized through the cache write lock (only one writer
+//! inserting/evicting pages at a time) but reads can proceed concurrently
+//! because they take only a read lock on the cache.
 
 use crate::error::{Error, Result};
 use crate::storage::page::{
     FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAGE_SIZE, FIRST_PAGE_ID,
 };
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+// On Unix, use positioned I/O (pread/pwrite) so multiple threads can read
+// and write the file concurrently without serializing on the file offset.
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 /// A shared mutable reference to a page.
 ///
 /// `Arc<Mutex<Page>>` makes `PageRef` `Send + Sync`, which in turn makes
 /// `Pager` (and therefore `Database`) `Send + Sync`. This unlocks true
 /// concurrent reads when `Database` is wrapped in `Arc<RwLock<Database>>`:
-/// N readers can hold `&Database` simultaneously, each calling `query()`
+/// N readers can hold `&Database` simultaneously, each calling `query_shared()`
 /// without serializing against other readers.
 ///
 /// We use `parking_lot::Mutex` rather than `std::sync::Mutex` because:
@@ -64,10 +87,10 @@ impl PagerSnapshot {
     /// Snapshot the pager's mutable metadata at the current point in time.
     pub fn capture(pager: &Pager) -> Self {
         Self {
-            n_pages: pager.n_pages,
-            freelist_head: pager.freelist_head,
-            freelist_count: pager.freelist_count,
-            schema_cookie: pager.schema_cookie,
+            n_pages: pager.n_pages.load(Ordering::Acquire),
+            freelist_head: pager.freelist_head.load(Ordering::Acquire),
+            freelist_count: pager.freelist_count.load(Ordering::Acquire),
+            schema_cookie: pager.schema_cookie.load(Ordering::Acquire),
         }
     }
 }
@@ -78,26 +101,35 @@ impl PagerSnapshot {
 /// For simplicity, we use a `LinkedHashMap`-style structure built on top of
 /// `HashMap` + a manual ordering list. This is fast enough for typical
 /// workloads (cache sizes of a few thousand pages).
+///
+/// ## Interior mutability
+///
+/// All mutable state is wrapped in `RwLock`/`Mutex`/`Atomic*` so that all
+/// public methods take `&self`. This is the key enabler for the multi-threaded
+/// concurrent server: N reader threads can call `pager.get_page(id)`
+/// simultaneously without serializing on a write lock for cache hits.
 pub struct Pager {
     file: File,
     path: PathBuf,
-    page_size: u32,
-    /// Total number of pages in the file (cached, updated on writes).
-    n_pages: u32,
+    /// Page size in bytes (immutable after `open`).
+    page_size: AtomicU32,
+    /// Total number of pages in the file (updated on writes).
+    n_pages: AtomicU32,
     /// Head of the freelist (0 if empty).
-    freelist_head: PageId,
+    freelist_head: AtomicU32,
     /// Number of pages on the freelist.
-    freelist_count: u32,
-    /// In-memory cache: page_id → page.
-    cache: HashMap<PageId, PageRef>,
+    freelist_count: AtomicU32,
+    /// In-memory cache: page_id → page. RwLock so reads on distinct pages
+    /// don't serialize; only cache-miss inserts take the write lock.
+    cache: RwLock<HashMap<PageId, PageRef>>,
     /// LRU ordering: most recently used at the back.
-    lru: std::collections::VecDeque<PageId>,
-    /// Maximum number of pages to keep in the cache.
+    lru: Mutex<VecDeque<PageId>>,
+    /// Maximum number of pages to keep in the cache (immutable after open).
     cache_capacity: usize,
     /// Schema cookie, bumped on every schema change.
-    schema_cookie: u32,
+    schema_cookie: AtomicU32,
     /// True if this is a freshly created database (no header yet).
-    is_new: bool,
+    is_new: AtomicBool,
     /// Upper-bound count of dirty pages since the last `flush()`. Incremented
     /// by `note_write()` on every mutating operation (allocate_page, free_page,
     /// Btree insert/delete/etc.). Reset to 0 by `flush()`.
@@ -107,43 +139,37 @@ pub struct Pager {
     ///   `dirty_count_approx == 0  ⟹  no pages are dirty`
     /// which is sufficient to make `flush()`'s fast path O(1) and to make
     /// `dirty_page_count()` O(1) for the threshold check.
-    ///
-    /// Before this counter existed, `flush()` did
-    /// `self.cache.values().any(|p| p.borrow().dirty)` — an O(cache_size)
-    /// scan on EVERY `Database::query()` call (in deferred_flush mode).
-    /// With a default cache of 2048 pages, that was ~5 µs of pure overhead
-    /// per SELECT, which dominated the 9.2× point-lookup gap vs SQLite.
-    dirty_count_approx: usize,
+    dirty_count_approx: AtomicUsize,
 }
 
 impl Pager {
     /// Open or create a database file at the given path.
     pub fn open<P: AsRef<Path>>(path: P, cache_capacity: usize) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.ref_to_path();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&path)?;
 
-        let mut pager = Self {
+        let pager = Self {
             file,
             path,
-            page_size: DEFAULT_PAGE_SIZE,
-            n_pages: 0,
-            freelist_head: 0,
-            freelist_count: 0,
-            cache: HashMap::new(),
-            lru: std::collections::VecDeque::new(),
+            page_size: AtomicU32::new(DEFAULT_PAGE_SIZE),
+            n_pages: AtomicU32::new(0),
+            freelist_head: AtomicU32::new(0),
+            freelist_count: AtomicU32::new(0),
+            cache: RwLock::new(HashMap::new()),
+            lru: Mutex::new(VecDeque::new()),
             cache_capacity,
-            schema_cookie: 0,
-            is_new: false,
-            dirty_count_approx: 0,
+            schema_cookie: AtomicU32::new(0),
+            is_new: AtomicBool::new(false),
+            dirty_count_approx: AtomicUsize::new(0),
         };
 
         let file_size = pager.file.metadata()?.len();
         if file_size == 0 {
-            pager.is_new = true;
+            pager.is_new.store(true, Ordering::Release);
             pager.initialize_new_db()?;
         } else {
             pager.read_header()?;
@@ -153,16 +179,17 @@ impl Pager {
 
     /// Create a fresh database: write page 0 with the file header and an
     /// empty leaf page (the schema table root).
-    fn initialize_new_db(&mut self) -> Result<()> {
-        let mut page0 = Page::new(0, self.page_size);
+    fn initialize_new_db(&self) -> Result<()> {
+        let page_size = self.page_size.load(Ordering::Acquire);
+        let mut page0 = Page::new(0, page_size);
         FileHeader::write(
             &mut page0.data,
-            self.page_size,
+            page_size,
             1, // 1 page total
             0, // schema cookie
         );
         // Page 0 is also the schema table's root (a leaf table page).
-        // The header is 100 bytes; the B+tree header starts at offset 100.
+        // The header is 100 bytes; the B+tree header begins at offset 100.
         page0.data[DB_HEADER_SIZE as usize] = crate::storage::page::PageType::LeafTable as u8;
         page0.data[DB_HEADER_SIZE as usize + 4..DB_HEADER_SIZE as usize + 6]
             .copy_from_slice(&0u16.to_be_bytes()); // n_cells = 0
@@ -172,21 +199,21 @@ impl Pager {
             .copy_from_slice(&0u32.to_be_bytes()); // right_pointer = 0
         page0.dirty = true;
 
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&page0.data)?;
+        self.write_file_at(0, &page0.data)?;
         self.file.sync_all()?;
-        self.n_pages = 1;
-        self.schema_cookie = 0;
-        self.is_new = false;
+        self.n_pages.store(1, Ordering::Release);
+        self.page_size.store(page_size, Ordering::Release);
+        self.schema_cookie.store(0, Ordering::Release);
+        self.is_new.store(false, Ordering::Release);
         // page0 was written directly to disk (not through the cache), so
         // no in-memory page is dirty. Keep the counter accurate.
-        self.dirty_count_approx = 0;
+        self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
     }
 
-    fn read_header(&mut self) -> Result<()> {
+    fn read_header(&self) -> Result<()> {
         let mut header = [0u8; 100];
-        let n = self.file.read(&mut header)?;
+        let n = self.read_file_at(0, &mut header)?;
         if n < 100 {
             return Err(Error::corruption(format!(
                 "file too small for header: {} bytes",
@@ -196,34 +223,39 @@ impl Pager {
         if FileHeader::magic(&header) != Some(&crate::storage::page::DB_MAGIC) {
             return Err(Error::corruption("invalid magic header"));
         }
-        self.page_size = FileHeader::page_size(&header)?;
-        self.n_pages = FileHeader::db_size_pages(&header);
-        self.freelist_head = u32::from_le_bytes(header[20..24].try_into().unwrap());
-        self.freelist_count = u32::from_le_bytes(header[24..28].try_into().unwrap());
-        self.schema_cookie = FileHeader::schema_cookie(&header);
+        let page_size = FileHeader::page_size(&header)?;
+        self.page_size.store(page_size, Ordering::Release);
+        let n_pages = FileHeader::db_size_pages(&header);
+        let freelist_head = u32::from_le_bytes(header[20..24].try_into().unwrap());
+        let freelist_count = u32::from_le_bytes(header[24..28].try_into().unwrap());
+        let schema_cookie = FileHeader::schema_cookie(&header);
+        self.n_pages.store(n_pages, Ordering::Release);
+        self.freelist_head.store(freelist_head, Ordering::Release);
+        self.freelist_count.store(freelist_count, Ordering::Release);
+        self.schema_cookie.store(schema_cookie, Ordering::Release);
 
         // Verify file size matches the claimed page count.
         let actual_size = self.file.metadata()?.len();
-        let expected_size = self.n_pages as u64 * self.page_size as u64;
+        let expected_size = n_pages as u64 * page_size as u64;
         if actual_size < expected_size {
             return Err(Error::corruption(format!(
                 "file size {} < expected {} (n_pages={}, page_size={})",
-                actual_size, expected_size, self.n_pages, self.page_size
+                actual_size, expected_size, n_pages, page_size
             )));
         }
         Ok(())
     }
 
     pub fn page_size(&self) -> u32 {
-        self.page_size
+        self.page_size.load(Ordering::Acquire)
     }
 
     pub fn n_pages(&self) -> u32 {
-        self.n_pages
+        self.n_pages.load(Ordering::Acquire)
     }
 
     pub fn schema_cookie(&self) -> u32 {
-        self.schema_cookie
+        self.schema_cookie.load(Ordering::Acquire)
     }
 
     /// Notify the pager that a mutating operation just happened (or is
@@ -234,111 +266,126 @@ impl Pager {
     ///
     /// Cost: O(1). This replaced an O(cache_size) scan on every
     /// `Database::query()` call (the 9.2× point-lookup gap vs SQLite).
-    pub fn note_write(&mut self) {
-        self.dirty_count_approx = self.dirty_count_approx.saturating_add(1);
+    pub fn note_write(&self) {
+        self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
     }
 
     /// True if there might be dirty pages in the cache. O(1).
     pub fn has_dirty_pages(&self) -> bool {
-        self.dirty_count_approx > 0
+        self.dirty_count_approx.load(Ordering::Acquire) > 0
     }
 
-    pub fn bump_schema_cookie(&mut self) -> Result<()> {
-        self.schema_cookie = self.schema_cookie.wrapping_add(1);
+    pub fn dirty_page_count(&self) -> usize {
+        self.dirty_count_approx.load(Ordering::Acquire)
+    }
+
+    pub fn bump_schema_cookie(&self) -> Result<()> {
+        let new_cookie = self.schema_cookie.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |x| Some(x.wrapping_add(1)),
+        ).unwrap_or_else(|x| x);
         let mut header = [0u8; 100];
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_exact(&mut header)?;
-        FileHeader::set_schema_cookie(&mut header, self.schema_cookie);
-        header[16..20].copy_from_slice(&self.n_pages.to_le_bytes());
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&header)?;
+        self.read_file_at(0, &mut header)?;
+        FileHeader::set_schema_cookie(&mut header, new_cookie.wrapping_add(1));
+        let n_pages_val = self.n_pages.load(Ordering::Acquire);
+        header[16..20].copy_from_slice(&n_pages_val.to_le_bytes());
+        self.write_file_at(0, &header)?;
         Ok(())
     }
 
     /// Get a page by ID, reading from disk if not cached.
-    pub fn get_page(&mut self, id: PageId) -> Result<PageRef> {
-        if id >= self.n_pages && id != 0 {
+    ///
+    /// Concurrency:
+    ///  - Cache hit: brief read lock on the cache; clone the Arc; release.
+    ///    Multiple readers can do this concurrently on different pages.
+    ///  - Cache miss: brief read lock to check (double-checked), then brief
+    ///    write lock to insert. Only one thread does the disk read; the other
+    ///    waits on the write lock and then sees the page in cache.
+    pub fn get_page(&self, id: PageId) -> Result<PageRef> {
+        let n_pages_val = self.n_pages.load(Ordering::Acquire);
+        if id >= n_pages_val && id != 0 {
             return Err(Error::corruption(format!(
                 "page {} out of range (n_pages={})",
-                id, self.n_pages
+                id, n_pages_val
             )));
         }
 
-        // Check cache
-        let cached = self.cache.get(&id).cloned();
-        if let Some(page_ref) = cached {
-            // NOTE: We intentionally skip `touch_lru(id)` here.
-            //
-            // The previous implementation did `self.touch_lru(id)` on every
-            // cache hit. `touch_lru` does `self.lru.iter().position(|x| *x == id)`
-            // — an O(cache_size) linear scan on EVERY page access. With a
-            // default cache of 2048 pages, that's ~2048 comparisons per
-            // page lookup, which dominated the 8× point-lookup gap vs SQLite.
-            //
-            // Skipping touch means our "LRU" is now FIFO (evict the
-            // oldest-inserted page, not the oldest-accessed). For workloads
-            // where the cache comfortably holds the working set (the common
-            // case for an embedded DB), FIFO eviction is just as good as LRU
-            // — we never evict hot pages because we never evict at all.
-            // When the cache IS under pressure, FIFO is slightly worse than
-            // LRU but the difference is small (a few extra cache misses) and
-            // is dwarfed by the O(1) hit cost.
-            //
-            // If true LRU is needed in the future, swap `lru: VecDeque<PageId>`
-            // for `linked_hash_map` (O(1) removal) or a hand-rolled doubly-
-            // linked list. The rest of the code only uses `lru.front()` and
-            // `lru.push_back()` + the now-skipped `touch_lru`, so the swap
-            // would be localized to this file.
-            return Ok(page_ref);
+        // Fast path: read lock, check cache.
+        {
+            let cache = self.cache.read();
+            if let Some(page_ref) = cache.get(&id).cloned() {
+                return Ok(page_ref);
+            }
         }
 
-        // Read from disk
-        let mut page = Page::new(id, self.page_size);
-        let offset = id as u64 * self.page_size as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut page.data)?;
-
-        let page_ref = Arc::new(Mutex::new(page));
-        self.maybe_evict();
-        self.cache.insert(id, page_ref.clone());
-        self.lru.push_back(id);
+        // Slow path: cache miss — take write lock, double-check, then read from disk.
+        let page_ref = {
+            let mut cache = self.cache.write();
+            // Double-check: another thread may have inserted while we waited.
+            if let Some(page_ref) = cache.get(&id).cloned() {
+                return Ok(page_ref);
+            }
+            let psz = self.page_size();
+            let mut page = Page::new(id, psz);
+            let offset = id as u64 * psz as u64;
+            let n = self.read_file_at(offset, &mut page.data)?;
+            if n != psz as usize {
+                return Err(Error::corruption(format!(
+                    "short read on page {}: {} of {} bytes",
+                    id, n, psz
+                )));
+            }
+            let page_ref = Arc::new(Mutex::new(page));
+            self.maybe_evict_locked(&mut cache);
+            cache.insert(id, page_ref.clone());
+            self.lru.lock().push_back(id);
+            page_ref
+        };
         Ok(page_ref)
     }
 
     /// Allocate a new page. Uses the freelist first, then extends the file.
-    pub fn allocate_page(&mut self) -> Result<PageId> {
-        if self.freelist_count > 0 {
-            // Pop a page from the freelist
-            let page = self.get_page(self.freelist_head)?;
+    pub fn allocate_page(&self) -> Result<PageId> {
+        let current_free_count = self.freelist_count.load(Ordering::Acquire);
+        if current_free_count > 0 {
+            // Pop a page from the freelist.
+            let head = self.freelist_head.load(Ordering::Acquire);
+            let page = self.get_page(head)?;
             let next = {
                 let borrowed = page.lock();
-                // First 4 bytes of a freelist page point to the next free page.
                 u32::from_le_bytes(borrowed.data[..4].try_into().unwrap())
             };
-            let freed = self.freelist_head;
-            self.freelist_head = next;
-            self.freelist_count -= 1;
+            let freed = head;
+            self.freelist_head.store(next, Ordering::Release);
+            // Use fetch_sub to safely decrement without overflow.
+            self.freelist_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |x| if x > 0 { Some(x - 1) } else { None },
+            ).map_err(|_| Error::corruption("freelist underflow"))?;
 
-            // Clear the page before reuse
+            // Clear the page before reuse.
             {
                 let mut borrowed = page.lock();
                 borrowed.data.fill(0);
                 borrowed.dirty = true;
             }
-            // A page was dirtied (the recycled freelist page).
             self.note_write();
             Ok(freed)
         } else {
-            // Extend the file
-            let id = self.n_pages;
-            let mut page = Page::new(id, self.page_size);
+            // Extend the file.
+            let id = self.n_pages.fetch_add(1, Ordering::AcqRel);
+            let psz = self.page_size();
+            let mut page = Page::new(id, psz);
             page.dirty = true;
             let page_ref = Arc::new(Mutex::new(page));
-            self.maybe_evict();
-            self.cache.insert(id, page_ref);
-            self.lru.push_back(id);
-            self.n_pages += 1;
-            // A new page was created and marked dirty.
+            {
+                let mut cache = self.cache.write();
+                self.maybe_evict_locked(&mut cache);
+                cache.insert(id, page_ref);
+            }
+            self.lru.lock().push_back(id);
             self.note_write();
             Ok(id)
         }
@@ -346,85 +393,88 @@ impl Pager {
 
     /// Mark a page as freed (push it onto the freelist).
     /// The page is added to the head of the freelist.
-    pub fn free_page(&mut self, id: PageId) -> Result<()> {
+    pub fn free_page(&self, id: PageId) -> Result<()> {
         if id == 0 {
             return Err(Error::InvalidArgument("cannot free page 0".into()));
         }
         let page = self.get_page(id)?;
-        let mut borrowed = page.lock();
-        borrowed.data.fill(0);
-        // Write the previous freelist head into the first 4 bytes.
-        borrowed.data[..4].copy_from_slice(&self.freelist_head.to_le_bytes());
-        borrowed.dirty = true;
-        drop(borrowed);
-        self.freelist_head = id;
-        self.freelist_count += 1;
-        // The freed page is now dirty (we wrote the next-pointer into it).
+        let prev_head = self.freelist_head.load(Ordering::Acquire);
+        {
+            let mut borrowed = page.lock();
+            borrowed.data.fill(0);
+            borrowed.data[..4].copy_from_slice(&prev_head.to_le_bytes());
+            borrowed.dirty = true;
+        }
+        self.freelist_head.store(id, Ordering::Release);
+        self.freelist_count.fetch_add(1, Ordering::AcqRel);
         self.note_write();
         Ok(())
     }
 
     /// Flush all dirty pages to disk and sync.
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         // O(1) fast path: if no writes happened since the last flush, skip
-        // the entire flush (including sync_all). This makes `flush()` after
-        // a query-only workload a no-op, which matters when `Database::query`
-        // calls flush before reads in deferred_flush mode — without this,
-        // every SELECT would pay an fsync for no reason.
-        //
-        // The previous implementation did
-        //   `self.cache.values().any(|p| p.borrow().dirty)`
-        // here — an O(cache_size) scan on EVERY call. With a default cache
-        // of 2048 pages, that was ~5 µs of pure overhead per SELECT, which
-        // was the dominant cost in the 9.2× point-lookup gap vs SQLite.
-        if self.dirty_count_approx == 0 {
+        // the entire flush (including sync_all).
+        if self.dirty_count_approx.load(Ordering::Acquire) == 0 {
             return Ok(());
         }
+
+        let n_pages_val = self.n_pages.load(Ordering::Acquire);
+        let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
+        let freelist_count_val = self.freelist_count.load(Ordering::Acquire);
+        let schema_cookie_val = self.schema_cookie.load(Ordering::Acquire);
+
         // Update file header on page 0
-        if let Some(page0) = self.cache.get(&0) {
-            let mut borrowed = page0.lock();
-            FileHeader::write(
-                &mut borrowed.data,
-                self.page_size,
-                self.n_pages,
-                self.schema_cookie,
-            );
-            // Also persist freelist info
-            borrowed.data[20..24].copy_from_slice(&self.freelist_head.to_le_bytes());
-            borrowed.data[24..28].copy_from_slice(&self.freelist_count.to_le_bytes());
-            borrowed.dirty = true;
+        let page0_in_cache = self.cache.read().contains_key(&0);
+        let psz = self.page_size();
+        if page0_in_cache {
+            let page0 = self.cache.read().get(&0).cloned();
+            if let Some(page0) = page0 {
+                let mut borrowed = page0.lock();
+                FileHeader::write(
+                    &mut borrowed.data,
+                    psz,
+                    n_pages_val,
+                    schema_cookie_val,
+                );
+                borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
+                borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
+                borrowed.dirty = true;
+            }
         } else {
             // Page 0 not in cache — read, modify, write directly
-            let mut header = vec![0u8; self.page_size as usize];
-            self.file.seek(SeekFrom::Start(0))?;
-            self.file.read_exact(&mut header)?;
-            FileHeader::write(&mut header, self.page_size, self.n_pages, self.schema_cookie);
-            header[20..24].copy_from_slice(&self.freelist_head.to_le_bytes());
-            header[24..28].copy_from_slice(&self.freelist_count.to_le_bytes());
-            self.file.seek(SeekFrom::Start(0))?;
-            self.file.write_all(&header)?;
+            let mut header = vec![0u8; psz as usize];
+            self.read_file_at(0, &mut header)?;
+            FileHeader::write(&mut header, psz, n_pages_val, schema_cookie_val);
+            header[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
+            header[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
+            self.write_file_at(0, &header)?;
         }
 
-        // Flush dirty pages in cache
-        let dirty_ids: Vec<PageId> = self
-            .cache
-            .iter()
-            .filter(|(_, p)| p.lock().dirty)
-            .map(|(id, _)| *id)
-            .collect();
+        // Flush dirty pages in cache. Collect dirty IDs first (avoid holding
+        // the cache lock while doing disk I/O).
+        let dirty_ids: Vec<PageId> = {
+            let cache = self.cache.read();
+            cache
+                .iter()
+                .filter(|(_, p)| p.lock().dirty)
+                .map(|(id, _)| *id)
+                .collect()
+        };
 
         for id in dirty_ids {
-            let page = self.cache.get(&id).unwrap().clone();
-            let mut borrowed = page.lock();
-            let offset = id as u64 * self.page_size as u64;
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(&borrowed.data)?;
-            borrowed.dirty = false;
+            let page_ref = self.cache.read().get(&id).cloned();
+            if let Some(page_ref) = page_ref {
+                let mut borrowed = page_ref.lock();
+                if borrowed.dirty {
+                    let offset = id as u64 * psz as u64;
+                    self.write_file_at(offset, &borrowed.data)?;
+                    borrowed.dirty = false;
+                }
+            }
         }
         self.file.sync_all()?;
-        // All dirty pages have been written and their dirty flags cleared.
-        // Reset the upper-bound counter so the next flush() can fast-path.
-        self.dirty_count_approx = 0;
+        self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -435,35 +485,29 @@ impl Pager {
     /// guard), restores the pager's mutable metadata to the pre-BEGIN values,
     /// and truncates the file back to `n_pages` if the transaction allocated
     /// new pages.
-    pub fn rollback_to(&mut self, snap: &PagerSnapshot) -> Result<()> {
-        // 1. Drop the entire cache — every cached page may have been modified
-        //    during the transaction, and we have no per-page dirty tracking.
-        //    Next reads will repopulate the cache from disk, which still
-        //    holds the pre-BEGIN state (because no flush occurred during txn).
-        self.cache.clear();
-        self.lru.clear();
+    pub fn rollback_to(&self, snap: &PagerSnapshot) -> Result<()> {
+        // 1. Drop the entire cache.
+        {
+            let mut cache = self.cache.write();
+            cache.clear();
+        }
+        self.lru.lock().clear();
 
         // 2. Restore mutable metadata.
-        self.n_pages = snap.n_pages;
-        self.freelist_head = snap.freelist_head;
-        self.freelist_count = snap.freelist_count;
-        self.schema_cookie = snap.schema_cookie;
+        self.n_pages.store(snap.n_pages, Ordering::Release);
+        self.freelist_head.store(snap.freelist_head, Ordering::Release);
+        self.freelist_count.store(snap.freelist_count, Ordering::Release);
+        self.schema_cookie.store(snap.schema_cookie, Ordering::Release);
 
         // 3. Truncate the file back if pages were allocated during the txn.
-        //    We don't strictly need to do this for correctness (the truncated
-        //    tail is now beyond n_pages and won't be read), but it keeps the
-        //    file size honest and prevents unbounded growth on repeated
-        //    begin/insert/rollback cycles.
-        let target_size = self.n_pages as u64 * self.page_size as u64;
+        let target_size = snap.n_pages as u64 * self.page_size() as u64;
         let current_size = self.file.metadata()?.len();
         if current_size > target_size {
             self.file.set_len(target_size)?;
         }
 
-        // 4. Reset the dirty counter — the cache is now empty, so no pages
-        //    are dirty. The next flush() will fast-path correctly.
-        self.dirty_count_approx = 0;
-
+        // 4. Reset the dirty counter.
+        self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -473,57 +517,95 @@ impl Pager {
     }
 
     /// Evict pages from the cache until we're under capacity.
-    fn maybe_evict(&mut self) {
-        while self.cache.len() >= self.cache_capacity {
-            // Find the least-recently-used page that is not dirty.
-            let evict_id = match self.lru.front().copied() {
-                Some(id) => id,
-                None => break,
+    /// Caller must hold the cache write lock.
+    fn maybe_evict_locked(&self, cache: &mut HashMap<PageId, PageRef>) {
+        while cache.len() >= self.cache_capacity {
+            let evict_id = {
+                let mut lru = self.lru.lock();
+                match lru.front().copied() {
+                    Some(id) => {
+                        lru.pop_front();
+                        id
+                    }
+                    None => break,
+                }
             };
-            let should_evict = match self.cache.get(&evict_id) {
+            let should_evict = match cache.get(&evict_id) {
                 Some(p) => !p.lock().dirty,
                 None => true,
             };
             if should_evict {
-                self.lru.pop_front();
-                self.cache.remove(&evict_id);
+                cache.remove(&evict_id);
             } else {
                 // Move dirty page to the back and try the next one.
-                self.lru.pop_front();
-                self.lru.push_back(evict_id);
+                self.lru.lock().push_back(evict_id);
             }
         }
     }
 
-    fn touch_lru(&mut self, id: PageId) {
-        if let Some(pos) = self.lru.iter().position(|x| *x == id) {
-            self.lru.remove(pos);
-            self.lru.push_back(id);
+    #[allow(dead_code)]
+    fn touch_lru(&self, id: PageId) {
+        let mut lru = self.lru.lock();
+        if let Some(pos) = lru.iter().position(|x| *x == id) {
+            lru.remove(pos);
+            lru.push_back(id);
         }
     }
 
     /// Total bytes used by the cache (for instrumentation).
     pub fn cache_bytes(&self) -> usize {
-        self.cache.len() * self.page_size as usize
+        self.cache.read().len() * self.page_size() as usize
     }
 
     pub fn cache_size(&self) -> usize {
-        self.cache.len()
+        self.cache.read().len()
     }
 
     pub fn cache_capacity(&self) -> usize {
         self.cache_capacity
     }
 
-    /// Count the number of dirty pages currently in the cache. Used by
-    /// `Database::execute` to decide whether to force a deferred flush
-    /// when `deferred_flush` mode is enabled.
-    ///
-    /// O(1): returns the upper-bound counter maintained by `note_write()`.
-    /// The actual dirty page count is at most this value (it can be less
-    /// if the same page was dirtied multiple times, but never more).
-    pub fn dirty_page_count(&self) -> usize {
-        self.dirty_count_approx
+    // ----- File I/O helpers: positioned I/O so multiple threads can
+    //       read/write without serializing on the file offset. -----
+
+    #[cfg(unix)]
+    fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        use std::os::unix::fs::FileExt;
+        Ok(self.file.read_at(buf, offset)?)
+    }
+
+    #[cfg(unix)]
+    fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(buf, offset)?;
+        Ok(())
+    }
+
+    // Non-unix fallback: serialize through seek+read/write.
+    #[cfg(not(unix))]
+    fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(file.read(buf)?)
+    }
+
+    #[cfg(not(unix))]
+    fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(buf)?;
+        Ok(())
+    }
+}
+
+/// Trait helper to convert `AsRef<Path>` to `PathBuf` without naming the
+/// `path` parameter `path` (which would shadow the field `path`).
+trait PathExt {
+    fn ref_to_path(&self) -> PathBuf;
+}
+impl<P: AsRef<Path>> PathExt for P {
+    fn ref_to_path(&self) -> PathBuf {
+        self.as_ref().to_path_buf()
     }
 }
 
@@ -544,7 +626,7 @@ mod tests {
     fn allocate_and_flush() {
         let tmp = NamedTempFile::new().unwrap();
         {
-            let mut pager = Pager::open(tmp.path(), 64).unwrap();
+            let pager = Pager::open(tmp.path(), 64).unwrap();
             let id = pager.allocate_page().unwrap();
             assert_eq!(id, 1);
             let page = pager.get_page(id).unwrap();
@@ -553,10 +635,11 @@ mod tests {
                 p.data[0] = 42;
                 p.mark_dirty();
             }
+            pager.note_write();
             pager.flush().unwrap();
         }
         // Reopen and verify
-        let mut pager = Pager::open(tmp.path(), 64).unwrap();
+        let pager = Pager::open(tmp.path(), 64).unwrap();
         assert_eq!(pager.n_pages(), 2);
         let page = pager.get_page(1).unwrap();
         assert_eq!(page.lock().data[0], 42);
@@ -565,7 +648,7 @@ mod tests {
     #[test]
     fn freelist_recycles_pages() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pager = Pager::open(tmp.path(), 64).unwrap();
+        let pager = Pager::open(tmp.path(), 64).unwrap();
         let p1 = pager.allocate_page().unwrap();
         let p2 = pager.allocate_page().unwrap();
         let p3 = pager.allocate_page().unwrap();
@@ -573,5 +656,39 @@ mod tests {
         pager.free_page(p2).unwrap();
         let reused = pager.allocate_page().unwrap();
         assert_eq!(reused, p2);
+    }
+
+    /// Concurrent reads should not deadlock and should see consistent data.
+    #[test]
+    fn concurrent_get_page_is_safe() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pager = Arc::new(Pager::open(tmp.path(), 128).unwrap());
+        // Allocate some pages
+        let ids: Vec<u32> = (0..8).map(|_| pager.allocate_page().unwrap()).collect();
+        for &id in &ids {
+            let page = pager.get_page(id).unwrap();
+            let mut p = page.lock();
+            p.data[0] = (id % 256) as u8;
+            p.dirty = true;
+        }
+        pager.note_write();
+        pager.flush().unwrap();
+
+        let pager = Arc::new(Pager::open(tmp.path(), 128).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let pager = Arc::clone(&pager);
+            let ids = ids.clone();
+            handles.push(std::thread::spawn(move || {
+                for &id in &ids {
+                    let page = pager.get_page(id).unwrap();
+                    let p = page.lock();
+                    assert_eq!(p.data[0], (id % 256) as u8);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

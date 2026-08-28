@@ -4,7 +4,7 @@
 //! names). We use a recursive evaluator (collect-all model) rather than the
 //! Volcano iterator model: this is simpler to reason about with Rust's borrow
 //! checker and avoids the lifetime gymnastics that streaming iterators would
-//! require when the same `&mut Pager` is shared between operators.
+//! require when the same `&Pager` is shared between operators.
 //!
 //! For large result sets, the executor materializes everything in memory. A
 //! production engine would use a pull-based streaming model with `Rc<RefCell<>>`
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 /// Shared execution state.
 pub struct ExecContext<'a> {
-    pub pager: &'a mut Pager,
+    pub pager: &'a Pager,
     /// Positional bound parameters (`?` placeholders), indexed 0..N.
     /// Pushed by `bind_positional`. This is the common case — virtually
     /// all real-world queries use `?` placeholders.
@@ -70,7 +70,7 @@ pub struct ExecContext<'a> {
 }
 
 impl<'a> ExecContext<'a> {
-    pub fn new(pager: &'a mut Pager, catalog: *const crate::schema::Catalog) -> Self {
+    pub fn new(pager: &'a Pager, catalog: *const crate::schema::Catalog) -> Self {
         Self {
             pager,
             params: Vec::new(),
@@ -1663,14 +1663,14 @@ fn encode_index_key(index: &crate::schema::Index, table: &Table, row: &[Value]) 
 }
 
 /// Insert an entry into an index for a given row.
-fn insert_index_entry(pager: &mut Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
+fn insert_index_entry(pager: &Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
     let key_bytes = encode_index_key(index, table, row);
     let mut bt = Btree::new(pager, index.root_page, true);
     bt.insert_index(&key_bytes, rowid)
 }
 
 /// Delete an entry from an index for a given row.
-fn delete_index_entry(pager: &mut Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
+fn delete_index_entry(pager: &Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
     let _ = row;
     let _ = table;
     let mut bt = Btree::new(pager, index.root_page, true);
@@ -1683,7 +1683,7 @@ fn delete_index_entry(pager: &mut Pager, index: &crate::schema::Index, table: &T
 // because they use the catalog's root_page (which may be stale after splits
 // within the same statement — a known limitation to fix later).
 
-fn find_max_rowid(pager: &mut Pager, root: u32) -> Result<i64> {
+fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
     let mut bt = Btree::new(pager, root, false);
     let mut max = 0i64;
     bt.scan_table(|rowid, _| {

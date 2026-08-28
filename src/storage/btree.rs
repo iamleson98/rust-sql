@@ -289,7 +289,7 @@ fn decode_rowid_only(buf: &[u8]) -> Option<(i64, usize)> {
 
 /// A B+tree over a pager. Trees are identified by their root page ID.
 pub struct Btree<'a> {
-    pub pager: &'a mut Pager,
+    pub pager: &'a Pager,
     pub root: PageId,
     pub is_index: bool,
 }
@@ -308,7 +308,7 @@ pub enum LookupResult {
 }
 
 impl<'a> Btree<'a> {
-    pub fn new(pager: &'a mut Pager, root: PageId, is_index: bool) -> Self {
+    pub fn new(pager: &'a Pager, root: PageId, is_index: bool) -> Self {
         Self {
             pager,
             root,
@@ -317,7 +317,7 @@ impl<'a> Btree<'a> {
     }
 
     /// Initialize a new B+tree (create the root page as an empty leaf).
-    pub fn create(pager: &'a mut Pager, is_index: bool) -> Result<Self> {
+    pub fn create(pager: &'a Pager, is_index: bool) -> Result<Self> {
         let root = pager.allocate_page()?;
         let page = pager.get_page(root)?;
         if is_index {

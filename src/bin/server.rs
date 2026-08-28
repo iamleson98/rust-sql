@@ -19,17 +19,21 @@
 //!
 //! The database is wrapped in `Arc<RwLock<Database>>`. The TCP accept loop
 //! is multi-threaded (N worker threads pull from the listener in parallel),
-//! and request parsing happens in parallel across cores. Read (`/query`)
-//! and write (`/execute`) handlers both currently take the WRITE lock
-//! because `Database::query` requires `&mut self` (it mutates the page
-//! cache on misses and the statement cache on first sight of a SQL string).
+//! and request parsing happens in parallel across cores.
 //!
-//! After the `PageRef` refactor from `Rc<RefCell<Page>>` to
-//! `Arc<parking_lot::Mutex<Page>>`, `Database` is now naturally `Send +
-//! Sync` — the `unsafe impl Send/Sync for State` is gone. This sets the
-//! stage for true concurrent reads: once `Database::query` is refactored
-//! to take `&self` (interior mutability on the pager cache and statement
-//! cache), read handlers can take the READ lock and run concurrently.
+//! **Reads (`/query`)** take a READ lock and call `Database::query_shared()`
+//! (a `&self` method). Multiple readers run concurrently — no writer-head
+//! contention, no serial lock across readers.
+//!
+//! **Writes (`/execute`)** take a WRITE lock and call `Database::execute()`
+//! (a `&mut self` method). Writers are serialized, but a writer doesn't
+//! block concurrent readers (it just queues for the next available write
+//! window — readers proceed).
+//!
+//! This is enabled by the interior-mutability refactor on `Pager` (cache is
+//! `RwLock<HashMap>`, page size / n_pages / freelist are `AtomicU32`, file
+//! I/O uses positioned `pread`/`pwrite` so threads don't share an offset)
+//! and on `Database` (`stmt_cache`/`root_overrides`/`max_rowids` are `RwLock`).
 //!
 //! ## Usage
 //!
@@ -43,10 +47,8 @@ use std::thread;
 use tiny_http::{Header, Method, Response, Server};
 
 struct State {
-    /// RwLock: write-locked for both reads and writes today, but the type
-    /// is already `RwLock` (not `Mutex`) so we can switch read handlers to
-    /// take the READ lock once `Database::query` becomes `&self`-friendly
-    /// via interior mutability on the pager and statement caches.
+    /// RwLock: read-locked for `/query` (concurrent reads), write-locked
+    /// for `/execute` (serialized writes).
     db: RwLock<Database>,
 }
 
@@ -176,9 +178,12 @@ fn handle_query(mut request: tiny_http::Request, state: &State) {
         }
     };
 
-    // Write lock today: Database::query takes &mut self (it mutates the
-    // cache on misses). Switch to read lock after refactoring query to &self.
-    let mut guard = state.db.write();
+    // READ lock — multiple readers can run concurrently. This is the key
+    // change that enables true concurrency: before the interior-mutability
+    // refactor on `Pager` and `Database`, we had to take the write lock
+    // here because `query()` required `&mut self`. Now `query_shared()`
+    // takes `&self` and uses interior mutability for cache fills.
+    let guard = state.db.read();
     match guard.query_with_columns(&parsed.sql, parsed.params) {
         Ok((cols, rows)) => {
             let json = format_query_result(&cols, &rows);

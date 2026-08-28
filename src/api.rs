@@ -21,8 +21,10 @@ use crate::storage::btree::Btree;
 use crate::storage::pager::Pager;
 use crate::storage::row_codec::{decode_row, encode_row};
 use crate::types::{Row, Value};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The maximum number of pages cached in memory.
@@ -33,19 +35,31 @@ const DEFAULT_CACHE_PAGES: usize = 2048;
 // const DEFAULT_PAGE_SIZE: u32 = 16384;
 
 /// A database. Owns the pager and catalog.
+///
+/// All mutable state is wrapped in interior-mutability primitives
+/// (`RwLock`/`Mutex`/`Atomic*`), so all public read methods take `&self`.
+/// This lets N reader threads share a single `&Database` via `Arc<RwLock<Database>>`
+/// and run queries concurrently. Writers take the outer write lock to get
+/// `&mut Database`, which serializes them — but reads proceed without
+/// blocking on the outer lock.
 pub struct Database {
     pager: Pager,
     catalog: Catalog,
     path: PathBuf,
-    in_transaction: bool,
+    /// Inside an explicit BEGIN..COMMIT/ROLLBACK transaction. Only mutated
+    /// by the writer (which holds `&mut self` via the outer write lock),
+    /// but wrapped for interior mutability so `&self` query paths can read it.
+    in_transaction: AtomicBool,
     /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager's
     /// state to the pre-transaction point.
-    txn_snapshot: Option<crate::storage::pager::PagerSnapshot>,
+    txn_snapshot: Mutex<Option<crate::storage::pager::PagerSnapshot>>,
     /// Root page overrides (table_name -> current root). Updated when B+tree
     /// splits change the root, since the catalog's Arc<Table> is immutable.
-    root_overrides: HashMap<String, u32>,
+    /// RwLock so reads can run concurrently; only writes (INSERT/UPDATE/DELETE
+    /// causing a root split) take the write lock.
+    root_overrides: RwLock<HashMap<String, u32>>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
-    max_rowids: HashMap<String, i64>,
+    max_rowids: RwLock<HashMap<String, i64>>,
     /// Prepared-statement cache: SQL text -> (Arc<Statement>, Option<Plan>).
     /// Eliminates the parse+plan cost on repeated calls with the same SQL
     /// (the common case in real workloads: `INSERT INTO t VALUES (?)` is
@@ -61,12 +75,16 @@ pub struct Database {
     /// allocations per call, contributing to the 9× point-lookup gap vs
     /// SQLite. The `Plan` is `Clone`-cheap because it only holds `Arc`
     /// references internally.
-    stmt_cache: HashMap<String, (std::sync::Arc<Statement>, Option<crate::planner::plan::Plan>)>,
+    ///
+    /// RwLock so concurrent readers can hit the cache simultaneously; only
+    /// a cache miss takes the brief write lock to insert.
+    stmt_cache: RwLock<HashMap<String, (Arc<Statement>, Option<crate::planner::plan::Plan>)>>,
     /// FIFO order of insertion into `stmt_cache`, used for eviction when the
     /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
     /// oldest entry and the next to be evicted.
-    stmt_cache_order: Vec<String>,
+    stmt_cache_order: Mutex<Vec<String>>,
     /// Maximum number of entries in the statement cache. Default 64.
+    /// Immutable after open (only set via `set_stmt_cache_capacity`).
     stmt_cache_capacity: usize,
     /// When true (default: false), the per-statement flush in exec_insert /
     /// exec_update / exec_delete is suppressed. Mirrors SQLite's
@@ -82,9 +100,10 @@ pub struct Database {
     /// per statement. The cost is reduced durability — unflushed writes can
     /// be lost on application crash (but not on transaction abort, since
     /// rollback uses the in-memory snapshot, not the on-disk state).
-    deferred_flush: bool,
+    deferred_flush: AtomicBool,
     /// Threshold for forcing a flush when `deferred_flush` is enabled.
     /// Default: 1000 dirty pages (~4 MB at 4 KiB page size).
+    /// Immutable after open.
     deferred_flush_threshold: usize,
 }
 
@@ -104,14 +123,14 @@ impl Database {
             pager,
             catalog,
             path,
-            in_transaction: false,
-            txn_snapshot: None,
-            root_overrides: HashMap::new(),
-            max_rowids: HashMap::new(),
-            stmt_cache: HashMap::new(),
-            stmt_cache_order: Vec::new(),
+            in_transaction: AtomicBool::new(false),
+            txn_snapshot: Mutex::new(None),
+            root_overrides: RwLock::new(HashMap::new()),
+            max_rowids: RwLock::new(HashMap::new()),
+            stmt_cache: RwLock::new(HashMap::new()),
+            stmt_cache_order: Mutex::new(Vec::new()),
             stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
-            deferred_flush: false,
+            deferred_flush: AtomicBool::new(false),
             deferred_flush_threshold: 1000,
         })
     }
@@ -133,9 +152,11 @@ impl Database {
     pub fn set_stmt_cache_capacity(&mut self, capacity: usize) {
         self.stmt_cache_capacity = capacity;
         // If shrinking, evict excess entries (FIFO).
-        while self.stmt_cache.len() > capacity && !self.stmt_cache_order.is_empty() {
-            let oldest = self.stmt_cache_order.remove(0);
-            self.stmt_cache.remove(&oldest);
+        let mut cache = self.stmt_cache.write();
+        let mut order = self.stmt_cache_order.lock();
+        while cache.len() > capacity && !order.is_empty() {
+            let oldest = order.remove(0);
+            cache.remove(&oldest);
         }
     }
 
@@ -154,7 +175,7 @@ impl Database {
     /// INSERT/UPDATE/DELETE in auto-commit mode). The trade-off is reduced
     /// durability: unflushed writes can be lost on application crash.
     pub fn set_deferred_flush(&mut self, enabled: bool) {
-        self.deferred_flush = enabled;
+        self.deferred_flush.store(enabled, Ordering::Release);
     }
 
     /// Set the dirty-page threshold at which a deferred-flush database
@@ -170,6 +191,12 @@ impl Database {
         self.pager.flush()
     }
 
+    /// Flush from a `&self` reference — used by concurrent readers when they
+    /// need to see unflushed writes. Uses the pager's interior mutability.
+    pub fn flush_shared(&self) -> Result<()> {
+        self.pager.flush()
+    }
+
     /// Look up the statement cache; on miss, parse + plan, store, and return.
     /// Returns `(Arc<Statement>, Option<Plan>)` so the caller can:
     /// - For SELECT (query path): use just the Plan (cheap Arc clone).
@@ -182,33 +209,41 @@ impl Database {
     /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
     /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
     /// don't conflict.
-    fn get_or_cache_stmt(&mut self, sql: &str) -> Result<(std::sync::Arc<Statement>, Option<crate::planner::plan::Plan>)> {
+    fn get_or_cache_stmt(&self, sql: &str) -> Result<(std::sync::Arc<Statement>, Option<crate::planner::plan::Plan>)> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let stmt = parse(sql)?;
             let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
             return Ok((std::sync::Arc::new(stmt), plan_opt));
         }
-        if let Some((stmt, plan_opt)) = self.stmt_cache.get(sql) {
-            // Cache hit: clone the Arc (atomic refcount inc, ~1 ns) and the
-            // Plan (Arc-only clone, ~10 ns). Previously this was a deep
-            // clone of the entire Statement AST (Strings, Vecs, nested Exprs
-            // — 10-50 allocations, ~500 ns each).
-            return Ok((stmt.clone(), plan_opt.clone()));
+        // Fast path: read lock — concurrent readers can hit the cache
+        // simultaneously without serializing.
+        {
+            let cache = self.stmt_cache.read();
+            if let Some((stmt, plan_opt)) = cache.get(sql) {
+                return Ok((stmt.clone(), plan_opt.clone()));
+            }
         }
-        // Miss: parse + plan.
+        // Miss: parse + plan + insert. Take the write lock to insert,
+        // double-check in case another thread inserted while we waited.
         let stmt = parse(sql)?;
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
+        let mut cache = self.stmt_cache.write();
+        // Double-check: another thread may have inserted while we waited.
+        if let Some((s, p)) = cache.get(sql) {
+            return Ok((s.clone(), p.clone()));
+        }
         // Evict FIFO if at capacity.
-        if self.stmt_cache.len() >= self.stmt_cache_capacity {
-            if let Some(oldest) = self.stmt_cache_order.first().cloned() {
-                self.stmt_cache.remove(&oldest);
-                self.stmt_cache_order.remove(0);
+        if cache.len() >= self.stmt_cache_capacity {
+            let mut order = self.stmt_cache_order.lock();
+            if let Some(oldest) = order.first().cloned() {
+                cache.remove(&oldest);
+                order.remove(0);
             }
         }
         let stmt_arc = std::sync::Arc::new(stmt);
-        self.stmt_cache.insert(sql.to_string(), (stmt_arc.clone(), plan_opt.clone()));
-        self.stmt_cache_order.push(sql.to_string());
+        cache.insert(sql.to_string(), (stmt_arc.clone(), plan_opt.clone()));
+        self.stmt_cache_order.lock().push(sql.to_string());
         Ok((stmt_arc, plan_opt))
     }
 
@@ -216,12 +251,17 @@ impl Database {
     /// (CREATE/DROP TABLE/INDEX/VIEW/TRIGGER) because the cached Plans hold
     /// `Arc<Table>` / `Arc<Index>` references that become stale when the
     /// schema changes.
-    fn invalidate_stmt_cache(&mut self) {
-        self.stmt_cache.clear();
-        self.stmt_cache_order.clear();
+    fn invalidate_stmt_cache(&self) {
+        self.stmt_cache.write().clear();
+        self.stmt_cache_order.lock().clear();
     }
 
     /// Execute a statement that does not return rows (INSERT/UPDATE/DELETE/CREATE/...).
+    ///
+    /// Takes `&mut self` because the outer `RwLock<Database>` write lock
+    /// must be held to ensure single-writer semantics — but the actual state
+    /// mutations go through interior mutability so the body could in principle
+    /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         let is_ddl = is_ddl_sql(sql);
         let (stmt, _plan_opt) = self.get_or_cache_stmt(sql)?;
@@ -229,31 +269,34 @@ impl Database {
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &stmt;
         let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
-        let in_txn = self.in_transaction;
-        let txn_snap = self.txn_snapshot.take();
-        let deferred_flush = self.deferred_flush;
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot.lock().take();
+        let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
         let deferred_flush_threshold = self.deferred_flush_threshold;
-        let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
+        // Move root_overrides/max_rowids out of the RwLock into a local; we'll
+        // write them back after the statement completes. The write lock on the
+        // outer `RwLock<Database>` (held by the caller's `execute(&mut self)`)
+        // guarantees exclusive access, so we can safely move.
+        let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
         ctx.txn_snapshot = txn_snap;
-        ctx.root_overrides = std::mem::take(&mut self.root_overrides);
-        ctx.max_rowids = std::mem::take(&mut self.max_rowids);
+        ctx.root_overrides = std::mem::take(&mut *self.root_overrides.write());
+        ctx.max_rowids = std::mem::take(&mut *self.max_rowids.write());
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
         let result = Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql);
-        self.in_transaction = ctx.in_transaction;
-        self.txn_snapshot = ctx.txn_snapshot;
-        self.root_overrides = std::mem::take(&mut ctx.root_overrides);
-        self.max_rowids = std::mem::take(&mut ctx.max_rowids);
+        self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+        *self.txn_snapshot.lock() = ctx.txn_snapshot;
+        *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
+        *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
         if result.is_ok() && is_ddl {
             self.invalidate_stmt_cache();
         }
         // If deferred_flush is enabled, force a flush when the dirty-page
-        // count exceeds the threshold. This bounds the in-memory footprint
-        // and prevents unbounded growth on long write bursts.
+        // count exceeds the threshold.
         if result.is_ok() && deferred_flush {
             let dirty = self.pager.dirty_page_count();
             if dirty >= deferred_flush_threshold {
@@ -264,67 +307,73 @@ impl Database {
     }
 
     /// Execute a query and return all rows.
-    pub fn query<P: Params>(&mut self, sql: &str, params: P) -> Result<Vec<Row>> {
+    ///
+    /// Takes `&self` — concurrent readers can call this simultaneously when
+    /// the outer `Arc<RwLock<Database>>` is held with a read lock. All mutations
+    /// required (cache miss insert, page cache fill on miss) go through
+    /// interior mutability on `stmt_cache` and `pager`.
+    ///
+    /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
+    /// the duration of the query — a SELECT never writes them back.
+    pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
         // In deferred_flush mode, a SELECT must see all writes that
-        // happened since the last flush. But only flush if writes actually
-        // happened — `has_dirty_pages()` is O(1) (maintained by
-        // `Pager::note_write()` on every mutating Btree/Pager op). The
-        // previous implementation called `flush()` unconditionally, which
-        // did an O(cache_size) scan to check for dirty pages. That scan
-        // was the dominant cost in the 9.2× point-lookup gap vs SQLite.
-        if self.deferred_flush && self.pager.has_dirty_pages() {
+        // happened since the last flush.
+        if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
         let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
         if let Some(plan) = plan_opt {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
-            let in_txn = self.in_transaction;
-            let txn_snap = self.txn_snapshot.take();
-            let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
+            let in_txn = self.in_transaction.load(Ordering::Acquire);
+            let txn_snap = self.txn_snapshot.lock().clone();
+            let root_overrides = self.root_overrides.read().clone();
+            let max_rowids = self.max_rowids.read().clone();
+            let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
-            ctx.deferred_flush = self.deferred_flush;
+            ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
             ctx.txn_snapshot = txn_snap;
-            // See comment in `query` — move (not clone) these.
-            ctx.root_overrides = std::mem::take(&mut self.root_overrides);
-            ctx.max_rowids = std::mem::take(&mut self.max_rowids);
+            ctx.root_overrides = root_overrides;
+            ctx.max_rowids = max_rowids;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
             let res = execute(&plan, &mut ctx)?;
-            self.txn_snapshot = ctx.txn_snapshot;
-            self.root_overrides = std::mem::take(&mut ctx.root_overrides);
-            self.max_rowids = std::mem::take(&mut ctx.max_rowids);
+            // For SELECT, root_overrides/max_rowids don't change. Don't write back.
             Ok(res.rows)
         } else {
             Ok(Vec::new())
         }
     }
 
+    /// Alias for `query()` — for use when callers want to emphasize that
+    /// they're sharing a `&Database` reference across threads.
+    pub fn query_shared<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
+        self.query(sql, params)
+    }
+
     /// Execute a query and return (column_names, rows).
-    pub fn query_with_columns<P: Params>(&mut self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)> {
-        // Same flush-before-read as `query` — but skip when no writes
-        // happened since the last flush. See `query` for the rationale.
-        if self.deferred_flush && self.pager.has_dirty_pages() {
+    ///
+    /// Takes `&self` — concurrent readers can call this simultaneously.
+    pub fn query_with_columns<P: Params>(&self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)> {
+        if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
         let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
         if let Some(plan) = plan_opt {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
-            let in_txn = self.in_transaction;
-            let txn_snap = self.txn_snapshot.take();
-            let mut ctx = ExecContext::new(&mut self.pager, catalog_ptr);
+            let in_txn = self.in_transaction.load(Ordering::Acquire);
+            let txn_snap = self.txn_snapshot.lock().clone();
+            let root_overrides = self.root_overrides.read().clone();
+            let max_rowids = self.max_rowids.read().clone();
+            let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
-            // See comment in `query` — move (not clone) these.
-            ctx.root_overrides = std::mem::take(&mut self.root_overrides);
-            ctx.max_rowids = std::mem::take(&mut self.max_rowids);
+            ctx.root_overrides = root_overrides;
+            ctx.max_rowids = max_rowids;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
             let res = execute(&plan, &mut ctx)?;
-            self.txn_snapshot = ctx.txn_snapshot;
-            self.root_overrides = std::mem::take(&mut ctx.root_overrides);
-            self.max_rowids = std::mem::take(&mut ctx.max_rowids);
             Ok((res.columns, res.rows))
         } else {
             Ok((Vec::new(), Vec::new()))
@@ -684,7 +733,7 @@ impl Database {
 }
 
 /// Insert a row into the schema table (rooted at page 0).
-fn insert_schema_row(pager: &mut Pager, row: &[Value]) -> Result<()> {
+fn insert_schema_row(pager: &Pager, row: &[Value]) -> Result<()> {
     // Find max rowid in the schema table.
     let mut max_rowid = 0i64;
     let mut bt = Btree::new(pager, 0, false);
@@ -702,7 +751,7 @@ fn insert_schema_row(pager: &mut Pager, row: &[Value]) -> Result<()> {
 }
 
 /// Delete a schema row by (kind, name).
-fn delete_schema_row(pager: &mut Pager, kind: &str, name: &str) -> Result<()> {
+fn delete_schema_row(pager: &Pager, kind: &str, name: &str) -> Result<()> {
     let mut bt = Btree::new(pager, 0, false);
     let mut to_delete = Vec::new();
     bt.scan_table(|rowid, payload| {
@@ -722,7 +771,7 @@ fn delete_schema_row(pager: &mut Pager, kind: &str, name: &str) -> Result<()> {
 }
 
 /// Load the schema from the schema table (page 0) into the catalog.
-fn load_schema(pager: &mut Pager, catalog: &mut Catalog) -> Result<()> {
+fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     let mut bt = Btree::new(pager, 0, false);
     let mut entries = Vec::new();
     bt.scan_table(|_rowid, payload| {
