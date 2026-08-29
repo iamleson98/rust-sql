@@ -1616,7 +1616,7 @@ impl Database {
         }
     }
 
-    fn plan_insert(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
+    pub(crate) fn plan_insert(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
         let ins = match stmt {
             Statement::Insert(i) => i,
             _ => unreachable!(),
@@ -1657,7 +1657,7 @@ impl Database {
         })
     }
 
-    fn plan_update(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
+    pub(crate) fn plan_update(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
         let upd = match stmt {
             Statement::Update(u) => u,
             _ => unreachable!(),
@@ -1690,7 +1690,7 @@ impl Database {
         })
     }
 
-    fn plan_delete(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
+    pub(crate) fn plan_delete(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
         let del = match stmt {
             Statement::Delete(d) => d,
             _ => unreachable!(),

@@ -13,6 +13,7 @@
 
 pub mod datetime;
 pub mod expr;
+pub(crate) mod triggers;
 pub(crate) mod predicate;
 
 pub use expr::{apply_binary, evaluate, EvalContext};
@@ -118,6 +119,8 @@ pub struct ExecContext<'a> {
     /// subquery planning (exec_select_statement) so `IN (SELECT .. FROM cte)`
     /// inside a WITH statement resolves the CTE.
     pub ctes: Option<HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>>,
+    /// Current trigger-firing depth (guards runaway recursion).
+    pub trigger_depth: u32,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -144,6 +147,7 @@ impl<'a> ExecContext<'a> {
             index_roots_changed: false,
             table_append_hint: None,
             ctes: None,
+            trigger_depth: 0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -179,6 +183,7 @@ impl<'a> ExecContext<'a> {
             index_roots_changed: false,
             table_append_hint: None,
             ctes: None,
+            trigger_depth: 0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -4424,10 +4429,26 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             // only consulted for CHECK expressions (empty when absent).
             enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
 
+            // BEFORE INSERT triggers (NEW = the row about to be inserted,
+            // rowid assigned + constraints enforced). An error aborts the
+            // statement before the row is written.
+            if crate::executor::triggers::has_triggers_for(ctx, &table, &crate::sql::ast::TriggerEvent::Insert) {
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    &table,
+                    &crate::sql::ast::TriggerEvent::Insert,
+                    crate::sql::ast::TriggerWhen::Before,
+                    Some(&full_row),
+                    None,
+                    &table.col_names,
+                )?;
+            }
+
             let outcome = exec_insert_one_row(
                 ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
                 &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert, rowid_autogen,
             )?;
+            let trigger_fired = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
             match outcome {
                 InsertOutcome::Inserted => {
                     inserted += 1;
@@ -4442,6 +4463,21 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
                     }
                 }
                 InsertOutcome::Skipped => {}
+            }
+            // AFTER INSERT triggers (skip the catalog lookup entirely when
+            // the table has none).
+            if trigger_fired
+                && crate::executor::triggers::has_triggers_for(ctx, &table, &crate::sql::ast::TriggerEvent::Insert)
+            {
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    &table,
+                    &crate::sql::ast::TriggerEvent::Insert,
+                    crate::sql::ast::TriggerWhen::After,
+                    Some(&full_row),
+                    None,
+                    &table.col_names,
+                )?;
             }
         }
         // Write back any index-root moves (splits) to the context so the
@@ -4664,6 +4700,19 @@ pub fn fast_insert_literal_rows(
 
         enforce_row_constraints(table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
 
+        // BEFORE INSERT triggers.
+        if crate::executor::triggers::has_triggers_for(ctx, table, &crate::sql::ast::TriggerEvent::Insert) {
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Insert,
+                crate::sql::ast::TriggerWhen::Before,
+                Some(&full_row),
+                None,
+                &table.col_names,
+            )?;
+        }
+
         let outcome = exec_insert_one_row(
             ctx,
             table,
@@ -4677,8 +4726,23 @@ pub fn fast_insert_literal_rows(
             None,
             rowid_autogen,
         )?;
-        if matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting) {
+        let ok = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
+        if ok {
             inserted += 1;
+        }
+        // AFTER INSERT triggers.
+        if ok
+            && crate::executor::triggers::has_triggers_for(ctx, table, &crate::sql::ast::TriggerEvent::Insert)
+        {
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Insert,
+                crate::sql::ast::TriggerWhen::After,
+                Some(&full_row),
+                None,
+                &table.col_names,
+            )?;
         }
     }
 
@@ -5449,7 +5513,14 @@ fn try_streaming_update(
             })
         }).collect()
     };
-    let needs_old_payload = !touched_indexes.is_empty();
+    // AFTER UPDATE triggers need the OLD row too — stash old payloads
+    // whenever triggers exist, not just for index maintenance.
+    let has_update_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        table,
+        &crate::sql::ast::TriggerEvent::Update(vec![]),
+    );
+    let needs_old_payload = !touched_indexes.is_empty() || has_update_triggers;
 
     // Collect (rowid, new_payload_bytes, old_payload_bytes) tuples for the
     // update phase. We can't update inside the scan callback because the
@@ -5647,10 +5718,12 @@ fn try_streaming_update(
     order.sort_unstable_by_key(|&i| updates[i].0);
     let mut deferred: Vec<usize> = Vec::new();
     let mut root = root;
+    // Triggers force the per-row path: bulk-applied rows skip AFTER UPDATE
+    // trigger firing.
     // Bulk in-place pass ONLY when no indexed column is being SET —
     // bulk-applied rows skip the per-row index maintenance, so any
     // touched index forces the per-row path (defer everything).
-    if touched_indexes.is_empty() {
+    if touched_indexes.is_empty() && !has_update_triggers {
         let sorted_updates: Vec<(i64, &[u8])> =
             order.iter().map(|&i| (updates[i].0, updates[i].1.as_slice())).collect();
         let mut bt = Btree::new(ctx.pager, root, false);
@@ -5684,6 +5757,31 @@ fn try_streaming_update(
             new_root = bt.root;
         }
         ctx.set_table_root(&table.name, new_root);
+        // AFTER UPDATE triggers: NEW = the post-change row, OLD = the
+        // pre-change row (decoded from the stash when present; otherwise
+        // we can't reconstruct it — triggers on indexed-SET updates always
+        // have the stash since needs_old_payload is true for them).
+        if has_update_triggers {
+            let old_row_v: Option<Vec<Value>> = old_payload_opt.and_then(|op| {
+                decode_row(op, n_cols, *rowid, table.rowid_alias).ok()
+            });
+            let new_row_v = decode_row(new_payload, n_cols, *rowid, table.rowid_alias).ok();
+            if let (Some(old_r), Some(new_r)) = (old_row_v, new_row_v) {
+                let changed_cols: Vec<String> = assignments
+                    .iter()
+                    .map(|(idx, _)| table.columns[*idx].name.clone())
+                    .collect();
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    &table,
+                    &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                    crate::sql::ast::TriggerWhen::After,
+                    Some(&new_r),
+                    Some(&old_r),
+                    &table.col_names,
+                )?;
+            }
+        }
         // Index maintenance — only on indexes whose key actually changed.
         // The old/new keys are computed HERE and handed straight to the
         // B+tree (the previous code called delete_index_entry /
@@ -5855,14 +5953,38 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
             if let Some(payload) = old_payload {
                 deleted = 1;
                 ctx.changes += 1;
-                if !indexes.is_empty() || returning.is_some() {
-                    // Decode the old row only for index keys / RETURNING.
+                let need_row = !indexes.is_empty()
+                    || returning.is_some()
+                    || crate::executor::triggers::has_triggers_for(
+                        ctx,
+                        &table,
+                        &crate::sql::ast::TriggerEvent::Delete,
+                    );
+                if need_row {
+                    // Decode the old row only for index keys / RETURNING /
+                    // triggers.
                     let row = decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias)?;
                     if let (Some(ret), Some(names)) = (returning, col_names_fast.as_deref()) {
                         returning_rows.push(project_returning_row(ret, &row, names, &ctx.params, &ctx.named_params)?);
                     }
                     for idx in &indexes {
                         delete_index_entry(ctx, idx, &table, &row, rowid_val)?;
+                    }
+                    // AFTER DELETE triggers.
+                    if crate::executor::triggers::has_triggers_for(
+                        ctx,
+                        &table,
+                        &crate::sql::ast::TriggerEvent::Delete,
+                    ) {
+                        crate::executor::triggers::fire_triggers(
+                            ctx,
+                            &table,
+                            &crate::sql::ast::TriggerEvent::Delete,
+                            crate::sql::ast::TriggerWhen::After,
+                            None,
+                            Some(&row),
+                            &table.col_names,
+                        )?;
                     }
                 }
                 // Keep the cached max-rowid consistent (see below).
@@ -5921,6 +6043,22 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         }
         ctx.changes += 1;
         deleted += 1;
+        // AFTER DELETE triggers.
+        if crate::executor::triggers::has_triggers_for(
+            ctx,
+            &table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        ) {
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                &table,
+                &crate::sql::ast::TriggerEvent::Delete,
+                crate::sql::ast::TriggerWhen::After,
+                None,
+                Some(row),
+                &table.col_names,
+            )?;
+        }
     }
     // Keep the cached max-rowid consistent: if we deleted the current max
     // rowid, the cached value is stale. Invalidate it — the next INSERT

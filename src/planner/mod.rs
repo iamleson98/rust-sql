@@ -337,6 +337,46 @@ impl<'a> Planner<'a> {
                         return Ok(Plan::CteRows { rows: rows.clone(), columns: ql });
                     }
                 }
+                // VIEW reference: expand to the view's SELECT (recursively —
+                // views may reference other views). The statement cache is
+                // invalidated on CREATE/DROP VIEW, so plans never hold a
+                // stale view definition.
+                if indexed.is_none() {
+                    if let Some(view) = self.catalog.get_view(name) {
+                        let inner = self.plan_select(&view.select)?;
+                        // Optional column rename (CREATE VIEW v(a, b) AS
+                        // ...): wrap in a Project aliasing the view select's
+                        // top-level output columns positionally.
+                        let plan = match (&view.columns, top_level_output_names(&view.select)) {
+                            (Some(renames), Some(inner_names))
+                                if renames.len() == inner_names.len() =>
+                            {
+                                let prefix = alias.clone().unwrap_or_else(|| name.clone());
+                                let cols: Vec<crate::planner::plan::ProjectExpr> = renames
+                                    .iter()
+                                    .zip(inner_names.iter())
+                                    .map(|(new, old)| crate::planner::plan::ProjectExpr {
+                                        expr: Expr::Column { table: None, name: old.clone() },
+                                        alias: Some(format!("{}.{}", prefix, new)),
+                                    })
+                                    .collect();
+                                Plan::Project {
+                                    input: Box::new(Plan::Subquery { plan: Box::new(inner) }),
+                                    columns: cols,
+                                }
+                            }
+                            (Some(renames), _) => {
+                                return Err(Error::semantic(format!(
+                                    "view {} declares {} columns but its SELECT is too complex to rename (use explicit column aliases)",
+                                    name,
+                                    renames.len()
+                                )));
+                            }
+                            _ => Plan::Subquery { plan: Box::new(inner) },
+                        };
+                        return Ok(plan);
+                    }
+                }
                 let table = self.catalog.get_table(name).ok_or_else(|| {
                     Error::NotFound(format!("table: {}", name))
                 })?;
@@ -1378,6 +1418,34 @@ fn conjunct_bound_by(conjunct: &Expr, cols: &[(Option<String>, String)]) -> bool
 /// 312x regression on the 2-table-join benchmark came from hashing all 10k
 /// orders + probing with all 1k users, when the WHERE actually filtered
 /// the left side to a single user.
+/// Output column names of a SELECT's top level, when statically known:
+/// explicit aliases or bare column references. `None` when any output is a
+/// `*` or a complex expression without an alias (renaming then requires
+/// execution).
+pub fn top_level_output_names(sel: &SelectStatement) -> Option<Vec<String>> {
+    match &sel.body {
+        SelectBody::Simple(s) => {
+            let mut names = Vec::with_capacity(s.columns.len());
+            for c in &s.columns {
+                match c {
+                    crate::sql::ast::ResultColumn::Expr { expr, alias } => {
+                        if let Some(a) = alias {
+                            names.push(a.clone());
+                        } else if let Expr::Column { name, .. } = expr {
+                            names.push(name.clone());
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None, // Star / TableStar
+                }
+            }
+            Some(names)
+        }
+        _ => None, // compound selects: defer to execution-time names
+    }
+}
+
 pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
     let conjuncts = split_and_chain(predicate);
 
