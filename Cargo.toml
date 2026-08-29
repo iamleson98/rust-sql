@@ -39,6 +39,12 @@ tempfile = "3"
 # Used by Pager cache (Arc<Mutex<Page>>) so Database becomes Send+Sync,
 # enabling true concurrent reads via Arc<RwLock<Database>>.
 parking_lot = "0.12"
+# Fast general-purpose allocator. The engine is allocation-intensive on hot
+# paths (row Vecs, statement ASTs, key buffers); mimalloc's thread-local
+# heaps cut small-allocation cost by 20-40% vs the system malloc, which
+# shows up directly in scan/insert/join throughput. Optional — opt out
+# with `default-features = false`.
+mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -47,7 +53,9 @@ tempfile = "3"
 rand = "0.8"
 
 [features]
-default = []
+default = ["mimalloc"]
+# Fast global allocator (see the mimalloc dependency note above).
+mimalloc = ["dep:mimalloc"]
 # Disable to remove rustyline (smaller binary)
 no-cli-readline = []
 

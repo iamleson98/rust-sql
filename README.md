@@ -85,8 +85,23 @@ The engine is structured in five layers, each with a clear contract:
 
 ## Performance
 
-Benchmarks vs SQLite (rusqlite with bundled SQLite), in-memory database,
-steady-state (statements warm). Full harness: `cargo run --release --example bench_compare`.
+Head-to-head vs SQLite (rusqlite with bundled SQLite), in-memory database,
+criterion harness (`cargo bench --bench sqlite_comparison`), measured
+2026-08-29 after the statement-pipeline sprint:
+
+| Workload                           | rustqlite | SQLite  | Ratio           |
+|------------------------------------|-----------|---------|-----------------|
+| INSERT auto-commit (1k, unique SQL)| **940 µs**| 1.60 ms | **1.7x faster** |
+| INSERT in BEGIN/COMMIT (1k)        | **967 µs**| 1.05 ms | **1.1x faster** |
+| Point lookup by rowid              | **688 ns**| 1.65 µs | **2.4x faster** |
+| COUNT(*) on 10k rows               | **1.1 µs**| 2.6 µs  | **2.4x faster** |
+| Concurrent reads (8 threads)       | **6.3 ms**| 14.6 ms | **2.3x faster** |
+| Mixed R/W (4 readers + 1 writer)   | **1.9 ms**| 4.5 ms  | **2.4x faster** |
+| Range scan (100 rows)              | **10.5 µs**| 11.6 µs| **1.1x faster** |
+| Inner join (1k x 1k, rowid FK)     | 158 µs    | 123 µs  | 1.3x slower     |
+
+Single-shot workloads (`cargo run --release --example bench_compare`,
+steady state):
 
 | Workload                          | rustqlite | SQLite  | Ratio           |
 |-----------------------------------|-----------|---------|-----------------|
@@ -95,18 +110,24 @@ steady-state (statements warm). Full harness: `cargo run --release --example ben
 | 2-table join, filter by PK        | 4.2 µs    | 24 µs   | **5.8x faster** |
 | UPDATE by PK (1k ops)             | 1.25 ms   | 1.82 ms | **1.5x faster** |
 | Aggregates (SUM/AVG/MIN/MAX)      | 555 µs    | 1.18 ms | **2.1x faster** |
-| Single-row inserts (1k, autocommit)| 981 µs   | 1.80 ms | **1.8x faster** |
 | 100k inserts in BEGIN/COMMIT      | 116 ms    | 128 ms  | **1.1x faster** |
 | GROUP BY (100 buckets)            | 1.92 ms   | 1.88 ms | parity          |
 | Indexed point lookup (1k ops)     | 539 µs    | 526 µs  | parity          |
 | Range scan (1000 rows)            | 167 µs    | 108 µs  | 1.5x slower     |
-| Point lookup by rowid (1k ops)    | 758 ns/op | 362 ns/op | 2.1x slower   |
 | DELETE by PK (1k ops)             | 4.6 ms    | 1.35 ms | 3.4x slower     |
 | DB file size (10k rows)           | 328 KB    | 262 KB  | 1.25x larger    |
 | Stripped binary size              | 1.28 MB   | 1.99 MB | **0.64x**       |
 
 ### Where we win
 
+- **OLTP inserts**: a byte-level fast-path scanner executes single-row
+  literal `INSERT ... VALUES (...)` without building tokens, an AST, or a
+  plan — and `:memory:` databases skip per-statement file writes entirely
+  (lazy write-back). Even with unique SQL text per statement (worst case
+  for caching), we beat SQLite's re-prepare cost.
+- **Concurrency**: multiple readers run truly in parallel on shared pages
+  (page-level locks + interior-mutability pager); SQLite serializes
+  everything through its connection mutex.
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index
   and touches only matching rows; SQLite's planner picks a full table walk
   on this workload shape.
@@ -120,9 +141,8 @@ steady-state (statements warm). Full harness: `cargo run --release --example ben
 
 ### Where SQLite still wins
 
-- **Point lookups / small scans**: the rusqlite-style API materializes an
-  owned `Vec<Row>` per query (2–3 allocations); SQLite's step/column API
-  avoids that. A cursor/callback API is the fix.
+- **Full inner joins (1.3x)**: scan-side row materialization (one Vec per
+  row) is the remainder of the join gap; a column-block scan would close it.
 - **DELETE by PK**: we default to per-statement durability (flush+fsync
   per statement); the harness runs SQLite in WAL + `synchronous=OFF`.
 - **Full scans with filters**: per-row predicate evaluation still resolves
@@ -132,6 +152,7 @@ steady-state (statements warm). Full harness: `cargo run --release --example ben
 Run the benchmarks yourself:
 
 ```bash
+cargo bench --bench sqlite_comparison  # full head-to-head
 cargo bench --bench point_lookup -- --quick
 cargo bench --bench range_scan  -- --quick
 cargo bench --bench insert      -- --quick

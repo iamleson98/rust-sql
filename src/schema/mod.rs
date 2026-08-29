@@ -155,6 +155,17 @@ impl Catalog {
         self.tables.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    /// Alloc-free fast path for already-lowercase names (the common case:
+    /// table names in SQL are usually written lowercase, and the fast
+    /// INSERT scanner slices them straight out of the statement text).
+    /// Falls back to a lowercasing lookup for mixed-case names.
+    pub fn get_table_fast(&self, name: &str) -> Option<Arc<Table>> {
+        if let Some(t) = self.tables.get(name) {
+            return Some(t.clone());
+        }
+        self.tables.get(&name.to_ascii_lowercase()).cloned()
+    }
+
     pub fn get_index(&self, name: &str) -> Option<Arc<Index>> {
         self.indexes.get(&name.to_ascii_lowercase()).cloned()
     }

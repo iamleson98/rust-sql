@@ -557,7 +557,7 @@ impl Affinity {
 /// numeric order (the classic sign-flip trick):
 ///   negative: !bits   (more negative → larger u64)
 ///   positive: bits | sign bit
-fn double_order_key(f: f64) -> u64 {
+pub(crate) fn double_order_key(f: f64) -> u64 {
     let bits = f.to_bits();
     if bits >> 63 == 1 {
         !bits

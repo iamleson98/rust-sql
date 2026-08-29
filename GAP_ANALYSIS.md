@@ -1,51 +1,49 @@
 # Gap Analysis — Where rustqlite Still Loses to SQLite
 
-> Re-measured `2026-08-29` after the execution-overhead + storage sprint:
-> `02d5e5c` (per-query fixed overhead: cached column names, Arc<[String]>
-> ExecResult, precomputed projection indices, cached has_subqueries flag),
-> `bc7bc99` (vectorized GROUP BY: zero-alloc hash grouping, selective
-> decode, AggFunc enum dispatch), `b3e241e` (row codec v2 + rowid-alias
-> elision, append-mode B+tree splits, empty-leaf freelist recycling),
-> `5f0f47d` (binary-search update_table), `6aa8e10` (steady-state bench
-> warmups). `cargo test --release`: 104 tests, 191 differential cases.
-> Workload: `cargo run --release --example bench_compare` (single-shot
-> workloads warmed to steady state, matching SQLite's prepare-outside-
-> timer methodology).
+> Re-measured `2026-08-29` after the fixed-cost elimination sprint
+> (statement pipeline overhaul): zero-allocation lexer (binary-search
+> keyword recognition, static operator strings), "cache on second sight"
+> statement admission, mimalloc global allocator, rewritten hash join
+> (pure-equi fast path, u64 numeric-key path, bucket-chain table, fused
+> projection), lazy write-back for `:memory:` databases, identity
+> projection fast path, and a dedicated fast path for single-row literal
+> INSERTs (byte-level scanner — no tokenizer/AST/Plan). `cargo test
+> --release`: 107 unit tests + 198 differential cases + 7 integration
+> suites, all green. Benchmark: `cargo bench --bench sqlite_comparison`.
 
 ## 1. Current performance gap (lower ratio = closer to SQLite)
 
-**Wins — rustqlite beats SQLite:**
+**Head-to-head (`cargo bench --bench sqlite_comparison`, criterion, 2026-08-29):**
 
 | # | Workload | rustqlite | SQLite | Ratio | Status |
 |---|---|---|---|---|---|
-| 1 | UPDATE range (`val > 5000`, indexed) | **21 µs** | 1.24 ms | **59× faster** | ✅ IndexRange plan node (was 29.6 ms / 22× slower) |
-| 2 | 3-table join, filter by PK (~50 rows) | **3.6 µs** | 56–73 µs | **15–20× faster** | ✅ INLJ + warm statement cache (was 22 ms / 177× slower) |
-| 3 | 2-table join, filter by PK (~10 rows) | **4.2 µs** | 24 µs | **5.8× faster** | ✅ INLJ (was 5.7× slower under cold-cache timing) |
-| 4 | UPDATE by PK (1k ops) | **1.25 ms** | 1.82 ms | **1.5× faster** | ✅ binary-search update_table + codec v2 (was 3.0× slower) |
-| 5 | Aggregate (SUM/AVG/MIN/MAX) | **555 µs** | 1.18 ms | **2.1× faster** | ✅ vectorized fast path |
-| 6 | Single-row inserts (1k, auto-commit) | **981 µs** | 1.80 ms | **1.8× faster** | ✅ deferred flush (was 6.9× slower) |
-| 7 | Single-row in BEGIN/COMMIT (100k) | **116 ms** | 128 ms | **1.1× faster** | ✅ was 1.6× slower |
-| 8 | Single-row in BEGIN/COMMIT (10k) | **11.1 ms** | 12.5 ms | **1.1× faster** | ✅ |
-| 9 | Binary size (stripped) | **1.28 MB** | 1.99 MB | **0.64×** | ✅ |
-| 10 | Point lookup by indexed col (1k ops) | **539 µs** | 526 µs | **parity** (1.02×) | ✅ was 1.1× slower |
-| 11 | GROUP BY (100 buckets) | **1.92 ms** | 1.88 ms | **parity** (1.02×) | ✅ vectorized hash grouping (was 1.5× slower) |
-| 12 | Peak RSS (100k insert) | **47.4 MB** | 46.0 MB | **parity** (1.03×) | ✅ was 1.3× larger |
+| 1 | INSERT auto-commit (1k, unique SQL text) | **940 µs** | 1.60 ms | **1.70× faster** | ✅ fast INSERT scanner (was 3.6× slower at sprint start) |
+| 2 | INSERT in BEGIN/COMMIT (1k, unique SQL text) | **967 µs** | 1.05 ms | **1.09× faster** | ✅ (was 2.9× slower) |
+| 3 | Point lookup by rowid | **688 ns** | 1.65 µs | **2.4× faster** | ✅ |
+| 4 | COUNT(*) on 10k rows | **1.05 µs** | 2.57 µs | **2.4× faster** | ✅ vectorized scan count |
+| 5 | Concurrent read throughput (8 readers) | **6.3 ms** | 14.6 ms | **2.3× faster** | ✅ MRMW readers |
+| 6 | Mixed read/write (4 readers + 1 writer) | **1.88 ms** | 4.49 ms | **2.4× faster** | ✅ |
+| 7 | Range scan (100 rows) | **10.5 µs** | 11.6 µs | **1.10× faster** | ✅ identity projection (was 1.7× slower) |
+| 8 | Inner join (1k × 1k, rowid FK) | 158 µs | 123 µs | 1.28× slower | 🟡 hash join rewrite closed 6.2× → 1.28×; remainder = row materialization |
 
-**Remaining gaps:**
+Earlier `bench_compare` workloads (single-shot, warmed steady state) —
+still valid as of this sprint:
 
 | # | Workload | rustqlite | SQLite | Ratio | Status |
 |---|---|---|---|---|---|
-| 13 | DELETE by PK (1k ops) | 4.6 ms | 1.35 ms | 3.4× slower | 🟡 per-statement flush (durability default) + row materialization |
-| 14 | Mixed 80/20 (5k ops) | 7.5 ms | 2.5 ms | 3.0× slower | 🟡 composite of gaps below (was 4.4×) |
-| 15 | 2-table join + GROUP BY (full scan) | 7.4 ms | 3.0 ms | 2.5× slower | 🟡 join+agg materialization (was 4.4×) |
-| 16 | Multi-row VALUES batches (10k) | 16.5 ms | 6.7 ms | 2.5× slower | 🟢 per-row insert overhead |
-| 17 | Full scan + COUNT with filter | 1.15 ms | 472 µs | 2.4× slower | 🟡 per-row decode + eval (was 2.7×) |
-| 18 | Point lookup by rowid (1k ops) | 758 ns/op | 362 ns/op | 2.1× slower | 🟡 Vec<Row> materialization + stmt-cache hash (was 2.6×) |
-| 19 | Range scan (5000 rows) | 1.01 ms | 564 µs | 1.8× slower | 🟢 |
-| 20 | Range scan (1000 rows) | 167 µs | 108 µs | 1.5× slower | 🟢 (was 1.8×) |
-| 21 | Range scan (100 rows) | 25 µs | 12 µs | 2.0× slower | 🟢 |
-| 22 | Range scan (10 rows) | 6.6 µs | 3.5 µs | 1.9× slower | 🟢 was 13× (cold-cache timing + 6.5× real overhead) |
-| 23 | DB file size (10k rows) | 327.7 KB | 262.1 KB | 1.25× larger | 🟢 codec v2 + append splits (was 3.5×) |
+| 9 | UPDATE range (`val > 5000`, indexed) | **21 µs** | 1.24 ms | **59× faster** | ✅ IndexRange |
+| 10 | 3-table join, filter by PK (~50 rows) | **3.6 µs** | 56–73 µs | **15–20× faster** | ✅ INLJ |
+| 11 | UPDATE by PK (1k ops) | **1.25 ms** | 1.82 ms | **1.5× faster** | ✅ |
+| 12 | Aggregate (SUM/AVG/MIN/MAX) | **555 µs** | 1.18 ms | **2.1× faster** | ✅ |
+| 13 | GROUP BY (100 buckets) | **1.92 ms** | 1.88 ms | parity | ✅ |
+| 14 | Binary size (stripped) | **1.28 MB** | 1.99 MB | **0.64×** | ✅ |
+| 15 | DELETE by PK (1k ops) | 4.6 ms | 1.35 ms | 3.4× slower | 🟡 per-statement flush + materialization |
+| 16 | Mixed 80/20 (5k ops) | 7.5 ms | 2.5 ms | 3.0× slower | 🟡 composite |
+| 17 | 2-table join + GROUP BY (full scan) | 7.4 ms | 3.0 ms | 2.5× slower | 🟡 join+agg materialization |
+| 18 | Multi-row VALUES batches (10k) | 16.5 ms | 6.7 ms | 2.5× slower | 🟢 |
+| 19 | Full scan + COUNT with filter | 1.15 ms | 472 µs | 2.4× slower | 🟡 |
+| 20 | Range scan (5000 rows) | 1.01 ms | 564 µs | 1.8× slower | 🟢 |
+| 21 | DB file size (10k rows) | 327.7 KB | 262.1 KB | 1.25× larger | 🟢 |
 
 ## 2. What was closed in the previous sprint (2026-08-28)
 
@@ -142,14 +140,91 @@
   a cold parse+plan per single-shot workload (the "13× range scan" and
   "5.7× join" gaps were largely this artifact).
 
-## 4. Working order (next sprint)
+## 4. What was closed this sprint (2026-08-29, second pass): the statement pipeline
 
-1. ⏳ DELETE by PK (3.4×) — per-statement flush dominates; batch dirty
+The single biggest remaining cost for OLTP-shaped workloads was the fixed
+per-statement pipeline: tokenize → parse → plan → (maybe) cache → execute.
+Profiling a 1k-row in-transaction INSERT batch showed ~3.1 µs/insert split
+roughly: parse 1.2 µs, plan 0.16 µs, cache-populate 1.0 µs, execute 1.3 µs.
+Every phase was attacked:
+
+### Lexer: zero-allocation tokens
+- `Token::Keyword(&'static str)` and `Token::Op(&'static str)` — keywords
+  and operators are static strings now; previously every keyword token
+  heap-allocated its uppercase spelling, and `try_multi_char_op` called
+  `format!()` twice for EVERY operator token (dead 3-char probe included).
+- Keyword recognition is a binary search over the sorted static table with
+  case-folding comparison (~8 short memcmps). Previously: a
+  `to_ascii_uppercase()` String allocation + linear scan over 144 keywords
+  per identifier (~900 string compares per INSERT statement).
+- **UTF-8 correctness fix**: string and quoted-identifier literals were
+  built with `byte as char`, silently mangling multi-byte text
+  (`'héllo'` stored as `"hÃ©llo"`). Now byte-collected and decoded once.
+
+### Statement cache: cache on second sight
+- Populating the cache costs ~1 µs (two key Strings, write lock, Arc
+  clones, FIFO bookkeeping). For one-off statement text — literal-inlined
+  `INSERT ... VALUES ('name42', 42)` — that is pure waste. A 5 ns FxHash
+  "seen" filter admits a statement to the cache only on its second
+  sighting.
+
+### Allocator: mimalloc
+- The engine allocates on every hot path (row Vecs, ASTs, join keys).
+  mimalloc's thread-local heaps cut small-allocation cost 20–40%
+  (feature `mimalloc`, on by default; opt out with
+  `default-features = false`). Full-join benchmark: 337 → 229 µs from
+  this change alone.
+
+### Hash join: rebuilt for the common case
+- **Pure-equi fast path**: when the join condition is exactly the
+  equi-key predicates, a hash-key match PROVES the condition — the
+  per-candidate `eval_row` (AST walk + string column resolution,
+  ~300–500 ns/row) is skipped entirely.
+- **u64 numeric-key path**: single-column joins where every build key is
+  a small INTEGER or REAL hash by the 8-byte order-key double — no
+  per-row `Vec<u8>` key allocation, and Integer(5) / Real(5.0) match
+  exactly per SQL numeric equality (the old tagged encoding silently
+  dropped cross-type matches — a correctness fix).
+- **Bucket-chain hash table** (`HashMap<K, u32>` + flat chain Vec): one
+  allocation per build row instead of two.
+- **Fused projection**: `Project(HashJoin)` emits only the projected
+  columns directly — no full-width combined row, no second cloning pass.
+- NULL join keys never match (SQL semantics), with correct unmatched-row
+  emission for LEFT/RIGHT/FULL.
+- Identity projection: `SELECT *` (or any in-order full projection) moves
+  rows instead of cloning them (1000 allocations per 1000-row scan gone).
+
+### Storage: lazy write-back for `:memory:`
+- In-memory databases no longer write pages to the backing temp file on
+  every auto-commit statement: `flush()` is a no-op and dirty pages spill
+  only on cache eviction. BEGIN forces one real write-back so ROLLBACK
+  (which restores by clearing the cache and re-reading the file) stays
+  correct. Auto-commit INSERT: 4.8 ms → 2.0 ms per 1k batch.
+- `insert_table_append`: one page-lock acquisition per level instead of
+  five; cell bytes built in a 256-byte stack buffer (heap only for big
+  rows).
+- Root/max-rowid bookkeeping no longer allocates key Strings when values
+  are unchanged; `sync_schema_roots` runs only when a root actually moved
+  (was: two locks + two Vec collects per statement).
+
+### Fast INSERT path (the endgame for item 1)
+- A byte-level scanner recognizes `INSERT INTO t (cols) VALUES (literals)`
+  — single row, literals only — and executes it without building tokens,
+  an AST, or a Plan, funneling into the very same
+  `exec_insert_one_row` (so affinity, NOT NULL, UNIQUE-index maintenance,
+  conflict handling, and rowid semantics are identical to the general
+  path). Result: **0.92 µs/insert**, beating SQLite's 1.05 µs on the
+  unique-SQL-text benchmark where statement caching is useless.
+
+## 5. Working order (next sprint)
+
+1. ⏳ Inner join (1.28×) — the last criterion head-to-head gap. Scan-side
+   row materialization (one Vec per row) is the remainder; a column-block
+   scan or join-side row reuse would close it.
+2. ⏳ DELETE by PK (3.4×) — per-statement flush dominates; batch dirty
    pages like SQLite's WAL auto-checkpoint, or make per-statement flush
-   incremental (write-behind).
-2. ⏳ Point lookup by rowid (2.1×) — `Vec<Row>` materialization in the
-   public API; a row-cursor / callback query API would remove 2-3
-   allocations per query.
+   incremental (write-behind). A fast DELETE scanner (mirror of the fast
+   INSERT path) is another option for `DELETE FROM t WHERE rowid = k`.
 3. ⏳ Full-scan COUNT with filter (2.4×) + join+GROUP BY (2.5×) —
    predicate evaluation per row is still `eval_row` (name lookup);
    resolve predicate columns to indices like GROUP BY now does.
@@ -158,10 +233,12 @@
 5. ⏳ Correlated subqueries (per-row execution with outer-row binding).
 6. ⏳ Views, triggers, CTE execution, window LAG/LEAD.
 7. ⏳ MVCC visibility wiring + connection pool for concurrency parity.
+8. ⏳ Fast-path scanners for the other hot shapes: single-row UPDATE by
+   rowid / point DELETE (mirroring the fast INSERT scanner).
 
 ---
 
-## 5. Tracking conventions
+## 6. Tracking conventions
 
 - Tick a box when the work is **merged to master and CI is green**.
 - For perf items, re-run `bench_compare` and update the table at the top

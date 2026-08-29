@@ -140,6 +140,14 @@ pub struct Pager {
     /// same per-statement overhead as SQLite's `:memory:` mode (which never
     /// fsyncs because there's no file at all).
     skip_fsync: AtomicBool,
+    /// Lazy write-back mode (in-memory databases). When true, `flush()` does
+    /// NOT write dirty pages to the backing temp file — it just resets the
+    /// dirty bookkeeping (O(1)). Dirty pages are written lazily by cache
+    /// eviction instead. Since in-memory DBs are deleted on close, the file
+    /// is only a spill area for caches larger than memory, so per-statement
+    /// write() syscalls are pure overhead. This is what makes autocommit
+    /// INSERTs in `:memory:` mode competitive with SQLite's.
+    lazy_writeback: AtomicBool,
     /// Upper-bound count of dirty pages since the last `flush()`. Incremented
     /// by `note_write()` on every mutating operation (allocate_page, free_page,
     /// Btree insert/delete/etc.). Reset to 0 by `flush()`.
@@ -187,6 +195,7 @@ impl Pager {
             schema_cookie: AtomicU32::new(0),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(false),
+            lazy_writeback: AtomicBool::new(false),
             dirty_count_approx: AtomicUsize::new(0),
             dirty_pages: Mutex::new(std::collections::HashSet::new()),
         };
@@ -472,6 +481,18 @@ impl Pager {
 
     /// Flush all dirty pages to disk and sync.
     pub fn flush(&self) -> Result<()> {
+        // LAZY WRITE-BACK MODE (in-memory databases): pure no-op. Do NOT
+        // clear the dirty bookkeeping — the dirty_pages set and count are
+        // the record of what a future REAL flush (flush_before_snapshot at
+        // BEGIN, or eviction) must write. Clearing them here while pages
+        // keep their in-cache `.dirty` flag would orphan those pages: the
+        // next real flush would skip them, and ROLLBACK (which restores by
+        // clearing the cache and re-reading from the file) would hit short
+        // reads. All reads go through the cache, so skipping the file
+        // writes is safe; the temp file is deleted on close anyway.
+        if self.lazy_writeback.load(Ordering::Acquire) {
+            return Ok(());
+        }
         // O(1) fast path: if no writes happened since the last flush, skip
         // the entire flush (including sync_all).
         if self.dirty_count_approx.load(Ordering::Acquire) == 0 {
@@ -554,6 +575,46 @@ impl Pager {
         self.skip_fsync.store(skip, Ordering::Release);
     }
 
+    /// Enable lazy write-back mode (in-memory databases): `flush()` becomes
+    /// O(1) (no file writes); dirty pages spill to the backing temp file
+    /// only on cache eviction. See the field docs for rationale.
+    pub fn set_lazy_writeback(&self, enabled: bool) {
+        self.lazy_writeback.store(enabled, Ordering::Release);
+    }
+
+    /// Called at BEGIN (before taking the rollback snapshot).
+    ///
+    /// In lazy write-back mode, dirty pages normally never reach the file —
+    /// but ROLLBACK restores by clearing the page cache and re-reading
+    /// pages from the file, so the file MUST hold the pre-BEGIN state.
+    /// This forces a real write-back of all dirty pages. It runs once per
+    /// BEGIN, not per statement, so the amortized cost is negligible
+    /// compared to the per-autocommit-statement writes it eliminates.
+    ///
+    /// In normal (non-lazy) mode this is a no-op: flush() already keeps the
+    /// file current.
+    pub fn flush_before_snapshot(&self) -> Result<()> {
+        if self.lazy_writeback.load(Ordering::Acquire) {
+            // Temporarily disable lazy mode and run the real flush with the
+            // dirty-count fast path bypassed: in lazy mode the count and the
+            // dirty_pages set can diverge from the pages' actual .dirty
+            // flags, so the only reliable "nothing to write" check is the
+            // set itself (which the flush body drains).
+            self.lazy_writeback.store(false, Ordering::Release);
+            let count_checkpoint = self.dirty_count_approx.swap(1, Ordering::Release);
+            let result = self.flush();
+            // Restore a sane count (flush() reset it to 0; if the real
+            // flush wrote nothing because the set was empty, keep whatever
+            // the pre-call state implied — 0 is fine either way since the
+            // set is now empty too).
+            let _ = count_checkpoint;
+            self.lazy_writeback.store(true, Ordering::Release);
+            result
+        } else {
+            Ok(())
+        }
+    }
+
     /// Rollback to the state captured by `PagerSnapshot::capture` at BEGIN.
     ///
     /// This discards all in-memory dirty pages (their contents were never
@@ -596,7 +657,12 @@ impl Pager {
     /// Evict pages from the cache until we're under capacity.
     /// Caller must hold the cache write lock.
     fn maybe_evict_locked(&self, cache: &mut HashMap<PageId, PageRef>) {
-        while cache.len() >= self.cache_capacity {
+        // Safety bound: if every cached page is dirty and unwritable (or
+        // lazy_writeback is off), the loop below would otherwise spin
+        // forever moving dirty pages to the back. `attempts` caps it.
+        let mut attempts = cache.len();
+        while cache.len() >= self.cache_capacity && attempts > 0 {
+            attempts -= 1;
             let evict_id = {
                 let mut lru = self.lru.lock();
                 match lru.front().copied() {
@@ -608,7 +674,28 @@ impl Pager {
                 }
             };
             let should_evict = match cache.get(&evict_id) {
-                Some(p) => !p.lock().dirty,
+                Some(p) => {
+                    let mut pg = p.lock();
+                    if pg.dirty {
+                        if self.lazy_writeback.load(Ordering::Acquire) {
+                            // Lazy write-back: the page was never written by
+                            // flush() — write it NOW, then it's safe to evict.
+                            // Errors: keep the page (retry later) rather than
+                            // losing data.
+                            let offset = evict_id as u64 * self.page_size() as u64;
+                            if self.write_file_at(offset, &pg.data).is_ok() {
+                                pg.dirty = false;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                }
                 None => true,
             };
             if should_evict {

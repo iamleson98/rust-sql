@@ -50,7 +50,7 @@ impl Parser {
             return self.parse_with_statement();
         }
         match &t.token {
-            Token::Keyword(k) => match k.as_str() {
+            Token::Keyword(k) => match *k {
                 "CREATE" => self.parse_create(),
                 "DROP" => self.parse_drop(),
                 "INSERT" | "REPLACE" => self.parse_insert(),
@@ -96,7 +96,7 @@ impl Parser {
         // A WITH can prefix SELECT, INSERT, UPDATE, or DELETE.
         let t = self.peek();
         match &t.token {
-            Token::Keyword(k) => match k.as_str() {
+            Token::Keyword(k) => match *k {
                 "SELECT" | "VALUES" => {
                     let mut sel = self.parse_select()?;
                     sel.with = Some(with);
@@ -266,7 +266,7 @@ impl Parser {
     fn is_column_constraint_start(&self) -> bool {
         match &self.peek().token {
             Token::Keyword(k) => matches!(
-                k.as_str(),
+                *k,
                 "PRIMARY" | "NOT" | "NULL" | "UNIQUE" | "CHECK" | "DEFAULT"
                     | "COLLATE" | "REFERENCES" | "GENERATED" | "AS" | "CONSTRAINT"
             ),
@@ -696,7 +696,7 @@ impl Parser {
                 self.advance();
                 let t = self.peek();
                 let r = match &t.token {
-                    Token::Keyword(k) => match k.as_str() {
+                    Token::Keyword(k) => match *k {
                         "ROLLBACK" => ConflictResolution::Rollback,
                         "ABORT" => ConflictResolution::Abort,
                         "FAIL" => ConflictResolution::Fail,
@@ -840,7 +840,7 @@ impl Parser {
             self.advance();
             let t = self.peek();
             let r = match &t.token {
-                Token::Keyword(k) => match k.as_str() {
+                Token::Keyword(k) => match *k {
                     "ROLLBACK" => ConflictResolution::Rollback,
                     "ABORT" => ConflictResolution::Abort,
                     "FAIL" => ConflictResolution::Fail,
@@ -1612,7 +1612,7 @@ impl Parser {
     fn try_binary_op(&self) -> Option<BinaryOp> {
         let t = &self.peek().token;
         match t {
-            Token::Op(s) => match s.as_str() {
+            Token::Op(s) => match *s {
                 "+" => Some(BinaryOp::Add),
                 "-" => Some(BinaryOp::Sub),
                 "*" => Some(BinaryOp::Mul),
@@ -1632,7 +1632,7 @@ impl Parser {
                 ">=" => Some(BinaryOp::GtEq),
                 _ => None,
             },
-            Token::Keyword(k) => match k.as_str() {
+            Token::Keyword(k) => match *k {
                 "AND" => Some(BinaryOp::And),
                 "OR" => Some(BinaryOp::Or),
                 _ => None,
@@ -1913,7 +1913,7 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Parameter(p.clone()))
             }
-            Token::Keyword(k) => match k.as_str() {
+            Token::Keyword(k) => match *k {
                 "NULL" => {
                     self.advance();
                     Ok(Expr::Literal(Value::Null))
@@ -1928,7 +1928,7 @@ impl Parser {
                 }
                 "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "CURRENT" => {
                     // Treat as a function with no args.
-                    let name = k.clone();
+                    let name = (*k).to_string();
                     self.advance();
                     if self.peek().is_punct('(') {
                         self.advance();
@@ -1956,7 +1956,7 @@ impl Parser {
                     // Could be a function call with a keyword name (e.g. LEFT, RIGHT).
                     if let Some(next) = self.toks.get(self.pos + 1) {
                         if next.is_punct('(') {
-                            let name = k.clone();
+                            let name = (*k).to_string();
                             self.advance();
                             self.advance(); // consume (
                             return self.parse_function_call(name);
@@ -2264,7 +2264,7 @@ impl Parser {
 fn is_clause_keyword(t: &Token) -> bool {
     match t {
         Token::Keyword(k) => matches!(
-            k.as_str(),
+            *k,
             "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "LIMIT" | "OFFSET"
                 | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL"
                 | "ON" | "USING" | "AS" | "WINDOW" | "UNION" | "INTERSECT" | "EXCEPT"

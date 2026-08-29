@@ -30,6 +30,61 @@ use std::sync::Arc;
 /// The maximum number of pages cached in memory.
 const DEFAULT_CACHE_PAGES: usize = 2048;
 
+/// Lightweight phase profiler (nanosecond accumulators). Zero-cost when
+/// not being read; used by `examples/phase_profile.rs` to attribute
+/// per-statement cost to parse / plan / exec phases.
+#[doc(hidden)]
+pub mod profile {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    pub static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub static PARSE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PLAN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static EXEC_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COUNT: AtomicU64 = AtomicU64::new(0);
+    /// Returns Some(Instant) when profiling is enabled. One relaxed atomic
+    /// load when disabled (~1 ns) — safe to call on hot paths.
+    #[inline]
+    pub fn now() -> Option<std::time::Instant> {
+        if ENABLED.load(Ordering::Relaxed) {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+    #[inline]
+    pub fn span(started: Option<std::time::Instant>, c: &AtomicU64) {
+        if let Some(t) = started {
+            c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    pub fn reset() {
+        PARSE_NS.store(0, Ordering::Relaxed);
+        PLAN_NS.store(0, Ordering::Relaxed);
+        EXEC_NS.store(0, Ordering::Relaxed);
+        CACHE_NS.store(0, Ordering::Relaxed);
+        COUNT.store(0, Ordering::Relaxed);
+    }
+    pub fn dump() {
+        let c = COUNT.load(Ordering::Relaxed) as f64;
+        if c == 0.0 {
+            println!("profile: no samples");
+            return;
+        }
+        println!(
+            "profile: n={:.0}  parse={:.3}us  plan={:.3}us  cache={:.3}us  exec={:.3}us  (sum={:.3}us)",
+            c,
+            PARSE_NS.load(Ordering::Relaxed) as f64 / c / 1000.0,
+            PLAN_NS.load(Ordering::Relaxed) as f64 / c / 1000.0,
+            CACHE_NS.load(Ordering::Relaxed) as f64 / c / 1000.0,
+            EXEC_NS.load(Ordering::Relaxed) as f64 / c / 1000.0,
+            (PARSE_NS.load(Ordering::Relaxed) + PLAN_NS.load(Ordering::Relaxed)
+                + CACHE_NS.load(Ordering::Relaxed) + EXEC_NS.load(Ordering::Relaxed)) as f64
+                / c / 1000.0,
+        );
+    }
+}
+
 /// Page size: 16 KiB (larger than SQLite's 4 KiB default) to reduce splits.
 /// This trades some memory for fewer B+tree splits and better scan locality.
 // const DEFAULT_PAGE_SIZE: u32 = 16384;
@@ -100,6 +155,19 @@ pub struct Database {
     /// Maximum number of entries in the statement cache. Default 64.
     /// Immutable after open (only set via `set_stmt_cache_capacity`).
     stmt_cache_capacity: usize,
+    /// Hashes of SQL statements seen at least once ("cache on second
+    /// sight" filter). Populating the statement cache costs ~1 µs (two
+    /// String allocations for the key + FIFO order entry, write-lock, Arc
+    /// clones). For workloads where every statement text is unique —
+    /// e.g. literal-inlined `INSERT ... VALUES ('name42', 42)` in a loop —
+    /// that insert is pure waste: the entry is evicted before ever being
+    /// hit again. With this filter, a statement is only admitted to the
+    /// cache the SECOND time we see its hash; one-off statements pay just
+    /// a ~5 ns hash insert. Repeated statements (the cache's real clientele)
+    /// reach the cache on their 2nd execution and hit it from the 3rd on.
+    /// Bounded: cleared wholesale when it grows past `seen_hashes_cap`.
+    seen_hashes: Mutex<std::collections::HashSet<u64>>,
+    seen_hashes_cap: usize,
     /// When true (default: false), the per-statement flush in exec_insert /
     /// exec_update / exec_delete is suppressed. Mirrors SQLite's
     /// `journal_mode=WAL + synchronous=NORMAL` behaviour — dirty pages
@@ -123,6 +191,22 @@ pub struct Database {
 
 /// Default capacity of the statement cache.
 const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
+
+/// Fast non-cryptographic hash (FxHash-style, as used by rustc) for the
+/// statement "seen" filter. ~5 ns for a typical 60-byte statement; used
+/// only as a heuristic gate, so collisions are harmless (they cause one
+/// unnecessary cache insert, never a wrong result).
+#[inline]
+fn quick_sql_hash(s: &str) -> u64 {
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut h: u64 = 0;
+    for chunk in s.as_bytes().chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(SEED);
+    }
+    h
+}
 
 /// A cached prepared statement: the parsed AST, the plan (if any), and the
 /// precomputed `has_subqueries` flag (mirrors SQLite's OP_Once check —
@@ -166,6 +250,8 @@ impl Database {
             stmt_cache: RwLock::new(HashMap::new()),
             stmt_cache_order: Mutex::new(Vec::new()),
             stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
+            seen_hashes: Mutex::new(std::collections::HashSet::new()),
+            seen_hashes_cap: 4096,
             deferred_flush: AtomicBool::new(false),
             deferred_flush_threshold: 1000,
         })
@@ -186,6 +272,11 @@ impl Database {
         let mut db = Self::open(tmp.path())?;
         db.path = path;
         db.pager.set_skip_fsync(true);
+        // Lazy write-back: per-statement flushes skip file writes entirely;
+        // dirty pages spill to the temp file only on cache eviction. The
+        // file is deleted on close, so this is pure win: autocommit
+        // INSERTs in :memory: mode drop the write() syscall per statement.
+        db.pager.set_lazy_writeback(true);
         Ok(db)
     }
 
@@ -253,11 +344,129 @@ impl Database {
     /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
     /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
     /// don't conflict.
+    /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
+    ///
+    /// Returns `Ok(true)` when executed, `Ok(false)` when the fast path
+    /// turns out not to apply (caller falls through to the general path),
+    /// `Err` for a real failure. Not-applicable cases: WITHOUT ROWID /
+    /// STRICT tables, generated columns, missing DEFAULT evaluation,
+    /// duplicate column names (the general path produces nicer errors).
+    fn exec_fast_insert(&mut self, mut fi: FastInsert<'_>) -> Result<bool> {
+        let table = match self.catalog.get_table_fast(fi.table) {
+            Some(t) => t,
+            None => {
+                // Unknown table — same error the planner produces.
+                return Err(Error::NotFound(format!("table: {}", fi.table)));
+            }
+        };
+        // Table-shape bails: fall through to the general path.
+        if table.without_rowid
+            || table.strict
+            || table.columns.iter().any(|c| c.generated.is_some())
+        {
+            return Ok(false);
+        }
+        // If any column has a DEFAULT and the row doesn't supply every
+        // column, defaults must be evaluated — general path.
+        let supplies_all = fi.columns.is_empty()
+            || (fi.columns.len() == table.n_columns());
+        if !supplies_all && table.columns.iter().any(|c| c.default.is_some()) {
+            return Ok(false);
+        }
+
+        // Resolve target column indices.
+        let n_cols = table.n_columns();
+        let mut supplied: Vec<(usize, Value)> = Vec::with_capacity(fi.values.len());
+        if fi.columns.is_empty() {
+            if fi.values.len() != n_cols {
+                return Err(Error::semantic(format!(
+                    "table {} has {} columns but {} values were supplied",
+                    table.name, n_cols, fi.values.len()
+                )));
+            }
+            let vals = std::mem::take(&mut fi.values);
+            for (i, v) in IntoIterator::into_iter(vals).enumerate() {
+                let affinity = table.columns[i].affinity;
+                supplied.push((i, affinity.coerce(v)));
+            }
+        } else {
+            if fi.values.len() != fi.columns.len() {
+                return Err(Error::semantic(format!(
+                    "{} VALUES for {} columns",
+                    fi.values.len(),
+                    fi.columns.len()
+                )));
+            }
+            let mut seen: Vec<usize> = Vec::with_capacity(fi.columns.len());
+            for (name, v) in fi.columns.iter().zip(std::mem::take(&mut fi.values)) {
+                match table.find_column(name) {
+                    Some(idx) => {
+                        if seen.contains(&idx) {
+                            // Duplicate column — general path errors nicely.
+                            return Ok(false);
+                        }
+                        seen.push(idx);
+                        let affinity = table.columns[idx].affinity;
+                        supplied.push((idx, affinity.coerce(v)));
+                    }
+                    None => {
+                        return Err(Error::semantic(format!(
+                            "table {} has no column named {}",
+                            table.name, name
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Set up the execution context exactly like `execute` does.
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot.get_mut().take();
+        let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = deferred_flush;
+        ctx.txn_snapshot = txn_snap;
+        ctx.root_overrides = std::mem::take(self.root_overrides.get_mut());
+        ctx.max_rowids = std::mem::take(self.max_rowids.get_mut());
+        ctx.index_roots = std::mem::take(self.index_roots.get_mut());
+
+        let result = crate::executor::fast_insert_single_row(&mut ctx, &table, supplied);
+
+        // Epilogue: same write-backs as `execute`.
+        self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+        *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
+        *self.max_rowids.get_mut() = std::mem::take(&mut ctx.max_rowids);
+        *self.index_roots.get_mut() = std::mem::take(&mut ctx.index_roots);
+        if result.is_ok() && ctx.roots_changed {
+            self.sync_schema_roots()?;
+        }
+        result?;
+        // Auto-commit: flush outside explicit transactions (no-op in lazy
+        // write-back / in-memory mode). With deferred flush enabled, honor
+        // the dirty-page threshold exactly like the general path.
+        if !in_txn && !deferred_flush {
+            self.pager.flush()?;
+        } else if deferred_flush && !in_txn {
+            let dirty = self.pager.dirty_page_count();
+            if dirty >= self.deferred_flush_threshold {
+                let _ = self.pager.flush();
+            }
+        }
+        Ok(true)
+    }
+
     fn get_or_cache_stmt(&self, sql: &str) -> Result<CachedStmt> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
+            let t0 = profile::now();
             let stmt = parse(sql)?;
+            profile::span(t0, &profile::PARSE_NS);
+            let t1 = profile::now();
             let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
+            profile::span(t1, &profile::PLAN_NS);
             let plan_arc = plan_opt.map(Arc::new);
             let has_subq = plan_arc
                 .as_ref()
@@ -278,31 +487,53 @@ impl Database {
                 return Ok(cached.clone());
             }
         }
-        // Miss: parse + plan + insert. Take the write lock to insert,
-        // double-check in case another thread inserted while we waited.
+        // Miss: parse + plan. Then decide whether to populate the cache.
+        let t0 = profile::now();
         let stmt = parse(sql)?;
+        profile::span(t0, &profile::PARSE_NS);
+        let t1 = profile::now();
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
-        let mut cache = self.stmt_cache.write();
-        // Double-check: another thread may have inserted while we waited.
-        if let Some(cached) = cache.get(sql) {
-            return Ok(cached.clone());
-        }
-        // Evict FIFO if at capacity.
-        if cache.len() >= self.stmt_cache_capacity {
-            let mut order = self.stmt_cache_order.lock();
-            if let Some(oldest) = order.first().cloned() {
-                cache.remove(&oldest);
-                order.remove(0);
-            }
-        }
+        profile::span(t1, &profile::PLAN_NS);
         let plan_arc = plan_opt.map(Arc::new);
         let has_subq = plan_arc
             .as_ref()
             .map(|p| crate::executor::plan_has_subqueries(p))
             .unwrap_or(false);
         let entry = CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq };
-        cache.insert(sql.to_string(), entry.clone());
-        self.stmt_cache_order.lock().push(sql.to_string());
+        let t2 = profile::now();
+        // "Cache on second sight": only populate the cache for SQL text we
+        // have seen before. A first sighting returns the freshly-parsed
+        // statement WITHOUT inserting — populating the cache for one-off
+        // statement text (literal-inlined values are the common case) is
+        // pure overhead: ~1 µs of allocations + locking for an entry that
+        // will never be hit before eviction.
+        let h = quick_sql_hash(sql);
+        let should_cache = {
+            let mut seen = self.seen_hashes.lock();
+            if seen.len() >= self.seen_hashes_cap {
+                seen.clear();
+            }
+            // insert() returns false when the hash was already present —
+            // i.e. this is (at least) the second sighting → cache it.
+            !seen.insert(h)
+        };
+        if should_cache {
+            let mut cache = self.stmt_cache.write();
+            // Double-check: another thread may have inserted while we waited.
+            if cache.get(sql).is_none() {
+                // Evict FIFO if at capacity.
+                if cache.len() >= self.stmt_cache_capacity {
+                    let mut order = self.stmt_cache_order.lock();
+                    if let Some(oldest) = order.first().cloned() {
+                        cache.remove(&oldest);
+                        order.remove(0);
+                    }
+                }
+                cache.insert(sql.to_string(), entry.clone());
+                self.stmt_cache_order.lock().push(sql.to_string());
+            }
+        }
+        profile::span(t2, &profile::CACHE_NS);
         Ok(entry)
     }
 
@@ -407,8 +638,28 @@ impl Database {
     /// mutations go through interior mutability so the body could in principle
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
+        profile::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // ---- FAST INSERT PATH ----
+        // Single-row literal VALUES inserts are the hottest statement shape
+        // in OLTP. A dedicated byte scanner recognizes them without the
+        // tokenizer/parser/planner/statement-cache pipeline (~1.3 us per
+        // statement of pure overhead). The scanner is conservative: any
+        // deviation (UPSERT, RETURNING, non-literals, multi-row) falls
+        // through to the general path below.
+        {
+            let first = sql.as_bytes().iter().find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+            if first == Some(&b'I') || first == Some(&b'i') {
+                if let Some(fi) = try_fast_insert_parse(sql) {
+                    if self.exec_fast_insert(fi)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let is_ddl = is_ddl_sql(sql);
+        let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
+        profile::span(t_cache, &profile::CACHE_NS);
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &cached.stmt;
@@ -443,6 +694,7 @@ impl Database {
         // means 1k wasted planning passes (each builds a Plan::Insert
         // containing Plan::Values { Vec<Vec<Expr>> }, several heap
         // allocations). With the cached plan, we skip all of that.
+        let t_exec = profile::now();
         let result = if let Some(plan) = plan_opt {
             // Substitute uncorrelated subqueries (scalar / IN / EXISTS) with
             // their materialized results before execution — mirrors
@@ -466,6 +718,7 @@ impl Database {
             // VACUUM/PRAGMA) without a Plan.
             Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql)
         };
+        profile::span(t_exec, &profile::EXEC_NS);
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
@@ -487,7 +740,10 @@ impl Database {
         // Persist any root-page moves (B+tree splits) to the schema rows so
         // a reopened database sees the full tree. Without this, every table
         // or index that split lost all data beyond the stale root on reopen.
-        if result.is_ok() {
+        // Gated on ctx.roots_changed — roots only move on splits, which are
+        // rare; previously this ran (two read locks + two Vec<(String,u32)>
+        // collects with String clones) after EVERY statement.
+        if result.is_ok() && ctx.roots_changed {
             self.sync_schema_roots()?;
         }
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
@@ -807,6 +1063,15 @@ impl Database {
                 // restore to this point. We also flip in_transaction so the
                 // executor's INSERT/UPDATE/DELETE skip per-statement flushes
                 // (so dirty pages stay in cache only, never reaching disk).
+                //
+                // In lazy write-back mode (in-memory DBs), flush() doesn't
+                // write dirty pages — but ROLLBACK restores by CLEARING the
+                // cache and reading pages back from the file, which requires
+                // the file to hold the pre-BEGIN state. So at BEGIN we force
+                // one real write-back of all dirty pages (BEGIN is rare
+                // compared to autocommit statements, so this is cheap
+                // amortized) and THEN take the snapshot.
+                ctx.pager.flush_before_snapshot()?;
                 ctx.in_transaction = true;
                 ctx.txn_snapshot = Some(ctx.pager.snapshot());
                 Ok(())
@@ -1306,6 +1571,276 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
 /// Used to invalidate the statement cache after schema changes. We only need
 /// a cheap prefix check — the parser is the source of truth, and the cache
 /// will be re-populated on the next call.
+
+// ============================================================================
+// Fast INSERT path
+// ============================================================================
+
+/// Pieces of a fast-path INSERT statement, sliced directly out of the SQL
+/// text (no tokenizer, no AST, no Plan).
+struct FastInsert<'a> {
+    /// Table name as written (matched case-insensitively).
+    table: &'a str,
+    /// Column names as written; empty = all columns in declared order.
+    columns: Vec<&'a str>,
+    /// Literal values in order.
+    values: Vec<Value>,
+}
+
+/// Ultra-lightweight scanner for the single hottest statement shape in
+/// OLTP workloads:
+///
+/// ```text
+/// INSERT INTO <table> [(<col>, <col>, ...)] VALUES (<literal>, ...)
+/// ```
+///
+/// Recognizes ONLY single-row literal VALUES inserts. Anything else —
+/// multi-row VALUES, non-literal expressions, `?` parameters, ON CONFLICT /
+/// UPSERT / RETURNING clauses, INSERT OR ..., DEFAULT VALUES, SELECT
+/// sources, quoted identifiers, trailing garbage — returns None and the
+/// caller falls back to the full parse path. This skips the entire
+/// tokenizer -> parser -> planner -> statement-cache pipeline (~1.3 us per
+/// statement), which dominates single-row INSERT cost.
+#[inline]
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i
+}
+
+/// Match keyword `kw` (ASCII, case-insensitive) at `i`; requires the
+/// following byte to be a non-identifier char so `INTO` doesn't match
+/// `INTOXICATED`. Returns the index after the keyword.
+#[inline]
+fn match_word_ci(b: &[u8], i: usize, kw: &str) -> Option<usize> {
+    let kb = kw.as_bytes();
+    if i + kb.len() > b.len() {
+        return None;
+    }
+    for (j, &k) in kb.iter().enumerate() {
+        if b[i + j] != k && b[i + j] != (k ^ 0x20) {
+            return None;
+        }
+    }
+    let after = i + kb.len();
+    if after < b.len() {
+        let c = b[after];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+            return None;
+        }
+    }
+    Some(after)
+}
+
+#[inline]
+fn is_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_'
+}
+
+#[inline]
+fn is_ident_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// Read an unquoted identifier starting at `i`. Returns (start, end).
+#[inline]
+fn read_ident(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if i >= b.len() || !is_ident_start(b[i]) {
+        return None;
+    }
+    let start = i;
+    let mut j = i;
+    while j < b.len() && is_ident_char(b[j]) {
+        j += 1;
+    }
+    Some((start, j))
+}
+
+/// Parse one literal at `i`. Supports NULL, TRUE, FALSE, integers (decimal
+/// and 0x hex), floats, signed numbers, and single-quoted strings with
+/// `''` escapes (UTF-8-safe). Anything else -> None.
+fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
+    if i >= b.len() {
+        return None;
+    }
+    // Keywords
+    if let Some(j) = match_word_ci(b, i, "NULL") {
+        return Some((Value::Null, j));
+    }
+    if let Some(j) = match_word_ci(b, i, "TRUE") {
+        return Some((Value::Integer(1), j));
+    }
+    if let Some(j) = match_word_ci(b, i, "FALSE") {
+        return Some((Value::Integer(0), j));
+    }
+    // Sign
+    let mut j = i;
+    let neg = match b[j] {
+        b'-' => {
+            j += 1;
+            true
+        }
+        b'+' => {
+            j += 1;
+            false
+        }
+        _ => false,
+    };
+    // Hex
+    if j + 1 < b.len() && b[j] == b'0' && (b[j + 1] | 0x20) == b'x' {
+        let hs = j + 2;
+        let mut he = hs;
+        while he < b.len() && b[he].is_ascii_hexdigit() {
+            he += 1;
+        }
+        if he == hs {
+            return None;
+        }
+        let text = std::str::from_utf8(&b[hs..he]).ok()?;
+        let v = i64::from_str_radix(text, 16).ok()?;
+        return Some((Value::Integer(if neg { -v } else { v }), he));
+    }
+    // Decimal / float
+    if j < b.len() && (b[j].is_ascii_digit() || (b[j] == b'.' && j + 1 < b.len() && b[j + 1].is_ascii_digit())) {
+        let ns = j;
+        let mut ne = j;
+        while ne < b.len() && b[ne].is_ascii_digit() {
+            ne += 1;
+        }
+        let mut is_float = false;
+        if ne < b.len() && b[ne] == b'.' {
+            is_float = true;
+            ne += 1;
+            while ne < b.len() && b[ne].is_ascii_digit() {
+                ne += 1;
+            }
+        }
+        if ne < b.len() && (b[ne] | 0x20) == b'e' {
+            let save = ne;
+            ne += 1;
+            if ne < b.len() && (b[ne] == b'+' || b[ne] == b'-') {
+                ne += 1;
+            }
+            if ne < b.len() && b[ne].is_ascii_digit() {
+                is_float = true;
+                while ne < b.len() && b[ne].is_ascii_digit() {
+                    ne += 1;
+                }
+            } else {
+                ne = save; // not an exponent — leave 'e' for the caller to reject
+            }
+        }
+        let text = std::str::from_utf8(&b[ns..ne]).ok()?;
+        if is_float {
+            let v: f64 = text.parse().ok()?;
+            Some((Value::Real(if neg { -v } else { v }), ne))
+        } else {
+            match text.parse::<i64>() {
+                Ok(v) => Some((Value::Integer(if neg { -v } else { v }), ne)),
+                // Out-of-i64-range integer literal: SQLite treats it as REAL.
+                Err(_) => {
+                    let v: f64 = text.parse().ok()?;
+                    Some((Value::Real(if neg { -v } else { v }), ne))
+                }
+            }
+        }
+    } else if b[i] == b'\'' {
+        // String literal with '' escapes; UTF-8-safe byte collection.
+        let mut k = i + 1;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            if k >= b.len() {
+                return None; // unterminated
+            }
+            let c = b[k];
+            if c == b'\'' {
+                if k + 1 < b.len() && b[k + 1] == b'\'' {
+                    bytes.push(b'\'');
+                    k += 2;
+                } else {
+                    k += 1;
+                    break;
+                }
+            } else {
+                bytes.push(c);
+                k += 1;
+            }
+        }
+        let s = String::from_utf8(bytes).ok()?;
+        Some((Value::Text(s), k))
+    } else {
+        None
+    }
+}
+
+fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
+    let b = sql.as_bytes();
+    let mut i = skip_ws(b, 0);
+    i = match_word_ci(b, i, "INSERT")?;
+    i = skip_ws(b, i);
+    i = match_word_ci(b, i, "INTO")?;
+    i = skip_ws(b, i);
+    let (ts, te) = read_ident(b, i)?;
+    let table = &sql[ts..te];
+    i = skip_ws(b, te);
+    // Optional column list.
+    let mut columns: Vec<&str> = Vec::new();
+    if i < b.len() && b[i] == b'(' {
+        i += 1;
+        loop {
+            i = skip_ws(b, i);
+            let (cs, ce) = read_ident(b, i)?;
+            columns.push(&sql[cs..ce]);
+            i = skip_ws(b, ce);
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if i >= b.len() || b[i] != b')' {
+            return None;
+        }
+        i += 1;
+        i = skip_ws(b, i);
+    }
+    i = match_word_ci(b, i, "VALUES")?;
+    i = skip_ws(b, i);
+    if i >= b.len() || b[i] != b'(' {
+        return None;
+    }
+    i += 1;
+    let mut values: Vec<Value> = Vec::new();
+    loop {
+        i = skip_ws(b, i);
+        let (v, ni) = parse_fast_literal(b, i)?;
+        values.push(v);
+        i = skip_ws(b, ni);
+        if i < b.len() && b[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if i >= b.len() || b[i] != b')' {
+        return None;
+    }
+    i += 1;
+    i = skip_ws(b, i);
+    // Optional single trailing semicolon, then end-of-statement.
+    if i < b.len() && b[i] == b';' {
+        i = skip_ws(b, i + 1);
+    }
+    if i != b.len() {
+        return None;
+    }
+    if values.is_empty() {
+        return None;
+    }
+    Some(FastInsert { table, columns, values })
+}
+
 fn is_ddl_sql(sql: &str) -> bool {
     // Fast path: scan at most ~10 chars, case-insensitive ASCII compare
     // without allocating a new String. The previous version called

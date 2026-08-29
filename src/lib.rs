@@ -34,6 +34,16 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::large_enum_variant)]
 
+/// Global allocator: mimalloc. The engine allocates heavily on hot paths
+/// (one Vec per decoded row, statement ASTs, join key buffers, combined
+/// rows). mimalloc's thread-local free lists make those small allocations
+/// 20-40% cheaper than the system malloc, which translates directly into
+/// scan/insert/join throughput. Opt out at build time with
+/// `default-features = false`.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod error;
 pub mod planner;
 pub mod schema;

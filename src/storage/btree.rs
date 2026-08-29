@@ -524,36 +524,67 @@ impl<'a> Btree<'a> {
         self.pager.note_write();
 
         // Walk right_most_pointer chain down to the rightmost leaf.
+        // One lock per level: read page_type and right_most_pointer in a
+        // single guard (previously two separate `.lock()` acquisitions).
         let mut page_id = self.root;
         let leaf_id;
         loop {
             let page = self.pager.get_page(page_id)?;
-            let pt = page.lock().page_type()?;
-            match pt {
+            let guard = page.lock();
+            match guard.page_type()? {
                 PageType::LeafTable => {
                     leaf_id = page_id;
                     break;
                 }
                 PageType::InteriorTable => {
-                    let right = page.lock().right_most_pointer();
+                    let right = guard.right_most_pointer();
                     if right == 0 {
                         // Shouldn't happen on a valid interior page, but fall back.
+                        drop(guard);
                         return self.insert_table(rowid, payload);
                     }
                     page_id = right;
                 }
                 _ => {
+                    drop(guard);
                     return self.insert_table(rowid, payload);
                 }
             }
         }
 
-        // Now at the rightmost leaf. Check the last cell's rowid to confirm
-        // this really is an append (caller's responsibility, but we verify).
+        // Rightmost leaf: verify the append, check space, and write — all
+        // under ONE lock guard. Previously this took the leaf lock 5 times
+        // (page_type, n_cells, cell_pointer, free_space, then the write),
+        // ~5 x 20 ns of uncontended mutex traffic per inserted row.
         let page = self.pager.get_page(leaf_id)?;
-        let n = page.lock().n_cells();
+        // Cell bytes: varint rowid + varint payload len + payload. Typical
+        // rows are well under 256 bytes — build in a stack buffer and only
+        // fall back to the heap when genuinely large (avoids a per-insert
+        // `Vec::with_capacity` allocation for the common case).
+        let mut cell_stack = [0u8; 256];
+        let mut cell_heap: Vec<u8>;
+        let mut rid_buf = [0u8; 9];
+        let n_rid = varint::encode_signed(rowid, &mut rid_buf);
+        let mut plen_buf = [0u8; 9];
+        let n_plen = varint::encode(payload.len() as u64, &mut plen_buf);
+        let cell_len = n_rid + n_plen + payload.len();
+        let cell: &[u8] = if cell_len <= cell_stack.len() {
+            cell_stack[..n_rid].copy_from_slice(&rid_buf[..n_rid]);
+            cell_stack[n_rid..n_rid + n_plen].copy_from_slice(&plen_buf[..n_plen]);
+            cell_stack[n_rid + n_plen..cell_len].copy_from_slice(payload);
+            &cell_stack[..cell_len]
+        } else {
+            cell_heap = Vec::with_capacity(cell_len);
+            cell_heap.extend_from_slice(&rid_buf[..n_rid]);
+            cell_heap.extend_from_slice(&plen_buf[..n_plen]);
+            cell_heap.extend_from_slice(payload);
+            &cell_heap
+        };
+        let cell_size = cell.len() as u32;
+
+        let mut borrowed = page.lock();
+        let n = borrowed.n_cells();
         if n > 0 {
-            let borrowed = page.lock();
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
             if let Some((last_rowid, _)) = varint::decode_signed(&borrowed.data[cell_ptr..]) {
                 if rowid <= last_rowid {
@@ -564,35 +595,20 @@ impl<'a> Btree<'a> {
             }
         }
 
-        // Compute the cell bytes once.
-        let mut cell_buf = Vec::with_capacity(payload.len() + 12);
-        // Encode varint rowid.
-        let mut rid_buf = [0u8; 9];
-        let n_rid = varint::encode_signed(rowid, &mut rid_buf);
-        cell_buf.extend_from_slice(&rid_buf[..n_rid]);
-        // Encode varint payload length.
-        let mut plen_buf = [0u8; 9];
-        let n_plen = varint::encode(payload.len() as u64, &mut plen_buf);
-        cell_buf.extend_from_slice(&plen_buf[..n_plen]);
-        // Payload.
-        cell_buf.extend_from_slice(payload);
-
-        let cell_size = cell_buf.len() as u32;
-
         // Check if the leaf has space.
-        let free = page.lock().free_space();
+        let free = borrowed.free_space();
         if free < cell_size + 2 {
             // Need to split — fall back to the normal insert path, which
             // handles splitting + propagating the split up the tree.
+            drop(borrowed);
             return self.insert_table(rowid, payload);
         }
 
         // Append: write cell at the new content start, write pointer at end.
         {
-            let mut borrowed = page.lock();
             let new_content_start = borrowed.cell_content_start() - cell_size;
             let off = new_content_start as usize;
-            borrowed.data[off..off + cell_size as usize].copy_from_slice(&cell_buf);
+            borrowed.data[off..off + cell_size as usize].copy_from_slice(cell);
             borrowed.set_cell_content_start(new_content_start);
 
             // Append the cell pointer at position `n` (end).
@@ -608,6 +624,7 @@ impl<'a> Btree<'a> {
             borrowed.set_n_cells(n + 1);
             borrowed.dirty = true;
         }
+        drop(borrowed);
         self.pager.note_dirty(leaf_id);
         Ok(())
     }

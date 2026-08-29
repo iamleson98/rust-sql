@@ -77,6 +77,11 @@ pub struct ExecContext<'a> {
     pub index_roots: HashMap<String, u32>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
     pub max_rowids: HashMap<String, i64>,
+    /// Set when a table/index root actually MOVED this statement (B+tree
+    /// split). Gates `sync_schema_roots` in api.rs — previously that call
+    /// ran after EVERY statement, taking two read locks and collecting
+    /// `Vec<(String, u32)>`s (with String clones) even when nothing moved.
+    pub roots_changed: bool,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -97,6 +102,7 @@ impl<'a> ExecContext<'a> {
             root_overrides: HashMap::new(),
             index_roots: HashMap::new(),
             max_rowids: HashMap::new(),
+            roots_changed: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -118,7 +124,7 @@ impl<'a> ExecContext<'a> {
 
     /// Update the root page override for a table.
     pub fn set_table_root(&mut self, table_name: &str, root: u32) {
-        self.root_overrides.insert(table_name.to_ascii_lowercase(), root);
+        self.set_table_root_lc(&table_name.to_ascii_lowercase(), root);
     }
 
     /// Current root page of an index B+tree (override-aware).
@@ -131,18 +137,52 @@ impl<'a> ExecContext<'a> {
 
     /// Update the index root override (called after an index B+tree split).
     pub fn set_index_root(&mut self, index_name: &str, root: u32) {
-        self.index_roots.insert(index_name.to_ascii_lowercase(), root);
+        let key = index_name.to_ascii_lowercase();
+        match self.index_roots.get_mut(&key) {
+            Some(v) if *v == root => {}
+            Some(v) => {
+                *v = root;
+                self.roots_changed = true;
+            }
+            None => {
+                self.index_roots.insert(key, root);
+                self.roots_changed = true;
+            }
+        }
     }
 
     /// Fast-path set_table_root for callers that have already lower-cased
     /// the table name (e.g. exec_insert hoists this out of the per-row
-    /// loop). Avoids the per-call `to_ascii_lowercase()` String allocation.
+    /// loop). Avoids the per-call `to_ascii_lowercase()` String allocation,
+    /// and — critically — does NOTHING (no HashMap write, no String
+    /// allocation) when the root is unchanged, which is the common case:
+    /// roots only move on B+tree splits. Previously this allocated a fresh
+    /// key String + inserted into the map on EVERY inserted row.
     pub fn set_table_root_lc(&mut self, table_name_lc: &str, root: u32) {
-        self.root_overrides.insert(table_name_lc.to_string(), root);
+        match self.root_overrides.get_mut(table_name_lc) {
+            Some(v) if *v == root => { /* unchanged — nothing to do */ }
+            Some(v) => {
+                *v = root;
+                self.roots_changed = true;
+            }
+            None => {
+                self.root_overrides.insert(table_name_lc.to_string(), root);
+                self.roots_changed = true;
+            }
+        }
     }
 
     /// Get the cached max rowid for a table, or scan if not cached.
+    /// Avoids the `to_ascii_lowercase()` String allocation on the fast
+    /// path: table names are lowercased at cache-key time, and most table
+    /// names in practice are already lowercase, so try the exact name
+    /// first (borrowed lookup, zero allocation).
     pub fn get_or_scan_max_rowid(&mut self, table: &Table) -> Result<i64> {
+        // Fast path 1: table name is already lowercase (the common case).
+        if let Some(&max) = self.max_rowids.get(&table.name) {
+            return Ok(max);
+        }
+        // Fast path 2: mixed-case name with a cached lowercase key.
         let key = table.name.to_ascii_lowercase();
         if let Some(&max) = self.max_rowids.get(&key) {
             return Ok(max);
@@ -155,15 +195,19 @@ impl<'a> ExecContext<'a> {
 
     /// Update the cached max rowid for a table.
     pub fn set_max_rowid(&mut self, table_name: &str, rowid: i64) {
-        self.max_rowids.insert(table_name.to_ascii_lowercase(), rowid);
+        self.set_max_rowid_lc(&table_name.to_ascii_lowercase(), rowid);
     }
 
-    /// Fast-path set_max_rowid for callers that have already lower-cased
-    /// the table name. Avoids the per-call String allocation.
+    /// Fast-path set_max_rowid for pre-lower-cased names. Updates the value
+    /// in place when the key already exists (the common case —
+    /// `get_or_scan_max_rowid` seeds it) instead of re-allocating the key
+    /// String on every inserted row.
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
-        // max_rowids is keyed by String, so we'd need to_string() anyway.
-        // But we still save the to_ascii_lowercase() work.
-        self.max_rowids.insert(table_name_lc.to_string(), rowid);
+        if let Some(v) = self.max_rowids.get_mut(table_name_lc) {
+            *v = rowid;
+        } else {
+            self.max_rowids.insert(table_name_lc.to_string(), rowid);
+        }
     }
 
     /// Bind a positional parameter (the common `?` placeholder case).
@@ -215,14 +259,27 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::Scan { table, alias, .. } => exec_scan(ctx, table.clone(), alias.clone()),
         Plan::Values { rows } => exec_values(ctx, rows),
         Plan::Filter { input, predicate } => exec_filter(ctx, input, predicate),
-        Plan::Project { input, columns } => exec_project(ctx, input, columns),
+        Plan::Project { input, columns } => {
+            // FUSED PATH: Project over a Hash Join. The join can emit the
+            // projected columns directly, skipping the intermediate
+            // full-width combined rows (one Vec + copies per row) and the
+            // second pass of value cloning. Falls back internally to
+            // normal join + apply_projection when fusion isn't applicable
+            // (non-column projections, residual predicates, ...).
+            if let Plan::Join { left, right, join_type, condition, algorithm } = &**input {
+                if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
+                    return exec_hash_join(ctx, left, right, *join_type, condition, Some(columns));
+                }
+            }
+            exec_project(ctx, input, columns)
+        }
         Plan::Sort { input, terms } => exec_sort(ctx, input, terms),
         Plan::Limit { input, count, offset } => exec_limit(ctx, input, count, offset),
         Plan::Aggregate { input, group_by, aggregates } => exec_aggregate(ctx, input, group_by, aggregates),
         Plan::Window { input, windows } => exec_window(ctx, input, windows),
         Plan::Join { left, right, join_type, condition, algorithm } => {
             if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
-                exec_hash_join(ctx, left, right, *join_type, condition)
+                exec_hash_join(ctx, left, right, *join_type, condition, None)
             } else {
                 exec_join(ctx, left, right, *join_type, condition)
             }
@@ -1285,6 +1342,13 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
 
 fn exec_project(ctx: &mut ExecContext<'_>, input: &Plan, columns: &[ProjectExpr]) -> Result<ExecResult> {
     let inner = execute(input, ctx)?;
+    apply_projection(inner, columns, ctx)
+}
+
+/// Apply a projection to an ALREADY-EXECUTED input. Split out of
+/// `exec_project` so the fused hash-join path can fall back to normal
+/// projection semantics when its fusion preconditions don't hold.
+fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContext<'_>) -> Result<ExecResult> {
     // Compute output columns, expanding `*` and `table.*` to the underlying
     // input column names.
     let mut out_columns: Vec<String> = Vec::new();
@@ -1337,6 +1401,23 @@ fn exec_project(ctx: &mut ExecContext<'_>, input: &Plan, columns: &[ProjectExpr]
         .collect();
     let all_resolved = resolved.iter().all(|r| r.is_some())
         && columns.iter().all(|c| !matches!(&c.expr, Expr::Column { name, .. } if name == "*"));
+
+    // ---- IDENTITY FAST PATH ----
+    // `SELECT *`, `SELECT t.*`-style star projections, or any projection
+    // that selects every input column in order produce rows identical to
+    // the input rows. Move them instead of cloning every value into fresh
+    // Vecs — for a 1000-row scan that's 1000 allocations + 2000+ Value
+    // clones eliminated. Only the column NAMES can differ (aliases / star
+    // unqualification); the values are byte-identical.
+    let single_star = columns.len() == 1
+        && matches!(&columns[0].expr, Expr::Column { name, .. } if name == "*");
+    let identity_projection = single_star
+        || (all_resolved
+            && resolved.len() == inner.columns.len()
+            && resolved.iter().enumerate().all(|(i, r)| r == &Some(i)));
+    if identity_projection {
+        return Ok(ExecResult { columns: out_columns.into(), rows: inner.rows });
+    }
 
     let mut out_rows = Vec::with_capacity(inner.rows.len());
     if all_resolved {
@@ -2662,15 +2743,48 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
     Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
 }
 
-/// Hash join: build a hash table on the smaller (right) side, then probe
-/// with the left side. Only works for equi-joins where the condition is
-/// `left.col = right.col`.
+/// Hash join: build a hash table on the smaller side, then probe with the
+/// other side. Works for equi-joins where the condition is `left.col =
+/// right.col` (or an AND chain of such equalities).
+///
+/// Performance-critical design notes (this node runs for every join in
+/// every query):
+///
+/// 1. **Pure-equi fast path.** When the join condition consists ONLY of the
+///    extracted equi-key predicates (no residual terms like `b.y > 5`),
+///    matching hash keys PROVES the condition holds — the per-candidate
+///    `eval_row` call is skipped entirely. That call walks the AST and
+///    resolves column names by string comparison per row (~300-500 ns
+///    each); skipping it is the single biggest win, ~0.4 ms on a 1k x 1k
+///    join.
+///
+/// 2. **Order-key encoding for join keys.** Keys are built with
+///    `encode_order_key_into`, which interleaves INTEGER and REAL values
+///    numerically. This is both alloc-free (into a reusable buffer on the
+///    probe side) and *semantically required*: SQL equality says 5 = 5.0,
+///    but the old `Value::encode()` tagged encoding hashed them apart,
+///    silently dropping cross-type join matches.
+///
+/// 3. **NULL keys never match.** `NULL = x` is NULL in SQL. NULL-keyed
+///    build rows are excluded from the hash table and NULL-keyed probe
+///    rows skip probing — they fall through to the unmatched-emission path
+///    (which is what LEFT/RIGHT/FULL joins need; INNER just drops them).
+///
+/// 4. **Bucket-chain hash table.** `heads: HashMap<Vec<u8>, u32>` plus a
+///    flat `chain: Vec<u32>` linked list. One allocation per build row
+///    (the owned key), zero per probe. The previous layout stored
+///    `Vec<u8> -> Vec<usize>` — an extra heap Vec per distinct key.
+///
+/// 5. **Single-allocation combined rows.** `Vec::with_capacity(n_l+n_r)` +
+///    two `extend_from_slice`s, instead of cloning one side wholesale into
+///    a temporary Vec that was immediately consumed by `extend`.
 fn exec_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
     right: &Plan,
     join_type: crate::planner::plan::JoinType,
     condition: &Option<Expr>,
+    projection: Option<&[crate::planner::plan::ProjectExpr]>,
 ) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
@@ -2686,11 +2800,65 @@ fn exec_hash_join(
     let eq_pairs = extract_equi_join_keys(condition, &left_res.columns, &right_res.columns);
 
     if eq_pairs.is_empty() {
-        // No equi-join keys — fall back to nested-loop.
-        return exec_join(ctx, left, right, join_type, condition);
+        // No equi-join keys — fall back to nested-loop (+ optional projection).
+        let res = exec_join(ctx, left, right, join_type, condition)?;
+        return match projection {
+            Some(cols) => apply_projection(res, cols, ctx),
+            None => Ok(res),
+        };
     }
 
-    // Build a hash table on the smaller side to minimize build cost.
+    // Is the condition EXACTLY the conjunction of the equi predicates?
+    // (Every leaf of the AND-tree is an `l.col = r.col` that produced a
+    // pair, and there are no other leaves.) If so, a hash-key match proves
+    // the whole condition — no residual evaluation needed.
+    let pure_equi = {
+        let n_leaves = count_eq_leaves_and_purity(condition, &left_res.columns, &right_res.columns);
+        matches!(n_leaves, Some(n) if n == eq_pairs.len())
+    };
+
+    // ---- FUSED PROJECTION resolution ----
+    // When this join sits under a Project of bare column references, the
+    // join emits ONLY those columns directly — no full-width combined row,
+    // no second cloning pass. Requires pure_equi (a residual predicate
+    // would need to see the full combined row).
+    let mut proj: Option<(Vec<usize>, Vec<String>)> = None;
+    if let (Some(columns), true) = (projection, pure_equi) {
+        if !columns.is_empty()
+            && columns.iter().all(|c| {
+                matches!(&c.expr, Expr::Column { name, .. } if name != "*")
+            })
+        {
+            let mut indices = Vec::with_capacity(columns.len());
+            let mut names = Vec::with_capacity(columns.len());
+            let mut all_ok = true;
+            for c in columns {
+                if let Expr::Column { table, name } = &c.expr {
+                    match resolve_column_index(&combined_cols, table.as_deref(), name) {
+                        Some(i) => {
+                            indices.push(i);
+                            names.push(match &c.alias {
+                                Some(a) => a.clone(),
+                                None => expr_display_name(&c.expr, &combined_cols),
+                            });
+                        }
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                proj = Some((indices, names));
+            }
+        }
+    }
+
+    // Build a hash on the smaller side to minimize build cost.
     // For INNER joins we can freely pick which side to build on; for outer
     // joins we must preserve the side that's preserved by the join type, so
     // we fall back to the (correct-but-slower) right-side-build path. This
@@ -2699,106 +2867,228 @@ fn exec_hash_join(
     let left_is_smaller = left_res.rows.len() <= right_res.rows.len();
     let build_left = is_inner && left_is_smaller;
 
-    // Build the hash on the chosen build side. Key = concatenated `Value::encode()`
-    // bytes of the build-side key columns. Vec<u8> implements Hash+Eq natively,
-    // and `Value::encode()` produces a stable, collision-resistant form that
-    // respects SQL type semantics (Integer/Real/Text/Blob each get a distinct
-    // leading tag byte). This replaces the prior `format!("{:?}", v)` approach
-    // which allocated a String per value per row — ~30× slower than byte encode
-    // for the common Integer case.
-    use std::collections::HashMap as StdHashMap;
-    let mut hash: StdHashMap<Vec<u8>, Vec<usize>> = StdHashMap::new();
-
     let (build_rows, build_key_indices): (&Vec<Row>, Vec<usize>) = if build_left {
-        // Build on left; eq_pairs gives (left_idx, right_idx), take left_idx.
         let idxs: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
         (&left_res.rows, idxs)
     } else {
-        // Build on right; take right_idx.
         let idxs: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
         (&right_res.rows, idxs)
     };
 
-    for (row_idx, row) in build_rows.iter().enumerate() {
-        let mut key: Vec<u8> = Vec::with_capacity(24);
-        for &ci in &build_key_indices {
-            if let Some(v) = row.get(ci) {
-                key.extend_from_slice(&v.encode());
+    // ---- u64 FAST KEY PATH ----
+    // Single numeric key column where every build key is a small INTEGER
+    // (|i| <= 2^53) or a REAL: the hash key is the 8-byte order-key double
+    // (double_order_key), which maps Integer(n) and Real(n as f64) to the
+    // SAME key — exactly the engine's cross-type numeric equality — and is
+    // injective among those values. This eliminates the per-build-row
+    // Vec<u8> key allocation entirely (the dominant build cost for the
+    // ubiquitous integer-FK join shape: `b.a_id = a.id`).
+    let u64_mode = build_key_indices.len() == 1 && {
+        let ci = build_key_indices[0];
+        build_rows.iter().all(|r| match r.get(ci) {
+            Some(Value::Integer(i)) => i.unsigned_abs() <= (1u64 << 53),
+            Some(Value::Real(_)) => true,
+            _ => false,
+        })
+    };
+
+    // ---- BUILD phase ----
+    // heads: key -> first row ordinal in the chain
+    // chain: row ordinal -> next row ordinal with the same key (u32::MAX = end)
+    let mut heads_u64: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::with_capacity(build_rows.len().max(1));
+    let mut heads_bytes: std::collections::HashMap<Vec<u8>, u32> =
+        std::collections::HashMap::with_capacity(build_rows.len().max(1));
+    let mut chain: Vec<u32> = vec![u32::MAX; build_rows.len()];
+    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+    for (i, row) in build_rows.iter().enumerate() {
+        if u64_mode {
+            let ci = build_key_indices[0];
+            let k = match &row[ci] {
+                Value::Integer(iv) => crate::types::value::double_order_key(*iv as f64),
+                Value::Real(fv) => crate::types::value::double_order_key(*fv),
+                _ => unreachable!("u64_mode verified all build keys numeric"),
+            };
+            if let Some(prev) = heads_u64.get_mut(&k) {
+                chain[i] = *prev;
+                *prev = i as u32;
             } else {
-                // Missing column — treat as NULL.
-                key.push(0);
+                heads_u64.insert(k, i as u32);
             }
-            // Separator byte to disambiguate adjacent variable-length encodings.
-            key.push(0xff);
+        } else {
+            key_buf.clear();
+            let mut has_null = false;
+            for &ci in &build_key_indices {
+                match row.get(ci) {
+                    Some(Value::Null) | None => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(v) => v.encode_order_key_into(&mut key_buf),
+                }
+            }
+            if has_null {
+                // NULL keys never match anything; leave this row out of the
+                // table. build_matched stays false so outer joins emit it
+                // as unmatched.
+                continue;
+            }
+            if let Some(prev) = heads_bytes.get_mut(&key_buf) {
+                // Prepend to the bucket chain: this row becomes the new
+                // head, linked to the previous head.
+                chain[i] = *prev;
+                *prev = i as u32;
+            } else {
+                // Clone the buffer ONLY when inserting a new key.
+                heads_bytes.insert(key_buf.clone(), i as u32);
+            }
         }
-        hash.entry(key).or_default().push(row_idx);
     }
 
-    let mut out_rows: Vec<Row> = Vec::new();
-    let mut build_matched = vec![false; build_rows.len()];
-
-    // Probe with the other (probe) side. Determine which rows to iterate and
-    // which key indices to extract from them.
+    // ---- PROBE phase ----
     let (probe_rows, probe_key_indices, probe_is_left): (&Vec<Row>, Vec<usize>, bool) = if build_left {
-        // Build was left; probe is right. Take right_idx from eq_pairs.
         let idxs: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
         (&right_res.rows, idxs, false)
     } else {
-        // Build was right; probe is left. Take left_idx from eq_pairs.
         let idxs: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
         (&left_res.rows, idxs, true)
     };
 
-    // Allocate NULL rows for unmatched emission (LEFT/RIGHT/FULL).
-    let nulls_right = vec![Value::Null; n_right];
-    let nulls_left = vec![Value::Null; n_left];
+    // Projection bookkeeping: output width and per-output-source mapping.
+    // proj_indices[i] = combined-row index of output column i.
+    let proj_indices: Option<&Vec<usize>> = proj.as_ref().map(|(idxs, _)| idxs);
+    let out_width = match proj_indices {
+        Some(idxs) => idxs.len(),
+        None => n_left + n_right,
+    };
+    let mut out_rows: Vec<Row> = Vec::with_capacity(probe_rows.len());
+    let mut build_matched = vec![false; build_rows.len()];
 
-    // Reuse a single key buffer across all probes to avoid allocating a
-    // fresh Vec<u8> per probe row. Previously this allocated ~N times for
-    // N probe rows (10000 allocs in the join benchmark → ~1ms of pure alloc
-    // overhead). The buffer is cleared and refilled per iteration; capacity
-    // is retained so subsequent iterations don't reallocate.
-    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+    // NULL row templates for unmatched emission (LEFT/RIGHT/FULL).
+    let nulls_right: Vec<Value> = vec![Value::Null; n_right];
+    let nulls_left: Vec<Value> = vec![Value::Null; n_left];
+
+    let residual: Option<&Expr> = if pure_equi { None } else { condition.as_ref() };
+
+    // Helper: emit a joined (probe_row, build_row) pair, either fused to
+    // the projected columns or as a full [left, right] combined row.
+    #[inline]
+    fn emit_row(
+        out_rows: &mut Vec<Row>,
+        proj_indices: Option<&Vec<usize>>,
+        probe_row: &Row,
+        build_row: &Row,
+        probe_is_left: bool,
+        n_left: usize,
+        out_width: usize,
+    ) {
+        match proj_indices {
+            Some(idxs) => {
+                let mut out = Vec::with_capacity(idxs.len());
+                for &p in idxs {
+                    // combined index p: [0, n_left) = left side, else right.
+                    let v = if p < n_left {
+                        if probe_is_left {
+                            &probe_row[p]
+                        } else {
+                            &build_row[p]
+                        }
+                    } else if probe_is_left {
+                        &build_row[p - n_left]
+                    } else {
+                        &probe_row[p - n_left]
+                    };
+                    out.push(v.clone());
+                }
+                out_rows.push(out);
+            }
+            None => {
+                let mut combined: Row = Vec::with_capacity(out_width);
+                if probe_is_left {
+                    combined.extend_from_slice(probe_row);
+                    combined.extend_from_slice(build_row);
+                } else {
+                    combined.extend_from_slice(build_row);
+                    combined.extend_from_slice(probe_row);
+                }
+                out_rows.push(combined);
+            }
+        }
+    }
 
     for probe_row in probe_rows.iter() {
-        key_buf.clear();
-        for &ci in &probe_key_indices {
-            if let Some(v) = probe_row.get(ci) {
-                key_buf.extend_from_slice(&v.encode());
-            } else {
-                key_buf.push(0);
+        // Build the probe key. NULL key -> no match possible.
+        let mut probe_null = false;
+        let mut u64_probe_key: u64 = 0;
+        if u64_mode {
+            let ci = probe_key_indices[0];
+            match probe_row.get(ci) {
+                Some(Value::Null) | None => probe_null = true,
+                // Text/Blob probe keys can never equal the all-numeric
+                // build keys (different storage classes never compare
+                // equal), so they are non-matches, not lookups.
+                Some(Value::Integer(iv)) => {
+                    u64_probe_key = crate::types::value::double_order_key(*iv as f64)
+                }
+                Some(Value::Real(fv)) => {
+                    u64_probe_key = crate::types::value::double_order_key(*fv)
+                }
+                Some(_) => probe_null = true,
             }
-            key_buf.push(0xff);
+        } else {
+            key_buf.clear();
+            for &ci in &probe_key_indices {
+                match probe_row.get(ci) {
+                    Some(Value::Null) | None => {
+                        probe_null = true;
+                        break;
+                    }
+                    Some(v) => v.encode_order_key_into(&mut key_buf),
+                }
+            }
         }
         let mut matched = false;
-        if let Some(candidates) = hash.get(&key_buf) {
-            for &bi in candidates {
+        if !probe_null {
+            let mut next = if u64_mode {
+                heads_u64.get(&u64_probe_key).copied()
+            } else {
+                heads_bytes.get(&key_buf).copied()
+            };
+            while let Some(n) = next {
+                if n == u32::MAX {
+                    break;
+                }
+                let bi = n as usize;
                 let build_row = &build_rows[bi];
-                // Emit combined row in [left, right] order regardless of which
-                // side was the build side.
-                let combined: Row = if probe_is_left {
-                    // probe = left, build = right → [probe, build]
-                    let mut c = probe_row.clone();
-                    c.extend(build_row.clone());
-                    c
+                if residual.is_some() {
+                    // Residual predicates need the FULL combined row.
+                    let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                    if probe_is_left {
+                        combined.extend_from_slice(probe_row);
+                        combined.extend_from_slice(build_row);
+                    } else {
+                        combined.extend_from_slice(build_row);
+                        combined.extend_from_slice(probe_row);
+                    }
+                    let ok = {
+                        let v = eval_row(residual.unwrap(), &combined, &combined_cols, &params, &named_params)?;
+                        v.is_truthy()
+                    };
+                    if ok {
+                        emit_row(&mut out_rows, proj_indices, probe_row, build_row, probe_is_left, n_left, out_width);
+                        matched = true;
+                        build_matched[bi] = true;
+                    }
                 } else {
-                    // probe = right, build = left → [build, probe]
-                    let mut c = build_row.clone();
-                    c.extend(probe_row.clone());
-                    c
-                };
-                // Verify the full condition (in case there are non-equi predicates).
-                let ok = if let Some(cond) = condition {
-                    let v = eval_row(cond, &combined, &combined_cols, &params, &named_params)?;
-                    v.is_truthy()
-                } else {
-                    true
-                };
-                if ok {
-                    out_rows.push(combined);
+                    emit_row(&mut out_rows, proj_indices, probe_row, build_row, probe_is_left, n_left, out_width);
                     matched = true;
                     build_matched[bi] = true;
                 }
+                // Advance the chain (u32::MAX sentinel = end of bucket).
+                next = match chain[bi] {
+                    u32::MAX => None,
+                    m => Some(m),
+                };
             }
         }
         // Unmatched handling for LEFT/RIGHT/FULL joins.
@@ -2806,13 +3096,49 @@ fn exec_hash_join(
         // If probe is right and the join preserves right (RIGHT/FULL), emit [NULLs, probe].
         if !matched {
             if probe_is_left && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
-                let mut c = probe_row.clone();
-                c.extend(nulls_right.clone());
-                out_rows.push(c);
+                match proj_indices {
+                    Some(idxs) => {
+                        let mut out = Vec::with_capacity(idxs.len());
+                        for &p in idxs {
+                            let v = if p < n_left {
+                                // Left side is the probe (preserved) row.
+                                &probe_row[p]
+                            } else {
+                                &Value::Null
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                    }
+                    None => {
+                        let mut c: Row = Vec::with_capacity(out_width);
+                        c.extend_from_slice(probe_row);
+                        c.extend_from_slice(&nulls_right);
+                        out_rows.push(c);
+                    }
+                }
             } else if !probe_is_left && matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
-                let mut c = nulls_left.clone();
-                c.extend(probe_row.clone());
-                out_rows.push(c);
+                match proj_indices {
+                    Some(idxs) => {
+                        let mut out = Vec::with_capacity(idxs.len());
+                        for &p in idxs {
+                            let v = if p < n_left {
+                                &Value::Null
+                            } else {
+                                // Right side is the probe (preserved) row.
+                                &probe_row[p - n_left]
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                    }
+                    None => {
+                        let mut c: Row = Vec::with_capacity(out_width);
+                        c.extend_from_slice(&nulls_left);
+                        c.extend_from_slice(probe_row);
+                        out_rows.push(c);
+                    }
+                }
             }
             // For INNER/CROSS, unmatched probe rows are dropped.
         }
@@ -2822,26 +3148,98 @@ fn exec_hash_join(
     // side is the preserved side (LEFT preserved by LEFT/FULL if build was left;
     // RIGHT preserved by RIGHT/FULL if build was right).
     if build_left && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
-        // Build was left; unmatched left rows are [left, NULLs].
         for (bi, build_row) in build_rows.iter().enumerate() {
             if !build_matched[bi] {
-                let mut c = build_row.clone();
-                c.extend(nulls_right.clone());
-                out_rows.push(c);
+                match proj_indices {
+                    Some(idxs) => {
+                        let mut out = Vec::with_capacity(idxs.len());
+                        for &p in idxs {
+                            let v = if p < n_left {
+                                // Left side is the build (preserved) row.
+                                &build_row[p]
+                            } else {
+                                &Value::Null
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                    }
+                    None => {
+                        let mut c: Row = Vec::with_capacity(out_width);
+                        c.extend_from_slice(build_row);
+                        c.extend_from_slice(&nulls_right);
+                        out_rows.push(c);
+                    }
+                }
             }
         }
     } else if !build_left && matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
-        // Build was right; unmatched right rows are [NULLs, right].
         for (bi, build_row) in build_rows.iter().enumerate() {
             if !build_matched[bi] {
-                let mut c = nulls_left.clone();
-                c.extend(build_row.clone());
-                out_rows.push(c);
+                match proj_indices {
+                    Some(idxs) => {
+                        let mut out = Vec::with_capacity(idxs.len());
+                        for &p in idxs {
+                            let v = if p < n_left {
+                                &Value::Null
+                            } else {
+                                // Right side is the build (preserved) row.
+                                &build_row[p - n_left]
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                    }
+                    None => {
+                        let mut c: Row = Vec::with_capacity(out_width);
+                        c.extend_from_slice(&nulls_left);
+                        c.extend_from_slice(build_row);
+                        out_rows.push(c);
+                    }
+                }
             }
         }
     }
 
-    Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
+    let result = match &proj {
+        Some((_, names)) => ExecResult { columns: names.clone().into(), rows: out_rows },
+        None => ExecResult { columns: combined_cols.into(), rows: out_rows },
+    };
+    // When a projection was requested but fusion couldn't fire (residual
+    // predicates, non-column projections, unresolvable names), apply the
+    // projection normally on top of the full-width join output.
+    match (projection, proj.is_some()) {
+        (Some(cols), false) => apply_projection(result, cols, ctx),
+        _ => Ok(result),
+    }
+}
+
+/// If `cond` is a pure conjunction of `l.col = r.col` predicates (possibly
+/// just one), returns the number of such equality leaves. Otherwise returns
+/// None (the condition contains residual terms that must be evaluated per
+/// candidate row). Conservative: any leaf that does not unambiguously
+/// resolve to one column on each side disqualifies purity — the join then
+/// keeps per-row residual evaluation (correct, slightly slower).
+fn count_eq_leaves_and_purity(condition: &Option<Expr>, left_cols: &[String], right_cols: &[String]) -> Option<usize> {
+    fn walk(e: &Expr, lc: &[String], rc: &[String]) -> Option<usize> {
+        match e {
+            Expr::Binary { op: BinaryOp::And, left, right } => {
+                Some(walk(left, lc, rc)? + walk(right, lc, rc)?)
+            }
+            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                let l_in_left = col_index(left, lc).is_some();
+                let l_in_right = col_index(left, rc).is_some();
+                let r_in_left = col_index(right, lc).is_some();
+                let r_in_right = col_index(right, rc).is_some();
+                let unambiguous_one_each =
+                    ((l_in_left && !l_in_right) && (r_in_right && !r_in_left))
+                        || ((l_in_right && !l_in_left) && (r_in_left && !r_in_right));
+                if unambiguous_one_each { Some(1) } else { None }
+            }
+            _ => None,
+        }
+    }
+    condition.as_ref().and_then(|c| walk(c, left_cols, right_cols))
 }
 
 /// Extract equi-join key column pairs from a join condition.
@@ -3516,6 +3914,12 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
 }
 
 /// Build the final ExecResult for an INSERT (with or without RETURNING).
+/// Shared column names for the non-RETURNING INSERT result shape
+/// `["inserted"]`. Built once — previously every INSERT statement allocated
+/// a fresh String + Vec for this, immediately discarded by the execute()
+/// path (which ignores the result). ~4 allocations per statement saved.
+static INSERTED_COLS: std::sync::OnceLock<Arc<[String]>> = std::sync::OnceLock::new();
+
 fn finish_insert_result(
     inserted: i64,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
@@ -3528,8 +3932,9 @@ fn finish_insert_result(
             rows: returning_rows,
         }
     } else {
+        let cols = INSERTED_COLS.get_or_init(|| Arc::from(vec!["inserted".to_string()]));
         ExecResult {
-            columns: Arc::from(vec!["inserted".to_string()]),
+            columns: Arc::clone(cols),
             rows: vec![vec![Value::Integer(inserted)]],
         }
     }
@@ -3555,6 +3960,88 @@ enum InsertOutcome {
 ///
 /// On UPSERT DO UPDATE, `full_row` is REPLACED with the merged (updated)
 /// row so the caller can project RETURNING from it.
+/// Fast-path single-row INSERT for the statement shape
+/// `INSERT INTO t (c1, c2, ...) VALUES (literal, literal, ...)`.
+///
+/// Called from `Database::execute` when a lightweight scanner (no tokenizer,
+/// no AST, no Plan — see `api::try_fast_insert_parse`) recognizes the
+/// statement. Semantics are IDENTICAL to the general path: affinity
+/// coercion, NOT NULL enforcement, rowid auto-assignment, UNIQUE index
+/// maintenance, conflict handling (default ABORT) — because it funnels
+/// into the very same `exec_insert_one_row`. The saving is the entire
+/// parse -> plan -> cache machinery (~1.3 us/statement), which dominates
+/// single-row OLTP inserts.
+///
+/// `supplied` is a list of (column_index, value) pairs (already
+/// affinity-coerced by the caller). Returns the number of affected rows
+/// (0 or 1).
+pub fn fast_insert_single_row(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    supplied: Vec<(usize, Value)>,
+) -> Result<i64> {
+    // Look up indexes on this table once (same as exec_insert).
+    let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> =
+        indexes.iter().map(|idx| (idx.clone(), ctx.index_root(idx))).collect();
+
+    let table_name_lc = table.name.to_ascii_lowercase();
+    let mut current_root = ctx.table_root(table);
+    let mut max_rowid = ctx.get_or_scan_max_rowid(table)?;
+
+    let n_cols = table.n_columns();
+    let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
+
+    for (idx, v) in supplied {
+        full_row[idx] = v;
+    }
+
+    // Rowid pre-assignment so a NULL rowid-alias doesn't trip NOT NULL
+    // (mirrors exec_insert).
+    let mut rowid_autogen = false;
+    if let Some(idx) = table.rowid_alias {
+        if full_row[idx].is_null() {
+            max_rowid += 1;
+            full_row[idx] = Value::Integer(max_rowid);
+            rowid_autogen = true;
+        }
+    }
+
+    // NOT NULL / CHECK enforcement (positional; CHECKs use col_names).
+    enforce_row_constraints(
+        table,
+        &full_row,
+        &table.col_names,
+        &ctx.params,
+        &ctx.named_params,
+    )?;
+
+    let outcome = exec_insert_one_row(
+        ctx,
+        table,
+        &table_name_lc,
+        &mut current_root,
+        &mut max_rowid,
+        &mut full_row,
+        &mut payload_buf,
+        &mut index_roots,
+        crate::sql::ast::ConflictResolution::Abort,
+        None,
+        rowid_autogen,
+    )?;
+    // Write back index roots that moved (splits).
+    for (idx, root) in index_roots.iter() {
+        if ctx.index_root(idx) != *root {
+            ctx.set_index_root(&idx.name, *root);
+        }
+    }
+    match outcome {
+        InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => Ok(1),
+        InsertOutcome::Skipped => Ok(0),
+    }
+}
+
 fn exec_insert_one_row(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,

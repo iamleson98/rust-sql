@@ -10,8 +10,12 @@ use crate::error::{Error, Result};
 /// A SQL token.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
-    /// A keyword (SELECT, FROM, WHERE, etc.). Keywords are stored in uppercase.
-    Keyword(String),
+    /// A keyword (SELECT, FROM, WHERE, etc.). Points at the canonical
+    /// uppercase spelling in the static `KEYWORDS` table — zero allocation.
+    /// (Previously `Keyword(String)`, which heap-allocated on every keyword
+    /// token; a simple INSERT statement produced 5+ keyword allocations
+    /// before the parser even started.)
+    Keyword(&'static str),
     /// An unquoted identifier (e.g. `users`, `name`). Identifiers are stored
     /// as-is (case preserved).
     Ident(String),
@@ -27,8 +31,9 @@ pub enum Token {
     Blob(Vec<u8>),
     /// A parameter placeholder (`?`, `?1`, `:name`, `@name`, `$name`).
     Parameter(String),
-    /// An operator (e.g. `=`, `<=`, `+`).
-    Op(String),
+    /// An operator (e.g. `=`, `<=`, `+`). Points at a static string —
+    /// zero allocation (previously `Op(String)`, allocating per token).
+    Op(&'static str),
     /// A punctuation character (e.g. `(`, `)`, `,`, `;`, `.`).
     Punct(char),
     /// End of input.
@@ -45,7 +50,7 @@ impl Token {
     }
 
     pub fn is_op(&self, s: &str) -> bool {
-        matches!(self, Token::Op(o) if o == s)
+        matches!(self, Token::Op(o) if *o == s)
     }
 }
 
@@ -185,14 +190,30 @@ impl<'a> Lexer<'a> {
             self.advance();
             return Ok(Token::Punct(c as char));
         }
-        // Operators (multi-char first)
+        // Operators (multi-char first) — zero-allocation byte matching.
         if let Some(op) = self.try_multi_char_op() {
             return Ok(Token::Op(op));
         }
         // Single-char operator
         if matches!(c, b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'!' | b'|' | b'&' | b'~' | b'^') {
             self.advance();
-            return Ok(Token::Op((c as char).to_string()));
+            let op: &'static str = match c {
+                b'+' => "+",
+                b'-' => "-",
+                b'*' => "*",
+                b'/' => "/",
+                b'%' => "%",
+                b'=' => "=",
+                b'<' => "<",
+                b'>' => ">",
+                b'!' => "!",
+                b'|' => "|",
+                b'&' => "&",
+                b'~' => "~",
+                b'^' => "^",
+                _ => unreachable!(),
+            };
+            return Ok(Token::Op(op));
         }
         Err(Error::lex(self.line, self.col, format!("unexpected character '{}'", c as char)))
     }
@@ -210,8 +231,13 @@ impl<'a> Lexer<'a> {
         let s = std::str::from_utf8(&self.src[start..self.pos]).map_err(|_| {
             Error::lex(self.line, self.col, "invalid utf8 in identifier")
         })?;
-        if is_keyword(s) {
-            Ok(Token::Keyword(s.to_ascii_uppercase()))
+        // Zero-allocation keyword recognition: binary search over the sorted
+        // static table, comparing case-insensitively. Previously this did
+        // `s.to_ascii_uppercase()` (a String allocation per identifier!) plus
+        // a linear scan over 144 keywords (~900 string compares per INSERT
+        // statement). Now: ~7 short memcmps, no allocation.
+        if let Some(kw) = keyword_lookup(s) {
+            Ok(Token::Keyword(kw))
         } else {
             Ok(Token::Ident(s.to_string()))
         }
@@ -269,7 +295,11 @@ impl<'a> Lexer<'a> {
 
     fn lex_string(&mut self) -> Result<Token> {
         self.advance(); // skip opening quote
-        let mut out = String::new();
+        // Collect RAW BYTES, then decode as UTF-8 at the end. The previous
+        // implementation pushed each byte with `c as char`, which passes
+        // every byte through Latin-1 — multi-byte UTF-8 text like 'héllo'
+        // was silently mangled into "hÃ©llo".
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             if self.pos >= self.src.len() {
                 return Err(Error::lex(self.line, self.col, "unterminated string literal"));
@@ -278,7 +308,7 @@ impl<'a> Lexer<'a> {
             if c == b'\'' {
                 // Check for escaped quote ('')
                 if self.peek(1) == Some(b'\'') {
-                    out.push('\'');
+                    bytes.push(b'\'');
                     self.advance();
                     self.advance();
                 } else {
@@ -286,16 +316,20 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             } else {
-                out.push(c as char);
+                bytes.push(c);
                 if c == b'\n' {
                     self.line += 1;
                     self.col = 1;
+                    self.pos += 1;
                 } else {
                     self.advance();
                 }
             }
         }
-        Ok(Token::String(out))
+        let s = String::from_utf8(bytes).map_err(|_| {
+            Error::lex(self.line, self.col, "invalid utf8 in string literal")
+        })?;
+        Ok(Token::String(s))
     }
 
     fn lex_blob(&mut self) -> Result<Token> {
@@ -325,7 +359,8 @@ impl<'a> Lexer<'a> {
 
     fn lex_quoted_ident(&mut self) -> Result<Token> {
         self.advance(); // skip opening quote
-        let mut out = String::new();
+        // Raw bytes + UTF-8 decode (see lex_string — same Latin-1 bug fix).
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             if self.pos >= self.src.len() {
                 return Err(Error::lex(self.line, self.col, "unterminated quoted identifier"));
@@ -333,7 +368,7 @@ impl<'a> Lexer<'a> {
             let c = self.src[self.pos];
             if c == b'"' {
                 if self.peek(1) == Some(b'"') {
-                    out.push('"');
+                    bytes.push(b'"');
                     self.advance();
                     self.advance();
                 } else {
@@ -341,11 +376,14 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             } else {
-                out.push(c as char);
+                bytes.push(c);
                 self.advance();
             }
         }
-        Ok(Token::QuotedIdent(out))
+        let s = String::from_utf8(bytes).map_err(|_| {
+            Error::lex(self.line, self.col, "invalid utf8 in quoted identifier")
+        })?;
+        Ok(Token::QuotedIdent(s))
     }
 
     fn lex_parameter(&mut self) -> Result<Token> {
@@ -384,45 +422,29 @@ impl<'a> Lexer<'a> {
         Ok(Token::Parameter(name))
     }
 
-    fn try_multi_char_op(&mut self) -> Option<String> {
-        let two = if self.pos + 1 < self.src.len() {
-            Some((self.src[self.pos] as char, self.src[self.pos + 1] as char))
-        } else {
-            None
+    fn try_multi_char_op(&mut self) -> Option<&'static str> {
+        // Zero-allocation operator matching on raw bytes. The previous
+        // implementation called `format!("{}{}{}", ...)` for the 3-char
+        // probe AND `format!("{}{}", ...)` for the 2-char probe on EVERY
+        // operator token — 2 heap allocations just to lex `=` or `+`.
+        // (The 3-char block was dead code: no 3-char operator was ever
+        // returned.) Now: direct byte comparison, no allocation.
+        let a = *self.src.get(self.pos)?;
+        let b = *self.src.get(self.pos + 1)?;
+        let op: &'static str = match (a, b) {
+            (b'<', b'=') => "<=",
+            (b'>', b'=') => ">=",
+            (b'!', b'=') => "!=",
+            (b'<', b'>') => "<>",
+            (b'=', b'=') => "==",
+            (b'|', b'|') => "||",
+            (b'<', b'<') => "<<",
+            (b'>', b'>') => ">>",
+            _ => return None,
         };
-        let three = if self.pos + 2 < self.src.len() {
-            Some((
-                self.src[self.pos] as char,
-                self.src[self.pos + 1] as char,
-                self.src[self.pos + 2] as char,
-            ))
-        } else {
-            None
-        };
-        // Three-char operators
-        if let Some((a, b, c)) = three {
-            let s = format!("{}{}{}", a, b, c);
-            if matches!(s.as_str(), "<<" | ">>") {
-                // 2-char, fall through
-            } else if s == "!=" || s == "<=>" {
-                // 2-char, fall through
-            } else if s == "||>" || s == "|>>" {
-                // not supported
-            }
-        }
-        // Two-char operators
-        if let Some((a, b)) = two {
-            let s = format!("{}{}", a, b);
-            match s.as_str() {
-                "<=" | ">=" | "!=" | "<>" | "==" | "||" | "<<" | ">>" => {
-                    self.advance();
-                    self.advance();
-                    return Some(s);
-                }
-                _ => {}
-            }
-        }
-        None
+        self.advance();
+        self.advance();
+        Some(op)
     }
 
     fn peek(&self, offset: usize) -> Option<u8> {
@@ -436,29 +458,59 @@ impl<'a> Lexer<'a> {
 }
 
 /// Returns true if `s` is a SQL keyword (case-insensitive).
+/// Zero-allocation (previously: `KEYWORDS.contains(&s.to_ascii_uppercase())`
+/// — one String allocation + a 144-entry linear scan per call).
 pub fn is_keyword(s: &str) -> bool {
-    KEYWORDS.contains(&s.to_ascii_uppercase().as_str())
+    keyword_lookup(s).is_some()
 }
 
-/// The set of SQL keywords recognized by the lexer.
+/// Case-insensitive lookup of `s` in the sorted static keyword table.
+/// Returns the canonical uppercase spelling. ~log2(144) ≈ 8 short compares,
+/// zero allocation.
+pub fn keyword_lookup(s: &str) -> Option<&'static str> {
+    let sb = s.as_bytes();
+    KEYWORDS
+        .binary_search_by(|kw| {
+            let kb = kw.as_bytes();
+            // `& 0xDF` uppercases ASCII letters and leaves `_` untouched.
+            // Keywords contain only A-Z and `_`, so this is the identity on
+            // the array side — matching its plain byte sort order — while
+            // case-folding the probe side.
+            let n = kb.len().min(sb.len());
+            for i in 0..n {
+                let a = kb[i] & 0xDF;
+                let b = sb[i] & 0xDF;
+                if a != b {
+                    return a.cmp(&b);
+                }
+            }
+            kb.len().cmp(&sb.len())
+        })
+        .ok()
+        .map(|i| KEYWORDS[i])
+}
+
+/// The set of SQL keywords recognized by the lexer. MUST stay sorted by
+/// raw byte order (binary search in `keyword_lookup` depends on it).
 pub const KEYWORDS: &[&str] = &[
-    "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ANALYZE", "AND", "AS", "ASC",
-    "ATTACH", "AUTOINCREMENT", "BEFORE", "BEGIN", "BETWEEN", "BY", "CASCADE", "CASE",
-    "CAST", "CHECK", "COLLATE", "COLUMN", "COMMIT", "CONFLICT", "CONSTRAINT", "CREATE",
-    "CROSS", "CURRENT", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATABASE",
+    "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ANALYZE", "AND",
+    "AS", "ASC", "ATTACH", "AUTOINCREMENT", "BEFORE", "BEGIN", "BETWEEN", "BY",
+    "CASCADE", "CASE", "CAST", "CHECK", "COLLATE", "COLUMN", "COMMIT", "CONFLICT",
+    "CONSTRAINT", "CREATE", "CROSS", "CURRENT", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATABASE",
     "DEFAULT", "DEFERRABLE", "DEFERRED", "DELETE", "DESC", "DETACH", "DISTINCT", "DO",
-    "DROP", "EACH", "ELSE", "END", "ESCAPE", "EXCEPT", "EXCLUSIVE", "EXCLUDE", "EXISTS",
-    "EXPLAIN", "FAIL", "FILTER", "FOLLOWING", "FOR", "FOREIGN", "FROM", "FULL", "GLOB",
-    "GROUP", "GROUPS", "HAVING", "IF", "IGNORE", "IMMEDIATE", "IN", "INDEX", "INDEXED",
-    "INITIALLY", "INNER", "INSERT", "INSTEAD", "INTERSECT", "INTO", "IS", "ISNULL",
-    "JOIN", "KEY", "LEFT", "LIKE", "LIMIT", "MATCH", "MATERIALIZED", "NATURAL", "NO",
-    "NOT", "NOTHING", "NOTNULL", "NULL", "NULLS", "OF", "OFFSET", "ON", "OR", "ORDER",
-    "OTHERS", "OUTER", "OVER", "PARTITION", "PLAN", "PRAGMA", "PRECEDING", "PRIMARY",
-    "QUERY", "RAISE", "RANGE", "RECURSIVE", "REFERENCES", "REGEXP", "REINDEX", "RELEASE",
-    "RENAME", "REPLACE", "RESTRICT", "RETURNING", "RIGHT", "ROLLBACK", "ROW", "ROWS",
-    "SAVEPOINT", "SELECT", "SET", "STORED", "TABLE", "TEMP", "TEMPORARY", "TIES", "THEN",
-    "TO", "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE", "USING",
-    "VACUUM", "VALUES", "VIEW", "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT",
+    "DROP", "EACH", "ELSE", "END", "ESCAPE", "EXCEPT", "EXCLUDE", "EXCLUSIVE",
+    "EXISTS", "EXPLAIN", "FAIL", "FILTER", "FOLLOWING", "FOR", "FOREIGN", "FROM",
+    "FULL", "GLOB", "GROUP", "GROUPS", "HAVING", "IF", "IGNORE", "IMMEDIATE",
+    "IN", "INDEX", "INDEXED", "INITIALLY", "INNER", "INSERT", "INSTEAD", "INTERSECT",
+    "INTO", "IS", "ISNULL", "JOIN", "KEY", "LEFT", "LIKE", "LIMIT",
+    "MATCH", "MATERIALIZED", "NATURAL", "NO", "NOT", "NOTHING", "NOTNULL", "NULL",
+    "NULLS", "OF", "OFFSET", "ON", "OR", "ORDER", "OTHERS", "OUTER",
+    "OVER", "PARTITION", "PLAN", "PRAGMA", "PRECEDING", "PRIMARY", "QUERY", "RAISE",
+    "RANGE", "RECURSIVE", "REFERENCES", "REGEXP", "REINDEX", "RELEASE", "RENAME", "REPLACE",
+    "RESTRICT", "RETURNING", "RIGHT", "ROLLBACK", "ROW", "ROWS", "SAVEPOINT", "SELECT",
+    "SET", "STORED", "TABLE", "TEMP", "TEMPORARY", "THEN", "TIES", "TO",
+    "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE", "USING", "VACUUM",
+    "VALUES", "VIEW", "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT",
 ];
 
 #[cfg(test)]
