@@ -2147,18 +2147,25 @@ impl<'a> Btree<'a> {
         f: F,
     ) -> Result<()> {
         let mut f = f;
-        self.scan_index_range_subtree(self.root, start_key, &mut f, &mut false)
+        self.scan_index_range_subtree(self.root, start_key, &mut f, &mut false)?;
+        Ok(())
     }
 
     /// Recursive range scan. `started` tracks whether we've passed the start
     /// key yet (once true, every entry is visited).
+    ///
+    /// Returns `Ok(true)` to keep scanning siblings, `Ok(false)` when the
+    /// callback stopped the scan ( propagated up so the interior loop
+    /// doesn't keep binary-searching leaves past the stop point — a point
+    /// lookup previously visited EVERY leaf to the right of the match,
+    /// costing ~5 µs per lookup on a 10k-entry index).
     fn scan_index_range_subtree<F: FnMut(i64, &[u8]) -> bool>(
         &mut self,
         page_id: PageId,
         start_key: &[u8],
         f: &mut F,
         started: &mut bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
         match pt {
@@ -2193,12 +2200,12 @@ impl<'a> Btree<'a> {
                     let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     if let Cell::IndexLeaf { key, rowid } = c {
                         if !f(rowid, &key) {
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 }
                 *started = true;
-                Ok(())
+                Ok(true)
             }
             PageType::InteriorIndex => {
                 // Find the first child that can contain entries >= start_key.
@@ -2226,7 +2233,8 @@ impl<'a> Btree<'a> {
                     (n, first_cell_idx, borrowed.right_most_pointer())
                 };
                 drop(page);
-                // Visit children from first_cell_idx onward.
+                // Visit children from first_cell_idx onward, stopping as
+                // soon as the callback stops.
                 for i in first_cell_idx..n {
                     let page = self.pager.get_page(page_id)?;
                     let borrowed = page.lock();
@@ -2235,12 +2243,16 @@ impl<'a> Btree<'a> {
                     let child = c.left_child();
                     drop(borrowed);
                     drop(page);
-                    self.scan_index_range_subtree(child, start_key, f, started)?;
+                    if !self.scan_index_range_subtree(child, start_key, f, started)? {
+                        return Ok(false);
+                    }
                 }
                 if right_most != 0 {
-                    self.scan_index_range_subtree(right_most, start_key, f, started)?;
+                    if !self.scan_index_range_subtree(right_most, start_key, f, started)? {
+                        return Ok(false);
+                    }
                 }
-                Ok(())
+                Ok(true)
             }
             _ => Err(Error::corruption(format!(
                 "unexpected page type in index range scan: {:?}",

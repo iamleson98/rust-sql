@@ -48,6 +48,10 @@ pub struct ExecContext<'a> {
     pub changes: i64,
     /// When true (inside BEGIN..COMMIT), DML operators skip per-statement flushes.
     pub in_transaction: bool,
+    /// Set when the last statement was a ROLLBACK — the caller (api.rs)
+    /// must rebuild its persisted-root bookkeeping because root moves and
+    /// schema-row rewrites from the transaction were discarded.
+    pub rolled_back: bool,
     /// When true (Database::deferred_flush), DML operators skip per-statement
     /// flushes even outside an explicit transaction. Mirrors SQLite's WAL+
     /// synchronous=NORMAL behaviour. The caller (Database::execute) is
@@ -65,6 +69,12 @@ pub struct ExecContext<'a> {
     /// Updated when a B+tree split changes the root. This avoids the stale
     /// root_page problem when the catalog's Arc<Table> can't be mutated.
     pub root_overrides: HashMap<String, u32>,
+    /// Overrides for INDEX root pages (index_name -> current root page).
+    /// Same purpose as root_overrides: an index B+tree split moves the
+    /// root, but the catalog's Arc<Index> is immutable. Without this, the
+    /// first index split orphaned every entry inserted afterwards (the
+    /// catalog kept descending from the stale root).
+    pub index_roots: HashMap<String, u32>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
     pub max_rowids: HashMap<String, i64>,
     /// Marker to keep the lifetime.
@@ -80,10 +90,12 @@ impl<'a> ExecContext<'a> {
             last_insert_rowid: 0,
             changes: 0,
             in_transaction: false,
+            rolled_back: false,
             deferred_flush: false,
             txn_snapshot: None,
             catalog_ptr: catalog,
             root_overrides: HashMap::new(),
+            index_roots: HashMap::new(),
             max_rowids: HashMap::new(),
             _marker: std::marker::PhantomData,
         }
@@ -107,6 +119,19 @@ impl<'a> ExecContext<'a> {
     /// Update the root page override for a table.
     pub fn set_table_root(&mut self, table_name: &str, root: u32) {
         self.root_overrides.insert(table_name.to_ascii_lowercase(), root);
+    }
+
+    /// Current root page of an index B+tree (override-aware).
+    pub fn index_root(&self, index: &crate::schema::Index) -> u32 {
+        self.index_roots
+            .get(&index.name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(index.root_page)
+    }
+
+    /// Update the index root override (called after an index B+tree split).
+    pub fn set_index_root(&mut self, index_name: &str, root: u32) {
+        self.index_roots.insert(index_name.to_ascii_lowercase(), root);
     }
 
     /// Fast-path set_table_root for callers that have already lower-cased
@@ -2964,7 +2989,7 @@ fn exec_index_nested_loop_join(
         let key_bytes = key_value.encode_order_key();
 
         // Look up matching rowids in the index B+tree.
-        let mut index_bt = Btree::new(ctx.pager, inner_index.root_page, true);
+        let mut index_bt = Btree::new(ctx.pager, ctx.index_root(&inner_index), true);
         let rowids = index_bt.lookup_index(&key_bytes)?;
 
         // Fetch each matching row from the inner table. Deduplicate rowids
@@ -3170,8 +3195,9 @@ fn exec_index_lookup(
         v.encode_order_key_into(&mut key_bytes);
     }
 
-    // Look up matching rowids in the index.
-    let mut index_bt = Btree::new(ctx.pager, index.root_page, true);
+    // Look up matching rowids in the index (override-aware root).
+    let index_root = ctx.index_root(&index);
+    let mut index_bt = Btree::new(ctx.pager, index_root, true);
     let rowids = index_bt.lookup_index(&key_bytes)?;
 
     // Fetch each row by rowid from the table B+tree. Use the
@@ -3237,7 +3263,8 @@ fn exec_index_range(
     let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
     let mut rowids: Vec<i64> = Vec::new();
     {
-        let mut index_bt = Btree::new(ctx.pager, index.root_page, true);
+        let index_root = ctx.index_root(&index);
+        let mut index_bt = Btree::new(ctx.pager, index_root, true);
         index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
             // Exclusive lower bound: skip entries whose leading column
             // equals the bound (they share the bound's key prefix).
@@ -3305,9 +3332,10 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
 
     // Look up indexes on this table once, up front.
     let indexes = ctx.catalog().indexes_on_table(&table.name);
-    // Track current root for each index too.
+    // Track current root for each index too (seeded from the override-aware
+    // roots — the catalog snapshot may be stale after earlier splits).
     let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> = indexes
-        .iter().map(|idx| (idx.clone(), idx.root_page)).collect();
+        .iter().map(|idx| (idx.clone(), ctx.index_root(idx))).collect();
 
     // Pre-compute the lower-cased table name ONCE — set_table_root and
     // set_max_rowid both call to_ascii_lowercase() per call, which
@@ -3405,6 +3433,14 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
                 InsertOutcome::Skipped => {}
             }
         }
+        // Write back any index-root moves (splits) to the context so the
+        // NEXT statement descends from the current root — the catalog's
+        // Arc<Index> still holds the CREATE-time root.
+        for (idx, root) in index_roots.iter() {
+            if ctx.index_root(idx) != *root {
+                ctx.set_index_root(&idx.name, *root);
+            }
+        }
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
@@ -3465,6 +3501,14 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             InsertOutcome::Skipped => {}
         }
     }
+        // Write back any index-root moves (splits) to the context so the
+        // NEXT statement descends from the current root — the catalog's
+        // Arc<Index> still holds the CREATE-time root.
+        for (idx, root) in index_roots.iter() {
+            if ctx.index_root(idx) != *root {
+                ctx.set_index_root(&idx.name, *root);
+            }
+        }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
@@ -3902,17 +3946,28 @@ pub(crate) fn encode_index_key(index: &crate::schema::Index, table: &Table, row:
 }
 
 /// Insert an entry into an index for a given row.
-fn insert_index_entry(pager: &Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
+fn insert_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
     let key_bytes = encode_index_key(index, table, row);
-    let mut bt = Btree::new(pager, index.root_page, true);
-    bt.insert_index(&key_bytes, rowid)
+    // Override-aware root: an earlier split may have moved this index's
+    // root since the catalog snapshot was taken.
+    let root = ctx.index_root(index);
+    let mut bt = Btree::new(ctx.pager, root, true);
+    bt.insert_index(&key_bytes, rowid)?;
+    if bt.root != root {
+        ctx.set_index_root(&index.name, bt.root);
+    }
+    Ok(())
 }
 
 /// Delete an entry from an index for a given row.
-fn delete_index_entry(pager: &Pager, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
+fn delete_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
     let key_bytes = encode_index_key(index, table, row);
-    let mut bt = Btree::new(pager, index.root_page, true);
+    let root = ctx.index_root(index);
+    let mut bt = Btree::new(ctx.pager, root, true);
     bt.delete_index(&key_bytes, rowid)?;
+    if bt.root != root {
+        ctx.set_index_root(&index.name, bt.root);
+    }
     Ok(())
 }
 
@@ -4014,8 +4069,8 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
                 // No change to this index's key — skip maintenance.
                 continue;
             }
-            let _ = delete_index_entry(ctx.pager, idx, &table, row, rowid);
-            let _ = insert_index_entry(ctx.pager, idx, &table, &new_row, rowid);
+            let _ = delete_index_entry(ctx, idx, &table, row, rowid);
+            let _ = insert_index_entry(ctx, idx, &table, &new_row, rowid);
         }
         ctx.changes += 1;
         updated += 1;
@@ -4284,8 +4339,8 @@ fn try_streaming_update(
                     if old_key == new_key {
                         continue;
                     }
-                    let _ = delete_index_entry(ctx.pager, idx, table, &old_row_buf, *rowid);
-                    let _ = insert_index_entry(ctx.pager, idx, table, &new_row, *rowid);
+                    let _ = delete_index_entry(ctx, idx, table, &old_row_buf, *rowid);
+                    let _ = insert_index_entry(ctx, idx, table, &new_row, *rowid);
                 }
             }
         }
@@ -4415,7 +4470,7 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
                         returning_rows.push(project_returning_row(ret, &row, names, &ctx.params, &ctx.named_params)?);
                     }
                     for idx in &indexes {
-                        delete_index_entry(ctx.pager, idx, &table, &row, rowid_val)?;
+                        delete_index_entry(ctx, idx, &table, &row, rowid_val)?;
                     }
                 }
                 // Keep the cached max-rowid consistent (see below).
@@ -4470,7 +4525,7 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         ctx.set_table_root_lc(&table_name_lc, new_root);
         // Maintain indexes: delete the entry for this row.
         for idx in &indexes {
-            delete_index_entry(ctx.pager, idx, &table, row, rowid)?;
+            delete_index_entry(ctx, idx, &table, row, rowid)?;
         }
         ctx.changes += 1;
         deleted += 1;

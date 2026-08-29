@@ -691,6 +691,18 @@ static CASES: &[Case] = &[
         "SELECT COUNT(*) FROM t",
     ),
     case!(
+        "index_maintained_across_statements",
+        // Index created BEFORE inserts; splits happen mid-sequence across
+        // thousands of autocommit statements — the index root must be
+        // tracked so later entries stay reachable (regression: the first
+        // index split orphaned every entry inserted afterwards).
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
+        "CREATE INDEX idx_val ON t(val)",
+        "INSERT INTO t (val) SELECT 300 FROM (SELECT 1) UNION ALL SELECT 301",
+        "SELECT COUNT(*) FROM t WHERE val = 300",
+        "SELECT COUNT(*) FROM t WHERE val > 299",
+    ),
+    case!(
         "composite_index_lookup",
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
         "CREATE INDEX idx_ab ON t(a, b)",

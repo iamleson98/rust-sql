@@ -159,6 +159,17 @@ impl Catalog {
         self.indexes.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    /// All tables (name, table) — used by api.rs to seed the persisted-root
+    /// map after loading the schema.
+    pub fn all_tables(&self) -> Vec<(String, Arc<Table>)> {
+        self.tables.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// All indexes (name, index).
+    pub fn all_indexes(&self) -> Vec<(String, Arc<Index>)> {
+        self.indexes.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
     pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         self.views.get(&name.to_ascii_lowercase()).cloned()
     }
@@ -175,14 +186,6 @@ impl Catalog {
             .get(&table.to_ascii_lowercase())
             .cloned()
             .unwrap_or_default()
-    }
-
-    pub fn all_tables(&self) -> Vec<Arc<Table>> {
-        self.tables.values().cloned().collect()
-    }
-
-    pub fn all_indexes(&self) -> Vec<Arc<Index>> {
-        self.indexes.values().cloned().collect()
     }
 
     pub fn add_table(&mut self, table: Table) {

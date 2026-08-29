@@ -60,6 +60,16 @@ pub struct Database {
     root_overrides: RwLock<HashMap<String, u32>>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
     max_rowids: RwLock<HashMap<String, i64>>,
+    /// Current root pages for INDEX B+trees (index_name -> root). Splits
+    /// move an index root; the catalog's Arc<Index> is immutable, so the
+    /// current root is tracked here (same pattern as root_overrides).
+    index_roots: RwLock<HashMap<String, u32>>,
+    /// Root page currently persisted in the schema table per object
+    /// ("table:name" / "index:name" -> rootpage in the schema row).
+    /// `sync_schema_roots` rewrites a schema row only when the live root
+    /// diverges from this value — splits are rare, so the amortized cost
+    /// is one schema-row rewrite per split.
+    schema_root_pages: Mutex<HashMap<String, u32>>,
     /// Prepared-statement cache: SQL text → `CachedStmt`.
     /// Eliminates the parse+plan cost on repeated calls with the same SQL
     /// (the common case in real workloads: `INSERT INTO t VALUES (?)` is
@@ -134,6 +144,15 @@ impl Database {
         catalog.schema_cookie = pager.schema_cookie();
         // Load the schema from page 0 (the schema table root).
         load_schema(&mut pager, &mut catalog)?;
+        // Seed the persisted-root map from the loaded schema so
+        // sync_schema_roots only rewrites rows when a root actually moves.
+        let mut schema_root_pages = HashMap::new();
+        for (name, t) in catalog.all_tables() {
+            schema_root_pages.insert(format!("table:{}", name), t.root_page);
+        }
+        for (name, i) in catalog.all_indexes() {
+            schema_root_pages.insert(format!("index:{}", name), i.root_page);
+        }
         Ok(Self {
             pager,
             catalog,
@@ -142,6 +161,8 @@ impl Database {
             txn_snapshot: Mutex::new(None),
             root_overrides: RwLock::new(HashMap::new()),
             max_rowids: RwLock::new(HashMap::new()),
+            index_roots: RwLock::new(HashMap::new()),
+            schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(HashMap::new()),
             stmt_cache_order: Mutex::new(Vec::new()),
             stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
@@ -285,6 +306,91 @@ impl Database {
         Ok(entry)
     }
 
+    /// Persist root-page moves (from B+tree splits) into the schema rows.
+    ///
+    /// The catalog's `Arc<Table>`/`Arc<Index>` are immutable, so live roots
+    /// are tracked in `root_overrides` / `index_roots`. The schema row of
+    /// each object holds the root at CREATE time — if a split moved the
+    /// root and we never rewrite that row, a REOPENED database would
+    /// descend from the stale root and silently see only the first
+    /// subtree's rows (e.g. 10k-row table visible as ~1.8k after reopen).
+    ///
+    /// Rewrites only happen when the live root differs from the value we
+    /// last persisted (tracked in `schema_root_pages`), so the cost is one
+    /// schema-row rewrite per actual split — O(1) amortized.
+    fn sync_schema_roots(&self) -> Result<()> {
+        let tables: Vec<(String, u32)> = {
+            let ro = self.root_overrides.read();
+            ro.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        let indexes: Vec<(String, u32)> = {
+            let ir = self.index_roots.read();
+            ir.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        if tables.is_empty() && indexes.is_empty() {
+            return Ok(());
+        }
+        let mut synced = self.schema_root_pages.lock();
+        let mut dirty = false;
+        for (name, root) in tables {
+            let key = format!("table:{}", name);
+            if synced.get(&key).copied() != Some(root) {
+                self.rewrite_schema_row_root("table", &name, root)?;
+                synced.insert(key, root);
+                dirty = true;
+            }
+        }
+        for (name, root) in indexes {
+            let key = format!("index:{}", name);
+            if synced.get(&key).copied() != Some(root) {
+                self.rewrite_schema_row_root("index", &name, root)?;
+                synced.insert(key, root);
+                dirty = true;
+            }
+        }
+        if dirty {
+            // The schema rows changed — cached plans may hold stale roots.
+            self.invalidate_stmt_cache();
+            // Flush the rewritten schema rows UNLESS we're inside a
+            // transaction (dirty pages must stay in cache until COMMIT so
+            // ROLLBACK can discard them — flushing here broke
+            // rollback semantics).
+            if !self.in_transaction.load(Ordering::Acquire) {
+                let _ = self.pager.flush();
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite one schema row's rootpage: read the existing row (preserving
+    /// its name/table/sql columns), delete it, and insert the updated row.
+    fn rewrite_schema_row_root(&self, kind: &str, name: &str, new_root: u32) -> Result<()> {
+        let mut bt = Btree::new(&self.pager, 0, false);
+        let mut found: Option<(i64, Vec<Value>)> = None;
+        bt.scan_table(|rowid, payload| {
+            if let Ok(row) = decode_row(payload, 5, 0, None) {
+                if let Some((k, n, _, _, _)) = crate::schema::decode_schema_row(&row) {
+                    if k == kind && n.eq_ignore_ascii_case(name) {
+                        found = Some((rowid, row));
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        drop(bt);
+        if let Some((old_rowid, mut row)) = found {
+            if row.len() >= 4 {
+                row[3] = Value::Integer(new_root as i64);
+            }
+            let mut bt = Btree::new(&self.pager, 0, false);
+            bt.delete_table(old_rowid)?;
+            let payload = encode_row(&row);
+            bt.insert_table(old_rowid, &payload)?;
+        }
+        Ok(())
+    }
+
     /// Invalidate the statement cache. Called after any DDL statement
     /// (CREATE/DROP TABLE/INDEX/VIEW/TRIGGER) because the cached Plans hold
     /// `Arc<Table>` / `Arc<Index>` references that become stale when the
@@ -328,6 +434,7 @@ impl Database {
         ctx.txn_snapshot = txn_snap;
         ctx.root_overrides = std::mem::take(self.root_overrides.get_mut());
         ctx.max_rowids = std::mem::take(self.max_rowids.get_mut());
+        ctx.index_roots = std::mem::take(self.index_roots.get_mut());
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
@@ -363,6 +470,26 @@ impl Database {
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
         *self.max_rowids.get_mut() = std::mem::take(&mut ctx.max_rowids);
+        *self.index_roots.get_mut() = std::mem::take(&mut ctx.index_roots);
+        if result.is_ok() && ctx.rolled_back {
+            // ROLLBACK discarded in-transaction schema-row rewrites; reset
+            // the persisted-root map to the catalog's (CREATE-time) values,
+            // which match the rolled-back file.
+            let mut synced = self.schema_root_pages.lock();
+            synced.clear();
+            for (name, t) in self.catalog.all_tables() {
+                synced.insert(format!("table:{}", name), t.root_page);
+            }
+            for (name, i) in self.catalog.all_indexes() {
+                synced.insert(format!("index:{}", name), i.root_page);
+            }
+        }
+        // Persist any root-page moves (B+tree splits) to the schema rows so
+        // a reopened database sees the full tree. Without this, every table
+        // or index that split lost all data beyond the stale root on reopen.
+        if result.is_ok() {
+            self.sync_schema_roots()?;
+        }
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
         if result.is_ok() && is_ddl {
             self.invalidate_stmt_cache();
@@ -408,12 +535,17 @@ impl Database {
                 let mr = self.max_rowids.read();
                 if mr.is_empty() { HashMap::new() } else { mr.clone() }
             };
+            let index_roots = {
+                let ir = self.index_roots.read();
+                if ir.is_empty() { HashMap::new() } else { ir.clone() }
+            };
             let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
             ctx.txn_snapshot = txn_snap;
             ctx.root_overrides = root_overrides;
             ctx.max_rowids = max_rowids;
+            ctx.index_roots = index_roots;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
@@ -439,6 +571,8 @@ impl Database {
             ) {
                 *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
                 *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
+                *self.index_roots.write() = std::mem::take(&mut ctx.index_roots);
+                self.sync_schema_roots()?;
             }
             Ok(res.rows)
         } else {
@@ -474,11 +608,16 @@ impl Database {
                 let mr = self.max_rowids.read();
                 if mr.is_empty() { HashMap::new() } else { mr.clone() }
             };
+            let index_roots = {
+                let ir = self.index_roots.read();
+                if ir.is_empty() { HashMap::new() } else { ir.clone() }
+            };
             let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
             ctx.root_overrides = root_overrides;
             ctx.max_rowids = max_rowids;
+            ctx.index_roots = index_roots;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
@@ -500,6 +639,8 @@ impl Database {
             ) {
                 *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
                 *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
+                *self.index_roots.write() = std::mem::take(&mut ctx.index_roots);
+                self.sync_schema_roots()?;
             }
             Ok((res.columns.to_vec(), res.rows))
         } else {
@@ -682,10 +823,13 @@ impl Database {
                     ctx.pager.rollback_to(&snap)?;
                 }
                 ctx.in_transaction = false;
-                // Root overrides and max_rowids cached during the txn are
-                // now stale; clear them so the next op rescans.
+                // Root overrides, index roots, and max_rowids cached during
+                // the txn are now stale (their pages may not exist anymore);
+                // clear them so the next op rescans.
                 ctx.root_overrides.clear();
+                ctx.index_roots.clear();
                 ctx.max_rowids.clear();
+                ctx.rolled_back = true;
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
@@ -1734,5 +1878,86 @@ mod tests {
         assert_eq!(rows.len(), 3);
         let rows = db.query("SELECT x FROM t WHERE x >= 1.5", []).unwrap();
         assert_eq!(rows.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn roots_persist_across_reopen() {
+        // Regression: B+tree splits moved table/index roots but the schema
+        // rows kept the CREATE-time root — after reopen only the first
+        // subtree was visible (10k-row table read back as ~1.8k rows).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let mut db = Database::open(path).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+            db.execute("BEGIN", []).unwrap();
+            for i in 1..=10_000i64 {
+                db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)]).unwrap();
+            }
+            db.execute("COMMIT", []).unwrap();
+            db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
+            let c = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+            assert_eq!(c[0][0], Value::Integer(10_000));
+        }
+        let db2 = Database::open(path).unwrap();
+        let c = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(c[0][0], Value::Integer(10_000), "row count lost across reopen");
+        let r = db2.query("SELECT val FROM t WHERE id = 5000", []).unwrap();
+        assert_eq!(r[0][0], Value::Integer(5000), "row 5000 lost across reopen");
+        // Index still works after reopen.
+        let r2 = db2.query("SELECT id FROM t WHERE val = 7500", []).unwrap();
+        assert_eq!(r2.len(), 1, "index lookup lost across reopen");
+    }
+
+    #[test]
+    fn index_roots_survive_many_statements() {
+        // Regression: index root moved by a split during statement N was
+        // forgotten by statement N+1 (no override tracking) — entries past
+        // the first split were silently unreachable.
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+        db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
+        for i in 1..=3_000i64 {
+            db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i * 7)]).unwrap();
+        }
+        let mut missing = 0;
+        for i in 1..=3_000i64 {
+            let r = db.query("SELECT id FROM t WHERE val = ?", [Value::Integer(i * 7)]).unwrap();
+            if r.len() != 1 {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 0, "{} indexed rows unreachable", missing);
+        // Range scans too.
+        let r = db.query("SELECT COUNT(*) FROM t WHERE val > 14000", []).unwrap();
+        assert_eq!(r[0][0], Value::Integer(1_000)); // i*7 > 14000 → i in 2001..3000
+    }
+
+    #[test]
+    fn rollback_discards_root_moves() {
+        // Splits inside a rolled-back transaction must not leak roots or
+        // schema rewrites into the persisted state.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let mut db = Database::open(path).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+            db.execute("INSERT INTO t (val) VALUES (1)", []).unwrap();
+            db.execute("BEGIN", []).unwrap();
+            for i in 2..=5_000i64 {
+                db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)]).unwrap();
+            }
+            db.execute("ROLLBACK", []).unwrap();
+            let c = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+            assert_eq!(c[0][0], Value::Integer(1));
+        }
+        let db2 = Database::open(path).unwrap();
+        let c = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(c[0][0], Value::Integer(1), "rollback leaked rows across reopen");
     }
 }
