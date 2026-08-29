@@ -29,6 +29,27 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Shared execution state.
+/// Combined per-Database bookkeeping maps, shared with statements behind
+/// a single `Arc` — ONE read-lock acquisition + ONE refcount bump per
+/// query (previously three separate `RwLock<Arc<HashMap>>` fields:
+/// ~3 locks + 3 atomic bumps + 3 throwaway `Arc::new` allocations per
+/// query just to hand a statement its snapshots).
+#[derive(Default, Clone)]
+pub struct StmtMaps {
+    /// table name (lowercase) -> current root page
+    pub roots: HashMap<String, u32>,
+    /// index name (lowercase) -> current root page
+    pub index_roots: HashMap<String, u32>,
+    /// table name (lowercase) -> cached max rowid
+    pub max_rowids: HashMap<String, i64>,
+}
+
+impl StmtMaps {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 pub struct ExecContext<'a> {
     pub pager: &'a Pager,
     /// Positional bound parameters (`?` placeholders), indexed 0..N.
@@ -67,22 +88,16 @@ pub struct ExecContext<'a> {
     pub catalog_ptr: *const crate::schema::Catalog,
     /// LOCAL root-page overrides written by THIS statement (table_name ->
     /// current root page). Starts empty; merged into the Database's shared
-    /// snapshot at statement end (see `root_shared`).
+    /// snapshot at statement end (see `shared`).
     pub root_overrides: HashMap<String, u32>,
-    /// READ-ONLY snapshot of the Database's accumulated root overrides.
-    /// Lookups check `root_overrides` first, then this. Cloning an Arc
-    /// snapshot per statement replaced deep-cloning the whole HashMap per
-    /// statement (~250 ns of allocations+copies per query on a
-    /// post-split database).
-    pub root_shared: std::sync::Arc<HashMap<String, u32>>,
+    /// READ-ONLY snapshot of the Database's accumulated bookkeeping maps
+    /// (table roots, index roots, max-rowid cache) behind ONE Arc.
+    /// Lookups check the local overlays first, then these.
+    pub shared: std::sync::Arc<StmtMaps>,
     /// LOCAL index-root overrides written by this statement.
     pub index_roots: HashMap<String, u32>,
-    /// READ-ONLY snapshot of the Database's accumulated index roots.
-    pub index_shared: std::sync::Arc<HashMap<String, u32>>,
     /// LOCAL max-rowid cache entries written by this statement.
     pub max_rowids: HashMap<String, i64>,
-    /// READ-ONLY snapshot of the Database's accumulated max-rowid cache.
-    pub max_rowids_shared: std::sync::Arc<HashMap<String, i64>>,
     /// Set when a table/index root actually MOVED this statement (B+tree
     /// split). Gates `sync_schema_roots` in api.rs — previously that call
     /// ran after EVERY statement, taking two read locks and collecting
@@ -112,11 +127,42 @@ impl<'a> ExecContext<'a> {
             txn_snapshot: None,
             catalog_ptr: catalog,
             root_overrides: HashMap::new(),
-            root_shared: std::sync::Arc::new(HashMap::new()),
+            shared: std::sync::Arc::new(StmtMaps::empty()),
             index_roots: HashMap::new(),
-            index_shared: std::sync::Arc::new(HashMap::new()),
             max_rowids: HashMap::new(),
-            max_rowids_shared: std::sync::Arc::new(HashMap::new()),
+            roots_changed: false,
+            max_rowids_changed: false,
+            index_roots_changed: false,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Zero-allocation constructor for reader (query) paths: takes the
+    /// shared maps Arc by value (one refcount bump, paid by the caller)
+    /// instead of allocating three throwaway empty `Arc<HashMap>`s that
+    /// `new()` would create and immediately overwrite.
+    pub fn new_reader(
+        pager: &'a Pager,
+        catalog: *const crate::schema::Catalog,
+        shared: std::sync::Arc<StmtMaps>,
+    ) -> Self {
+        // Full struct literal — `..Self::new(..)` would allocate a
+        // throwaway empty `Arc<StmtMaps>` just to overwrite it.
+        Self {
+            pager,
+            params: Vec::new(),
+            named_params: HashMap::new(),
+            last_insert_rowid: 0,
+            changes: 0,
+            in_transaction: false,
+            rolled_back: false,
+            deferred_flush: false,
+            txn_snapshot: None,
+            catalog_ptr: catalog,
+            root_overrides: HashMap::new(),
+            shared,
+            index_roots: HashMap::new(),
+            max_rowids: HashMap::new(),
             roots_changed: false,
             max_rowids_changed: false,
             index_roots_changed: false,
@@ -140,14 +186,14 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.root_overrides.get(&table.name) {
             return r;
         }
-        if let Some(&r) = self.root_shared.get(&table.name) {
+        if let Some(&r) = self.shared.roots.get(&table.name) {
             return r;
         }
         let lc = table.name.to_ascii_lowercase();
         if let Some(&r) = self.root_overrides.get(&lc) {
             return r;
         }
-        self.root_shared.get(&lc).copied().unwrap_or(table.root_page)
+        self.shared.roots.get(&lc).copied().unwrap_or(table.root_page)
     }
 
     /// Update the root page override for a table.
@@ -161,26 +207,26 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.index_roots.get(&index.name) {
             return r;
         }
-        if let Some(&r) = self.index_shared.get(&index.name) {
+        if let Some(&r) = self.shared.index_roots.get(&index.name) {
             return r;
         }
         let lc = index.name.to_ascii_lowercase();
         if let Some(&r) = self.index_roots.get(&lc) {
             return r;
         }
-        self.index_shared.get(&lc).copied().unwrap_or(index.root_page)
+        self.shared.index_roots.get(&lc).copied().unwrap_or(index.root_page)
     }
 
     /// Update the index root override (called after an index B+tree split).
     pub fn set_index_root(&mut self, index_name: &str, root: u32) {
         if self.index_roots.get(index_name) == Some(&root)
-            || self.index_shared.get(index_name) == Some(&root)
+            || self.shared.index_roots.get(index_name) == Some(&root)
         {
             return;
         }
         let key = index_name.to_ascii_lowercase();
         if self.index_roots.get(&key) == Some(&root)
-            || self.index_shared.get(&key) == Some(&root)
+            || self.shared.index_roots.get(&key) == Some(&root)
         {
             return;
         }
@@ -200,7 +246,7 @@ impl<'a> ExecContext<'a> {
         // Skip when the value already matches either the local overlay or
         // the shared snapshot (roots only move on B+tree splits).
         if self.root_overrides.get(table_name_lc) == Some(&root)
-            || self.root_shared.get(table_name_lc) == Some(&root)
+            || self.shared.roots.get(table_name_lc) == Some(&root)
         {
             return;
         }
@@ -218,7 +264,7 @@ impl<'a> ExecContext<'a> {
         if let Some(&max) = self.max_rowids.get(&table.name) {
             return Ok(max);
         }
-        if let Some(&max) = self.max_rowids_shared.get(&table.name) {
+        if let Some(&max) = self.shared.max_rowids.get(&table.name) {
             // Seed the local overlay so later set_max_rowid_lc calls in
             // this statement hit the in-place fast path.
             self.max_rowids.insert(table.name.clone(), max);
@@ -230,7 +276,7 @@ impl<'a> ExecContext<'a> {
         if let Some(&max) = self.max_rowids.get(&key) {
             return Ok(max);
         }
-        if let Some(&max) = self.max_rowids_shared.get(&key) {
+        if let Some(&max) = self.shared.max_rowids.get(&key) {
             self.max_rowids.insert(key, max);
             self.max_rowids_changed = true;
             return Ok(max);
@@ -261,7 +307,7 @@ impl<'a> ExecContext<'a> {
             self.max_rowids_changed = true;
             return;
         }
-        if self.max_rowids_shared.get(table_name_lc) == Some(&rowid) {
+        if self.shared.max_rowids.get(table_name_lc) == Some(&rowid) {
             // Already at this value in the shared snapshot — nothing to do.
             return;
         }

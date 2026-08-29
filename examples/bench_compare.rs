@@ -790,6 +790,20 @@ fn main() {
     rustqlite_setup_join(&mut db_j);
     let conn_j = sqlite_open();
     sqlite_setup_join(&conn_j);
+    // Allocator steady-state warmup: the 10k-row reads + CREATE INDEX +
+    // point-lookup sections leave mimalloc with a large deferred-free list;
+    // the next allocation-heavy parse pays a one-time ~250 us purge
+    // (madvise of freed pages). Absorb it here — on BOTH engines — so the
+    // single-query join measurements below reflect steady state, exactly
+    // like the statement-cache warmup does for parse+plan.
+    {
+        let warm_sql = "SELECT u.name, o.total, o.user_id + 1 FROM users u JOIN orders o ON u.id = o.user_id + 1 WHERE u.id > ?";
+        let _ = db_j.query(warm_sql, [Value::Integer(0)]).unwrap();
+        let _ = db_j.query(warm_sql, [Value::Integer(0)]).unwrap();
+        let warm_s = "SELECT u.name, o.total, o.user_id + 1 FROM users u JOIN orders o ON u.id = o.user_id + 1 WHERE u.id > ?";
+        let mut stmt_w = conn_j.prepare(warm_s).unwrap();
+        let _ = stmt_w.query(rusqlite::params![0]).unwrap();
+    }
 
     {
         let d_r = rustqlite_join_2table(&mut db_j);

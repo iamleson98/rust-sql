@@ -13,13 +13,14 @@
 
 use crate::error::{Error, Result};
 use crate::executor::{execute, ExecContext};
+use crate::planner::plan::Plan;
 use crate::planner::Planner;
-use crate::schema::{build_table, Catalog};
+use crate::schema::{build_table, Catalog, Index, Table};
 use crate::sql::ast::*;
 use crate::sql::parse;
-use crate::storage::btree::Btree;
+use crate::storage::btree::{Btree, LookupResult};
 use crate::storage::pager::Pager;
-use crate::storage::row_codec::{decode_row, encode_row};
+use crate::storage::row_codec::{decode_row, decode_row_selective, encode_row};
 use crate::types::{Row, Value};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -108,17 +109,13 @@ pub struct Database {
     /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager's
     /// state to the pre-transaction point.
     txn_snapshot: Mutex<Option<crate::storage::pager::PagerSnapshot>>,
-    /// Root page overrides (table_name -> current root). Updated when B+tree
-    /// splits change the root, since the catalog's Arc<Table> is immutable.
-    /// RwLock so reads can run concurrently; only writes (INSERT/UPDATE/DELETE
-    /// causing a root split) take the write lock.
-    root_overrides: RwLock<std::sync::Arc<HashMap<String, u32>>>,
-    /// Max rowid per table (avoids O(n) scan on every INSERT).
-    max_rowids: RwLock<std::sync::Arc<HashMap<String, i64>>>,
-    /// Current root pages for INDEX B+trees (index_name -> root). Splits
-    /// move an index root; the catalog's Arc<Index> is immutable, so the
-    /// current root is tracked here (same pattern as root_overrides).
-    index_roots: RwLock<std::sync::Arc<HashMap<String, u32>>>,
+    /// Combined bookkeeping maps (table root overrides, index roots,
+    /// max-rowid cache) behind ONE Arc — a query snapshot is a single
+    /// read-lock + one refcount bump (previously three separate
+    /// `RwLock<Arc<HashMap>>` fields: 3 locks + 3 atomic bumps per query).
+    /// Only writes (DML causing root splits / rowid-cache fills) take the
+    /// write lock, and the writer (`&mut self`) detaches the Arc entirely.
+    maps: RwLock<std::sync::Arc<crate::executor::StmtMaps>>,
     /// Root page currently persisted in the schema table per object
     /// ("table:name" / "index:name" -> rootpage in the schema row).
     /// `sync_schema_roots` rewrites a schema row only when the live root
@@ -192,17 +189,12 @@ pub struct Database {
 /// Default capacity of the statement cache.
 const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
 
-/// Shared empty-map singletons: cloning these costs one refcount bump
-/// instead of an ArcBox allocation, which matters on the per-statement
-/// detach/attach path in `execute`.
-fn empty_arc_u32() -> Arc<HashMap<String, u32>> {
-    static E: std::sync::OnceLock<Arc<HashMap<String, u32>>> = std::sync::OnceLock::new();
-    E.get_or_init(|| Arc::new(HashMap::new())).clone()
-}
-
-fn empty_arc_i64() -> Arc<HashMap<String, i64>> {
-    static E: std::sync::OnceLock<Arc<HashMap<String, i64>>> = std::sync::OnceLock::new();
-    E.get_or_init(|| Arc::new(HashMap::new())).clone()
+/// Shared empty-maps singleton: cloning costs one refcount bump instead
+/// of an ArcBox allocation, which matters on the per-statement detach /
+/// attach path in `execute` and on the ROLLBACK reset.
+fn empty_maps() -> Arc<crate::executor::StmtMaps> {
+    static E: std::sync::OnceLock<Arc<crate::executor::StmtMaps>> = std::sync::OnceLock::new();
+    E.get_or_init(|| Arc::new(crate::executor::StmtMaps::empty())).clone()
 }
 
 /// Generic FxHash-style string hasher for statement-cache keys.
@@ -267,7 +259,61 @@ fn quick_sql_hash(s: &str) -> u64 {
     h.finish()
 }
 
-/// A cached prepared statement: the parsed AST, the plan (if any), and the
+/// A bound value for a fast-path lookup key, resolved at detection time.
+#[derive(Clone, Debug)]
+enum FastBound {
+    /// Positional parameter index (from a numeric `?N` name).
+    Param(usize),
+    /// A literal constant.
+    Literal(Value),
+}
+
+impl FastBound {
+    /// Resolve the bound value against the statement's parameters.
+    /// Mirrors `evaluate`'s Parameter semantics: missing params are NULL.
+    #[inline]
+    fn resolve<'p>(&'p self, params: &'p [Value]) -> &'p Value {
+        match self {
+            FastBound::Param(i) => params.get(*i).unwrap_or(&Value::Null),
+            FastBound::Literal(v) => v,
+        }
+    }
+}
+
+/// Pre-compiled ultra-fast execution paths for the two hottest OLTP
+/// shapes. Detected once at statement-cache population; execution skips
+/// the ExecContext, EvalContext, and Plan dispatch entirely (~200 ns of
+/// machinery), going straight to B+tree descent + selective row decode.
+///
+/// The full pipeline (ExecContext setup, execute() dispatch, Project
+/// cloning) measured ~350 ns before the statement even touched a page —
+/// larger than SQLite's ENTIRE point lookup (~355 ns). These paths close
+/// that gap while keeping identical semantics: they funnel into the same
+/// `lookup_table` / `lookup_index` / `decode_row*` routines the general
+/// path uses.
+#[derive(Clone)]
+enum FastPath {
+    /// `SELECT cols FROM t WHERE rowid_alias = ?` / `WHERE rowid = literal`
+    RowidPoint {
+        table: Arc<Table>,
+        rowid: FastBound,
+        /// `None` = identity projection (all columns). `Some(indices)` =
+        /// project these table column indices (selective decode).
+        project: Option<Vec<usize>>,
+        /// Output column names.
+        columns: Arc<[String]>,
+    },
+    /// `SELECT cols FROM t WHERE indexed_col = ?` (single- or multi-column
+    /// unique/non-unique index point lookup).
+    IndexPoint {
+        table: Arc<Table>,
+        index: Arc<Index>,
+        keys: Vec<FastBound>,
+        project: Option<Vec<usize>>,
+        columns: Arc<[String]>,
+    },
+}
+
 /// precomputed `has_subqueries` flag (mirrors SQLite's OP_Once check —
 /// computed once at plan time instead of re-walking the plan tree, which
 /// allocated a Vec of expr references, on every execution).
@@ -276,6 +322,44 @@ struct CachedStmt {
     stmt: Arc<Statement>,
     plan: Option<Arc<crate::planner::plan::Plan>>,
     has_subqueries: bool,
+    /// Pre-compiled point-lookup fast path (see `FastPath`).
+    fast_path: Option<Arc<FastPath>>,
+}
+
+impl FastPath {
+    /// The table this fast path reads from.
+    #[inline]
+    fn table_name(&self) -> &str {
+        match self {
+            FastPath::RowidPoint { table, .. } => &table.name,
+            FastPath::IndexPoint { table, .. } => &table.name,
+        }
+    }
+
+    /// Output column names.
+    #[inline]
+    fn output_columns(&self) -> &Arc<[String]> {
+        match self {
+            FastPath::RowidPoint { columns, .. } => columns,
+            FastPath::IndexPoint { columns, .. } => columns,
+        }
+    }
+}
+
+/// Decode a row payload with an optional column projection.
+/// `None` decodes all columns (identity — SELECT *); `Some(indices)` uses
+/// the selective decoder, which skips over un-projected columns without
+/// allocating Values for them.
+#[inline]
+fn decode_projected(payload: &[u8], table: &Table, rowid: i64, project: Option<&[usize]>) -> Result<Row> {
+    match project {
+        Some(idxs) => {
+            let mut out = Vec::with_capacity(idxs.len());
+            decode_row_selective(payload, table.n_columns(), idxs, rowid, table.rowid_alias, &mut out)?;
+            Ok(out)
+        }
+        None => decode_row(payload, table.n_columns(), rowid, table.rowid_alias),
+    }
 }
 
 impl Database {
@@ -302,9 +386,7 @@ impl Database {
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
-            root_overrides: RwLock::new(std::sync::Arc::new(HashMap::new())),
-            max_rowids: RwLock::new(std::sync::Arc::new(HashMap::new())),
-            index_roots: RwLock::new(std::sync::Arc::new(HashMap::new())),
+            maps: RwLock::new(empty_maps()),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
             stmt_cache_order: Mutex::new(Vec::new()),
@@ -487,29 +569,29 @@ impl Database {
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
         ctx.txn_snapshot = txn_snap;
-        // DETACH (zero-copy — see execute()).
-        ctx.root_shared = std::mem::replace(self.root_overrides.get_mut(), empty_arc_u32());
-        ctx.max_rowids_shared = std::mem::replace(self.max_rowids.get_mut(), empty_arc_i64());
-        ctx.index_shared = std::mem::replace(self.index_roots.get_mut(), empty_arc_u32());
-
+        // DETACH the combined maps (zero-copy): `execute`-family callers
+        // hold `&mut self`, so no reader can hold a snapshot concurrently.
+        ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
         let result = crate::executor::fast_insert_single_row(&mut ctx, &table, supplied);
 
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        // Merge overlays back regardless of success — a failed statement
+        // may still have split a B+tree (page writes are not undone), so
+        // dropping the root override would lose data. ROLLBACK is the only
+        // path that legitimately discards them.
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.root_shared).extend(ctx.root_overrides.drain());
+            Arc::make_mut(&mut ctx.shared).roots.extend(ctx.root_overrides.drain());
         }
         if ctx.max_rowids_changed {
-            Arc::make_mut(&mut ctx.max_rowids_shared).extend(ctx.max_rowids.drain());
+            Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.index_shared).extend(ctx.index_roots.drain());
+            Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
         }
-        *self.root_overrides.get_mut() = ctx.root_shared;
-        *self.max_rowids.get_mut() = ctx.max_rowids_shared;
-        *self.index_roots.get_mut() = ctx.index_shared;
+        *self.maps.get_mut() = ctx.shared;
         if result.is_ok() && ctx.roots_changed {
             self.sync_schema_roots()?;
         }
@@ -542,7 +624,8 @@ impl Database {
                 .as_ref()
                 .map(|p| crate::executor::plan_has_subqueries(p))
                 .unwrap_or(false);
-            return Ok(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq });
+            let fast_path = plan_arc.as_ref().and_then(|p| Self::detect_fast_path(p)).map(Arc::new);
+            return Ok(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path });
         }
         // Fast path: read lock — concurrent readers can hit the cache
         // simultaneously without serializing.
@@ -569,7 +652,8 @@ impl Database {
             .as_ref()
             .map(|p| crate::executor::plan_has_subqueries(p))
             .unwrap_or(false);
-        let entry = CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq };
+        let fast_path = plan_arc.as_ref().and_then(|p| Self::detect_fast_path(p)).map(Arc::new);
+        let entry = CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path };
         let t2 = profile::now();
         // "Cache on second sight": only populate the cache for SQL text we
         // have seen before. A first sighting returns the freshly-parsed
@@ -620,13 +704,12 @@ impl Database {
     /// last persisted (tracked in `schema_root_pages`), so the cost is one
     /// schema-row rewrite per actual split — O(1) amortized.
     fn sync_schema_roots(&self) -> Result<()> {
-        let tables: Vec<(String, u32)> = {
-            let ro = self.root_overrides.read();
-            ro.iter().map(|(k, v)| (k.clone(), *v)).collect()
-        };
-        let indexes: Vec<(String, u32)> = {
-            let ir = self.index_roots.read();
-            ir.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        let (tables, indexes): (Vec<(String, u32)>, Vec<(String, u32)>) = {
+            let m = self.maps.read();
+            (
+                m.roots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                m.index_roots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            )
         };
         if tables.is_empty() && indexes.is_empty() {
             return Ok(());
@@ -753,15 +836,13 @@ impl Database {
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
         ctx.txn_snapshot = txn_snap;
-        // DETACH the shared maps (zero-copy): `execute` holds `&mut self`,
+        // DETACH the combined maps (zero-copy): `execute` holds `&mut self`,
         // so no reader can hold a snapshot concurrently. The statement owns
-        // the maps via `ctx.*_shared` and hands them back in the epilogue.
-        // (Cloning the Arc snapshots here instead would keep a second
+        // the maps via `ctx.shared` and hands them back in the epilogue.
+        // (Cloning the Arc snapshot here instead would keep a second
         // refcount alive and force `Arc::make_mut` to deep-copy the maps
         // on every write-back — a ~30% insert regression.)
-        ctx.root_shared = std::mem::replace(self.root_overrides.get_mut(), empty_arc_u32());
-        ctx.max_rowids_shared = std::mem::replace(self.max_rowids.get_mut(), empty_arc_i64());
-        ctx.index_shared = std::mem::replace(self.index_roots.get_mut(), empty_arc_u32());
+        ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
@@ -799,19 +880,20 @@ impl Database {
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         // Merge local overlay entries into the DETACHED maps (in place —
         // the statement is the sole owner, so make_mut never clones) and
-        // attach them back to the Database.
+        // attach them back to the Database. Merge regardless of `result`:
+        // a failed statement may still have split a B+tree (page writes
+        // are not undone by error propagation); ROLLBACK is the only path
+        // that legitimately discards them.
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.root_shared).extend(ctx.root_overrides.drain());
+            Arc::make_mut(&mut ctx.shared).roots.extend(ctx.root_overrides.drain());
         }
         if ctx.max_rowids_changed {
-            Arc::make_mut(&mut ctx.max_rowids_shared).extend(ctx.max_rowids.drain());
+            Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.index_shared).extend(ctx.index_roots.drain());
+            Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
         }
-        *self.root_overrides.get_mut() = ctx.root_shared;
-        *self.max_rowids.get_mut() = ctx.max_rowids_shared;
-        *self.index_roots.get_mut() = ctx.index_shared;
+        *self.maps.get_mut() = ctx.shared;
         if result.is_ok() && ctx.rolled_back {
             // ROLLBACK discarded in-transaction schema-row rewrites; reset
             // the persisted-root map to the catalog's (CREATE-time) values,
@@ -826,9 +908,7 @@ impl Database {
             for (name, i) in self.catalog.all_indexes() {
                 synced.insert(format!("index:{}", name), i.root_page);
             }
-            *self.root_overrides.get_mut() = Arc::new(HashMap::new());
-            *self.max_rowids.get_mut() = Arc::new(HashMap::new());
-            *self.index_roots.get_mut() = Arc::new(HashMap::new());
+            *self.maps.get_mut() = empty_maps();
         }
         // Persist any root-page moves (B+tree splits) to the schema rows so
         // a reopened database sees the full tree. Without this, every table
@@ -871,22 +951,33 @@ impl Database {
         }
         let cached = self.get_or_cache_stmt(sql)?;
         if let Some(plan) = cached.plan {
+            // Pre-compiled point-lookup fast path: skips the ExecContext /
+            // EvalContext / Plan dispatch entirely. Only fires for the
+            // exact shapes detected at cache time (bare-column projections
+            // over a rowid / index point lookup).
+            if let Some(fp) = &cached.fast_path {
+                let params_v: Vec<Value> = params.into_iter().collect();
+                let rows = self.run_fast_path(fp, &params_v)?;
+                return Ok(rows);
+            }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
-            let txn_snap = self.txn_snapshot.lock().clone();
-            // Arc snapshot clones — one atomic refcount bump each,
-            // replacing a full HashMap deep-clone per query (~250 ns of
-            // allocations+copies on a post-split database).
-            let root_shared = self.root_overrides.read().clone();
-            let max_rowids_shared = self.max_rowids.read().clone();
-            let index_shared = self.index_roots.read().clone();
-            let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+            // Skip the txn-snapshot Mutex entirely when not inside a
+            // transaction — the snapshot is only ever Some(...) between
+            // BEGIN and COMMIT/ROLLBACK, and the lock was ~15-20 ns on
+            // every single query outside that window.
+            let txn_snap = if in_txn {
+                self.txn_snapshot.lock().clone()
+            } else {
+                None
+            };
+            // ONE read-lock + ONE refcount bump for all three bookkeeping
+            // maps (was three separate `RwLock<Arc<HashMap>>` reads).
+            let shared = self.maps.read().clone();
+            let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
             ctx.txn_snapshot = txn_snap;
-            ctx.root_shared = root_shared;
-            ctx.max_rowids_shared = max_rowids_shared;
-            ctx.index_shared = index_shared;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
@@ -912,25 +1003,26 @@ impl Database {
             ) {
                 // DML via the query path (e.g. INSERT..RETURNING): merge
                 // any root moves / max-rowid updates back.
-                if ctx.roots_changed {
-                    let mut m = self.root_overrides.write();
-                    Arc::make_mut(&mut *m).extend(ctx.root_overrides.drain());
-                }
-                if ctx.max_rowids_changed {
-                    let mut m = self.max_rowids.write();
-                    Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
-                }
-                if ctx.index_roots_changed {
-                    let mut m = self.index_roots.write();
-                    Arc::make_mut(&mut *m).extend(ctx.index_roots.drain());
+                if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
+                    let mut m = self.maps.write();
+                    let bk = Arc::make_mut(&mut *m);
+                    if ctx.roots_changed {
+                        bk.roots.extend(ctx.root_overrides.drain());
+                    }
+                    if ctx.max_rowids_changed {
+                        bk.max_rowids.extend(ctx.max_rowids.drain());
+                    }
+                    if ctx.index_roots_changed {
+                        bk.index_roots.extend(ctx.index_roots.drain());
+                    }
                 }
                 self.sync_schema_roots()?;
             } else if ctx.max_rowids_changed {
                 // Pure SELECTs can still populate the max-rowid scan cache
                 // (used by the index-range merge-scan heuristic) — merge it
                 // back so repeated queries don't rescan.
-                let mut m = self.max_rowids.write();
-                Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
+                let mut m = self.maps.write();
+                Arc::make_mut(&mut *m).max_rowids.extend(ctx.max_rowids.drain());
             }
             Ok(res.rows)
         } else {
@@ -953,20 +1045,25 @@ impl Database {
         }
         let cached = self.get_or_cache_stmt(sql)?;
         if let Some(plan) = cached.plan {
+            // Pre-compiled point-lookup fast path (see query()).
+            if let Some(fp) = &cached.fast_path {
+                let params_v: Vec<Value> = params.into_iter().collect();
+                let rows = self.run_fast_path(fp, &params_v)?;
+                return Ok((fp.output_columns().to_vec(), rows));
+            }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
-            let txn_snap = self.txn_snapshot.lock().clone();
-            // Arc snapshot clones — one atomic refcount bump each
-            // (replaces a full HashMap deep-clone per query).
-            let root_shared = self.root_overrides.read().clone();
-            let max_rowids_shared = self.max_rowids.read().clone();
-            let index_shared = self.index_roots.read().clone();
-            let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+            let txn_snap = if in_txn {
+                self.txn_snapshot.lock().clone()
+            } else {
+                None
+            };
+            // ONE read-lock + ONE refcount bump (see query()).
+            let shared = self.maps.read().clone();
+            let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
             ctx.in_transaction = in_txn;
+            ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
             ctx.txn_snapshot = txn_snap;
-            ctx.root_shared = root_shared;
-            ctx.max_rowids_shared = max_rowids_shared;
-            ctx.index_shared = index_shared;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
@@ -986,25 +1083,26 @@ impl Database {
                     | crate::planner::plan::Plan::Update { .. }
                     | crate::planner::plan::Plan::Delete { .. }
             ) {
-                if ctx.roots_changed {
-                    let mut m = self.root_overrides.write();
-                    Arc::make_mut(&mut *m).extend(ctx.root_overrides.drain());
-                }
-                if ctx.max_rowids_changed {
-                    let mut m = self.max_rowids.write();
-                    Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
-                }
-                if ctx.index_roots_changed {
-                    let mut m = self.index_roots.write();
-                    Arc::make_mut(&mut *m).extend(ctx.index_roots.drain());
+                if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
+                    let mut m = self.maps.write();
+                    let bk = Arc::make_mut(&mut *m);
+                    if ctx.roots_changed {
+                        bk.roots.extend(ctx.root_overrides.drain());
+                    }
+                    if ctx.max_rowids_changed {
+                        bk.max_rowids.extend(ctx.max_rowids.drain());
+                    }
+                    if ctx.index_roots_changed {
+                        bk.index_roots.extend(ctx.index_roots.drain());
+                    }
                 }
                 self.sync_schema_roots()?;
             } else if ctx.max_rowids_changed {
                 // Pure SELECTs can still populate the max-rowid scan cache
                 // (used by the index-range merge-scan heuristic) — merge it
                 // back so repeated queries don't rescan.
-                let mut m = self.max_rowids.write();
-                Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
+                let mut m = self.maps.write();
+                Arc::make_mut(&mut *m).max_rowids.extend(ctx.max_rowids.drain());
             }
             Ok((res.columns.to_vec(), res.rows))
         } else {
@@ -1059,6 +1157,151 @@ impl Database {
             Statement::Update(_) => Ok(Some(Self::plan_update(catalog, stmt)?)),
             Statement::Delete(_) => Ok(Some(Self::plan_delete(catalog, stmt)?)),
             _ => Ok(None),
+        }
+    }
+
+    /// Detect a pre-compilable point-lookup fast path in a plan (see
+    /// `FastPath`). Conservative: any shape other than
+    /// `Project(RowidLookup)` / `Project(IndexLookup)` with bare-column
+    /// projections falls back to the general pipeline.
+    fn detect_fast_path(plan: &Plan) -> Option<FastPath> {
+        /// Resolve a projection list to table column indices. Returns None
+        /// unless EVERY projection expr is a bare column of the table.
+        /// `project == None` in the result means identity (all columns,
+        /// in table order) — used for `SELECT *` / `SELECT t.*`.
+        fn resolve_projection(
+            columns: &[crate::planner::plan::ProjectExpr],
+            table: &Table,
+        ) -> Option<(Option<Vec<usize>>, Arc<[String]>)> {
+            // `SELECT *` / `SELECT t.*` plans as a single pseudo-column
+            // named "*" — identity projection, decode the full row.
+            if columns.len() == 1 {
+                if let Expr::Column { name, .. } = &columns[0].expr {
+                    if name == "*" {
+                        return Some((None, table.col_names.clone()));
+                    }
+                }
+            }
+            let mut idxs = Vec::with_capacity(columns.len());
+            let mut names: Vec<String> = Vec::with_capacity(columns.len());
+            for pe in columns {
+                match &pe.expr {
+                    Expr::Column { name, .. } => {
+                        let idx = table.find_column(name)?;
+                        idxs.push(idx);
+                        names.push(pe.alias.clone().unwrap_or_else(|| table.columns[idx].name.clone()));
+                    }
+                    _ => return None,
+                }
+            }
+            Some((Some(idxs), names.into()))
+        }
+
+        /// Bind an expression used as a lookup key: positional parameter
+        /// (`?`/`?N` — numeric names) or literal.
+        fn bind_expr(e: &Expr) -> Option<FastBound> {
+            match e {
+                Expr::Parameter(p) => p.parse::<usize>().ok().map(FastBound::Param),
+                Expr::Literal(v) => Some(FastBound::Literal(v.clone())),
+                _ => None,
+            }
+        }
+
+        match plan {
+            // Bare `SELECT * FROM t WHERE id = ?` (no Project node).
+            Plan::RowidLookup { table, rowid, .. } => {
+                let rowid = bind_expr(rowid)?;
+                Some(FastPath::RowidPoint {
+                    table: table.clone(),
+                    rowid,
+                    project: None,
+                    columns: table.col_names.clone(),
+                })
+            }
+            Plan::Project { input, columns } => match input.as_ref() {
+                Plan::RowidLookup { table, rowid, .. } => {
+                    let rowid = bind_expr(rowid)?;
+                    let (project, cols) = resolve_projection(columns, table)?;
+                    Some(FastPath::RowidPoint {
+                        table: table.clone(),
+                        rowid,
+                        project,
+                        columns: cols,
+                    })
+                }
+                Plan::IndexLookup { table, index, key_exprs, .. } => {
+                    let keys = key_exprs.iter().map(bind_expr).collect::<Option<Vec<_>>>()?;
+                    let (project, cols) = resolve_projection(columns, table)?;
+                    Some(FastPath::IndexPoint {
+                        table: table.clone(),
+                        index: index.clone(),
+                        keys,
+                        project,
+                        columns: cols,
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Execute a pre-compiled point-lookup fast path: B+tree descent +
+    /// selective decode, with NO ExecContext / EvalContext / Plan dispatch.
+    /// Semantics identical to the general path (same `lookup_table` /
+    /// `lookup_index` / `decode_row*` calls, same `.as_integer()` binding).
+    fn run_fast_path(&self, fp: &FastPath, params: &[Value]) -> Result<Vec<Row>> {
+        // One combined snapshot read for root overrides (tables + indexes).
+        // Cheap: usually the maps are empty and this is a failed lookup on
+        // an empty HashMap behind one read lock.
+        let (table_root, index_root) = {
+            let m = self.maps.read();
+            let name = fp.table_name();
+            let t = m.roots.get(name).copied()
+                .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
+            let i = match fp {
+                FastPath::IndexPoint { index, .. } => m.index_roots.get(&index.name).copied()
+                    .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
+                _ => None,
+            };
+            (t, i)
+        };
+        match fp {
+            FastPath::RowidPoint { table, rowid, project, columns: _ } => {
+                let rid = rowid.resolve(params).as_integer();
+                let root = table_root.unwrap_or(table.root_page);
+                let mut bt = Btree::new(&self.pager, root, false);
+                match bt.lookup_table(rid)? {
+                    LookupResult::Found(payload) => {
+                        let row = decode_projected(&payload, table, rid, project.as_deref())?;
+                        Ok(vec![row])
+                    }
+                    LookupResult::NotFound => Ok(Vec::new()),
+                }
+            }
+            FastPath::IndexPoint { table, index, keys, project, columns: _ } => {
+                // Encode the key (same order-preserving encoding as the
+                // general path's exec_index_lookup).
+                let mut key_bytes = Vec::with_capacity(keys.len() * 8);
+                for k in keys {
+                    k.resolve(params).encode_order_key_into(&mut key_bytes);
+                }
+                let iroot = index_root.unwrap_or(index.root_page);
+                let mut ibt = Btree::new(&self.pager, iroot, true);
+                let rowids = ibt.lookup_index(&key_bytes)?;
+                if rowids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let troot = table_root.unwrap_or(table.root_page);
+                let mut tbt = Btree::new(&self.pager, troot, false);
+                let mut rows = Vec::with_capacity(rowids.len());
+                for rid in rowids {
+                    if let LookupResult::Found(payload) = tbt.lookup_table(rid)? {
+                        rows.push(decode_projected(&payload, table, rid, project.as_deref())?);
+                    }
+                }
+                Ok(rows)
+            }
         }
     }
 
