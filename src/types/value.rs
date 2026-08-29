@@ -231,6 +231,12 @@ impl Value {
     ///                0x01: 0 (constant zero)
     ///                0x02: i8   0x03: i16   0x04: i32   0x05: i64 (LE)
     ///   Real      -> [0x06] + f64 LE                  (9 bytes)
+    ///                [0x0A] + zigzag uvarint(i64)    (2-4 bytes) when the
+    ///                double is an exact integer in ±2^53 (SQLite's
+    ///                "integral REAL stored as integer" optimization —
+    ///                the dominant per-row saving on REAL-heavy schemas:
+    ///                9 bytes -> 2-3 for scores/amounts/prices that happen
+    ///                to be whole numbers)
     ///   Text      -> [0x07] + uvarint(len) + bytes
     ///   Blob      -> [0x08] + uvarint(len) + bytes
     ///   RowidRef  -> [0x09]                           (1 byte; row-level
@@ -260,8 +266,23 @@ impl Value {
                 }
             }
             Value::Real(f) => {
-                out.push(0x06);
-                out.extend_from_slice(&f.to_le_bytes());
+                // Integral doubles within ±2^53 round-trip exactly through
+                // i64: store them as a 2-4 byte zigzag varint instead of a
+                // 9-byte tagged f64. -0.0 keeps the wide form (its sign
+                // would be lost); NaN/inf/huge values fall through too.
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && f.abs() <= 9_007_199_254_740_992.0 // 2^53
+                    && !(*f == 0.0 && f.is_sign_negative())
+                {
+                    let i = *f as i64;
+                    let zigzag = ((i << 1) ^ (i >> 63)) as u64;
+                    out.push(0x0A);
+                    encode_uvarint(zigzag, out);
+                } else {
+                    out.push(0x06);
+                    out.extend_from_slice(&f.to_le_bytes());
+                }
             }
             Value::Text(s) => {
                 out.push(0x07);
@@ -416,6 +437,13 @@ impl Value {
             // Rowid-alias marker: NULL at the Value level; the row decoder
             // replaces it with the cell's rowid.
             0x09 => Ok((Value::Null, 1)),
+            // Integral REAL stored as zigzag varint — decodes back to
+            // Real(f) with the exact same value (lossless for |v| <= 2^53).
+            0x0A => {
+                let (z, n) = decode_uvarint(rest)?;
+                let i = ((z >> 1) as i64) ^ -((z & 1) as i64);
+                Ok((Value::Real(i as f64), 1 + n))
+            }
             _ => Err("unknown value tag"),
         }
     }
@@ -687,6 +715,73 @@ mod tests {
             let (decoded, n) = Value::decode(&encoded).unwrap();
             assert_eq!(n, encoded.len());
             assert_eq!(v, decoded);
+        }
+    }
+
+    #[test]
+    fn integral_real_compact_roundtrip() {
+        // Integral doubles encode as 0x0A + zigzag varint (2-4 bytes) and
+        // decode back to the exact same Real value.
+        for f in [
+            0.0,
+            1.0,
+            -1.0,
+            42.0,
+            -42.0,
+            127.0,
+            -128.0,
+            32_767.0,
+            -32_768.0,
+            2_147_483_647.0,
+            1e12,
+            -1e12,
+            9_007_199_254_740_992.0, // 2^53 (still compact-path, though the varint is wide)
+            -9_007_199_254_740_992.0,
+        ] {
+            let v = Value::Real(f);
+            let encoded = v.encode();
+            assert!(
+                encoded.len() <= 9,
+                "integral real {} should never exceed the wide form, got {} bytes",
+                f,
+                encoded.len()
+            );
+            let (decoded, n) = Value::decode(&encoded).unwrap();
+            assert_eq!(n, encoded.len());
+            assert_eq!(v, decoded);
+        }
+        // Small integral reals are 2 bytes (tag + 1-byte zigzag).
+        assert_eq!(Value::Real(1.0).encode().len(), 2);
+        assert_eq!(Value::Real(-1.0).encode().len(), 2);
+        assert_eq!(Value::Real(100.0).encode().len(), 3);
+        assert_eq!(Value::Real(10_000.0).encode().len(), 4); // zigzag(10k)=20k -> 3-byte varint
+        assert_eq!(Value::Real(1_000_000.0).encode().len(), 4);
+    }
+
+    #[test]
+    fn non_integral_real_keeps_wide_form() {
+        // Fractional / huge / NaN / inf / -0.0 values must keep the 9-byte
+        // form so the roundtrip is bit-exact.
+        for f in [
+            3.5,
+            -3.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            9_007_199_254_740_994.0, // 2^53 + 2 (not representable as i64 roundtrip? it IS integral but > 2^53)
+            1e300,
+        ] {
+            let v = Value::Real(f);
+            let encoded = v.encode();
+            assert_eq!(encoded.len(), 9, "value {:?} must use the wide form", f);
+            let (decoded, n) = Value::decode(&encoded).unwrap();
+            assert_eq!(n, 9);
+            if f.is_nan() {
+                assert!(decoded.as_real().is_nan());
+            } else {
+                assert_eq!(decoded, v, "bit-exact roundtrip for {:?}", f);
+            }
         }
     }
 

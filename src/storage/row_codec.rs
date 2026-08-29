@@ -234,6 +234,13 @@ fn value_encoded_len(buf: &[u8]) -> Result<usize> {
         0x03 => 3,                                   // i16
         0x04 => 5,                                   // i32
         0x05 | 0x06 => 9,                            // i64 / f64
+        0x0A => {
+            // Integral REAL as zigzag varint: tag + varint.
+            let rest = &buf[1..];
+            let (_, n) = crate::types::value::decode_uvarint(rest)
+                .map_err(|e| crate::error::Error::corruption(e))?;
+            1 + n
+        }
         0x07 | 0x08 => {
             // Text / Blob: 1 (tag) + varint length + body.
             let rest = &buf[1..];
