@@ -485,11 +485,15 @@ impl<'a> Btree<'a> {
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;
-            let pt = page.lock().page_type()?;
+            // ONE lock per page: determine the type and do the leaf work
+            // under the same guard (was: a temp lock for page_type plus a
+            // second lock for the scan — two atomic RMWs per level per
+            // descent).
+            let borrowed = page.lock();
+            let pt = borrowed.page_type()?;
             match pt {
                 PageType::LeafTable => {
-                    // Single immutable borrow for the whole leaf scan.
-                    let borrowed = page.lock();
+                    // (guard held for the whole leaf scan)
                     let n = borrowed.n_cells() as usize;
                     // Binary search by rowid (cells are stored sorted).
                     let mut lo = 0usize;
@@ -516,7 +520,6 @@ impl<'a> Btree<'a> {
                     return Ok(LookupResult::NotFound);
                 }
                 PageType::InteriorTable => {
-                    let borrowed = page.lock();
                     let n = borrowed.n_cells() as usize;
                     // Binary search the interior cells for the right child.
                     // Cells are sorted by key; cell (left_child, key) means
@@ -1890,13 +1893,16 @@ impl<'a> Btree<'a> {
         f: &mut F,
     ) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.lock().page_type()?;
+        // ONE lock per page (was: one lock for page_type, one for n_cells,
+        // then PER CELL: a lock for cell_pointer + another for the data —
+        // ~2,000 lock/unlock pairs on a 1,000-cell leaf).
+        let borrowed = page.lock();
+        let pt = borrowed.page_type()?;
         match pt {
             PageType::LeafTable => {
-                let n = page.lock().n_cells();
+                let n = borrowed.n_cells();
                 for i in 0..n {
-                    let cell_ptr = page.lock().cell_pointer(i) as usize;
-                    let borrowed = page.lock();
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
                     let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
                     if let Cell::TableLeaf { rowid, payload } = cell {
                         if !f(rowid, &payload) {
@@ -1907,10 +1913,9 @@ impl<'a> Btree<'a> {
                 Ok(())
             }
             PageType::InteriorTable => {
-                let n = page.lock().n_cells();
-                let right = page.lock().right_most_pointer();
+                let n = borrowed.n_cells();
+                let right = borrowed.right_most_pointer();
                 let cells: Vec<PageId> = {
-                    let borrowed = page.lock();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
@@ -1922,6 +1927,7 @@ impl<'a> Btree<'a> {
                     v.push(right);
                     v
                 };
+                drop(borrowed);
                 drop(page);
                 for child in cells {
                     self.scan_subtree(child, f)?;
@@ -1966,10 +1972,11 @@ impl<'a> Btree<'a> {
         f: &mut F,
     ) -> Result<()> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.lock().page_type()?;
+        // ONE lock per page: type check + leaf work under the same guard.
+        let borrowed = page.lock();
+        let pt = borrowed.page_type()?;
         match pt {
             PageType::LeafTable => {
-                let borrowed = page.lock();
                 let n = borrowed.n_cells();
                 let psz = borrowed.data.len();
                 for i in 0..n {
@@ -2004,10 +2011,9 @@ impl<'a> Btree<'a> {
                 Ok(())
             }
             PageType::InteriorTable => {
-                let n = page.lock().n_cells();
-                let right = page.lock().right_most_pointer();
+                let n = borrowed.n_cells();
+                let right = borrowed.right_most_pointer();
                 let cells: Vec<(PageId, i64)> = {
-                    let borrowed = page.lock();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
@@ -2019,6 +2025,7 @@ impl<'a> Btree<'a> {
                     v.push((right, i64::MAX));
                     v
                 };
+                drop(borrowed);
                 drop(page);
                 for (child, key) in cells {
                     if key < start {
@@ -2309,17 +2316,20 @@ impl<'a> Btree<'a> {
         started: &mut bool,
     ) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
-        let pt = page.lock().page_type()?;
+        // ONE lock + ONE page-cache hit per page (was: a temp lock for
+        // page_type, a second for n_cells, a third for the binary search,
+        // then a full drop + re-get_page + fourth lock for the iteration).
+        let borrowed = page.lock();
+        let pt = borrowed.page_type()?;
         match pt {
             PageType::LeafIndex => {
-                let n = page.lock().n_cells();
+                let n = borrowed.n_cells();
                 let begin = if *started {
                     0
                 } else {
                     // Binary search for the first cell with key >= start_key
                     // (allocation-free views; (key, MIN) ordering means a
                     // cell is "less" iff its key is strictly less).
-                    let borrowed = page.lock();
                     let mut lo = 0u16;
                     let mut hi = n;
                     while lo < hi {
@@ -2336,21 +2346,16 @@ impl<'a> Btree<'a> {
                     }
                     lo
                 };
-                drop(page);
-                // Iterate the leaf under ONE lock, borrowing key slices
+                // Iterate the leaf under the SAME lock, borrowing key slices
                 // straight from the page buffer (Cell::decode allocated a
                 // key Vec per cell here).
-                {
-                    let page = self.pager.get_page(page_id)?;
-                    let borrowed = page.lock();
-                    for i in begin..n {
-                        let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
-                            continue;
-                        };
-                        if !f(v.rowid, v.key) {
-                            return Ok(false);
-                        }
+                for i in begin..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                        continue;
+                    };
+                    if !f(v.rowid, v.key) {
+                        return Ok(false);
                     }
                 }
                 *started = true;
@@ -2358,8 +2363,8 @@ impl<'a> Btree<'a> {
             }
             PageType::InteriorIndex => {
                 // Find the first child that can contain entries >= start_key.
+                // (uses the single outer guard — no re-lock)
                 let (n, first_cell_idx, right_most) = {
-                    let borrowed = page.lock();
                     let n = borrowed.n_cells();
                     let mut first_cell_idx = n; // default: right_most only
                     if !*started {
@@ -2382,6 +2387,8 @@ impl<'a> Btree<'a> {
                     }
                     (n, first_cell_idx, borrowed.right_most_pointer())
                 };
+                // Release the parent page before recursing into children.
+                drop(borrowed);
                 drop(page);
                 // Visit children from first_cell_idx onward, stopping as
                 // soon as the callback stops.

@@ -377,6 +377,20 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     return exec_hash_join(ctx, left, right, *join_type, condition, Some(columns));
                 }
             }
+            // FUSED PATH: Project over a RowidRange / RowidLookup with
+            // bare-column projections — decode ONLY the projected columns
+            // per row (skipping e.g. the rowid marker and un-referenced
+            // wide text columns), with no second cloning pass.
+            if let Plan::RowidRange { table, alias: _, start, end, residual: None } = &**input {
+                if let Some((project, out_cols)) = bare_column_projection(columns, table) {
+                    return exec_rowid_range_projected(ctx, table.clone(), start.as_ref(), end.as_ref(), project.as_deref(), out_cols);
+                }
+            }
+            if let Plan::RowidLookup { table, rowid, .. } = &**input {
+                if let Some((project, out_cols)) = bare_column_projection(columns, table) {
+                    return exec_rowid_lookup_projected(ctx, table.clone(), rowid, project.as_deref(), out_cols);
+                }
+            }
             exec_project(ctx, input, columns)
         }
         Plan::Sort { input, terms } => exec_sort(ctx, input, terms),
@@ -3896,6 +3910,113 @@ fn exec_rowid_range(
     }
 
     Ok(ExecResult { columns, rows })
+}
+
+/// Resolve a projection list against a base table: returns
+/// `(project, out_cols)` where `project == None` means identity (SELECT *,
+/// decode the full row in table order) and `Some(indices)` means decode only
+/// those table column indices. Returns None unless EVERY projection expr is
+/// a bare column of the table (or the single "*" pseudo-column).
+fn bare_column_projection(columns: &[ProjectExpr], table: &Table) -> Option<(Option<Vec<usize>>, Arc<[String]>)> {
+    if columns.len() == 1 {
+        if let Expr::Column { name, .. } = &columns[0].expr {
+            if name == "*" {
+                return Some((None, table.col_names.clone()));
+            }
+        }
+    }
+    let mut idxs = Vec::with_capacity(columns.len());
+    let mut names: Vec<String> = Vec::with_capacity(columns.len());
+    for pe in columns {
+        match &pe.expr {
+            Expr::Column { name, .. } => {
+                let idx = table.find_column(name)?;
+                idxs.push(idx);
+                names.push(pe.alias.clone().unwrap_or_else(|| table.columns[idx].name.clone()));
+            }
+            _ => return None,
+        }
+    }
+    Some((Some(idxs), names.into()))
+}
+
+/// RowidRange with the projection FUSED into the scan: each row decodes
+/// only the projected columns (selective decode) — no full-row decode, no
+/// second cloning pass. `project == None` decodes the full row and moves it.
+fn exec_rowid_range_projected(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    start_expr: Option<&Expr>,
+    end_expr: Option<&Expr>,
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let start: i64 = match start_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+        None => i64::MIN,
+    };
+    let end: i64 = match end_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+        None => i64::MAX,
+    };
+    let root = ctx.table_root(&table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let mut rows: Vec<Row> = Vec::new();
+    bt.scan_table_range_borrowed(start, end, |rowid, payload| {
+        match project {
+            Some(idxs) => {
+                let mut row = Vec::with_capacity(idxs.len());
+                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok() {
+                    rows.push(row);
+                }
+            }
+            None => {
+                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    rows.push(row);
+                }
+            }
+        }
+        true
+    })?;
+    Ok(ExecResult { columns: out_cols, rows })
+}
+
+/// RowidLookup with the projection fused (mirror of the api.rs fast path
+/// for statements that go through the general executor).
+fn exec_rowid_lookup_projected(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    rowid_expr: &Expr,
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let rowid = evaluate(rowid_expr, &eval_ctx)?.as_integer();
+    let root = ctx.table_root(&table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    match bt.lookup_table(rowid)? {
+        LookupResult::Found(payload) => {
+            let row = match project {
+                Some(idxs) => {
+                    let mut out = Vec::with_capacity(idxs.len());
+                    decode_row_selective(&payload, n_cols, idxs, rowid, rowid_alias, &mut out)?;
+                    out
+                }
+                None => decode_row(&payload, n_cols, rowid, rowid_alias)?,
+            };
+            Ok(ExecResult { columns: out_cols, rows: vec![row] })
+        }
+        LookupResult::NotFound => Ok(ExecResult { columns: out_cols, rows: Vec::new() }),
+    }
 }
 
 // ============================================================================
