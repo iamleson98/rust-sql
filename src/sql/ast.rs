@@ -23,6 +23,7 @@ pub enum Statement {
     Attach(AttachStatement),
     Detach(DetachStatement),
     Vacuum(VacuumStatement),
+    Alter(AlterStatement),
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +156,26 @@ pub enum DropKind {
     Index,
     View,
     Trigger,
+}
+
+/// `ALTER TABLE <table> <action>`.
+#[derive(Clone, Debug)]
+pub struct AlterStatement {
+    pub table: String,
+    pub action: AlterAction,
+}
+
+#[derive(Clone, Debug)]
+pub enum AlterAction {
+    /// `RENAME TO <new_name>`
+    RenameTable { new_name: String },
+    /// `ADD [COLUMN] <def>` — SQLite requires a DEFAULT (or a nullable
+    /// column); existing rows are back-filled with it.
+    AddColumn { column: ColumnDef },
+    /// `RENAME COLUMN <old> TO <new>`
+    RenameColumn { old: String, new: String },
+    /// `DROP COLUMN <name>`
+    DropColumn { name: String },
 }
 
 /// A qualified table name: `main.users` or just `users`.

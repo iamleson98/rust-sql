@@ -13,6 +13,7 @@
 
 pub mod datetime;
 pub mod expr;
+pub mod json;
 pub(crate) mod triggers;
 pub(crate) mod predicate;
 

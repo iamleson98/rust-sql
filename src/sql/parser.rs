@@ -82,6 +82,7 @@ impl Parser {
                     Ok(Statement::Begin(BeginStatement { mode: BeginMode::Deferred }))
                 }
                 "PRAGMA" => self.parse_pragma(),
+                "ALTER" => self.parse_alter(),
                 "ATTACH" => self.parse_attach(),
                 "DETACH" => self.parse_detach(),
                 "VACUUM" => self.parse_vacuum(),
@@ -1007,6 +1008,60 @@ impl Parser {
             None
         };
         Ok(Statement::Pragma(PragmaStatement { schema, name, value }))
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.advance(); // ALTER
+        self.expect_keyword("TABLE")?;
+        let table = self.parse_ident()?;
+        if self.peek().is_keyword("RENAME") {
+            self.advance();
+            // RENAME TO x  |  RENAME COLUMN a TO b  |  RENAME a TO b
+            if self.peek().is_keyword("TO") {
+                self.advance();
+                let new_name = self.parse_ident()?;
+                return Ok(Statement::Alter(AlterStatement {
+                    table,
+                    action: AlterAction::RenameTable { new_name },
+                }));
+            }
+            if self.peek().is_keyword("COLUMN") {
+                self.advance();
+            }
+            let old = self.parse_ident()?;
+            self.expect_keyword("TO")?;
+            let new = self.parse_ident()?;
+            Ok(Statement::Alter(AlterStatement {
+                table,
+                action: AlterAction::RenameColumn { old, new },
+            }))
+        } else if self.peek().is_keyword("ADD") {
+            self.advance();
+            if self.peek().is_keyword("COLUMN") {
+                self.advance();
+            }
+            let column = self.parse_column_def()?;
+            Ok(Statement::Alter(AlterStatement {
+                table,
+                action: AlterAction::AddColumn { column },
+            }))
+        } else if self.peek().is_keyword("DROP") {
+            self.advance();
+            if self.peek().is_keyword("COLUMN") {
+                self.advance();
+            }
+            let name = self.parse_ident()?;
+            Ok(Statement::Alter(AlterStatement {
+                table,
+                action: AlterAction::DropColumn { name },
+            }))
+        } else {
+            Err(Error::parse(
+                self.peek().line,
+                self.peek().col,
+                "expected RENAME, ADD, or DROP after table name",
+            ))
+        }
     }
 
     fn parse_attach(&mut self) -> Result<Statement> {

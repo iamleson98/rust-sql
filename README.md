@@ -23,25 +23,26 @@ for row in &rows {
 
 ### SQL Surface
 
-- **DDL**: `CREATE TABLE`, `CREATE INDEX` (unique + partial), `CREATE VIEW`, `CREATE TRIGGER`, `DROP TABLE/INDEX/VIEW/TRIGGER`, `ALTER TABLE` (parsed, not fully implemented)
+- **DDL**: `CREATE TABLE`, `CREATE INDEX` (unique + partial), `CREATE VIEW`, `CREATE TRIGGER`, `DROP TABLE/INDEX/VIEW/TRIGGER`, `ALTER TABLE RENAME TO` (catalog + schema move with index/trigger attachment and FK reference rewriting), `ALTER TABLE ADD COLUMN` (with DEFAULT back-fill)
 - **DML**: `INSERT` (with `OR REPLACE/IGNORE`, `... RETURNING`, `UPSERT`), `UPDATE`, `DELETE` (with `RETURNING`)
 - **UPSERT**: `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE SET ... [WHERE ...]` with `excluded.*` references (SQLite semantics)
 - **RETURNING**: `INSERT/UPDATE/DELETE ... RETURNING * | exprs` on all three write paths
 - **CHECK + NOT NULL constraints**: enforced on INSERT, UPDATE, and UPSERT merges (column-level and table-level)
+- **FOREIGN KEY constraints**: enforced when `PRAGMA foreign_keys = ON` (default off, like SQLite) — child-side checks on INSERT/UPDATE, parent-side checks on DELETE with `ON DELETE RESTRICT / CASCADE (recursive) / SET NULL / SET DEFAULT`, composite keys, implicit-PK references, and index maintenance on cascaded deletes
 - **Implicit UNIQUE indexes**: column/table-level UNIQUE and non-rowid PKs create `sqlite_autoindex_*` (actually enforced)
 - **Subqueries**: uncorrelated scalar / `IN (SELECT ...)` / `EXISTS (SELECT ...)` — executed once per statement, arbitrarily nested
 - **Queries**: `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`
 - **Joins**: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`, with `ON` / `USING`
 - **Set operations**: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
-- **Subqueries**: scalar subqueries, `IN (subquery)`, `EXISTS (subquery)` (parsed; some forms not yet executed)
-- **CTEs**: `WITH` (non-recursive and recursive, parsed)
+- **CTEs**: `WITH` (non-recursive) and `WITH RECURSIVE` — full execution
 - **Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM() OVER (...)`, etc.
 - **Aggregates**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`, with `DISTINCT`
 - **Expressions**: arithmetic, string concat (`||`), bitwise, `CASE WHEN`, `CAST`, `LIKE`, `GLOB`, `BETWEEN`, `IN`, `IS NULL`, `IS`, etc.
 - **Functions**: `ABS`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTR`, `COALESCE`, `NULLIF`, `IIF`, `ROUND`, `RANDOM`, `HEX`, `TYPEOF`, `INSTR`, `PRINTF`, scalar `MIN`/`MAX`, math functions, and more
+- **JSON1**: `json()`, `json_extract()` (incl. `$[n]`, `$.a.b`, `[#-n]` paths, unicode escapes, surrogate pairs), `json_valid()`, `json_type()`, `json_quote()`, `json_array()`, `json_object()`, `json_array_length()`, `json_insert()`, `json_replace()`, `json_set()`, `json_remove()`, `json_patch()` (RFC 7396)
 - **Date/time (full SQLite compatibility)**: `date()`, `time()`, `datetime()`, `julianday()`, `unixepoch()`, `strftime()`, `timediff()` with all modifiers (`+N days/months/years`, `start of month/year/day`, `end of month`, `weekday N`, `unixepoch`, `localtime`/`utc`, `subsec`) — a faithful port of SQLite's `date.c`
 - **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` (auto-commit per statement; full transaction semantics still being wired up)
-- **Pragmas**: `PRAGMA` (most are no-ops; honored: none yet)
+- **Pragmas**: `PRAGMA foreign_keys = ON/OFF` (honored); others parse and are accepted as no-ops
 
 ### Storage
 
@@ -243,20 +244,22 @@ cargo run --example batch
 
 This is a proof-of-concept. Known gaps:
 
-- **Streaming**: The executor materializes all rows in memory (collect-all model). A pull-based streaming executor would be needed for large result sets.
-- **Index usage**: The planner parses indexes but does not yet use them for `WHERE col = ?` lookups. Only `WHERE rowid = ?` could be optimized (and isn't yet).
-- **Subquery execution**: Scalar subqueries and `EXISTS` parse but return errors at execution time.
-- **Foreign keys**: Parsed but not enforced.
-- **Triggers**: Stored in the catalog but not fired.
-- **Views**: Stored in the catalog but not expanded in queries.
-- **UPDATE/DELETE without INTEGER PRIMARY KEY**: Not yet supported (requires rowid tracking through scans).
-- **Concurrent access**: The pager takes a single `&mut` — there's no MVCC visibility check yet, just the infrastructure.
-- **Numeric precision**: `AVG` rounds to 10 decimals; some edge cases in real formatting differ from SQLite.
-- **Date/time**: Minimal stubs — `CURRENT_TIMESTAMP` always returns the Unix epoch.
+- **Streaming**: The executor materializes all rows in memory (collect-all
+  model). A pull-based streaming executor would be needed for large result
+  sets.
+- **Correlated subqueries**: clean "unsupported" errors (uncorrelated
+  scalar / IN / EXISTS subqueries work).
+- **ALTER TABLE RENAME COLUMN / DROP COLUMN**: parsed, rejected with a
+  clear error (RENAME TO and ADD COLUMN are implemented).
+- **Concurrent access**: page-level MRMW reads work (3.1x SQLite's
+  concurrent-read throughput); full MVCC visibility wiring is still
+  infrastructure-only.
+- **Numeric precision**: `AVG` rounds to 10 decimals; some edge cases in
+  real formatting differ from SQLite.
 - **Collations**: Only `BINARY` is honored.
-- **Pragmas**: All no-ops.
-- **Correlated subqueries**: clean "unsupported" errors (uncorrelated ones work).
-- **UPDATE/DELETE without INTEGER PRIMARY KEY**: not supported (rowid tracking).
+- **Pragmas**: Only `foreign_keys` changes behavior; the rest are no-ops.
+- **WAL/MVCC**: the log and snapshot machinery exists (CRC32 frames, salt
+  recovery) but readers do not yet serve queries from WAL frames.
 
 ## License
 

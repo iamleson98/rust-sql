@@ -671,7 +671,10 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // TRUE() / FALSE() — SQLite 3.23+ boolean literals.
         "true" => Value::Integer(1),
         "false" => Value::Integer(0),
-        _ => Value::Null,
+        // JSON1 — see json.rs. Unknown names return NULL (legacy behavior:
+        // unknown functions evaluate to NULL rather than erroring).
+        _ => crate::executor::json::call_json_function(&fname, args)
+            .unwrap_or(Value::Null),
     }
 }
 

@@ -336,6 +336,40 @@ cloned every map under a read lock).
   reordered/duplicate projection regression matrix across rowid-point,
   rowid-range and index-point fast paths.
 
+## 6c. What was closed this sprint (2026-08-29, sixth pass): feature parity
+
+- **FOREIGN KEY enforcement** (the largest remaining correctness gap):
+  `PRAGMA foreign_keys = ON/OFF` toggles it (default off, SQLite's
+  default). Child side: INSERT/UPDATE reject orphan keys (MATCH SIMPLE
+  NULL pass-through; rowid-alias parent keys use O(log N) point probes).
+  Parent side: DELETE applies ON DELETE RESTRICT / CASCADE (recursive,
+  with index maintenance) / SET NULL / SET DEFAULT. Composite keys,
+  implicit-PK (`REFERENCES parent`) refs, and text parent keys all
+  enforced. 14 tests in tests/foreign_keys.rs.
+- **DELETE on tables without INTEGER PRIMARY KEY**: the new
+  `try_streaming_delete` walks the B+tree directly (rowid from the cell
+  key, not a row column), fixing the long-standing "unsupported" error
+  and removing per-row materialization for Scan/Filter/RowidRange/
+  IndexRange sources in the same stroke.
+- **JSON1**: a self-contained JSON engine (parser with unicode escapes
+  and surrogate pairs, `$.a.b[0]` / `$[#-n]` path language, minifying
+  serializer) backing `json`, `json_extract`, `json_valid`, `json_type`,
+  `json_quote`, `json_array`, `json_object`, `json_array_length`,
+  `json_insert`, `json_replace`, `json_set`, `json_remove`, `json_patch`
+  (RFC 7396). Previously these silently returned NULL. 6 tests in
+  tests/json1.rs.
+- **ALTER TABLE**: RENAME TO (catalog entry move preserving index/trigger
+  attachment, schema-row + `ON <table>` SQL rewrite, other tables'
+  REFERENCES clauses rewritten, two-pass schema load so reordered rows
+  resolve) and ADD COLUMN (SQLite restrictions enforced; DEFAULT
+  physically back-filled into existing rows). RENAME COLUMN / DROP
+  COLUMN parse and report a clean unsupported error. 11 tests in
+  tests/alter_table.rs.
+- **Dense page cache**: HashMap<PageId, PageRef> replaced by a
+  direct-indexed Vec for page ids < 2^20 (4 GB file), HashMap overflow
+  beyond — no hashing on any B+tree descent, bounded memory.
+- Test count: 164 (120 lib + 11 alter + 14 fk + 6 json + 13 integration).
+
 ## 7. Working order (next sprint)
 
 1. ⏳ Inner join (1.28×) — the last criterion head-to-head gap. Scan-side

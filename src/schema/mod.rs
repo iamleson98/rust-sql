@@ -253,6 +253,99 @@ impl Catalog {
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
     }
 
+    /// ALTER TABLE RENAME TO: rewrite every other table's FOREIGN KEY
+    /// clauses that reference `old_name` so they point at `new_name`
+    /// (SQLite rewrites REFERENCES in modern rename mode).
+    pub fn rename_fk_references(&mut self, old_name: &str, new_name: &str) {
+        let tables: Vec<String> = self
+            .tables
+            .values()
+            .filter(|t| {
+                t.foreign_keys
+                    .iter()
+                    .any(|fk| fk.ref_table.eq_ignore_ascii_case(old_name))
+            })
+            .map(|t| t.name.to_ascii_lowercase())
+            .collect();
+        for key in tables {
+            if let Some(t) = self.tables.get_mut(&key) {
+                let mut t2 = (**t).clone();
+                for fk in t2.foreign_keys.iter_mut() {
+                    if fk.ref_table.eq_ignore_ascii_case(old_name) {
+                        fk.ref_table = new_name.to_string();
+                    }
+                }
+                // The stored CREATE SQL keeps its old REFERENCES text; the
+                // in-memory catalog is authoritative until reopen, where
+                // the (unrewritten) SQL re-parses with the old name — so
+                // rewrite the create_sql text as well.
+                let old_ref = format!("REFERENCES {}", old_name);
+                let new_ref = format!("REFERENCES {}", new_name);
+                t2.create_sql = t2.create_sql.replace(&old_ref, &new_ref);
+                *t = Arc::new(t2);
+            }
+        }
+        self.schema_cookie = self.schema_cookie.wrapping_add(1);
+    }
+
+    /// ALTER TABLE RENAME TO: move the table entry (and its index and
+    /// trigger registrations) from `old_name` to `new_name` without
+    /// touching the underlying B-trees. `drop_table` + `add_table` would
+    /// discard the index/triggers-by-table maps — a rename must keep them.
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Option<()> {
+        let old_key = old_name.to_ascii_lowercase();
+        let new_key = new_name.to_ascii_lowercase();
+        if self.tables.contains_key(&new_key) {
+            return None;
+        }
+        let t = self.tables.remove(&old_key)?;
+        // Move index registrations.
+        if let Some(idx_list) = self.indexes_by_table.remove(&old_key) {
+            for idx in &idx_list {
+                self.indexes.remove(&idx.name.to_ascii_lowercase());
+                // Re-key the index's table field by cloning with the new
+                // table name.
+                let mut i2 = (**idx).clone();
+                i2.table = new_name.to_string();
+                let i2 = Arc::new(i2);
+                self.indexes.insert(i2.name.to_ascii_lowercase(), i2.clone());
+                self.indexes_by_table
+                    .entry(new_key.clone())
+                    .or_default()
+                    .push(i2);
+            }
+        }
+        // Move trigger registrations.
+        if let Some(trig_list) = self.triggers_by_table.remove(&old_key) {
+            for trig in &trig_list {
+                self.triggers.remove(&trig.name.to_ascii_lowercase());
+                let mut t2 = (**trig).clone();
+                t2.table = new_name.to_string();
+                let t2 = Arc::new(t2);
+                self.triggers.insert(t2.name.to_ascii_lowercase(), t2.clone());
+                self.triggers_by_table
+                    .entry(new_key.clone())
+                    .or_default()
+                    .push(t2);
+            }
+        }
+        self.tables.insert(new_key, t);
+        self.schema_cookie = self.schema_cookie.wrapping_add(1);
+        Some(())
+    }
+
+    /// Replace a table's Arc in place (used by ALTER TABLE RENAME after
+    /// rename_table moved the entry under the new key).
+    pub fn replace_table(&mut self, name: &str, table: Table) -> Option<()> {
+        let key = name.to_ascii_lowercase();
+        if !self.tables.contains_key(&key) {
+            return None;
+        }
+        self.tables.insert(key, Arc::new(table));
+        self.schema_cookie = self.schema_cookie.wrapping_add(1);
+        Some(())
+    }
+
     pub fn drop_table(&mut self, name: &str) -> Option<Arc<Table>> {
         let key = name.to_ascii_lowercase();
         let t = self.tables.remove(&key)?;

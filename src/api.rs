@@ -20,7 +20,7 @@ use crate::sql::ast::*;
 use crate::sql::parse;
 use crate::storage::btree::{Btree, LookupResult};
 use crate::storage::pager::Pager;
-use crate::storage::row_codec::{decode_row, decode_row_selective, encode_row};
+use crate::storage::row_codec::{decode_row, decode_row_selective, encode_row, encode_row_aliased};
 use crate::types::{Row, Value};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -1824,6 +1824,7 @@ impl Database {
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
+            Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
             Statement::Explain(_) => Ok(()),
@@ -2174,6 +2175,191 @@ impl Database {
         }
     }
 
+    /// ALTER TABLE — RENAME TO (catalog + schema row rewrite, index
+    /// tbl_name fixups) and ADD COLUMN (catalog + schema rewrite +
+    /// physical back-fill of the new column's default into existing rows,
+    /// matching SQLite's read-time default semantics with a one-time
+    /// write). RENAME COLUMN / DROP COLUMN are parsed but unsupported.
+    fn execute_alter(
+        a: crate::sql::ast::AlterStatement,
+        ctx: &mut ExecContext,
+        catalog: &mut Catalog,
+    ) -> Result<()> {
+        use crate::sql::ast::AlterAction;
+        match a.action {
+            AlterAction::RenameTable { new_name } => {
+                // Fetch first for validation + name rewriting (fetching by
+                // Arc so the original stays in the catalog until the move).
+                let table = catalog
+                    .get_table(&a.table)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                if catalog.get_table(&new_name).is_some() {
+                    return Err(Error::AlreadyExists(format!("table: {}", new_name)));
+                }
+                let old_name = table.name.clone();
+                let root = table.root_page;
+
+                // Rewrite the CREATE TABLE statement's table name and the
+                // qualified column names; everything else (columns, FKs,
+                // checks) is unchanged.
+                let new_sql = rewrite_create_table_name(&table.create_sql, &new_name);
+                let mut rebuilt = (*table).clone();
+                rebuilt.name = new_name.clone();
+                rebuilt.create_sql = new_sql.clone();
+                rebuilt.qualified_col_names = rebuilt
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", new_name, c.name))
+                    .collect::<Vec<_>>()
+                    .into();
+
+                // Move the catalog entry (indexes + triggers follow).
+                catalog.rename_table(&old_name, &new_name).ok_or_else(|| {
+                    Error::AlreadyExists(format!("table: {}", new_name))
+                })?;
+                // Replace the moved entry's Arc with the rebuilt table.
+                catalog.replace_table(&new_name, rebuilt);
+
+                // Other tables' REFERENCES clauses follow the rename
+                // (SQLite modern rename mode rewrites them).
+                catalog.rename_fk_references(&old_name, &new_name);
+
+                // Schema row: delete old, insert new (kind=table,
+                // name/tbl_name=new, same root, new SQL).
+                delete_schema_row(ctx.pager, "table", &old_name)?;
+                let schema_row = crate::schema::encode_schema_row(
+                    "table", &new_name, &new_name, root, &new_sql,
+                );
+                insert_schema_row(ctx.pager, &schema_row)?;
+
+                // Index schema rows keep name and SQL but tbl_name follows.
+                rewrite_index_tbl_names(ctx.pager, &old_name, &new_name)?;
+                rewrite_trigger_tbl_names(ctx.pager, &old_name, &new_name)?;
+
+                ctx.pager.flush()?;
+                Ok(())
+            }
+            AlterAction::AddColumn { column } => {
+                let table = catalog
+                    .get_table(&a.table)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                let root = table.root_page;
+                // SQLite restrictions: the new column may not be PRIMARY
+                // KEY or UNIQUE, and must either be nullable or carry a
+                // DEFAULT.
+                let has_pk = column
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::PrimaryKey { .. }));
+                let has_unique = column
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique));
+                if has_pk || has_unique {
+                    return Err(Error::semantic(
+                        "Cannot add a PRIMARY KEY or UNIQUE column with ALTER TABLE",
+                    ));
+                }
+                let has_default = column
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Default(_)));
+                let not_null = column
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::NotNull));
+                if not_null && !has_default {
+                    return Err(Error::semantic(
+                        "Cannot add a NOT NULL column with no DEFAULT value",
+                    ));
+                }
+
+                // The value existing rows will carry: the DEFAULT (or NULL).
+                let default_value: Value = if has_default {
+                    let expr = column
+                        .constraints
+                        .iter()
+                        .find_map(|c| match c {
+                            crate::sql::ast::ColumnConstraint::Default(e) => Some(e.clone()),
+                            _ => None,
+                        })
+                        .unwrap();
+                    let names: Vec<String> =
+                        table.columns.iter().map(|c| c.name.clone()).collect();
+                    crate::executor::eval_row_public(
+                        &expr,
+                        &[],
+                        &names,
+                        &[],
+                        &std::collections::HashMap::new(),
+                    )?
+                } else {
+                    Value::Null
+                };
+
+                // Rewrite the CREATE TABLE SQL to include the new column.
+                let new_sql = rewrite_create_table_add_column(&table.create_sql, &column);
+                let mut rebuilt = (*table).clone();
+                // Rebuild via build_table so affinity/constraints parse
+                // consistently (parse the new SQL and take its columns).
+                if let Ok(stmt) = crate::sql::parser::parse(&new_sql) {
+                    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                        columns, constraints, without_rowid, strict, ..
+                    }) = stmt
+                    {
+                        rebuilt = build_table(&table.name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
+                    }
+                }
+                let table_name = rebuilt.name.clone();
+                catalog.drop_table(&a.table);
+                catalog.add_table(rebuilt);
+
+                // Schema row rewrite.
+                delete_schema_row(ctx.pager, "table", &table.name)?;
+                let schema_row =
+                    crate::schema::encode_schema_row("table", &table_name, &table_name, root, &new_sql);
+                insert_schema_row(ctx.pager, &schema_row)?;
+
+                // Physical back-fill: append the default to every existing
+                // row. (SQLite stores the default in the schema and
+                // materializes it at read time; a one-time rewrite is the
+                // same observable behavior.)
+                if !default_value.is_null() {
+                    let n_cols = table.n_columns();
+                    let alias = table.rowid_alias;
+                    let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
+                    {
+                        let mut bt = Btree::new(ctx.pager, root, false);
+                        bt.scan_table(|rowid, payload| {
+                            if let Ok(mut row) = decode_row(payload, n_cols, rowid, alias) {
+                                row.push(default_value.clone());
+                                let new_payload = encode_row_aliased(&row, alias);
+                                updates.push((rowid, new_payload));
+                            }
+                            true
+                        })?;
+                    }
+                    let mut bt = Btree::new(ctx.pager, root, false);
+                    for (rowid, payload) in updates {
+                        let did = bt.update_table(rowid, &payload).unwrap_or(false);
+                        if !did {
+                            bt.delete_table(rowid)?;
+                            bt.insert_table(rowid, &payload)?;
+                        }
+                    }
+                    if bt.root != root {
+                        ctx.set_table_root(&table.name, bt.root);
+                    }
+                }
+                ctx.pager.flush()?;
+                Ok(())
+            }
+            AlterAction::RenameColumn { .. } | AlterAction::DropColumn { .. } => Err(
+                Error::Unsupported("ALTER TABLE RENAME COLUMN / DROP COLUMN"),
+            ),
+        }
+    }
+
     fn execute_pragma(p: PragmaStatement, ctx: &mut ExecContext) -> Result<()> {
         // Honored pragmas:
         //   foreign_keys = 0/1/on/off   — toggle FK enforcement (SQLite
@@ -2219,6 +2405,221 @@ fn value_as_expr(v: &crate::sql::ast::PragmaValue) -> &crate::sql::ast::Expr {
         crate::sql::ast::PragmaValue::Expr(e) => e,
         crate::sql::ast::PragmaValue::Call(e) => e,
     }
+}
+
+
+
+/// Minimal Expr → SQL text renderer (enough for DEFAULT / CHECK clauses
+/// replayed through ALTER TABLE ADD COLUMN's schema rewrite).
+fn expr_to_sql(e: &Expr) -> String {
+    use crate::sql::ast::Expr as E;
+    match e {
+        E::Literal(v) => match v {
+            Value::Null => "NULL".into(),
+            Value::Integer(i) => i.to_string(),
+            Value::Real(r) => r.to_string(),
+            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+            Value::Blob(b) => {
+                let hex: String = b.iter().map(|x| format!("{:02X}", x)).collect();
+                format!("X'{}'", hex)
+            }
+        },
+        E::Column { table: None, name } => name.clone(),
+        E::Column { table: Some(t), name } => format!("{}.{}", t, name),
+        E::Binary { op, left, right } => {
+            format!("{} {:?} {}", expr_to_sql(left), op, expr_to_sql(right))
+        }
+        E::Unary { op, expr } => format!("{:?} {}", op, expr_to_sql(expr)),
+        E::Function { name, args, .. } => {
+            let inner: Vec<String> = args.iter().map(expr_to_sql).collect();
+            format!("{}({})", name, inner.join(", "))
+        }
+        E::Row(items) => {
+            let inner: Vec<String> = items.iter().map(expr_to_sql).collect();
+            format!("({})", inner.join(", "))
+        }
+        _ => "?".to_string(),
+    }
+}
+
+/// Rewrite `CREATE TABLE <old> ...` → `CREATE TABLE <new> ...` preserving
+/// the rest of the statement text.
+fn rewrite_create_table_name(sql: &str, new_name: &str) -> String {
+    // Find the table-name token after "CREATE TABLE" (case-insensitive),
+    // possibly with IF NOT EXISTS.
+    let lower = sql.to_ascii_lowercase();
+    let ct = match lower.find("create table") {
+        Some(i) => i + "create table".len(),
+        None => return sql.to_string(),
+    };
+    let rest = &sql[ct..];
+    let trimmed = rest.trim_start();
+    let ws = rest.len() - trimmed.len();
+    let after_ws = ct + ws;
+    if trimmed.to_ascii_lowercase().starts_with("if not exists") {
+        let kw_len = "if not exists".len();
+        let rest2 = &sql[after_ws + kw_len..];
+        let t2 = rest2.trim_start();
+        let ws2 = rest2.len() - t2.len();
+        let name_len = t2
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(t2.len());
+        let name_start = after_ws + kw_len + ws2;
+        return format!("{}{}{}", &sql[..name_start], new_name, &sql[name_start + name_len..]);
+    }
+    let name_len = trimmed
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(trimmed.len());
+    format!("{}{}{}", &sql[..after_ws], new_name, &sql[after_ws + name_len..])
+}
+
+/// Append `, <column-def>` to a CREATE TABLE statement's column list (just
+/// before the closing paren).
+fn rewrite_create_table_add_column(
+    sql: &str,
+    column: &crate::sql::ast::ColumnDef,
+) -> String {
+    // Render the column definition back to SQL text.
+    let mut col_sql = column.name.clone();
+    if !column.type_name.is_empty() {
+        col_sql.push(' ');
+        col_sql.push_str(&column.type_name);
+    }
+    for c in &column.constraints {
+        use crate::sql::ast::ColumnConstraint::*;
+        col_sql.push(' ');
+        match c {
+            PrimaryKey { autoincrement, .. } => {
+                col_sql.push_str("PRIMARY KEY");
+                if *autoincrement {
+                    col_sql.push_str(" AUTOINCREMENT");
+                }
+            }
+            NotNull => col_sql.push_str("NOT NULL"),
+            Null => col_sql.push_str("NULL"),
+            Unique => col_sql.push_str("UNIQUE"),
+            Check(e) => col_sql.push_str(&format!("CHECK ({})", expr_to_sql(e))),
+            Default(e) => col_sql.push_str(&format!("DEFAULT {}", expr_to_sql(e))),
+            Collate(c) => col_sql.push_str(&format!("COLLATE {}", c)),
+            References { table, columns, on_delete, on_update } => {
+                col_sql.push_str(&format!("REFERENCES {}", table));
+                if !columns.is_empty() {
+                    col_sql.push_str(&format!("({})", columns.join(", ")));
+                }
+                use crate::sql::ast::ForeignKeyAction::*;
+                let act = |a: &crate::sql::ast::ForeignKeyAction| match a {
+                    NoAction => "NO ACTION".to_string(),
+                    Restrict => "RESTRICT".to_string(),
+                    SetNull => "SET NULL".to_string(),
+                    SetDefault => "SET DEFAULT".to_string(),
+                    Cascade => "CASCADE".to_string(),
+                };
+                if !matches!(on_delete, NoAction) {
+                    col_sql.push_str(&format!(" ON DELETE {}", act(on_delete)));
+                }
+                if !matches!(on_update, NoAction) {
+                    col_sql.push_str(&format!(" ON UPDATE {}", act(on_update)));
+                }
+            }
+            GeneratedAs { expr, stored } => {
+                col_sql.push_str(&format!(
+                    "GENERATED ALWAYS AS ({}){}",
+                    expr_to_sql(expr),
+                    if *stored { " STORED" } else { "" }
+                ));
+            }
+        }
+    }
+    // Insert before the LAST ')' of the statement.
+    match sql.rfind(')') {
+        Some(close) => {
+            // trim trailing whitespace/comma before the close paren
+            let before = &sql[..close];
+            let trimmed = before.trim_end();
+            format!("{}, {})", trimmed, col_sql)
+        }
+        None => sql.to_string(),
+    }
+}
+
+/// Rewrite the `tbl_name` column of every trigger schema row on `old_table`
+/// (ALTER TABLE RENAME TO keeps triggers attached to the renamed table).
+fn rewrite_trigger_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> Result<()> {
+    let mut bt = Btree::new(pager, 0, false);
+    let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
+    bt.scan_table(|rowid, payload| {
+        if let Ok(row) = decode_row(payload, 5, 0, None) {
+            if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+                if kind == "trigger" && tbl_name.eq_ignore_ascii_case(old_table) {
+                    let new_sql = rewrite_on_table(&sql, old_table, new_table);
+                    updates.push((
+                        rowid,
+                        crate::schema::encode_schema_row("trigger", &name, new_table, rootpage, &new_sql),
+                    ));
+                }
+            }
+        }
+        true
+    })?;
+    for (rowid, row) in updates {
+        let payload = encode_row(&row);
+        bt.delete_table(rowid)?;
+        bt.insert_table(rowid, &payload)?;
+    }
+    Ok(())
+}
+
+
+/// Rewrite `... ON <old> ...` → `... ON <new> ...` in a CREATE INDEX /
+/// CREATE TRIGGER statement (case-insensitive table name, word boundaries).
+fn rewrite_on_table(sql: &str, old: &str, new: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let on_kw = " on ";
+    let mut out = sql.to_string();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find(on_kw) {
+        let on_pos = search_from + rel + on_kw.len();
+        // The table name runs from on_pos to the next delimiter.
+        let rest = &sql[on_pos..];
+        let name_len = rest
+            .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            .unwrap_or(rest.len());
+        let name = &sql[on_pos..on_pos + name_len];
+        if name.eq_ignore_ascii_case(old) {
+            out = format!("{}{}{}", &sql[..on_pos], new, &sql[on_pos + name_len..]);
+            // Rebuild the lowercase view for the next iteration.
+            return rewrite_on_table(&out, old, new);
+        }
+        search_from = on_pos + name_len.max(1);
+    }
+    out
+}
+
+/// Rewrite the `tbl_name` column of every index schema row that belongs to
+/// `old_table` (used by ALTER TABLE RENAME TO).
+fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> Result<()> {
+    let mut bt = Btree::new(pager, 0, false);
+    let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
+    bt.scan_table(|rowid, payload| {
+        if let Ok(row) = decode_row(payload, 5, 0, None) {
+            if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+                if kind == "index" && tbl_name.eq_ignore_ascii_case(old_table) {
+                    let new_sql = rewrite_on_table(&sql, old_table, new_table);
+                    updates.push((
+                        rowid,
+                        crate::schema::encode_schema_row("index", &name, new_table, rootpage, &new_sql),
+                    ));
+                }
+            }
+        }
+        true
+    })?;
+    for (rowid, row) in updates {
+        let payload = encode_row(&row);
+        bt.delete_table(rowid)?;
+        bt.insert_table(rowid, &payload)?;
+    }
+    Ok(())
 }
 
 /// Insert a row into the schema table (rooted at page 0).
@@ -2269,8 +2670,30 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         }
         true
     })?;
+    // Two passes: TABLES first, then everything else. ALTER TABLE RENAME
+    // re-inserts the table's schema row at the END of the schema B+tree
+    // (delete + insert), so an index's row can precede its table's row —
+    // a single pass would see the index before the table exists.
+    // Decode into owned tuples so the row Vecs can drop.
+    let mut tables_first: Vec<(String, String, String, u32, String)> = Vec::new();
+    let mut others: Vec<(String, String, String, u32, String)> = Vec::new();
     for row in entries {
         if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+            let owned = (kind.to_string(), _name.to_string(), tbl_name.to_string(), rootpage, sql.to_string());
+            if kind == "table" {
+                tables_first.push(owned);
+            } else {
+                others.push(owned);
+            }
+        }
+    }
+    let ordered = tables_first.into_iter().chain(others.into_iter());
+    for (kind, _name, tbl_name, rootpage, sql) in ordered {
+        let kind = kind.as_str();
+        let sql = sql.as_str();
+        let _ = &_name;
+        let _ = &tbl_name;
+        {
             match kind {
                 "table" => {
                     if let Ok(stmt) = parse(sql) {
