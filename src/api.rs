@@ -309,7 +309,21 @@ enum FastPath {
         table: Arc<Table>,
         index: Arc<Index>,
         keys: Vec<FastBound>,
+        /// When every key is a literal, the encoded index key is computed
+        /// ONCE at statement-cache time — execution borrows these bytes
+        /// instead of re-encoding (and re-allocating) per call.
+        pre_encoded: Option<Arc<[u8]>>,
         project: Option<Vec<usize>>,
+        columns: Arc<[String]>,
+    },
+    /// `SELECT COUNT(*) FROM t WHERE indexed_col = ?` — covering index
+    /// count: the table is never touched; the answer is the number of
+    /// index entries with the encoded key prefix.
+    IndexCount {
+        table: Arc<Table>,
+        index: Arc<Index>,
+        keys: Vec<FastBound>,
+        pre_encoded: Option<Arc<[u8]>>,
         columns: Arc<[String]>,
     },
     /// `SELECT cols FROM t WHERE rowid BETWEEN ? AND ?` (or the planner's
@@ -345,6 +359,7 @@ impl FastPath {
         match self {
             FastPath::RowidPoint { table, .. } => &table.name,
             FastPath::IndexPoint { table, .. } => &table.name,
+            FastPath::IndexCount { table, .. } => &table.name,
             FastPath::RowidRange { table, .. } => &table.name,
         }
     }
@@ -355,6 +370,7 @@ impl FastPath {
         match self {
             FastPath::RowidPoint { columns, .. } => columns,
             FastPath::IndexPoint { columns, .. } => columns,
+            FastPath::IndexCount { columns, .. } => columns,
             FastPath::RowidRange { columns, .. } => columns,
         }
     }
@@ -365,6 +381,23 @@ impl FastPath {
 /// the selective decoder, which skips over un-projected columns without
 /// allocating Values for them.
 #[inline]
+
+/// Pre-encode the index key for an IndexPoint fast path when every bound
+/// key is a literal (constants in the SQL text). Returns None when any
+/// key is a parameter (re-encoded per call against the param values).
+fn pre_encode_literal_keys(keys: &[FastBound]) -> Option<Arc<[u8]>> {
+    if !keys.iter().all(|k| matches!(k, FastBound::Literal(_))) {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(keys.len() * 8);
+    for k in keys {
+        if let FastBound::Literal(v) = k {
+            v.encode_order_key_into(&mut buf);
+        }
+    }
+    Some(buf.into())
+}
+
 fn decode_projected(payload: &[u8], table: &Table, rowid: i64, project: Option<&[usize]>) -> Result<Row> {
     match project {
         Some(idxs) => {
@@ -1068,6 +1101,12 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
+        // Read-form PRAGMAs surface their value as a result row.
+        if let Statement::Pragma(p) = cached.stmt.as_ref() {
+            if let Some(row) = read_pragma(p, &self.pager) {
+                return Ok(vec![row]);
+            }
+        }
         // WITH-clause statements: materialize CTEs, plan with them in
         // scope, execute — never cached (rows are recomputed per call).
         if let Statement::Select(sel) = cached.stmt.as_ref() {
@@ -1192,6 +1231,11 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
+        if let Statement::Pragma(p) = cached.stmt.as_ref() {
+            if let Some(row) = read_pragma(p, &self.pager) {
+                return Ok((vec![p.name.clone()], vec![row]));
+            }
+        }
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -1565,6 +1609,47 @@ impl Database {
             }
         }
 
+        // `SELECT COUNT(*) FROM t WHERE indexed_col = ?` — the
+        // covering-index count: index probe only, no table fetch, no
+        // pipeline (the general path measured ~1085 ns for this shape).
+        // The planner wraps the Aggregate in a Project (handled inside the
+        // match below); a BARE Aggregate reaching the top of the plan is
+        // rare but valid — check it here, before dispatch.
+        fn covering_count_fp(
+            input: &crate::planner::plan::Plan,
+            group_by: &[Expr],
+            aggregates: &[crate::planner::plan::AggExpr],
+        ) -> Option<FastPath> {
+            if !group_by.is_empty() || aggregates.len() != 1 {
+                return None;
+            }
+            let agg = &aggregates[0];
+            if !agg.func.eq_ignore_ascii_case("count") || agg.arg.is_some() || agg.distinct {
+                return None;
+            }
+            match input {
+                crate::planner::plan::Plan::IndexLookup { table, index, key_exprs, .. } => {
+                    let keys = key_exprs
+                        .iter()
+                        .map(|e| bind_expr(e))
+                        .collect::<Option<Vec<_>>>()?;
+                    let pre_encoded = pre_encode_literal_keys(&keys);
+                    Some(FastPath::IndexCount {
+                        table: table.clone(),
+                        index: index.clone(),
+                        keys,
+                        pre_encoded,
+                        columns: std::sync::Arc::from(vec![agg.display_name.clone()]),
+                    })
+                }
+                _ => None,
+            }
+        }
+        if let Plan::Aggregate { input, group_by, aggregates } = plan {
+            if let Some(fp) = covering_count_fp(input, group_by, aggregates) {
+                return Some(fp);
+            }
+        }
         match plan {
             // Bare `SELECT * FROM t WHERE id = ?` (no Project node).
             Plan::RowidLookup { table, rowid, .. } => {
@@ -1602,10 +1687,12 @@ impl Database {
                 Plan::IndexLookup { table, index, key_exprs, .. } => {
                     let keys = key_exprs.iter().map(bind_expr).collect::<Option<Vec<_>>>()?;
                     let (project, cols) = resolve_projection(columns, table)?;
+                    let pre_encoded = pre_encode_literal_keys(&keys);
                     Some(FastPath::IndexPoint {
                         table: table.clone(),
                         index: index.clone(),
                         keys,
+                        pre_encoded,
                         project,
                         columns: cols,
                     })
@@ -1621,6 +1708,33 @@ impl Database {
                         project,
                         columns: cols,
                     })
+                }
+                // Project { Aggregate { IndexLookup } } — the planner's
+                // wrapped form of the covering-index COUNT (see above).
+                Plan::Aggregate { input, group_by, aggregates }
+                    if group_by.is_empty() && aggregates.len() == 1 =>
+                {
+                    // Only when the projection is the trivial single-column
+                    // pass-through of the aggregate output.
+                    let trivial = columns.len() == 1
+                        && matches!(&columns[0].expr, Expr::Column { name, .. }
+                            if name.starts_with("__agg_"));
+                    if !trivial {
+                        return None;
+                    }
+                    if let Plan::IndexLookup { table, index, key_exprs, .. } = input.as_ref() {
+                        let keys = key_exprs.iter().map(|e| bind_expr(e)).collect::<Option<Vec<_>>>()?;
+                        let pre_encoded = pre_encode_literal_keys(&keys);
+                        Some(FastPath::IndexCount {
+                            table: table.clone(),
+                            index: index.clone(),
+                            keys,
+                            pre_encoded,
+                            columns: std::sync::Arc::from(vec![aggregates[0].display_name.clone()]),
+                        })
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             },
@@ -1661,13 +1775,38 @@ impl Database {
                     LookupResult::NotFound => Ok(Vec::new()),
                 }
             }
-            FastPath::IndexPoint { table, index, keys, project, columns: _ } => {
+            FastPath::IndexCount { index, keys, pre_encoded, .. } => {
+                let mut key_scratch: Vec<u8>;
+                let key_bytes: &[u8] = match pre_encoded {
+                    Some(pre) => &pre[..],
+                    None => {
+                        key_scratch = Vec::with_capacity(keys.len() * 8);
+                        for k in keys {
+                            k.resolve(params).encode_order_key_into(&mut key_scratch);
+                        }
+                        &key_scratch
+                    }
+                };
+                let iroot = index_root.unwrap_or(index.root_page);
+                let mut ibt = Btree::new(&self.pager, iroot, true);
+                let rowids = ibt.lookup_index(key_bytes)?;
+                Ok(vec![vec![Value::Integer(rowids.len() as i64)]])
+            }
+            FastPath::IndexPoint { table, index, keys, pre_encoded, project, columns: _ } => {
                 // Encode the key (same order-preserving encoding as the
-                // general path's exec_index_lookup).
-                let mut key_bytes = Vec::with_capacity(keys.len() * 8);
-                for k in keys {
-                    k.resolve(params).encode_order_key_into(&mut key_bytes);
-                }
+                // general path's exec_index_lookup). All-literal keys were
+                // pre-encoded at cache time — borrow, don't re-encode.
+                let mut key_scratch: Vec<u8>;
+                let key_bytes: &[u8] = match pre_encoded {
+                    Some(pre) => &pre[..],
+                    None => {
+                        key_scratch = Vec::with_capacity(keys.len() * 8);
+                        for k in keys {
+                            k.resolve(params).encode_order_key_into(&mut key_scratch);
+                        }
+                        &key_scratch
+                    }
+                };
                 let iroot = index_root.unwrap_or(index.root_page);
                 let mut ibt = Btree::new(&self.pager, iroot, true);
                 let rowids = ibt.lookup_index(&key_bytes)?;
@@ -2419,6 +2558,35 @@ impl Database {
     }
 }
 
+
+
+/// Evaluate a read-form PRAGMA (`PRAGMA name` with no `= value`) into a
+/// result row. Returns None for unknown names (the caller then treats the
+/// statement as a no-op, matching the previous behavior).
+fn read_pragma(p: &PragmaStatement, pager: &Pager) -> Option<Vec<Value>> {
+    let name = p.name.to_ascii_lowercase();
+    if p.value.is_some() {
+        return None; // write form
+    }
+    let v = match name.as_str() {
+        "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
+        "page_size" => Value::Integer(pager.page_size() as i64),
+        "page_count" => Value::Integer(pager.n_pages() as i64),
+        "cache_size" => Value::Integer(pager.cache_capacity() as i64),
+        "schema_version" => Value::Integer(pager.schema_cookie() as i64),
+        // Accepted no-op pragmas report SQLite's documented defaults.
+        "journal_mode" => Value::Text("delete".into()),
+        "synchronous" => Value::Integer(2),
+        "temp_store" => Value::Integer(0),
+        "locking_mode" => Value::Text("normal".into()),
+        "user_version" => Value::Integer(0),
+        "application_id" => Value::Integer(0),
+        "auto_vacuum" => Value::Integer(0),
+        "encoding" => Value::Text("UTF-8".into()),
+        _ => return None,
+    };
+    Some(vec![v])
+}
 
 /// Extract the expression from a PRAGMA value (plain expr or parenthesized
 /// call form).
@@ -3953,5 +4121,62 @@ mod persist_tests {
         db.execute("INSERT INTO t (v) VALUES ('e')", []).unwrap();
         let rows = db.query("SELECT id FROM t", []).unwrap();
         assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[test]
+    fn index_count_fast_path_shapes() {
+        // `SELECT COUNT(*) FROM t WHERE indexed_col = ?` runs a dedicated
+        // covering-index fast path (index probe only, no table fetch).
+        // Exercise literal keys, param keys, misses, aliases, and the
+        // shapes that must NOT take it (COUNT(col), GROUP BY).
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)", []).unwrap();
+        db.execute("BEGIN", []).unwrap();
+        for i in 1..=1000i64 {
+            let cat = if i % 3 == 0 { "a" } else if i % 3 == 1 { "b" } else { "c" };
+            db.execute(
+                "INSERT INTO t (cat, val) VALUES (?, ?)",
+                [Value::Text(cat.into()), Value::Integer(i)],
+            )
+            .unwrap();
+        }
+        db.execute("COMMIT", []).unwrap();
+        db.execute("CREATE INDEX idx_cat ON t(cat)", []).unwrap();
+        // Literal key.
+        let r = db.query("SELECT COUNT(*) FROM t WHERE cat = 'a'", []).unwrap();
+        assert_eq!(r, vec![vec![Value::Integer(333)]]);
+        // Parameter key (re-encoded per call).
+        let r = db
+            .query("SELECT COUNT(*) FROM t WHERE cat = ?", [Value::Text("b".into())])
+            .unwrap();
+        assert_eq!(r, vec![vec![Value::Integer(334)]]);
+        // Miss.
+        let r = db.query("SELECT COUNT(*) FROM t WHERE cat = 'zzz'", []).unwrap();
+        assert_eq!(r, vec![vec![Value::Integer(0)]]);
+        // Aliased.
+        let r = db.query("SELECT COUNT(*) AS n FROM t WHERE cat = 'a'", []).unwrap();
+        assert_eq!(r, vec![vec![Value::Integer(333)]]);
+        // Column names through query_with_columns.
+        let (cols, rows) = db
+            .query_with_columns("SELECT COUNT(*) FROM t WHERE cat = 'c'", [])
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::Integer(333)]]);
+        assert_eq!(cols.len(), 1);
+        // COUNT(col) is NOT the fast path but must stay correct.
+        let r = db.query("SELECT COUNT(val) FROM t WHERE cat = 'c'", []).unwrap();
+        assert_eq!(r, vec![vec![Value::Integer(333)]]);
+        // GROUP BY multi-bucket stays correct.
+        let r = db
+            .query("SELECT cat, COUNT(*) FROM t GROUP BY cat ORDER BY cat", [])
+            .unwrap();
+        assert_eq!(r, vec![
+            vec![Value::Text("a".into()), Value::Integer(333)],
+            vec![Value::Text("b".into()), Value::Integer(334)],
+            vec![Value::Text("c".into()), Value::Integer(333)],
+        ]);
+        // Indexed point lookups still correct alongside (pre-encoded
+        // literal keys path).
+        let r = db.query("SELECT id FROM t WHERE cat = 'a' AND val = 999", []).unwrap();
+        assert_eq!(r, vec![vec![Value::Integer(999)]]);
     }
 }
