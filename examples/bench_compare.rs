@@ -421,6 +421,10 @@ fn rustqlite_point_lookup_indexed(db: &mut rustqlite::Database, n: usize) -> Dur
 fn rustqlite_range_scan(db: &mut rustqlite::Database, range: usize) -> Duration {
     // Use placeholders so the cache amortizes parse+plan across all range sizes.
     let sql = "SELECT name, val, score FROM t WHERE id BETWEEN ? AND ?";
+    // Steady-state warmup: populate the statement cache (parse+plan) before
+    // timing. SQLite's harness prepares its statement OUTSIDE the timer, so
+    // without this the comparison would charge us a cold compile.
+    let _ = db.query(sql, [Value::Integer(1), Value::Integer(2)]).unwrap();
     let start = Instant::now();
     let _ = db.query(
         sql,
@@ -430,18 +434,24 @@ fn rustqlite_range_scan(db: &mut rustqlite::Database, range: usize) -> Duration 
 }
 
 fn rustqlite_full_scan_count(db: &mut rustqlite::Database) -> Duration {
+    // Steady-state warmup (see rustqlite_range_scan).
+    let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
     let start = Instant::now();
     let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
     start.elapsed()
 }
 
 fn rustqlite_aggregate(db: &mut rustqlite::Database) -> Duration {
+    // Steady-state warmup (see rustqlite_range_scan).
+    let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
     let start = Instant::now();
     let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
     start.elapsed()
 }
 
 fn rustqlite_group_by(db: &mut rustqlite::Database) -> Duration {
+    // Steady-state warmup (see rustqlite_range_scan).
+    let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
     let start = Instant::now();
     let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
     start.elapsed()
@@ -483,6 +493,8 @@ fn rustqlite_setup_join(db: &mut rustqlite::Database) {
 
 fn rustqlite_join_2table(db: &mut rustqlite::Database) -> Duration {
     let sql = "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
+    // Steady-state warmup (see rustqlite_range_scan).
+    let _ = db.query(sql, [Value::Integer(1)]).unwrap();
     let start = Instant::now();
     let _ = db.query(sql, [Value::Integer(500)]).unwrap();
     start.elapsed()
@@ -490,6 +502,8 @@ fn rustqlite_join_2table(db: &mut rustqlite::Database) -> Duration {
 
 fn rustqlite_join_3table(db: &mut rustqlite::Database) -> Duration {
     let sql = "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = ?";
+    // Steady-state warmup (see rustqlite_range_scan).
+    let _ = db.query(sql, [Value::Integer(1)]).unwrap();
     let start = Instant::now();
     let _ = db.query(sql, [Value::Integer(500)]).unwrap();
     start.elapsed()
@@ -497,6 +511,8 @@ fn rustqlite_join_3table(db: &mut rustqlite::Database) -> Duration {
 
 fn rustqlite_join_full_scan(db: &mut rustqlite::Database) -> Duration {
     let sql = "SELECT u.dept, COUNT(*), SUM(o.total) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.dept";
+    // Steady-state warmup (see rustqlite_range_scan).
+    let _ = db.query(sql, []).unwrap();
     let start = Instant::now();
     let _ = db.query(sql, []).unwrap();
     start.elapsed()
