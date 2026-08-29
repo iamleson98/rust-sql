@@ -37,6 +37,21 @@ impl Column {
     }
 }
 
+/// One FOREIGN KEY clause of a table (from a column-level `REFERENCES` or
+/// a table-level `FOREIGN KEY (...) REFERENCES ...`).
+#[derive(Clone, Debug)]
+pub struct ForeignKeyClause {
+    /// Child-side column indices (into `Table::columns`).
+    pub columns: Vec<usize>,
+    /// Referenced (parent) table name.
+    pub ref_table: String,
+    /// Referenced (parent) column names. Empty means "the parent's PRIMARY
+    /// KEY" (SQLite's implicit form: `REFERENCES parent`).
+    pub ref_columns: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
 /// A table in the catalog.
 #[derive(Clone, Debug)]
 pub struct Table {
@@ -53,6 +68,11 @@ pub struct Table {
     /// the full row after defaults are applied; a NULL or false result
     /// rejects the write with `CHECK constraint failed: <table>`.
     pub check_exprs: Vec<crate::sql::ast::Expr>,
+    /// FOREIGN KEY clauses (column-level REFERENCES and table-level FOREIGN
+    /// KEY). Enforced on INSERT/UPDATE (child side) and DELETE/parent-key
+    /// UPDATE (parent side) when `PRAGMA foreign_keys = ON` (default OFF,
+    /// matching SQLite).
+    pub foreign_keys: Vec<ForeignKeyClause>,
     /// Cached unqualified column names (`["id", "name", ...]`), shared by
     /// every executor fast path. Built once in `build_table`; cloning is a
     /// single refcount bump instead of N `String` deep clones per query.
@@ -401,6 +421,47 @@ pub fn build_table(
         }
     }
 
+    // Collect FOREIGN KEY clauses: column-level REFERENCES first, then
+    // table-level FOREIGN KEY (...). Child columns resolve to indices now
+    // (case-insensitive); unknown child columns are a semantic error.
+    let mut foreign_keys = Vec::new();
+    for (i, col) in columns.iter().enumerate() {
+        for constraint in &col.constraints {
+            if let ColumnConstraint::References { table: rt, columns: rc, on_delete, on_update } = constraint {
+                foreign_keys.push(ForeignKeyClause {
+                    columns: vec![i],
+                    ref_table: rt.clone(),
+                    ref_columns: rc.clone(),
+                    on_delete: *on_delete,
+                    on_update: *on_update,
+                });
+            }
+        }
+    }
+    for c in constraints {
+        if let TableConstraint::ForeignKey { columns: cols, ref_table, ref_columns, on_delete, on_update } = c {
+            let mut child_idx = Vec::with_capacity(cols.len());
+            for cn in cols {
+                match table_columns.iter().position(|tc| tc.name.eq_ignore_ascii_case(cn)) {
+                    Some(idx) => child_idx.push(idx),
+                    None => {
+                        return Err(Error::semantic(format!(
+                            "unknown column {} in FOREIGN KEY definition",
+                            cn
+                        )))
+                    }
+                }
+            }
+            foreign_keys.push(ForeignKeyClause {
+                columns: child_idx,
+                ref_table: ref_table.clone(),
+                ref_columns: ref_columns.clone(),
+                on_delete: *on_delete,
+                on_update: *on_update,
+            });
+        }
+    }
+
     let plain: Vec<String> = table_columns.iter().map(|c| c.name.clone()).collect();
     let qualified: Vec<String> = table_columns
         .iter()
@@ -416,6 +477,7 @@ pub fn build_table(
         rowid_alias,
         create_sql: create_sql.to_string(),
         check_exprs,
+        foreign_keys,
         col_names: plain.into(),
         qualified_col_names: qualified.into(),
     })

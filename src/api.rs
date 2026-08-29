@@ -503,6 +503,17 @@ impl Database {
         self.deferred_flush.store(enabled, Ordering::Release);
     }
 
+    /// Enable or disable FOREIGN KEY enforcement (same as
+    /// `PRAGMA foreign_keys = ON/OFF`). Default: off, like SQLite.
+    pub fn set_foreign_keys(&mut self, enabled: bool) {
+        self.pager.set_foreign_keys_enabled(enabled);
+    }
+
+    /// Current FOREIGN KEY enforcement state.
+    pub fn foreign_keys_enabled(&self) -> bool {
+        self.pager.foreign_keys_enabled()
+    }
+
     /// Set the dirty-page threshold at which a deferred-flush database
     /// auto-flushes. Default: 1000 pages.
     pub fn set_deferred_flush_threshold(&mut self, threshold: usize) {
@@ -2163,10 +2174,50 @@ impl Database {
         }
     }
 
-    fn execute_pragma(p: PragmaStatement, _ctx: &mut ExecContext) -> Result<()> {
-        // Most pragmas are no-ops; a few are honored.
-        let _ = p;
+    fn execute_pragma(p: PragmaStatement, ctx: &mut ExecContext) -> Result<()> {
+        // Honored pragmas:
+        //   foreign_keys = 0/1/on/off   — toggle FK enforcement (SQLite
+        //                                 default: off)
+        //   cache_size = N              — page-cache capacity hint (floor 1)
+        //   synchronous, journal_mode, temp_store, locking_mode,
+        //   legacy_alter_table, recursive_triggers, defer_foreign_keys —
+        //   parsed and accepted, semantics unchanged.
+        let name = p.name.to_ascii_lowercase();
+        if let Some(value) = &p.value {
+            // Evaluate the value expression with no row context.
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = crate::executor::EvalContext::new(
+                &empty_row,
+                &empty_cols,
+                &ctx.params,
+                &ctx.named_params,
+            );
+            let v = crate::executor::evaluate(&value_as_expr(value), &eval_ctx)?;
+            match name.as_str() {
+                "foreign_keys" => {
+                    let on = v.is_truthy();
+                    ctx.pager.set_foreign_keys_enabled(on);
+                }
+                "cache_size" => {
+                    // Advisory: the pager's cache capacity is set at open.
+                    // Accept and ignore (no error) — SQLite treats this as
+                    // a hint too.
+                }
+                _ => {}
+            }
+        }
         Ok(())
+    }
+}
+
+
+/// Extract the expression from a PRAGMA value (plain expr or parenthesized
+/// call form).
+fn value_as_expr(v: &crate::sql::ast::PragmaValue) -> &crate::sql::ast::Expr {
+    match v {
+        crate::sql::ast::PragmaValue::Expr(e) => e,
+        crate::sql::ast::PragmaValue::Call(e) => e,
     }
 }
 

@@ -976,7 +976,28 @@ impl Parser {
         let (schema, name) = self.parse_qualified_name()?;
         let value = if self.peek().is_op("=") {
             self.advance();
-            Some(PragmaValue::Expr(self.parse_primary_expr()?))
+            // Keyword literals (ON/OFF/TRUE/FALSE) are valid pragma values
+            // — they arrive as identifier-ish keywords, not expressions.
+            let v = match self.peek() {
+                t if t.is_keyword("ON") => {
+                    self.advance();
+                    Expr::Literal(Value::Integer(1))
+                }
+                t if t.is_keyword("OFF") => {
+                    self.advance();
+                    Expr::Literal(Value::Integer(0))
+                }
+                t if t.is_keyword("TRUE") => {
+                    self.advance();
+                    Expr::Literal(Value::Integer(1))
+                }
+                t if t.is_keyword("FALSE") => {
+                    self.advance();
+                    Expr::Literal(Value::Integer(0))
+                }
+                _ => self.parse_primary_expr()?,
+            };
+            Some(PragmaValue::Expr(v))
         } else if self.peek().is_punct('(') {
             self.advance();
             let e = self.parse_expr()?;

@@ -154,6 +154,102 @@ impl std::hash::BuildHasher for PageIdHashBuild {
 pub type PageCacheMap = std::collections::HashMap<PageId, PageRef, PageIdHashBuild>;
 pub type PageIdSet = std::collections::HashSet<PageId, PageIdHashBuild>;
 
+/// Pages with id below this bound live in the direct-indexed Vec (any
+/// file up to 4 GB at 4 KB pages); higher ids spill to a HashMap. This
+/// bounds the Vec at 8 MB regardless of database size while keeping the
+/// no-hash fast path for every page of a normal database.
+const PAGE_VEC_DIRECT_LIMIT: usize = 1 << 20;
+
+/// Dense page-id → page cache.
+///
+/// Page ids are small sequential integers, so low ids are stored in a
+/// `Vec<Option<PageRef>>` indexed directly by page id — no hashing, no
+/// probing — instead of a HashMap. Every B-tree descent touches 2-4
+/// pages, each of which previously paid a hash get (~25 ns) under the
+/// cache's read lock; direct indexing costs ~2 ns. Ids beyond
+/// `PAGE_VEC_DIRECT_LIMIT` (huge files) spill into a HashMap so the Vec
+/// can never grow proportional to a multi-GB file.
+pub struct PageCache {
+    slots: Vec<Option<PageRef>>,
+    overflow: PageCacheMap,
+    count: usize,
+}
+
+impl PageCache {
+    pub fn new() -> Self {
+        Self { slots: Vec::new(), overflow: PageCacheMap::default(), count: 0 }
+    }
+
+    #[inline]
+    pub fn get(&self, id: PageId) -> Option<&PageRef> {
+        if (id as usize) < PAGE_VEC_DIRECT_LIMIT {
+            self.slots.get(id as usize).and_then(|s| s.as_ref())
+        } else {
+            self.overflow.get(&id)
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, id: PageId) -> bool {
+        self.get(id).is_some()
+    }
+
+    #[inline]
+    pub fn insert(&mut self, id: PageId, page: PageRef) {
+        if (id as usize) < PAGE_VEC_DIRECT_LIMIT {
+            let idx = id as usize;
+            if idx >= self.slots.len() {
+                self.slots.resize(idx + 1, None);
+            }
+            if self.slots[idx].replace(page).is_none() {
+                self.count += 1;
+            }
+        } else {
+            if self.overflow.insert(id, page).is_none() {
+                self.count += 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, id: PageId) -> Option<PageRef> {
+        let old = if (id as usize) < PAGE_VEC_DIRECT_LIMIT {
+            self.slots.get_mut(id as usize).and_then(|s| s.take())
+        } else {
+            self.overflow.remove(&id)
+        };
+        if old.is_some() {
+            self.count -= 1;
+        }
+        old
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.overflow.clear();
+        self.count = 0;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (PageId, &PageRef)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|p| (i as PageId, p)))
+            .chain(self.overflow.iter().map(|(k, v)| (*k, v)))
+    }
+}
+
+impl Default for PageCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Pager {
     file: File,
     path: PathBuf,
@@ -167,8 +263,8 @@ pub struct Pager {
     freelist_count: AtomicU32,
     /// In-memory cache: page_id → page. RwLock so reads on distinct pages
     /// don't serialize; only cache-miss inserts take the write lock.
-    /// Keyed by u32 with a splitmix64 hasher (see `PageIdHasher`).
-    cache: RwLock<PageCacheMap>,
+    /// Direct-indexed Vec for low page ids (see `PageCache`).
+    cache: RwLock<PageCache>,
     /// LRU ordering: most recently used at the back.
     lru: Mutex<VecDeque<PageId>>,
     /// Maximum number of pages to keep in the cache (immutable after open).
@@ -187,6 +283,10 @@ pub struct Pager {
     /// same per-statement overhead as SQLite's `:memory:` mode (which never
     /// fsyncs because there's no file at all).
     skip_fsync: AtomicBool,
+    /// Whether FOREIGN KEY constraints are enforced (PRAGMA foreign_keys).
+    /// Lives on the pager so both Database (api.rs) and the executor's
+    /// static statement dispatcher can reach it through a shared &Pager.
+    foreign_keys_enabled: AtomicBool,
     /// Lazy write-back mode (in-memory databases). When true, `flush()` does
     /// NOT write dirty pages to the backing temp file — it just resets the
     /// dirty bookkeeping (O(1)). Dirty pages are written lazily by cache
@@ -239,12 +339,13 @@ impl Pager {
             n_pages: AtomicU32::new(0),
             freelist_head: AtomicU32::new(0),
             freelist_count: AtomicU32::new(0),
-            cache: RwLock::new(PageCacheMap::default()),
+            cache: RwLock::new(PageCache::new()),
             lru: Mutex::new(VecDeque::new()),
             cache_capacity,
             schema_cookie: AtomicU32::new(0),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(false),
+            foreign_keys_enabled: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
             last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
             dirty_count_approx: AtomicUsize::new(0),
@@ -440,7 +541,7 @@ impl Pager {
         // Fast path: read lock, check cache.
         {
             let cache = self.cache.read();
-            if let Some(page_ref) = cache.get(&id).cloned() {
+            if let Some(page_ref) = cache.get(id).cloned() {
                 return Ok(page_ref);
             }
         }
@@ -449,7 +550,7 @@ impl Pager {
         let page_ref = {
             let mut cache = self.cache.write();
             // Double-check: another thread may have inserted while we waited.
-            if let Some(page_ref) = cache.get(&id).cloned() {
+            if let Some(page_ref) = cache.get(id).cloned() {
                 return Ok(page_ref);
             }
             let psz = self.page_size();
@@ -566,10 +667,10 @@ impl Pager {
         let schema_cookie_val = self.schema_cookie.load(Ordering::Acquire);
 
         // Update file header on page 0
-        let page0_in_cache = self.cache.read().contains_key(&0);
+        let page0_in_cache = self.cache.read().contains_key(0);
         let psz = self.page_size();
         if page0_in_cache {
-            let page0 = self.cache.read().get(&0).cloned();
+            let page0 = self.cache.read().get(0).cloned();
             if let Some(page0) = page0 {
                 let mut borrowed = page0.lock();
                 FileHeader::write(
@@ -607,7 +708,7 @@ impl Pager {
         for id in dirty_ids {
             // Use a single cache read lock to look up the page; clone the Arc
             // and release the lock before doing I/O.
-            let page_ref = self.cache.read().get(&id).cloned();
+            let page_ref = self.cache.read().get(id).cloned();
             if let Some(page_ref) = page_ref {
                 let mut borrowed = page_ref.lock();
                 if borrowed.dirty {
@@ -721,7 +822,7 @@ impl Pager {
 
     /// Evict pages from the cache until we're under capacity.
     /// Caller must hold the cache write lock.
-    fn maybe_evict_locked(&self, cache: &mut PageCacheMap) {
+    fn maybe_evict_locked(&self, cache: &mut PageCache) {
         // Safety bound: if every cached page is dirty and unwritable (or
         // lazy_writeback is off), the loop below would otherwise spin
         // forever moving dirty pages to the back. `attempts` caps it.
@@ -738,7 +839,7 @@ impl Pager {
                     None => break,
                 }
             };
-            let should_evict = match cache.get(&evict_id) {
+            let should_evict = match cache.get(evict_id) {
                 Some(p) => {
                     let mut pg = p.lock();
                     if pg.dirty {
@@ -764,7 +865,7 @@ impl Pager {
                 None => true,
             };
             if should_evict {
-                cache.remove(&evict_id);
+                cache.remove(evict_id);
             } else {
                 // Move dirty page to the back and try the next one.
                 self.lru.lock().push_back(evict_id);
@@ -782,6 +883,15 @@ impl Pager {
     }
 
     /// Total bytes used by the cache (for instrumentation).
+    /// FOREIGN KEY enforcement toggle (PRAGMA foreign_keys = ON/OFF).
+    pub fn set_foreign_keys_enabled(&self, enabled: bool) {
+        self.foreign_keys_enabled.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn foreign_keys_enabled(&self) -> bool {
+        self.foreign_keys_enabled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn cache_bytes(&self) -> usize {
         self.cache.read().len() * self.page_size() as usize
     }

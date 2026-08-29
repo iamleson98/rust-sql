@@ -521,6 +521,323 @@ fn enforce_row_constraints(
     Ok(())
 }
 
+// ============================================================================
+// FOREIGN KEY enforcement
+// ============================================================================
+
+/// Does a parent row exist for the given foreign key values?
+///
+/// Resolution order for the parent key columns:
+/// 1. `fk.ref_columns` (explicit `REFERENCES p(c)`) — resolved on the parent.
+/// 2. Empty `ref_columns` — the parent's PRIMARY KEY column(s).
+///
+/// Lookup strategy:
+/// - single referenced column that is the parent's rowid alias → O(log N)
+///   `lookup_table` point probe;
+/// - otherwise → full table scan with an equality check (correct, and the
+///   common case for small reference tables; an index-based probe can be
+///   added when the parent has a matching unique index).
+fn fk_parent_exists(
+    ctx: &ExecContext<'_>,
+    fk: &crate::schema::ForeignKeyClause,
+    key_values: &[Value],
+) -> Result<bool> {
+    let catalog = ctx.catalog();
+    let Some(parent) = catalog.get_table(&fk.ref_table) else {
+        // Parent missing: SQLite rejects the DDL at definition time; if we
+        // got here the schema is inconsistent — treat as violation.
+        return Err(Error::semantic(format!(
+            "FOREIGN KEY constraint failed: no such table: {}",
+            fk.ref_table
+        )));
+    };
+    // Resolve parent key column indices: explicit list, else PK columns.
+    let parent_cols: Vec<usize> = if !fk.ref_columns.is_empty() {
+        let mut v = Vec::with_capacity(fk.ref_columns.len());
+        for rc in &fk.ref_columns {
+            match parent.find_column(rc) {
+                Some(i) => v.push(i),
+                None => {
+                    return Err(Error::semantic(format!(
+                        "FOREIGN KEY constraint failed: no such column: {}.{}",
+                        parent.name, rc
+                    )))
+                }
+            }
+        }
+        v
+    } else {
+        let pk: Vec<usize> = parent
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .map(|(i, _)| i)
+            .collect();
+        if pk.is_empty() {
+            // No PK on parent: SQLite requires a PK or unique index; the
+            // rowid (implicit PK) is the fallback.
+            vec![usize::MAX] // marker: compare against the rowid
+        } else {
+            pk
+        }
+    };
+
+    let root = ctx.table_root(&parent);
+    let n_cols = parent.n_columns();
+    let alias = parent.rowid_alias;
+
+    // Fast path: single referenced column == parent rowid alias → point probe.
+    if parent_cols.len() == 1 && parent_cols[0] != usize::MAX && alias == Some(parent_cols[0]) {
+        let rowid = key_values[0].as_integer();
+        let mut bt = Btree::new(ctx.pager, root, false);
+        return Ok(matches!(bt.lookup_table(rowid)?, LookupResult::Found(_)));
+    }
+
+    // General path: scan the parent, comparing the key columns.
+    let rowid_marker = parent_cols.len() == 1 && parent_cols[0] == usize::MAX;
+    let mut found = false;
+    let mut buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    bt.scan_table_borrowed(|rowid, payload| {
+        buf.clear();
+        if decode_row_into(payload, n_cols, rowid, alias, &mut buf).is_err() {
+            return true;
+        }
+        let matched = if rowid_marker {
+            key_values.len() == 1 && Value::Integer(rowid) == key_values[0]
+        } else {
+            parent_cols
+                .iter()
+                .zip(key_values.iter())
+                .all(|(&pc, kv)| buf.get(pc).map(|v| v == kv).unwrap_or(false))
+        };
+        if matched {
+            found = true;
+            false // stop
+        } else {
+            true
+        }
+    })?;
+    Ok(found)
+}
+
+/// Child-side enforcement: every FK of `table` must reference an existing
+/// parent row (NULL child keys pass — SQL MATCH SIMPLE semantics, same as
+/// SQLite's default). Called from INSERT and UPDATE before the write lands.
+fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Result<()> {
+    if table.foreign_keys.is_empty() || !ctx.pager.foreign_keys_enabled() {
+        return Ok(());
+    }
+    for fk in &table.foreign_keys {
+        let key_values: Vec<Value> =
+            fk.columns.iter().map(|&i| row.get(i).cloned().unwrap_or(Value::Null)).collect();
+        // MATCH SIMPLE: any NULL in the key → constraint satisfied.
+        if key_values.iter().any(|v| v.is_null()) {
+            continue;
+        }
+        if !fk_parent_exists(ctx, fk, &key_values)? {
+            let cols: Vec<String> = fk.columns.iter().map(|&i| table.columns[i].name.clone()).collect();
+            return Err(Error::semantic(format!(
+                "FOREIGN KEY constraint failed: {}.{} -> {}",
+                table.name,
+                cols.join(", "),
+                fk.ref_table
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Find child rows referencing `old_row`'s key through `fk` (a clause of
+/// `child_table` that references `parent_table`). Returns (rowid, key-values)
+/// pairs for each referencing child row.
+fn fk_find_child_rows(
+    ctx: &ExecContext<'_>,
+    child_table: &Table,
+    fk: &crate::schema::ForeignKeyClause,
+    parent_table: &Table,
+    parent_col_idxs: &[usize],
+    old_row: &[Value],
+    parent_rowid: i64,
+) -> Result<Vec<(i64, Vec<Value>)>> {
+    let parent_key: Vec<Value> = if parent_col_idxs.is_empty() {
+        vec![Value::Integer(parent_rowid)]
+    } else {
+        parent_col_idxs
+            .iter()
+            .map(|&i| old_row.get(i).cloned().unwrap_or(Value::Null))
+            .collect()
+    };
+    let root = ctx.table_root(child_table);
+    let n_cols = child_table.n_columns();
+    let alias = child_table.rowid_alias;
+    let mut hits: Vec<(i64, Vec<Value>)> = Vec::new();
+    let mut buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    bt.scan_table_borrowed(|rowid, payload| {
+        buf.clear();
+        if decode_row_into(payload, n_cols, rowid, alias, &mut buf).is_err() {
+            return true;
+        }
+        let matched = fk
+            .columns
+            .iter()
+            .zip(parent_key.iter())
+            .all(|(&ci, pv)| buf.get(ci).map(|v| v == pv).unwrap_or(false));
+        if matched {
+            hits.push((rowid, buf.clone()));
+        }
+        true
+    })?;
+    Ok(hits)
+}
+
+/// Parent-side enforcement for a DELETE (or a parent-key UPDATE that moves
+/// the key away): apply the ON DELETE action of every referencing FK.
+///
+/// - NoAction / Restrict: reject if any child references the key.
+/// - Cascade: delete the referencing children (recursively — children may
+///   themselves be parents).
+/// - SetNull / SetDefault: rewrite the referencing children's key columns.
+fn enforce_parent_delete_fks(
+    ctx: &mut ExecContext<'_>,
+    parent: &Table,
+    old_row: &[Value],
+    parent_rowid: i64,
+    depth: usize,
+) -> Result<()> {
+    if !ctx.pager.foreign_keys_enabled() || depth > 16 {
+        return Ok(());
+    }
+    // Every table whose FK references `parent` (case-insensitive).
+    // (Collected first: the loop below mutates ctx, and `catalog()` borrows
+    // it immutably — collecting the Arc clones up-front detaches the borrow.)
+    let referencing: Vec<(Arc<Table>, Vec<crate::schema::ForeignKeyClause>)> = ctx
+        .catalog()
+        .all_tables()
+        .into_iter()
+        .filter(|(_, t)| !t.name.eq_ignore_ascii_case(&parent.name) && !t.foreign_keys.is_empty())
+        .filter(|(_, t)| {
+            t.foreign_keys.iter().any(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+        })
+        .map(|(_, t)| {
+            let fks: Vec<crate::schema::ForeignKeyClause> = t
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+                .cloned()
+                .collect();
+            (t, fks)
+        })
+        .collect();
+    for (child, fks) in referencing {
+        for fk in &fks {
+            // Resolve the parent-side columns this FK points at.
+            let parent_cols: Vec<usize> = if !fk.ref_columns.is_empty() {
+                let mut v = Vec::with_capacity(fk.ref_columns.len());
+                for rc in &fk.ref_columns {
+                    if let Some(i) = parent.find_column(rc) {
+                        v.push(i);
+                    }
+                }
+                v
+            } else {
+                parent
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.primary_key)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            // Does this FK point at the parent's PRIMARY KEY columns being
+            // deleted? When the FK targets specific columns, only enforce
+            // when those columns are part of the parent key set — otherwise
+            // (FK on a non-key column) it's still a reference we must check.
+            let children = fk_find_child_rows(
+                ctx, &child, fk, parent, &parent_cols, old_row, parent_rowid,
+            )?;
+            if children.is_empty() {
+                continue;
+            }
+            match fk.on_delete {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                    return Err(Error::semantic(format!(
+                        "FOREIGN KEY constraint failed: {} rows reference {}",
+                        child.name, parent.name
+                    )));
+                }
+                ForeignKeyAction::Cascade => {
+                    // Recursively delete each child row (children may be
+                    // parents themselves — nested FKs cascade too).
+                    for (rowid, crow) in children {
+                        let child2 = child.clone();
+                        enforce_parent_delete_fks(ctx, &child2, &crow, rowid, depth + 1)?;
+                        let root = ctx.table_root(&child2);
+                        let new_root;
+                        {
+                            let mut bt = Btree::new(ctx.pager, root, false);
+                            bt.delete_table(rowid)?;
+                            new_root = bt.root;
+                        }
+                        let lc = child2.name.to_ascii_lowercase();
+                        ctx.set_table_root_lc(&lc, new_root);
+                        // Index maintenance for the deleted child row.
+                        let indexes = ctx.catalog().indexes_on_table(&child2.name);
+                        for idx in indexes {
+                            delete_index_entry(ctx, &idx, &child2, &crow, rowid)?;
+                        }
+                        ctx.changes += 1;
+                        if let Some(&cached) = ctx.max_rowids.get(&lc) {
+                            if rowid >= cached {
+                                ctx.max_rowids.remove(&lc);
+                            }
+                        }
+                    }
+                }
+                ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                    // Rewrite each child row's FK columns to NULL / defaults.
+                    for (rowid, mut crow) in children {
+                        for &ci in &fk.columns {
+                            crow[ci] = if fk.on_delete == ForeignKeyAction::SetNull {
+                                Value::Null
+                            } else {
+                                let default_val = child.columns[ci].default.as_ref().map(|e| {
+                                    let names: Vec<String> =
+                                        child.columns.iter().map(|c| c.name.clone()).collect();
+                                    eval_row(e, &crow, &names, &ctx.params, &ctx.named_params)
+                                        .unwrap_or(Value::Null)
+                                });
+                                default_val.unwrap_or(Value::Null)
+                            };
+                        }
+                        let payload = encode_row_aliased(&crow, child.rowid_alias);
+                        let root = ctx.table_root(&child);
+                        let new_root;
+                        {
+                            let mut bt = Btree::new(ctx.pager, root, false);
+                            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
+                            if !updated {
+                                bt.delete_table(rowid)?;
+                                bt.insert_table(rowid, &payload)?;
+                            }
+                            new_root = bt.root;
+                        }
+                        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
+                        let indexes = ctx.catalog().indexes_on_table(&child.name);
+                        for idx in indexes {
+                            delete_index_entry(ctx, &idx, &child, &crow, rowid)?;
+                        }
+                        ctx.changes += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Project the RETURNING clause for one affected row.
 /// `Star` expands to all columns; `Expr` is evaluated against the row.
 fn project_returning_row(
@@ -4491,6 +4808,8 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             // loop is purely positional (no names needed); col_names is
             // only consulted for CHECK expressions (empty when absent).
             enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+            // FOREIGN KEY (child side) — enforced only when the pragma is on.
+            enforce_child_fks(ctx, &table, &full_row)?;
 
             // BEFORE INSERT triggers (NEW = the row about to be inserted,
             // rowid assigned + constraints enforced). An error aborts the
@@ -4609,6 +4928,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
 
         // NOT NULL + CHECK constraints (see fast path).
         enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+        enforce_child_fks(ctx, &table, &full_row)?;
 
         let outcome = exec_insert_one_row(
             ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
@@ -4774,6 +5094,7 @@ pub fn fast_insert_literal_rows(
         }
 
         enforce_row_constraints(table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+        enforce_child_fks(ctx, table, &full_row)?;
 
         // BEFORE INSERT triggers.
         if crate::executor::triggers::has_triggers_for(ctx, table, &crate::sql::ast::TriggerEvent::Insert) {
@@ -4881,6 +5202,7 @@ pub fn fast_insert_single_row(
         &ctx.params,
         &ctx.named_params,
     )?;
+    enforce_child_fks(ctx, table, &full_row)?;
 
     let outcome = exec_insert_one_row(
         ctx,
@@ -5641,7 +5963,7 @@ fn try_streaming_update(
                 // index maintenance (free stash, saves a re-fetch descent).
                 let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
                 if let Err(e) = process_update_row(
-                    &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                    ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
                 ) {
@@ -5655,7 +5977,7 @@ fn try_streaming_update(
         bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
             let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
             if let Err(e) = process_update_row(
-                payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
             ) {
@@ -5737,7 +6059,7 @@ fn try_streaming_update(
                 ri += 1;
                 let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
                 if let Err(e) = process_update_row(
-                    payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                    ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
                 ) {
@@ -5758,7 +6080,7 @@ fn try_streaming_update(
                     // touches an indexed column).
                     let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
                     if let Err(e) = process_update_row(
-                        &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                        ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                         assignments, &col_names, &params, &named_params, table,
                         residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
                     ) {
@@ -5775,7 +6097,7 @@ fn try_streaming_update(
         bt.scan_table_borrowed(|rowid, payload| {
             let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
             if let Err(e) = process_update_row(
-                payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
             ) {
@@ -5953,6 +6275,7 @@ fn try_streaming_update(
 /// (rowid, payload) tuple into `updates`. Buffers are reused across rows.
 #[allow(clippy::too_many_arguments)]
 fn process_update_row(
+    fk_ctx: &ExecContext<'_>,
     payload: &[u8],
     n_cols: usize,
     rowid: i64,
@@ -6000,6 +6323,10 @@ fn process_update_row(
     }
     // NOT NULL + CHECK constraints on the updated row.
     enforce_row_constraints(table, new_row, col_names, params, named_params)?;
+    // FOREIGN KEY (child side): the updated row's FK values must reference
+    // an existing parent row (only when the pragma is on and the table has
+    // FKs — two cheap checks otherwise).
+    enforce_child_fks(fk_ctx, table, new_row)?;
     // Encode the new row.
     payload_buf.clear();
     encode_row_aliased_into(new_row, table.rowid_alias, payload_buf);
@@ -6016,7 +6343,271 @@ fn process_update_row(
 // DELETE
 // ============================================================================
 
+/// Streaming DELETE: walk the source B+tree directly (or the index for
+/// IndexRange sources), evaluate the residual predicate against a reused
+/// decode buffer, and collect just the rowids to remove. Phase 2 deletes
+/// each rowid via `delete_table_get_payload` (one descent, payload handed
+/// back for index maintenance / RETURNING / triggers).
+///
+/// Besides the allocation savings (the generic path materializes every
+/// matched row — one Vec<Value> + one String per TEXT column), this is
+/// what makes `DELETE FROM t WHERE ...` work on tables **without** an
+/// INTEGER PRIMARY KEY: the rowid comes from the B+tree cell key, not
+/// from a row column (SQLite semantics — every table has a rowid).
+///
+/// Returns Ok(None) when the source shape isn't handled here (the caller
+/// falls back to the generic materialize-all path).
+fn try_streaming_delete(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    source: &Plan,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+) -> Result<Option<ExecResult>> {
+    use crate::planner::plan::Plan;
+
+    // The source table must be the DELETE target itself.
+    let (src_table, residual_pred, range, index_range) = match source {
+        Plan::Scan { table: t, predicate, .. } => (t, predicate.as_ref(), None, None),
+        Plan::Filter { input, predicate } => {
+            match input.as_ref() {
+                Plan::Scan { table: t, predicate: None, .. } => (t, Some(predicate), None, None),
+                _ => return Ok(None),
+            }
+        }
+        Plan::RowidRange { table: t, start, end, residual, .. } => {
+            (t, residual.as_ref(), Some((start.as_ref(), end.as_ref())), None)
+        }
+        Plan::IndexRange { table: t, index, start, end, residual, .. } => {
+            (t, residual.as_ref(), None, Some((index, start.as_ref(), end.as_ref())))
+        }
+        _ => return Ok(None),
+    };
+    if src_table.name.to_ascii_lowercase() != table.name.to_ascii_lowercase() {
+        return Ok(None);
+    }
+
+    let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
+    let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    let n_cols = table.n_columns();
+    let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let has_delete_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        table,
+        &crate::sql::ast::TriggerEvent::Delete,
+    );
+    let need_row = !indexes.is_empty() || returning.is_some() || has_delete_triggers;
+    let root = ctx.table_root(table);
+
+    // ---- Phase 1: collect rowids to delete ----
+    let mut rowids: Vec<i64> = Vec::new();
+    let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut first_error: Option<crate::error::Error> = None;
+
+    let mut bt = Btree::new(ctx.pager, root, false);
+    if let Some((index, start, end)) = index_range {
+        // IndexRange source: scan the index between the encoded bounds,
+        // collecting rowids (bounds logic mirrors try_streaming_update).
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
+        let start_key: Option<(Vec<u8>, bool)> = match start {
+            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            None => None,
+        };
+        let end_key: Option<(Vec<u8>, bool)> = match end {
+            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            None => None,
+        };
+        let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+        let index_root = ctx.index_root(index);
+        {
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
+                if let Some((k, false)) = &start_key {
+                    if cell_key.starts_with(k) {
+                        return true; // exclusive lower bound
+                    }
+                }
+                if let Some((k, inc)) = &end_key {
+                    match index_key_prefix_cmp(cell_key, k) {
+                        std::cmp::Ordering::Less => {}
+                        std::cmp::Ordering::Equal if *inc => {}
+                        _ => return false,
+                    }
+                }
+                rowids.push(rowid);
+                true
+            })?;
+        }
+        // Fetch each candidate row to evaluate the residual predicate
+        // (index bounds alone may over-select; the predicate decides).
+        if residual_pred.is_some() || need_row {
+            let mut matched: Vec<i64> = Vec::with_capacity(rowids.len());
+            for rid in rowids.drain(..) {
+                match bt.lookup_table(rid)? {
+                    LookupResult::Found(payload) => {
+                        row_buf.clear();
+                        if decode_row_into(&payload, n_cols, rid, table.rowid_alias, &mut row_buf).is_err() {
+                            continue;
+                        }
+                        if let Some(pred) = residual_pred {
+                            match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                                Ok(v) if v.is_truthy() => {}
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    first_error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        matched.push(rid);
+                    }
+                    LookupResult::NotFound => {} // row deleted concurrently — skip
+                }
+            }
+            rowids = matched;
+        }
+    } else if let Some((start_expr, end_expr)) = range {
+        // RowidRange source: walk the range, decode each payload for the
+        // residual predicate (ranges are inclusive on both ends).
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
+        let lo = match start_expr {
+            Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+            None => i64::MIN,
+        };
+        let hi = match end_expr {
+            Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+            None => i64::MAX,
+        };
+        bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+            if let Some(pred) = residual_pred {
+                row_buf.clear();
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err() {
+                    return true; // skip undecodable rows, keep walking
+                }
+                match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                    Ok(v) if v.is_truthy() => {}
+                    Ok(_) => return true,
+                    Err(e) => {
+                        first_error = Some(e);
+                        return false;
+                    }
+                }
+            }
+            rowids.push(rowid);
+            true
+        })?;
+    } else {
+        // Full scan (optionally filtered): walk every cell.
+        bt.scan_table_borrowed(|rowid, payload| {
+            if let Some(pred) = residual_pred {
+                row_buf.clear();
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err() {
+                    return true;
+                }
+                match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                    Ok(v) if v.is_truthy() => {}
+                    Ok(_) => return true,
+                    Err(e) => {
+                        first_error = Some(e);
+                        return false;
+                    }
+                }
+            }
+            rowids.push(rowid);
+            true
+        })?;
+    }
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    // Keep max-rowid bookkeeping consistent (mirrors the generic path):
+    // deleting the max rowid invalidates the cached next-rowid hint.
+    let table_name_lc = table.name.to_ascii_lowercase();
+    if let Some(&max_del) = rowids.iter().max() {
+        if let Some(&cached) = ctx.max_rowids.get(&table_name_lc) {
+            if max_del >= cached {
+                ctx.max_rowids.remove(&table_name_lc);
+            }
+        }
+    }
+
+    // ---- Phase 2: delete + index maintenance + triggers + RETURNING ----
+    let mut deleted: i64 = 0;
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    let mut new_root = root;
+    for rid in rowids {
+        // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
+        // row goes away. The old row is fetched first (needed for the key
+        // comparison and for CASCADE/SET NULL rewrites of child rows).
+        if ctx.pager.foreign_keys_enabled() {
+            let mut bt = Btree::new(ctx.pager, new_root, false);
+            if let LookupResult::Found(payload) = bt.lookup_table(rid)? {
+                if let Ok(old_row) = decode_row(&payload, n_cols, rid, table.rowid_alias) {
+                    enforce_parent_delete_fks(ctx, table, &old_row, rid, 0)?;
+                }
+            }
+        }
+        // One descent: find + delete, payload returned for maintenance.
+        let payload = {
+            let mut bt = Btree::new(ctx.pager, new_root, false);
+            let p = bt.delete_table_get_payload(rid)?;
+            new_root = bt.root;
+            p
+        };
+        ctx.set_table_root_lc(&table_name_lc, new_root);
+        let Some(payload) = payload else { continue };
+        deleted += 1;
+        ctx.changes += 1;
+        if need_row {
+            let row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
+            if let Some(ret) = returning {
+                returning_rows.push(project_returning_row(ret, &row, &col_names, &params, &named_params)?);
+            }
+            for idx in &indexes {
+                delete_index_entry(ctx, idx, table, &row, rid)?;
+            }
+            if has_delete_triggers {
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    table,
+                    &crate::sql::ast::TriggerEvent::Delete,
+                    crate::sql::ast::TriggerWhen::After,
+                    None,
+                    Some(&row),
+                    &table.col_names,
+                )?;
+            }
+        }
+    }
+    if !ctx.in_transaction && !ctx.deferred_flush {
+        ctx.pager.flush()?;
+    }
+    if returning.is_some() {
+        return Ok(Some(ExecResult {
+            columns: returning_column_names(returning.unwrap(), &col_names).into(),
+            rows: returning_rows,
+        }));
+    }
+    Ok(Some(ExecResult {
+        columns: Arc::from(vec!["deleted".to_string()]),
+        rows: vec![vec![Value::Integer(deleted)]],
+    }))
+}
+
 fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+    // Streaming path first: handles Scan/Filter, RowidRange and IndexRange
+    // sources without materializing matched rows, and — critically —
+    // supports DELETE on tables without an INTEGER PRIMARY KEY (rowid
+    // comes from the B+tree cell key). RowidLookup sources fall through
+    // to the dedicated point-delete fast path below.
+    if let Some(result) = try_streaming_delete(ctx, &table, source, returning)? {
+        return Ok(result);
+    }
+
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let table_name_lc = table.name.to_ascii_lowercase();
 
@@ -6042,6 +6633,17 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
             let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let rowid_val = evaluate(rowid, &eval_ctx)?.as_integer();
             let root = ctx.table_root(&table);
+            // FOREIGN KEY (parent side): check BEFORE deleting — the row's
+            // key values are needed for the child-reference scan and for
+            // CASCADE / SET NULL rewrites.
+            if ctx.pager.foreign_keys_enabled() {
+                let mut bt = Btree::new(ctx.pager, root, false);
+                if let LookupResult::Found(payload) = bt.lookup_table(rowid_val)? {
+                    if let Ok(old_row) = decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias) {
+                        enforce_parent_delete_fks(ctx, &table, &old_row, rowid_val, 0)?;
+                    }
+                }
+            }
             let (new_root, old_payload) = {
                 let mut bt = Btree::new(ctx.pager, root, false);
                 let payload = bt.delete_table_get_payload(rowid_val)?;
@@ -6129,6 +6731,10 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         if let Some(ret) = returning {
             returning_rows.push(project_returning_row(ret, row, &col_names, &ctx.params, &ctx.named_params)?);
         }
+        // FOREIGN KEY (parent side): reject / cascade / set-null before the
+        // row goes away (only when the pragma is on and some table
+        // references this one).
+        enforce_parent_delete_fks(ctx, &table, row, rowid, 0)?;
         let root = ctx.table_root(&table);
         let new_root;
         {
