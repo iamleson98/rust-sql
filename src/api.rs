@@ -646,7 +646,11 @@ impl Database {
             Arc::make_mut(&mut ctx.shared).roots.extend(ctx.root_overrides.drain());
         }
         if ctx.max_rowids_changed {
-            Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.max_rowids.extend(ctx.max_rowids.drain());
+            for k in ctx.max_rowids_invalidated.drain(..) {
+                shared.max_rowids.remove(&k);
+            }
         }
         if ctx.index_roots_changed {
             Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
@@ -998,7 +1002,11 @@ impl Database {
             Arc::make_mut(&mut ctx.shared).roots.extend(ctx.root_overrides.drain());
         }
         if ctx.max_rowids_changed {
-            Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.max_rowids.extend(ctx.max_rowids.drain());
+            for k in ctx.max_rowids_invalidated.drain(..) {
+                shared.max_rowids.remove(&k);
+            }
         }
         if ctx.index_roots_changed {
             Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
@@ -1144,6 +1152,9 @@ impl Database {
                     }
                     if ctx.max_rowids_changed {
                         bk.max_rowids.extend(ctx.max_rowids.drain());
+                        for k in ctx.max_rowids_invalidated.drain(..) {
+                            bk.max_rowids.remove(&k);
+                        }
                     }
                     if ctx.index_roots_changed {
                         bk.index_roots.extend(ctx.index_roots.drain());
@@ -1155,7 +1166,11 @@ impl Database {
                 // (used by the index-range merge-scan heuristic) — merge it
                 // back so repeated queries don't rescan.
                 let mut m = self.maps.write();
-                Arc::make_mut(&mut *m).max_rowids.extend(ctx.max_rowids.drain());
+                let bk = Arc::make_mut(&mut *m);
+                bk.max_rowids.extend(ctx.max_rowids.drain());
+                for k in ctx.max_rowids_invalidated.drain(..) {
+                    bk.max_rowids.remove(&k);
+                }
             }
             Ok(res.rows)
         } else {
@@ -1245,6 +1260,9 @@ impl Database {
                     }
                     if ctx.max_rowids_changed {
                         bk.max_rowids.extend(ctx.max_rowids.drain());
+                        for k in ctx.max_rowids_invalidated.drain(..) {
+                            bk.max_rowids.remove(&k);
+                        }
                     }
                     if ctx.index_roots_changed {
                         bk.index_roots.extend(ctx.index_roots.drain());
@@ -1256,7 +1274,11 @@ impl Database {
                 // (used by the index-range merge-scan heuristic) — merge it
                 // back so repeated queries don't rescan.
                 let mut m = self.maps.write();
-                Arc::make_mut(&mut *m).max_rowids.extend(ctx.max_rowids.drain());
+                let bk = Arc::make_mut(&mut *m);
+                bk.max_rowids.extend(ctx.max_rowids.drain());
+                for k in ctx.max_rowids_invalidated.drain(..) {
+                    bk.max_rowids.remove(&k);
+                }
             }
             Ok((res.columns.to_vec(), res.rows))
         } else {
@@ -3901,5 +3923,35 @@ mod persist_tests {
             Value::Integer(9),
             Value::Integer(63),
         ]]);
+    }
+
+    #[test]
+    fn rowid_reuse_after_delete_of_max() {
+        // Regression: the shared max-rowid cache survived DELETE (the merge
+        // is extend-only, so removals never propagated), making the next
+        // INSERT skip rowids — `DELETE row 2` then INSERT returned 3, not
+        // SQLite's max(existing)+1 = 2.
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('a')", []).unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('b')", []).unwrap();
+        // Filtered delete of the max rowid (streaming path).
+        db.execute("DELETE FROM t WHERE v = 'b'", []).unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('c')", []).unwrap();
+        let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
+        assert_eq!(rows, vec![
+            vec![Value::Integer(1), Value::Text("a".into())],
+            vec![Value::Integer(2), Value::Text("c".into())],
+        ], "INSERT must reuse max(existing)+1 = 2");
+        // Delete-all (Scan path) then insert: rowids restart at 1.
+        db.execute("DELETE FROM t", []).unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('d')", []).unwrap();
+        let rows = db.query("SELECT id, v FROM t", []).unwrap();
+        assert_eq!(rows, vec![vec![Value::Integer(1), Value::Text("d".into())]]);
+        // Point delete of the max (fast path) then insert.
+        db.execute("DELETE FROM t WHERE id = 1", []).unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('e')", []).unwrap();
+        let rows = db.query("SELECT id FROM t", []).unwrap();
+        assert_eq!(rows, vec![vec![Value::Integer(1)]]);
     }
 }

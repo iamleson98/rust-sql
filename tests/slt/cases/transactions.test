@@ -1,0 +1,274 @@
+# SQLlogictest cases: transactions, rollback persistence, constraint
+# rollbacks, mixed DML inside transactions, and concurrency-relevant
+# isolation behaviors that a single connection can verify.
+
+# ============================================================================
+# Section 1 — basic transaction commit
+# ============================================================================
+
+statement ok
+CREATE TABLE tx1 (id INTEGER PRIMARY KEY, x INTEGER)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx1 (x) VALUES (1), (2), (3)
+
+query I
+SELECT COUNT(*) FROM tx1
+----
+3
+
+statement ok
+COMMIT
+
+query I
+SELECT COUNT(*) FROM tx1
+----
+3
+
+# ============================================================================
+# Section 2 — rollback discards writes
+# ============================================================================
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx1 (x) VALUES (4), (5), (6)
+
+statement ok
+UPDATE tx1 SET x = x * 100
+
+query I
+SELECT COUNT(*) FROM tx1
+----
+6
+
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT x FROM tx1
+----
+1
+2
+3
+
+# ============================================================================
+# Section 3 — rollback of large transactions (multi-page trees)
+# ============================================================================
+
+statement ok
+CREATE TABLE tx2 (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO tx2 (v) VALUES (1)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx2 (v) SELECT id + 1 FROM tx2
+
+statement ok
+INSERT INTO tx2 (v) SELECT v + 10 FROM tx2
+
+statement ok
+INSERT INTO tx2 (v) SELECT v + 100 FROM tx2
+
+query I
+SELECT COUNT(*) FROM tx2
+----
+8
+
+statement ok
+ROLLBACK
+
+query I
+SELECT COUNT(*) FROM tx2
+----
+1
+
+# ============================================================================
+# Section 4 — constraint failure inside a transaction aborts the statement,
+# not the transaction
+# ============================================================================
+
+statement ok
+CREATE TABLE tx3 (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO tx3 (name) VALUES ('a')
+
+statement ok
+BEGIN
+
+statement error
+INSERT INTO tx3 (name) VALUES (NULL)
+
+# Transaction is still alive: valid inserts land.
+statement ok
+INSERT INTO tx3 (name) VALUES ('b')
+
+statement ok
+COMMIT
+
+query T rowsort
+SELECT name FROM tx3
+----
+a
+b
+
+# ============================================================================
+# Section 5 — UNIQUE constraint rollback mid-statement
+# ============================================================================
+
+statement ok
+CREATE TABLE tx4 (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)
+
+statement ok
+INSERT INTO tx4 (u) VALUES (10)
+
+statement error
+INSERT INTO tx4 (u) VALUES (10)
+
+query I
+SELECT COUNT(*) FROM tx4
+----
+1
+
+# ============================================================================
+# Section 6 — CHECK constraint
+# ============================================================================
+
+statement ok
+CREATE TABLE tx5 (x INTEGER CHECK (x > 0))
+
+statement ok
+INSERT INTO tx5 VALUES (5)
+
+statement error
+INSERT INTO tx5 VALUES (-1)
+
+query I
+SELECT COUNT(*) FROM tx5
+----
+1
+
+# ============================================================================
+# Section 7 — DELETE + re-insert rowid reuse (SQLite semantics)
+# ============================================================================
+
+statement ok
+CREATE TABLE tx6 (id INTEGER PRIMARY KEY, v TEXT)
+
+statement ok
+INSERT INTO tx6 (v) VALUES ('one')
+
+statement ok
+INSERT INTO tx6 (v) VALUES ('two')
+
+statement ok
+DELETE FROM tx6 WHERE v = 'two'
+
+# Next auto rowid reuses the max+1 path (1 here).
+statement ok
+INSERT INTO tx6 (v) VALUES ('three')
+
+query IT rowsort
+SELECT id, v FROM tx6
+----
+1 one
+2 three
+
+statement ok
+DELETE FROM tx6
+
+statement ok
+INSERT INTO tx6 (v) VALUES ('fresh')
+
+# After deleting everything, rowids restart at 1 (SQLite reuses).
+query I
+SELECT id FROM tx6
+----
+1
+
+# ============================================================================
+# Section 8 — UPDATE with expressions and index maintenance
+# ============================================================================
+
+statement ok
+CREATE TABLE tx7 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+
+statement ok
+CREATE INDEX idx_tx7_a ON tx7(a)
+
+statement ok
+INSERT INTO tx7 (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+statement ok
+UPDATE tx7 SET a = a + 10 WHERE a >= 2
+
+query II rowsort
+SELECT id, a FROM tx7
+----
+1 1
+2 12
+3 13
+
+# The index sees the updated values.
+query T
+SELECT b FROM tx7 WHERE a = 12
+----
+y
+
+query I
+SELECT COUNT(*) FROM tx7 WHERE a > 5
+----
+2
+
+# ============================================================================
+# Section 9 — UPSERT
+# ============================================================================
+
+statement ok
+CREATE TABLE tx8 (id INTEGER PRIMARY KEY, n INTEGER)
+
+statement ok
+INSERT INTO tx8 VALUES (1, 10)
+
+statement ok
+INSERT INTO tx8 VALUES (1, 99) ON CONFLICT(id) DO UPDATE SET n = n + 1
+
+query II
+SELECT id, n FROM tx8
+----
+1 11
+
+statement ok
+INSERT INTO tx8 VALUES (2, 5) ON CONFLICT(id) DO NOTHING
+
+query II rowsort
+SELECT id, n FROM tx8
+----
+1 11
+2 5
+
+# ============================================================================
+# Section 10 — RETURNING
+# ============================================================================
+
+statement ok
+CREATE TABLE tx9 (id INTEGER PRIMARY KEY, v TEXT)
+
+query IT
+INSERT INTO tx9 (v) VALUES ('r1') RETURNING id, v
+----
+1 r1
+
+query T
+DELETE FROM tx9 WHERE v = 'r1' RETURNING v
+----
+r1

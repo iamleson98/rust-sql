@@ -1,0 +1,328 @@
+# SQLlogictest cases: foreign keys, DELETE variants (incl. no-PK tables),
+# JSON1, and ALTER TABLE — the feature-parity sprint coverage in SLT form.
+
+# ============================================================================
+# Section 1 — DELETE on tables without INTEGER PRIMARY KEY
+# ============================================================================
+
+statement ok
+CREATE TABLE nopk (tag TEXT, n INTEGER)
+
+statement ok
+INSERT INTO nopk VALUES ('a', 1), ('b', 2), ('c', 3)
+
+query IT rowsort
+SELECT tag, n FROM nopk
+----
+a 1
+b 2
+c 3
+
+statement ok
+DELETE FROM nopk WHERE tag = 'b'
+
+query T rowsort
+SELECT tag FROM nopk
+----
+a
+c
+
+statement ok
+DELETE FROM nopk WHERE n > 2
+
+query T rowsort
+SELECT tag FROM nopk
+----
+a
+
+statement ok
+DELETE FROM nopk
+
+query I
+SELECT COUNT(*) FROM nopk
+----
+0
+
+# ============================================================================
+# Section 2 — FOREIGN KEY enforcement
+# ============================================================================
+
+statement ok
+CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))
+
+# FKs off by default: orphans allowed.
+statement ok
+INSERT INTO child (pid) VALUES (999)
+
+statement ok
+DELETE FROM child
+
+statement ok
+PRAGMA foreign_keys = ON
+
+statement error
+INSERT INTO child (pid) VALUES (999)
+
+statement ok
+INSERT INTO parent (name) VALUES ('root')
+
+statement ok
+INSERT INTO child (pid) VALUES (1)
+
+statement error
+UPDATE child SET pid = 555
+
+statement error
+DELETE FROM parent WHERE id = 1
+
+# After removing the child, the parent deletes fine.
+statement ok
+DELETE FROM child
+
+statement ok
+DELETE FROM parent WHERE id = 1
+
+query I
+SELECT COUNT(*) FROM parent
+----
+0
+
+statement ok
+PRAGMA foreign_keys = OFF
+
+statement ok
+INSERT INTO child (pid) VALUES (777)
+
+query I
+SELECT COUNT(*) FROM child
+----
+1
+
+# ============================================================================
+# Section 3 — ON DELETE CASCADE
+# ============================================================================
+
+statement ok
+CREATE TABLE p2 (id INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2(id) ON DELETE CASCADE, tag TEXT)
+
+statement ok
+PRAGMA foreign_keys = ON
+
+statement ok
+INSERT INTO p2 (id) VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO c2 (pid, tag) VALUES (1, 'x'), (1, 'y'), (2, 'z'), (3, 'w')
+
+statement ok
+DELETE FROM p2 WHERE id = 1
+
+query T rowsort
+SELECT tag FROM c2
+----
+w
+z
+
+statement ok
+DELETE FROM p2 WHERE id IN (2, 3)
+
+query I
+SELECT COUNT(*) FROM c2
+----
+0
+
+# ============================================================================
+# Section 4 — ON DELETE SET NULL
+# ============================================================================
+
+statement ok
+CREATE TABLE p3 (id INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE c3 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p3(id) ON DELETE SET NULL)
+
+statement ok
+INSERT INTO p3 (id) VALUES (10), (20)
+
+statement ok
+INSERT INTO c3 (pid) VALUES (10), (10), (20)
+
+statement ok
+DELETE FROM p3 WHERE id = 10
+
+query I rowsort
+SELECT pid FROM c3
+----
+NULL
+NULL
+20
+
+# ============================================================================
+# Section 5 — JSON1
+# ============================================================================
+
+query I
+SELECT json_extract('{"a": 5}', '$.a')
+----
+5
+
+query T
+SELECT json_extract('{"a": {"b": [1, 2, 3]}}', '$.a.b[2]')
+----
+3
+
+query T
+SELECT json_extract('{"a": "hello"}', '$.a')
+----
+hello
+
+query I
+SELECT json_valid('{"a": 1}')
+----
+1
+
+query I
+SELECT json_valid('nope')
+----
+0
+
+query T
+SELECT json_type('[1, 2]')
+----
+array
+
+query T
+SELECT json_type('{"a": 1}', '$.a')
+----
+integer
+
+query T
+SELECT json_array(1, 'two', 3.5)
+----
+'[1,"two",3.5]'
+
+query T
+SELECT json_object('k', 'v', 'n', 7)
+----
+'{"k":"v","n":7}'
+
+query I
+SELECT json_array_length('[1, 2, 3]')
+----
+3
+
+query T
+SELECT json_set('{"a": 1}', '$.b', 2)
+----
+'{"a":1,"b":2}'
+
+query T
+SELECT json_remove('{"a": 1, "b": 2}', '$.a')
+----
+'{"b":2}'
+
+query T
+SELECT json_patch('{"a": 1, "b": 2}', '{"b": null, "c": 3}')
+----
+'{"a":1,"c":3}'
+
+# json_extract over table data
+statement ok
+CREATE TABLE events (id INTEGER PRIMARY KEY, payload TEXT)
+
+statement ok
+INSERT INTO events (payload) VALUES ('{"user": "ann", "n": 3}'), ('{"user": "bob", "n": 5}')
+
+query T rowsort
+SELECT json_extract(payload, '$.user') FROM events
+----
+ann
+bob
+
+query I
+SELECT SUM(json_extract(payload, '$.n')) FROM events
+----
+8
+
+query I
+SELECT id FROM events WHERE json_extract(payload, '$.n') > 4
+----
+2
+
+# ============================================================================
+# Section 6 — ALTER TABLE
+# ============================================================================
+
+statement ok
+CREATE TABLE t6 (id INTEGER PRIMARY KEY, x INTEGER)
+
+statement ok
+INSERT INTO t6 (x) VALUES (1), (2), (3)
+
+statement ok
+ALTER TABLE t6 RENAME TO t6b
+
+query II rowsort
+SELECT id, x FROM t6b
+----
+1 1
+2 2
+3 3
+
+statement error
+SELECT COUNT(*) FROM t6
+
+statement ok
+INSERT INTO t6b (x) VALUES (4)
+
+query I
+SELECT MAX(id) FROM t6b
+----
+4
+
+statement ok
+ALTER TABLE t6b ADD COLUMN note TEXT DEFAULT 'hi'
+
+query T rowsort
+SELECT note FROM t6b
+----
+hi
+hi
+hi
+hi
+
+statement ok
+INSERT INTO t6b (x, note) VALUES (5, 'five')
+
+query T
+SELECT note FROM t6b WHERE x = 5
+----
+five
+
+statement error
+ALTER TABLE t6b ADD COLUMN bad INTEGER NOT NULL
+
+statement error
+ALTER TABLE t6b RENAME TO t6b
+
+# ============================================================================
+# Section 7 — rowid ranges after everything above
+# ============================================================================
+
+query II
+SELECT id, x FROM t6b WHERE id BETWEEN 2 AND 4
+----
+2 2
+3 3
+4 4
+
+query I
+SELECT COUNT(*) FROM t6b WHERE id BETWEEN 100 AND 200
+----
+0

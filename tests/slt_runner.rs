@@ -259,25 +259,36 @@ fn parse_expected_row(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
     let mut cur = String::new();
-    let mut in_quotes = false;
+    // 0 = unquoted, 1 = in double quotes, 2 = in single quotes.
+    // Single-quoted values are verbatim — they exist so expected values
+    // that CONTAIN double quotes (JSON1 output like [1,"two",3.5]) can be
+    // written without escaping.
+    let mut in_quotes = 0u8;
     while let Some(c) = chars.next() {
-        if in_quotes {
+        if in_quotes == 1 {
             if c == '"' {
-                in_quotes = false;
+                in_quotes = 0;
                 out.push(std::mem::take(&mut cur));
             } else {
                 cur.push(c);
             }
-        } else {
-            if c == '"' {
-                in_quotes = true;
-            } else if c.is_whitespace() {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
+        } else if in_quotes == 2 {
+            if c == '\'' {
+                in_quotes = 0;
+                out.push(std::mem::take(&mut cur));
             } else {
                 cur.push(c);
             }
+        } else if c == '"' {
+            in_quotes = 1;
+        } else if c == '\'' {
+            in_quotes = 2;
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
         }
     }
     if !cur.is_empty() {

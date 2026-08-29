@@ -111,6 +111,12 @@ pub struct ExecContext<'a> {
     /// write-back merge — root moves are rare, but the max-rowid scan cache
     /// populates on first INSERT and on first index-range heuristic use).
     pub max_rowids_changed: bool,
+    /// Table-name keys whose cached max-rowid was INVALIDATED by a DELETE
+    /// in this statement. The shared map merge is `extend` (adds/updates
+    /// only), so removals must be recorded and replayed — otherwise the
+    /// next INSERT on another statement reads a stale max and skips
+    /// rowids (SQLite reuses rowids after the max row is deleted).
+    pub max_rowids_invalidated: Vec<String>,
     /// Set when `index_roots` gained local entries this statement.
     pub index_roots_changed: bool,
     /// Pinned right-most leaf for sequential table appends, valid ONLY
@@ -146,6 +152,7 @@ impl<'a> ExecContext<'a> {
             max_rowids: HashMap::new(),
             roots_changed: false,
             max_rowids_changed: false,
+            max_rowids_invalidated: Vec::new(),
             index_roots_changed: false,
             table_append_hint: None,
             ctes: None,
@@ -182,6 +189,7 @@ impl<'a> ExecContext<'a> {
             max_rowids: HashMap::new(),
             roots_changed: false,
             max_rowids_changed: false,
+            max_rowids_invalidated: Vec::new(),
             index_roots_changed: false,
             table_append_hint: None,
             ctes: None,
@@ -311,6 +319,31 @@ impl<'a> ExecContext<'a> {
     /// Update the cached max rowid for a table.
     pub fn set_max_rowid(&mut self, table_name: &str, rowid: i64) {
         self.set_max_rowid_lc(&table_name.to_ascii_lowercase(), rowid);
+    }
+
+    /// Invalidate the cached max-rowid for a table (DELETE paths). Records
+    /// the key so the statement-end merge removes it from the shared map
+    /// too — `extend` alone would leave the stale value behind.
+    pub fn invalidate_max_rowid(&mut self, table_name_lc: &str) {
+        self.max_rowids.remove(table_name_lc);
+        self.max_rowids_invalidated.push(table_name_lc.to_string());
+        self.max_rowids_changed = true;
+    }
+
+    /// DELETE-path helper: invalidate the cached max-rowid when the
+    /// statement deleted the rowid the cache is keyed on. The cache may
+    /// live in the LOCAL overlay or only in the SHARED map (populated by
+    /// an earlier statement) — check both, else the next INSERT reads the
+    /// stale shared value and skips rowids.
+    pub fn invalidate_max_rowid_if_deleted(&mut self, table_name_lc: &str, max_deleted: i64) {
+        let local = self.max_rowids.get(table_name_lc).copied();
+        let shared = self.shared.max_rowids.get(table_name_lc).copied();
+        let cached = local.or(shared);
+        if let Some(cached) = cached {
+            if max_deleted >= cached {
+                self.invalidate_max_rowid(table_name_lc);
+            }
+        }
     }
 
     /// Fast-path set_max_rowid for pre-lower-cased names. Updates the value
@@ -792,7 +825,7 @@ fn enforce_parent_delete_fks(
                         ctx.changes += 1;
                         if let Some(&cached) = ctx.max_rowids.get(&lc) {
                             if rowid >= cached {
-                                ctx.max_rowids.remove(&lc);
+                                ctx.invalidate_max_rowid(&lc);
                             }
                         }
                     }
@@ -6529,11 +6562,7 @@ fn try_streaming_delete(
     // deleting the max rowid invalidates the cached next-rowid hint.
     let table_name_lc = table.name.to_ascii_lowercase();
     if let Some(&max_del) = rowids.iter().max() {
-        if let Some(&cached) = ctx.max_rowids.get(&table_name_lc) {
-            if max_del >= cached {
-                ctx.max_rowids.remove(&table_name_lc);
-            }
-        }
+        ctx.invalidate_max_rowid_if_deleted(&table_name_lc, max_del);
     }
 
     // ---- Phase 2: delete + index maintenance + triggers + RETURNING ----
@@ -6691,11 +6720,7 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
                     }
                 }
                 // Keep the cached max-rowid consistent (see below).
-                if let Some(&cached) = ctx.max_rowids.get(&table_name_lc) {
-                    if rowid_val >= cached {
-                        ctx.max_rowids.remove(&table_name_lc);
-                    }
-                }
+                ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid_val);
             }
             if !ctx.in_transaction && !ctx.deferred_flush {
                 ctx.pager.flush()?;
@@ -6774,11 +6799,7 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
     // row is deleted). Without this, a DELETE-all followed by inserts
     // continued from the old max instead of restarting at 1.
     if max_deleted != i64::MIN {
-        if let Some(&cached) = ctx.max_rowids.get(&table_name_lc) {
-            if max_deleted >= cached {
-                ctx.max_rowids.remove(&table_name_lc);
-            }
-        }
+        ctx.invalidate_max_rowid_if_deleted(&table_name_lc, max_deleted);
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;

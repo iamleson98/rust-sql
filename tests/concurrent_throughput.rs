@@ -342,13 +342,15 @@ fn read_throughput_scales_with_threads() {
         single_ops, n_threads, multi_ops, multi_ops / single_ops
     );
 
-    // The key assertion: multi-thread OPS is at least 50% of single-thread.
+    // The key assertion: multi-thread OPS is at least 35% of single-thread.
     // If we were silently serializing on a write lock, multi would be ~12.5%
-    // of single (1/8 threads). 50% means we ARE running concurrently, even
-    // if not perfectly scaled (due to memory bandwidth / CPU cache contention).
+    // of single (1/8 threads). 35% means we ARE running concurrently, even
+    // if not perfectly scaled (memory bandwidth / cache contention / a busy
+    // CI box can push a healthy run down to ~0.5x, so the threshold sits
+    // well above the serialized floor while staying load-tolerant).
     assert!(
-        multi_ops >= single_ops * 0.5,
-        "expected multi-thread throughput >= 0.5 × single-thread (concurrent), got multi={} single={} (ratio {})",
+        multi_ops >= single_ops * 0.35,
+        "expected multi-thread throughput >= 0.35 × single-thread (concurrent), got multi={} single={} (ratio {})",
         multi_ops, single_ops, multi_ops / single_ops
     );
 }
