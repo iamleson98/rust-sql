@@ -312,6 +312,18 @@ enum FastPath {
         project: Option<Vec<usize>>,
         columns: Arc<[String]>,
     },
+    /// `SELECT cols FROM t WHERE rowid BETWEEN ? AND ?` (or the planner's
+    /// equivalent >= / <= conjunct pair). Skips the full pipeline for the
+    /// small-range OLTP shape — the general path's fixed cost (~1 us:
+    /// ExecContext setup, plan dispatch, result plumbing) dominated
+    /// 1-100-row scans.
+    RowidRange {
+        table: Arc<Table>,
+        start: FastBound,
+        end: FastBound,
+        project: Option<Vec<usize>>,
+        columns: Arc<[String]>,
+    },
 }
 
 /// precomputed `has_subqueries` flag (mirrors SQLite's OP_Once check —
@@ -333,6 +345,7 @@ impl FastPath {
         match self {
             FastPath::RowidPoint { table, .. } => &table.name,
             FastPath::IndexPoint { table, .. } => &table.name,
+            FastPath::RowidRange { table, .. } => &table.name,
         }
     }
 
@@ -342,6 +355,7 @@ impl FastPath {
         match self {
             FastPath::RowidPoint { columns, .. } => columns,
             FastPath::IndexPoint { columns, .. } => columns,
+            FastPath::RowidRange { columns, .. } => columns,
         }
     }
 }
@@ -1529,6 +1543,18 @@ impl Database {
                     columns: table.col_names.clone(),
                 })
             }
+            // Bare `SELECT * FROM t WHERE id BETWEEN ? AND ?`.
+            Plan::RowidRange { table, start: Some(s), end: Some(e), residual: None, .. } => {
+                let start = bind_expr(s)?;
+                let end = bind_expr(e)?;
+                Some(FastPath::RowidRange {
+                    table: table.clone(),
+                    start,
+                    end,
+                    project: None,
+                    columns: table.col_names.clone(),
+                })
+            }
             Plan::Project { input, columns } => match input.as_ref() {
                 Plan::RowidLookup { table, rowid, .. } => {
                     let rowid = bind_expr(rowid)?;
@@ -1547,6 +1573,18 @@ impl Database {
                         table: table.clone(),
                         index: index.clone(),
                         keys,
+                        project,
+                        columns: cols,
+                    })
+                }
+                Plan::RowidRange { table, start: Some(s), end: Some(e), residual: None, .. } => {
+                    let start = bind_expr(s)?;
+                    let end = bind_expr(e)?;
+                    let (project, cols) = resolve_projection(columns, table)?;
+                    Some(FastPath::RowidRange {
+                        table: table.clone(),
+                        start,
+                        end,
                         project,
                         columns: cols,
                     })
@@ -1611,6 +1649,21 @@ impl Database {
                         rows.push(decode_projected(&payload, table, rid, project.as_deref())?);
                     }
                 }
+                Ok(rows)
+            }
+            FastPath::RowidRange { table, start, end, project, columns: _ } => {
+                let lo = start.resolve(params).as_integer();
+                let hi = end.resolve(params).as_integer();
+                let root = table_root.unwrap_or(table.root_page);
+                let mut bt = Btree::new(&self.pager, root, false);
+                let mut rows = Vec::new();
+                bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+                    // Match the general path: skip undecodable rows.
+                    if let Ok(row) = decode_projected(payload, table, rowid, project.as_deref()) {
+                        rows.push(row);
+                    }
+                    true
+                })?;
                 Ok(rows)
             }
         }
@@ -3095,6 +3148,10 @@ mod tests {
 mod persist_tests {
     use super::*;
 
+    fn memdb() -> Database {
+        Database::open_in_memory().unwrap()
+    }
+
     #[test]
     fn roots_persist_across_reopen() {
         // Regression: B+tree splits moved table/index roots but the schema
@@ -3169,5 +3226,206 @@ mod persist_tests {
         let db2 = Database::open(path).unwrap();
         let c = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
         assert_eq!(c[0][0], Value::Integer(1), "rollback leaked rows across reopen");
+    }
+
+    // ---- RowidRange fast path -------------------------------------------
+    // These all run through `FastPath::RowidRange` when the plan shape is
+    // `RowidRange { start: Some, end: Some, residual: None }` — the
+    // pipeline-skipping OLTP path added alongside the binary-search
+    // range scan in the B-tree.
+
+    fn range_db(n: i64) -> Database {
+        let mut db = memdb();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", [])
+            .unwrap();
+        // 10k rows → a multi-level tree so the interior-node binary
+        // search and early-stop logic are exercised, not just one leaf.
+        for i in 1..=n {
+            db.execute(
+                "INSERT INTO t (name, val) VALUES (?, ?)",
+                [Value::Text(format!("row-{i}")), Value::Integer(i * 7)],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn rowid_range_fast_path_bare_star() {
+        let db = range_db(10_000);
+        // BETWEEN on the INTEGER PRIMARY KEY alias.
+        let rows = db.query("SELECT * FROM t WHERE id BETWEEN 1000 AND 1009", []).unwrap();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0][0], Value::Integer(1000));
+        assert_eq!(rows[9][0], Value::Integer(1009));
+        assert_eq!(rows[0][1], Value::Text("row-1000".into()));
+        // Projection form: only requested columns, in order.
+        let rows = db.query("SELECT val, name FROM t WHERE id BETWEEN 1000 AND 1004", []).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0][0], Value::Integer(7000));
+        assert_eq!(rows[0][1], Value::Text("row-1000".into()));
+    }
+
+    #[test]
+    fn rowid_range_fast_path_conjunct_bounds() {
+        let db = range_db(10_000);
+        // >= / <= conjunct pair is the same plan shape as BETWEEN.
+        let rows = db.query("SELECT id FROM t WHERE id >= 5000 AND id <= 5004", []).unwrap();
+        assert_eq!(rows.len(), 5);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(r[0], Value::Integer(5000 + i as i64));
+        }
+        // > / < (exclusive) still routes through the general range plan —
+        // verify row count and edges are right there too.
+        let rows = db.query("SELECT id FROM t WHERE id > 9990 AND id < 9999", []).unwrap();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0][0], Value::Integer(9991));
+        assert_eq!(rows[7][0], Value::Integer(9998));
+    }
+
+    #[test]
+    fn rowid_range_fast_path_param_bounds() {
+        let db = range_db(10_000);
+        // Bound parameters hit `bind_expr` — make sure positional params
+        // resolve against the same value vector the general path uses.
+        let rows = db
+            .query(
+                "SELECT id FROM t WHERE id BETWEEN ? AND ?",
+                [Value::Integer(4242), Value::Integer(4244)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1][0], Value::Integer(4243));
+    }
+
+    #[test]
+    fn rowid_range_degenerate_and_edge_bounds() {
+        let db = range_db(10_000);
+        // Empty range: start > end → no rows, no panic, no infinite loop.
+        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 500 AND 400", []).unwrap();
+        assert!(rows.is_empty());
+        // Single-row range.
+        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 1 AND 1", []).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(1));
+        // Full-table range via rowid bounds.
+        let rows = db.query("SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 20000", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(10_000));
+        // Bounds beyond both ends clamp correctly.
+        let rows = db.query("SELECT COUNT(*) FROM t WHERE id BETWEEN -5 AND 50000", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(10_000));
+        // Range entirely past the right edge: the early-stop must kick in
+        // at the first leaf without walking every remaining leaf.
+        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 10001 AND 20000", []).unwrap();
+        assert!(rows.is_empty());
+        // Range entirely before the left edge: the interior binary search
+        // must skip to the first child, not panic.
+        let rows = db.query("SELECT id FROM t WHERE id BETWEEN -100 AND -1", []).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn rowid_range_residual_falls_back_correctly() {
+        let db = range_db(10_000);
+        // A residual predicate keeps the plan off the fast path — the
+        // general RowidRange executor must still filter it.
+        let rows = db
+            .query(
+                "SELECT id FROM t WHERE id BETWEEN 1 AND 100 AND val > 350",
+                [],
+            )
+            .unwrap();
+        // val = id*7 > 350 → id >= 51, within [1, 100] → 50 rows.
+        assert_eq!(rows.len(), 50);
+        assert_eq!(rows[0][0], Value::Integer(51));
+        assert_eq!(rows[49][0], Value::Integer(100));
+    }
+
+    #[test]
+    fn rowid_range_after_deletes() {
+        // Punch holes in the tree then range-scan across them: the
+        // binary-search start lookup must land on the first surviving
+        // rowid >= start even when earlier cells were deleted.
+        let mut db = range_db(2_000);
+        for i in (100..200).step_by(2) {
+            db.execute("DELETE FROM t WHERE id = ?", [Value::Integer(i)]).unwrap();
+        }
+        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 99 AND 201", []).unwrap();
+        // Survivors: 99, 101, 103, ..., 199, 200, 201
+        let expect: Vec<Vec<Value>> = (99..=201)
+            .filter(|i| *i == 99 || *i >= 200 || i % 2 == 1)
+            .map(|i| vec![Value::Integer(i)])
+            .collect();
+        assert_eq!(rows, expect);
+        let rows = db.query("SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 2000", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(1_950)); // 2000 - 50 deleted
+    }
+
+    #[test]
+    fn rowid_range_multi_page_spans() {
+        // A range wide enough to cross many leaves AND interior nodes:
+        // verifies the early-stop `Ok(false)` propagation never cuts the
+        // walk short while rows remain inside the range.
+        let db = range_db(10_000);
+        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 137 AND 9973", []).unwrap();
+        assert_eq!(rows.len() as i64, 9973 - 137 + 1);
+        assert_eq!(rows[0][0], Value::Integer(137));
+        let last = rows.last().unwrap();
+        assert_eq!(last[0], Value::Integer(9973));
+        // Descending ranges are not the fast path, but must agree.
+        let rows2 = db
+            .query("SELECT id FROM t WHERE id BETWEEN 137 AND 9973 ORDER BY id DESC", [])
+            .unwrap();
+        assert_eq!(rows2.len(), rows.len());
+        assert_eq!(rows2[0][0], Value::Integer(9973));
+    }
+
+    #[test]
+    fn fast_paths_handle_reordered_and_duplicate_projections() {
+        // Regression: `decode_row_selective` used to require ascending
+        // column indices, so `SELECT val, name` on every fast path
+        // (rowid point, rowid range, index point) silently returned NULL
+        // for the out-of-order column, and `SELECT val, val` dropped the
+        // duplicate. Fixed by decoding through a sorted-index permutation.
+        let mut db = range_db(30);
+        db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
+        // Rowid point lookup, reordered projection.
+        let rows = db.query("SELECT val, name, id FROM t WHERE id = 5", []).unwrap();
+        assert_eq!(rows, vec![vec![
+            Value::Integer(35),
+            Value::Text("row-5".into()),
+            Value::Integer(5),
+        ]]);
+        // Rowid range, reordered projection.
+        let rows = db.query("SELECT val, name FROM t WHERE id BETWEEN 5 AND 6", []).unwrap();
+        assert_eq!(rows, vec![
+            vec![Value::Integer(35), Value::Text("row-5".into())],
+            vec![Value::Integer(42), Value::Text("row-6".into())],
+        ]);
+        // Index point lookup, reordered projection.
+        let rows = db.query("SELECT val, name, id FROM t WHERE val = 35", []).unwrap();
+        assert_eq!(rows, vec![vec![
+            Value::Integer(35),
+            Value::Text("row-5".into()),
+            Value::Integer(5),
+        ]]);
+        // Duplicate projections on both point shapes.
+        let rows = db.query("SELECT val, val FROM t WHERE id = 5", []).unwrap();
+        assert_eq!(rows, vec![vec![Value::Integer(35), Value::Integer(35)]]);
+        let rows = db.query("SELECT name, name FROM t WHERE val = 35", []).unwrap();
+        assert_eq!(rows, vec![vec![
+            Value::Text("row-5".into()),
+            Value::Text("row-5".into()),
+        ]]);
+        // Single-column reorder: projection picks the LAST column only.
+        let rows = db.query("SELECT val FROM t WHERE id = 7", []).unwrap();
+        assert_eq!(rows, vec![vec![Value::Integer(49)]]);
+        // Mid-table reorder mixing alias, text and integer.
+        let rows = db.query("SELECT name, id, val FROM t WHERE id BETWEEN 9 AND 9", []).unwrap();
+        assert_eq!(rows, vec![vec![
+            Value::Text("row-9".into()),
+            Value::Integer(9),
+            Value::Integer(63),
+        ]]);
     }
 }

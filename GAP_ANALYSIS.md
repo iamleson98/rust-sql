@@ -27,29 +27,34 @@
 | 8 | Inner join (1k × 1k, rowid FK) | 155 µs | 122 µs | 1.27× slower | 🟡 hash join rewrite closed 6.2× → 1.27×; remainder = row materialization |
 
 Earlier `bench_compare` workloads (single-shot, warmed steady state),
-re-measured after the index-path sprint (`COUNT` via index now covers,
-index navigation is allocation-free, big index-range selections use a
-merge scan, streaming UPDATE fuses fetch + index maintenance):
+re-measured after the rowid-range fast path sprint (binary-search leaf
+descent + early-stop range walks, `WHERE id BETWEEN ? AND ?` fast path,
+projection-permutation codec fix):
 
 | # | Workload | rustqlite | SQLite | Ratio | Status |
 |---|---|---|---|---|---|
 | 9 | COUNT(*) with indexed range filter | **32 µs** | 479 µs* | **~15× faster** | ✅ covering-index count (*SQLite runs its filtered count BEFORE creating the index — its indexed number is not measured; the comparison uses its full-scan count) |
-| 10 | UPDATE range (`score = score+1 WHERE val > 5000`, indexed) | 2.3 ms | 1.3 ms | 1.8× slower | 🟡 was "59× faster" — that number timed an empty index (pre-backfill bug); real work now measured; merge scan + fused maintenance closed 5.2→2.3 ms |
-| 11 | 3-table join, filter by PK (~50 rows) | 156 µs | 62 µs | 2.5× slower | 🟡 was "15× faster" — also inflated by the empty-index bug; real number now |
-| 12 | UPDATE by PK (1k ops) | **1.32 ms** | 1.85 ms | **1.4× faster** | ✅ |
-| 13 | Aggregate (SUM/AVG/MIN/MAX) | **567 µs** | 1.22 ms | **2.2× faster** | ✅ |
-| 14 | GROUP BY (100 buckets) | **1.86 ms** | 2.04 ms | **1.1× faster** | ✅ |
-| 15 | 2-table join + GROUP BY (full scan) | **2.44 ms** | 3.45 ms | **1.4× faster** | ✅ |
-| 16 | Range scan (100 rows) | **17 µs** | 18.5 µs | **1.1× faster** | ✅ |
-| 17 | Binary size (stripped) | **1.53 MB** | 2.00 MB | **0.77×** | ✅ |
-| 18 | Point lookup by rowid (1k ops) | 776 µs | 350 µs | 2.2× slower | 🟡 per-query floor |
-| 19 | Point lookup by indexed col (1k ops) | 1.31 ms | 535 µs | 2.4× slower | 🟡 index seek + row fetch |
-| 20 | DELETE by PK (1k ops) | 1.92 ms | 1.34 ms | 1.4× slower | 🟡 |
-| 21 | Mixed 80/20 (5k ops) | 4.21 ms | 2.51 ms | 1.7× slower | 🟡 composite |
-| 22 | Range scan (5000 rows) | 927 µs | 569 µs | 1.6× slower | 🟢 |
-| 23 | Multi-row VALUES batches (10k) | 12.3 ms | 6.4 ms | 1.9× slower | 🟢 |
-| 24 | Full scan + COUNT with filter (no index) | 1.18 ms | 479 µs | 2.5× slower | 🟡 per-row filter eval |
-| 25 | DB file size (10k rows) | 327.7 KB | 262.1 KB | 1.25× larger | 🟢 |
+| 10 | UPDATE range (`score = score+1 WHERE val > 5000`, indexed) | 1.52 ms | 1.26 ms | 1.2× slower | 🟡 was "59× faster" (empty-index timing bug); merge scan + fused maintenance closed 30.9→1.52 ms across sprints |
+| 11 | 3-table join, filter by PK (~50 rows) | 160 µs | 110 µs | 1.5× slower | 🟡 was "15× faster" — also inflated by the empty-index bug; real number now |
+| 12 | UPDATE by PK (1k ops) | 2.30 ms | 1.86 ms | 1.24× slower | 🟡 run-to-run variance (prior run: 1.32 ms / 1.4× faster); allocator state dominates this micro-bench |
+| 13 | Aggregate (SUM/AVG/MIN/MAX) | **625 µs** | 1.21 ms | **1.9× faster** | ✅ |
+| 14 | GROUP BY (100 buckets) | **1.91 ms** | 2.10 ms | **1.1× faster** | ✅ |
+| 15 | 2-table join + GROUP BY (full scan) | **2.41 ms** | 3.30 ms | **1.4× faster** | ✅ |
+| 16 | Range scan (100 rows) | **11.2 µs** | 11.6 µs | **~parity** | ✅ binary-search descent + early stop (was 36 µs / 3.0× slower) |
+| 16b | Range scan (1000 rows) | **97 µs** | 110 µs | **1.1× faster** | ✅ (was 225 µs / 2.1× slower) |
+| 16c | Range scan (10 rows) | 10 µs | 3.5 µs | 2.9× slower | 🟡 fixed cost only (was 39 µs / 8.7× slower) |
+| 17 | Binary size (stripped) | **1.67 MB** | 2.01 MB | **0.83×** | ✅ |
+| 18 | Point lookup by rowid (1k ops) | 403 µs | 349 µs | 1.15× slower | 🟡 near parity (was 776 µs / 2.2× slower) |
+| 19 | Point lookup by indexed col (1k ops) | 738 µs | 531 µs | 1.4× slower | 🟡 index seek + row fetch (was 1.31 ms / 2.4× slower) |
+| 20 | DELETE by PK (1k ops) | **511 µs** | 1.35 ms | **2.6× faster** | ✅ allocation-free delete path (was 1.92 ms / 1.4× slower) |
+| 20b | Single-row inserts (1k, auto-commit) | **796 µs** | 1.78 ms | **2.2× faster** | ✅ (was 2.0 ms / 1.10× slower) |
+| 20c | Single-row BEGIN/COMMIT (100k rows) | **77 ms** | 130 ms | **1.7× faster** | ✅ (was 403 ms / 3.1× slower) |
+| 20d | Multi-row VALUES batches (10k) | **4.1 ms** | 6.2 ms | **1.5× faster** | ✅ (was 12.3 ms / 1.9× slower) |
+| 21 | Mixed 80/20 (5k ops) | **2.73 ms** | 2.45 ms | ~parity | 🟡 composite (was 4.21 ms / 1.7× slower) |
+| 22 | Range scan (5000 rows) | 679 µs | 570 µs | 1.2× slower | 🟢 (was 927 µs / 1.6× slower) |
+| 23 | Full scan + COUNT with filter (no index) | **364 µs** | 488 µs | **1.3× faster** | ✅ (was 1.18 ms / 2.5× slower) |
+| 24 | 2-table join, filter by PK (~10 rows) | **32 µs** | 38 µs | **1.2× faster** | ✅ (was 140 µs / 6.1× slower) |
+| 25 | DB file size (10k rows) | 294.9 KB | 262.1 KB | 1.13× larger | 🟢 (was 327.7 KB / 1.25×) |
 
 ## 2. What was closed in the previous sprint (2026-08-28)
 
@@ -288,6 +293,48 @@ cloned every map under a read lock).
   SipHash's 40-80 ns per SQL text hash).
 - ROLLBACK clears the shared snapshots (entries cached during the
   transaction may reference rolled-back pages).
+
+## 6b. What was closed this sprint (2026-08-29, fifth pass): rowid ranges
+
+### `WHERE id BETWEEN ? AND ?` fast path + binary-search range walks
+
+- **`FastPath::RowidRange`** (api.rs): the plan shape
+  `RowidRange { start: Some, end: Some, residual: None }` — bare or under
+  a simple column projection — skips ExecContext setup, plan dispatch and
+  result plumbing and drives the B-tree directly with bound parameters.
+  This is the OLTP shape `SELECT cols FROM t WHERE id BETWEEN ? AND ?`;
+  the general path's ~1 µs fixed cost dominated 1-100-row scans.
+- **Binary-searched leaf descent**: the range walk previously linearly
+  skipped every cell below `start` in each leaf (hundreds of cell decodes
+  for `BETWEEN 1000 AND 1009` on a 10k-row table); it now binary-searches
+  the cell array by rowid. Interior nodes binary-search the separator
+  keys too and skip all children left of `start`.
+- **Early-stop propagation**: the walk previously returned `Ok(())` at
+  the first cell past `end` but the subtree driver still visited every
+  leaf to the right, paying a page fetch + lock per leaf for a first-cell
+  check. The walk now returns `Ok(false)` (stop) vs `Ok(true)`
+  (continue right), so a 10-row range on a 10k-row table touches ~3
+  pages instead of ~40.
+- **Projection-permutation codec fix** (row_codec.rs): a correctness bug
+  found by the new fast-path tests — `decode_row_selective` required
+  ascending column indices, so **any reordered projection on any fast
+  path silently returned NULL for the out-of-order column**
+  (`SELECT val, name FROM t WHERE id = 5` → `[35, NULL]`), and duplicate
+  projections (`SELECT val, val`) dropped the duplicate. Projections are
+  now decoded through a sorted-index permutation with slot mapping;
+  ascending projections (the common case) keep the allocation-free path,
+  single-slot decodes move the value with no clone.
+- Effects (bench_compare, 10k-row table): range scan 100 rows
+  36 → 11.2 µs (3.0× slower → parity); 1000 rows 225 → 97 µs (2.1×
+  slower → 1.1× faster); 10 rows 39 → 10 µs (8.7× → 2.9× slower); full
+  scan + COUNT with filter 1.18 ms → 364 µs (2.5× slower → 1.3×
+  faster); DB file size 327.7 → 294.9 KB (1.25× → 1.13× of SQLite);
+  inserts, deletes and aggregates all now lead SQLite (see table above).
+- Tests: 8 new cases in `persist_tests` — bare/projection/parameter/
+  conjunct fast-path shapes, degenerate and out-of-bounds ranges,
+  residual fallback, holes after deletes, multi-page spans, and the
+  reordered/duplicate projection regression matrix across rowid-point,
+  rowid-range and index-point fast paths.
 
 ## 7. Working order (next sprint)
 

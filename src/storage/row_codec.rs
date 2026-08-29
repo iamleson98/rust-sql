@@ -171,24 +171,75 @@ pub fn decode_row_selective(
         return Ok(());
     }
 
+    // The single-cursor column walk below requires `col_indices` to be in
+    // ascending order. Projections arrive in SELECT order — `SELECT val,
+    // name` on (id, name, val) is [2, 1] — so detect a non-ascending list
+    // once and decode through a sorted copy plus a slot permutation.
+    // Ascending projections (the common case: prefix projections and
+    // covering-index reads) keep the allocation-free path.
+    let mut ascending = true;
+    for w in 1..col_indices.len() {
+        if col_indices[w - 1] > col_indices[w] {
+            ascending = false;
+            break;
+        }
+    }
+    // Only allocated for non-ascending projections.
+    let perm: Option<(Vec<usize>, Vec<usize>)> = if ascending {
+        None
+    } else {
+        // Sort a copy of the indices and remember, for each sorted
+        // position k, the output slot it feeds: slots[k].
+        let mut order: Vec<usize> = (0..col_indices.len()).collect();
+        order.sort_unstable_by_key(|&slot| col_indices[slot]);
+        let sorted: Vec<usize> = order.iter().map(|&slot| col_indices[slot]).collect();
+        Some((sorted, order))
+    };
+    let indices: &[usize] = match &perm {
+        None => col_indices,
+        Some((sorted, _)) => sorted,
+    };
+    // Output slot for sorted position `k` (identity when ascending).
+    #[inline]
+    fn perm_slots(perm: &Option<(Vec<usize>, Vec<usize>)>) -> &[usize] {
+        match perm {
+            None => &[],
+            Some((_, slots)) => slots,
+        }
+    }
+    #[inline]
+    fn slot_of(indices_asc: bool, slots: &[usize], k: usize) -> usize {
+        if indices_asc {
+            k
+        } else {
+            slots[k]
+        }
+    }
+
     // Walk through the encoded columns once. For each column index that's
-    // in `col_indices`, decode the value and place it in the right slot of
+    // in `indices`, decode the value and place it in the right slot of
     // `out`. For other columns, skip the bytes.
     let mut pos = 0usize;
     let mut col = 0usize;
     let mut wanted_idx = 0usize;
 
-    while pos < buf.len() && col < n_cols_total && wanted_idx < col_indices.len() {
+    while pos < buf.len() && col < n_cols_total && wanted_idx < indices.len() {
         // Advance `wanted_idx` past any indices < col.
-        while wanted_idx < col_indices.len() && col_indices[wanted_idx] < col {
+        while wanted_idx < indices.len() && indices[wanted_idx] < col {
             wanted_idx += 1;
         }
-        if wanted_idx >= col_indices.len() {
+        if wanted_idx >= indices.len() {
             break;
         }
-        let target = col_indices[wanted_idx];
+        let target = indices[wanted_idx];
 
         if col == target {
+            // How many sorted positions target this same column (handles
+            // duplicate projections like `SELECT val, val`).
+            let mut run_end = wanted_idx;
+            while run_end < indices.len() && indices[run_end] == col {
+                run_end += 1;
+            }
             if alias == Some(col) {
                 // Rowid-alias column: payload holds the 0x09 marker (1
                 // byte); the value is the cell key.
@@ -197,15 +248,24 @@ pub fn decode_row_selective(
                         "rowid-alias column must hold the rowid marker",
                     ));
                 }
-                out[wanted_idx] = Value::Integer(rowid);
+                for k in wanted_idx..run_end {
+                    out[slot_of(ascending, perm_slots(&perm), k)] = Value::Integer(rowid);
+                }
                 pos += 1;
             } else {
                 let (v, n) = Value::decode(&buf[pos..])
                     .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
-                out[wanted_idx] = v;
+                if run_end - wanted_idx == 1 {
+                    // Common case: one slot — move the value, no clone.
+                    out[slot_of(ascending, perm_slots(&perm), wanted_idx)] = v;
+                } else {
+                    for k in wanted_idx..run_end {
+                        out[slot_of(ascending, perm_slots(&perm), k)] = v.clone();
+                    }
+                }
                 pos += n;
             }
-            wanted_idx += 1;
+            wanted_idx = run_end;
         } else if alias == Some(col) {
             // Skipping over the rowid-alias column: 1 marker byte.
             pos += 1;

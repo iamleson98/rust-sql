@@ -2994,16 +2994,23 @@ impl<'a> Btree<'a> {
         end: i64,
         mut f: F,
     ) -> Result<()> {
-        self.scan_range_subtree_borrowed(self.root, start, end, &mut f)
+        self.scan_range_subtree_borrowed(self.root, start, end, &mut f)?;
+        Ok(())
     }
 
+    /// Walk the rowid range [start, end] in order. Returns Ok(false) when
+    /// the walk should STOP (a leaf's smallest rowid exceeded `end`, or the
+    /// callback asked to stop) — the caller must not descend into further
+    /// right siblings. The old version visited every leaf to the right of
+    /// the range, paying a page fetch + lock per leaf for a first-cell
+    /// check (~500 ns on a 10k-row table for a 1-row range).
     fn scan_range_subtree_borrowed<F: FnMut(i64, &[u8]) -> bool>(
         &mut self,
         page_id: PageId,
         start: i64,
         end: i64,
         f: &mut F,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
         // ONE lock per page: type check + leaf work under the same guard.
         let borrowed = page.lock();
@@ -3012,7 +3019,27 @@ impl<'a> Btree<'a> {
             PageType::LeafTable => {
                 let n = borrowed.n_cells();
                 let psz = borrowed.data.len();
-                for i in 0..n {
+                // Binary search for the first cell with rowid >= start
+                // (the old code linearly skipped every cell below the
+                // range start — for `WHERE id BETWEEN 1000 AND 1009` that
+                // walked hundreds of cells per leaf before the first hit).
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                        Some((rowid, _)) if rowid < start => lo = mid + 1,
+                        _ => hi = mid,
+                    }
+                }
+                for i in lo..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
                     if cell_ptr >= psz {
                         return Err(Error::corruption(format!(
@@ -3024,7 +3051,9 @@ impl<'a> Btree<'a> {
                     let (rowid, n1) = varint::decode_signed(buf)
                         .ok_or_else(|| Error::corruption("truncated leaf rowid in range_borrowed"))?;
                     if rowid > end {
-                        return Ok(());
+                        // Cells are sorted: everything after is past the
+                        // range too — stop the whole walk.
+                        return Ok(false);
                     }
                     if rowid >= start {
                         let rest = &buf[n1..];
@@ -3037,36 +3066,53 @@ impl<'a> Btree<'a> {
                         }
                         let payload = &buf[payload_start..payload_start + plen_usize];
                         if !f(rowid, payload) {
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 }
-                Ok(())
+                Ok(true) // leaf exhausted within the range — continue right
             }
             PageType::InteriorTable => {
                 let n = borrowed.n_cells();
                 let right = borrowed.right_most_pointer();
-                let cells: Vec<(PageId, i64)> = {
-                    let mut v = Vec::with_capacity(n as usize + 1);
-                    for i in 0..n {
-                        let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if let Cell::TableInterior { left_child, key } = c {
-                            v.push((left_child, key));
-                        }
+                // Binary search for the FIRST child whose separator >=
+                // start (children with separator < start hold only rowids
+                // < start). Then descend only into children [lo..n] plus
+                // the right-most pointer — view decodes, no allocations,
+                // no left-side scans.
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    let key = decode_table_interior_key(&borrowed.data[cell_ptr..])
+                        .ok_or_else(|| Error::corruption("truncated interior cell in range scan"))?;
+                    if key < start {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
                     }
-                    v.push((right, i64::MAX));
-                    v
-                };
+                }
+                let mut children: Vec<PageId> = Vec::with_capacity((n - lo) as usize + 1);
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if let Some(child) =
+                        decode_table_interior_child(&borrowed.data[cell_ptr..])
+                    {
+                        children.push(child);
+                    }
+                }
+                if right != 0 {
+                    children.push(right);
+                }
                 drop(borrowed);
                 drop(page);
-                for (child, key) in cells {
-                    if key < start {
-                        continue;
+                for child in children {
+                    if !self.scan_range_subtree_borrowed(child, start, end, f)? {
+                        return Ok(false);
                     }
-                    self.scan_range_subtree_borrowed(child, start, end, f)?;
                 }
-                Ok(())
+                Ok(true)
             }
             _ => Err(Error::corruption(format!(
                 "unexpected page type in range scan: {:?}",

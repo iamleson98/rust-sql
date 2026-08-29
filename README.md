@@ -101,26 +101,29 @@ criterion harness (`cargo bench --bench sqlite_comparison`), measured
 | Inner join (1k x 1k, rowid FK)     | 155 µs    | 122 µs  | 1.3x slower     |
 
 Single-shot workloads (`cargo run --release --example bench_compare`,
-steady state; index paths re-measured after the empty-index backfill fix —
-several earlier "wins" were timing a no-op):
+steady state; measured 2026-08-29 after the rowid-range fast path +
+binary-search range scans + the projection-permutation codec fix):
 
 | Workload                          | rustqlite | SQLite  | Ratio           |
 |-----------------------------------|-----------|---------|-----------------|
-| COUNT(*) via indexed range        | 32 µs     | 479 µs* | **~15x faster** |
-| Aggregates (SUM/AVG/MIN/MAX)      | 567 µs    | 1.22 ms | **2.2x faster** |
-| UPDATE by PK (1k ops)             | 1.32 ms   | 1.85 ms | **1.4x faster** |
-| 2-table join + GROUP BY           | 2.44 ms   | 3.45 ms | **1.4x faster** |
-| GROUP BY (100 buckets)            | 1.86 ms   | 2.04 ms | **1.1x faster** |
-| Range scan (100 rows)             | 17 µs     | 18.5 µs | **1.1x faster** |
-| Stripped binary size              | 1.53 MB   | 2.00 MB | **0.77x**       |
-| UPDATE range (indexed, 5k rows)   | 2.3 ms    | 1.3 ms  | 1.8x slower     |
-| Point lookup by rowid (1k ops)    | 776 µs    | 350 µs  | 2.2x slower     |
-| Indexed point lookup (1k ops)     | 1.31 ms   | 535 µs  | 2.4x slower     |
-| DELETE by PK (1k ops)             | 1.92 ms   | 1.34 ms | 1.4x slower     |
-| DB file size (10k rows)           | 328 KB    | 262 KB  | 1.25x larger    |
-
-*SQLite's filtered-count row runs before its index exists; the comparison
-uses its full-scan count as the conservative baseline.
+| Single-row inserts (1k, autocommit)| **796 µs**| 1.78 ms | **2.2x faster** |
+| Single-row BEGIN/COMMIT (100k)    | **77 ms** | 130 ms  | **1.7x faster** |
+| Multi-row VALUES (10k rows)       | **4.1 ms**| 6.2 ms  | **1.5x faster** |
+| DELETE by PK (1k ops)             | **511 µs**| 1.35 ms | **2.6x faster** |
+| Aggregates (SUM/AVG/MIN/MAX)      | **625 µs**| 1.21 ms | **1.9x faster** |
+| 2-table join (PK filter, ~10 rows)| **32 µs** | 38 µs   | **1.2x faster** |
+| 2-table join + GROUP BY           | **2.41 ms**| 3.30 ms| **1.4x faster** |
+| Full scan + COUNT with filter     | **364 µs**| 488 µs  | **1.3x faster** |
+| GROUP BY (100 buckets)            | **1.91 ms**| 2.10 ms| **1.1x faster** |
+| Range scan (100 rows)             | **11.2 µs**| 11.6 µs| **~parity**     |
+| Range scan (1000 rows)            | **97 µs** | 110 µs  | **1.1x faster** |
+| UPDATE by PK (1k ops)             | 2.30 ms   | 1.86 ms | 1.24x slower    |
+| UPDATE range (val > 5000)         | 1.52 ms   | 1.26 ms | 1.2x slower     |
+| Point lookup by rowid (1k ops)    | 403 µs    | 349 µs  | 1.15x slower    |
+| Indexed point lookup (1k ops)     | 738 µs    | 531 µs  | 1.4x slower     |
+| Range scan (10 rows)              | 10 µs     | 3.5 µs  | 2.9x slower     |
+| DB file size (10k rows)           | 295 KB    | 262 KB  | 1.13x larger    |
+| Stripped binary size              | 1.67 MB   | 2.01 MB | **0.83x**       |
 
 ### Where we win
 
@@ -135,20 +138,29 @@ uses its full-scan count as the conservative baseline.
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index
   and touches only matching rows; SQLite's planner picks a full table walk
   on this workload shape.
+- **Rowid range scans**: `WHERE id BETWEEN ? AND ?` runs a dedicated fast
+  path — no pipeline setup, binary-searched leaf descent, and an early
+  stop at the first cell past the range end (previously every leaf right
+  of the range was still visited). 100- and 1000-row ranges now beat
+  SQLite; 10-row ranges cut from 39 µs to ~10 µs.
 - **Filtered joins**: IndexNestedLoopJoin + a warm statement cache beats
   SQLite's prepared-statement path on point-filtered joins.
 - **Bulk inserts**: BTREE_APPEND right-most descent + append-mode splits +
   codec v2 (rows are ~40% smaller than v1) keep sequential loads dense.
 - **File size**: codec v2 + ~100% page fill for sequential loads lands
-  within 1.25x of SQLite's record format (was 3.5x).
+  within 1.13x of SQLite's record format (was 3.5x).
 - **Binary size**: no libc regex/pcre, no ICU, no optional extensions.
 
 ### Where SQLite still wins
 
 - **Full inner joins (1.3x)**: scan-side row materialization (one Vec per
   row) is the remainder of the join gap; a column-block scan would close it.
-- **DELETE by PK**: we default to per-statement durability (flush+fsync
-  per statement); the harness runs SQLite in WAL + `synchronous=OFF`.
+- **Tiny range scans (2.9x on 10-row ranges)**: SQLite's prepared VDBE
+  program still has ~3 µs less fixed cost than our fast path; the residual
+  is statement-cache lookup + row Vec allocation.
+- **Indexed point lookups (1.4x)**: the index path builds both the index
+  key and the result row per hit; SQLite's OP_SeekGE/OP_IdxRowid pair does
+  it with precompiled registers.
 - **Full scans with filters**: per-row predicate evaluation still resolves
   column names (string compares); resolving to indices like the GROUP BY
   path now does is the fix.
