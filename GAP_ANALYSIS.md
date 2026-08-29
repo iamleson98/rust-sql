@@ -17,14 +17,14 @@
 
 | # | Workload | rustqlite | SQLite | Ratio | Status |
 |---|---|---|---|---|---|
-| 1 | INSERT auto-commit (1k, unique SQL text) | **940 µs** | 1.60 ms | **1.70× faster** | ✅ fast INSERT scanner (was 3.6× slower at sprint start) |
-| 2 | INSERT in BEGIN/COMMIT (1k, unique SQL text) | **967 µs** | 1.05 ms | **1.09× faster** | ✅ (was 2.9× slower) |
-| 3 | Point lookup by rowid | **688 ns** | 1.65 µs | **2.4× faster** | ✅ |
-| 4 | COUNT(*) on 10k rows | **1.05 µs** | 2.57 µs | **2.4× faster** | ✅ vectorized scan count |
-| 5 | Concurrent read throughput (8 readers) | **6.3 ms** | 14.6 ms | **2.3× faster** | ✅ MRMW readers |
-| 6 | Mixed read/write (4 readers + 1 writer) | **1.88 ms** | 4.49 ms | **2.4× faster** | ✅ |
-| 7 | Range scan (100 rows) | **10.5 µs** | 11.6 µs | **1.10× faster** | ✅ identity projection (was 1.7× slower) |
-| 8 | Inner join (1k × 1k, rowid FK) | 158 µs | 123 µs | 1.28× slower | 🟡 hash join rewrite closed 6.2× → 1.28×; remainder = row materialization |
+| 1 | INSERT auto-commit (1k, unique SQL text) | **1.08 ms** | 1.55 ms | **1.44× faster** | ✅ fast INSERT scanner (was 3.6× slower at sprint start) |
+| 2 | INSERT in BEGIN/COMMIT (1k, unique SQL text) | 1.14 ms | 1.07 ms | 1.07× slower | 🟡 near parity (was 2.9× slower; regressed slightly from the Arc-map durability bookkeeping — worth reclaiming) |
+| 3 | Point lookup by rowid | **656 ns** | 1.65 µs | **2.51× faster** | ✅ |
+| 4 | COUNT(*) on 10k rows | **1.01 µs** | 2.61 µs | **2.57× faster** | ✅ vectorized scan count |
+| 5 | Concurrent read throughput (8 readers) | **4.83 ms** | 15.1 ms | **3.14× faster** | ✅ MRMW readers + Arc snapshot maps (was 2.3×) |
+| 6 | Mixed read/write (4 readers + 1 writer) | **1.76 ms** | 4.91 ms | **2.79× faster** | ✅ |
+| 7 | Range scan (100 rows) | **10.5 µs** | 11.2 µs | **1.07× faster** | ✅ identity projection (was 1.7× slower) |
+| 8 | Inner join (1k × 1k, rowid FK) | 155 µs | 122 µs | 1.27× slower | 🟡 hash join rewrite closed 6.2× → 1.27×; remainder = row materialization |
 
 Earlier `bench_compare` workloads (single-shot, warmed steady state),
 re-measured after the index-path sprint (`COUNT` via index now covers,
@@ -264,7 +264,32 @@ actually populated, the real index-path costs surfaced — and were attacked:
 - Root lookups (`table_root`/`index_root`) no longer allocate a lowercase
   String per call; INLJ hoists the index root out of the per-row loop.
 
-## 6. Working order (next sprint)
+## 6. What was closed this sprint (2026-08-29, fourth pass): shared-map snapshots
+
+The three per-Database bookkeeping maps (table root overrides, index
+roots, max-rowid cache) were deep-cloned into every statement's
+ExecContext — ~250 ns of allocations+copies per query on a post-split
+database, and the dominant serializer for concurrent readers (each reader
+cloned every map under a read lock).
+
+- **Readers (`query`/`query_with_columns`)**: the maps are now
+  `RwLock<Arc<HashMap>>`; a query clones three Arc snapshots (one atomic
+  refcount bump each) and reads through them. Concurrent-read throughput
+  improved 2.3× → 3.14× vs SQLite.
+- **Writers (`execute`)**: the maps are DETACHED (zero-copy move) into
+  the statement — `execute` holds `&mut self`, so no reader can race —
+  mutated in place, and attached back. `Arc::make_mut` never deep-copies
+  because the statement is the sole owner.
+- **Statement-local overlay**: ExecContext keeps local overlay maps +
+  changed flags; the write-back merges only what changed. Pure SELECTs
+  can still populate the max-rowid scan cache (used by the merge-scan
+  heuristic) — that merges back without touching root bookkeeping.
+- **Statement cache + seen-set**: FxHash string keys (~10-15 ns vs
+  SipHash's 40-80 ns per SQL text hash).
+- ROLLBACK clears the shared snapshots (entries cached during the
+  transaction may reference rolled-back pages).
+
+## 7. Working order (next sprint)
 
 1. ⏳ Inner join (1.28×) — the last criterion head-to-head gap. Scan-side
    row materialization (one Vec per row) is the remainder; a column-block
@@ -286,7 +311,7 @@ actually populated, the real index-path costs surfaced — and were attacked:
 
 ---
 
-## 7. Tracking conventions
+## 8. Tracking conventions
 
 - Tick a box when the work is **merged to master and CI is green**.
 - For perf items, re-run `bench_compare` and update the table at the top

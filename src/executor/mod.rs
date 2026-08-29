@@ -65,23 +65,35 @@ pub struct ExecContext<'a> {
     /// conflicts with the mutable catalog borrow in api.rs. The caller
     /// (api.rs) guarantees the catalog outlives the context.
     pub catalog_ptr: *const crate::schema::Catalog,
-    /// Overrides for table root pages (table_name -> current root page).
-    /// Updated when a B+tree split changes the root. This avoids the stale
-    /// root_page problem when the catalog's Arc<Table> can't be mutated.
+    /// LOCAL root-page overrides written by THIS statement (table_name ->
+    /// current root page). Starts empty; merged into the Database's shared
+    /// snapshot at statement end (see `root_shared`).
     pub root_overrides: HashMap<String, u32>,
-    /// Overrides for INDEX root pages (index_name -> current root page).
-    /// Same purpose as root_overrides: an index B+tree split moves the
-    /// root, but the catalog's Arc<Index> is immutable. Without this, the
-    /// first index split orphaned every entry inserted afterwards (the
-    /// catalog kept descending from the stale root).
+    /// READ-ONLY snapshot of the Database's accumulated root overrides.
+    /// Lookups check `root_overrides` first, then this. Cloning an Arc
+    /// snapshot per statement replaced deep-cloning the whole HashMap per
+    /// statement (~250 ns of allocations+copies per query on a
+    /// post-split database).
+    pub root_shared: std::sync::Arc<HashMap<String, u32>>,
+    /// LOCAL index-root overrides written by this statement.
     pub index_roots: HashMap<String, u32>,
-    /// Max rowid per table (avoids O(n) scan on every INSERT).
+    /// READ-ONLY snapshot of the Database's accumulated index roots.
+    pub index_shared: std::sync::Arc<HashMap<String, u32>>,
+    /// LOCAL max-rowid cache entries written by this statement.
     pub max_rowids: HashMap<String, i64>,
+    /// READ-ONLY snapshot of the Database's accumulated max-rowid cache.
+    pub max_rowids_shared: std::sync::Arc<HashMap<String, i64>>,
     /// Set when a table/index root actually MOVED this statement (B+tree
     /// split). Gates `sync_schema_roots` in api.rs — previously that call
     /// ran after EVERY statement, taking two read locks and collecting
     /// `Vec<(String, u32)>`s (with String clones) even when nothing moved.
     pub roots_changed: bool,
+    /// Set when `max_rowids` gained local entries this statement (gates the
+    /// write-back merge — root moves are rare, but the max-rowid scan cache
+    /// populates on first INSERT and on first index-range heuristic use).
+    pub max_rowids_changed: bool,
+    /// Set when `index_roots` gained local entries this statement.
+    pub index_roots_changed: bool,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -100,9 +112,14 @@ impl<'a> ExecContext<'a> {
             txn_snapshot: None,
             catalog_ptr: catalog,
             root_overrides: HashMap::new(),
+            root_shared: std::sync::Arc::new(HashMap::new()),
             index_roots: HashMap::new(),
+            index_shared: std::sync::Arc::new(HashMap::new()),
             max_rowids: HashMap::new(),
+            max_rowids_shared: std::sync::Arc::new(HashMap::new()),
             roots_changed: false,
+            max_rowids_changed: false,
+            index_roots_changed: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -123,10 +140,14 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.root_overrides.get(&table.name) {
             return r;
         }
-        self.root_overrides
-            .get(&table.name.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(table.root_page)
+        if let Some(&r) = self.root_shared.get(&table.name) {
+            return r;
+        }
+        let lc = table.name.to_ascii_lowercase();
+        if let Some(&r) = self.root_overrides.get(&lc) {
+            return r;
+        }
+        self.root_shared.get(&lc).copied().unwrap_or(table.root_page)
     }
 
     /// Update the root page override for a table.
@@ -140,26 +161,32 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.index_roots.get(&index.name) {
             return r;
         }
-        self.index_roots
-            .get(&index.name.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(index.root_page)
+        if let Some(&r) = self.index_shared.get(&index.name) {
+            return r;
+        }
+        let lc = index.name.to_ascii_lowercase();
+        if let Some(&r) = self.index_roots.get(&lc) {
+            return r;
+        }
+        self.index_shared.get(&lc).copied().unwrap_or(index.root_page)
     }
 
     /// Update the index root override (called after an index B+tree split).
     pub fn set_index_root(&mut self, index_name: &str, root: u32) {
-        let key = index_name.to_ascii_lowercase();
-        match self.index_roots.get_mut(&key) {
-            Some(v) if *v == root => {}
-            Some(v) => {
-                *v = root;
-                self.roots_changed = true;
-            }
-            None => {
-                self.index_roots.insert(key, root);
-                self.roots_changed = true;
-            }
+        if self.index_roots.get(index_name) == Some(&root)
+            || self.index_shared.get(index_name) == Some(&root)
+        {
+            return;
         }
+        let key = index_name.to_ascii_lowercase();
+        if self.index_roots.get(&key) == Some(&root)
+            || self.index_shared.get(&key) == Some(&root)
+        {
+            return;
+        }
+        self.index_roots.insert(key, root);
+        self.roots_changed = true;
+        self.index_roots_changed = true;
     }
 
     /// Fast-path set_table_root for callers that have already lower-cased
@@ -170,17 +197,15 @@ impl<'a> ExecContext<'a> {
     /// roots only move on B+tree splits. Previously this allocated a fresh
     /// key String + inserted into the map on EVERY inserted row.
     pub fn set_table_root_lc(&mut self, table_name_lc: &str, root: u32) {
-        match self.root_overrides.get_mut(table_name_lc) {
-            Some(v) if *v == root => { /* unchanged — nothing to do */ }
-            Some(v) => {
-                *v = root;
-                self.roots_changed = true;
-            }
-            None => {
-                self.root_overrides.insert(table_name_lc.to_string(), root);
-                self.roots_changed = true;
-            }
+        // Skip when the value already matches either the local overlay or
+        // the shared snapshot (roots only move on B+tree splits).
+        if self.root_overrides.get(table_name_lc) == Some(&root)
+            || self.root_shared.get(table_name_lc) == Some(&root)
+        {
+            return;
         }
+        self.root_overrides.insert(table_name_lc.to_string(), root);
+        self.roots_changed = true;
     }
 
     /// Get the cached max rowid for a table, or scan if not cached.
@@ -193,14 +218,27 @@ impl<'a> ExecContext<'a> {
         if let Some(&max) = self.max_rowids.get(&table.name) {
             return Ok(max);
         }
+        if let Some(&max) = self.max_rowids_shared.get(&table.name) {
+            // Seed the local overlay so later set_max_rowid_lc calls in
+            // this statement hit the in-place fast path.
+            self.max_rowids.insert(table.name.clone(), max);
+            self.max_rowids_changed = true;
+            return Ok(max);
+        }
         // Fast path 2: mixed-case name with a cached lowercase key.
         let key = table.name.to_ascii_lowercase();
         if let Some(&max) = self.max_rowids.get(&key) {
             return Ok(max);
         }
+        if let Some(&max) = self.max_rowids_shared.get(&key) {
+            self.max_rowids.insert(key, max);
+            self.max_rowids_changed = true;
+            return Ok(max);
+        }
         let root = self.table_root(table);
         let max = find_max_rowid(self.pager, root)?;
         self.max_rowids.insert(key, max);
+        self.max_rowids_changed = true;
         Ok(max)
     }
 
@@ -214,11 +252,21 @@ impl<'a> ExecContext<'a> {
     /// `get_or_scan_max_rowid` seeds it) instead of re-allocating the key
     /// String on every inserted row.
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
+        // Fast path: local entry exists (seeded by get_or_scan_max_rowid's
+        // copy-on-read, or written earlier in this statement) — update in
+        // place. This is the INSERT hot path: the rowid always advances
+        // the max, so no unchanged-check is worthwhile.
         if let Some(v) = self.max_rowids.get_mut(table_name_lc) {
             *v = rowid;
-        } else {
-            self.max_rowids.insert(table_name_lc.to_string(), rowid);
+            self.max_rowids_changed = true;
+            return;
         }
+        if self.max_rowids_shared.get(table_name_lc) == Some(&rowid) {
+            // Already at this value in the shared snapshot — nothing to do.
+            return;
+        }
+        self.max_rowids.insert(table_name_lc.to_string(), rowid);
+        self.max_rowids_changed = true;
     }
 
     /// Bind a positional parameter (the common `?` placeholder case).

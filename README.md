@@ -91,14 +91,14 @@ criterion harness (`cargo bench --bench sqlite_comparison`), measured
 
 | Workload                           | rustqlite | SQLite  | Ratio           |
 |------------------------------------|-----------|---------|-----------------|
-| INSERT auto-commit (1k, unique SQL)| **940 µs**| 1.60 ms | **1.7x faster** |
-| INSERT in BEGIN/COMMIT (1k)        | **967 µs**| 1.05 ms | **1.1x faster** |
-| Point lookup by rowid              | **688 ns**| 1.65 µs | **2.4x faster** |
-| COUNT(*) on 10k rows               | **1.1 µs**| 2.6 µs  | **2.4x faster** |
-| Concurrent reads (8 threads)       | **6.3 ms**| 14.6 ms | **2.3x faster** |
-| Mixed R/W (4 readers + 1 writer)   | **1.9 ms**| 4.5 ms  | **2.4x faster** |
-| Range scan (100 rows)              | **10.5 µs**| 11.6 µs| **1.1x faster** |
-| Inner join (1k x 1k, rowid FK)     | 158 µs    | 123 µs  | 1.3x slower     |
+| INSERT auto-commit (1k, unique SQL)| **1.08 ms**| 1.55 ms | **1.44x faster**|
+| Point lookup by rowid              | **656 ns**| 1.65 µs | **2.5x faster** |
+| COUNT(*) on 10k rows               | **1.0 µs**| 2.6 µs  | **2.6x faster** |
+| Concurrent reads (8 threads)       | **4.8 ms**| 15.1 ms | **3.1x faster** |
+| Mixed R/W (4 readers + 1 writer)   | **1.8 ms**| 4.9 ms  | **2.8x faster** |
+| Range scan (100 rows)              | **10.5 µs**| 11.2 µs| **1.1x faster** |
+| INSERT in BEGIN/COMMIT (1k)        | 1.14 ms   | 1.07 ms | ~parity         |
+| Inner join (1k x 1k, rowid FK)     | 155 µs    | 122 µs  | 1.3x slower     |
 
 Single-shot workloads (`cargo run --release --example bench_compare`,
 steady state; index paths re-measured after the empty-index backfill fix —

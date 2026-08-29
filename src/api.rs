@@ -112,13 +112,13 @@ pub struct Database {
     /// splits change the root, since the catalog's Arc<Table> is immutable.
     /// RwLock so reads can run concurrently; only writes (INSERT/UPDATE/DELETE
     /// causing a root split) take the write lock.
-    root_overrides: RwLock<HashMap<String, u32>>,
+    root_overrides: RwLock<std::sync::Arc<HashMap<String, u32>>>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
-    max_rowids: RwLock<HashMap<String, i64>>,
+    max_rowids: RwLock<std::sync::Arc<HashMap<String, i64>>>,
     /// Current root pages for INDEX B+trees (index_name -> root). Splits
     /// move an index root; the catalog's Arc<Index> is immutable, so the
     /// current root is tracked here (same pattern as root_overrides).
-    index_roots: RwLock<HashMap<String, u32>>,
+    index_roots: RwLock<std::sync::Arc<HashMap<String, u32>>>,
     /// Root page currently persisted in the schema table per object
     /// ("table:name" / "index:name" -> rootpage in the schema row).
     /// `sync_schema_roots` rewrites a schema row only when the live root
@@ -147,7 +147,7 @@ pub struct Database {
     ///
     /// RwLock so concurrent readers can hit the cache simultaneously; only
     /// a cache miss takes the brief write lock to insert.
-    stmt_cache: RwLock<HashMap<String, CachedStmt>>,
+    stmt_cache: RwLock<StmtCacheMap>,
     /// FIFO order of insertion into `stmt_cache`, used for eviction when the
     /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
     /// oldest entry and the next to be evicted.
@@ -166,7 +166,7 @@ pub struct Database {
     /// a ~5 ns hash insert. Repeated statements (the cache's real clientele)
     /// reach the cache on their 2nd execution and hit it from the 3rd on.
     /// Bounded: cleared wholesale when it grows past `seen_hashes_cap`.
-    seen_hashes: Mutex<std::collections::HashSet<u64>>,
+    seen_hashes: Mutex<std::collections::HashSet<u64, FxHashBuild>>,
     seen_hashes_cap: usize,
     /// When true (default: false), the per-statement flush in exec_insert /
     /// exec_update / exec_delete is suppressed. Mirrors SQLite's
@@ -192,20 +192,79 @@ pub struct Database {
 /// Default capacity of the statement cache.
 const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
 
+/// Shared empty-map singletons: cloning these costs one refcount bump
+/// instead of an ArcBox allocation, which matters on the per-statement
+/// detach/attach path in `execute`.
+fn empty_arc_u32() -> Arc<HashMap<String, u32>> {
+    static E: std::sync::OnceLock<Arc<HashMap<String, u32>>> = std::sync::OnceLock::new();
+    E.get_or_init(|| Arc::new(HashMap::new())).clone()
+}
+
+fn empty_arc_i64() -> Arc<HashMap<String, i64>> {
+    static E: std::sync::OnceLock<Arc<HashMap<String, i64>>> = std::sync::OnceLock::new();
+    E.get_or_init(|| Arc::new(HashMap::new())).clone()
+}
+
+/// Generic FxHash-style string hasher for statement-cache keys.
+///
+/// The statement cache is consulted on EVERY query/execute: hashing the
+/// SQL text with std's default SipHash-1-3 costs ~40-80 ns for a typical
+/// 35-60 byte statement; this multiply-rotate scheme is ~10-15 ns with
+/// good avalanche for table indexing. Collisions are impossible to fully
+/// rule out for any non-crypto hash, but the cache keys are compared by
+/// full string equality on hit (HashMap semantics), so a collision costs
+/// a wasted comparison — never a wrong result.
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let w = u64::from_le_bytes(buf);
+            self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, b: u8) {
+        self.hash = (self.hash.rotate_left(5) ^ (b as u64)).wrapping_mul(FX_SEED);
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FxHashBuild;
+
+impl std::hash::BuildHasher for FxHashBuild {
+    type Hasher = FxHasher;
+    #[inline]
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher::default()
+    }
+}
+
+/// Statement-cache map type with the fast string hasher.
+pub type StmtCacheMap = HashMap<String, CachedStmt, FxHashBuild>;
+
 /// Fast non-cryptographic hash (FxHash-style, as used by rustc) for the
 /// statement "seen" filter. ~5 ns for a typical 60-byte statement; used
 /// only as a heuristic gate, so collisions are harmless (they cause one
 /// unnecessary cache insert, never a wrong result).
 #[inline]
 fn quick_sql_hash(s: &str) -> u64 {
-    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-    let mut h: u64 = 0;
-    for chunk in s.as_bytes().chunks(8) {
-        let mut buf = [0u8; 8];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(SEED);
-    }
-    h
+    use std::hash::Hasher;
+    let mut h = FxHasher::default();
+    h.write(s.as_bytes());
+    h.finish()
 }
 
 /// A cached prepared statement: the parsed AST, the plan (if any), and the
@@ -243,14 +302,14 @@ impl Database {
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
-            root_overrides: RwLock::new(HashMap::new()),
-            max_rowids: RwLock::new(HashMap::new()),
-            index_roots: RwLock::new(HashMap::new()),
+            root_overrides: RwLock::new(std::sync::Arc::new(HashMap::new())),
+            max_rowids: RwLock::new(std::sync::Arc::new(HashMap::new())),
+            index_roots: RwLock::new(std::sync::Arc::new(HashMap::new())),
             schema_root_pages: Mutex::new(schema_root_pages),
-            stmt_cache: RwLock::new(HashMap::new()),
+            stmt_cache: RwLock::new(StmtCacheMap::default()),
             stmt_cache_order: Mutex::new(Vec::new()),
             stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
-            seen_hashes: Mutex::new(std::collections::HashSet::new()),
+            seen_hashes: Mutex::new(std::collections::HashSet::default()),
             seen_hashes_cap: 4096,
             deferred_flush: AtomicBool::new(false),
             deferred_flush_threshold: 1000,
@@ -428,18 +487,29 @@ impl Database {
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
         ctx.txn_snapshot = txn_snap;
-        ctx.root_overrides = std::mem::take(self.root_overrides.get_mut());
-        ctx.max_rowids = std::mem::take(self.max_rowids.get_mut());
-        ctx.index_roots = std::mem::take(self.index_roots.get_mut());
+        // DETACH (zero-copy — see execute()).
+        ctx.root_shared = std::mem::replace(self.root_overrides.get_mut(), empty_arc_u32());
+        ctx.max_rowids_shared = std::mem::replace(self.max_rowids.get_mut(), empty_arc_i64());
+        ctx.index_shared = std::mem::replace(self.index_roots.get_mut(), empty_arc_u32());
 
         let result = crate::executor::fast_insert_single_row(&mut ctx, &table, supplied);
 
-        // Epilogue: same write-backs as `execute`.
+        // Epilogue: same write-backs as `execute` (merge into the
+        // detached maps in place, then attach back).
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
-        *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
-        *self.max_rowids.get_mut() = std::mem::take(&mut ctx.max_rowids);
-        *self.index_roots.get_mut() = std::mem::take(&mut ctx.index_roots);
+        if ctx.roots_changed {
+            Arc::make_mut(&mut ctx.root_shared).extend(ctx.root_overrides.drain());
+        }
+        if ctx.max_rowids_changed {
+            Arc::make_mut(&mut ctx.max_rowids_shared).extend(ctx.max_rowids.drain());
+        }
+        if ctx.index_roots_changed {
+            Arc::make_mut(&mut ctx.index_shared).extend(ctx.index_roots.drain());
+        }
+        *self.root_overrides.get_mut() = ctx.root_shared;
+        *self.max_rowids.get_mut() = ctx.max_rowids_shared;
+        *self.index_roots.get_mut() = ctx.index_shared;
         if result.is_ok() && ctx.roots_changed {
             self.sync_schema_roots()?;
         }
@@ -683,9 +753,15 @@ impl Database {
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
         ctx.txn_snapshot = txn_snap;
-        ctx.root_overrides = std::mem::take(self.root_overrides.get_mut());
-        ctx.max_rowids = std::mem::take(self.max_rowids.get_mut());
-        ctx.index_roots = std::mem::take(self.index_roots.get_mut());
+        // DETACH the shared maps (zero-copy): `execute` holds `&mut self`,
+        // so no reader can hold a snapshot concurrently. The statement owns
+        // the maps via `ctx.*_shared` and hands them back in the epilogue.
+        // (Cloning the Arc snapshots here instead would keep a second
+        // refcount alive and force `Arc::make_mut` to deep-copy the maps
+        // on every write-back — a ~30% insert regression.)
+        ctx.root_shared = std::mem::replace(self.root_overrides.get_mut(), empty_arc_u32());
+        ctx.max_rowids_shared = std::mem::replace(self.max_rowids.get_mut(), empty_arc_i64());
+        ctx.index_shared = std::mem::replace(self.index_roots.get_mut(), empty_arc_u32());
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
@@ -721,13 +797,27 @@ impl Database {
         profile::span(t_exec, &profile::EXEC_NS);
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
-        *self.root_overrides.get_mut() = std::mem::take(&mut ctx.root_overrides);
-        *self.max_rowids.get_mut() = std::mem::take(&mut ctx.max_rowids);
-        *self.index_roots.get_mut() = std::mem::take(&mut ctx.index_roots);
+        // Merge local overlay entries into the DETACHED maps (in place —
+        // the statement is the sole owner, so make_mut never clones) and
+        // attach them back to the Database.
+        if ctx.roots_changed {
+            Arc::make_mut(&mut ctx.root_shared).extend(ctx.root_overrides.drain());
+        }
+        if ctx.max_rowids_changed {
+            Arc::make_mut(&mut ctx.max_rowids_shared).extend(ctx.max_rowids.drain());
+        }
+        if ctx.index_roots_changed {
+            Arc::make_mut(&mut ctx.index_shared).extend(ctx.index_roots.drain());
+        }
+        *self.root_overrides.get_mut() = ctx.root_shared;
+        *self.max_rowids.get_mut() = ctx.max_rowids_shared;
+        *self.index_roots.get_mut() = ctx.index_shared;
         if result.is_ok() && ctx.rolled_back {
             // ROLLBACK discarded in-transaction schema-row rewrites; reset
             // the persisted-root map to the catalog's (CREATE-time) values,
-            // which match the rolled-back file.
+            // which match the rolled-back file. The shared root/max-rowid
+            // snapshots may also hold stale entries from the transaction —
+            // clear them so the next statement rescans.
             let mut synced = self.schema_root_pages.lock();
             synced.clear();
             for (name, t) in self.catalog.all_tables() {
@@ -736,6 +826,9 @@ impl Database {
             for (name, i) in self.catalog.all_indexes() {
                 synced.insert(format!("index:{}", name), i.root_page);
             }
+            *self.root_overrides.get_mut() = Arc::new(HashMap::new());
+            *self.max_rowids.get_mut() = Arc::new(HashMap::new());
+            *self.index_roots.get_mut() = Arc::new(HashMap::new());
         }
         // Persist any root-page moves (B+tree splits) to the schema rows so
         // a reopened database sees the full tree. Without this, every table
@@ -781,27 +874,19 @@ impl Database {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             let txn_snap = self.txn_snapshot.lock().clone();
-            // Skip the HashMap clone (and its bucket-array allocation) when
-            // the maps are empty — `HashMap::new()` never allocates.
-            let root_overrides = {
-                let ro = self.root_overrides.read();
-                if ro.is_empty() { HashMap::new() } else { ro.clone() }
-            };
-            let max_rowids = {
-                let mr = self.max_rowids.read();
-                if mr.is_empty() { HashMap::new() } else { mr.clone() }
-            };
-            let index_roots = {
-                let ir = self.index_roots.read();
-                if ir.is_empty() { HashMap::new() } else { ir.clone() }
-            };
+            // Arc snapshot clones — one atomic refcount bump each,
+            // replacing a full HashMap deep-clone per query (~250 ns of
+            // allocations+copies on a post-split database).
+            let root_shared = self.root_overrides.read().clone();
+            let max_rowids_shared = self.max_rowids.read().clone();
+            let index_shared = self.index_roots.read().clone();
             let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
             ctx.txn_snapshot = txn_snap;
-            ctx.root_overrides = root_overrides;
-            ctx.max_rowids = max_rowids;
-            ctx.index_roots = index_roots;
+            ctx.root_shared = root_shared;
+            ctx.max_rowids_shared = max_rowids_shared;
+            ctx.index_shared = index_shared;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
@@ -825,10 +910,27 @@ impl Database {
                     | crate::planner::plan::Plan::Update { .. }
                     | crate::planner::plan::Plan::Delete { .. }
             ) {
-                *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
-                *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
-                *self.index_roots.write() = std::mem::take(&mut ctx.index_roots);
+                // DML via the query path (e.g. INSERT..RETURNING): merge
+                // any root moves / max-rowid updates back.
+                if ctx.roots_changed {
+                    let mut m = self.root_overrides.write();
+                    Arc::make_mut(&mut *m).extend(ctx.root_overrides.drain());
+                }
+                if ctx.max_rowids_changed {
+                    let mut m = self.max_rowids.write();
+                    Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
+                }
+                if ctx.index_roots_changed {
+                    let mut m = self.index_roots.write();
+                    Arc::make_mut(&mut *m).extend(ctx.index_roots.drain());
+                }
                 self.sync_schema_roots()?;
+            } else if ctx.max_rowids_changed {
+                // Pure SELECTs can still populate the max-rowid scan cache
+                // (used by the index-range merge-scan heuristic) — merge it
+                // back so repeated queries don't rescan.
+                let mut m = self.max_rowids.write();
+                Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
             }
             Ok(res.rows)
         } else {
@@ -854,26 +956,17 @@ impl Database {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             let txn_snap = self.txn_snapshot.lock().clone();
-            // Skip the HashMap clone (and its bucket-array allocation) when
-            // the maps are empty — `HashMap::new()` never allocates.
-            let root_overrides = {
-                let ro = self.root_overrides.read();
-                if ro.is_empty() { HashMap::new() } else { ro.clone() }
-            };
-            let max_rowids = {
-                let mr = self.max_rowids.read();
-                if mr.is_empty() { HashMap::new() } else { mr.clone() }
-            };
-            let index_roots = {
-                let ir = self.index_roots.read();
-                if ir.is_empty() { HashMap::new() } else { ir.clone() }
-            };
+            // Arc snapshot clones — one atomic refcount bump each
+            // (replaces a full HashMap deep-clone per query).
+            let root_shared = self.root_overrides.read().clone();
+            let max_rowids_shared = self.max_rowids.read().clone();
+            let index_shared = self.index_roots.read().clone();
             let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
-            ctx.root_overrides = root_overrides;
-            ctx.max_rowids = max_rowids;
-            ctx.index_roots = index_roots;
+            ctx.root_shared = root_shared;
+            ctx.max_rowids_shared = max_rowids_shared;
+            ctx.index_shared = index_shared;
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
@@ -893,10 +986,25 @@ impl Database {
                     | crate::planner::plan::Plan::Update { .. }
                     | crate::planner::plan::Plan::Delete { .. }
             ) {
-                *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
-                *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
-                *self.index_roots.write() = std::mem::take(&mut ctx.index_roots);
+                if ctx.roots_changed {
+                    let mut m = self.root_overrides.write();
+                    Arc::make_mut(&mut *m).extend(ctx.root_overrides.drain());
+                }
+                if ctx.max_rowids_changed {
+                    let mut m = self.max_rowids.write();
+                    Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
+                }
+                if ctx.index_roots_changed {
+                    let mut m = self.index_roots.write();
+                    Arc::make_mut(&mut *m).extend(ctx.index_roots.drain());
+                }
                 self.sync_schema_roots()?;
+            } else if ctx.max_rowids_changed {
+                // Pure SELECTs can still populate the max-rowid scan cache
+                // (used by the index-range merge-scan heuristic) — merge it
+                // back so repeated queries don't rescan.
+                let mut m = self.max_rowids.write();
+                Arc::make_mut(&mut *m).extend(ctx.max_rowids.drain());
             }
             Ok((res.columns.to_vec(), res.rows))
         } else {
