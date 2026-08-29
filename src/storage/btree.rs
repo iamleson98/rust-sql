@@ -636,49 +636,54 @@ impl<'a> Btree<'a> {
             let pt = page.lock().page_type()?;
             match pt {
                 PageType::LeafTable => {
-                    // First pass: find the matching cell, record its offset
-                    // and the old payload length. We must NOT hold a borrow
-                    // across the mutable write below.
-                    let mut match_offset: Option<usize> = None;
-                    let mut match_old_len: Option<usize> = None;
-                    let n = page.lock().n_cells();
-                    for i in 0..n {
-                        let cell_ptr = page.lock().cell_pointer(i) as usize;
+                    // Binary search for the cell by rowid (cells are stored
+                    // sorted) — reading ONLY the rowid varint per probe, no
+                    // payload allocation. This used to be a linear scan that
+                    // fully decoded every cell (a Vec allocation each); with
+                    // codec v2 + append-mode splits a 16 KiB leaf holds
+                    // ~1000 cells, so the linear scan cost ~500 allocations
+                    // (~7 µs) per UPDATE-by-PK. Binary search needs ~10
+                    // rowid reads.
+                    let (_cell_ptr, payload_offset, old_len) = {
                         let borrowed = page.lock();
-                        let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if let Cell::TableLeaf {
-                            rowid: rid,
-                            payload: old_payload,
-                        } = &cell
-                        {
-                            if *rid == rowid {
-                                match_offset = Some(cell_ptr);
-                                match_old_len = Some(old_payload.len());
-                                break;
-                            }
-                            if *rid > rowid {
-                                // Rowid doesn't exist (cells are sorted).
-                                return Ok(false);
+                        let n = borrowed.n_cells() as usize;
+                        let mut lo = 0usize;
+                        let mut hi = n;
+                        let mut found: Option<usize> = None;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2;
+                            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                            let (cell_rowid, n_rid) =
+                                decode_rowid_only(&borrowed.data[cell_ptr..]).ok_or_else(|| {
+                                    Error::corruption("truncated leaf rowid in update")
+                                })?;
+                            match cell_rowid.cmp(&rowid) {
+                                std::cmp::Ordering::Equal => {
+                                    found = Some(cell_ptr + n_rid);
+                                    break;
+                                }
+                                std::cmp::Ordering::Less => lo = mid + 1,
+                                std::cmp::Ordering::Greater => hi = mid,
                             }
                         }
-                    }
-                    let (cell_ptr, old_len) = match (match_offset, match_old_len) {
-                        (Some(o), Some(l)) => (o, l),
-                        _ => return Ok(false),
+                        match found {
+                            None => return Ok(false), // rowid not present
+                            Some(payload_len_pos) => {
+                                // Decode the payload-length varint.
+                                let (plen, n_plen) = varint::decode(
+                                    &borrowed.data[payload_len_pos..],
+                                )
+                                .ok_or_else(|| {
+                                    Error::corruption("truncated payload length in update")
+                                })?;
+                                (payload_len_pos, payload_len_pos + n_plen, plen as usize)
+                            }
+                        }
                     };
                     if old_len != new_payload.len() {
                         // Size changed — caller must fall back to delete+insert.
                         return Ok(false);
                     }
-                    // Compute the offset of the payload within the cell.
-                    // Cell layout: varint(rowid) + varint(payload_len) + payload.
-                    let mut prefix = Vec::with_capacity(20);
-                    let mut buf = [0u8; 10];
-                    let k = varint::encode_signed(rowid, &mut buf);
-                    prefix.extend_from_slice(&buf[..k]);
-                    let p = varint::encode(new_payload.len() as u64, &mut buf);
-                    prefix.extend_from_slice(&buf[..p]);
-                    let payload_offset = cell_ptr + prefix.len();
                     // Overwrite the payload bytes — single mutable borrow,
                     // no immutable borrows outstanding.
                     {
