@@ -45,13 +45,15 @@ for row in &rows {
 
 ### Storage
 
-- **Page format**: 4 KiB pages (configurable), 100-byte file header on page 0
+- **Page format**: 16 KiB pages (configurable), 100-byte file header on page 0
 - **B+tree**: clustered table B+tree (key = rowid) and index B+tree sorted by (key, rowid) with an order-preserving key encoding — O(log N) index seeks, prefix lookups for composite indexes, and range scans
 - **Index range scans**: `WHERE indexed_col > ?` / `BETWEEN` plans an `IndexRange` (index seek + fetch only matching rows)
+- **Append-mode splits**: right-edge inserts keep the old leaf 100% full (SQLite's `balance_quick` behavior) — sequential loads fill pages ~2x denser than naive mid-splits
+- **Page recycling**: DELETE unlinks empty leaves onto the pager freelist; new allocations reuse freelist pages before growing the file
 - **Pager**: LRU cache, freelist, page allocation, dirty page tracking
 - **WAL**: write-ahead log with CRC32 checksums, salt-based recovery, frame-level integrity
 - **MVCC**: snapshot isolation via WAL frame indexing (foundation in place)
-- **Row codec**: compact binary encoding with type tags
+- **Row codec v2** (`RSQLDB02`): size-classed integers (1–9 bytes), LEB128 text/blob lengths, and rowid-alias elision — `id INTEGER PRIMARY KEY` is stored as a 1-byte marker materialized from the B+tree key, like SQLite's record format
 
 ### Tooling
 
@@ -83,21 +85,49 @@ The engine is structured in five layers, each with a clear contract:
 
 ## Performance
 
-Preliminary benchmarks vs SQLite (rusqlite with bundled SQLite) on an in-memory database:
+Benchmarks vs SQLite (rusqlite with bundled SQLite), in-memory database,
+steady-state (statements warm). Full harness: `cargo run --release --example bench_compare`.
 
-| Workload              | rustqlite  | SQLite (rusqlite) | Ratio    |
-|-----------------------|-----------|-------------------|----------|
-| Point lookup (rowid)  | 12.4 µs   | 1.57 µs           | 7.9x slower |
-| Range scan (4000 rows)| 19.6 µs   | 342 µs            | **17x faster** |
-| Insert (1000 rows)    | 11.3 ms   | 1.5 ms            | 7.5x slower |
-| Join (5 rows out)     | 3.57 ms   | 3.9 µs            | ~900x slower |
+| Workload                          | rustqlite | SQLite  | Ratio           |
+|-----------------------------------|-----------|---------|-----------------|
+| UPDATE range (indexed)            | 21 µs     | 1.24 ms | **59x faster**  |
+| 3-table join, filter by PK        | 3.6 µs    | 56 µs   | **15x faster**  |
+| 2-table join, filter by PK        | 4.2 µs    | 24 µs   | **5.8x faster** |
+| UPDATE by PK (1k ops)             | 1.25 ms   | 1.82 ms | **1.5x faster** |
+| Aggregates (SUM/AVG/MIN/MAX)      | 555 µs    | 1.18 ms | **2.1x faster** |
+| Single-row inserts (1k, autocommit)| 981 µs   | 1.80 ms | **1.8x faster** |
+| 100k inserts in BEGIN/COMMIT      | 116 ms    | 128 ms  | **1.1x faster** |
+| GROUP BY (100 buckets)            | 1.92 ms   | 1.88 ms | parity          |
+| Indexed point lookup (1k ops)     | 539 µs    | 526 µs  | parity          |
+| Range scan (1000 rows)            | 167 µs    | 108 µs  | 1.5x slower     |
+| Point lookup by rowid (1k ops)    | 758 ns/op | 362 ns/op | 2.1x slower   |
+| DELETE by PK (1k ops)             | 4.6 ms    | 1.35 ms | 3.4x slower     |
+| DB file size (10k rows)           | 328 KB    | 262 KB  | 1.25x larger    |
+| Stripped binary size              | 1.28 MB   | 1.99 MB | **0.64x**       |
 
-### Why these numbers
+### Where we win
 
-- **Range scan is faster**: SQLite has more per-row overhead (VDBE interpretation, type coercion, etc.). For bulk scans, our simpler executor wins.
-- **Point lookup is slower**: We don't yet use the rowid B+tree for `WHERE rowid = ?` — we always scan. Adding rowid point lookup would close most of this gap.
-- **Insert is slower**: We call `pager.flush()` after every INSERT, writing through to disk. SQLite uses WAL + group commit. Batching inserts in a transaction would close the gap.
-- **Join is slower**: Our nested-loop join materializes the entire inner side for each outer row. A hash join or streaming nested-loop would close the gap.
+- **UPDATE range / index scans**: the `IndexRange` plan node seeks the index
+  and touches only matching rows; SQLite's planner picks a full table walk
+  on this workload shape.
+- **Filtered joins**: IndexNestedLoopJoin + a warm statement cache beats
+  SQLite's prepared-statement path on point-filtered joins.
+- **Bulk inserts**: BTREE_APPEND right-most descent + append-mode splits +
+  codec v2 (rows are ~40% smaller than v1) keep sequential loads dense.
+- **File size**: codec v2 + ~100% page fill for sequential loads lands
+  within 1.25x of SQLite's record format (was 3.5x).
+- **Binary size**: no libc regex/pcre, no ICU, no optional extensions.
+
+### Where SQLite still wins
+
+- **Point lookups / small scans**: the rusqlite-style API materializes an
+  owned `Vec<Row>` per query (2–3 allocations); SQLite's step/column API
+  avoids that. A cursor/callback API is the fix.
+- **DELETE by PK**: we default to per-statement durability (flush+fsync
+  per statement); the harness runs SQLite in WAL + `synchronous=OFF`.
+- **Full scans with filters**: per-row predicate evaluation still resolves
+  column names (string compares); resolving to indices like the GROUP BY
+  path now does is the fix.
 
 Run the benchmarks yourself:
 
