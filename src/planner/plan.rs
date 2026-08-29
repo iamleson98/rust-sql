@@ -8,6 +8,7 @@ use crate::sql::ast::{Expr, OrderTerm};
 use std::sync::Arc;
 
 use crate::schema::{Index, Table};
+use crate::types::Row;
 
 /// A logical plan node.
 #[derive(Clone, Debug)]
@@ -122,6 +123,14 @@ pub enum Plan {
     },
     /// Subquery (materialized).
     Subquery { plan: Box<Plan> },
+    /// A materialized CTE result (WITH clause). The rows were computed
+    /// BEFORE planning (see api.rs's CTE materialization); references to
+    /// the CTE name in FROM scan these rows. Recomputed per statement
+    /// execution — statements with CTEs bypass the statement cache.
+    CteRows {
+        rows: std::sync::Arc<Vec<Row>>,
+        columns: Arc<[String]>,
+    },
     /// Distinct.
     Distinct { input: Box<Plan> },
     /// Set operations.

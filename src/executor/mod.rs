@@ -114,6 +114,10 @@ pub struct ExecContext<'a> {
     /// within the current statement (see insert_table_append_hinted). Keyed
     /// by the Arc<Table> identity so a hint never crosses tables.
     pub table_append_hint: Option<(usize, u32)>,
+    /// Materialized CTEs of the statement being executed — consulted by
+    /// subquery planning (exec_select_statement) so `IN (SELECT .. FROM cte)`
+    /// inside a WITH statement resolves the CTE.
+    pub ctes: Option<HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>>,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -139,6 +143,7 @@ impl<'a> ExecContext<'a> {
             max_rowids_changed: false,
             index_roots_changed: false,
             table_append_hint: None,
+            ctes: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -173,6 +178,7 @@ impl<'a> ExecContext<'a> {
             max_rowids_changed: false,
             index_roots_changed: false,
             table_append_hint: None,
+            ctes: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -444,6 +450,10 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::Intersect { left, right } => exec_intersect(ctx, left, right),
         Plan::Except { left, right } => exec_except(ctx, left, right),
         Plan::Subquery { plan } => execute(plan, ctx),
+        Plan::CteRows { rows, columns } => Ok(ExecResult {
+            columns: columns.clone(),
+            rows: rows.as_ref().clone(),
+        }),
         Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
         Plan::RowidRange { table, alias: _, start, end, residual } => exec_rowid_range(ctx, table.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
@@ -697,6 +707,7 @@ pub fn rewrite_plan_subqueries(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result
 pub fn plan_has_subqueries(plan: &Plan) -> bool {
     fn exprs_in_plan<'a>(p: &'a Plan, out: &mut Vec<&'a Expr>) {
         match p {
+            Plan::CteRows { .. } => {}
             Plan::Scan { predicate, .. } => {
                 if let Some(e) = predicate.as_ref() {
                     out.push(e);
@@ -822,6 +833,7 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
 
 fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) -> Result<()> {
     match plan {
+        Plan::CteRows { .. } => {}
         Plan::Scan { predicate, .. } => {
             if let Some(p) = predicate.as_mut() {
                 rewrite_expr_in_place(p, ctx)?;
@@ -974,7 +986,8 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             // Rewrite any NESTED subqueries inside this subquery first.
             let mut sel = *sel;
             rewrite_select_subqueries(&mut sel, ctx)?;
-            if subquery_is_correlated(&sel, ctx.catalog()) {
+            let (cte_names, cte_cols) = cte_scope_of(ctx);
+            if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                 Ok(Expr::Subquery(Box::new(sel)))
             } else {
                 let res = exec_select_statement(&sel, ctx)?;
@@ -989,7 +1002,8 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
         Expr::Exists(sel) => {
             let mut sel = *sel;
             rewrite_select_subqueries(&mut sel, ctx)?;
-            if subquery_is_correlated(&sel, ctx.catalog()) {
+            let (cte_names, cte_cols) = cte_scope_of(ctx);
+            if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                 Ok(Expr::Exists(Box::new(sel)))
             } else {
                 let res = exec_select_statement(&sel, ctx)?;
@@ -1001,7 +1015,8 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                 InSource::Subquery(sel) => {
                     let mut sel = *sel;
                     rewrite_select_subqueries(&mut sel, ctx)?;
-                    if subquery_is_correlated(&sel, ctx.catalog()) {
+                    let (cte_names, cte_cols) = cte_scope_of(ctx);
+                    if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                         InSource::Subquery(Box::new(sel))
                     } else {
                         let res = exec_select_statement(&sel, ctx)?;
@@ -1088,6 +1103,9 @@ fn rewrite_table_expression_subqueries(te: &mut TableExpression, ctx: &mut ExecC
 fn exec_select_statement(sel: &SelectStatement, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     let catalog = ctx.catalog();
     let mut planner = crate::planner::Planner::new(catalog);
+    if let Some(ctes) = ctx.ctes.clone() {
+        planner.set_ctes(ctes);
+    }
     let plan = planner.plan_select(sel)?;
     execute(&plan, ctx)
 }
@@ -1097,7 +1115,12 @@ fn exec_select_statement(sel: &SelectStatement, ctx: &mut ExecContext<'_>) -> Re
 /// including nested sources). If any ref's qualifier isn't a local source,
 /// or any unqualified ref doesn't match a local source column, treat the
 /// subquery as correlated (outer refs present).
-fn subquery_is_correlated(sel: &SelectStatement, catalog: &crate::schema::Catalog) -> bool {
+fn subquery_is_correlated(
+    sel: &SelectStatement,
+    catalog: &crate::schema::Catalog,
+    cte_names: &std::collections::HashSet<String>,
+    cte_cols: &HashMap<String, std::sync::Arc<[String]>>,
+) -> bool {
     let mut sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut source_tables: Vec<Arc<Table>> = Vec::new();
     collect_select_sources(sel, catalog, &mut sources, &mut source_tables);
@@ -1108,16 +1131,43 @@ fn subquery_is_correlated(sel: &SelectStatement, catalog: &crate::schema::Catalo
                 return true;
             }
         } else {
-            // Unqualified: must match a local source column.
-            let known = source_tables
-                .iter()
-                .any(|t| t.find_column(&name).is_some());
-            if !known {
+            // Unqualified: must match a local source column or a CTE column
+            // in scope (CTEs aren't catalog tables — without this check,
+            // every ref to a CTE column was misclassified as an outer
+            // reference, marking uncorrelated subqueries "correlated").
+            let known_table = source_tables.iter().any(|t| t.find_column(&name).is_some());
+            let known_cte = cte_names.iter().any(|cn| {
+                cte_cols
+                    .get(cn)
+                    .map(|cols| {
+                        cols.iter().any(|c| {
+                            let suffix = c.rsplit('.').next().unwrap_or(c);
+                            suffix.eq_ignore_ascii_case(&name)
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if !known_table && !known_cte {
                 return true;
             }
         }
     }
     false
+}
+
+/// CTE scope info extracted from an ExecContext for correlation analysis.
+fn cte_scope_of(
+    ctx: &ExecContext<'_>,
+) -> (std::collections::HashSet<String>, HashMap<String, std::sync::Arc<[String]>>) {
+    let mut names = std::collections::HashSet::new();
+    let mut cols = HashMap::new();
+    if let Some(ctes) = &ctx.ctes {
+        for (k, (_, c)) in ctes {
+            names.insert(k.clone());
+            cols.insert(k.clone(), c.clone());
+        }
+    }
+    (names, cols)
 }
 
 /// Collect source aliases/table names from a SELECT's FROM clause,

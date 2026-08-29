@@ -22,23 +22,29 @@ pub struct Planner<'a> {
     /// The current scope of table aliases → tables.
     /// Used for name resolution.
     scopes: Vec<HashMap<String, Arc<Table>>>,
+    /// Materialized CTE results visible in this SELECT's FROM clause
+    /// (lowercase CTE name -> (rows, qualified column names)). Populated
+    /// by api.rs before planning; FROM references resolve against CTEs
+    /// FIRST so a CTE shadows a real table of the same name (SQL standard).
+    ctes: HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>,
+    /// Parent planner's CTE map, merged when a nested SELECT is planned
+    /// (CTEs stay visible inside subqueries in the same statement).
+    outer_ctes: Option<HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>>,
 }
 
 impl<'a> Planner<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
-        Self { catalog, scopes: vec![HashMap::new()] }
+        Self { catalog, scopes: vec![HashMap::new()], ctes: HashMap::new(), outer_ctes: None }
     }
 
     /// Plan a SELECT statement.
+    ///
+    /// WITH clauses are NOT planned here — api.rs materializes CTEs into
+    /// rows BEFORE planning and hands them over via `set_ctes`; FROM
+    /// references resolve against them (see plan_table_expression). The
+    /// old vestigial pass re-planned CTE bodies without CTE scope, which
+    /// broke nested WITH clauses.
     pub fn plan_select(&mut self, stmt: &SelectStatement) -> Result<Plan> {
-        if let Some(with) = &stmt.with {
-            self.scopes.push(HashMap::new());
-            for cte in &with.ctes {
-                let cte_plan = self.plan_select(&cte.select)?;
-                let _ = cte_plan;
-            }
-        }
-
         let plan = self.plan_select_body(&stmt.body)?;
 
         // Insert Sort BELOW Project / Distinct so it can see all input
@@ -63,9 +69,6 @@ impl<'a> Planner<'a> {
             plan
         };
 
-        if stmt.with.is_some() {
-            self.scopes.pop();
-        }
         Ok(plan)
     }
 
@@ -293,9 +296,47 @@ impl<'a> Planner<'a> {
         pushdown_filter(self.catalog, plan, predicate)
     }
 
+    /// Provide the materialized CTE map for this statement (api.rs).
+    pub fn set_ctes(
+        &mut self,
+        ctes: HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>,
+    ) {
+        self.ctes = ctes;
+    }
+
+    /// Effective CTE map: own + inherited from the enclosing planner.
+    fn effective_cte(&self, name: &str) -> Option<(std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)> {
+        if let Some(v) = self.ctes.get(name) {
+            return Some(v.clone());
+        }
+        self.outer_ctes.as_ref().and_then(|m| m.get(name).cloned())
+    }
+
     fn plan_table_expression(&mut self, te: &TableExpression) -> Result<Plan> {
         match te {
             TableExpression::Table { name, alias, indexed, .. } => {
+                // CTE reference? (WITH ... name AS (...)). CTEs shadow real
+                // tables of the same name.
+                if indexed.is_none() {
+                    if let Some((rows, cols)) = self.effective_cte(&name.to_ascii_lowercase()) {
+                        // Rebind the column names to the effective alias so
+                        // `SELECT c.x FROM cte c` resolves: qualify with the
+                        // alias when present, else the CTE name.
+                        let prefix = alias.clone().unwrap_or_else(|| name.clone());
+                        let ql: Arc<[String]> = if prefix.eq_ignore_ascii_case(name) {
+                            cols.clone()
+                        } else {
+                            cols.iter()
+                                .map(|c| {
+                                    let suffix = c.rsplit('.').next().unwrap_or(c);
+                                    format!("{}.{}", prefix, suffix)
+                                })
+                                .collect::<Vec<String>>()
+                                .into()
+                        };
+                        return Ok(Plan::CteRows { rows: rows.clone(), columns: ql });
+                    }
+                }
                 let table = self.catalog.get_table(name).ok_or_else(|| {
                     Error::NotFound(format!("table: {}", name))
                 })?;
@@ -1707,6 +1748,10 @@ fn resolve_table_col_index(
 /// outputs.
 fn plan_output_width(plan: &Plan) -> usize {
     match plan {
+        Plan::CteRows { rows, columns } => {
+            let _ = rows;
+            columns.len()
+        }
         Plan::Scan { table, .. } => table.n_columns(),
         Plan::RowidLookup { table, .. } => table.n_columns(),
         Plan::IndexLookup { table, .. } => table.n_columns(),

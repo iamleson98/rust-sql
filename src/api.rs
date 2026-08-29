@@ -362,6 +362,42 @@ fn decode_projected(payload: &[u8], table: &Table, rowid: i64, project: Option<&
     }
 }
 
+/// Split a recursive CTE's compound SELECT into (base, set-op, recursive arm).
+/// The body must be `... UNION [ALL] <recursive>`; more than two arms or a
+/// non-UNION top-level operator is rejected (SQLite requires the same shape).
+fn split_compound_cte(
+    sel: &SelectStatement,
+) -> Result<(
+    SelectStatement,
+    crate::sql::ast::SetOp,
+    SelectStatement,
+)> {
+    use crate::sql::ast::{SelectBody, SelectStatement as Sel};
+    // Rebuild a plain SelectStatement from a SelectBody by cloning the
+    // statement shell with the body swapped.
+    fn with_body(s: &Sel, body: SelectBody) -> Sel {
+        let mut out = s.clone();
+        out.body = body;
+        out.with = None; // the outer WITH doesn't apply to inner arms
+        out
+    }
+    match &sel.body {
+        SelectBody::Binary { op, left, right } => match op {
+            crate::sql::ast::SetOp::Union | crate::sql::ast::SetOp::UnionAll => Ok((
+                with_body(sel, (**left).clone()),
+                *op,
+                with_body(sel, (**right).clone()),
+            )),
+            _ => Err(Error::semantic(
+                "WITH RECURSIVE requires UNION or UNION ALL as the compound operator",
+            )),
+        },
+        SelectBody::Simple(_) => Err(Error::semantic(
+            "WITH RECURSIVE requires a compound SELECT (base UNION [ALL] recursive)",
+        )),
+    }
+}
+
 impl Database {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -609,6 +645,16 @@ impl Database {
         Ok(true)
     }
 
+    /// True when the statement carries a WITH clause — its plan embeds
+    /// materialized CTE rows that must be recomputed per execution, so it
+    /// can never come from (or go into) the statement cache.
+    fn stmt_needs_cte_materialization(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Select(s) => s.with.is_some(),
+            _ => false,
+        }
+    }
+
     fn get_or_cache_stmt(&self, sql: &str) -> Result<CachedStmt> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
@@ -643,6 +689,18 @@ impl Database {
         let t0 = profile::now();
         let stmt = parse(sql)?;
         profile::span(t0, &profile::PARSE_NS);
+        // WITH-clause statements are NEVER cached (and never hit): their
+        // plans embed materialized CTE rows that must be recomputed per
+        // execution. Planning here would also be wrong — the caller
+        // materializes the CTEs first and plans with them in scope.
+        if Self::stmt_needs_cte_materialization(&stmt) {
+            return Ok(CachedStmt {
+                stmt: Arc::new(stmt),
+                plan: None,
+                has_subqueries: false,
+                fast_path: None,
+            });
+        }
         let t1 = profile::now();
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
         profile::span(t1, &profile::PLAN_NS);
@@ -812,6 +870,33 @@ impl Database {
         let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
         profile::span(t_cache, &profile::CACHE_NS);
+        // WITH-clause SELECT via the execute path: same CTE machinery as
+        // query(); the result rows are simply discarded.
+        if let Statement::Select(sel) = cached.stmt.as_ref() {
+            if sel.with.is_some() {
+                let in_txn = self.in_transaction.load(Ordering::Acquire);
+                let txn_snap = self.txn_snapshot.get_mut().take();
+                let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+                ctx.in_transaction = in_txn;
+                ctx.deferred_flush = deferred_flush;
+                ctx.txn_snapshot = txn_snap;
+                ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+                for v in params.into_iter() {
+                    ctx.bind_positional(v);
+                }
+                let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new());
+                self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+                *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+                if ctx.max_rowids_changed {
+                    Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
+                }
+                *self.maps.get_mut() = ctx.shared;
+                res?;
+                return Ok(());
+            }
+        }
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &cached.stmt;
@@ -950,6 +1035,29 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
+        // WITH-clause statements: materialize CTEs, plan with them in
+        // scope, execute — never cached (rows are recomputed per call).
+        if let Statement::Select(sel) = cached.stmt.as_ref() {
+            if sel.with.is_some() {
+                let in_txn = self.in_transaction.load(Ordering::Acquire);
+                let txn_snap = if in_txn {
+                    self.txn_snapshot.lock().clone()
+                } else {
+                    None
+                };
+                let shared = self.maps.read().clone();
+                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+                ctx.in_transaction = in_txn;
+                ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+                ctx.txn_snapshot = txn_snap;
+                for v in params.into_iter() {
+                    ctx.bind_positional(v);
+                }
+                let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
+                return Ok(res.rows);
+            }
+        }
         if let Some(plan) = cached.plan {
             // Pre-compiled point-lookup fast path: skips the ExecContext /
             // EvalContext / Plan dispatch entirely. Only fires for the
@@ -1044,6 +1152,27 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
+        if let Statement::Select(sel) = cached.stmt.as_ref() {
+            if sel.with.is_some() {
+                let in_txn = self.in_transaction.load(Ordering::Acquire);
+                let txn_snap = if in_txn {
+                    self.txn_snapshot.lock().clone()
+                } else {
+                    None
+                };
+                let shared = self.maps.read().clone();
+                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+                ctx.in_transaction = in_txn;
+                ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+                ctx.txn_snapshot = txn_snap;
+                for v in params.into_iter() {
+                    ctx.bind_positional(v);
+                }
+                let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
+                return Ok((res.columns.to_vec(), res.rows));
+            }
+        }
         if let Some(plan) = cached.plan {
             // Pre-compiled point-lookup fast path (see query()).
             if let Some(fp) = &cached.fast_path {
@@ -1145,6 +1274,188 @@ impl Database {
     /// Get a mutable pointer to the pager (for debugging/testing).
     pub fn pager_mut(&mut self) -> *mut Pager {
         &mut self.pager as *mut Pager
+    }
+
+    // ====================================================================
+    // CTE (WITH clause) materialization
+    // ====================================================================
+
+    /// Execute a SELECT statement with a set of pre-materialized CTEs in
+    /// scope. Returns the ExecResult (columns + rows).
+    fn exec_select_with_ctes(
+        &self,
+        ctx: &mut ExecContext<'_>,
+        select: &SelectStatement,
+        outer_ctes: &HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>,
+    ) -> Result<crate::executor::ExecResult> {
+        // Materialize THIS select's own WITH clause (nested WITH), layered
+        // on top of the outer map (inner names shadow outer names).
+        let cte_map = if let Some(with) = &select.with {
+            let mut m = outer_ctes.clone();
+            let own = self.materialize_ctes(with, &m, ctx)?;
+            m.extend(own);
+            m
+        } else {
+            outer_ctes.clone()
+        };
+        let mut planner = Planner::new(&self.catalog);
+        planner.set_ctes(cte_map.clone());
+        let plan = planner.plan_select(select)?;
+        let mut plan = plan;
+        // Make the CTEs visible to subquery planning inside this statement.
+        ctx.ctes = Some(cte_map);
+        // Uncorrelated subquery substitution (same as the general path).
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, ctx)?;
+        }
+        let res = crate::executor::execute(&plan, ctx);
+        ctx.ctes = None;
+        res
+    }
+
+    /// Materialize every CTE of a WITH clause into (rows, qualified column
+    /// names). Later CTEs see earlier ones; WITH RECURSIVE iterates the
+    /// recursive arm until no new rows appear.
+    fn materialize_ctes(
+        &self,
+        with: &WithClause,
+        outer_ctes: &HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>,
+        ctx: &mut ExecContext<'_>,
+    ) -> Result<HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>> {
+        let mut map: HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)> = outer_ctes.clone();
+        for cte in &with.ctes {
+            let name_lc = cte.name.to_ascii_lowercase();
+            let (rows, cols) = if with.recursive {
+                self.materialize_recursive_cte(cte, &map, ctx)?
+            } else {
+                let res = self.exec_select_with_ctes(ctx, &cte.select, &map)?;
+                (res.rows, res.columns)
+            };
+            // Apply the explicit column list (WITH name(a, b) AS ...) — the
+            // rename happens at the CTE boundary.
+            let cols: Arc<[String]> = match &cte.columns {
+                Some(list) if list.len() == cols.len() => list
+                    .iter()
+                    .map(|c| format!("{}.{}", cte.name, c))
+                    .collect::<Vec<String>>()
+                    .into(),
+                Some(list) => {
+                    return Err(Error::semantic(format!(
+                        "CTE {} declares {} columns but its SELECT produces {}",
+                        cte.name,
+                        list.len(),
+                        cols.len()
+                    )));
+                }
+                None => {
+                    // Qualify with the CTE name so `cte.col` references
+                    // resolve; unqualified refs match by suffix.
+                    cols.iter()
+                        .map(|c| {
+                            let suffix = c.rsplit('.').next().unwrap_or(c);
+                            format!("{}.{}", cte.name, suffix)
+                        })
+                        .collect::<Vec<String>>()
+                        .into()
+                }
+            };
+            map.insert(name_lc, (Arc::new(rows), cols));
+        }
+        Ok(map)
+    }
+
+    /// WITH RECURSIVE: the CTE body is `base UNION [ALL] recursive`. The
+    /// base arm executes once; the recursive arm (which references the CTE
+    /// by name) executes repeatedly, each time seeing ALL rows accumulated
+    /// so far, until it produces no new rows. UNION dedups against the
+    /// accumulated set; UNION ALL appends everything. A hard iteration cap
+    /// guards against non-terminating recursions (SQLite errors too).
+    fn materialize_recursive_cte(
+        &self,
+        cte: &Cte,
+        outer_ctes: &HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>,
+        ctx: &mut ExecContext<'_>,
+    ) -> Result<(Vec<Row>, Arc<[String]>)> {
+        let name_lc = cte.name.to_ascii_lowercase();
+        // Split the compound body: the LAST UNION [ALL] arm is the
+        // recursive one; everything before it is the base. (SQLite's rule:
+        // exactly one recursive reference, in the arm after the UNION.)
+        let (base, recursive_op, recursive_arm) = split_compound_cte(&cte.select)?;
+        // Base: execute with the CTE visible but EMPTY (a recursive
+        // reference in the base arm is an error in SQLite; empty keeps it
+        // simple and correct for well-formed queries).
+        let mut scope = outer_ctes.clone();
+        scope.insert(
+            name_lc.clone(),
+            (Arc::new(Vec::new()), Arc::from(vec![format!("{}.", cte.name)])),
+        );
+        let base_res = self.exec_select_with_ctes(ctx, &base, &scope)?;
+        let mut rows: Vec<Row> = base_res.rows;
+        let base_cols: Arc<[String]> = base_res.columns;
+        // Canonical output columns for the CTE.
+        let out_cols: Arc<[String]> = match &cte.columns {
+            Some(list) if list.len() == base_cols.len() => list
+                .iter()
+                .map(|c| format!("{}.{}", cte.name, c))
+                .collect::<Vec<String>>()
+                .into(),
+            Some(list) => {
+                return Err(Error::semantic(format!(
+                    "CTE {} declares {} columns but its SELECT produces {}",
+                    cte.name,
+                    list.len(),
+                    base_cols.len()
+                )));
+            }
+            None => base_cols
+                .iter()
+                .map(|c| {
+                    let suffix = c.rsplit('.').next().unwrap_or(c);
+                    format!("{}.{}", cte.name, suffix)
+                })
+                .collect::<Vec<String>>()
+                .into(),
+        };
+        // Dedup set for UNION semantics.
+        let mut seen: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|r| format!("{:?}", r))
+            .collect();
+        // Iterate the recursive arm with QUEUE semantics (SQLite's model):
+        // each iteration's arm sees ONLY the rows produced by the PREVIOUS
+        // iteration (the frontier), not the full accumulation — otherwise
+        // UNION ALL recursions never terminate (every iteration re-derives
+        // rows that are "new" again as duplicates).
+        let mut frontier: Vec<Row> = rows.clone();
+        const MAX_ITERS: usize = 1_000_000;
+        for _ in 0..MAX_ITERS {
+            if rows.len() > 10_000_000 {
+                return Err(Error::semantic(format!(
+                    "recursive CTE {} exceeded 10,000,000 rows",
+                    cte.name
+                )));
+            }
+            if frontier.is_empty() {
+                break;
+            }
+            let mut scope = outer_ctes.clone();
+            scope.insert(name_lc.clone(), (Arc::new(frontier), out_cols.clone()));
+            let new_res = self.exec_select_with_ctes(ctx, &recursive_arm, &scope)?;
+            let mut next_frontier: Vec<Row> = Vec::with_capacity(new_res.rows.len());
+            for r in new_res.rows {
+                if recursive_op == crate::sql::ast::SetOp::Union {
+                    let key = format!("{:?}", r);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key);
+                }
+                next_frontier.push(r.clone());
+                rows.push(r);
+            }
+            frontier = next_frontier;
+        }
+        Ok((rows, out_cols))
     }
 
     fn plan_for_statement(catalog: &Catalog, stmt: &Statement) -> Result<Option<crate::planner::plan::Plan>> {
