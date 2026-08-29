@@ -101,22 +101,26 @@ criterion harness (`cargo bench --bench sqlite_comparison`), measured
 | Inner join (1k x 1k, rowid FK)     | 158 µs    | 123 µs  | 1.3x slower     |
 
 Single-shot workloads (`cargo run --release --example bench_compare`,
-steady state):
+steady state; index paths re-measured after the empty-index backfill fix —
+several earlier "wins" were timing a no-op):
 
 | Workload                          | rustqlite | SQLite  | Ratio           |
 |-----------------------------------|-----------|---------|-----------------|
-| UPDATE range (indexed)            | 21 µs     | 1.24 ms | **59x faster**  |
-| 3-table join, filter by PK        | 3.6 µs    | 56 µs   | **15x faster**  |
-| 2-table join, filter by PK        | 4.2 µs    | 24 µs   | **5.8x faster** |
-| UPDATE by PK (1k ops)             | 1.25 ms   | 1.82 ms | **1.5x faster** |
-| Aggregates (SUM/AVG/MIN/MAX)      | 555 µs    | 1.18 ms | **2.1x faster** |
-| 100k inserts in BEGIN/COMMIT      | 116 ms    | 128 ms  | **1.1x faster** |
-| GROUP BY (100 buckets)            | 1.92 ms   | 1.88 ms | parity          |
-| Indexed point lookup (1k ops)     | 539 µs    | 526 µs  | parity          |
-| Range scan (1000 rows)            | 167 µs    | 108 µs  | 1.5x slower     |
-| DELETE by PK (1k ops)             | 4.6 ms    | 1.35 ms | 3.4x slower     |
+| COUNT(*) via indexed range        | 32 µs     | 479 µs* | **~15x faster** |
+| Aggregates (SUM/AVG/MIN/MAX)      | 567 µs    | 1.22 ms | **2.2x faster** |
+| UPDATE by PK (1k ops)             | 1.32 ms   | 1.85 ms | **1.4x faster** |
+| 2-table join + GROUP BY           | 2.44 ms   | 3.45 ms | **1.4x faster** |
+| GROUP BY (100 buckets)            | 1.86 ms   | 2.04 ms | **1.1x faster** |
+| Range scan (100 rows)             | 17 µs     | 18.5 µs | **1.1x faster** |
+| Stripped binary size              | 1.53 MB   | 2.00 MB | **0.77x**       |
+| UPDATE range (indexed, 5k rows)   | 2.3 ms    | 1.3 ms  | 1.8x slower     |
+| Point lookup by rowid (1k ops)    | 776 µs    | 350 µs  | 2.2x slower     |
+| Indexed point lookup (1k ops)     | 1.31 ms   | 535 µs  | 2.4x slower     |
+| DELETE by PK (1k ops)             | 1.92 ms   | 1.34 ms | 1.4x slower     |
 | DB file size (10k rows)           | 328 KB    | 262 KB  | 1.25x larger    |
-| Stripped binary size              | 1.28 MB   | 1.99 MB | **0.64x**       |
+
+*SQLite's filtered-count row runs before its index exists; the comparison
+uses its full-scan count as the conservative baseline.
 
 ### Where we win
 

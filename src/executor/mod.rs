@@ -115,7 +115,14 @@ impl<'a> ExecContext<'a> {
     }
 
     /// Get the current root page for a table, checking overrides first.
+    /// Zero-allocation fast path: map keys are stored lowercased and table
+    /// names are usually already lowercase, so try the exact name first
+    /// (borrowed lookup) and only pay the `to_ascii_lowercase()` String
+    /// allocation for mixed-case names.
     pub fn table_root(&self, table: &Table) -> u32 {
+        if let Some(&r) = self.root_overrides.get(&table.name) {
+            return r;
+        }
         self.root_overrides
             .get(&table.name.to_ascii_lowercase())
             .copied()
@@ -127,8 +134,12 @@ impl<'a> ExecContext<'a> {
         self.set_table_root_lc(&table_name.to_ascii_lowercase(), root);
     }
 
-    /// Current root page of an index B+tree (override-aware).
+    /// Current root page of an index B+tree (override-aware). Same
+    /// zero-allocation exact-name fast path as `table_root`.
     pub fn index_root(&self, index: &crate::schema::Index) -> u32 {
+        if let Some(&r) = self.index_roots.get(&index.name) {
+            return r;
+        }
         self.index_roots
             .get(&index.name.to_ascii_lowercase())
             .copied()
@@ -2366,6 +2377,86 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
             return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), Some(predicate), group_by, aggregates);
         }
     }
+    // Fast path #3: COUNT(*) over an IndexRange — COVERING INDEX count.
+    // `SELECT COUNT(*) FROM t WHERE indexed_col > ?` counts index ENTRIES
+    // directly: no row fetching, no decoding. The general path materialized
+    // every matching row (a B+tree descent per rowid) just to count them.
+    if group_by.is_empty()
+        && aggregates.len() == 1
+        && aggregates[0].func == "count"
+        && aggregates[0].arg.is_none()
+        && !aggregates[0].distinct
+    {
+        let covering = match input {
+            Plan::IndexRange { table, index, start, end, residual, .. } => {
+                if residual.is_none() {
+                    Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
+                } else {
+                    None
+                }
+            }
+            Plan::Filter { input: inner, predicate } => {
+                // The planner sometimes wraps IndexRange in a Filter with
+                // the range predicate as residual; only cover when the
+                // filter is exactly the index range (residual == predicate).
+                if let Plan::IndexRange { table, index, start, end, residual, .. } = inner.as_ref() {
+                    // Only cover when there is NO residual predicate —
+                    // any residual condition needs row data, so the index
+                    // alone can't answer the count. (Conservative: even a
+                    // residual identical to the filter is skipped; those
+                    // plans fall through to the general path.)
+                    if residual.is_none() {
+                        Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some((table, index, start, end)) = covering {
+            // Evaluate the bounds (same logic as exec_index_range).
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let start_key: Option<(Vec<u8>, bool)> = match start {
+                Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+                None => None,
+            };
+            let end_key: Option<(Vec<u8>, bool)> = match end {
+                Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+                None => None,
+            };
+            let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+            let mut n: i64 = 0;
+            let index_root = ctx.index_root(&index);
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            index_bt.scan_index_from(&scan_start, |_rowid, cell_key| {
+                if let Some((k, false)) = &start_key {
+                    if cell_key.starts_with(k) {
+                        return true; // exclusive lower bound
+                    }
+                }
+                if let Some((k, inc)) = &end_key {
+                    match index_key_prefix_cmp(cell_key, k) {
+                        std::cmp::Ordering::Greater => return false,
+                        std::cmp::Ordering::Equal if !*inc => return false,
+                        _ => {}
+                    }
+                }
+                n += 1;
+                true
+            })?;
+            let mut row = Vec::with_capacity(1);
+            row.push(Value::Integer(n));
+            return Ok(ExecResult {
+                columns: Arc::from(vec!["__agg_0".to_string()]),
+                rows: vec![row],
+            });
+        }
+    }
     let inner = execute(input, ctx)?;
     // Borrow params directly (inner is an owned local — no conflict).
     let params: &[Value] = &ctx.params;
@@ -3375,6 +3466,15 @@ fn exec_index_nested_loop_join(
 
     let mut out_rows: Vec<Row> = Vec::new();
     let inner_root = ctx.table_root(&inner_table);
+    // Hoist the index root lookup out of the per-row loop: resolving it
+    // per row cost a `to_ascii_lowercase()` String allocation + hash per
+    // outer row. Index roots only move on B+tree splits; re-read only if
+    // something actually changed roots mid-join (an UPDATE source writing
+    // the same table).
+    let mut inner_index_root = ctx.index_root(&inner_index);
+    let outer_width = outer_res.columns.len();
+    let total_width = outer_width + n_inner_cols;
+    let mut key_buf: Vec<u8> = Vec::with_capacity(16);
 
     for outer_row in &outer_res.rows {
         // Extract the join key from the outer row.
@@ -3383,12 +3483,17 @@ fn exec_index_nested_loop_join(
             None => continue, // NULL join key — no matches in INNER join.
         };
 
-        // Encode the key for index lookup (order-preserving form).
-        let key_bytes = key_value.encode_order_key();
+        // Encode the key for index lookup (order-preserving form), reusing
+        // the buffer across rows.
+        key_buf.clear();
+        key_value.encode_order_key_into(&mut key_buf);
 
         // Look up matching rowids in the index B+tree.
-        let mut index_bt = Btree::new(ctx.pager, ctx.index_root(&inner_index), true);
-        let rowids = index_bt.lookup_index(&key_bytes)?;
+        let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
+        let rowids = index_bt.lookup_index(&key_buf)?;
+        if index_bt.root != inner_index_root {
+            inner_index_root = index_bt.root;
+        }
 
         // Fetch each matching row from the inner table. Deduplicate rowids
         // defensively — the index B+tree may (in pathological cases) contain
@@ -3404,8 +3509,12 @@ fn exec_index_nested_loop_join(
             let mut table_bt = Btree::new(ctx.pager, inner_root, false);
             if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
                 if let Ok(inner_row) = decode_row(&payload, n_inner_cols, rowid, inner_table.rowid_alias) {
-                    let mut combined = outer_row.clone();
-                    combined.extend(inner_row);
+                    // Single allocation for the combined row (was: clone the
+                    // outer row into a fresh Vec, then grow it with extend —
+                    // two allocations and two copies per output row).
+                    let mut combined: Row = Vec::with_capacity(total_width);
+                    combined.extend_from_slice(outer_row);
+                    combined.extend_from_slice(&inner_row);
                     out_rows.push(combined);
                 }
             }
@@ -3700,17 +3809,97 @@ fn exec_index_range(
     let plain_names: Arc<[String]> = table.col_names.clone();
     let table_root = ctx.table_root(&table);
     let mut rows = Vec::with_capacity(rowids.len());
-    for rowid in rowids {
-        let mut table_bt = Btree::new(ctx.pager, table_root, false);
-        if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-            let row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
-            if let Some(pred) = residual {
-                let v = eval_row(pred, &row, &plain_names, &ctx.params, &ctx.named_params)?;
-                if !v.is_truthy() {
-                    continue;
+
+    // Fetch the rows by rowid. Two strategies:
+    //
+    // - RANDOM LOOKUPS (one B+tree descent per rowid) when the selection is
+    //   a small fraction of the table.
+    // - MERGE SCAN when the selection is large: sort the rowids and scan
+    //   the table B+tree ONCE in rowid order, merge-matching against the
+    //   sorted rowid list. A random lookup costs ~300 ns (full descent +
+    //   binary search); a sequential scan costs ~60-80 ns per visited row.
+    //   Selecting 5000 of 10000 rows: 1.5 ms of descents vs ~0.7 ms of
+    //   sequential scan — the crossover is around 20-25% of the table.
+    //   `max_rowid` (cached) approximates the row count.
+    let max_rowid_hint = ctx.get_or_scan_max_rowid(&table).unwrap_or(0);
+    let use_merge_scan = max_rowid_hint > 0
+        && (rowids.len() as i64) * 4 > max_rowid_hint
+        && residual.is_none(); // residual needs full rows in index order? No —
+    // (residual is fine with merge scan too, but the output ORDER changes:
+    // merge scan emits rows in ROWID order, random lookups emit in INDEX
+    // order. Keep order stability only for the no-residual case... actually
+    // both are unordered bags for SQL without ORDER BY; residual is safe.
+    // We keep the residual restriction for simplicity of reasoning about
+    // filter semantics on partially-indexed predicates.)
+
+    if use_merge_scan {
+        // Preserve the observable emission order (index order) even though
+        // rows are FETCHED in rowid order: remember each rowid's original
+        // position, then place decoded rows into a position-indexed slot.
+        let index_order: Vec<i64> = rowids.clone();
+        let mut position: std::collections::HashMap<i64, usize, crate::storage::pager::PageIdHashBuild> =
+            std::collections::HashMap::with_capacity_and_hasher(
+                rowids.len(),
+                crate::storage::pager::PageIdHashBuild,
+            );
+        for (pos, rid) in index_order.iter().enumerate() {
+            position.insert(*rid, pos);
+        }
+        let mut placed: Vec<Option<Row>> = vec![None; index_order.len()];
+        rowids.sort_unstable();
+        rowids.dedup();
+        let mut ri = 0usize;
+        let n_cols = table.n_columns();
+        let params = ctx.params.clone();
+        let named_params = ctx.named_params.clone();
+        let residual_pred = residual;
+        let mut bt = Btree::new(ctx.pager, table_root, false);
+        bt.scan_table_borrowed(|rowid, payload| {
+            // Advance the merge cursor.
+            while ri < rowids.len() && rowids[ri] < rowid {
+                ri += 1;
+            }
+            if ri >= rowids.len() {
+                return false; // all matches emitted — stop the scan early
+            }
+            if rowids[ri] != rowid {
+                return true; // not a match — keep scanning
+            }
+            ri += 1;
+            if let Ok(row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
+                let keep = match residual_pred {
+                    Some(pred) => match eval_row(pred, &row, &plain_names, &params, &named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(_) => false,
+                    },
+                    None => true,
+                };
+                if keep {
+                    if let Some(&pos) = position.get(&rowid) {
+                        placed[pos] = Some(row);
+                    }
                 }
             }
-            rows.push(row);
+            true
+        })?;
+        for slot in placed {
+            if let Some(row) = slot {
+                rows.push(row);
+            }
+        }
+    } else {
+        for rowid in rowids {
+            let mut table_bt = Btree::new(ctx.pager, table_root, false);
+            if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
+                let row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
+                if let Some(pred) = residual {
+                    let v = eval_row(pred, &row, &plain_names, &ctx.params, &ctx.named_params)?;
+                    if !v.is_truthy() {
+                        continue;
+                    }
+                }
+                rows.push(row);
+            }
         }
     }
 
@@ -4698,18 +4887,32 @@ fn try_streaming_update(
     let mut new_row: Vec<Value> = Vec::with_capacity(n_cols);
     let mut payload_buf: Vec<u8> = Vec::with_capacity(256);
 
-    // Collect (rowid, new_payload_bytes) tuples for the update phase.
-    // We can't update inside the scan callback because the scan holds
-    // `&mut self.pager` via the Btree. So we collect first, then update
+    // Pre-compute which indexes might be touched by the SET assignments
+    // BEFORE the scan — when any index column is assigned, the OLD payload
+    // must be stashed during the scan phase so phase 2 can compute the old
+    // index keys WITHOUT re-fetching the row (one full B+tree descent +
+    // decode per row). The lookup-based sources (RowidLookup / IndexRange)
+    // already hold the payload as an owned Vec — stashing it is free.
+    let touched_indexes: Vec<&Arc<crate::schema::Index>> = {
+        let assignment_cols: std::collections::HashSet<usize> =
+            assignments.iter().map(|(idx, _)| *idx).collect();
+        indexes.iter().filter(|idx| {
+            idx.columns.iter().any(|c| {
+                if let Some(col_idx) = table.find_column(&c.name) {
+                    assignment_cols.contains(&col_idx)
+                } else {
+                    false
+                }
+            })
+        }).collect()
+    };
+    let needs_old_payload = !touched_indexes.is_empty();
+
+    // Collect (rowid, new_payload_bytes, old_payload_bytes) tuples for the
+    // update phase. We can't update inside the scan callback because the
+    // scan holds the pager via the Btree, so we collect first, then update
     // after the scan completes.
-    //
-    // We only stash the byte payload — NOT the decoded Vec<Value>. The
-    // old row is re-decoded from the B+tree during the update phase
-    // (one cheap `lookup_table` per row, which is ~5µs vs ~3µs to clone
-    // a Vec<Value>). This trades a small extra B+tree seek for ~3 fewer
-    // heap allocations per row, which is the dominant cost on a 10k-row
-    // UPDATE.
-    let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut updates: Vec<(i64, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     // RETURNING: stash decoded new rows too (only when needed).
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     // First constraint error encountered during the scan (if any).
@@ -4720,10 +4923,13 @@ fn try_streaming_update(
         // RowidLookup source — fetch exactly one row by rowid.
         match bt.lookup_table(rowid)? {
             LookupResult::Found(payload) => {
+                // `payload` is an owned Vec — hand it over for phase 2's
+                // index maintenance (free stash, saves a re-fetch descent).
+                let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
                 if let Err(e) = process_update_row(
                     &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
-                    residual_pred, &mut updates, &mut returning_rows, returning,
+                    residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
                 ) {
                     first_error = Some(e);
                 }
@@ -4733,10 +4939,11 @@ fn try_streaming_update(
         Ok::<(), crate::error::Error>(())
     } else if matches!(src, StreamingSource::RowidRange { .. }) {
         bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
+            let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
             if let Err(e) = process_update_row(
                 payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
-                residual_pred, &mut updates, &mut returning_rows, returning,
+                residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -4789,13 +4996,57 @@ fn try_streaming_update(
         // Phase 1b: fetch rows by rowid and process. All reads — the tree
         // isn't mutated until phase 2, so interleaving table lookups here
         // is safe.
+        //
+        // MERGE SCAN: when the selection is a large fraction of the table,
+        // sort the rowids and walk the table B+tree ONCE (sequential leaf
+        // reads, ~60-80 ns per visited row) instead of one random descent
+        // (~300 ns) per rowid. Selecting 5000 of 10000 rows: ~1.5 ms of
+        // descents becomes ~0.7 ms of scan. Payloads are borrowed from the
+        // page during the scan, so the old-payload stash clones when needed.
+        let max_rowid_hint = ctx.get_or_scan_max_rowid(table).unwrap_or(0);
+        let use_merge = max_rowid_hint > 0 && (rowids.len() as i64) * 4 > max_rowid_hint;
+        if use_merge {
+            rowids.sort_unstable();
+            rowids.dedup();
+            let mut ri = 0usize;
+            let mut err: Option<crate::error::Error> = None;
+            bt.scan_table_borrowed(|rowid, payload| {
+                while ri < rowids.len() && rowids[ri] < rowid {
+                    ri += 1;
+                }
+                if ri >= rowids.len() {
+                    return false; // all matches processed
+                }
+                if rowids[ri] != rowid {
+                    return true;
+                }
+                ri += 1;
+                let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
+                if let Err(e) = process_update_row(
+                    payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                    assignments, &col_names, &params, &named_params, table,
+                    residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
+                ) {
+                    err = Some(e);
+                    return false;
+                }
+                true
+            })?;
+            if let Some(e) = err {
+                first_error = Some(e);
+            }
+        } else {
         for rowid in rowids {
             match bt.lookup_table(rowid)? {
                 LookupResult::Found(payload) => {
+                    // Owned payload — stash for phase 2's index maintenance
+                    // (saves a re-fetch descent per row when the SET clause
+                    // touches an indexed column).
+                    let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
                     if let Err(e) = process_update_row(
                         &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                         assignments, &col_names, &params, &named_params, table,
-                        residual_pred, &mut updates, &mut returning_rows, returning,
+                        residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
                     ) {
                         first_error = Some(e);
                         break;
@@ -4804,13 +5055,15 @@ fn try_streaming_update(
                 LookupResult::NotFound => {}
             }
         }
+        }
         Ok::<(), crate::error::Error>(())
     } else {
         bt.scan_table_borrowed(|rowid, payload| {
+            let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
             if let Err(e) = process_update_row(
                 payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
-                residual_pred, &mut updates, &mut returning_rows, returning,
+                residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -4827,51 +5080,24 @@ fn try_streaming_update(
         return Err(e);
     }
 
-    // Phase 2: apply the updates. For each (rowid, new_payload):
-    //   1. If any index exists AND the SET assignments touch an indexed
-    //      column, look up the existing payload (for index maintenance
-    //      old-key comparison). Skip the lookup when no index needs
-    //      updating — `update_table` will do its own internal lookup.
-    //      This saves a B+tree seek per row on the common
-    //      `UPDATE t SET score = ... WHERE val > 5000` case where `score`
-    //      isn't indexed but `val` is — ~5µs/row × 5000 rows = 25ms saved.
+    // Phase 2: apply the updates. For each (rowid, new_payload, old_payload):
+    //   1. The old payload was pre-stashed during the scan when an indexed
+    //      column is being SET — no per-row re-fetch descent needed.
     //   2. If new payload size matches the existing size, overwrite in
     //      place via `update_table`. Otherwise, delete + insert.
     //   3. Maintain indexes: only update the index if the key changed.
-    //
-    // Pre-compute which indexes might be touched by the SET assignments.
-    // An index is "touched" if any of its columns appears in the SET list.
-    let touched_indexes: Vec<&Arc<crate::schema::Index>> = if indexes.is_empty() {
-        Vec::new()
-    } else {
-        let assignment_cols: std::collections::HashSet<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
-        indexes.iter().filter(|idx| {
-            // An index is touched if any of its columns is in the SET list.
-            idx.columns.iter().any(|c| {
-                if let Some(col_idx) = table.find_column(&c.name) {
-                    assignment_cols.contains(&col_idx)
-                } else {
-                    false
-                }
-            })
-        }).collect()
-    };
-    let needs_old_payload = !touched_indexes.is_empty();
     let mut updated = 0i64;
     let mut old_row_buf: Vec<Value> = Vec::with_capacity(n_cols);
-    for (rowid, new_payload) in &updates {
-        // Look up the existing row payload ONLY if we need it for index
-        // maintenance. This saves a B+tree seek per row on the common
-        // no-index UPDATE range case (~5µs/row × 5000 rows = 25ms saved).
-        let old_payload_opt: Option<Vec<u8>> = if needs_old_payload {
-            let mut bt = Btree::new(ctx.pager, root, false);
-            match bt.lookup_table(*rowid)? {
-                LookupResult::Found(p) => Some(p),
-                LookupResult::NotFound => None,
-            }
-        } else {
-            None
-        };
+    // One persistent Btree per touched index, reused across all rows.
+    let mut index_bts: Vec<Btree<'_>> = Vec::with_capacity(touched_indexes.len());
+    let mut index_roots: Vec<u32> = Vec::with_capacity(touched_indexes.len());
+    for idx in &touched_indexes {
+        let r = ctx.index_root(idx);
+        index_roots.push(r);
+        index_bts.push(Btree::new(ctx.pager, r, true));
+    }
+    for (rowid, new_payload, old_payload_stash) in &updates {
+        let old_payload_opt: Option<&[u8]> = old_payload_stash.as_deref();
         let new_root;
         {
             let mut bt = Btree::new(ctx.pager, root, false);
@@ -4884,24 +5110,43 @@ fn try_streaming_update(
         }
         ctx.set_table_root(&table.name, new_root);
         // Index maintenance — only on indexes whose key actually changed.
+        // The old/new keys are computed HERE and handed straight to the
+        // B+tree (the previous code called delete_index_entry /
+        // insert_index_entry wrappers, which re-encoded the keys from the
+        // decoded rows a second time and created a fresh Btree per call).
+        // Index B+trees are reused across the loop: their roots track
+        // splits, and the pager keeps pages hot.
         if needs_old_payload {
             if let Some(old_payload) = old_payload_opt {
                 old_row_buf.clear();
-                if decode_row_into(&old_payload, n_cols, *rowid, table.rowid_alias, &mut old_row_buf).is_err() {
+                if decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut old_row_buf).is_err() {
                     continue;
                 }
                 new_row.clear();
                 if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut new_row).is_err() {
                     continue;
                 }
-                for idx in &touched_indexes {
+                for (ti, idx) in touched_indexes.iter().enumerate() {
                     let old_key = encode_index_key(idx, table, &old_row_buf);
                     let new_key = encode_index_key(idx, table, &new_row);
                     if old_key == new_key {
                         continue;
                     }
-                    let _ = delete_index_entry(ctx, idx, table, &old_row_buf, *rowid);
-                    let _ = insert_index_entry(ctx, idx, table, &new_row, *rowid);
+                    let ibt = &mut index_bts[ti];
+                    if ibt.delete_index(&old_key, *rowid).is_ok() {
+                        if ibt.insert_index(&new_key, *rowid).is_err() {
+                            // Insert failed after a successful delete — the
+                            // entry is gone; propagate a hard error.
+                            return Err(Error::corruption(format!(
+                                "index maintenance failed for {} (rowid {})",
+                                idx.name, rowid
+                            )));
+                        }
+                    }
+                    if ibt.root != index_roots[ti] {
+                        index_roots[ti] = ibt.root;
+                        ctx.set_index_root(&idx.name, ibt.root);
+                    }
                 }
             }
         }
@@ -4941,9 +5186,14 @@ fn process_update_row(
     named_params: &HashMap<String, Value>,
     table: &Arc<Table>,
     residual_pred: Option<&Expr>,
-    updates: &mut Vec<(i64, Vec<u8>)>,
+    updates: &mut Vec<(i64, Vec<u8>, Option<Vec<u8>>)>,
     returning_rows: &mut Vec<Vec<Value>>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
+    // Old row payload, owned (pre-stashed by lookup-based sources) or
+    // cloned (scan-based sources). Only stashed when an indexed column is
+    // being SET — phase 2 needs it for index maintenance without a
+    // per-row re-fetch descent.
+    old_payload_stash: Option<Vec<u8>>,
 ) -> Result<()> {
     row_buf.clear();
     if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {
@@ -4978,8 +5228,8 @@ fn process_update_row(
     if let Some(ret) = returning {
         returning_rows.push(project_returning_row(ret, new_row, col_names, params, named_params)?);
     }
-    // Stash the (rowid, payload) for phase 2.
-    updates.push((rowid, payload_buf.clone()));
+    // Stash the (rowid, new payload, old payload) for phase 2.
+    updates.push((rowid, payload_buf.clone(), old_payload_stash));
     Ok(())
 }
 

@@ -296,6 +296,109 @@ impl Cell {
     }
 }
 
+/// Allocation-free view of an index cell (leaf or interior).
+///
+/// Cell layouts:
+/// ```text
+/// LeafIndex:     [varint: rowid][varint: key_len][key bytes]
+/// InteriorIndex: [be_u32: left_child][varint: rowid][varint: key_len][key bytes]
+/// ```
+///
+/// `Cell::decode` heap-allocates the key `Vec<u8>` for every cell — and the
+/// interior-page navigation loops decoded EVERY cell of EVERY page on every
+/// descent (a 16 KB interior page holds ~150-200 cells, so a single 3-level
+/// index descent allocated ~450 key Vecs). This view borrows the key bytes
+/// straight from the page buffer: zero allocation, and it enables binary
+/// search (the navigation loops were linear scans).
+#[derive(Clone, Copy)]
+struct IndexCellView<'a> {
+    key: &'a [u8],
+    rowid: i64,
+    left_child: u32,
+}
+
+fn decode_index_cell(buf: &[u8], interior: bool) -> Option<IndexCellView<'_>> {
+    if interior {
+        if buf.len() < 4 {
+            return None;
+        }
+        let left_child = u32::from_be_bytes(buf[..4].try_into().unwrap());
+        let (rowid, n) = varint::decode_signed(&buf[4..])?;
+        let rest = &buf[4 + n..];
+        let (key_len, m) = varint::decode(rest)?;
+        let rest = &rest[m..];
+        let key_len = key_len as usize;
+        if rest.len() < key_len {
+            return None;
+        }
+        Some(IndexCellView { key: &rest[..key_len], rowid, left_child })
+    } else {
+        let (rowid, n) = varint::decode_signed(buf)?;
+        let rest = &buf[n..];
+        let (key_len, m) = varint::decode(rest)?;
+        let rest = &rest[m..];
+        let key_len = key_len as usize;
+        if rest.len() < key_len {
+            return None;
+        }
+        Some(IndexCellView { key: &rest[..key_len], rowid, left_child: 0 })
+    }
+}
+
+/// Read the separator key of a table-interior cell without allocating.
+/// Layout: [be_u32: left_child][varint: key].
+fn decode_table_interior_key(buf: &[u8]) -> Option<i64> {
+    if buf.len() < 4 {
+        return None;
+    }
+    varint::decode_signed(&buf[4..]).map(|(k, _)| k)
+}
+
+/// Read the left-child pointer of a table-interior cell.
+fn decode_table_interior_child(buf: &[u8]) -> Option<u32> {
+    if buf.len() < 4 {
+        return None;
+    }
+    Some(u32::from_be_bytes(buf[..4].try_into().unwrap()))
+}
+
+/// Binary-search an interior INDEX page for the first cell whose
+/// (key, rowid) separator is >= the target (key, rowid). Returns
+/// (cell_index, that cell's left_child, n_cells, right_most). When all
+/// separators are < target, returns (n, right_most, n, right_most).
+fn find_index_child(
+    data: &[u8],
+    n: u16,
+    cell_pointer: impl Fn(u16) -> u16,
+    right_most: u32,
+    key: &[u8],
+    rowid: i64,
+) -> (usize, u32) {
+    let mut lo: u16 = 0;
+    let mut hi: u16 = n;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let ptr = cell_pointer(mid) as usize;
+        let Some(v) = decode_index_cell(&data[ptr..], true) else { break };
+        // (v.key, v.rowid) < (key, rowid)  → go right
+        let ord = v.key.cmp(key).then(v.rowid.cmp(&rowid));
+        if ord == std::cmp::Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo >= n {
+        (n as usize, right_most)
+    } else {
+        let ptr = cell_pointer(lo) as usize;
+        match decode_index_cell(&data[ptr..], true) {
+            Some(v) => (lo as usize, v.left_child),
+            None => (n as usize, right_most),
+        }
+    }
+}
+
 /// Decode just the rowid from a leaf-table cell, without allocating the
 /// payload. Used by `lookup_table`'s binary search to avoid O(N) heap
 /// allocations per lookup.
@@ -760,26 +863,45 @@ impl<'a> Btree<'a> {
             // entries <= sep. Descent: take the FIRST cell whose separator is
             // >= the target; go to its left_child. If none, go to right_most.
             // Table pages compare by i64 key; index pages by (key, rowid).
+            //
+            // Binary search with allocation-free cell views. The previous
+            // code linearly decoded EVERY interior cell (for index pages
+            // that's a Vec allocation per cell — ~150-200 per page, per
+            // level, per descent).
             let is_idx = pt.is_index();
             let child_id = {
                 let borrowed = page.lock();
                 let n = borrowed.n_cells();
-                let mut next = borrowed.right_most_pointer();
-                for i in 0..n {
-                    let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    let target_le_sep = if is_idx {
-                        c.cmp_index_target(cell.index_key(), cell.key())
-                            != std::cmp::Ordering::Less
+                let right_most = borrowed.right_most_pointer();
+                let data = &borrowed.data;
+                let cp = |i: u16| borrowed.cell_pointer(i);
+                if is_idx {
+                    let (_, child) = find_index_child(
+                        data, n, cp, right_most, cell.index_key(), cell.key(),
+                    );
+                    child
+                } else {
+                    // Table interior: [be_u32 child][varint key].
+                    let mut lo: u16 = 0;
+                    let mut hi: u16 = n;
+                    let target_key = cell.key();
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let ptr = cp(mid) as usize;
+                        let sep = decode_table_interior_key(&data[ptr..]);
+                        match sep {
+                            Some(k) if k < target_key => lo = mid + 1,
+                            Some(_) => hi = mid,
+                            None => break,
+                        }
+                    }
+                    if lo >= n {
+                        right_most
                     } else {
-                        cell.key() <= c.key()
-                    };
-                    if target_le_sep {
-                        next = c.left_child();
-                        break;
+                        let ptr = cp(lo) as usize;
+                        decode_table_interior_child(&data[ptr..]).unwrap_or(right_most)
                     }
                 }
-                next
             };
             drop(page);
             match self.insert_into_page(child_id, cell)? {
@@ -2041,7 +2163,8 @@ impl<'a> Btree<'a> {
         match pt {
             PageType::LeafIndex => {
                 let n = page.lock().n_cells();
-                // Binary search for the first cell >= (key, rowid).
+                // Binary search for the first cell >= (key, rowid), using
+                // allocation-free cell views.
                 let pos = {
                     let borrowed = page.lock();
                     let mut lo = 0;
@@ -2049,8 +2172,10 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if c.cmp_index_target(key, rowid) == std::cmp::Ordering::Less {
+                        let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                            return Err(Error::corruption("truncated index leaf cell"));
+                        };
+                        if (v.key, v.rowid) < (key, rowid) {
                             lo = mid + 1;
                         } else {
                             hi = mid;
@@ -2064,8 +2189,10 @@ impl<'a> Btree<'a> {
                 let key_matches = {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    c.index_key() == key && c.key() == rowid
+                    match decode_index_cell(&borrowed.data[cell_ptr..], false) {
+                        Some(v) => v.key == key && v.rowid == rowid,
+                        None => false,
+                    }
                 };
                 if !key_matches {
                     return Ok(false);
@@ -2074,19 +2201,17 @@ impl<'a> Btree<'a> {
                 self.remove_cell_at(page_id, pos, n)
             }
             PageType::InteriorIndex => {
+                // Binary-search the first separator >= (key, rowid) and
+                // descend into its left child (right_most if none). The
+                // previous code linearly decoded every interior cell — a
+                // Vec allocation per cell per level.
                 let child_id = {
                     let borrowed = page.lock();
                     let n = borrowed.n_cells();
-                    let mut next = borrowed.right_most_pointer();
-                    for i in 0..n {
-                        let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if c.cmp_index_target(key, rowid) != std::cmp::Ordering::Less {
-                            next = c.left_child();
-                            break;
-                        }
-                    }
-                    next
+                    let data = &borrowed.data;
+                    let cp = |i: u16| borrowed.cell_pointer(i);
+                    let (_, child) = find_index_child(data, n, cp, borrowed.right_most_pointer(), key, rowid);
+                    child
                 };
                 drop(page);
                 let deleted = self.delete_index_from_page(child_id, key, rowid)?;
@@ -2191,17 +2316,19 @@ impl<'a> Btree<'a> {
                 let begin = if *started {
                     0
                 } else {
-                    // Binary search for the first cell >= (start_key, MIN).
+                    // Binary search for the first cell with key >= start_key
+                    // (allocation-free views; (key, MIN) ordering means a
+                    // cell is "less" iff its key is strictly less).
                     let borrowed = page.lock();
                     let mut lo = 0u16;
                     let mut hi = n;
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if c.cmp_index_target(start_key, i64::MIN)
-                            == std::cmp::Ordering::Less
-                        {
+                        let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                            return Err(Error::corruption("truncated index leaf cell in scan"));
+                        };
+                        if v.key < start_key {
                             lo = mid + 1;
                         } else {
                             hi = mid;
@@ -2210,13 +2337,18 @@ impl<'a> Btree<'a> {
                     lo
                 };
                 drop(page);
-                for i in begin..n {
+                // Iterate the leaf under ONE lock, borrowing key slices
+                // straight from the page buffer (Cell::decode allocated a
+                // key Vec per cell here).
+                {
                     let page = self.pager.get_page(page_id)?;
                     let borrowed = page.lock();
-                    let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    if let Cell::IndexLeaf { key, rowid } = c {
-                        if !f(rowid, &key) {
+                    for i in begin..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                            continue;
+                        };
+                        if !f(v.rowid, v.key) {
                             return Ok(false);
                         }
                     }
@@ -2236,10 +2368,11 @@ impl<'a> Btree<'a> {
                         while lo < hi {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                            let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                            if c.cmp_index_target(start_key, i64::MIN)
-                                == std::cmp::Ordering::Less
-                            {
+                            let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], true)
+                            else {
+                                break;
+                            };
+                            if v.key < start_key {
                                 lo = mid + 1;
                             } else {
                                 hi = mid;
@@ -2256,8 +2389,10 @@ impl<'a> Btree<'a> {
                     let page = self.pager.get_page(page_id)?;
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    let child = c.left_child();
+                    let child = match decode_index_cell(&borrowed.data[cell_ptr..], true) {
+                        Some(v) => v.left_child,
+                        None => break,
+                    };
                     drop(borrowed);
                     drop(page);
                     if !self.scan_index_range_subtree(child, start_key, f, started)? {
@@ -2292,30 +2427,30 @@ impl<'a> Btree<'a> {
         let pt = page.lock().page_type()?;
         match pt {
             PageType::LeafIndex => {
-                let n = page.lock().n_cells();
+                // Allocation-free iteration: borrow key slices from the page.
+                let borrowed = page.lock();
+                let n = borrowed.n_cells();
                 for i in 0..n {
-                    let cell_ptr = page.lock().cell_pointer(i) as usize;
-                    let borrowed = page.lock();
-                    let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    if let Cell::IndexLeaf { key, rowid } = cell {
-                        if !f(rowid, &key) {
-                            return Ok(());
-                        }
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                        continue;
+                    };
+                    if !f(v.rowid, v.key) {
+                        return Ok(());
                     }
                 }
                 Ok(())
             }
             PageType::InteriorIndex => {
-                let n = page.lock().n_cells();
-                let right = page.lock().right_most_pointer();
                 let cells: Vec<PageId> = {
                     let borrowed = page.lock();
+                    let n = borrowed.n_cells();
+                    let right = borrowed.right_most_pointer();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if let Cell::IndexInterior { left_child, .. } = c {
-                            v.push(left_child);
+                        if let Some(c) = decode_index_cell(&borrowed.data[cell_ptr..], true) {
+                            v.push(c.left_child);
                         }
                     }
                     v.push(right);

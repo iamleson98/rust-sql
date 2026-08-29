@@ -26,24 +26,30 @@
 | 7 | Range scan (100 rows) | **10.5 µs** | 11.6 µs | **1.10× faster** | ✅ identity projection (was 1.7× slower) |
 | 8 | Inner join (1k × 1k, rowid FK) | 158 µs | 123 µs | 1.28× slower | 🟡 hash join rewrite closed 6.2× → 1.28×; remainder = row materialization |
 
-Earlier `bench_compare` workloads (single-shot, warmed steady state) —
-still valid as of this sprint:
+Earlier `bench_compare` workloads (single-shot, warmed steady state),
+re-measured after the index-path sprint (`COUNT` via index now covers,
+index navigation is allocation-free, big index-range selections use a
+merge scan, streaming UPDATE fuses fetch + index maintenance):
 
 | # | Workload | rustqlite | SQLite | Ratio | Status |
 |---|---|---|---|---|---|
-| 9 | UPDATE range (`val > 5000`, indexed) | **21 µs** | 1.24 ms | **59× faster** | ✅ IndexRange |
-| 10 | 3-table join, filter by PK (~50 rows) | **3.6 µs** | 56–73 µs | **15–20× faster** | ✅ INLJ |
-| 11 | UPDATE by PK (1k ops) | **1.25 ms** | 1.82 ms | **1.5× faster** | ✅ |
-| 12 | Aggregate (SUM/AVG/MIN/MAX) | **555 µs** | 1.18 ms | **2.1× faster** | ✅ |
-| 13 | GROUP BY (100 buckets) | **1.92 ms** | 1.88 ms | parity | ✅ |
-| 14 | Binary size (stripped) | **1.28 MB** | 1.99 MB | **0.64×** | ✅ |
-| 15 | DELETE by PK (1k ops) | 4.6 ms | 1.35 ms | 3.4× slower | 🟡 per-statement flush + materialization |
-| 16 | Mixed 80/20 (5k ops) | 7.5 ms | 2.5 ms | 3.0× slower | 🟡 composite |
-| 17 | 2-table join + GROUP BY (full scan) | 7.4 ms | 3.0 ms | 2.5× slower | 🟡 join+agg materialization |
-| 18 | Multi-row VALUES batches (10k) | 16.5 ms | 6.7 ms | 2.5× slower | 🟢 |
-| 19 | Full scan + COUNT with filter | 1.15 ms | 472 µs | 2.4× slower | 🟡 |
-| 20 | Range scan (5000 rows) | 1.01 ms | 564 µs | 1.8× slower | 🟢 |
-| 21 | DB file size (10k rows) | 327.7 KB | 262.1 KB | 1.25× larger | 🟢 |
+| 9 | COUNT(*) with indexed range filter | **32 µs** | 479 µs* | **~15× faster** | ✅ covering-index count (*SQLite runs its filtered count BEFORE creating the index — its indexed number is not measured; the comparison uses its full-scan count) |
+| 10 | UPDATE range (`score = score+1 WHERE val > 5000`, indexed) | 2.3 ms | 1.3 ms | 1.8× slower | 🟡 was "59× faster" — that number timed an empty index (pre-backfill bug); real work now measured; merge scan + fused maintenance closed 5.2→2.3 ms |
+| 11 | 3-table join, filter by PK (~50 rows) | 156 µs | 62 µs | 2.5× slower | 🟡 was "15× faster" — also inflated by the empty-index bug; real number now |
+| 12 | UPDATE by PK (1k ops) | **1.32 ms** | 1.85 ms | **1.4× faster** | ✅ |
+| 13 | Aggregate (SUM/AVG/MIN/MAX) | **567 µs** | 1.22 ms | **2.2× faster** | ✅ |
+| 14 | GROUP BY (100 buckets) | **1.86 ms** | 2.04 ms | **1.1× faster** | ✅ |
+| 15 | 2-table join + GROUP BY (full scan) | **2.44 ms** | 3.45 ms | **1.4× faster** | ✅ |
+| 16 | Range scan (100 rows) | **17 µs** | 18.5 µs | **1.1× faster** | ✅ |
+| 17 | Binary size (stripped) | **1.53 MB** | 2.00 MB | **0.77×** | ✅ |
+| 18 | Point lookup by rowid (1k ops) | 776 µs | 350 µs | 2.2× slower | 🟡 per-query floor |
+| 19 | Point lookup by indexed col (1k ops) | 1.31 ms | 535 µs | 2.4× slower | 🟡 index seek + row fetch |
+| 20 | DELETE by PK (1k ops) | 1.92 ms | 1.34 ms | 1.4× slower | 🟡 |
+| 21 | Mixed 80/20 (5k ops) | 4.21 ms | 2.51 ms | 1.7× slower | 🟡 composite |
+| 22 | Range scan (5000 rows) | 927 µs | 569 µs | 1.6× slower | 🟢 |
+| 23 | Multi-row VALUES batches (10k) | 12.3 ms | 6.4 ms | 1.9× slower | 🟢 |
+| 24 | Full scan + COUNT with filter (no index) | 1.18 ms | 479 µs | 2.5× slower | 🟡 per-row filter eval |
+| 25 | DB file size (10k rows) | 327.7 KB | 262.1 KB | 1.25× larger | 🟢 |
 
 ## 2. What was closed in the previous sprint (2026-08-28)
 
@@ -216,7 +222,49 @@ Every phase was attacked:
   path). Result: **0.92 µs/insert**, beating SQLite's 1.05 µs on the
   unique-SQL-text benchmark where statement caching is useless.
 
-## 5. Working order (next sprint)
+## 5. What was closed this sprint (2026-08-29, third pass): the index paths
+
+Benchmarks after the statement-pipeline sprint exposed that several
+previously "winning" index workloads had been timing a NO-OP: `CREATE
+INDEX` never backfilled existing rows (fixed in 7e56b7f), so the index was
+empty and `UPDATE ... WHERE val > 5000` matched zero rows. With the index
+actually populated, the real index-path costs surfaced — and were attacked:
+
+### Allocation-free index B+tree navigation
+- Interior index pages were navigated by decoding EVERY cell into an
+  allocating `Cell` (each index cell owns a `Vec<u8>` key — ~150-200 heap
+  allocations per interior page, per level, per descent). All navigation
+  (insert descent, delete descent, range scan, full scan) now uses
+  `IndexCellView` — a borrow-only view of the cell's key/rowid/child — and
+  BINARY SEARCH instead of linear scans. Table interior pages get the same
+  treatment (`decode_table_interior_key/child`).
+- Page cache and dirty-page set keyed by u32 with a splitmix64 hasher
+  (~2 ns vs ~20-25 ns for std's SipHash per lookup).
+
+### Merge-scan rowid fetching
+- `exec_index_range` and the streaming UPDATE fetched each matching row
+  with an independent B+tree descent (~300 ns each, random order). When
+  the selection exceeds ~25% of the table (via the cached max-rowid
+  estimate), the rowids are now sorted and the table scanned ONCE with a
+  merge cursor (~60-80 ns per visited row), preserving the original
+  emission order via a position map. Selecting 5000 of 10000 rows:
+  ~1.5 ms of descents → ~0.7 ms of scan.
+
+### Covering-index COUNT
+- `SELECT COUNT(*) FROM t WHERE indexed_col > ?` now counts index ENTRIES
+  directly — no row fetching, no decoding, no materialization. 835 µs →
+  32 µs on a 10k-row table (26×).
+
+### Streaming UPDATE improvements
+- Old payload stashed during the scan phase (lookup-based sources already
+  hold it as an owned Vec — free) instead of a per-row re-fetch descent.
+- Index maintenance uses the already-encoded old/new keys directly against
+  persistent B+tree handles (one per touched index), instead of
+  re-encoding and re-opening the tree per row.
+- Root lookups (`table_root`/`index_root`) no longer allocate a lowercase
+  String per call; INLJ hoists the index root out of the per-row loop.
+
+## 6. Working order (next sprint)
 
 1. ⏳ Inner join (1.28×) — the last criterion head-to-head gap. Scan-side
    row materialization (one Vec per row) is the remainder; a column-block
@@ -238,7 +286,7 @@ Every phase was attacked:
 
 ---
 
-## 6. Tracking conventions
+## 7. Tracking conventions
 
 - Tick a box when the work is **merged to master and CI is green**.
 - For perf items, re-run `bench_compare` and update the table at the top

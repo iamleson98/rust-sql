@@ -108,6 +108,52 @@ impl PagerSnapshot {
 /// public methods take `&self`. This is the key enabler for the multi-threaded
 /// concurrent server: N reader threads can call `pager.get_page(id)`
 /// simultaneously without serializing on a write lock for cache hits.
+/// Fast hasher for u32 page-id keys (splitmix64 finalizer).
+///
+/// The page cache is looked up on EVERY B+tree level of EVERY operation —
+/// a descent through a 3-level tree hashes the same page-id class 3+ times.
+/// std's default SipHash-1-3 costs ~20-25 ns per u32; this is ~2 ns with
+/// full avalanche (splitmix64 finalizer), saving ~60-100 ns per lookup
+/// chain. The `write` fallback (never used for u32 keys, but required by
+/// the Hasher trait) is FNV-1a.
+#[derive(Default)]
+pub struct PageIdHasher(u64);
+
+impl std::hash::Hasher for PageIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        let mut z = (i as u64).wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        self.0 = z ^ (z >> 31);
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct PageIdHashBuild;
+
+impl std::hash::BuildHasher for PageIdHashBuild {
+    type Hasher = PageIdHasher;
+    #[inline]
+    fn build_hasher(&self) -> PageIdHasher {
+        PageIdHasher::default()
+    }
+}
+
+/// Page-id-keyed map types using the fast hasher.
+pub type PageCacheMap = std::collections::HashMap<PageId, PageRef, PageIdHashBuild>;
+pub type PageIdSet = std::collections::HashSet<PageId, PageIdHashBuild>;
+
 pub struct Pager {
     file: File,
     path: PathBuf,
@@ -121,7 +167,8 @@ pub struct Pager {
     freelist_count: AtomicU32,
     /// In-memory cache: page_id → page. RwLock so reads on distinct pages
     /// don't serialize; only cache-miss inserts take the write lock.
-    cache: RwLock<HashMap<PageId, PageRef>>,
+    /// Keyed by u32 with a splitmix64 hasher (see `PageIdHasher`).
+    cache: RwLock<PageCacheMap>,
     /// LRU ordering: most recently used at the back.
     lru: Mutex<VecDeque<PageId>>,
     /// Maximum number of pages to keep in the cache (immutable after open).
@@ -169,7 +216,7 @@ pub struct Pager {
     /// with a 10k-page cache but only 2 dirty pages per statement, this
     /// turns flush() from O(10k) page-lock-acquire-and-check into O(2)
     /// HashSet lookups — a 5000× speedup on the per-statement overhead.
-    dirty_pages: Mutex<std::collections::HashSet<PageId>>,
+    dirty_pages: Mutex<PageIdSet>,
 }
 
 impl Pager {
@@ -189,7 +236,7 @@ impl Pager {
             n_pages: AtomicU32::new(0),
             freelist_head: AtomicU32::new(0),
             freelist_count: AtomicU32::new(0),
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(PageCacheMap::default()),
             lru: Mutex::new(VecDeque::new()),
             cache_capacity,
             schema_cookie: AtomicU32::new(0),
@@ -197,7 +244,7 @@ impl Pager {
             skip_fsync: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
             dirty_count_approx: AtomicUsize::new(0),
-            dirty_pages: Mutex::new(std::collections::HashSet::new()),
+            dirty_pages: Mutex::new(PageIdSet::default()),
         };
 
         let file_size = pager.file.metadata()?.len();
@@ -656,7 +703,7 @@ impl Pager {
 
     /// Evict pages from the cache until we're under capacity.
     /// Caller must hold the cache write lock.
-    fn maybe_evict_locked(&self, cache: &mut HashMap<PageId, PageRef>) {
+    fn maybe_evict_locked(&self, cache: &mut PageCacheMap) {
         // Safety bound: if every cached page is dirty and unwritable (or
         // lazy_writeback is off), the loop below would otherwise spin
         // forever moving dirty pages to the back. `attempts` caps it.
