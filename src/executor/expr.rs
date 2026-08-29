@@ -446,8 +446,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             crate::executor::datetime::call_datetime_function(&fname, args)
         }
         "last_insert_rowid" => Value::Integer(0), // overridden by executor
-        "changes" => Value::Integer(0),
-        "total_changes" => Value::Integer(0),
+        "changes" => Value::Integer(crate::executor::change_counters::last()),
+        "total_changes" => Value::Integer(crate::executor::change_counters::total()),
         "sqlite_version" => Value::Text("3.0.0".to_string()),
         "quote" => {
             let v = args.first().cloned().unwrap_or(Value::Null);

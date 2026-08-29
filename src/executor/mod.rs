@@ -366,6 +366,32 @@ impl ExecResult {
 }
 
 /// Execute a plan and return all rows.
+/// Per-thread change counters backing the `changes()` / `total_changes()`
+/// SQL functions (SQLite semantics: changes() = rows modified by the most
+/// recent INSERT/UPDATE/DELETE on this connection; total_changes() = the
+/// running sum). Thread-local because a Database handle is used from one
+/// thread at a time (writers hold `&mut self`; readers never modify).
+pub mod change_counters {
+    use std::cell::Cell;
+    thread_local! {
+        static LAST: Cell<i64> = const { Cell::new(0) };
+        static TOTAL: Cell<i64> = const { Cell::new(0) };
+    }
+    /// Record a completed statement's change count.
+    pub fn record(changes: i64) {
+        LAST.with(|c| c.set(changes));
+        TOTAL.with(|t| t.set(t.get() + changes));
+    }
+    /// Rows modified by the most recent statement.
+    pub fn last() -> i64 {
+        LAST.with(|c| c.get())
+    }
+    /// Running total across all statements.
+    pub fn total() -> i64 {
+        TOTAL.with(|t| t.get())
+    }
+}
+
 pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     match plan {
         Plan::Scan { table, alias, .. } => exec_scan(ctx, table.clone(), alias.clone()),
@@ -5551,7 +5577,9 @@ fn try_streaming_update(
     //   1. The old payload was pre-stashed during the scan when an indexed
     //      column is being SET — no per-row re-fetch descent needed.
     //   2. If new payload size matches the existing size, overwrite in
-    //      place via `update_table`. Otherwise, delete + insert.
+    //      place — BULK when updates are rowid-sorted: one tree traversal
+    //      patches every same-size payload with no per-row descent.
+    //      Size-changed / missing rows fall back to per-row delete+insert.
     //   3. Maintain indexes: only update the index if the key changed.
     let mut updated = 0i64;
     let mut old_row_buf: Vec<Value> = Vec::with_capacity(n_cols);
@@ -5563,7 +5591,37 @@ fn try_streaming_update(
         index_roots.push(r);
         index_bts.push(Btree::new(ctx.pager, r, true));
     }
-    for (rowid, new_payload, old_payload_stash) in &updates {
+    // Sort by rowid (merge-scan sources already are; IndexRange sources
+    // are in index order). Phase 2's per-row work is order-independent.
+    let mut order: Vec<usize> = (0..updates.len()).collect();
+    order.sort_unstable_by_key(|&i| updates[i].0);
+    let mut deferred: Vec<usize> = Vec::new();
+    let mut root = root;
+    // Bulk in-place pass ONLY when no indexed column is being SET —
+    // bulk-applied rows skip the per-row index maintenance, so any
+    // touched index forces the per-row path (defer everything).
+    if touched_indexes.is_empty() {
+        let sorted_updates: Vec<(i64, &[u8])> =
+            order.iter().map(|&i| (updates[i].0, updates[i].1.as_slice())).collect();
+        let mut bt = Btree::new(ctx.pager, root, false);
+        bt.update_table_bulk(&sorted_updates, &mut deferred)?;
+        if bt.root != root {
+            root = bt.root;
+            ctx.set_table_root(&table.name, root);
+        }
+    } else {
+        deferred = (0..updates.len()).collect();
+    }
+    // Everything the bulk pass did NOT defer is already applied.
+    let mut done_mask: Vec<bool> = vec![true; updates.len()];
+    for &di in &deferred {
+        done_mask[di] = false; // not applied yet
+    }
+    for &i in order.iter() {
+        if done_mask[i] {
+            continue;
+        }
+        let (rowid, new_payload, old_payload_stash) = &updates[i];
         let old_payload_opt: Option<&[u8]> = old_payload_stash.as_deref();
         let new_root;
         {
@@ -5619,6 +5677,12 @@ fn try_streaming_update(
         }
         ctx.changes += 1;
         updated += 1;
+    }
+    // Count the bulk-applied rows (they skipped the per-row loop).
+    {
+        let bulk_applied = updates.len().saturating_sub(deferred.len());
+        updated += bulk_applied as i64;
+        ctx.changes += bulk_applied as i64;
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;

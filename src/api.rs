@@ -574,6 +574,9 @@ impl Database {
         // detached maps in place, then attach back).
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        if let Ok(n) = result {
+            crate::executor::change_counters::record(n);
+        }
         // Merge overlays back regardless of success — a failed statement
         // may still have split a B+tree (page writes are not undone), so
         // dropping the root override would lose data. ROLLBACK is the only
@@ -874,6 +877,7 @@ impl Database {
         profile::span(t_exec, &profile::EXEC_NS);
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        crate::executor::change_counters::record(ctx.changes);
         // Merge local overlay entries into the DETACHED maps (in place —
         // the statement is the sole owner, so make_mut never clones) and
         // attach them back to the Database. Merge regardless of `result`:

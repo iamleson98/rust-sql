@@ -819,6 +819,185 @@ impl<'a> Btree<'a> {
     ///
     /// For benchmark impact: `UPDATE by PK` 1k ops drops from ~11 ms
     /// (delete+insert) to ~5 ms (in-place), putting us within 3× of SQLite.
+    /// Bulk in-place UPDATE for a SORTED list of (rowid, new_payload).
+    ///
+    /// One full tree traversal visits every leaf sequentially (no
+    /// root-to-leaf descent per row — the dominant cost of the old
+    /// per-row `update_table` loop on `UPDATE ... WHERE indexed_col > ?`,
+    /// which paid ~250 ns of descent per row). Within each leaf, updates
+    /// are matched in order (both sides sorted) with a merge-style
+    /// advance instead of a per-row binary search.
+    ///
+    /// Rows whose new payload size differs from the old one CANNOT be
+    /// patched in place (cell size is fixed); their INDICES in `updates`
+    /// are pushed to `deferred` and the caller falls back to the
+    /// delete+insert path for just those rows. Rowids not present in the
+    /// table are likewise deferred (the caller's fallback path reports
+    /// the miss consistently with update_table's `Ok(false)`).
+    pub fn update_table_bulk(
+        &mut self,
+        updates: &[(i64, &[u8])],
+        deferred: &mut Vec<usize>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.pager.note_write();
+        let mut ui = 0usize;
+        self.update_table_bulk_subtree(self.root, updates, &mut ui, deferred)?;
+        Ok(())
+    }
+
+    fn update_table_bulk_subtree(
+        &mut self,
+        page_id: PageId,
+        updates: &[(i64, &[u8])],
+        ui: &mut usize,
+        deferred: &mut Vec<usize>,
+    ) -> Result<()> {
+        if *ui >= updates.len() {
+            return Ok(());
+        }
+        let page = self.pager.get_page(page_id)?;
+        let mut borrowed = page.lock();
+        let pt = borrowed.page_type()?;
+        let mut wrote = false;
+        match pt {
+            PageType::LeafTable => {
+                let n = borrowed.n_cells() as usize;
+                let psz = borrowed.data.len();
+                // In-order merge: cells and updates are both sorted by rowid.
+                // START with a binary search for the first cell >= the next
+                // pending rowid — sparse updates (one row per leaf, e.g.
+                // UPDATE ... WHERE id = ?) would otherwise linear-scan from
+                // cell 0 (~130 cells/leaf).
+                let mut ci = {
+                    let target = updates[*ui].0;
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                            Some((cell_rowid, _)) => {
+                                if cell_rowid < target {
+                                    lo = mid + 1;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    lo
+                };
+                while *ui < updates.len() && ci < n {
+                    let cell_ptr = borrowed.cell_pointer(ci as u16) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption("cell pointer out of range in bulk update"));
+                    }
+                    let (cell_rowid, n_rid) = varint::decode_signed(&borrowed.data[cell_ptr..])
+                        .ok_or_else(|| Error::corruption("truncated rowid in bulk update"))?;
+                    let (rowid, new_payload) = updates[*ui];
+                    match cell_rowid.cmp(&rowid) {
+                        std::cmp::Ordering::Less => ci += 1,
+                        std::cmp::Ordering::Greater => {
+                            // This update's rowid isn't in the table — defer.
+                            deferred.push(*ui);
+                            *ui += 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let plen_pos = cell_ptr + n_rid;
+                            let (plen, n_plen) = varint::decode(&borrowed.data[plen_pos..])
+                                .ok_or_else(|| Error::corruption("truncated payload len in bulk update"))?;
+                            let payload_offset = plen_pos + n_plen;
+                            if plen as usize == new_payload.len()
+                                && payload_offset + new_payload.len() <= psz
+                            {
+                                borrowed.data[payload_offset..payload_offset + new_payload.len()]
+                                    .copy_from_slice(new_payload);
+                                borrowed.dirty = true;
+                                // The write happened while the guard is held;
+                                // note the dirty page AFTER dropping it.
+                                wrote = true;
+                            } else {
+                                // Size changed (or truncated) — defer to the
+                                // delete+insert fallback.
+                                deferred.push(*ui);
+                            }
+                            *ui += 1;
+                            ci += 1;
+                        }
+                    }
+                }
+                drop(borrowed);
+                if wrote {
+                    self.pager.note_dirty(page_id);
+                }
+                Ok(())
+            }
+            PageType::InteriorTable => {
+                let n = borrowed.n_cells() as usize;
+                // Binary-search the first child whose separator key is >=
+                // the next pending update's rowid — children entirely below
+                // the update range are skipped WITHOUT decoding their keys
+                // (collecting every separator was ~75 key decodes per
+                // statement at the root of a 10k-row table).
+                let data_len = borrowed.data.len();
+                let cell_key = |i: usize| -> Option<i64> {
+                    let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
+                    if cell_ptr + 4 > data_len {
+                        return None;
+                    }
+                    varint::decode_signed(&borrowed.data[cell_ptr + 4..]).map(|(k, _)| k)
+                };
+                let mut lo = 0usize;
+                let mut hi = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    match cell_key(mid) {
+                        Some(key) if key < updates[*ui].0 => lo = mid + 1,
+                        Some(_) => hi = mid,
+                        None => break,
+                    }
+                }
+                // Collect only the candidate children from `lo` onward
+                // (each recursion consumes updates in order and the loop
+                // exits as soon as the pending list is drained).
+                let mut children: Vec<PageId> = Vec::new();
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
+                    if cell_ptr + 4 > data_len {
+                        break;
+                    }
+                    let left = u32::from_be_bytes(
+                        borrowed.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                    );
+                    children.push(left);
+                    // For single-row updates, stop after the containing
+                    // child plus one (the next child can't be needed).
+                    if *ui + 1 >= updates.len() {
+                        break;
+                    }
+                }
+                let right = borrowed.right_most_pointer();
+                drop(borrowed);
+                drop(page);
+                for child in children {
+                    if *ui >= updates.len() {
+                        return Ok(());
+                    }
+                    self.update_table_bulk_subtree(child, updates, ui, deferred)?;
+                }
+                if right != 0 && *ui < updates.len() {
+                    self.update_table_bulk_subtree(right, updates, ui, deferred)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
         // Notify the pager that a write is about to happen (in-place UPDATE).
         self.pager.note_write();
