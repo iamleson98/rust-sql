@@ -1381,6 +1381,94 @@ impl<'a> Btree<'a> {
         self.delete_from_page(self.root, rowid)
     }
 
+    /// Delete a rowid from a TABLE B+tree and return the deleted cell's
+    /// payload. Used by the DELETE fast path: the executor needs the old
+    /// row bytes for index maintenance / RETURNING, and this avoids a
+    /// separate `lookup_table` descent. Returns `Ok(None)` when the rowid
+    /// doesn't exist.
+    pub fn delete_table_get_payload(&mut self, rowid: i64) -> Result<Option<Vec<u8>>> {
+        self.pager.note_write();
+        // Find the leaf and capture the payload before removing the cell.
+        let mut page_id = self.root;
+        loop {
+            let page = self.pager.get_page(page_id)?;
+            let pt = page.lock().page_type()?;
+            match pt {
+                PageType::LeafTable => {
+                    let payload = {
+                        let borrowed = page.lock();
+                        let n = borrowed.n_cells() as usize;
+                        let mut lo = 0usize;
+                        let mut hi = n;
+                        let mut found: Option<usize> = None;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2;
+                            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                            let (cell_rowid, _) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                                .ok_or_else(|| Error::corruption("truncated leaf rowid in delete"))?;
+                            match cell_rowid.cmp(&rowid) {
+                                std::cmp::Ordering::Equal => {
+                                    found = Some(cell_ptr);
+                                    break;
+                                }
+                                std::cmp::Ordering::Less => lo = mid + 1,
+                                std::cmp::Ordering::Greater => hi = mid,
+                            }
+                        }
+                        match found {
+                            None => None,
+                            Some(cell_ptr) => {
+                                // Decode the payload length + body.
+                                let plen_pos = {
+                                    let (_, n_rid) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                                        .ok_or_else(|| Error::corruption("truncated rowid"))?;
+                                    cell_ptr + n_rid
+                                };
+                                let (plen, n_plen) = varint::decode(&borrowed.data[plen_pos..])
+                                    .ok_or_else(|| Error::corruption("truncated payload length"))?;
+                                let start = plen_pos + n_plen;
+                                Some(borrowed.data[start..start + plen as usize].to_vec())
+                            }
+                        }
+                    };
+                    if payload.is_none() {
+                        return Ok(None);
+                    }
+                    drop(page);
+                    let deleted = self.delete_from_page(page_id, rowid)?;
+                    debug_assert!(deleted, "binary search found the cell but delete_from_page didn't");
+                    return Ok(payload);
+                }
+                PageType::InteriorTable => {
+                    let next = {
+                        let borrowed = page.lock();
+                        let n = borrowed.n_cells();
+                        let mut next = borrowed.right_most_pointer();
+                        for i in 0..n {
+                            let cell_ptr = borrowed.cell_pointer(i) as usize;
+                            let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                            if let Cell::TableInterior { left_child, key } = c {
+                                if rowid <= key {
+                                    next = left_child;
+                                    break;
+                                }
+                            }
+                        }
+                        next
+                    };
+                    drop(page);
+                    page_id = next;
+                }
+                _ => {
+                    return Err(Error::corruption(format!(
+                        "unexpected page type in delete: {:?}",
+                        pt
+                    )))
+                }
+            }
+        }
+    }
+
     fn delete_from_page(&mut self, page_id: PageId, rowid: i64) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;

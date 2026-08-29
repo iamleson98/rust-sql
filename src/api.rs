@@ -841,11 +841,91 @@ impl Database {
                     partial_expr: where_clause,
                     create_sql: original_sql.to_string(),
                 };
+                // ---- BACKFILL ----
+                // Populate the index from rows that already exist in the
+                // table. Previously CREATE INDEX registered an EMPTY B+tree
+                // and only new writes maintained it — every existing row was
+                // invisible to index scans (WHERE col = ? returned nothing;
+                // UPDATE ... WHERE indexed_col > ? silently matched zero
+                // rows). Rows are decoded once and each entry is inserted
+                // into the index B+tree with its rowid.
+                //
+                // For UNIQUE indexes, a duplicate key in existing data
+                // aborts the CREATE INDEX (SQLite semantics). For partial
+                // indexes, only rows matching the WHERE clause are indexed.
+                let final_root;
+                {
+                    let table_root = ctx.table_root(&table);
+                    let n_cols = table.n_columns();
+                    let alias = table.rowid_alias;
+                    let col_names: Vec<String> =
+                        table.columns.iter().map(|c| c.name.clone()).collect();
+                    let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
+                    let mut index_bt = crate::storage::btree::Btree::new(ctx.pager, root_page, true);
+                    let partial = index.partial_expr.clone();
+                    let is_unique = index.unique;
+                    let mut backfill_err: Option<crate::error::Error> = None;
+                    let mut table_bt = crate::storage::btree::Btree::new(ctx.pager, table_root, false);
+                    table_bt.scan_table_borrowed(|rowid, payload| {
+                        if crate::storage::row_codec::decode_row_into(
+                            payload, n_cols, rowid, alias, &mut row_buf,
+                        )
+                        .is_err()
+                        {
+                            return true; // skip corrupt rows
+                        }
+                        // Partial index: only rows matching the WHERE clause.
+                        if let Some(pred) = &partial {
+                            match crate::executor::eval_row_public(
+                                pred,
+                                &row_buf,
+                                &col_names,
+                                &ctx.params,
+                                &ctx.named_params,
+                            ) {
+                                Ok(v) if v.is_truthy() => {}
+                                _ => return true,
+                            }
+                        }
+                        let key = crate::executor::encode_index_key(&index, &table, &row_buf);
+                        if is_unique {
+                            match index_bt.lookup_index(&key) {
+                                Ok(existing) if !existing.is_empty() => {
+                                    backfill_err = Some(Error::semantic(format!(
+                                        "UNIQUE constraint failed: {}.{}",
+                                        table_name,
+                                        index.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                                    )));
+                                    return false; // stop the scan
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    backfill_err = Some(e);
+                                    return false;
+                                }
+                            }
+                        }
+                        if let Err(e) = index_bt.insert_index(&key, rowid) {
+                            backfill_err = Some(e);
+                            return false;
+                        }
+                        true
+                    })?;
+                    if let Some(e) = backfill_err {
+                        return Err(e);
+                    }
+                    // Splits during the backfill may have moved the root.
+                    final_root = index_bt.root;
+                }
+                let index = crate::schema::Index {
+                    root_page: final_root,
+                    ..index
+                };
                 let schema_row = crate::schema::encode_schema_row(
                     "index",
                     &index.name,
                     &index.table,
-                    root_page,
+                    final_root,
                     &index.create_sql,
                 );
                 insert_schema_row(ctx.pager, &schema_row)?;

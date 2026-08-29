@@ -226,6 +226,18 @@ fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], 
     evaluate(expr, &ctx)
 }
 
+/// Crate-public wrapper around `eval_row` — used by api.rs for index
+/// backfill (partial-index WHERE clause evaluation against existing rows).
+pub(crate) fn eval_row_public(
+    expr: &Expr,
+    row: &[Value],
+    col_names: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<Value> {
+    eval_row(expr, row, col_names, params, named_params)
+}
+
 /// Enforce NOT NULL and CHECK constraints on a (new or updated) row.
 /// Returns a semantic error naming the offending column / table.
 ///
@@ -3162,10 +3174,16 @@ fn exec_index_lookup(
     let mut index_bt = Btree::new(ctx.pager, index.root_page, true);
     let rowids = index_bt.lookup_index(&key_bytes)?;
 
-    // Fetch each row by rowid from the table B+tree.
+    // Fetch each row by rowid from the table B+tree. Use the
+    // override-aware root: the catalog's Arc<Table> holds the root from
+    // CREATE TABLE time, but splits may have moved the actual root
+    // (tracked in ctx.root_overrides). Using the stale root made rows
+    // beyond the first subtree invisible to indexed lookups after the
+    // table had grown.
+    let table_root = ctx.table_root(&table);
     let mut rows = Vec::with_capacity(rowids.len());
     for rowid in rowids {
-        let mut table_bt = Btree::new(ctx.pager, table.root_page, false);
+        let mut table_bt = Btree::new(ctx.pager, table_root, false);
         if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
             rows.push(decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?);
         }
@@ -3255,9 +3273,10 @@ fn exec_index_range(
             .into()
     };
     let plain_names: Arc<[String]> = table.col_names.clone();
+    let table_root = ctx.table_root(&table);
     let mut rows = Vec::with_capacity(rowids.len());
     for rowid in rowids {
-        let mut table_bt = Btree::new(ctx.pager, table.root_page, false);
+        let mut table_bt = Btree::new(ctx.pager, table_root, false);
         if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
             let row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
             if let Some(pred) = residual {
@@ -3870,7 +3889,7 @@ fn exec_upsert_row(
 /// Uses the ORDER-PRESERVING key encoding (see `Value::encode_order_key_into`)
 /// so that the index B+tree's byte order matches SQL value ordering —
 /// required for range scans and binary-search equality lookups.
-fn encode_index_key(index: &crate::schema::Index, table: &Table, row: &[Value]) -> Vec<u8> {
+pub(crate) fn encode_index_key(index: &crate::schema::Index, table: &Table, row: &[Value]) -> Vec<u8> {
     let mut key_bytes = Vec::new();
     for col in &index.columns {
         if let Some(pos) = table.find_column(&col.name) {
@@ -4353,8 +4372,77 @@ fn process_update_row(
 // ============================================================================
 
 fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
-    let source_res = execute(source, ctx)?;
     let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let table_name_lc = table.name.to_ascii_lowercase();
+
+    // ---- Fast path: DELETE ... WHERE id = ? (RowidLookup source) ----
+    //
+    // The generic path executes the source plan (which decodes every
+    // matched row into a Vec<Value> — including a String allocation per
+    // TEXT column) and then re-walks the B+tree to delete. When the source
+    // is a RowidLookup on the same table, evaluate the rowid expression
+    // directly and use `delete_table_get_payload`, which finds + deletes
+    // in ONE descent and returns the old payload bytes. The row is decoded
+    // ONLY when actually needed: RETURNING projections or index
+    // maintenance.
+    let col_names_fast: Option<Vec<String>> = if returning.is_some() {
+        Some(table.columns.iter().map(|c| c.name.clone()).collect())
+    } else {
+        None
+    };
+    if let Plan::RowidLookup { table: src_table, rowid, .. } = source {
+        if Arc::ptr_eq(src_table, &table) || src_table.name.eq_ignore_ascii_case(&table.name) {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let rowid_val = evaluate(rowid, &eval_ctx)?.as_integer();
+            let root = ctx.table_root(&table);
+            let (new_root, old_payload) = {
+                let mut bt = Btree::new(ctx.pager, root, false);
+                let payload = bt.delete_table_get_payload(rowid_val)?;
+                (bt.root, payload)
+            };
+            ctx.set_table_root_lc(&table_name_lc, new_root);
+            let mut deleted = 0i64;
+            let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+            if let Some(payload) = old_payload {
+                deleted = 1;
+                ctx.changes += 1;
+                if !indexes.is_empty() || returning.is_some() {
+                    // Decode the old row only for index keys / RETURNING.
+                    let row = decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias)?;
+                    if let (Some(ret), Some(names)) = (returning, col_names_fast.as_deref()) {
+                        returning_rows.push(project_returning_row(ret, &row, names, &ctx.params, &ctx.named_params)?);
+                    }
+                    for idx in &indexes {
+                        delete_index_entry(ctx.pager, idx, &table, &row, rowid_val)?;
+                    }
+                }
+                // Keep the cached max-rowid consistent (see below).
+                if let Some(&cached) = ctx.max_rowids.get(&table_name_lc) {
+                    if rowid_val >= cached {
+                        ctx.max_rowids.remove(&table_name_lc);
+                    }
+                }
+            }
+            if !ctx.in_transaction && !ctx.deferred_flush {
+                ctx.pager.flush()?;
+            }
+            if let Some(ret) = returning {
+                let names = col_names_fast.as_deref().unwrap_or(&[]);
+                return Ok(ExecResult {
+                    columns: returning_column_names(ret, names).into(),
+                    rows: returning_rows,
+                });
+            }
+            return Ok(ExecResult {
+                columns: Arc::from(vec!["deleted".to_string()]),
+                rows: vec![vec![Value::Integer(deleted)]],
+            });
+        }
+    }
+
+    let source_res = execute(source, ctx)?;
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let mut deleted = 0i64;
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
@@ -4379,7 +4467,7 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
             bt.delete_table(rowid)?;
             new_root = bt.root;
         }
-        ctx.set_table_root(&table.name, new_root);
+        ctx.set_table_root_lc(&table_name_lc, new_root);
         // Maintain indexes: delete the entry for this row.
         for idx in &indexes {
             delete_index_entry(ctx.pager, idx, &table, row, rowid)?;
@@ -4394,10 +4482,9 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
     // row is deleted). Without this, a DELETE-all followed by inserts
     // continued from the old max instead of restarting at 1.
     if max_deleted != i64::MIN {
-        let key = table.name.to_ascii_lowercase();
-        if let Some(&cached) = ctx.max_rowids.get(&key) {
+        if let Some(&cached) = ctx.max_rowids.get(&table_name_lc) {
             if max_deleted >= cached {
-                ctx.max_rowids.remove(&key);
+                ctx.max_rowids.remove(&table_name_lc);
             }
         }
     }

@@ -63,6 +63,18 @@ fn run_case(case: &Case) {
         if trimmed.is_empty() {
             continue;
         }
+        // Convention: a statement prefixed with '!' must FAIL on both
+        // engines (e.g. a UNIQUE violation during CREATE UNIQUE INDEX).
+        if let Some(expect_fail) = trimmed.strip_prefix('!') {
+            let r = sqlite.execute(expect_fail, []);
+            assert!(
+                r.is_err(),
+                "case {}: statement {:?} was expected to FAIL on SQLite but succeeded",
+                case.name,
+                expect_fail
+            );
+            continue;
+        }
         let upper = trimmed.to_ascii_uppercase();
         let is_select = upper.starts_with("SELECT") || upper.starts_with("WITH")
             || upper.starts_with("VALUES") || upper.starts_with("PRAGMA");
@@ -94,6 +106,16 @@ fn run_case(case: &Case) {
     for stmt_sql in case.sql {
         let trimmed = stmt_sql.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(expect_fail) = trimmed.strip_prefix('!') {
+            let r = rdb.execute(expect_fail, []);
+            assert!(
+                r.is_err(),
+                "case {}: statement {:?} was expected to FAIL on rustqlite but succeeded",
+                case.name,
+                expect_fail
+            );
             continue;
         }
         let upper = trimmed.to_ascii_uppercase();
@@ -614,6 +636,57 @@ static CASES: &[Case] = &[
         "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)",
         "CREATE UNIQUE INDEX idx_email ON t(email)",
         "INSERT INTO t (email) VALUES ('a@x.com'), ('b@x.com')",
+        "INSERT OR IGNORE INTO t (email) VALUES ('a@x.com')",
+        "SELECT COUNT(*) FROM t",
+    ),
+    case!(
+        "index_backfill_after_insert",
+        // CREATE INDEX on a table that ALREADY has rows must populate the
+        // index (regression: the index was left empty and every lookup
+        // returned 0 rows).
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)",
+        "INSERT INTO t (email) VALUES ('a@x.com'), ('b@x.com'), ('c@x.com')",
+        "CREATE INDEX idx_email ON t(email)",
+        "SELECT id, email FROM t WHERE email = 'b@x.com'",
+    ),
+    case!(
+        "index_backfill_range_scan",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t (v) VALUES (5), (15), (25), (35), (45)",
+        "CREATE INDEX idx_v ON t(v)",
+        "SELECT COUNT(*), SUM(v) FROM t WHERE v > 20",
+    ),
+    case!(
+        "index_backfill_update_uses_index",
+        // UPDATE with an indexed predicate must actually touch rows when
+        // the index was created after the data (regression: matched 0 rows).
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s INTEGER)",
+        "INSERT INTO t (v, s) VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)",
+        "CREATE INDEX idx_v ON t(v)",
+        "UPDATE t SET s = 100 WHERE v > 2",
+        "SELECT v, s FROM t ORDER BY v",
+    ),
+    case!(
+        "index_backfill_delete_uses_index",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t (v) VALUES (1), (2), (3), (4), (5)",
+        "CREATE INDEX idx_v ON t(v)",
+        "DELETE FROM t WHERE v >= 4",
+        "SELECT COUNT(*), MAX(v) FROM t",
+    ),
+    case!(
+        "index_backfill_unique_violation",
+        // CREATE UNIQUE INDEX on duplicate data must fail (SQLite aborts).
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)",
+        "INSERT INTO t (email) VALUES ('a@x.com'), ('a@x.com')",
+        "!CREATE UNIQUE INDEX idx_email ON t(email)",
+        "SELECT COUNT(*) FROM t",
+    ),
+    case!(
+        "index_backfill_unique_ok",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)",
+        "INSERT INTO t (email) VALUES ('a@x.com'), ('b@x.com')",
+        "CREATE UNIQUE INDEX idx_email ON t(email)",
         "INSERT OR IGNORE INTO t (email) VALUES ('a@x.com')",
         "SELECT COUNT(*) FROM t",
     ),
