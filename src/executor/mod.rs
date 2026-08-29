@@ -110,6 +110,10 @@ pub struct ExecContext<'a> {
     pub max_rowids_changed: bool,
     /// Set when `index_roots` gained local entries this statement.
     pub index_roots_changed: bool,
+    /// Pinned right-most leaf for sequential table appends, valid ONLY
+    /// within the current statement (see insert_table_append_hinted). Keyed
+    /// by the Arc<Table> identity so a hint never crosses tables.
+    pub table_append_hint: Option<(usize, u32)>,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -134,6 +138,7 @@ impl<'a> ExecContext<'a> {
             roots_changed: false,
             max_rowids_changed: false,
             index_roots_changed: false,
+            table_append_hint: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -167,6 +172,7 @@ impl<'a> ExecContext<'a> {
             roots_changed: false,
             max_rowids_changed: false,
             index_roots_changed: false,
+            table_append_hint: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -4506,6 +4512,109 @@ enum InsertOutcome {
 /// `supplied` is a list of (column_index, value) pairs (already
 /// affinity-coerced by the caller). Returns the number of affected rows
 /// (0 or 1).
+/// Fast-path INSERT for one or more rows of LITERAL values (the byte-level
+/// scanner path in api.rs). Semantics identical to exec_insert's Values
+/// loop — same affinity coercion, same NOT NULL/CHECK enforcement, same
+/// exec_insert_one_row (UNIQUE-index maintenance, conflict resolution,
+/// rowid semantics) — but:
+///   * values are already `Value`s (no evaluate() per literal),
+///   * the target column indices, index roots, max-rowid, current root,
+///     row buffer, and payload buffer are resolved ONCE for the whole
+///     batch instead of per row,
+///   * no AST, Plan, or statement cache.
+/// `col_indices` empty = all columns in declared order.
+pub fn fast_insert_literal_rows(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    col_indices: &[usize],
+    rows: Vec<Vec<Value>>,
+) -> Result<i64> {
+    let mut current_root = ctx.table_root(table);
+    let mut max_rowid = ctx.get_or_scan_max_rowid(table)?;
+    let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> =
+        indexes.iter().map(|idx| (idx.clone(), ctx.index_root(idx))).collect();
+    let table_name_lc = table.name.to_ascii_lowercase();
+    let n_cols = table.n_columns();
+    let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
+    let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
+    // Column names — only needed for CHECK constraints (NOT NULL is positional).
+    let col_names: Vec<String> = if table.check_exprs.is_empty() {
+        Vec::new()
+    } else {
+        table.columns.iter().map(|c| c.name.clone()).collect()
+    };
+    let mut inserted = 0i64;
+
+    for row in rows {
+        // Reset the row buffer without releasing capacity.
+        for v in full_row.iter_mut() {
+            *v = Value::Null;
+        }
+        if col_indices.is_empty() {
+            // All columns in declared order.
+            if row.len() != n_cols {
+                return Err(Error::semantic(format!(
+                    "table {} has {} columns but {} values were supplied",
+                    table.name, n_cols, row.len()
+                )));
+            }
+            for (i, v) in row.into_iter().enumerate() {
+                full_row[i] = table.columns[i].affinity.coerce(v);
+            }
+        } else {
+            if row.len() != col_indices.len() {
+                return Err(Error::semantic(format!(
+                    "{} VALUES for {} columns",
+                    row.len(),
+                    col_indices.len()
+                )));
+            }
+            for (v, &col_idx) in row.into_iter().zip(col_indices.iter()) {
+                full_row[col_idx] = table.columns[col_idx].affinity.coerce(v);
+            }
+        }
+
+        // Rowid pre-assignment so a NULL rowid-alias doesn't trip NOT NULL
+        // (mirrors exec_insert).
+        let mut rowid_autogen = false;
+        if let Some(idx) = table.rowid_alias {
+            if full_row[idx].is_null() {
+                max_rowid += 1;
+                full_row[idx] = Value::Integer(max_rowid);
+                rowid_autogen = true;
+            }
+        }
+
+        enforce_row_constraints(table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+
+        let outcome = exec_insert_one_row(
+            ctx,
+            table,
+            &table_name_lc,
+            &mut current_root,
+            &mut max_rowid,
+            &mut full_row,
+            &mut payload_buf,
+            &mut index_roots,
+            crate::sql::ast::ConflictResolution::Abort,
+            None,
+            rowid_autogen,
+        )?;
+        if matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting) {
+            inserted += 1;
+        }
+    }
+
+    // Write back any index-root moves (splits).
+    for (idx, root) in index_roots.iter() {
+        if ctx.index_root(idx) != *root {
+            ctx.set_index_root(&idx.name, *root);
+        }
+    }
+    Ok(inserted)
+}
+
 pub fn fast_insert_single_row(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -4758,7 +4867,23 @@ fn exec_insert_one_row(
             // skip the binary search per insert. Falls back to the
             // normal path automatically if the leaf is full or the
             // rowid is not actually an append.
-            bt.insert_table_append(rowid, payload)?;
+            //
+            // The APPEND HINT (statement-scoped) additionally skips the
+            // root-to-leaf descent per row: bulk VALUES batches pin the
+            // right-most leaf and append straight into it until a split
+            // re-pins. Validated on every use.
+            let table_key = Arc::as_ptr(table) as usize;
+            let hint = ctx
+                .table_append_hint
+                .take()
+                .filter(|(k, _)| *k == table_key)
+                .map(|(_, leaf)| leaf);
+            let new_hint = bt.insert_table_append_hinted(rowid, payload, hint)?;
+            if let Some(leaf) = new_hint {
+                ctx.table_append_hint = Some((table_key, leaf));
+            } else {
+                ctx.table_append_hint = None;
+            }
         } else {
             // Single lookup_table call (was 2 before — redundant when
             // the rowid existed and we needed the old payload for the

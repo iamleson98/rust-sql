@@ -195,6 +195,9 @@ pub struct Pager {
     /// write() syscalls are pure overhead. This is what makes autocommit
     /// INSERTs in `:memory:` mode competitive with SQLite's.
     lazy_writeback: AtomicBool,
+    /// Last page id inserted into `dirty_pages` (see note_dirty's fast
+    /// path). u32::MAX = none. Reset by flush().
+    last_noted_dirty: std::sync::atomic::AtomicU32,
     /// Upper-bound count of dirty pages since the last `flush()`. Incremented
     /// by `note_write()` on every mutating operation (allocate_page, free_page,
     /// Btree insert/delete/etc.). Reset to 0 by `flush()`.
@@ -243,6 +246,7 @@ impl Pager {
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
+            last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
             dirty_count_approx: AtomicUsize::new(0),
             dirty_pages: Mutex::new(PageIdSet::default()),
         };
@@ -373,7 +377,17 @@ impl Pager {
     /// Idempotent — calling it twice with the same page ID is fine.
     /// Cost: O(1) HashSet insert.
     pub fn note_dirty(&self, id: PageId) {
-        self.dirty_pages.lock().insert(id);
+        // Fast path: the same page is the last one we inserted — it's
+        // already in the set (nothing but flush() removes entries, and
+        // flush resets this hint). Bulk inserts dirty the SAME leaf
+        // hundreds of times in a row; the lock + hash + insert was
+        // ~40-60 ns per row.
+        if self.last_noted_dirty.load(Ordering::Relaxed) == id {
+            return;
+        }
+        let mut dp = self.dirty_pages.lock();
+        dp.insert(id);
+        self.last_noted_dirty.store(id, Ordering::Relaxed);
     }
 
     /// True if there might be dirty pages in the cache. O(1).
@@ -677,6 +691,10 @@ impl Pager {
         }
         self.lru.lock().clear();
         self.dirty_pages.lock().clear();
+        // The set was drained — the last-noted hint is stale (that page is
+        // no longer in the set). Reset so future note_dirty calls don't
+        // skip a needed insert.
+        self.last_noted_dirty.store(u32::MAX, Ordering::Release);
 
         // 2. Restore mutable metadata.
         self.n_pages.store(snap.n_pages, Ordering::Release);

@@ -123,6 +123,14 @@ fn sqlite_insert_single_in_txn(conn: &rusqlite::Connection, n: usize) -> Duratio
 }
 
 fn sqlite_insert_multirow(conn: &rusqlite::Connection, n: usize) -> Duration {
+    // Matching allocator warmup on the SQLite side (same rationale).
+    {
+        let values: Vec<String> = (1..=50i64)
+            .map(|i| format!("('warm{}', {}, {})", i, i, i as f64))
+            .collect();
+        let sql = format!("INSERT INTO t (name, val, score) VALUES {}", values.join(", "));
+        let _ = conn.execute(&sql, []).unwrap();
+    }
     let start = Instant::now();
     let batch = 500;
     for chunk_start in (1..=n as i64).step_by(batch) {
@@ -380,8 +388,18 @@ fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Dur
 }
 
 fn rustqlite_insert_multirow(db: &mut rustqlite::Database, n: usize) -> Duration {
-    let start = Instant::now();
     let batch = 500;
+    // Allocator steady-state warmup (see the join section): absorb
+    // mimalloc's one-time deferred-free purge so the timed batches
+    // measure steady state.
+    {
+        let values: Vec<String> = (1..=50i64)
+            .map(|i| format!("('warm{}', {}, {})", i, i, i as f64))
+            .collect();
+        let sql = format!("INSERT INTO t (name, val, score) VALUES {}", values.join(", "));
+        let _ = db.execute(&sql, []).unwrap();
+    }
+    let start = Instant::now();
     for chunk_start in (1..=n as i64).step_by(batch) {
         let chunk_end = (chunk_start + batch as i64 - 1).min(n as i64);
         let values: Vec<String> = (chunk_start..=chunk_end)
@@ -648,17 +666,34 @@ fn main() {
     }
 
     {
-        let mut db = rustqlite_open();
-        rustqlite_create_table(&mut db);
-        let d_r = rustqlite_insert_multirow(&mut db, MEDIUM);
-        let conn = sqlite_open();
-        sqlite_create_table(&conn);
-        let d_s = sqlite_insert_multirow(&conn, MEDIUM);
+        // Min-of-3 on fresh databases: single-shot measurements here were
+        // noisy in full-suite context (allocator/OS state from earlier
+        // sections) while isolated runs are stable — min-of-N is the
+        // standard steady-state estimator. Both engines get the same
+        // treatment.
+        // Run each engine's iterations CONSECUTIVELY: interleaved runs
+        // share the process allocator (SQLite's bundled library allocates
+        // through the same global mimalloc), so each engine's deferred-free
+        // churn lands in the other's measurement.
+        let mut best_r = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let mut db = rustqlite_open();
+            rustqlite_create_table(&mut db);
+            let d_r = rustqlite_insert_multirow(&mut db, MEDIUM);
+            best_r = best_r.min(d_r);
+        }
+        let mut best_s = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let conn = sqlite_open();
+            sqlite_create_table(&conn);
+            let d_s = sqlite_insert_multirow(&conn, MEDIUM);
+            best_s = best_s.min(d_s);
+        }
         println!(
             "{:<50} {:>12} {:>12}",
             format!("Multi-row VALUES batches ({} rows)", MEDIUM),
-            fmt_dur(d_r),
-            fmt_dur(d_s)
+            fmt_dur(best_r),
+            fmt_dur(best_s)
         );
     }
 

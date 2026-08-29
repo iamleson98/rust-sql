@@ -627,7 +627,42 @@ impl<'a> Btree<'a> {
     /// Precondition: `rowid > current_max_rowid` (caller's responsibility).
     /// If the precondition is violated, this falls back to the normal path.
     pub fn insert_table_append(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
+        self.insert_table_append_inner(rowid, payload, None).map(|_| ())
+    }
+
+    /// Append with a LEAF HINT from a previous append in the SAME statement:
+    /// skips the root-to-leaf descent entirely when the hinted leaf is still
+    /// the right-most leaf with room (the overwhelmingly common case in bulk
+    /// sequential inserts). The hint is validated per use — wrong type,
+    /// non-monotonic rowid, or a full page falls back to the full descent.
+    /// Returns the new hint (the leaf that received this row).
+    ///
+    /// SAFETY of the hint: it is only valid within a single statement (no
+    /// DROP/DELETE/ROLLBACK can intervene), and every use re-validates the
+    /// page type and ordering — so a stale hint is detected, never applied.
+    pub fn insert_table_append_hinted(
+        &mut self,
+        rowid: i64,
+        payload: &[u8],
+        hint: Option<PageId>,
+    ) -> Result<Option<PageId>> {
+        self.insert_table_append_inner(rowid, payload, hint)
+    }
+
+    fn insert_table_append_inner(
+        &mut self,
+        rowid: i64,
+        payload: &[u8],
+        hint: Option<PageId>,
+    ) -> Result<Option<PageId>> {
         self.pager.note_write();
+
+        // Fast path: validate the hinted leaf and append directly into it.
+        if let Some(h) = hint {
+            if let Some(new_hint) = self.try_append_into_leaf(h, rowid, payload)? {
+                return Ok(Some(new_hint));
+            }
+        }
 
         // Walk right_most_pointer chain down to the rightmost leaf.
         // One lock per level: read page_type and right_most_pointer in a
@@ -647,21 +682,35 @@ impl<'a> Btree<'a> {
                     if right == 0 {
                         // Shouldn't happen on a valid interior page, but fall back.
                         drop(guard);
-                        return self.insert_table(rowid, payload);
+                        self.insert_table(rowid, payload)?;
+                        return Ok(Some(self.right_most_leaf()?));
                     }
                     page_id = right;
                 }
                 _ => {
                     drop(guard);
-                    return self.insert_table(rowid, payload);
+                    self.insert_table(rowid, payload)?;
+                    return Ok(Some(self.right_most_leaf()?));
                 }
             }
         }
 
-        // Rightmost leaf: verify the append, check space, and write — all
-        // under ONE lock guard. Previously this took the leaf lock 5 times
-        // (page_type, n_cells, cell_pointer, free_space, then the write),
-        // ~5 x 20 ns of uncontended mutex traffic per inserted row.
+        // Rightmost leaf: verify the append, check space, and write.
+        if let Some(h) = self.try_append_into_leaf(leaf_id, rowid, payload)? {
+            return Ok(Some(h));
+        }
+        // Not an append / full leaf — the normal insert path handles
+        // splitting + propagation.
+        self.insert_table(rowid, payload)?;
+        // Re-pin the right-most leaf (one descent; runs only after splits).
+        Ok(Some(self.right_most_leaf()?))
+    }
+
+    /// Try to append `rowid -> payload` directly into leaf page `leaf_id`.
+    /// Returns `Ok(Some(leaf_id))` on success, `Ok(None)` when the page is
+    /// not a table leaf, the rowid isn't past the last cell, or there is no
+    /// room (caller falls back to the full insert path).
+    fn try_append_into_leaf(&self, leaf_id: PageId, rowid: i64, payload: &[u8]) -> Result<Option<PageId>> {
         let page = self.pager.get_page(leaf_id)?;
         // Cell bytes: varint rowid + varint payload len + payload. Typical
         // rows are well under 256 bytes — build in a stack buffer and only
@@ -689,14 +738,16 @@ impl<'a> Btree<'a> {
         let cell_size = cell.len() as u32;
 
         let mut borrowed = page.lock();
+        if borrowed.page_type()? != PageType::LeafTable {
+            return Ok(None); // stale hint pointing at a non-leaf page
+        }
         let n = borrowed.n_cells();
         if n > 0 {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
             if let Some((last_rowid, _)) = varint::decode_signed(&borrowed.data[cell_ptr..]) {
                 if rowid <= last_rowid {
-                    // Not an append — fall back to the normal path.
-                    drop(borrowed);
-                    return self.insert_table(rowid, payload);
+                    // Not an append — caller falls back to the normal path.
+                    return Ok(None);
                 }
             }
         }
@@ -704,10 +755,8 @@ impl<'a> Btree<'a> {
         // Check if the leaf has space.
         let free = borrowed.free_space();
         if free < cell_size + 2 {
-            // Need to split — fall back to the normal insert path, which
-            // handles splitting + propagating the split up the tree.
-            drop(borrowed);
-            return self.insert_table(rowid, payload);
+            // Need to split — caller handles splitting + propagation.
+            return Ok(None);
         }
 
         // Append: write cell at the new content start, write pointer at end.
@@ -732,7 +781,27 @@ impl<'a> Btree<'a> {
         }
         drop(borrowed);
         self.pager.note_dirty(leaf_id);
-        Ok(())
+        Ok(Some(leaf_id))
+    }
+
+    /// Descend the right-most-child chain to the right-most leaf.
+    fn right_most_leaf(&self) -> Result<PageId> {
+        let mut page_id = self.root;
+        loop {
+            let page = self.pager.get_page(page_id)?;
+            let guard = page.lock();
+            match guard.page_type()? {
+                PageType::LeafTable => return Ok(page_id),
+                PageType::InteriorTable => {
+                    let right = guard.right_most_pointer();
+                    if right == 0 {
+                        return Ok(page_id);
+                    }
+                    page_id = right;
+                }
+                _ => return Ok(page_id),
+            }
+        }
     }
 
     /// Update a row in a table B+tree in place when possible.

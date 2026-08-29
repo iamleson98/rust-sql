@@ -492,7 +492,7 @@ impl Database {
     /// `Err` for a real failure. Not-applicable cases: WITHOUT ROWID /
     /// STRICT tables, generated columns, missing DEFAULT evaluation,
     /// duplicate column names (the general path produces nicer errors).
-    fn exec_fast_insert(&mut self, mut fi: FastInsert<'_>) -> Result<bool> {
+    fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
         let table = match self.catalog.get_table_fast(fi.table) {
             Some(t) => t,
             None => {
@@ -515,31 +515,28 @@ impl Database {
             return Ok(false);
         }
 
-        // Resolve target column indices.
+        // Resolve target column indices ONCE for the whole batch (was: per
+        // value, per row). Empty = all columns in declared order.
         let n_cols = table.n_columns();
-        let mut supplied: Vec<(usize, Value)> = Vec::with_capacity(fi.values.len());
-        if fi.columns.is_empty() {
-            if fi.values.len() != n_cols {
+        let n_values_per_row = fi.values.first().map(|r| r.len()).unwrap_or(0);
+        let col_indices: Vec<usize> = if fi.columns.is_empty() {
+            if n_values_per_row != n_cols {
                 return Err(Error::semantic(format!(
                     "table {} has {} columns but {} values were supplied",
-                    table.name, n_cols, fi.values.len()
+                    table.name, n_cols, n_values_per_row
                 )));
             }
-            let vals = std::mem::take(&mut fi.values);
-            for (i, v) in IntoIterator::into_iter(vals).enumerate() {
-                let affinity = table.columns[i].affinity;
-                supplied.push((i, affinity.coerce(v)));
-            }
+            Vec::new()
         } else {
-            if fi.values.len() != fi.columns.len() {
+            if n_values_per_row != fi.columns.len() {
                 return Err(Error::semantic(format!(
                     "{} VALUES for {} columns",
-                    fi.values.len(),
+                    n_values_per_row,
                     fi.columns.len()
                 )));
             }
             let mut seen: Vec<usize> = Vec::with_capacity(fi.columns.len());
-            for (name, v) in fi.columns.iter().zip(std::mem::take(&mut fi.values)) {
+            for name in fi.columns.iter() {
                 match table.find_column(name) {
                     Some(idx) => {
                         if seen.contains(&idx) {
@@ -547,8 +544,6 @@ impl Database {
                             return Ok(false);
                         }
                         seen.push(idx);
-                        let affinity = table.columns[idx].affinity;
-                        supplied.push((idx, affinity.coerce(v)));
                     }
                     None => {
                         return Err(Error::semantic(format!(
@@ -558,7 +553,8 @@ impl Database {
                     }
                 }
             }
-        }
+            seen
+        };
 
         // Set up the execution context exactly like `execute` does.
         let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -572,7 +568,7 @@ impl Database {
         // DETACH the combined maps (zero-copy): `execute`-family callers
         // hold `&mut self`, so no reader can hold a snapshot concurrently.
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
-        let result = crate::executor::fast_insert_single_row(&mut ctx, &table, supplied);
+        let result = crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values);
 
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
@@ -1934,8 +1930,8 @@ struct FastInsert<'a> {
     table: &'a str,
     /// Column names as written; empty = all columns in declared order.
     columns: Vec<&'a str>,
-    /// Literal values in order.
-    values: Vec<Value>,
+    /// Literal values in order — one Vec per VALUES row.
+    values: Vec<Vec<Value>>,
 }
 
 /// Ultra-lightweight scanner for the single hottest statement shape in
@@ -2158,27 +2154,40 @@ fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
     }
     i = match_word_ci(b, i, "VALUES")?;
     i = skip_ws(b, i);
-    if i >= b.len() || b[i] != b'(' {
-        return None;
-    }
-    i += 1;
-    let mut values: Vec<Value> = Vec::new();
+    // Multi-row VALUES: ALL rows are scanned up front (a syntax error in
+    // row 37 must insert nothing, matching SQLite's parse-then-execute —
+    // the general path's parser also rejects the whole statement before
+    // any row is executed).
+    let mut values: Vec<Vec<Value>> = Vec::new();
     loop {
+        if i >= b.len() || b[i] != b'(' {
+            return None;
+        }
+        i += 1;
+        let mut row: Vec<Value> = Vec::new();
+        loop {
+            i = skip_ws(b, i);
+            let (v, ni) = parse_fast_literal(b, i)?;
+            row.push(v);
+            i = skip_ws(b, ni);
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if i >= b.len() || b[i] != b')' {
+            return None;
+        }
+        i += 1;
+        values.push(row);
         i = skip_ws(b, i);
-        let (v, ni) = parse_fast_literal(b, i)?;
-        values.push(v);
-        i = skip_ws(b, ni);
         if i < b.len() && b[i] == b',' {
-            i += 1;
+            i = skip_ws(b, i + 1);
             continue;
         }
         break;
     }
-    if i >= b.len() || b[i] != b')' {
-        return None;
-    }
-    i += 1;
-    i = skip_ws(b, i);
     // Optional single trailing semicolon, then end-of-statement.
     if i < b.len() && b[i] == b';' {
         i = skip_ws(b, i + 1);
