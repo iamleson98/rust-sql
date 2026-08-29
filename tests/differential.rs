@@ -298,6 +298,52 @@ static CASES: &[Case] = &[
         "INSERT INTO t VALUES (1, NULL, 10), (2, NULL, 20), (3, 'a', 30)",
         "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g",
     ),
+    case!(
+        "group_by_numeric_cross_type_groups_together",
+        // 1 (INTEGER) and 1.0 (REAL) must land in the SAME group — SQLite
+        // numeric equality in GROUP BY keys.
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g, v INTEGER)",
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1.0, 20), (3, 2, 30), (4, 2.5, 40)",
+        "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g ORDER BY g",
+    ),
+    case!(
+        "group_by_multi_column_key",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, v INTEGER)",
+        "INSERT INTO t VALUES (1, 1, 'x', 10), (2, 1, 'x', 20), (3, 1, 'y', 30), (4, 2, 'x', 40)",
+        "SELECT a, b, COUNT(*), SUM(v) FROM t GROUP BY a, b ORDER BY a, b",
+    ),
+    case!(
+        "group_by_expression_key",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4)",
+        "SELECT v % 2 AS parity, COUNT(*) FROM t GROUP BY v % 2 ORDER BY parity",
+    ),
+    case!(
+        "group_by_with_where_filter",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, v INTEGER)",
+        "INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40), (5, 'a', 50)",
+        "SELECT g, COUNT(*), SUM(v) FROM t WHERE v > 10 GROUP BY g ORDER BY g",
+    ),
+    case!(
+        "count_distinct_aggregate",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT)",
+        "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b'), (5, 'a')",
+        "SELECT COUNT(DISTINCT g) FROM t",
+    ),
+    case!(
+        "sum_distinct_aggregate",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+        "SELECT SUM(DISTINCT v) FROM t",
+    ),
+    case!(
+        "group_by_many_groups",
+        // 100 groups over 500 rows — exercises the hash grouper at a scale
+        // where the old format!()-per-row key scheme dominated.
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "INSERT INTO t VALUES (1,0,1),(2,1,2),(3,2,3),(4,3,4),(5,4,5),(6,5,6),(7,6,7),(8,7,8),(9,8,9),(10,9,10),(11,10,11),(12,11,12),(13,12,13),(14,13,14),(15,14,15),(16,15,16),(17,16,17),(18,17,18),(19,18,19),(20,19,20),(21,20,21),(22,21,22),(23,22,23),(24,23,24),(25,24,25),(26,25,26),(27,26,27),(28,27,28),(29,28,29),(30,29,30),(31,30,31),(32,31,32),(33,32,33),(34,33,34),(35,34,35),(36,35,36),(37,36,37),(38,37,38),(39,38,39),(40,39,40),(41,40,41),(42,41,42),(43,42,43),(44,43,44),(45,44,45),(46,45,46),(47,46,47),(48,47,48),(49,48,49),(50,49,50)",
+        "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g ORDER BY g",
+    ),
 
     // ========================================================================
     // JOINs

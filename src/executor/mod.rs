@@ -25,6 +25,7 @@ use crate::storage::pager::Pager;
 use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row, encode_row_into};
 use crate::types::{Row, Value};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Shared execution state.
@@ -1468,9 +1469,150 @@ struct AggState {
     int_sum: i64,
     min: Option<Value>,
     max: Option<Value>,
-    distinct: std::collections::HashSet<String>,
+    distinct: std::collections::HashSet<SqlValueKey>,
     concat: String,
     seen_value: bool,
+}
+
+/// A single SQL value wrapped for use as a HashSet key with SQL equality
+/// semantics (numeric cross-type equality). Replaces the old `format!("{:?}")`
+/// String keys in DISTINCT aggregates — one Value clone (free for Int/Real)
+/// instead of a Debug-format + heap String per row.
+#[derive(Clone, Debug)]
+struct SqlValueKey(Value);
+
+impl PartialEq for SqlValueKey {
+    fn eq(&self, other: &Self) -> bool {
+        crate::types::values_sql_equal(&self.0, &other.0)
+    }
+}
+impl Eq for SqlValueKey {}
+impl std::hash::Hash for SqlValueKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        hash_sql_value(&self.0, state);
+    }
+}
+
+/// Hash one value with SQL grouping semantics: integral REALs collide with
+/// INTEGERs, -0.0 collides with 0, NULL has its own tag.
+fn hash_sql_value<H: std::hash::Hasher>(v: &Value, state: &mut H) {
+    match v {
+        Value::Null => state.write_u8(0),
+        Value::Integer(i) => {
+            state.write_u8(1);
+            state.write_i64(*i);
+        }
+        Value::Real(f) => {
+            if f.is_finite() && *f == f.trunc() && f.abs() <= 9.007_199_254_740_992e15 {
+                state.write_u8(1);
+                state.write_i64(*f as i64);
+            } else {
+                state.write_u8(2);
+                state.write_u64(f.to_bits());
+            }
+        }
+        Value::Text(s) => {
+            state.write_u8(3);
+            s.hash(state);
+        }
+        Value::Blob(b) => {
+            state.write_u8(4);
+            b.hash(state);
+        }
+    }
+}
+
+/// The aggregate function, resolved once per query from the lowercased name.
+/// Replaces per-row `&str` matching in `update_agg_state` (the planner
+/// lowercases names, so this only needs the lowercase forms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggFunc {
+    Count,
+    Sum,
+    Total,
+    Avg,
+    Min,
+    Max,
+    GroupConcat,
+    Other,
+}
+
+impl AggFunc {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "total" => AggFunc::Total,
+            "avg" => AggFunc::Avg,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            "group_concat" => AggFunc::GroupConcat,
+            _ => AggFunc::Other,
+        }
+    }
+}
+
+/// Zero-allocation hash grouper for GROUP BY: buckets of group indices
+/// keyed by the SQL-semantic hash of the group key, with linear probing
+/// inside a bucket using SQL value equality.
+///
+/// Replaces the previous scheme — `format!("{:?}")` per key value +
+/// `join("|")` per row + `HashMap<String, _>` + a separate `group_order`
+/// Vec of cloned Strings — which cost 2-4 heap allocations and several
+/// hundred ns PER ROW. This costs one hash per row and zero allocations
+/// after warmup (each bucket Vec amortizes), and preserves first-seen
+/// group order exactly like the old implementation.
+struct HashGrouper {
+    buckets: HashMap<u64, Vec<usize>>,
+    /// (key values, per-aggregate states) in first-seen order.
+    groups: Vec<(Vec<Value>, Vec<AggState>)>,
+}
+
+impl Default for HashGrouper {
+    fn default() -> Self {
+        Self { buckets: HashMap::new(), groups: Vec::new() }
+    }
+}
+
+impl HashGrouper {
+    /// Find or create the group for `key`, returning its index.
+    /// `key` is typically a reusable scratch buffer — its contents are
+    /// cloned only when a NEW group is created.
+    fn intern(&mut self, key: &[Value]) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for v in key {
+            hash_sql_value(v, &mut hasher);
+        }
+        let h = hasher.finish();
+        if let Some(bucket) = self.buckets.get(&h) {
+            for &gi in bucket {
+                let (existing, _) = &self.groups[gi];
+                if existing.len() == key.len()
+                    && existing
+                        .iter()
+                        .zip(key.iter())
+                        .all(|(a, b)| crate::types::values_sql_equal(a, b))
+                {
+                    return gi;
+                }
+            }
+        }
+        // New group.
+        let gi = self.groups.len();
+        self.groups.push((key.to_vec(), Vec::new()));
+        self.buckets.entry(h).or_default().push(gi);
+        gi
+    }
+
+    /// Number of distinct groups so far.
+    fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
 }
 
 impl Default for AggState {
@@ -1529,83 +1671,183 @@ fn exec_aggregate_streaming_scan(
         return exec_aggregate_no_group_by(ctx, table, alias, filter_predicate, aggregates);
     }
 
-    let params = ctx.params.clone();
-    let named_params = ctx.named_params.clone();
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
     let n_cols = table.n_columns();
-    // Column names — we have to build these once for the eval_row calls.
-    // (We can't avoid this allocation without threading column-name
-    // references through EvalContext; that's future work.)
     let prefix = alias.as_deref().unwrap_or(&table.name);
+    // Qualified column names ("t.col") — needed for eval_row calls on the
+    // slow path (filter predicates / non-column group keys / non-column
+    // aggregate args). The fast path avoids them entirely.
     let columns: Vec<String> = table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect();
 
-    let mut groups: HashMap<String, (Vec<Value>, Vec<AggState>)> = HashMap::new();
-    let mut group_order: Vec<String> = Vec::new();
+    // ---- Vectorized setup: resolve everything ONCE before the scan ----
+    //
+    // 1. Group-by expressions → column indices (when they're bare Column
+    //    refs — the overwhelmingly common `GROUP BY cat` case).
+    // 2. Aggregate args → column indices (same).
+    // 3. Aggregate function names → AggFunc enums (no per-row &str match).
+    // 4. When there's no filter predicate AND everything resolved, we can
+    //    use `decode_row_selective` to decode ONLY the referenced columns,
+    //    skipping the decode of all other columns per row.
+    let key_col_indices: Vec<Option<usize>> = group_by
+        .iter()
+        .map(|e| match e {
+            Expr::Column { table: ref_t, name } => {
+                let matches = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+                if matches {
+                    table.find_column(name)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    let agg_col_indices: Vec<Option<usize>> = aggregates
+        .iter()
+        .map(|agg| match &agg.arg {
+            Some(Expr::Column { table: ref_t, name }) => {
+                let matches = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+                if matches {
+                    table.find_column(name)
+                } else {
+                    None
+                }
+            }
+            _ => None, // COUNT(*) or a non-column arg
+        })
+        .collect();
+    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
 
-    // Reusable row buffer — avoids per-row Vec allocation.
+    let all_resolved = key_col_indices.iter().all(|x| x.is_some())
+        && agg_col_indices.iter().all(|x| x.is_some());
+    let selective_eligible = all_resolved && filter_predicate.is_none();
+
+    // Sorted, deduped list of column indices to decode on the selective path.
+    let wanted: Vec<usize> = if selective_eligible {
+        let mut w: Vec<usize> = key_col_indices.iter().filter_map(|x| *x).collect();
+        w.extend(agg_col_indices.iter().filter_map(|x| *x));
+        w.sort_unstable();
+        w.dedup();
+        w
+    } else {
+        Vec::new()
+    };
+
+    let mut grouper = HashGrouper::default();
+    let n_aggs = aggregates.len();
+
+    // Scratch buffers, reused across rows.
+    let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
     let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
 
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
-    // Borrowed scan — skip per-row Cell::decode Vec allocation.
-    bt.scan_table_borrowed(|_rowid, payload| {
-        // Decode into the reusable buffer.
-        row_buf.clear();
-        if decode_row_into(payload, n_cols, &mut row_buf).is_err() {
-            return true; // skip corrupt rows
-        }
-        // Apply the filter predicate inline (if any). Skips rows that
-        // don't match — no materialization.
-        if let Some(pred) = filter_predicate {
-            match eval_row(pred, &row_buf, &columns, &params, &named_params) {
-                Ok(v) => {
-                    if !v.is_truthy() {
-                        return true; // skip — predicate false
-                    }
-                }
-                Err(_) => return true,
-            }
-        }
-        // Compute the group-by key (if any).
-        let key: Vec<Value> = match group_by.iter().map(|e| eval_row(e, &row_buf, &columns, &params, &named_params)).collect::<Result<Vec<_>>>() {
-            Ok(v) => v,
-            Err(_) => return true,
-        };
-        let key_str = key.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join("|");
-        let entry = groups.entry(key_str.clone()).or_insert_with(|| {
-            group_order.push(key_str.clone());
-            (key.clone(), vec![AggState::default(); aggregates.len()])
-        });
-        for (i, agg) in aggregates.iter().enumerate() {
-            let arg_val = if let Some(arg) = &agg.arg {
-                match eval_row(arg, &row_buf, &columns, &params, &named_params) {
-                    Ok(v) => v,
-                    Err(_) => Value::Null,
-                }
-            } else {
-                Value::Integer(1)
-            };
-            update_agg_state(&mut entry.1[i], &agg.func, &arg_val, agg.distinct);
-        }
-        true
-    })?;
 
-    // SQLite semantics: empty-table aggregate emits one row.
-    if group_by.is_empty() && groups.is_empty() && !aggregates.is_empty() {
-        let empty_key: Vec<Value> = Vec::new();
-        let empty_states = vec![AggState::default(); aggregates.len()];
-        groups.insert(String::new(), (empty_key, empty_states));
-        group_order.push(String::new());
+    if selective_eligible {
+        // ==== Fully vectorized path: selective decode + direct indexing ====
+        bt.scan_table_borrowed(|_rowid, payload| {
+            if decode_row_selective(payload, n_cols, &wanted, &mut sel_buf).is_err() {
+                return true; // skip corrupt rows
+            }
+            // Build the group key from the decoded slice. Map each group-by
+            // column index to its position in `wanted` (both sides are
+            // precomputed; the find is a tiny scan over a few entries).
+            key_buf.clear();
+            for kidx in key_col_indices.iter().map(|x| x.unwrap()) {
+                let pos = wanted.iter().position(|x| *x == kidx).unwrap_or(usize::MAX);
+                key_buf.push(if pos != usize::MAX && pos < sel_buf.len() {
+                    sel_buf[pos].clone()
+                } else {
+                    Value::Null
+                });
+            }
+            let gi = grouper.intern(&key_buf);
+            if grouper.groups[gi].1.is_empty() {
+                grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
+            }
+            for (i, agg) in aggregates.iter().enumerate() {
+                let arg_val = match agg_col_indices[i] {
+                    Some(aidx) => {
+                        let pos = wanted.iter().position(|x| *x == aidx).unwrap_or(usize::MAX);
+                        if pos != usize::MAX && pos < sel_buf.len() {
+                            sel_buf[pos].clone()
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    None => Value::Integer(1), // COUNT(*)
+                };
+                update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+            }
+            true
+        })?;
+    } else {
+        // ==== General path: full decode + eval_row for whatever didn't resolve ====
+        bt.scan_table_borrowed(|_rowid, payload| {
+            row_buf.clear();
+            if decode_row_into(payload, n_cols, &mut row_buf).is_err() {
+                return true; // skip corrupt rows
+            }
+            // Apply the filter predicate inline (if any).
+            if let Some(pred) = filter_predicate {
+                match eval_row(pred, &row_buf, &columns, params, named_params) {
+                    Ok(v) => {
+                        if !v.is_truthy() {
+                            return true; // skip — predicate false
+                        }
+                    }
+                    Err(_) => return true,
+                }
+            }
+            // Compute the group-by key: direct index when resolved, eval_row
+            // otherwise (e.g. GROUP BY x+y, GROUP BY upper(name)).
+            key_buf.clear();
+            let mut key_ok = true;
+            for (gi_expr, kidx) in group_by.iter().zip(key_col_indices.iter()) {
+                match kidx {
+                    Some(idx) => key_buf.push(row_buf[*idx].clone()),
+                    None => match eval_row(gi_expr, &row_buf, &columns, params, named_params) {
+                        Ok(v) => key_buf.push(v),
+                        Err(_) => {
+                            key_ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if !key_ok {
+                return true;
+            }
+            let gi = grouper.intern(&key_buf);
+            if grouper.groups[gi].1.is_empty() {
+                grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
+            }
+            for (i, agg) in aggregates.iter().enumerate() {
+                let arg_val = match (&agg.arg, agg_col_indices[i]) {
+                    (Some(_), Some(idx)) => row_buf[idx].clone(),
+                    (Some(arg), None) => match eval_row(arg, &row_buf, &columns, params, named_params) {
+                        Ok(v) => v,
+                        Err(_) => Value::Null,
+                    },
+                    (None, _) => Value::Integer(1), // COUNT(*)
+                };
+                update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+            }
+            true
+        })?;
     }
 
-    let mut out_rows = Vec::with_capacity(group_order.len());
-    for k in group_order {
-        if let Some((key, states)) = groups.remove(&k) {
-            let mut row = key;
-            for (i, agg) in aggregates.iter().enumerate() {
-                row.push(finalize_agg(&states[i], &agg.func));
-            }
-            out_rows.push(row);
+    // Emit one output row per group, in first-seen order (matches the
+    // previous implementation's `group_order` behavior).
+    let mut out_rows = Vec::with_capacity(grouper.len());
+    for (key, states) in grouper.groups {
+        let mut row = key;
+        for (i, agg) in aggregates.iter().enumerate() {
+            row.push(finalize_agg(&states[i], &agg.func));
         }
+        out_rows.push(row);
     }
 
     let mut out_cols = Vec::new();
@@ -1698,6 +1940,7 @@ fn exec_aggregate_no_group_by(
     let params = ctx.params.clone();
     let named_params = ctx.named_params.clone();
 
+    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
     let mut states: Vec<AggState> = (0..aggregates.len()).map(|_| AggState::default()).collect();
     let mut saw_any_row = false;
 
@@ -1794,7 +2037,7 @@ fn exec_aggregate_no_group_by(
                 } else {
                     Value::Integer(1)
                 };
-                update_agg_state(&mut states[i], &agg.func, &arg_val, agg.distinct);
+                update_agg_state(&mut states[i], agg_funcs[i], &arg_val, agg.distinct);
             }
             true
         })?;
@@ -1835,7 +2078,7 @@ fn exec_aggregate_no_group_by(
                 } else {
                     Value::Integer(1)
                 };
-                update_agg_state(&mut states[i], &agg.func, &arg_val, agg.distinct);
+                update_agg_state(&mut states[i], agg_funcs[i], &arg_val, agg.distinct);
             }
             true
         })?;
@@ -2000,25 +2243,63 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         }
     }
     let inner = execute(input, ctx)?;
-    let params = ctx.params.clone();
-    let named_params = ctx.named_params.clone();
-    let mut groups: HashMap<String, (Vec<Value>, Vec<AggState>)> = HashMap::new();
-    let mut group_order: Vec<String> = Vec::new();
+    // Borrow params directly (inner is an owned local — no conflict).
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
+    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
+    // Resolve group-by exprs and agg args against the input's column names
+    // once, so per-row work is an index read whenever possible.
+    let key_col_indices: Vec<Option<usize>> = group_by
+        .iter()
+        .map(|e| match e {
+            Expr::Column { table, name } => resolve_column_index(&inner.columns, table.as_deref(), name),
+            _ => None,
+        })
+        .collect();
+    let agg_col_indices: Vec<Option<usize>> = aggregates
+        .iter()
+        .map(|agg| match &agg.arg {
+            Some(Expr::Column { table, name }) => {
+                resolve_column_index(&inner.columns, table.as_deref(), name)
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut grouper = HashGrouper::default();
+    let n_aggs = aggregates.len();
+    let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
 
     for row in &inner.rows {
-        let key: Vec<Value> = group_by.iter().map(|e| eval_row(e, row, &inner.columns, &params, &named_params)).collect::<Result<_>>()?;
-        let key_str = key.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join("|");
-        let entry = groups.entry(key_str.clone()).or_insert_with(|| {
-            group_order.push(key_str.clone());
-            (key.clone(), vec![AggState::default(); aggregates.len()])
-        });
+        // Group key: direct index when resolvable, eval_row otherwise.
+        key_buf.clear();
+        let mut key_ok = true;
+        for (ge, kidx) in group_by.iter().zip(key_col_indices.iter()) {
+            match kidx {
+                Some(idx) => key_buf.push(row[*idx].clone()),
+                None => match eval_row(ge, row, &inner.columns, params, named_params) {
+                    Ok(v) => key_buf.push(v),
+                    Err(_) => {
+                        key_ok = false;
+                        break;
+                    }
+                },
+            }
+        }
+        if !key_ok {
+            continue;
+        }
+        let gi = grouper.intern(&key_buf);
+        if grouper.groups[gi].1.is_empty() {
+            grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
+        }
         for (i, agg) in aggregates.iter().enumerate() {
-            let arg_val = if let Some(arg) = &agg.arg {
-                eval_row(arg, row, &inner.columns, &params, &named_params)?
-            } else {
-                Value::Integer(1)
+            let arg_val = match (&agg.arg, agg_col_indices[i]) {
+                (Some(_), Some(idx)) => row[idx].clone(),
+                (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
+                (None, _) => Value::Integer(1),
             };
-            update_agg_state(&mut entry.1[i], &agg.func, &arg_val, agg.distinct);
+            update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
         }
     }
 
@@ -2026,22 +2307,17 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     // produced by the input, the aggregate still emits ONE row (with
     // COUNT=0, SUM=NULL, AVG=NULL, MIN=NULL, MAX=NULL). This handles the
     // common `SELECT COUNT(*) FROM empty_table` case.
-    if group_by.is_empty() && groups.is_empty() && !aggregates.is_empty() {
-        let empty_key: Vec<Value> = Vec::new();
-        let empty_states = vec![AggState::default(); aggregates.len()];
-        groups.insert(String::new(), (empty_key, empty_states));
-        group_order.push(String::new());
+    if group_by.is_empty() && grouper.is_empty() && !aggregates.is_empty() {
+        grouper.groups.push((Vec::new(), (0..n_aggs).map(|_| AggState::default()).collect()));
     }
 
-    let mut out_rows = Vec::with_capacity(group_order.len());
-    for k in group_order {
-        if let Some((key, states)) = groups.remove(&k) {
-            let mut row = key;
-            for (i, agg) in aggregates.iter().enumerate() {
-                row.push(finalize_agg(&states[i], &agg.func));
-            }
-            out_rows.push(row);
+    let mut out_rows = Vec::with_capacity(grouper.len());
+    for (key, states) in grouper.groups {
+        let mut row = key;
+        for (i, agg) in aggregates.iter().enumerate() {
+            row.push(finalize_agg(&states[i], &agg.func));
         }
+        out_rows.push(row);
     }
 
     let mut out_cols = Vec::new();
@@ -2072,15 +2348,14 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
 }
 
-fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool) {
+fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bool) {
     // Only compute the distinct key if we're actually doing a DISTINCT
-    // aggregate. For non-DISTINCT aggregates, this skips a per-row
-    // `format!("{:?}", v)` String allocation that was the dominant cost
-    // of `exec_aggregate_no_group_by` — for a 10k-row scan, that's 10k
-    // saved heap allocations, ~3-5 ms on a hot CPU.
+    // aggregate. For non-DISTINCT aggregates, this skips per-row hashing
+    // entirely. The key is a `SqlValueKey` (a Value clone — free for
+    // Integer/Real) instead of the old `format!("{:?}")` String, saving
+    // a heap allocation per row for DISTINCT aggregates.
     if distinct {
-        let key = format!("{:?}", v);
-        if !state.distinct.insert(key) {
+        if !state.distinct.insert(SqlValueKey(v.clone())) {
             return;
         }
     }
@@ -2100,13 +2375,13 @@ fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool)
         // still counting every row for COUNT(*). This bug was caught by
         // the SLT test suite (which expected COUNT(val) to be 5 over a
         // 6-row table where one row had val=NULL).
-        "count" => {
+        AggFunc::Count => {
             if v.is_null() {
                 return;
             }
             state.count += 1
         }
-        "sum" | "total" => {
+        AggFunc::Sum | AggFunc::Total => {
             if !v.is_null() {
                 if matches!(v, Value::Real(_)) {
                     state.sum_is_int = false;
@@ -2119,27 +2394,27 @@ fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool)
                 }
             }
         }
-        "avg" => {
+        AggFunc::Avg => {
             if !v.is_null() {
                 state.count += 1;
                 state.sum += v.as_real();
             }
         }
-        "min" => {
+        AggFunc::Min => {
             if !v.is_null() {
                 if state.min.is_none() || v < state.min.as_ref().unwrap() {
                     state.min = Some(v.clone());
                 }
             }
         }
-        "max" => {
+        AggFunc::Max => {
             if !v.is_null() {
                 if state.max.is_none() || v > state.max.as_ref().unwrap() {
                     state.max = Some(v.clone());
                 }
             }
         }
-        "group_concat" => {
+        AggFunc::GroupConcat => {
             if !v.is_null() {
                 if !state.concat.is_empty() {
                     state.concat.push(',');

@@ -6,6 +6,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// A single SQL value.
 ///
@@ -18,6 +19,99 @@ pub enum Value {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+}
+
+/// A wrapper around `&[Value]` (or any key slice) that implements `Hash`
+/// and `Eq` with **SQL grouping semantics**, matching how SQLite's GROUP BY
+/// / DISTINCT / UNION compare rows:
+///
+/// - NULL groups with NULL (SQLite's GROUP BY treats NULLs as one group).
+/// - INTEGER(n) groups with REAL(n as f64) — numeric equality, so `5` and
+///   `5.0` land in the same group, and `-0.0` groups with `0`.
+/// - TEXT and BLOB compare bitwise (BINARY collation); text is never
+///   equal to a blob even with identical bytes.
+/// - A non-integral REAL hashes its exact bit pattern (two NaN-free
+///   doubles that differ by any ULP are distinct groups).
+///
+/// The previous implementation of GROUP BY built a `format!("{:?}")` String
+/// per key per row — for a 100-group scan over 10k rows that was ~10k heap
+/// allocations plus Debug-formatting work. With `GroupKey` the hash map
+/// keys borrow the decoded values directly: zero allocations per row.
+#[derive(Debug)]
+pub struct GroupKey<'a>(pub &'a [Value]);
+
+impl PartialEq for GroupKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (self.0, other.0);
+        if a.len() != b.len() {
+            return false;
+        }
+        for (x, y) in a.iter().zip(b.iter()) {
+            if !values_sql_equal(x, y) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Eq for GroupKey<'_> {}
+
+impl Hash for GroupKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for v in self.0 {
+            hash_value_sql(v, state);
+        }
+    }
+}
+
+/// SQL equality on two values (numeric cross-type equality, NULL == NULL).
+pub fn values_sql_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        // Numeric equality across INTEGER/REAL (SQLite semantics).
+        (Value::Integer(x), Value::Real(y)) | (Value::Real(y), Value::Integer(x)) => {
+            *x as f64 == *y
+        }
+        (Value::Real(x), Value::Real(y)) => x == y,
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Blob(x), Value::Blob(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Hash one value consistently with `values_sql_equal`: numerics hash by
+/// their (normalized-to-integer-when-exact) value so Integer(5) and
+/// Real(5.0) collide, and -0.0 hashes like 0.
+fn hash_value_sql<H: Hasher>(v: &Value, state: &mut H) {
+    match v {
+        Value::Null => state.write_u8(0),
+        Value::Integer(i) => {
+            state.write_u8(1);
+            state.write_i64(*i);
+        }
+        Value::Real(f) => {
+            // Normalize integral doubles to their integer hash so they
+            // collide with Integer(n); normalize -0.0 to 0.
+            if f.is_finite() && *f == f.trunc() && f.abs() <= 9.007_199_254_740_992e15 {
+                state.write_u8(1);
+                state.write_i64(*f as i64);
+            } else {
+                state.write_u8(2);
+                state.write_u64(f.to_bits());
+            }
+        }
+        Value::Text(s) => {
+            state.write_u8(3);
+            s.hash(state);
+        }
+        Value::Blob(b) => {
+            state.write_u8(4);
+            b.hash(state);
+        }
+    }
 }
 
 impl Value {

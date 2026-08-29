@@ -47,7 +47,8 @@ impl<'a> Planner<'a> {
         // in the projection. SQLite semantics: ORDER BY may reference any
         // column in the FROM clause, or any projection alias.
         let plan = if !stmt.order_by.is_empty() {
-            insert_sort_below_top(plan, stmt.order_by.clone())
+            let terms = self.resolve_order_by_terms(&stmt.body, &stmt.order_by);
+            insert_sort_below_top(plan, terms)
         } else {
             plan
         };
@@ -66,6 +67,81 @@ impl<'a> Planner<'a> {
             self.scopes.pop();
         }
         Ok(plan)
+    }
+
+    /// Resolve ORDER BY terms so the Sort operator (which sits below the
+    /// Project) can evaluate them:
+    ///
+    /// 1. **Alias resolution** — a bare column reference that matches a
+    ///    projection alias (`ORDER BY parity` where the SELECT list has
+    ///    `v % 2 AS parity`) is replaced with the aliased expression.
+    ///    Previously the Sort evaluated the alias name against the input's
+    ///    column list, found nothing, and sorted on all-NULL keys — so
+    ///    `SELECT v % 2 AS parity, COUNT(*) ... GROUP BY v % 2 ORDER BY parity`
+    ///    silently kept first-seen group order instead of parity order.
+    /// 2. **Aggregate rewrite** — when the query is an aggregate query, the
+    ///    terms are rewritten with `rewrite_aggregates_and_groups` so
+    ///    `ORDER BY COUNT(*)` becomes `__agg_N` and `ORDER BY <group expr>`
+    ///    becomes the group-key column, both of which exist in the
+    ///    Aggregate operator's output.
+    fn resolve_order_by_terms(&mut self, body: &SelectBody, terms: &[OrderTerm]) -> Vec<OrderTerm> {
+        let s = match body {
+            SelectBody::Simple(s) => s,
+            SelectBody::Binary { .. } => {
+                // Set operations resolve their own ORDER BY against the
+                // combined output; no rewrite needed here.
+                return terms.to_vec();
+            }
+        };
+        terms
+            .iter()
+            .map(|t| {
+                let mut expr = t.expr.clone();
+                // 1. Alias resolution.
+                if let Expr::Column { table: None, name } = &expr {
+                    for c in &s.columns {
+                        if let ResultColumn::Expr { expr: ce, alias: Some(a) } = c {
+                            if a.eq_ignore_ascii_case(name) {
+                                expr = ce.clone();
+                                break;
+                            }
+                        }
+                    }
+                }
+                // 2. Aggregate rewrite (mirrors plan_simple_select).
+                let has_aggregates = self.expr_list_has_aggregates(&s.columns)
+                    || s.having.is_some()
+                    || !s.group_by.is_empty();
+                if has_aggregates {
+                    let aggregates = self
+                        .collect_aggregates(&s.columns, s.having.as_ref())
+                        .unwrap_or_default();
+                    let resolved_group_by: Vec<Expr> = s
+                        .group_by
+                        .iter()
+                        .map(|g| {
+                            if let Expr::Column { table: None, name } = g {
+                                for c in &s.columns {
+                                    if let ResultColumn::Expr { expr, alias: Some(a) } = c {
+                                        if a.eq_ignore_ascii_case(name) {
+                                            return expr.clone();
+                                        }
+                                    }
+                                }
+                            }
+                            g.clone()
+                        })
+                        .collect();
+                    expr = rewrite_aggregates_and_groups(
+                        &expr,
+                        &aggregates,
+                        &resolved_group_by,
+                        resolved_group_by.len(),
+                    );
+                }
+                OrderTerm { expr, order: t.order, nulls: t.nulls.clone() }
+            })
+            .collect()
     }
 
     fn plan_select_body(&mut self, body: &SelectBody) -> Result<Plan> {

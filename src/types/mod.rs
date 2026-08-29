@@ -2,4 +2,4 @@
 
 pub mod value;
 
-pub use value::{format_real, Affinity, Row, Value};
+pub use value::{format_real, values_sql_equal, Affinity, GroupKey, Row, Value};
