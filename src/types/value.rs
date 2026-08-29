@@ -219,26 +219,58 @@ impl Value {
     /// For larger Text/Blob values, the inner String/Vec allocation is
     /// unavoidable (we have to copy the bytes somewhere), but the outer
     /// Vec<u8> allocation is saved.
+    ///
+    /// ## Storage codec v2 (compact)
+    ///
+    /// Mirrors SQLite's record-format idea of size-classed integers and
+    /// varint lengths — the old format spent 9 bytes on EVERY integer and a
+    /// fixed 4-byte length prefix on every text/blob:
+    ///
+    ///   Null      -> [0x00]                          (1 byte)
+    ///   Integer   -> [0x01..=0x05] + body             (1-9 bytes)
+    ///                0x01: 0 (constant zero)
+    ///                0x02: i8   0x03: i16   0x04: i32   0x05: i64 (LE)
+    ///   Real      -> [0x06] + f64 LE                  (9 bytes)
+    ///   Text      -> [0x07] + uvarint(len) + bytes
+    ///   Blob      -> [0x08] + uvarint(len) + bytes
+    ///   RowidRef  -> [0x09]                           (1 byte; row-level
+    ///                marker for the rowid-alias column — decoded from the
+    ///                B+tree cell key, never stored)
+    ///
+    /// Typical OLTP row (small ints, short text) shrinks from 27-41 bytes
+    /// to 6-20 bytes, directly closing the ~3.5x DB-file-size gap vs SQLite.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Value::Null => out.push(0),
+            Value::Null => out.push(0x00),
             Value::Integer(i) => {
-                out.push(1);
-                out.extend_from_slice(&i.to_le_bytes());
+                if *i == 0 {
+                    out.push(0x01);
+                } else if *i >= i8::MIN as i64 && *i <= i8::MAX as i64 {
+                    out.push(0x02);
+                    out.push(*i as i8 as u8);
+                } else if *i >= i16::MIN as i64 && *i <= i16::MAX as i64 {
+                    out.push(0x03);
+                    out.extend_from_slice(&(*i as i16).to_le_bytes());
+                } else if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                    out.push(0x04);
+                    out.extend_from_slice(&(*i as i32).to_le_bytes());
+                } else {
+                    out.push(0x05);
+                    out.extend_from_slice(&i.to_le_bytes());
+                }
             }
             Value::Real(f) => {
-                out.push(2);
+                out.push(0x06);
                 out.extend_from_slice(&f.to_le_bytes());
             }
             Value::Text(s) => {
-                out.push(3);
-                let bytes = s.as_bytes();
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
+                out.push(0x07);
+                encode_uvarint(s.len() as u64, out);
+                out.extend_from_slice(s.as_bytes());
             }
             Value::Blob(b) => {
-                out.push(4);
-                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.push(0x08);
+                encode_uvarint(b.len() as u64, out);
                 out.extend_from_slice(b);
             }
         }
@@ -312,7 +344,9 @@ impl Value {
         out
     }
 
-    /// Decode a value from bytes. Returns (value, bytes consumed).
+    /// Decode a value from bytes (storage codec v2). Returns (value, bytes
+    /// consumed). The rowid marker 0x09 decodes as NULL at this level — the
+    /// row-level decoder (`decode_row*`) substitutes the B+tree cell key.
     pub fn decode(buf: &[u8]) -> Result<(Value, usize), &'static str> {
         if buf.is_empty() {
             return Err("empty buffer");
@@ -320,16 +354,39 @@ impl Value {
         let tag = buf[0];
         let rest = &buf[1..];
         match tag {
-            0 => Ok((Value::Null, 1)),
-            1 => {
+            0x00 => Ok((Value::Null, 1)),
+            0x01 => Ok((Value::Integer(0), 1)),
+            0x02 => {
+                if rest.is_empty() {
+                    return Err("truncated i8");
+                }
+                Ok((Value::Integer(rest[0] as i8 as i64), 2))
+            }
+            0x03 => {
+                if rest.len() < 2 {
+                    return Err("truncated i16");
+                }
+                let mut b = [0u8; 2];
+                b.copy_from_slice(&rest[..2]);
+                Ok((Value::Integer(i16::from_le_bytes(b) as i64), 3))
+            }
+            0x04 => {
+                if rest.len() < 4 {
+                    return Err("truncated i32");
+                }
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&rest[..4]);
+                Ok((Value::Integer(i32::from_le_bytes(b) as i64), 5))
+            }
+            0x05 => {
                 if rest.len() < 8 {
-                    return Err("truncated integer");
+                    return Err("truncated i64");
                 }
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&rest[..8]);
                 Ok((Value::Integer(i64::from_le_bytes(b)), 9))
             }
-            2 => {
+            0x06 => {
                 if rest.len() < 8 {
                     return Err("truncated real");
                 }
@@ -337,36 +394,65 @@ impl Value {
                 b.copy_from_slice(&rest[..8]);
                 Ok((Value::Real(f64::from_le_bytes(b)), 9))
             }
-            3 => {
-                if rest.len() < 4 {
-                    return Err("truncated text length");
-                }
-                let mut b = [0u8; 4];
-                b.copy_from_slice(&rest[..4]);
-                let len = u32::from_le_bytes(b) as usize;
-                if rest.len() < 4 + len {
+            0x07 => {
+                let (len, n) = decode_uvarint(rest)?;
+                let len = len as usize;
+                if rest.len() < n + len {
                     return Err("truncated text body");
                 }
-                let s = std::str::from_utf8(&rest[4..4 + len])
+                let s = std::str::from_utf8(&rest[n..n + len])
                     .map_err(|_| "invalid utf8 in text")?
                     .to_string();
-                Ok((Value::Text(s), 5 + len))
+                Ok((Value::Text(s), 1 + n + len))
             }
-            4 => {
-                if rest.len() < 4 {
-                    return Err("truncated blob length");
-                }
-                let mut b = [0u8; 4];
-                b.copy_from_slice(&rest[..4]);
-                let len = u32::from_le_bytes(b) as usize;
-                if rest.len() < 4 + len {
+            0x08 => {
+                let (len, n) = decode_uvarint(rest)?;
+                let len = len as usize;
+                if rest.len() < n + len {
                     return Err("truncated blob body");
                 }
-                Ok((Value::Blob(rest[4..4 + len].to_vec()), 5 + len))
+                Ok((Value::Blob(rest[n..n + len].to_vec()), 1 + n + len))
             }
+            // Rowid-alias marker: NULL at the Value level; the row decoder
+            // replaces it with the cell's rowid.
+            0x09 => Ok((Value::Null, 1)),
             _ => Err("unknown value tag"),
         }
     }
+}
+
+/// Encode a u64 as a LEB128 variable-length integer (1 byte for < 128,
+/// up to 9 bytes for the full u64 range). Used for Text/Blob lengths in
+/// the storage codec — short strings cost 1 byte instead of the old
+/// fixed 4-byte length prefix.
+pub fn encode_uvarint(mut n: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Decode a LEB128 u64 from the front of `buf`. Returns (value, bytes
+/// consumed).
+pub fn decode_uvarint(buf: &[u8]) -> Result<(u64, usize), &'static str> {
+    let mut n: u64 = 0;
+    let mut shift = 0u32;
+    for (i, &b) in buf.iter().enumerate() {
+        if shift >= 64 {
+            return Err("varint too long");
+        }
+        n |= ((b & 0x7f) as u64) << shift;
+        shift += 7;
+        if b & 0x80 == 0 {
+            return Ok((n, i + 1));
+        }
+    }
+    Err("truncated varint")
 }
 
 /// SQL type affinity (used in CREATE TABLE).

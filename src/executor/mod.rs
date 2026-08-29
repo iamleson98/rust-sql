@@ -22,7 +22,7 @@ use crate::schema::Table;
 use crate::sql::ast::*;
 use crate::storage::btree::{Btree, LookupResult};
 use crate::storage::pager::Pager;
-use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row, encode_row_into};
+use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row, encode_row_aliased, encode_row_aliased_into, encode_row_into};
 use crate::types::{Row, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -1170,8 +1170,10 @@ fn exec_scan(ctx: &mut ExecContext<'_>, table: Arc<Table>, alias: Option<String>
     let mut rows = Vec::new();
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
-    bt.scan_table_borrowed(|_rowid, payload| {
-        if let Ok(row) = decode_row(payload, table.n_columns()) {
+    let rowid_alias = table.rowid_alias;
+    let n_cols = table.n_columns();
+    bt.scan_table_borrowed(|rowid, payload| {
+        if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
             rows.push(row);
         }
         true
@@ -1747,8 +1749,9 @@ fn exec_aggregate_streaming_scan(
 
     if selective_eligible {
         // ==== Fully vectorized path: selective decode + direct indexing ====
-        bt.scan_table_borrowed(|_rowid, payload| {
-            if decode_row_selective(payload, n_cols, &wanted, &mut sel_buf).is_err() {
+        let rowid_alias = table.rowid_alias;
+        bt.scan_table_borrowed(|rowid, payload| {
+            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf).is_err() {
                 return true; // skip corrupt rows
             }
             // Build the group key from the decoded slice. Map each group-by
@@ -1785,9 +1788,10 @@ fn exec_aggregate_streaming_scan(
         })?;
     } else {
         // ==== General path: full decode + eval_row for whatever didn't resolve ====
-        bt.scan_table_borrowed(|_rowid, payload| {
+        let rowid_alias = table.rowid_alias;
+        bt.scan_table_borrowed(|rowid, payload| {
             row_buf.clear();
-            if decode_row_into(payload, n_cols, &mut row_buf).is_err() {
+            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
                 return true; // skip corrupt rows
             }
             // Apply the filter predicate inline (if any).
@@ -1984,9 +1988,10 @@ fn exec_aggregate_no_group_by(
         // Use scan_table_borrowed — bypasses Cell::decode's per-row Vec<u8>
         // allocation by passing &[u8] borrows directly into the page buffer.
         // For 10k rows, this saves 10k malloc+free pairs.
-        bt.scan_table_borrowed(|_rowid, payload| {
+        let rowid_alias = table.rowid_alias;
+        bt.scan_table_borrowed(|rowid, payload| {
             // Decode only the wanted columns.
-            if decode_row_selective(payload, n_cols, &wanted, &mut sel_buf).is_err() {
+            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf).is_err() {
                 return true;
             }
             // Apply the filter predicate, if any. We need a full row buffer
@@ -2046,9 +2051,10 @@ fn exec_aggregate_no_group_by(
         let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
         let root = ctx.table_root(&table);
         let mut bt = Btree::new(ctx.pager, root, false);
-        bt.scan_table_borrowed(|_rowid, payload| {
+        let rowid_alias = table.rowid_alias;
+        bt.scan_table_borrowed(|rowid, payload| {
             row_buf.clear();
-            if decode_row_into(payload, n_cols, &mut row_buf).is_err() {
+            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
                 return true; // skip corrupt rows
             }
             // Apply the filter predicate inline (if any).
@@ -2962,7 +2968,7 @@ fn exec_index_nested_loop_join(
             }
             let mut table_bt = Btree::new(ctx.pager, inner_root, false);
             if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                if let Ok(inner_row) = decode_row(&payload, n_inner_cols) {
+                if let Ok(inner_row) = decode_row(&payload, n_inner_cols, rowid, inner_table.rowid_alias) {
                     let mut combined = outer_row.clone();
                     combined.extend(inner_row);
                     out_rows.push(combined);
@@ -3053,7 +3059,7 @@ fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
     let row = match bt.lookup_table(rowid)? {
-        LookupResult::Found(payload) => decode_row(&payload, table.n_columns())?,
+        LookupResult::Found(payload) => decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?,
         LookupResult::NotFound => return Ok(ExecResult {
             columns: table.col_names.clone(),
             rows: Vec::new(),
@@ -3102,8 +3108,9 @@ fn exec_rowid_range(
     // decode_row itself still allocates a Vec<Value> per row (unavoidable
     // without restructuring the API to return iterators), but the payload
     // borrow eliminates one allocation per row.
-    bt.scan_table_range_borrowed(start, end, |_rowid, payload| {
-        if let Ok(row) = decode_row(payload, n_cols) {
+    let rowid_alias = table.rowid_alias;
+    bt.scan_table_range_borrowed(start, end, |rowid, payload| {
+        if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
             rows.push(row);
         }
         true
@@ -3160,7 +3167,7 @@ fn exec_index_lookup(
     for rowid in rowids {
         let mut table_bt = Btree::new(ctx.pager, table.root_page, false);
         if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-            rows.push(decode_row(&payload, table.n_columns())?);
+            rows.push(decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?);
         }
     }
 
@@ -3252,7 +3259,7 @@ fn exec_index_range(
     for rowid in rowids {
         let mut table_bt = Btree::new(ctx.pager, table.root_page, false);
         if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-            let row = decode_row(&payload, table.n_columns())?;
+            let row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
             if let Some(pred) = residual {
                 let v = eval_row(pred, &row, &plain_names, &ctx.params, &ctx.named_params)?;
                 if !v.is_truthy() {
@@ -3627,7 +3634,7 @@ fn exec_insert_one_row(
                 *current_root = bt.root;
                 ctx.set_table_root_lc(table_name_lc, *current_root);
                 if let Some(old_payload) = old_payload_opt {
-                    if let Ok(old_row) = decode_row(&old_payload, table.n_columns()) {
+                    if let Ok(old_row) = decode_row(&old_payload, table.n_columns(), existing_rowid, table.rowid_alias) {
                         for (idx, idx_root) in index_roots.iter_mut() {
                             let old_key = encode_index_key(idx, table, &old_row);
                             let mut ibt = Btree::new(ctx.pager, *idx_root, true);
@@ -3644,8 +3651,10 @@ fn exec_insert_one_row(
         }
     }
 
-    // Reuse the hoisted payload_buf. encode_row_into clears it first.
-    encode_row_into(full_row, payload_buf);
+    // Reuse the hoisted payload_buf. encode_row_aliased_into clears it first
+    // and elides the rowid-alias column to a 1-byte marker (its value lives
+    // in the B+tree cell key).
+    encode_row_aliased_into(full_row, table.rowid_alias, payload_buf);
     let payload: &[u8] = payload_buf;
     let old_payload_opt;
     {
@@ -3710,7 +3719,7 @@ fn exec_insert_one_row(
     // On conflict: delete the old row's index entries first.
     if let Some(old_payload) = old_payload_opt {
         if !index_roots.is_empty() {
-            if let Ok(old_row) = decode_row(&old_payload, table.n_columns()) {
+            if let Ok(old_row) = decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias) {
                 for (idx, idx_root) in index_roots.iter_mut() {
                     let old_key = encode_index_key(idx, table, &old_row);
                     let mut ibt = Btree::new(ctx.pager, *idx_root, true);
@@ -3771,7 +3780,7 @@ fn exec_upsert_row(
                 }
             };
             let n_cols = table.n_columns();
-            let old_row = match decode_row(&old_payload, n_cols) {
+            let old_row = match decode_row(&old_payload, n_cols, existing_rowid, table.rowid_alias) {
                 Ok(r) => r,
                 Err(_) => return Ok(InsertOutcome::Skipped),
             };
@@ -3821,7 +3830,7 @@ fn exec_upsert_row(
             // Rewrite the row: in-place when the payload size is unchanged,
             // otherwise delete + insert.
             payload_buf.clear();
-            encode_row_into(&new_row, payload_buf);
+            encode_row_aliased_into(&new_row, table.rowid_alias, payload_buf);
             {
                 let mut bt = Btree::new(ctx.pager, *current_root, false);
                 let did_in_place = bt.update_table(existing_rowid, payload_buf).unwrap_or(false);
@@ -3949,7 +3958,7 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
         }
         // NOT NULL + CHECK constraints on the updated row.
         enforce_row_constraints(&table, &new_row, &col_names, &ctx.params, &ctx.named_params)?;
-        let payload = encode_row(&new_row);
+        let payload = encode_row_aliased(&new_row, table.rowid_alias);
         let root = ctx.table_root(&table);
         let new_root;
         {
@@ -4139,7 +4148,7 @@ fn try_streaming_update(
         match bt.lookup_table(rowid)? {
             LookupResult::Found(payload) => {
                 if let Err(e) = process_update_row(
-                    &payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
+                    &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut returning_rows, returning,
                 ) {
@@ -4150,9 +4159,9 @@ fn try_streaming_update(
         }
         Ok::<(), crate::error::Error>(())
     } else if matches!(src, StreamingSource::RowidRange { .. }) {
-        bt.scan_table_range_borrowed(range_start, range_end, |_rowid, payload| {
+        bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
             if let Err(e) = process_update_row(
-                payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
+                payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut returning_rows, returning,
             ) {
@@ -4162,9 +4171,9 @@ fn try_streaming_update(
             true
         })
     } else {
-        bt.scan_table_borrowed(|_rowid, payload| {
+        bt.scan_table_borrowed(|rowid, payload| {
             if let Err(e) = process_update_row(
-                payload, n_cols, &mut row_buf, &mut new_row, &mut payload_buf,
+                payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut returning_rows, returning,
             ) {
@@ -4243,11 +4252,11 @@ fn try_streaming_update(
         if needs_old_payload {
             if let Some(old_payload) = old_payload_opt {
                 old_row_buf.clear();
-                if decode_row_into(&old_payload, n_cols, &mut old_row_buf).is_err() {
+                if decode_row_into(&old_payload, n_cols, *rowid, table.rowid_alias, &mut old_row_buf).is_err() {
                     continue;
                 }
                 new_row.clear();
-                if decode_row_into(new_payload, n_cols, &mut new_row).is_err() {
+                if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut new_row).is_err() {
                     continue;
                 }
                 for idx in &touched_indexes {
@@ -4287,6 +4296,7 @@ fn try_streaming_update(
 fn process_update_row(
     payload: &[u8],
     n_cols: usize,
+    rowid: i64,
     row_buf: &mut Vec<Value>,
     new_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
@@ -4301,15 +4311,10 @@ fn process_update_row(
     returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<()> {
     row_buf.clear();
-    if decode_row_into(payload, n_cols, row_buf).is_err() {
+    if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {
         return Ok(());
     }
-    // Extract rowid from the rowid-alias column (or _rowid_).
-    let rowid = if let Some(idx) = table.rowid_alias {
-        row_buf.get(idx).map(|v| v.as_integer()).unwrap_or(0)
-    } else {
-        0
-    };
+    // Rowid comes from the B+tree cell key (passed in by the caller).
     // Apply filter predicate (if any).
     if let Some(pred) = residual_pred {
         match eval_row(pred, row_buf, col_names, params, named_params) {
@@ -4333,7 +4338,7 @@ fn process_update_row(
     enforce_row_constraints(table, new_row, col_names, params, named_params)?;
     // Encode the new row.
     payload_buf.clear();
-    encode_row_into(new_row, payload_buf);
+    encode_row_aliased_into(new_row, table.rowid_alias, payload_buf);
     // RETURNING: project now (the row is final).
     if let Some(ret) = returning {
         returning_rows.push(project_returning_row(ret, new_row, col_names, params, named_params)?);
@@ -4353,12 +4358,16 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let mut deleted = 0i64;
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    let mut max_deleted: i64 = i64::MIN;
     for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else {
             return Err(Error::Unsupported("DELETE on a table without INTEGER PRIMARY KEY"));
         };
+        if rowid > max_deleted {
+            max_deleted = rowid;
+        }
         // RETURNING: project the pre-delete row.
         if let Some(ret) = returning {
             returning_rows.push(project_returning_row(ret, row, &col_names, &ctx.params, &ctx.named_params)?);
@@ -4377,6 +4386,20 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         }
         ctx.changes += 1;
         deleted += 1;
+    }
+    // Keep the cached max-rowid consistent: if we deleted the current max
+    // rowid, the cached value is stale. Invalidate it — the next INSERT
+    // rescans once and picks up the true max (matching SQLite's
+    // `next rowid = max(existing) + 1`, which REUSES rowids after the max
+    // row is deleted). Without this, a DELETE-all followed by inserts
+    // continued from the old max instead of restarting at 1.
+    if max_deleted != i64::MIN {
+        let key = table.name.to_ascii_lowercase();
+        if let Some(&cached) = ctx.max_rowids.get(&key) {
+            if max_deleted >= cached {
+                ctx.max_rowids.remove(&key);
+            }
+        }
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;

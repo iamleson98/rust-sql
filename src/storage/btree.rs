@@ -1033,6 +1033,16 @@ impl<'a> Btree<'a> {
 
     /// Split a leaf page. Returns the new page ID and the separator info.
     fn split_leaf(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
+        // Capture the new cell's identity before the merge below moves it.
+        let new_cell_key_rowid = new_cell.key();
+        let new_cell_key: Option<Vec<u8>> = if matches!(
+            new_cell,
+            Cell::IndexLeaf { .. } | Cell::IndexInterior { .. }
+        ) {
+            Some(new_cell.index_key().to_vec())
+        } else {
+            None
+        };
         // Read all existing cells + the new one, merged in sort order.
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
@@ -1069,7 +1079,73 @@ impl<'a> Btree<'a> {
         drop(page);
 
         let total = cells.len();
-        let mid = total / 2;
+        // ---- Split-point selection ----
+        //
+        // Mid split (default): the classic B-tree 50/50 split — best for
+        // random inserts, keeps both siblings half-full so either can
+        // absorb future inserts.
+        //
+        // APPEND-MODE split: when the new cell sorts AFTER every existing
+        // cell (a right-edge append — bulk loads, auto-increment
+        // INTEGER PRIMARY KEY, any monotonically increasing key), keep ALL
+        // existing cells in the old page and give the new page ONLY the
+        // new cell. Sequential inserts then fill pages to ~100% instead of
+        // leaving every left sibling frozen at 50% forever — for the 10k-row
+        // insert benchmark this halves the file size (the left-behind
+        // half-pages were the dominant on-disk waste). Mirrors SQLite's
+        // `balance_quick()` right-edge optimization.
+        //
+        // Detecting the append HERE (by comparing against the last cell)
+        // rather than threading a flag through the recursion also covers
+        // generic-path inserts that happen to land on the right edge.
+        let is_append = {
+            // cells was built by merging; the new cell is last iff its key
+            // is strictly greater than the previous last cell's. If the
+            // merge never hit the early-break, the new cell was pushed at
+            // the very end (see `cells.len() == n` above).
+            let new_is_last = cells.last().map(|c| {
+                if is_idx {
+                    c.index_key() == new_cell_key.as_ref().map(|k| k.as_slice()).unwrap_or(&[])
+                        && c.key() == new_cell_key_rowid
+                } else {
+                    c.key() == new_cell_key_rowid
+                }
+            }).unwrap_or(false);
+            // A true append also requires the cell before it to be an
+            // EXISTING cell (i.e. the new cell is strictly after all n
+            // originals). If the new cell equaled the last original's key
+            // the merge would have placed it after (cmp not Less), but that
+            // is a duplicate-key index insert, not an append — treat only
+            // strictly-after as append-mode.
+            new_is_last && {
+                let orig_last_before: Option<(Vec<u8>, i64)> = if n > 0 {
+                    let page_ref = self.pager.get_page(page_id)?;
+                    let borrowed = page_ref.lock();
+                    let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
+                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    Some((c.index_key().to_vec(), c.key()))
+                } else {
+                    None
+                };
+                match orig_last_before {
+                    None => true, // empty leaf: everything is an "append"
+                    Some((k, r)) => {
+                        if is_idx {
+                            // strictly greater than the original last entry
+                            let ord = new_cell_key
+                                .as_ref()
+                                .map(|nk| nk.as_slice().cmp(&k))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(new_cell_key_rowid.cmp(&r));
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            new_cell_key_rowid > r
+                        }
+                    }
+                }
+            }
+        };
+        let mid = if is_append && total > 1 { total - 1 } else { total / 2 };
 
         // Allocate a new leaf page.
         let new_page_id = self.pager.allocate_page()?;
@@ -1190,6 +1266,108 @@ impl<'a> Btree<'a> {
     //     Ok(InsertResult::Split { new_page: new_page_id, split_key })
     // }
 
+    /// If `child_id` is a LEAF page with zero cells, unlink it from its
+    /// parent `parent_id` and push it onto the pager freelist.
+    ///
+    /// Unlinking rules (parent is an interior page):
+    /// - Child referenced by a separator cell `(child, sep)`: remove that
+    ///   cell. The child's now-empty key range is covered by the next
+    ///   sibling (routing falls through to it, and inserts binary-search
+    ///   into the correct position).
+    /// - Child is the rightmost: the LAST separator cell `(prev, sep)`
+    ///   becomes the new rightmost child (remove the cell, set
+    ///   right_most = prev). If the parent has no cells, the empty child
+    ///   is its only child — leave it (a 0-cell interior with a rightmost
+    ///   pointer is valid and traversable).
+    ///
+    /// Interior children are never recycled (a 0-cell interior with a
+    /// rightmost pointer is left in place — one page, bounded waste, and
+    /// collapsing it requires full rebalancing).
+    fn maybe_recycle_empty_child(&mut self, parent_id: PageId, child_id: PageId) -> Result<()> {
+        if child_id == 0 || child_id == self.root {
+            return Ok(());
+        }
+        // Child must be an EMPTY leaf.
+        {
+            let child_ref = self.pager.get_page(child_id)?;
+            let borrowed = child_ref.lock();
+            match borrowed.page_type()? {
+                PageType::LeafTable | PageType::LeafIndex => {
+                    if borrowed.n_cells() != 0 {
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()), // interior child — don't recycle
+            }
+        }
+        // Scan the parent for the cell referencing child_id.
+        let (n_cells, pt, found_cell_idx) = {
+            let parent_ref = self.pager.get_page(parent_id)?;
+            let borrowed = parent_ref.lock();
+            let n = borrowed.n_cells();
+            let pt = borrowed.page_type()?;
+            let mut found = None;
+            for i in 0..n {
+                let cell_ptr = borrowed.cell_pointer(i) as usize;
+                let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                if c.left_child() == child_id {
+                    found = Some(i as usize);
+                    break;
+                }
+            }
+            (n, pt, found)
+        };
+        let header_offset = if parent_id == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+        match found_cell_idx {
+            Some(idx) => {
+                // Remove the separator cell slot.
+                let parent_ref = self.pager.get_page(parent_id)?;
+                let mut borrowed = parent_ref.lock();
+                let n_usize = n_cells as usize;
+                for i in idx..n_usize - 1 {
+                    let src = ptr_array_start + (i + 1) * 2;
+                    let dst = ptr_array_start + i * 2;
+                    let v = u16::from_be_bytes(borrowed.data[src..src + 2].try_into().unwrap());
+                    borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
+                }
+                borrowed.set_n_cells(n_cells - 1);
+                borrowed.dirty = true;
+            }
+            None => {
+                // Child is the rightmost. The last cell's left_child becomes
+                // the new rightmost.
+                if n_cells == 0 {
+                    return Ok(()); // only child — keep the empty leaf
+                }
+                let last_idx = n_cells as usize - 1;
+                let new_rightmost = {
+                    let parent_ref = self.pager.get_page(parent_id)?;
+                    let borrowed = parent_ref.lock();
+                    let cell_ptr = borrowed.cell_pointer(last_idx as u16) as usize;
+                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    c.left_child()
+                };
+                let parent_ref = self.pager.get_page(parent_id)?;
+                let mut borrowed = parent_ref.lock();
+                borrowed.set_right_most_pointer(new_rightmost);
+                // Remove the last cell slot (no shift needed — it's the tail).
+                borrowed.set_n_cells(n_cells - 1);
+                borrowed.dirty = true;
+            }
+        }
+        self.pager.note_dirty(parent_id);
+        // Free the empty leaf — the pager zeroes it and links it onto the
+        // freelist; the next allocate_page pops it instead of growing the
+        // file.
+        self.pager.free_page(child_id)?;
+        Ok(())
+    }
+
     /// Delete a (rowid) from a table B+tree. Does not rebalance (we leave
     /// pages underfull rather than risk concurrent-merge bugs).
     pub fn delete_table(&mut self, rowid: i64) -> Result<bool> {
@@ -1286,7 +1464,16 @@ impl<'a> Btree<'a> {
                     next
                 };
                 drop(page);
-                self.delete_from_page(child_id, rowid)
+                let deleted = self.delete_from_page(child_id, rowid)?;
+                if deleted {
+                    // A leaf that just became empty is unlinked from this
+                    // interior page and pushed onto the pager freelist, so
+                    // future inserts reuse it instead of growing the file
+                    // (mirrors SQLite's freelist; without it, delete-heavy
+                    // churn grows the file forever).
+                    self.maybe_recycle_empty_child(page_id, child_id)?;
+                }
+                Ok(deleted)
             }
             _ => Err(Error::corruption(format!(
                 "unexpected page type in delete: {:?}",
@@ -1792,7 +1979,11 @@ impl<'a> Btree<'a> {
                     next
                 };
                 drop(page);
-                self.delete_index_from_page(child_id, key, rowid)
+                let deleted = self.delete_index_from_page(child_id, key, rowid)?;
+                if deleted {
+                    self.maybe_recycle_empty_child(page_id, child_id)?;
+                }
+                Ok(deleted)
             }
             _ => Err(Error::corruption(format!(
                 "unexpected page type in index delete: {:?}",
@@ -2036,6 +2227,113 @@ mod tests {
     fn open_pager() -> Pager {
         let tmp = NamedTempFile::new().unwrap();
         Pager::open(tmp.path(), 256).unwrap()
+    }
+
+    #[test]
+    fn append_mode_split_fills_pages() {
+        // Sequential inserts must produce near-100% page fill: page count
+        // for N rows should be ~ceil(N * bytes / page_size), NOT 2x that.
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, false).unwrap();
+        let n = 20_000i64;
+        for i in 1..=n {
+            // ~30-byte payload → ~500 rows per 16 KiB page → ~40 pages.
+            bt.insert_table(i, b"aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        }
+        let pages = pager.n_pages();
+        // With mid splits this would be ~80+ pages; append splits ~40.
+        assert!(pages < 50, "expected < 50 pages for sequential inserts, got {}", pages);
+        // All rows present and ordered.
+        let mut seen = Vec::new();
+        bt.scan_table_borrowed(|rowid, _p| {
+            seen.push(rowid);
+            true
+        })
+        .unwrap();
+        assert_eq!(seen.len(), n as usize);
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn empty_leaves_recycled_on_delete() {
+        // Insert enough rows to build multiple leaves, delete them ALL,
+        // verify (a) every row is gone, (b) freed leaves are on the
+        // freelist, (c) re-inserting the same volume doesn't grow the file.
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, false).unwrap();
+        let n = 20_000i64;
+        for i in 1..=n {
+            bt.insert_table(i, b"aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        }
+        let pages_before = pager.n_pages();
+        assert!(pages_before > 5);
+        for i in 1..=n {
+            assert!(bt.delete_table(i).unwrap(), "delete {} failed", i);
+        }
+        // Tree must be empty.
+        let mut count = 0usize;
+        bt.scan_table_borrowed(|_rowid, _p| {
+            count += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(count, 0, "tree should be empty after deleting all rows");
+        // Freed leaves on the freelist.
+        assert!(
+            pager.freelist_count() > 0,
+            "freelist should be non-empty after deleting all rows (got {})",
+            pager.freelist_count()
+        );
+        // Re-insert the same volume: file must not grow.
+        for i in 1..=n {
+            bt.insert_table(i, b"aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        }
+        assert!(
+            pager.n_pages() <= pages_before,
+            "page count grew after churn: {} -> {}",
+            pages_before,
+            pager.n_pages()
+        );
+        // Spot-check rows.
+        for i in [1i64, 5000, 19999, 20000] {
+            assert!(matches!(bt.lookup_table(i).unwrap(), LookupResult::Found(_)));
+        }
+    }
+
+    #[test]
+    fn delete_rightmost_leaf_recycles() {
+        // Specifically exercise the rightmost-child unlink path: insert
+        // ranges so the rightmost leaf holds the highest rowids, then
+        // delete those and confirm the tree stays traversable.
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, false).unwrap();
+        for i in 1..=10_000i64 {
+            bt.insert_table(i, b"zzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap();
+        }
+        // Delete the tail range (rightmost leaf's rows).
+        for i in (9_000..=10_000).rev() {
+            assert!(bt.delete_table(i).unwrap());
+        }
+        // Remaining rows all present.
+        for i in 1..9_000i64 {
+            assert!(matches!(bt.lookup_table(i).unwrap(), LookupResult::Found(_)));
+        }
+        for i in 9_000..=10_000i64 {
+            assert!(matches!(bt.lookup_table(i).unwrap(), LookupResult::NotFound));
+        }
+        // Insert into the freed range again — reuses freed pages, ordering
+        // must still hold.
+        for i in 9_000..=10_000i64 {
+            bt.insert_table(i, b"zzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap();
+        }
+        let mut seen = Vec::new();
+        bt.scan_table_borrowed(|rowid, _p| {
+            seen.push(rowid);
+            true
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 10_000);
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

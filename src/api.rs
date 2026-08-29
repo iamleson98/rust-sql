@@ -922,7 +922,7 @@ impl Database {
                 let mut bt = Btree::new(ctx.pager, 0, false);
                 let mut to_delete = Vec::new();
                 bt.scan_table(|rowid, payload| {
-                    if let Ok(row) = decode_row(payload, 5) {
+                    if let Ok(row) = decode_row(payload, 5, 0, None) {
                         if let Some((kind, _n, tbl_name, _rootpage, _sql)) = crate::schema::decode_schema_row(&row) {
                             if kind == "index" && tbl_name.eq_ignore_ascii_case(&d.name) {
                                 to_delete.push(rowid);
@@ -989,7 +989,7 @@ fn delete_schema_row(pager: &Pager, kind: &str, name: &str) -> Result<()> {
     let mut bt = Btree::new(pager, 0, false);
     let mut to_delete = Vec::new();
     bt.scan_table(|rowid, payload| {
-        if let Ok(row) = decode_row(payload, 5) {
+        if let Ok(row) = decode_row(payload, 5, 0, None) {
             if let Some((k, n, _, _, _)) = crate::schema::decode_schema_row(&row) {
                 if k == kind && n.eq_ignore_ascii_case(name) {
                     to_delete.push(rowid);
@@ -1009,7 +1009,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     let mut bt = Btree::new(pager, 0, false);
     let mut entries = Vec::new();
     bt.scan_table(|_rowid, payload| {
-        if let Ok(row) = decode_row(payload, 5) {
+        if let Ok(row) = decode_row(payload, 5, 0, None) {
             entries.push(row);
         }
         true

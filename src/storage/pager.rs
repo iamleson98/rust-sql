@@ -245,6 +245,16 @@ impl Pager {
             )));
         }
         if FileHeader::magic(&header) != Some(&crate::storage::page::DB_MAGIC) {
+            // Distinguish "not a rustqlite file" from "old format version"
+            // so users get an actionable message.
+            let m = FileHeader::magic(&header).map(|m| String::from_utf8_lossy(m).into_owned()).unwrap_or_default();
+            if m.starts_with("RSQLDB") {
+                return Err(Error::corruption(format!(
+                    "unsupported database format version: {} (this build reads {};                      re-create the database or use the version that wrote it)",
+                    m,
+                    String::from_utf8_lossy(&crate::storage::page::DB_MAGIC)
+                )));
+            }
             return Err(Error::corruption("invalid magic header"));
         }
         let page_size = FileHeader::page_size(&header)?;
@@ -276,6 +286,12 @@ impl Pager {
 
     pub fn n_pages(&self) -> u32 {
         self.n_pages.load(Ordering::Acquire)
+    }
+
+    /// Number of pages currently on the freelist (available for reuse by
+    /// `allocate_page` without growing the file).
+    pub fn freelist_count(&self) -> u32 {
+        self.freelist_count.load(Ordering::Acquire)
     }
 
     pub fn schema_cookie(&self) -> u32 {
