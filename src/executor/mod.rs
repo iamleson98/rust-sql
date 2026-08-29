@@ -4127,6 +4127,13 @@ fn try_streaming_update(
         Scan { table: &'a Arc<Table>, filter: Option<&'a Expr> },
         RowidRange { table: &'a Arc<Table>, start: Option<&'a Expr>, end: Option<&'a Expr>, residual: Option<&'a Expr> },
         RowidLookup { table: &'a Arc<Table>, rowid: &'a Expr },
+        IndexRange {
+            table: &'a Arc<Table>,
+            index: &'a Arc<crate::schema::Index>,
+            start: Option<&'a (Expr, bool)>,
+            end: Option<&'a (Expr, bool)>,
+            residual: Option<&'a Expr>,
+        },
     }
     let src = match source {
         Plan::Scan { table: t, .. } => StreamingSource::Scan { table: t, filter: None },
@@ -4143,6 +4150,9 @@ fn try_streaming_update(
         Plan::RowidLookup { table: t, rowid, .. } => {
             StreamingSource::RowidLookup { table: t, rowid }
         }
+        Plan::IndexRange { table: t, index, start, end, residual, .. } => {
+            StreamingSource::IndexRange { table: t, index, start: start.as_ref(), end: end.as_ref(), residual: residual.as_ref() }
+        }
         _ => return Ok(None),
     };
 
@@ -4153,6 +4163,7 @@ fn try_streaming_update(
         StreamingSource::Scan { table: t, .. } => t.clone(),
         StreamingSource::RowidRange { table: t, .. } => t.clone(),
         StreamingSource::RowidLookup { table: t, .. } => t.clone(),
+        StreamingSource::IndexRange { table: t, .. } => t.clone(),
     };
     if src_table.name.to_ascii_lowercase() != table.name.to_ascii_lowercase() {
         return Ok(None);
@@ -4181,6 +4192,7 @@ fn try_streaming_update(
         StreamingSource::Scan { filter, .. } => *filter,
         StreamingSource::RowidRange { residual, .. } => *residual,
         StreamingSource::RowidLookup { .. } => None,
+        StreamingSource::IndexRange { residual, .. } => *residual,
     };
 
     // For RowidLookup, evaluate the rowid expression now.
@@ -4244,6 +4256,68 @@ fn try_streaming_update(
             }
             true
         })
+    } else if let StreamingSource::IndexRange { index, start, end, .. } = &src {
+        // IndexRange source: `UPDATE ... WHERE indexed_col > ?` (and
+        // BETWEEN / < / >= variants). Phase 1a scans the index between the
+        // encoded bounds collecting rowids; phase 1b fetches each row from
+        // the table B+tree and processes it through the same streaming
+        // path. Previously this shape fell through to the generic
+        // exec_update, which materialized every matching row (Vec<Value>
+        // per row) before updating.
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
+        let start_key: Option<(Vec<u8>, bool)> = match start {
+            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            None => None,
+        };
+        let end_key: Option<(Vec<u8>, bool)> = match end {
+            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            None => None,
+        };
+        let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+        let mut rowids: Vec<i64> = Vec::new();
+        {
+            let index_root = ctx.index_root(index);
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
+                // Exclusive lower bound: skip entries matching the bound key.
+                if let Some((k, false)) = &start_key {
+                    if cell_key.starts_with(k) {
+                        return true;
+                    }
+                }
+                // Upper bound: stop past it.
+                if let Some((k, inc)) = &end_key {
+                    match index_key_prefix_cmp(cell_key, k) {
+                        std::cmp::Ordering::Less => {}
+                        std::cmp::Ordering::Equal if *inc => {}
+                        _ => return false,
+                    }
+                }
+                rowids.push(rowid);
+                true
+            })?;
+        }
+        // Phase 1b: fetch rows by rowid and process. All reads — the tree
+        // isn't mutated until phase 2, so interleaving table lookups here
+        // is safe.
+        for rowid in rowids {
+            match bt.lookup_table(rowid)? {
+                LookupResult::Found(payload) => {
+                    if let Err(e) = process_update_row(
+                        &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
+                        assignments, &col_names, &params, &named_params, table,
+                        residual_pred, &mut updates, &mut returning_rows, returning,
+                    ) {
+                        first_error = Some(e);
+                        break;
+                    }
+                }
+                LookupResult::NotFound => {}
+            }
+        }
+        Ok::<(), crate::error::Error>(())
     } else {
         bt.scan_table_borrowed(|rowid, payload| {
             if let Err(e) = process_update_row(
