@@ -2569,21 +2569,31 @@ impl<'a> Btree<'a> {
                     return Ok(payload);
                 }
                 PageType::InteriorTable => {
+                    // Binary search over view cells (was: linear scan with
+                    // an allocating Cell::decode per cell).
                     let next = {
                         let borrowed = page.lock();
                         let n = borrowed.n_cells();
-                        let mut next = borrowed.right_most_pointer();
-                        for i in 0..n {
-                            let cell_ptr = borrowed.cell_pointer(i) as usize;
-                            let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                            if let Cell::TableInterior { left_child, key } = c {
-                                if rowid <= key {
-                                    next = left_child;
-                                    break;
-                                }
+                        let mut lo: u16 = 0;
+                        let mut hi: u16 = n;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2;
+                            let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                            let sep = decode_table_interior_key(&borrowed.data[cell_ptr..])
+                                .ok_or_else(|| Error::corruption("truncated interior cell"))?;
+                            if rowid <= sep {
+                                hi = mid;
+                            } else {
+                                lo = mid + 1;
                             }
                         }
-                        next
+                        if lo >= n {
+                            borrowed.right_most_pointer()
+                        } else {
+                            let cell_ptr = borrowed.cell_pointer(lo) as usize;
+                            decode_table_interior_child(&borrowed.data[cell_ptr..])
+                                .unwrap_or_else(|| borrowed.right_most_pointer())
+                        }
                     };
                     drop(page);
                     page_id = next;
@@ -2604,6 +2614,8 @@ impl<'a> Btree<'a> {
         match pt {
             PageType::LeafTable | PageType::LeafIndex => {
                 let n = page.lock().n_cells();
+                // Allocation-free binary search over cell views (the old
+                // code decoded an allocating Cell per probe).
                 let pos = {
                     let borrowed = page.lock();
                     let mut lo = 0;
@@ -2611,14 +2623,21 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if c.key() < rowid {
-                            lo = mid + 1;
-                        } else if c.key() > rowid {
-                            hi = mid;
+                        let k = if pt == PageType::LeafIndex {
+                            match decode_index_cell(&borrowed.data[cell_ptr..], false) {
+                                Some(v) => v.rowid,
+                                None => return Err(Error::corruption("truncated index cell")),
+                            }
                         } else {
-                            lo = mid;
-                            break;
+                            match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                                Some((k, _)) => k,
+                                None => return Err(Error::corruption("truncated rowid")),
+                            }
+                        };
+                        if k < rowid {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
                         }
                     }
                     lo
@@ -2630,13 +2649,21 @@ impl<'a> Btree<'a> {
                 let key_matches = {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                    c.key() == rowid
+                    if pt == PageType::LeafIndex {
+                        decode_index_cell(&borrowed.data[cell_ptr..], false)
+                            .map(|v| v.rowid == rowid)
+                            .unwrap_or(false)
+                    } else {
+                        varint::decode_signed(&borrowed.data[cell_ptr..])
+                            .map(|(k, _)| k == rowid)
+                            .unwrap_or(false)
+                    }
                 };
                 if !key_matches {
                     return Ok(false);
                 }
-                // Shift cell pointers left to remove the slot at `pos`.
+                // Shift cell pointers left to remove the slot at `pos` —
+                // one memmove (copy_within) instead of a per-element loop.
                 let header_offset = if page_id == 0 {
                     crate::storage::page::DB_HEADER_SIZE as usize
                 } else {
@@ -2647,12 +2674,10 @@ impl<'a> Btree<'a> {
                     let mut borrowed = page.lock();
                     let pos_usize = pos as usize;
                     let n_usize = n as usize;
-                    for i in pos_usize..n_usize - 1 {
-                        let src = ptr_array_start + (i + 1) * 2;
-                        let dst = ptr_array_start + i * 2;
-                        let v = u16::from_be_bytes(borrowed.data[src..src + 2].try_into().unwrap());
-                        borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
-                    }
+                    borrowed.data.copy_within(
+                        ptr_array_start + (pos_usize + 1) * 2..ptr_array_start + n_usize * 2,
+                        ptr_array_start + pos_usize * 2,
+                    );
                     borrowed.set_n_cells(n - 1);
                     borrowed.dirty = true;
                 }
@@ -2660,30 +2685,51 @@ impl<'a> Btree<'a> {
                 Ok(true)
             }
             PageType::InteriorTable | PageType::InteriorIndex => {
+                // Binary search over cell views (was: linear scan decoding
+                // an allocating Cell per cell). Convention: cell
+                // (left_child, sep) means left_child holds keys <= sep.
                 let child_id = {
                     let borrowed = page.lock();
                     let n = borrowed.n_cells();
-                    let mut next = borrowed.right_most_pointer();
-                    for i in 0..n {
-                        let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
-                        if let Cell::TableInterior { left_child, key } = c {
-                            if rowid <= key {
-                                next = left_child;
-                                break;
+                    let mut lo: u16 = 0;
+                    let mut hi: u16 = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                        let (sep, child) = if pt == PageType::InteriorIndex {
+                            match decode_index_cell(&borrowed.data[cell_ptr..], true) {
+                                Some(v) => (v.rowid, v.left_child),
+                                None => return Err(Error::corruption("truncated index interior cell")),
                             }
-                        }
-                        // For index interior cells, the layout differs but
-                        // the routing logic is the same: rowid <= key → go
-                        // to left_child. IndexInterior also stores left_child.
-                        if let Cell::IndexInterior { left_child, rowid: cell_rowid, .. } = c {
-                            if rowid <= cell_rowid {
-                                next = left_child;
-                                break;
+                        } else {
+                            match decode_table_interior_key(&borrowed.data[cell_ptr..]) {
+                                Some(k) => {
+                                    let ch = decode_table_interior_child(&borrowed.data[cell_ptr..])
+                                        .unwrap_or(0);
+                                    (k, ch)
+                                }
+                                None => return Err(Error::corruption("truncated interior cell")),
                             }
+                        };
+                        if rowid <= sep {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
                         }
                     }
-                    next
+                    if lo >= n {
+                        borrowed.right_most_pointer()
+                    } else {
+                        let cell_ptr = borrowed.cell_pointer(lo) as usize;
+                        if pt == PageType::InteriorIndex {
+                            decode_index_cell(&borrowed.data[cell_ptr..], true)
+                                .map(|v| v.left_child)
+                                .unwrap_or_else(|| borrowed.right_most_pointer())
+                        } else {
+                            decode_table_interior_child(&borrowed.data[cell_ptr..])
+                                .unwrap_or_else(|| borrowed.right_most_pointer())
+                        }
+                    }
                 };
                 drop(page);
                 let deleted = self.delete_from_page(child_id, rowid)?;
@@ -3234,12 +3280,11 @@ impl<'a> Btree<'a> {
             let mut borrowed = page.lock();
             let pos_usize = pos as usize;
             let n_usize = n as usize;
-            for i in pos_usize..n_usize - 1 {
-                let src = ptr_array_start + (i + 1) * 2;
-                let dst = ptr_array_start + i * 2;
-                let v = u16::from_be_bytes(borrowed.data[src..src + 2].try_into().unwrap());
-                borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
-            }
+            // One memmove instead of a per-element byte-swap loop.
+            borrowed.data.copy_within(
+                ptr_array_start + (pos_usize + 1) * 2..ptr_array_start + n_usize * 2,
+                ptr_array_start + pos_usize * 2,
+            );
             borrowed.set_n_cells(n - 1);
             borrowed.dirty = true;
         }
