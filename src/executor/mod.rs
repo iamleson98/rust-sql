@@ -23,6 +23,7 @@ use crate::planner::plan::*;
 use crate::schema::Table;
 use crate::sql::ast::*;
 use crate::storage::btree::{Btree, LookupResult};
+use crate::storage::page::PageId;
 use crate::storage::pager::Pager;
 use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row, encode_row_aliased, encode_row_aliased_into, encode_row_into};
 use crate::types::{Row, Value};
@@ -4339,6 +4340,69 @@ fn exec_index_range(
 // INSERT
 // ============================================================================
 
+/// Per-statement index maintenance state for the INSERT hot paths.
+///
+/// Replaces the old `Vec<(Arc<Index>, u32)>` tuple list with a struct that
+/// pre-resolves each index's column positions ONCE per statement (the old
+/// `encode_index_key` ran `table.find_column()` — a case-insensitive scan
+/// over the table's columns — for every indexed column of every row),
+/// carries a reusable key-encoding buffer (no per-row `Vec<u8>` alloc),
+/// and holds a validated APPEND HINT for the index B+tree so ascending
+/// bulk loads skip the root-to-leaf descent + binary search per entry.
+pub(crate) struct IndexMaintState {
+    pub idx: Arc<crate::schema::Index>,
+    pub root: u32,
+    /// Resolved column positions (`usize::MAX` = column dropped/renamed;
+    /// contributes nothing to the key, mirroring `encode_index_key`).
+    pub cols: Vec<usize>,
+    /// Pinned right-most index leaf from the previous append in this
+    /// statement (see `insert_index_append_hinted`).
+    pub hint: Option<PageId>,
+    /// Reusable order-key encoding buffer.
+    pub key_buf: Vec<u8>,
+}
+
+impl IndexMaintState {
+    /// Encode `row`'s index key into `buf` (cleared first) using the
+    /// pre-resolved column positions — zero allocations, no name lookups.
+    #[inline]
+    pub fn encode_key(&mut self, row: &[Value]) -> &[u8] {
+        self.key_buf.clear();
+        for &pos in &self.cols {
+            if let Some(v) = row.get(pos) {
+                v.encode_order_key_into(&mut self.key_buf);
+            }
+        }
+        &self.key_buf
+    }
+}
+
+/// Build the per-statement index maintenance states (resolved columns,
+/// current roots) for every index on `table`.
+pub(crate) fn make_index_states(
+    ctx: &ExecContext<'_>,
+    indexes: &[Arc<crate::schema::Index>],
+    table: &Table,
+) -> Vec<IndexMaintState> {
+    indexes
+        .iter()
+        .map(|idx| {
+            let cols: Vec<usize> = idx
+                .columns
+                .iter()
+                .map(|c| table.find_column(&c.name).unwrap_or(usize::MAX))
+                .collect();
+            IndexMaintState {
+                idx: idx.clone(),
+                root: ctx.index_root(idx),
+                cols,
+                hint: None,
+                key_buf: Vec::with_capacity(16),
+            }
+        })
+        .collect()
+}
+
 fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, columns: Option<Vec<usize>>, on_conflict: ConflictResolution, upsert: Option<&crate::sql::ast::UpsertClause>, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
     let target_indices: Vec<usize> = columns.unwrap_or_else(|| (0..table.n_columns()).collect());
     // Track the current root page — it may change if the B+tree splits.
@@ -4350,8 +4414,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     // Track current root for each index too (seeded from the override-aware
     // roots — the catalog snapshot may be stale after earlier splits).
-    let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> = indexes
-        .iter().map(|idx| (idx.clone(), ctx.index_root(idx))).collect();
+    let mut index_states = make_index_states(ctx, &indexes, &table);
 
     // Pre-compute the lower-cased table name ONCE — set_table_root and
     // set_max_rowid both call to_ascii_lowercase() per call, which
@@ -4442,11 +4505,19 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
                     None,
                     &table.col_names,
                 )?;
+                // Triggers may execute arbitrary SQL against this table
+                // through the generic path (which doesn't know about our
+                // append hints) — the pinned leaves may have split or been
+                // freed. Invalidate every hint; they re-pin on next use.
+                for st in index_states.iter_mut() {
+                    st.hint = None;
+                }
+                ctx.table_append_hint = None;
             }
 
             let outcome = exec_insert_one_row(
                 ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-                &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert, rowid_autogen,
+                &mut full_row, &mut payload_buf, &mut index_states, on_conflict, upsert, rowid_autogen,
             )?;
             let trigger_fired = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
             match outcome {
@@ -4478,14 +4549,19 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
                     None,
                     &table.col_names,
                 )?;
+                // Same hint invalidation as BEFORE triggers.
+                for st in index_states.iter_mut() {
+                    st.hint = None;
+                }
+                ctx.table_append_hint = None;
             }
         }
         // Write back any index-root moves (splits) to the context so the
         // NEXT statement descends from the current root — the catalog's
         // Arc<Index> still holds the CREATE-time root.
-        for (idx, root) in index_roots.iter() {
-            if ctx.index_root(idx) != *root {
-                ctx.set_index_root(&idx.name, *root);
+        for st in index_states.iter() {
+            if ctx.index_root(&st.idx) != st.root {
+                ctx.set_index_root(&st.idx.name, st.root);
             }
         }
         if !ctx.in_transaction && !ctx.deferred_flush {
@@ -4536,7 +4612,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
 
         let outcome = exec_insert_one_row(
             ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-            &mut full_row, &mut payload_buf, &mut index_roots, on_conflict, upsert, rowid_autogen,
+            &mut full_row, &mut payload_buf, &mut index_states, on_conflict, upsert, rowid_autogen,
         )?;
         match outcome {
             InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
@@ -4551,9 +4627,9 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         // Write back any index-root moves (splits) to the context so the
         // NEXT statement descends from the current root — the catalog's
         // Arc<Index> still holds the CREATE-time root.
-        for (idx, root) in index_roots.iter() {
-            if ctx.index_root(idx) != *root {
-                ctx.set_index_root(&idx.name, *root);
+        for st in index_states.iter() {
+            if ctx.index_root(&st.idx) != st.root {
+                ctx.set_index_root(&st.idx.name, st.root);
             }
         }
     if !ctx.in_transaction && !ctx.deferred_flush {
@@ -4644,8 +4720,7 @@ pub fn fast_insert_literal_rows(
     let mut current_root = ctx.table_root(table);
     let mut max_rowid = ctx.get_or_scan_max_rowid(table)?;
     let indexes = ctx.catalog().indexes_on_table(&table.name);
-    let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> =
-        indexes.iter().map(|idx| (idx.clone(), ctx.index_root(idx))).collect();
+    let mut index_states = make_index_states(ctx, &indexes, table);
     let table_name_lc = table.name.to_ascii_lowercase();
     let n_cols = table.n_columns();
     let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
@@ -4711,6 +4786,12 @@ pub fn fast_insert_literal_rows(
                 None,
                 &table.col_names,
             )?;
+            // Triggers may mutate this table through the generic path —
+            // invalidate all append hints (they re-pin on next use).
+            for st in index_states.iter_mut() {
+                st.hint = None;
+            }
+            ctx.table_append_hint = None;
         }
 
         let outcome = exec_insert_one_row(
@@ -4721,7 +4802,7 @@ pub fn fast_insert_literal_rows(
             &mut max_rowid,
             &mut full_row,
             &mut payload_buf,
-            &mut index_roots,
+            &mut index_states,
             crate::sql::ast::ConflictResolution::Abort,
             None,
             rowid_autogen,
@@ -4743,13 +4824,18 @@ pub fn fast_insert_literal_rows(
                 None,
                 &table.col_names,
             )?;
+            // Same hint invalidation as BEFORE triggers.
+            for st in index_states.iter_mut() {
+                st.hint = None;
+            }
+            ctx.table_append_hint = None;
         }
     }
 
     // Write back any index-root moves (splits).
-    for (idx, root) in index_roots.iter() {
-        if ctx.index_root(idx) != *root {
-            ctx.set_index_root(&idx.name, *root);
+    for st in index_states.iter() {
+        if ctx.index_root(&st.idx) != st.root {
+            ctx.set_index_root(&st.idx.name, st.root);
         }
     }
     Ok(inserted)
@@ -4762,8 +4848,7 @@ pub fn fast_insert_single_row(
 ) -> Result<i64> {
     // Look up indexes on this table once (same as exec_insert).
     let indexes = ctx.catalog().indexes_on_table(&table.name);
-    let mut index_roots: Vec<(Arc<crate::schema::Index>, u32)> =
-        indexes.iter().map(|idx| (idx.clone(), ctx.index_root(idx))).collect();
+    let mut index_states = make_index_states(ctx, &indexes, table);
 
     let table_name_lc = table.name.to_ascii_lowercase();
     let mut current_root = ctx.table_root(table);
@@ -4805,15 +4890,15 @@ pub fn fast_insert_single_row(
         &mut max_rowid,
         &mut full_row,
         &mut payload_buf,
-        &mut index_roots,
+        &mut index_states,
         crate::sql::ast::ConflictResolution::Abort,
         None,
         rowid_autogen,
     )?;
     // Write back index roots that moved (splits).
-    for (idx, root) in index_roots.iter() {
-        if ctx.index_root(idx) != *root {
-            ctx.set_index_root(&idx.name, *root);
+    for st in index_states.iter() {
+        if ctx.index_root(&st.idx) != st.root {
+            ctx.set_index_root(&st.idx.name, st.root);
         }
     }
     match outcome {
@@ -4830,7 +4915,7 @@ fn exec_insert_one_row(
     max_rowid: &mut i64,
     full_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
-    index_roots: &mut Vec<(Arc<crate::schema::Index>, u32)>,
+    index_states: &mut Vec<IndexMaintState>,
     on_conflict: ConflictResolution,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     rowid_autogen_hint: bool,
@@ -4877,11 +4962,11 @@ fn exec_insert_one_row(
     let upsert_target = match upsert {
         Some(u) if u.target.is_empty() => UpsertTarget::Any,
         Some(u) => {
-            let idx_pos = index_roots.iter().position(|(idx, _)| {
-                idx.unique
-                    && idx.columns.len() == u.target.len()
+            let idx_pos = index_states.iter().position(|st| {
+                st.idx.unique
+                    && st.idx.columns.len() == u.target.len()
                     && u.target.iter().all(|t| {
-                        idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&t.name))
+                        st.idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&t.name))
                     })
             });
             match idx_pos {
@@ -4921,12 +5006,17 @@ fn exec_insert_one_row(
     // UPSERT → DO NOTHING / DO UPDATE).
     let mut conflict_rowid: Option<i64> = None;
     let mut conflict_on_target = false;
-    for (i, (idx, idx_root)) in index_roots.iter().enumerate() {
-        if !idx.unique {
+    for i in 0..index_states.len() {
+        if !index_states[i].idx.unique {
             continue;
         }
-        let key_bytes = encode_index_key(idx, table, full_row);
-        let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+        // Any REPLACE/UPSERT path below mutates the index trees, so the
+        // append hint may go stale — drop it (it re-pins on the next
+        // plain insert).
+        index_states[i].hint = None;
+        let key_bytes = index_states[i].encode_key(full_row).to_vec();
+        let idx_root = index_states[i].root;
+        let mut ibt = Btree::new(ctx.pager, idx_root, true);
         let matches = ibt.lookup_index(&key_bytes)?;
         if !matches.is_empty() {
             conflict_rowid = Some(matches[0]);
@@ -4946,7 +5036,7 @@ fn exec_insert_one_row(
             if let Some(u) = upsert {
                 return exec_upsert_row(
                     ctx, table, table_name_lc, current_root, full_row, payload_buf,
-                    index_roots, existing_rowid, u,
+                    index_states, existing_rowid, u,
                 );
             }
         }
@@ -4965,11 +5055,11 @@ fn exec_insert_one_row(
                 ctx.set_table_root_lc(table_name_lc, *current_root);
                 if let Some(old_payload) = old_payload_opt {
                     if let Ok(old_row) = decode_row(&old_payload, table.n_columns(), existing_rowid, table.rowid_alias) {
-                        for (idx, idx_root) in index_roots.iter_mut() {
-                            let old_key = encode_index_key(idx, table, &old_row);
-                            let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                        for st in index_states.iter_mut() {
+                            let old_key = encode_index_key(&st.idx, table, &old_row);
+                            let mut ibt = Btree::new(ctx.pager, st.root, true);
                             ibt.delete_index(&old_key, existing_rowid)?;
-                            *idx_root = ibt.root;
+                            st.root = ibt.root;
                         }
                     }
                 }
@@ -5038,7 +5128,7 @@ fn exec_insert_one_row(
                             drop_payload(existing_payload);
                             return exec_upsert_row(
                                 ctx, table, table_name_lc, current_root, full_row, payload_buf,
-                                index_roots, rowid, u,
+                                index_states, rowid, u,
                             );
                         }
                     }
@@ -5064,23 +5154,31 @@ fn exec_insert_one_row(
     }
     // On conflict: delete the old row's index entries first.
     if let Some(old_payload) = old_payload_opt {
-        if !index_roots.is_empty() {
+        if !index_states.is_empty() {
             if let Ok(old_row) = decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias) {
-                for (idx, idx_root) in index_roots.iter_mut() {
-                    let old_key = encode_index_key(idx, table, &old_row);
-                    let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                for st in index_states.iter_mut() {
+                    let old_key = encode_index_key(&st.idx, table, &old_row);
+                    let mut ibt = Btree::new(ctx.pager, st.root, true);
                     ibt.delete_index(&old_key, rowid)?;
-                    *idx_root = ibt.root;
+                    st.root = ibt.root;
                 }
             }
         }
     }
     // Maintain indexes: insert an entry for each index on this table.
-    for (idx, idx_root) in index_roots.iter_mut() {
-        let key_bytes = encode_index_key(idx, table, full_row);
-        let mut ibt = Btree::new(ctx.pager, *idx_root, true);
-        ibt.insert_index(&key_bytes, rowid)?;
-        *idx_root = ibt.root;
+    // The per-index APPEND HINT skips the root-to-leaf descent + binary
+    // search on ascending bulk loads (validated per use; falls back to
+    // the full insert path automatically).
+    for st in index_states.iter_mut() {
+        // Copy the root/hint out first: `encode_key` holds a mutable
+        // borrow of `st` for as long as `key_bytes` is live.
+        let root = st.root;
+        let hint = st.hint.take();
+        let key_bytes = st.encode_key(full_row);
+        let mut ibt = Btree::new(ctx.pager, root, true);
+        let new_hint = ibt.insert_index_append_hinted(key_bytes, rowid, hint)?;
+        st.hint = new_hint;
+        st.root = ibt.root;
     }
     ctx.last_insert_rowid = rowid;
     ctx.changes += 1;
@@ -5107,7 +5205,7 @@ fn exec_upsert_row(
     current_root: &mut u32,
     full_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
-    index_roots: &mut Vec<(Arc<crate::schema::Index>, u32)>,
+    index_states: &mut Vec<IndexMaintState>,
     existing_rowid: i64,
     upsert: &crate::sql::ast::UpsertClause,
 ) -> Result<InsertOutcome> {
@@ -5189,18 +5287,20 @@ fn exec_upsert_row(
             }
 
             // Index maintenance: update entries whose key changed.
-            for (idx, idx_root) in index_roots.iter_mut() {
-                let old_key = encode_index_key(idx, table, &old_row);
-                let new_key = encode_index_key(idx, table, &new_row);
+            for st in index_states.iter_mut() {
+                let old_key = encode_index_key(&st.idx, table, &old_row);
+                let new_key = encode_index_key(&st.idx, table, &new_row);
                 if old_key == new_key {
                     continue;
                 }
-                let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                // The tree shape changes here — drop any append hint.
+                st.hint = None;
+                let mut ibt = Btree::new(ctx.pager, st.root, true);
                 ibt.delete_index(&old_key, existing_rowid)?;
-                *idx_root = ibt.root;
-                let mut ibt = Btree::new(ctx.pager, *idx_root, true);
+                st.root = ibt.root;
+                let mut ibt = Btree::new(ctx.pager, st.root, true);
                 ibt.insert_index(&new_key, existing_rowid)?;
-                *idx_root = ibt.root;
+                st.root = ibt.root;
             }
 
             // Replace full_row with the merged row for RETURNING.
