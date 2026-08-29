@@ -60,7 +60,7 @@ pub struct Database {
     root_overrides: RwLock<HashMap<String, u32>>,
     /// Max rowid per table (avoids O(n) scan on every INSERT).
     max_rowids: RwLock<HashMap<String, i64>>,
-    /// Prepared-statement cache: SQL text -> (Arc<Statement>, Option<Plan>).
+    /// Prepared-statement cache: SQL text → `CachedStmt`.
     /// Eliminates the parse+plan cost on repeated calls with the same SQL
     /// (the common case in real workloads: `INSERT INTO t VALUES (?)` is
     /// called N times in a loop, and `SELECT … WHERE id = ?` is called per
@@ -76,9 +76,13 @@ pub struct Database {
     /// SQLite. The `Plan` is `Clone`-cheap because it only holds `Arc`
     /// references internally.
     ///
+    /// `has_subqueries` is precomputed ONCE at plan time so the query path
+    /// doesn't re-walk the whole plan tree (which allocated a Vec of expr
+    /// references) on every execution.
+    ///
     /// RwLock so concurrent readers can hit the cache simultaneously; only
     /// a cache miss takes the brief write lock to insert.
-    stmt_cache: RwLock<HashMap<String, (Arc<Statement>, Option<Arc<crate::planner::plan::Plan>>)>>,
+    stmt_cache: RwLock<HashMap<String, CachedStmt>>,
     /// FIFO order of insertion into `stmt_cache`, used for eviction when the
     /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
     /// oldest entry and the next to be evicted.
@@ -109,6 +113,17 @@ pub struct Database {
 
 /// Default capacity of the statement cache.
 const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
+
+/// A cached prepared statement: the parsed AST, the plan (if any), and the
+/// precomputed `has_subqueries` flag (mirrors SQLite's OP_Once check —
+/// computed once at plan time instead of re-walking the plan tree, which
+/// allocated a Vec of expr references, on every execution).
+#[derive(Clone)]
+struct CachedStmt {
+    stmt: Arc<Statement>,
+    plan: Option<Arc<crate::planner::plan::Plan>>,
+    has_subqueries: bool,
+}
 
 impl Database {
     /// Open or create a database at the given path.
@@ -205,9 +220,10 @@ impl Database {
     }
 
     /// Look up the statement cache; on miss, parse + plan, store, and return.
-    /// Returns `(Arc<Statement>, Option<Plan>)` so the caller can:
+    /// Returns a `CachedStmt` clone (three refcount bumps) so the caller can:
     /// - For SELECT (query path): use just the Plan (cheap Arc clone).
     /// - For DML/DDL (execute path): use the Arc<Statement> (cheap Arc clone).
+    /// - The `has_subqueries` flag avoids re-walking the plan tree per query.
     ///
     /// The cached Plan is `Option<Plan>` and is cloned — cheap because
     /// `Plan` is `Clone` with only `Arc` references internally (no deep
@@ -216,24 +232,29 @@ impl Database {
     /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
     /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
     /// don't conflict.
-    fn get_or_cache_stmt(&self, sql: &str) -> Result<(Arc<Statement>, Option<Arc<crate::planner::plan::Plan>>)> {
+    fn get_or_cache_stmt(&self, sql: &str) -> Result<CachedStmt> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let stmt = parse(sql)?;
             let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
-            return Ok((Arc::new(stmt), plan_opt.map(Arc::new)));
+            let plan_arc = plan_opt.map(Arc::new);
+            let has_subq = plan_arc
+                .as_ref()
+                .map(|p| crate::executor::plan_has_subqueries(p))
+                .unwrap_or(false);
+            return Ok(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq });
         }
         // Fast path: read lock — concurrent readers can hit the cache
         // simultaneously without serializing.
         {
             let cache = self.stmt_cache.read();
-            if let Some((stmt, plan_opt)) = cache.get(sql) {
-                // Clone the Arc, NOT the Plan — for an INSERT plan with
+            if let Some(cached) = cache.get(sql) {
+                // Clone the Arcs, NOT the Plan — for an INSERT plan with
                 // Plan::Values { rows: Vec<Vec<Expr>> }, deep-cloning was
                 // 3+ heap allocations per cache hit. Arc clone is one atomic
                 // increment. For a 1k-statement INSERT batch, this saves
                 // ~3k heap allocations.
-                return Ok((stmt.clone(), plan_opt.clone()));
+                return Ok(cached.clone());
             }
         }
         // Miss: parse + plan + insert. Take the write lock to insert,
@@ -242,8 +263,8 @@ impl Database {
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
         let mut cache = self.stmt_cache.write();
         // Double-check: another thread may have inserted while we waited.
-        if let Some((s, p)) = cache.get(sql) {
-            return Ok((s.clone(), p.clone()));
+        if let Some(cached) = cache.get(sql) {
+            return Ok(cached.clone());
         }
         // Evict FIFO if at capacity.
         if cache.len() >= self.stmt_cache_capacity {
@@ -253,11 +274,15 @@ impl Database {
                 order.remove(0);
             }
         }
-        let stmt_arc = Arc::new(stmt);
         let plan_arc = plan_opt.map(Arc::new);
-        cache.insert(sql.to_string(), (stmt_arc.clone(), plan_arc.clone()));
+        let has_subq = plan_arc
+            .as_ref()
+            .map(|p| crate::executor::plan_has_subqueries(p))
+            .unwrap_or(false);
+        let entry = CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq };
+        cache.insert(sql.to_string(), entry.clone());
         self.stmt_cache_order.lock().push(sql.to_string());
-        Ok((stmt_arc, plan_arc))
+        Ok(entry)
     }
 
     /// Invalidate the statement cache. Called after any DDL statement
@@ -277,11 +302,11 @@ impl Database {
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         let is_ddl = is_ddl_sql(sql);
-        let (stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
+        let cached = self.get_or_cache_stmt(sql)?;
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
-        let stmt_ref: &Statement = &stmt;
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let stmt_ref: &Statement = &cached.stmt;
+        let plan_opt = cached.plan;
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -296,6 +321,7 @@ impl Database {
         // access — the lock is redundant. For a 1k-row INSERT batch (each
         // statement goes through this path), that's 4k avoided lock
         // acquisitions on `root_overrides` + `max_rowids`.
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
@@ -314,9 +340,10 @@ impl Database {
             // Substitute uncorrelated subqueries (scalar / IN / EXISTS) with
             // their materialized results before execution — mirrors
             // SQLite's OP_Once evaluation. Skipped entirely (zero cost)
-            // when the plan has no subquery expressions.
+            // when the plan has no subquery expressions (flag precomputed
+            // at plan time — no per-statement plan walk).
             let plan_local;
-            let plan_ref: &crate::planner::plan::Plan = if crate::executor::plan_has_subqueries(&plan) {
+            let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
                 plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
                 &plan_local
             } else {
@@ -366,13 +393,21 @@ impl Database {
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
-        let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
-        if let Some(plan) = plan_opt {
+        let cached = self.get_or_cache_stmt(sql)?;
+        if let Some(plan) = cached.plan {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             let txn_snap = self.txn_snapshot.lock().clone();
-            let root_overrides = self.root_overrides.read().clone();
-            let max_rowids = self.max_rowids.read().clone();
+            // Skip the HashMap clone (and its bucket-array allocation) when
+            // the maps are empty — `HashMap::new()` never allocates.
+            let root_overrides = {
+                let ro = self.root_overrides.read();
+                if ro.is_empty() { HashMap::new() } else { ro.clone() }
+            };
+            let max_rowids = {
+                let mr = self.max_rowids.read();
+                if mr.is_empty() { HashMap::new() } else { mr.clone() }
+            };
             let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -382,9 +417,10 @@ impl Database {
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
-            // Substitute uncorrelated subqueries before execution.
+            // Substitute uncorrelated subqueries before execution (flag
+            // precomputed at plan time — no per-query plan walk).
             let plan_local;
-            let plan_ref: &crate::planner::plan::Plan = if crate::executor::plan_has_subqueries(&plan) {
+            let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
                 plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
                 &plan_local
             } else {
@@ -423,13 +459,21 @@ impl Database {
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
-        let (_stmt, plan_opt) = self.get_or_cache_stmt(sql)?;
-        if let Some(plan) = plan_opt {
+        let cached = self.get_or_cache_stmt(sql)?;
+        if let Some(plan) = cached.plan {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             let txn_snap = self.txn_snapshot.lock().clone();
-            let root_overrides = self.root_overrides.read().clone();
-            let max_rowids = self.max_rowids.read().clone();
+            // Skip the HashMap clone (and its bucket-array allocation) when
+            // the maps are empty — `HashMap::new()` never allocates.
+            let root_overrides = {
+                let ro = self.root_overrides.read();
+                if ro.is_empty() { HashMap::new() } else { ro.clone() }
+            };
+            let max_rowids = {
+                let mr = self.max_rowids.read();
+                if mr.is_empty() { HashMap::new() } else { mr.clone() }
+            };
             let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
@@ -438,9 +482,10 @@ impl Database {
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
-            // Substitute uncorrelated subqueries before execution.
+            // Substitute uncorrelated subqueries before execution (flag
+            // precomputed at plan time — no per-query plan walk).
             let plan_local;
-            let plan_ref: &crate::planner::plan::Plan = if crate::executor::plan_has_subqueries(&plan) {
+            let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
                 plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
                 &plan_local
             } else {
@@ -456,7 +501,7 @@ impl Database {
                 *self.root_overrides.write() = std::mem::take(&mut ctx.root_overrides);
                 *self.max_rowids.write() = std::mem::take(&mut ctx.max_rowids);
             }
-            Ok((res.columns, res.rows))
+            Ok((res.columns.to_vec(), res.rows))
         } else {
             Ok((Vec::new(), Vec::new()))
         }

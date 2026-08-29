@@ -53,6 +53,13 @@ pub struct Table {
     /// the full row after defaults are applied; a NULL or false result
     /// rejects the write with `CHECK constraint failed: <table>`.
     pub check_exprs: Vec<crate::sql::ast::Expr>,
+    /// Cached unqualified column names (`["id", "name", ...]`), shared by
+    /// every executor fast path. Built once in `build_table`; cloning is a
+    /// single refcount bump instead of N `String` deep clones per query.
+    pub col_names: std::sync::Arc<[String]>,
+    /// Cached `"table.column"`-qualified names, matching what `exec_scan`
+    /// reports for an un-aliased scan. Built once in `build_table`.
+    pub qualified_col_names: std::sync::Arc<[String]>,
 }
 
 impl Table {
@@ -380,6 +387,12 @@ pub fn build_table(
         }
     }
 
+    let plain: Vec<String> = table_columns.iter().map(|c| c.name.clone()).collect();
+    let qualified: Vec<String> = table_columns
+        .iter()
+        .map(|c| format!("{}.{}", name, c.name))
+        .collect();
+
     Ok(Table {
         name: name.to_string(),
         columns: table_columns,
@@ -389,6 +402,8 @@ pub fn build_table(
         rowid_alias,
         create_sql: create_sql.to_string(),
         check_exprs,
+        col_names: plain.into(),
+        qualified_col_names: qualified.into(),
     })
 }
 

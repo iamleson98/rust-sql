@@ -170,13 +170,16 @@ impl<'a> ExecContext<'a> {
 
 /// Result of executing a plan: column names + rows.
 pub struct ExecResult {
-    pub columns: Vec<String>,
+    /// Output column names. `Arc<[String]>` so base-table operators can
+    /// return the cached names from `Table::col_names` / `qualified_col_names`
+    /// with a single refcount bump — no per-query `String` allocations.
+    pub columns: Arc<[String]>,
     pub rows: Vec<Row>,
 }
 
 impl ExecResult {
     pub fn empty() -> Self {
-        Self { columns: Vec::new(), rows: Vec::new() }
+        Self { columns: Arc::from(Vec::new()), rows: Vec::new() }
     }
 }
 
@@ -1175,8 +1178,22 @@ fn exec_scan(ctx: &mut ExecContext<'_>, table: Arc<Table>, alias: Option<String>
     // Column names: if there's an alias, prefix with "alias." so qualified
     // references in the planner/evaluator can find them. We also include
     // the unqualified name for backward compat.
+    //
+    // FAST PATH: when the effective prefix equals the table name (no alias,
+    // or an alias identical to the table), return the cached
+    // `qualified_col_names` built once in `build_table` — one refcount bump
+    // instead of N `format!()` allocations per query.
     let prefix = alias.as_deref().unwrap_or(&table.name);
-    let columns: Vec<String> = table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect();
+    let columns: Arc<[String]> = if prefix == table.name {
+        table.qualified_col_names.clone()
+    } else {
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect::<Vec<String>>()
+            .into()
+    };
     Ok(ExecResult {
         columns,
         rows,
@@ -1189,7 +1206,10 @@ fn exec_scan(ctx: &mut ExecContext<'_>, table: Arc<Table>, alias: Option<String>
 
 fn exec_values(ctx: &mut ExecContext<'_>, rows: &[Vec<Expr>]) -> Result<ExecResult> {
     let n = rows.first().map(|r| r.len()).unwrap_or(0);
-    let columns: Vec<String> = (0..n).map(|i| format!("column{}", i + 1)).collect();
+    let columns: Arc<[String]> = (0..n)
+        .map(|i| format!("column{}", i + 1))
+        .collect::<Vec<String>>()
+        .into();
     let mut out = Vec::with_capacity(rows.len());
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
@@ -1253,22 +1273,111 @@ fn exec_project(ctx: &mut ExecContext<'_>, input: &Plan, columns: &[ProjectExpr]
         out_columns.push(display);
         star_expansions.push(Vec::new());
     }
+
+    // ---- FAST PATH: pre-resolve bare column references to row indices ----
+    //
+    // For the overwhelmingly common `SELECT a, b, c FROM ...` shape, every
+    // projected expression is a plain `Expr::Column`. Resolving each one
+    // through `eval_row` → `EvalContext::lookup` costs a linear scan with
+    // case-insensitive string compares PER ROW PER COLUMN (~50-150 ns).
+    // We resolve each column to its index in `inner.columns` ONCE, then
+    // per row it's a Vec index + a Value clone (~2-5 ns).
+    //
+    // The resolution order exactly mirrors `EvalContext::lookup`:
+    // qualified match first (when the ref carries a table qualifier), then
+    // unqualified exact match, then suffix match on "prefix.name" columns.
+    let resolved: Vec<Option<usize>> = columns
+        .iter()
+        .map(|c| match &c.expr {
+            Expr::Column { table, name } if name != "*" => {
+                resolve_column_index(&inner.columns, table.as_deref(), name)
+            }
+            _ => None,
+        })
+        .collect();
+    let all_resolved = resolved.iter().all(|r| r.is_some())
+        && columns.iter().all(|c| !matches!(&c.expr, Expr::Column { name, .. } if name == "*"));
+
     let mut out_rows = Vec::with_capacity(inner.rows.len());
-    for row in &inner.rows {
-        let mut out = Vec::with_capacity(out_columns.len());
-        for (i, c) in columns.iter().enumerate() {
-            if let Expr::Column { name, .. } = &c.expr {
-                if name == "*" {
-                    out.extend(row.iter().cloned());
+    if all_resolved {
+        for row in &inner.rows {
+            let mut out = Vec::with_capacity(out_columns.len());
+            for r in &resolved {
+                // unwrap is safe: all_resolved guarantees Some
+                out.push(row[r.unwrap()].clone());
+            }
+            out_rows.push(out);
+        }
+    } else {
+        for row in &inner.rows {
+            let mut out = Vec::with_capacity(out_columns.len());
+            for (i, c) in columns.iter().enumerate() {
+                if let Some(Some(idx)) = resolved.get(i) {
+                    out.push(row[*idx].clone());
                     continue;
                 }
+                if let Expr::Column { name, .. } = &c.expr {
+                    if name == "*" {
+                        out.extend(row.iter().cloned());
+                        continue;
+                    }
+                }
+                out.push(eval_row(&c.expr, row, &inner.columns, &ctx.params, &ctx.named_params)?);
             }
-            out.push(eval_row(&c.expr, row, &inner.columns, &ctx.params, &ctx.named_params)?);
-            let _ = i;
+            out_rows.push(out);
         }
-        out_rows.push(out);
     }
-    Ok(ExecResult { columns: out_columns, rows: out_rows })
+    Ok(ExecResult { columns: out_columns.into(), rows: out_rows })
+}
+
+/// Resolve a column reference to an index in `col_names`, mirroring
+/// `EvalContext::lookup`'s resolution order:
+///
+/// 1. Qualified (`Some(table)`): look for `"table.column"` (case-insensitive),
+///    falling back to the unqualified rules.
+/// 2. Unqualified: exact case-insensitive match, then suffix match on
+///    `"prefix.name"` columns (e.g. ref `id` matches column `u.id`).
+///
+/// Returns `None` when the reference can't be statically resolved (caller
+/// falls back to the general evaluator, which yields NULL for unknown cols).
+fn resolve_column_index(
+    col_names: &[String],
+    table: Option<&str>,
+    name: &str,
+) -> Option<usize> {
+    if let Some(t) = table {
+        let tl = t.to_ascii_lowercase();
+        let nl = name.to_ascii_lowercase();
+        // Qualified exact match: "table.column".
+        for (i, n) in col_names.iter().enumerate() {
+            if n.len() == tl.len() + 1 + nl.len() {
+                let n_lower = n.to_ascii_lowercase();
+                if n_lower.as_str().get(tl.len()..tl.len() + 1) == Some(".")
+                    && n_lower[..tl.len()] == tl
+                    && &n_lower[tl.len() + 1..] == &nl
+                {
+                    return Some(i);
+                }
+            }
+        }
+        // Fall through to unqualified resolution (mirrors lookup()).
+    }
+    // Exact match first.
+    for (i, n) in col_names.iter().enumerate() {
+        if n.eq_ignore_ascii_case(name) {
+            return Some(i);
+        }
+    }
+    // Qualified match by suffix (e.g. "u.id" matches ref "id").
+    for (i, n) in col_names.iter().enumerate() {
+        if let Some(pos) = n.rfind('.') {
+            let suffix = &n[pos + 1..];
+            if suffix.eq_ignore_ascii_case(name) {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 /// Pretty-print an expression for column header display.
@@ -1301,13 +1410,15 @@ fn expr_display_name(e: &Expr, input_cols: &[String]) -> String {
 
 fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Result<ExecResult> {
     let mut inner = execute(input, ctx)?;
-    let params = ctx.params.clone();
-    let named_params = ctx.named_params.clone();
+    // Borrow params directly from ctx — `inner` is a local value, and the
+    // sort comparator only reads it, so no clone (1-2 allocs) is needed.
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
     let columns = inner.columns.clone();
     inner.rows.sort_by(|a, b| {
         for term in terms {
-            let va = eval_row(&term.expr, a, &columns, &params, &named_params).unwrap_or(Value::Null);
-            let vb = eval_row(&term.expr, b, &columns, &params, &named_params).unwrap_or(Value::Null);
+            let va = eval_row(&term.expr, a, &columns, params, named_params).unwrap_or(Value::Null);
+            let vb = eval_row(&term.expr, b, &columns, params, named_params).unwrap_or(Value::Null);
             let ord = va.cmp(&vb);
             let ord = if term.order == Order::Desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
@@ -1510,7 +1621,7 @@ fn exec_aggregate_streaming_scan(
         out_cols.push(format!("__agg_{}", i));
     }
 
-    Ok(ExecResult { columns: out_cols, rows: out_rows })
+    Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
 }
 
 /// Vectorized fast path for `SELECT <aggregates> FROM t [WHERE pred]`
@@ -1740,7 +1851,7 @@ fn exec_aggregate_no_group_by(
         out_row.push(finalize_agg(&states[i], &agg.func));
     }
     let out_cols: Vec<String> = aggregates.iter().enumerate().map(|(i, _)| format!("__agg_{}", i)).collect();
-    Ok(ExecResult { columns: out_cols, rows: vec![out_row] })
+    Ok(ExecResult { columns: out_cols.into(), rows: vec![out_row] })
 }
 
 /// True iff `expr` only references `Column` references that resolve
@@ -1868,7 +1979,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                 let mut row = Vec::with_capacity(1);
                 row.push(Value::Integer(n as i64));
                 return Ok(ExecResult {
-                    columns: vec!["__agg_0".to_string()],
+                    columns: Arc::from(vec!["__agg_0".to_string()]),
                     rows: vec![row],
                 });
             }
@@ -1958,7 +2069,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         out_cols.push(format!("__agg_{}", i));
     }
 
-    Ok(ExecResult { columns: out_cols, rows: out_rows })
+    Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
 }
 
 fn update_agg_state(state: &mut AggState, func: &str, v: &Value, distinct: bool) {
@@ -2074,8 +2185,8 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
 
 fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) -> Result<ExecResult> {
     let mut inner = execute(input, ctx)?;
-    let params = ctx.params.clone();
-    let named_params = ctx.named_params.clone();
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
     let n_rows = inner.rows.len();
 
     // For each window, compute values for each row.
@@ -2141,11 +2252,11 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
     }
 
     // Build column names: original + window aliases.
-    let mut out_cols = inner.columns.clone();
+    let mut out_cols: Vec<String> = inner.columns.to_vec();
     for w in windows {
         out_cols.push(w.alias.clone().unwrap_or_else(|| w.display_name.clone()));
     }
-    inner.columns = out_cols;
+    inner.columns = out_cols.into();
 
     Ok(inner)
 }
@@ -2185,8 +2296,8 @@ fn compute_window_value(
 fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: crate::planner::plan::JoinType, condition: &Option<Expr>) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
-    let mut combined_cols = left_res.columns.clone();
-    combined_cols.extend(right_res.columns.clone());
+    let mut combined_cols: Vec<String> = left_res.columns.to_vec();
+    combined_cols.extend(right_res.columns.iter().cloned());
     let n_left = left_res.columns.len();
     let n_right = right_res.columns.len();
     let params = ctx.params.clone();
@@ -2230,7 +2341,7 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
         }
     }
 
-    Ok(ExecResult { columns: combined_cols, rows: out_rows })
+    Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
 }
 
 /// Hash join: build a hash table on the smaller (right) side, then probe
@@ -2245,8 +2356,8 @@ fn exec_hash_join(
 ) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
-    let mut combined_cols = left_res.columns.clone();
-    combined_cols.extend(right_res.columns.clone());
+    let mut combined_cols: Vec<String> = left_res.columns.to_vec();
+    combined_cols.extend(right_res.columns.iter().cloned());
     let n_left = left_res.columns.len();
     let n_right = right_res.columns.len();
     let params = ctx.params.clone();
@@ -2412,7 +2523,7 @@ fn exec_hash_join(
         }
     }
 
-    Ok(ExecResult { columns: combined_cols, rows: out_rows })
+    Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
 }
 
 /// Extract equi-join key column pairs from a join condition.
@@ -2541,7 +2652,7 @@ fn exec_index_nested_loop_join(
 
     // Output columns: outer.cols ++ inner.cols (with inner prefix from alias).
     let inner_prefix = inner_alias.as_deref().unwrap_or(&inner_table.name);
-    let mut combined_cols = outer_res.columns.clone();
+    let mut combined_cols: Vec<String> = outer_res.columns.to_vec();
     combined_cols.extend(
         inner_table.columns.iter().map(|c| format!("{}.{}", inner_prefix, c.name)),
     );
@@ -2585,7 +2696,7 @@ fn exec_index_nested_loop_join(
         }
     }
 
-    Ok(ExecResult { columns: combined_cols, rows: out_rows })
+    Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
 }
 
 // ============================================================================
@@ -2669,12 +2780,12 @@ fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &
     let row = match bt.lookup_table(rowid)? {
         LookupResult::Found(payload) => decode_row(&payload, table.n_columns())?,
         LookupResult::NotFound => return Ok(ExecResult {
-            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            columns: table.col_names.clone(),
             rows: Vec::new(),
         }),
     };
     Ok(ExecResult {
-        columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+        columns: table.col_names.clone(),
         rows: vec![row],
     })
 }
@@ -2724,12 +2835,13 @@ fn exec_rowid_range(
     })?;
 
     // Apply residual predicate (strict < / > bounds, or additional filters).
-    let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    // Cached plain column names — one refcount bump, no per-query clones.
+    let columns: Arc<[String]> = table.col_names.clone();
     if let Some(res) = residual {
-        let params = ctx.params.clone();
-        let named_params = ctx.named_params.clone();
+        let params: &[Value] = &ctx.params;
+        let named_params = &ctx.named_params;
         rows.retain(|row| {
-            match eval_row(res, row, &columns, &params, &named_params) {
+            match eval_row(res, row, &columns, params, named_params) {
                 Ok(v) => v.is_truthy(),
                 Err(_) => false,
             }
@@ -2848,13 +2960,19 @@ fn exec_index_range(
     }
 
     // Fetch the rows by rowid and apply the residual predicate.
-    let prefix = alias.as_deref().unwrap_or(&table.name);
-    let columns: Vec<String> = table
-        .columns
-        .iter()
-        .map(|c| format!("{}.{}", prefix, c.name))
-        .collect();
-    let plain_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    // Cached qualified names — one refcount bump instead of N `format!()`s.
+    let columns: Arc<[String]> = if alias.as_deref().unwrap_or(&table.name) == table.name {
+        table.qualified_col_names.clone()
+    } else {
+        let prefix = alias.as_deref().unwrap_or(&table.name);
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect::<Vec<String>>()
+            .into()
+    };
+    let plain_names: Arc<[String]> = table.col_names.clone();
     let mut rows = Vec::with_capacity(rowids.len());
     for rowid in rowids {
         let mut table_bt = Btree::new(ctx.pager, table.root_page, false);
@@ -3061,12 +3179,12 @@ fn finish_insert_result(
 ) -> ExecResult {
     if let Some(ret) = returning {
         ExecResult {
-            columns: returning_column_names(ret, col_names),
+            columns: returning_column_names(ret, col_names).into(),
             rows: returning_rows,
         }
     } else {
         ExecResult {
-            columns: vec!["inserted".to_string()],
+            columns: Arc::from(vec!["inserted".to_string()]),
             rows: vec![vec![Value::Integer(inserted)]],
         }
     }
@@ -3607,12 +3725,12 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     }
     if let Some(ret) = returning {
         return Ok(ExecResult {
-            columns: returning_column_names(ret, &col_names),
+            columns: returning_column_names(ret, &col_names).into(),
             rows: returning_rows,
         });
     }
     Ok(ExecResult {
-        columns: vec!["updated".to_string()],
+        columns: Arc::from(vec!["updated".to_string()]),
         rows: vec![vec![Value::Integer(updated)]],
     })
 }
@@ -3876,12 +3994,12 @@ fn try_streaming_update(
     }
     if let Some(ret) = returning {
         return Ok(Some(ExecResult {
-            columns: returning_column_names(ret, &col_names),
+            columns: returning_column_names(ret, &col_names).into(),
             rows: returning_rows,
         }));
     }
     Ok(Some(ExecResult {
-        columns: vec!["updated".to_string()],
+        columns: Arc::from(vec!["updated".to_string()]),
         rows: vec![vec![Value::Integer(updated)]],
     }))
 }
@@ -3990,12 +4108,12 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
     }
     if let Some(ret) = returning {
         return Ok(ExecResult {
-            columns: returning_column_names(ret, &col_names),
+            columns: returning_column_names(ret, &col_names).into(),
             rows: returning_rows,
         });
     }
     Ok(ExecResult {
-        columns: vec!["deleted".to_string()],
+        columns: Arc::from(vec!["deleted".to_string()]),
         rows: vec![vec![Value::Integer(deleted)]],
     })
 }
