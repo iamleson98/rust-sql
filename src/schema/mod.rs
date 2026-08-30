@@ -201,6 +201,69 @@ impl Catalog {
         self.indexes.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
+    /// All views (name, view).
+    pub fn all_views(&self) -> Vec<(String, Arc<View>)> {
+        self.views.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// All triggers (name, trigger).
+    pub fn all_triggers(&self) -> Vec<(String, Arc<Trigger>)> {
+        self.triggers.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// Replace an index entry in place (ALTER TABLE column rewrites).
+    /// The per-table index list is refreshed too — the planner resolves
+    /// indexes through it.
+    pub fn replace_index(&mut self, name: &str, index: Index) -> Option<()> {
+        let key = name.to_ascii_lowercase();
+        if !self.indexes.contains_key(&key) {
+            return None;
+        }
+        let arc = Arc::new(index);
+        // Refresh indexes_by_table (holds its own Arc of the old entry).
+        let tbl_key = arc.table.to_ascii_lowercase();
+        if let Some(list) = self.indexes_by_table.get_mut(&tbl_key) {
+            for slot in list.iter_mut() {
+                if slot.name.eq_ignore_ascii_case(&arc.name) {
+                    *slot = Arc::clone(&arc);
+                }
+            }
+        }
+        self.indexes.insert(key, arc);
+        Some(())
+    }
+
+    /// Replace a view entry in place (ALTER TABLE column rewrites).
+    pub fn replace_view(&mut self, name: &str, view: View) -> Option<()> {
+        let key = name.to_ascii_lowercase();
+        if !self.views.contains_key(&key) {
+            return None;
+        }
+        self.views.insert(key, Arc::new(view));
+        Some(())
+    }
+
+    /// Replace a trigger entry in place (ALTER TABLE column rewrites).
+    /// The per-table trigger list is refreshed too — trigger firing
+    /// resolves through it.
+    pub fn replace_trigger(&mut self, name: &str, trigger: Trigger) -> Option<()> {
+        let key = name.to_ascii_lowercase();
+        if !self.triggers.contains_key(&key) {
+            return None;
+        }
+        let arc = Arc::new(trigger);
+        let tbl_key = arc.table.to_ascii_lowercase();
+        if let Some(list) = self.triggers_by_table.get_mut(&tbl_key) {
+            for slot in list.iter_mut() {
+                if slot.name.eq_ignore_ascii_case(&arc.name) {
+                    *slot = Arc::clone(&arc);
+                }
+            }
+        }
+        self.triggers.insert(key, arc);
+        Some(())
+    }
+
     pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         self.views.get(&name.to_ascii_lowercase()).cloned()
     }

@@ -287,6 +287,12 @@ pub struct Pager {
     /// Lives on the pager so both Database (api.rs) and the executor's
     /// static statement dispatcher can reach it through a shared &Pager.
     foreign_keys_enabled: AtomicBool,
+    /// Whether triggers may fire recursively (PRAGMA recursive_triggers).
+    /// SQLite's DEFAULT IS OFF: a trigger does not re-fire for statements
+    /// executed from inside another trigger. Our engine previously always
+    /// recursed (up to the depth cap), which broke the common
+    /// self-inserting AFTER INSERT trigger pattern.
+    recursive_triggers_enabled: AtomicBool,
     /// Lazy write-back mode (in-memory databases). When true, `flush()` does
     /// NOT write dirty pages to the backing temp file — it just resets the
     /// dirty bookkeeping (O(1)). Dirty pages are written lazily by cache
@@ -367,6 +373,7 @@ impl Pager {
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
+            recursive_triggers_enabled: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
             last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
             dirty_count_approx: AtomicUsize::new(0),
@@ -957,6 +964,17 @@ impl Pager {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.foreign_keys_enabled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Trigger recursion toggle (PRAGMA recursive_triggers). Default OFF —
+    /// SQLite's default: triggers do not re-fire from inside another
+    /// trigger's body.
+    pub fn set_recursive_triggers_enabled(&self, enabled: bool) {
+        self.recursive_triggers_enabled.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn recursive_triggers_enabled(&self) -> bool {
+        self.recursive_triggers_enabled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn cache_bytes(&self) -> usize {

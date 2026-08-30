@@ -183,13 +183,22 @@ fn alter_add_column_with_index_still_works() {
 }
 
 #[test]
-fn alter_rename_column_and_drop_parse_but_reject() {
+fn alter_rename_column_and_drop_work() {
+    // RENAME COLUMN and DROP COLUMN are now implemented (see
+    // tests/alter_column.rs for full coverage). The single-column
+    // rejection for DROP is still enforced here.
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    let err = db.execute("ALTER TABLE t RENAME COLUMN x TO y", []);
-    assert!(err.is_err(), "RENAME COLUMN is parsed but unsupported");
-    let err = db.execute("ALTER TABLE t DROP COLUMN x", []);
-    assert!(err.is_err(), "DROP COLUMN is parsed but unsupported");
-    // Table intact.
-    assert_eq!(db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0], Value::Integer(0));
+    db.execute("CREATE TABLE t (x INTEGER, y INTEGER)", []).unwrap();
+    db.execute("INSERT INTO t (x, y) VALUES (1, 2)", []).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN x TO a", []).unwrap();
+    let rows = db.query("SELECT a, y FROM t", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(1));
+    db.execute("ALTER TABLE t DROP COLUMN y", []).unwrap();
+    let rows = db.query("SELECT a FROM t", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(1));
+
+    // A one-column table refuses DROP COLUMN.
+    let mut db2 = Database::open_in_memory().unwrap();
+    db2.execute("CREATE TABLE u (only INTEGER)", []).unwrap();
+    assert!(db2.execute("ALTER TABLE u DROP COLUMN only", []).is_err());
 }

@@ -452,6 +452,849 @@ fn split_compound_cte(
     }
 }
 
+// ====================================================================
+// ALTER TABLE RENAME COLUMN / DROP COLUMN support
+// ====================================================================
+
+/// Serialize a `ColumnDef` back to SQL text.
+fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
+    use crate::sql::ast::ColumnConstraint as C;
+    let mut s = cd.name.clone();
+    if !cd.type_name.is_empty() {
+        s.push(' ');
+        s.push_str(&cd.type_name);
+    }
+    for c in &cd.constraints {
+        s.push(' ');
+        match c {
+            C::PrimaryKey { autoincrement, order } => {
+                s.push_str("PRIMARY KEY");
+                if *order == crate::sql::ast::Order::Desc {
+                    s.push_str(" DESC");
+                }
+                if *autoincrement {
+                    s.push_str(" AUTOINCREMENT");
+                }
+            }
+            C::NotNull => s.push_str("NOT NULL"),
+            C::Null => s.push_str("NULL"),
+            C::Unique => s.push_str("UNIQUE"),
+            C::Check(e) => s.push_str(&format!("CHECK ({})", expr_to_sql(e))),
+            C::Default(e) => s.push_str(&format!("DEFAULT {}", expr_to_sql(e))),
+            C::Collate(c) => s.push_str(&format!("COLLATE {}", c)),
+            C::References { table, columns, on_delete, on_update } => {
+                s.push_str(&format!("REFERENCES {}", table));
+                if !columns.is_empty() {
+                    s.push_str(&format!("({})", columns.join(", ")));
+                }
+                use crate::sql::ast::ForeignKeyAction::*;
+                let act = |a: &crate::sql::ast::ForeignKeyAction| match a {
+                    NoAction => "NO ACTION".to_string(),
+                    Restrict => "RESTRICT".to_string(),
+                    SetNull => "SET NULL".to_string(),
+                    SetDefault => "SET DEFAULT".to_string(),
+                    Cascade => "CASCADE".to_string(),
+                };
+                if !matches!(on_delete, NoAction) {
+                    s.push_str(&format!(" ON DELETE {}", act(on_delete)));
+                }
+                if !matches!(on_update, NoAction) {
+                    s.push_str(&format!(" ON UPDATE {}", act(on_update)));
+                }
+            }
+            C::GeneratedAs { expr, stored } => {
+                s.push_str(&format!(
+                    "GENERATED ALWAYS AS ({}){}",
+                    expr_to_sql(expr),
+                    if *stored { " STORED" } else { "" }
+                ));
+            }
+        }
+    }
+    s
+}
+
+fn indexed_columns_to_sql(cols: &[crate::sql::ast::IndexedColumn]) -> String {
+    cols.iter()
+        .map(|c| {
+            let mut s = c.name.clone();
+            if let Some(coll) = &c.collation {
+                s.push_str(&format!(" COLLATE {}", coll));
+            }
+            if c.order == crate::sql::ast::Order::Desc {
+                s.push_str(" DESC");
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Serialize a full CREATE TABLE statement from its parsed parts.
+fn create_table_to_sql(
+    name: &str,
+    columns: &[crate::sql::ast::ColumnDef],
+    constraints: &[crate::sql::ast::TableConstraint],
+    without_rowid: bool,
+    strict: bool,
+) -> String {
+    use crate::sql::ast::TableConstraint as T;
+    let mut parts: Vec<String> = columns.iter().map(column_def_to_sql).collect();
+    for tc in constraints {
+        let s = match tc {
+            T::PrimaryKey { columns } => format!("PRIMARY KEY ({})", indexed_columns_to_sql(columns)),
+            T::Unique(cols) => format!("UNIQUE ({})", indexed_columns_to_sql(cols)),
+            T::Check(e) => format!("CHECK ({})", expr_to_sql(e)),
+            T::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update } => {
+                let mut s = format!("FOREIGN KEY ({}) REFERENCES {}", columns.join(", "), ref_table);
+                if !ref_columns.is_empty() {
+                    s.push_str(&format!("({})", ref_columns.join(", ")));
+                }
+                use crate::sql::ast::ForeignKeyAction::*;
+                let act = |a: &crate::sql::ast::ForeignKeyAction| match a {
+                    NoAction => "NO ACTION".to_string(),
+                    Restrict => "RESTRICT".to_string(),
+                    SetNull => "SET NULL".to_string(),
+                    SetDefault => "SET DEFAULT".to_string(),
+                    Cascade => "CASCADE".to_string(),
+                };
+                if !matches!(on_delete, NoAction) {
+                    s.push_str(&format!(" ON DELETE {}", act(on_delete)));
+                }
+                if !matches!(on_update, NoAction) {
+                    s.push_str(&format!(" ON UPDATE {}", act(on_update)));
+                }
+                s
+            }
+        };
+        parts.push(s);
+    }
+    let mut sql = format!("CREATE TABLE {} ({})", name, parts.join(", "));
+    if without_rowid {
+        sql.push_str(" WITHOUT ROWID");
+    }
+    if strict {
+        sql.push_str(" STRICT");
+    }
+    sql
+}
+
+/// Rename `old` -> `new` inside an expression's column references.
+/// `qualifier` is this table's name (matches qualified refs); unqualified
+/// refs are table-local in CHECK/DEFAULT/GENERATED contexts.
+fn rename_column_in_expr(e: &mut Expr, old: &str, new: &str, qualifier: &str) {
+    match e {
+        Expr::Column { table, name } => {
+            let matches_qual = table.as_deref().map(|t| t.eq_ignore_ascii_case(qualifier)).unwrap_or(true);
+            if matches_qual && name.eq_ignore_ascii_case(old) {
+                *name = new.to_string();
+                if table.is_some() {
+                    // Keep the original qualifier casing; only the column name changes.
+                }
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            rename_column_in_expr(left, old, new, qualifier);
+            rename_column_in_expr(right, old, new, qualifier);
+        }
+        Expr::Unary { expr, .. } => rename_column_in_expr(expr, old, new, qualifier),
+        Expr::Function { args, .. } => {
+            for a in args.iter_mut() {
+                rename_column_in_expr(a, old, new, qualifier);
+            }
+        }
+        Expr::Row(items) => {
+            for it in items.iter_mut() {
+                rename_column_in_expr(it, old, new, qualifier);
+            }
+        }
+        Expr::Case { operand, whens, else_ } => {
+            if let Some(op) = operand {
+                rename_column_in_expr(op, old, new, qualifier);
+            }
+            for (w, t) in whens.iter_mut() {
+                rename_column_in_expr(w, old, new, qualifier);
+                rename_column_in_expr(t, old, new, qualifier);
+            }
+            if let Some(el) = else_ {
+                rename_column_in_expr(el, old, new, qualifier);
+            }
+        }
+        Expr::In { expr, source, .. } => {
+            rename_column_in_expr(expr, old, new, qualifier);
+            if let crate::sql::ast::InSource::List(items) = source {
+                for it in items.iter_mut() {
+                    rename_column_in_expr(it, old, new, qualifier);
+                }
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            rename_column_in_expr(expr, old, new, qualifier);
+            rename_column_in_expr(low, old, new, qualifier);
+            rename_column_in_expr(high, old, new, qualifier);
+        }
+        Expr::Cast { expr, .. } => rename_column_in_expr(expr, old, new, qualifier),
+        Expr::Collate { expr, .. } => rename_column_in_expr(expr, old, new, qualifier),
+        Expr::Like { expr, pattern, escape, .. } => {
+            rename_column_in_expr(expr, old, new, qualifier);
+            rename_column_in_expr(pattern, old, new, qualifier);
+            if let Some(e) = escape {
+                rename_column_in_expr(e, old, new, qualifier);
+            }
+        }
+        Expr::IsNull { expr, .. } => rename_column_in_expr(expr, old, new, qualifier),
+        Expr::Is { left, right, .. } => {
+            rename_column_in_expr(left, old, new, qualifier);
+            rename_column_in_expr(right, old, new, qualifier);
+        }
+        _ => {}
+    }
+}
+
+/// Does an expression reference column `old` (qualified by `qualifier` or
+/// unqualified)? Used by DROP COLUMN rejection checks.
+fn expr_references_column(e: &Expr, old: &str, qualifier: &str) -> bool {
+    match e {
+        Expr::Column { table, name } => {
+            let matches_qual = table.as_deref().map(|t| t.eq_ignore_ascii_case(qualifier)).unwrap_or(true);
+            matches_qual && name.eq_ignore_ascii_case(old)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_references_column(left, old, qualifier) || expr_references_column(right, old, qualifier)
+        }
+        Expr::Unary { expr, .. } => expr_references_column(expr, old, qualifier),
+        Expr::Function { args, filter, .. } => {
+            args.iter().any(|a| expr_references_column(a, old, qualifier))
+                || filter.as_ref().map(|f| expr_references_column(f, old, qualifier)).unwrap_or(false)
+        }
+        Expr::Row(items) => items.iter().any(|it| expr_references_column(it, old, qualifier)),
+        Expr::Case { operand, whens, else_ } => {
+            operand.as_ref().map(|o| expr_references_column(o, old, qualifier)).unwrap_or(false)
+                || whens.iter().any(|(w, t)| {
+                    expr_references_column(w, old, qualifier) || expr_references_column(t, old, qualifier)
+                })
+                || else_.as_ref().map(|el| expr_references_column(el, old, qualifier)).unwrap_or(false)
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            expr_references_column(expr, old, qualifier)
+                || expr_references_column(pattern, old, qualifier)
+                || escape.as_ref().map(|e| expr_references_column(e, old, qualifier)).unwrap_or(false)
+        }
+        Expr::IsNull { expr, .. } => expr_references_column(expr, old, qualifier),
+        Expr::Is { left, right, .. } => {
+            expr_references_column(left, old, qualifier) || expr_references_column(right, old, qualifier)
+        }
+        Expr::In { expr, source, .. } => {
+            expr_references_column(expr, old, qualifier)
+                || matches!(source, crate::sql::ast::InSource::List(items) if items.iter().any(|it| expr_references_column(it, old, qualifier)))
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_references_column(expr, old, qualifier)
+                || expr_references_column(low, old, qualifier)
+                || expr_references_column(high, old, qualifier)
+        }
+        Expr::Cast { expr, .. } => expr_references_column(expr, old, qualifier),
+        Expr::Collate { expr, .. } => expr_references_column(expr, old, qualifier),
+        _ => false,
+    }
+}
+
+/// Rewrite a CREATE TABLE statement, renaming column `old` to `new`
+/// everywhere it appears as THIS table's column: the column definition
+/// name, CHECK/DEFAULT/GENERATED expressions, table-constraint column
+/// lists, and this table's child-FK column lists. Parent-side references
+/// (REFERENCES other(...)) are left alone — other tables' FK clauses are
+/// rewritten separately.
+fn rename_column_in_create_table(
+    sql: &str,
+    table_name: &str,
+    old: &str,
+    new: &str,
+) -> Result<String> {
+    use crate::sql::ast::ColumnConstraint as C;
+    use crate::sql::ast::TableConstraint as T;
+    let stmt = crate::sql::parser::parse(sql)?;
+    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+        name, columns, constraints, without_rowid, strict, ..
+    }) = stmt
+    {
+        let mut columns = columns;
+        let mut constraints = constraints;
+        for cd in columns.iter_mut() {
+            if cd.name.eq_ignore_ascii_case(old) {
+                cd.name = new.to_string();
+            }
+            for c in cd.constraints.iter_mut() {
+                match c {
+                    C::Check(e) | C::Default(e) => rename_column_in_expr(e, old, new, table_name),
+                    C::GeneratedAs { expr, .. } => rename_column_in_expr(expr, old, new, table_name),
+                    C::References { table, columns, .. } => {
+                        // Child-side columns of THIS table's FK.
+                        if table.eq_ignore_ascii_case(table_name) {
+                            for cn in columns.iter_mut() {
+                                if cn.eq_ignore_ascii_case(old) {
+                                    *cn = new.to_string();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for tc in constraints.iter_mut() {
+            match tc {
+                T::PrimaryKey { columns } | T::Unique(columns) => {
+                    for ic in columns.iter_mut() {
+                        if ic.name.eq_ignore_ascii_case(old) {
+                            ic.name = new.to_string();
+                        }
+                    }
+                }
+                T::Check(e) => rename_column_in_expr(e, old, new, table_name),
+                T::ForeignKey { columns, ref_table, ref_columns, .. } => {
+                    for cn in columns.iter_mut() {
+                        if cn.eq_ignore_ascii_case(old) {
+                            *cn = new.to_string();
+                        }
+                    }
+                    if ref_table.eq_ignore_ascii_case(table_name) {
+                        for rc in ref_columns.iter_mut() {
+                            if rc.eq_ignore_ascii_case(old) {
+                                *rc = new.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(create_table_to_sql(&name.name, &columns, &constraints, without_rowid, strict))
+    } else {
+        Err(Error::corruption("schema row is not a CREATE TABLE statement"))
+    }
+}
+
+/// Rewrite a CREATE TABLE statement, renaming `old` -> `new` ONLY in
+/// REFERENCES <target_table> (...) parent-column lists (used when another
+/// table's column is renamed and this table points at it).
+fn rename_fk_refs_in_create_table(sql: &str, target_table: &str, old: &str, new: &str) -> Result<String> {
+    use crate::sql::ast::ColumnConstraint as C;
+    use crate::sql::ast::TableConstraint as T;
+    let stmt = crate::sql::parser::parse(sql)?;
+    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+        name, columns, constraints, without_rowid, strict, ..
+    }) = stmt
+    {
+        let mut columns = columns;
+        let mut constraints = constraints;
+        let rename_refs = |cols: &mut Vec<String>| {
+            for cn in cols.iter_mut() {
+                if cn.eq_ignore_ascii_case(old) {
+                    *cn = new.to_string();
+                }
+            }
+        };
+        for cd in columns.iter_mut() {
+            for c in cd.constraints.iter_mut() {
+                if let C::References { table, columns, .. } = c {
+                    if table.eq_ignore_ascii_case(target_table) {
+                        rename_refs(columns);
+                    }
+                }
+            }
+        }
+        for tc in constraints.iter_mut() {
+            if let T::ForeignKey { ref_table, ref_columns, .. } = tc {
+                if ref_table.eq_ignore_ascii_case(target_table) {
+                    rename_refs(ref_columns);
+                }
+            }
+        }
+        Ok(create_table_to_sql(&name.name, &columns, &constraints, without_rowid, strict))
+    } else {
+        Err(Error::corruption("schema row is not a CREATE TABLE statement"))
+    }
+}
+
+/// Rewrite a CREATE INDEX statement, renaming the indexed column.
+fn rename_column_in_create_index(sql: &str, old: &str, new: &str) -> Result<String> {
+    let stmt = crate::sql::parser::parse(sql)?;
+    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Index {
+        unique, name, table, columns, where_clause, ..
+    }) = stmt
+    {
+        let mut columns = columns;
+        for ic in columns.iter_mut() {
+            if ic.name.eq_ignore_ascii_case(old) {
+                ic.name = new.to_string();
+            }
+        }
+        let mut sql = format!(
+            "CREATE {}INDEX {} ON {} ({})",
+            if unique { "UNIQUE " } else { "" },
+            name,
+            table,
+            indexed_columns_to_sql(&columns)
+        );
+        if let Some(w) = &where_clause {
+            sql.push_str(&format!(" WHERE {}", expr_to_sql(w)));
+        }
+        Ok(sql)
+    } else {
+        Err(Error::corruption("schema row is not a CREATE INDEX statement"))
+    }
+}
+
+/// Position-aware identifier rewriter for trigger/view SQL. Tokenizes the
+/// text (strings, quoted identifiers, blob literals and comments are
+/// skipped verbatim) and replaces identifier tokens that match `old`
+/// (case-insensitively) in column positions referring to `table`:
+///
+///   - qualified: `table.old`, `alias.old`, `NEW.old`, `OLD.old`
+///   - `UPDATE OF old` (trigger event lists)
+///   - `INSERT INTO table (..., old, ...)` column lists
+///   - `UPDATE [table|alias] SET old = ...` assignment targets
+///
+/// Aliases of the target table are auto-detected from
+/// `FROM|JOIN <table> [AS] <ident>` patterns.
+///
+/// `unqualified`: when true, ALSO rename bare (unqualified) identifiers
+/// matching `old` — correct for single-table views over the target and for
+/// triggers ON the target (their unqualified names resolve to the trigger
+/// table per SQLite's lookup order). When false, only the disambiguated
+/// positions above are rewritten.
+fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unqualified: bool) -> String {
+    #[derive(Clone, Debug, PartialEq)]
+    enum Tk {
+        Ident(String),
+        Str(String),
+        Other(String),
+    }
+
+    fn tokenize(sql: &str) -> Vec<(Tk, usize, usize)> {
+        let b = sql.as_bytes();
+        let mut out: Vec<(Tk, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < b.len() {
+            let c = b[i];
+            let start = i;
+            if c == b'-' && i + 1 < b.len() && b[i + 1] == b'-' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push((Tk::Other(sql[start..i].to_string()), start, i));
+            } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push((Tk::Other(sql[start..i].to_string()), start, i));
+            } else if c == b'\'' {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push((Tk::Str(sql[start..i].to_string()), start, i));
+            } else if c == b'"' || c == b'`' || c == b'[' {
+                let close = if c == b'"' { b'"' } else if c == b'`' { b'`' } else { b']' };
+                i += 1;
+                while i < b.len() && b[i] != close {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+                out.push((Tk::Ident(sql[start + 1..i.saturating_sub(1)].to_string()), start, i));
+            } else if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
+                    i += 1;
+                }
+                out.push((Tk::Ident(sql[start..i].to_string()), start, i));
+            } else if c.is_ascii_digit() {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
+                    i += 1;
+                }
+                out.push((Tk::Other(sql[start..i].to_string()), start, i));
+            } else {
+                i += 1;
+                out.push((Tk::Other(sql[start..i].to_string()), start, i));
+            }
+        }
+        out
+    }
+
+    let toks = tokenize(sql);
+    let n = toks.len();
+    let as_str = |i: usize| -> Option<&str> {
+        match &toks.get(i)?.0 {
+            Tk::Ident(s) => Some(s.as_str()),
+            _ => None,
+        }
+    };
+    let is_kw = |s: &str| -> bool {
+        matches!(
+            s.to_ascii_uppercase().as_str(),
+            "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "NOT" | "VALUES" | "INSERT" | "UPDATE"
+                | "DELETE" | "SET" | "INTO" | "OF" | "JOIN" | "ON" | "AS" | "WHEN" | "THEN"
+                | "ELSE" | "CASE" | "END" | "IS" | "NULL" | "IN" | "BETWEEN" | "LIKE" | "GLOB"
+                | "REGEXP" | "MATCH" | "ESCAPE" | "CAST" | "COLLATE" | "ASC" | "DESC" | "IF"
+                | "EXISTS" | "BEGIN" | "BEFORE" | "AFTER" | "INSTEAD" | "FOR" | "EACH" | "ROW"
+                | "TRIGGER" | "VIEW" | "TABLE" | "INDEX" | "CREATE" | "REPLACE" | "CONFLICT"
+                | "DO" | "NOTHING" | "RETURNING" | "LIMIT" | "ORDER" | "BY" | "GROUP" | "HAVING"
+                | "DISTINCT" | "ALL" | "UNION" | "EXCEPT" | "INTERSECT" | "PRIMARY" | "KEY"
+                | "REFERENCES" | "DEFAULT" | "CHECK" | "UNIQUE" | "AUTOINCREMENT"
+        )
+    };
+
+    // Pass 1: aliases of the target table (FROM|JOIN <table> [AS] <ident>).
+    let mut aliases: Vec<String> = Vec::new();
+    for i in 0..n {
+        let up = as_str(i).map(|s| s.to_ascii_uppercase());
+        if up.as_deref() == Some("FROM") || up.as_deref() == Some("JOIN") {
+            if let Some(next) = as_str(i + 1) {
+                if next.eq_ignore_ascii_case(table) {
+                    if let Some(a) = as_str(i + 2) {
+                        if a.eq_ignore_ascii_case("AS") {
+                            if let Some(a2) = as_str(i + 3) {
+                                aliases.push(a2.to_string());
+                            }
+                        } else if !is_kw(a) {
+                            aliases.push(a.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let is_target_ref = |s: &str| -> bool {
+        s.eq_ignore_ascii_case(table) || aliases.iter().any(|a| s.eq_ignore_ascii_case(a))
+    };
+
+    // Pass 2: mark tokens to replace.
+    let mut replace = vec![false; n];
+    // 2a. Qualified references: <table|alias|NEW|OLD> . old — and bare
+    // references when `unqualified` is set (but never a keyword position,
+    // a table-name position, or a CREATE header).
+    for i in 0..n {
+        if let Some(s) = as_str(i) {
+            if s.eq_ignore_ascii_case(old) {
+                if unqualified && !is_kw(s) {
+                    // Bare occurrence: skip if it's qualified (handled
+                    // below), or it's a property of a dotted prefix
+                    // written the other way (t.old already covered), or it
+                    // sits right after a '.' (someone's column already).
+                    let prev_is_dot = i >= 1 && matches!(&toks[i - 1].0, Tk::Other(o) if o == ".");
+                    let next_is_dot = i + 1 < n && matches!(&toks[i + 1].0, Tk::Other(o) if o == ".");
+                    if !prev_is_dot && !next_is_dot {
+                        replace[i] = true;
+                    }
+                }
+                if i >= 2 {
+                    let prev_is_dot = matches!(&toks[i - 1].0, Tk::Other(o) if o == ".");
+                    if prev_is_dot {
+                        if let Some(q) = as_str(i - 2) {
+                            if is_target_ref(q)
+                                || q.eq_ignore_ascii_case("NEW")
+                                || q.eq_ignore_ascii_case("OLD")
+                            {
+                                replace[i] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2b. Statement-shape positions.
+    let mut i = 0usize;
+    while i < n {
+        let up = as_str(i).map(|s| s.to_ascii_uppercase());
+        match up.as_deref() {
+            Some("INSERT") => {
+                // INSERT [OR <conflict>] INTO <table> [ ( collist ) ]
+                let mut j = i + 1;
+                if as_str(j).map(|s| s.eq_ignore_ascii_case("OR")).unwrap_or(false) {
+                    j += 2; // skip OR + conflict action
+                }
+                if as_str(j).map(|s| s.eq_ignore_ascii_case("INTO")).unwrap_or(false) {
+                    j += 1;
+                    let target = as_str(j).map(is_target_ref).unwrap_or(false);
+                    j += 1;
+                    // Optional column list: '(' ident[, ident]* ')'
+                    if target {
+                        if matches!(&toks.get(j).map(|t| &t.0), Some(Tk::Other(o)) if o == "(") {
+                            j += 1;
+                            while j < n {
+                                if let Tk::Ident(s) = &toks[j].0 {
+                                    if s.eq_ignore_ascii_case(old) {
+                                        replace[j] = true;
+                                    }
+                                    j += 1;
+                                } else if matches!(&toks[j].0, Tk::Other(o) if o == ",") {
+                                    j += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                i = j;
+            }
+            Some("UPDATE") => {
+                // UPDATE [OR <conflict>] <table|OF> ...
+                let mut j = i + 1;
+                if as_str(j).map(|s| s.eq_ignore_ascii_case("OR")).unwrap_or(false) {
+                    j += 2;
+                }
+                if as_str(j).map(|s| s.eq_ignore_ascii_case("OF")).unwrap_or(false) {
+                    // Trigger UPDATE OF <col-list>: refers to the trigger's
+                    // table, which IS the target.
+                    j += 1;
+                    while j < n {
+                        if let Some(s) = as_str(j) {
+                            if s.eq_ignore_ascii_case(old) {
+                                replace[j] = true;
+                            }
+                            j += 1;
+                        } else if matches!(&toks[j].0, Tk::Other(o) if o == ",") {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i = j;
+                } else {
+                    let target = as_str(j).map(is_target_ref).unwrap_or(false);
+                    j += 1;
+                    // Scan forward for the SET keyword at this nesting
+                    // level; then rename LHS idents followed by '='.
+                    let mut depth = 0i32;
+                    let mut in_set = false;
+                    while j < n {
+                        match &toks[j].0 {
+                            Tk::Other(o) if o == "(" => {
+                                depth += 1;
+                                j += 1;
+                            }
+                            Tk::Other(o) if o == ")" => {
+                                depth -= 1;
+                                if depth < 0 {
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            Tk::Ident(s) if depth == 0 => {
+                                let u = s.to_ascii_uppercase();
+                                if u == "SET" {
+                                    in_set = true;
+                                    j += 1;
+                                } else if in_set && (u == "WHERE" || u == "RETURNING" || u == "ORDER" || u == "LIMIT") {
+                                    break;
+                                } else if in_set && s.eq_ignore_ascii_case(old) {
+                                    // LHS of an assignment? next token '='
+                                    if matches!(&toks.get(j + 1).map(|t| &t.0), Some(Tk::Other(o)) if o == "=")
+                                        && target
+                                    {
+                                        replace[j] = true;
+                                    }
+                                    j += 1;
+                                } else {
+                                    j += 1;
+                                }
+                            }
+                            _ => j += 1,
+                        }
+                    }
+                    i = j;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // Pass 3: splice.
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut last = 0usize;
+    for (idx, (_tk, start, end)) in toks.iter().enumerate() {
+        if replace[idx] {
+            out.push_str(&sql[last..*start]);
+            out.push_str(new);
+            last = *end;
+        }
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+
+/// Is a view's SELECT a single-table read of `table` (no joins, no
+/// subqueries)? Then every unqualified column in it resolves to `table`.
+fn view_is_single_table_over(select: &crate::sql::ast::SelectStatement, table: &str) -> bool {
+    use crate::sql::ast::{SelectBody, TableExpression};
+    fn body_single(b: &SelectBody, table: &str) -> bool {
+        match b {
+            SelectBody::Simple(s) => match &s.from {
+                Some(TableExpression::Table { name, .. }) => name.eq_ignore_ascii_case(table),
+                _ => false,
+            },
+            SelectBody::Binary { left, right, .. } => body_single(left, table) && body_single(right, table),
+        }
+    }
+    body_single(&select.body, table)
+}
+
+/// Rewrite trigger/view schema rows whose SQL references the renamed
+/// column of `table`. The catalog entries and the persisted schema rows
+/// are both updated.
+fn rewrite_object_sql_column_refs(
+    pager: &Pager,
+    catalog: &mut Catalog,
+    table: &str,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    let mut schema_updates: Vec<(i64, Vec<Value>)> = Vec::new();
+    {
+        let mut bt = Btree::new(pager, 0, false);
+        bt.scan_table(|rowid, payload| {
+            if let Ok(row) = decode_row(payload, 5, 0, None) {
+                if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+                    if (kind == "view" || kind == "trigger") && !sql.is_empty() {
+                        // Views: rename bare references only when the view
+                        // reads exactly this table (unqualified names then
+                        // resolve to it). Triggers on this table: bare
+                        // references resolve to it.
+                        let unq = if kind == "trigger" {
+                            tbl_name.eq_ignore_ascii_case(table)
+                        } else {
+                            catalog
+                                .get_view(&name)
+                                .map(|v| view_is_single_table_over(&v.select, table))
+                                .unwrap_or(false)
+                        };
+                        let new_sql = rename_column_in_object_sql(&sql, table, old, new, unq);
+                        if new_sql != sql {
+                            schema_updates.push((
+                                rowid,
+                                crate::schema::encode_schema_row(&kind, &name, &tbl_name, rootpage, &new_sql),
+                            ));
+                        }
+                    }
+                }
+            }
+            true
+        })?;
+    }
+    // Apply schema-row rewrites.
+    {
+        let mut bt = Btree::new(pager, 0, false);
+        for (rowid, row) in &schema_updates {
+            let payload = crate::storage::row_codec::encode_row(row);
+            let did = bt.update_table(*rowid, &payload).unwrap_or(false);
+            if !did {
+                bt.delete_table(*rowid)?;
+                bt.insert_table(*rowid, &payload)?;
+            }
+        }
+    }
+    // Refresh catalog entries (re-parse from the new SQL).
+    for (rowid, row) in &schema_updates {
+        let _ = rowid;
+        if let Some((kind, _name, _tbl, _root, sql)) = crate::schema::decode_schema_row(row) {
+            if let Ok(stmt) = crate::sql::parser::parse(&sql) {
+                match stmt {
+                    crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::View {
+                        name, columns, select, ..
+                    }) => {
+                        let vname = name.name.clone();
+                        catalog.replace_view(
+                            &vname,
+                            crate::schema::View {
+                                name: vname.clone(),
+                                columns,
+                                select: *select,
+                                create_sql: sql.to_string(),
+                            },
+                        );
+                    }
+                    crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Trigger(ct)) => {
+                        let tname2 = ct.name.clone();
+                        catalog.replace_trigger(
+                            &tname2,
+                            crate::schema::Trigger {
+                                name: tname2.clone(),
+                                table: ct.table.clone(),
+                                when: ct.when,
+                                events: ct.events,
+                                for_each_row: ct.for_each_row,
+                                when_clause: ct.when_clause,
+                                body: ct.body,
+                                create_sql: sql.to_string(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does a trigger/view's stored SQL reference column `name` of `table`?
+/// Conservative: any qualified reference (table/alias/NEW/OLD-qualified),
+/// UPDATE OF list entry, or INSERT column-list entry counts.
+fn object_sql_references_column(sql: &str, table: &str, name: &str, unqualified: bool) -> bool {
+    // Reuse the rewriter machinery: rewrite to a sentinel name and see if
+    // any position changed.
+    let probe = rename_column_in_object_sql(sql, table, name, "\u{1}__renamed__\u{1}", unqualified);
+    probe != sql
+}
+
+/// Remove a column definition from a CREATE TABLE statement, returning the
+/// new SQL. Returns `None` when the column isn't found.
+fn drop_column_from_create_table(sql: &str, name: &str) -> Result<Option<String>> {
+    let stmt = crate::sql::parser::parse(sql)?;
+    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+        name: tname,
+        columns,
+        constraints,
+        without_rowid,
+        strict,
+        ..
+    }) = stmt
+    {
+        let before = columns.len();
+        let columns: Vec<crate::sql::ast::ColumnDef> = columns
+            .into_iter()
+            .filter(|c| !c.name.eq_ignore_ascii_case(name))
+            .collect();
+        if columns.len() == before {
+            return Ok(None);
+        }
+        Ok(Some(create_table_to_sql(
+            &tname.name,
+            &columns,
+            &constraints,
+            without_rowid,
+            strict,
+        )))
+    } else {
+        Err(Error::corruption("schema row is not a CREATE TABLE statement"))
+    }
+}
+
+
 impl Database {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -2378,6 +3221,9 @@ impl Database {
         }
     }
 
+
+
+
     /// ALTER TABLE — RENAME TO (catalog + schema row rewrite, index
     /// tbl_name fixups) and ADD COLUMN (catalog + schema rewrite +
     /// physical back-fill of the new column's default into existing rows,
@@ -2530,9 +3376,14 @@ impl Database {
                 if !default_value.is_null() {
                     let n_cols = table.n_columns();
                     let alias = table.rowid_alias;
+                    // LIVE root — the catalog Arc's root_page can lag a
+                    // recent split (sync_schema_roots persists new roots to
+                    // schema rows; the in-memory Arc keeps the old value
+                    // until the table is re-fetched).
+                    let live_root = ctx.table_root(&table);
                     let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
                     {
-                        let mut bt = Btree::new(ctx.pager, root, false);
+                        let mut bt = Btree::new(ctx.pager, live_root, false);
                         bt.scan_table(|rowid, payload| {
                             if let Ok(mut row) = decode_row(payload, n_cols, rowid, alias) {
                                 row.push(default_value.clone());
@@ -2542,7 +3393,7 @@ impl Database {
                             true
                         })?;
                     }
-                    let mut bt = Btree::new(ctx.pager, root, false);
+                    let mut bt = Btree::new(ctx.pager, live_root, false);
                     for (rowid, payload) in updates {
                         let did = bt.update_table(rowid, &payload).unwrap_or(false);
                         if !did {
@@ -2550,16 +3401,343 @@ impl Database {
                             bt.insert_table(rowid, &payload)?;
                         }
                     }
-                    if bt.root != root {
+                    if bt.root != live_root {
                         ctx.set_table_root(&table.name, bt.root);
                     }
                 }
                 ctx.pager.flush()?;
                 Ok(())
             }
-            AlterAction::RenameColumn { .. } | AlterAction::DropColumn { .. } => Err(
-                Error::Unsupported("ALTER TABLE RENAME COLUMN / DROP COLUMN"),
-            ),
+            AlterAction::RenameColumn { old, new } => {
+                let table = catalog
+                    .get_table(&a.table)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                // LIVE root (catalog Arc may lag a split).
+                let root = ctx.table_root(&table);
+                let old_name_lc = old.to_ascii_lowercase();
+                // Resolve the column (case-insensitive).
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.to_ascii_lowercase() == old_name_lc)
+                    .ok_or_else(|| Error::NotFound(format!("column: {}", old)))?;
+                // New name must be unique in the table.
+                if table
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&new))
+                {
+                    return Err(Error::AlreadyExists(format!("column: {}", new)));
+                }
+                if new.is_empty()
+                    || new.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    || new.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+                {
+                    return Err(Error::semantic(format!("invalid column name: {}", new)));
+                }
+                let root = table.root_page;
+                let old_name = table.columns[col_idx].name.clone();
+                let table_name = table.name.clone();
+
+                // 1. Rewrite this table's CREATE statement (column def,
+                //    CHECK/DEFAULT/GENERATED exprs, PK/UNIQUE lists, child
+                //    FK columns, self-referencing FK parent columns).
+                let new_sql = rename_column_in_create_table(&table.create_sql, &table_name, &old_name, &new)?;
+
+                // 2. Rebuild the catalog entry from the new SQL.
+                let mut rebuilt = (*table).clone();
+                if let Ok(stmt) = crate::sql::parser::parse(&new_sql) {
+                    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                        columns, constraints, without_rowid, strict, ..
+                    }) = stmt
+                    {
+                        rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
+                    }
+                }
+                catalog.replace_table(&table_name, rebuilt);
+
+                // 3. Other tables' REFERENCES clauses pointing at the
+                //    renamed parent column.
+                for (other_name, other) in catalog.all_tables() {
+                    if other.name.eq_ignore_ascii_case(&table_name) {
+                        continue;
+                    }
+                    let references_us = other.foreign_keys.iter().any(|fk| {
+                        fk.ref_table.eq_ignore_ascii_case(&table_name)
+                            && fk.ref_columns.iter().any(|rc| rc.eq_ignore_ascii_case(&old_name))
+                    });
+                    if references_us {
+                        if let Ok(new_other_sql) =
+                            rename_fk_refs_in_create_table(&other.create_sql, &table_name, &old_name, &new)
+                        {
+                            let mut rebuilt_other = (*other).clone();
+                            if let Ok(stmt) = crate::sql::parser::parse(&new_other_sql) {
+                                if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                                    columns, constraints, without_rowid, strict, ..
+                                }) = stmt
+                                {
+                                    if let Ok(t) = build_table(&other.name, &columns, &constraints, other.root_page, without_rowid, strict, &new_other_sql) {
+                                        rebuilt_other = t;
+                                    }
+                                }
+                            }
+                            let other_root = ctx.table_root(&other);
+                            let other_display = other.name.clone();
+                            catalog.replace_table(&other_name, rebuilt_other);
+                            delete_schema_row(ctx.pager, "table", &other_display)?;
+                            let schema_row = crate::schema::encode_schema_row(
+                                "table", &other_display, &other_display, other_root, &new_other_sql,
+                            );
+                            insert_schema_row(ctx.pager, &schema_row)?;
+                        }
+                    }
+                }
+
+                // 4. Indexes on this table: rename the indexed column in
+                //    their CREATE statements (and the catalog's Index columns).
+                for (idx_name, idx) in catalog.all_indexes() {
+                    if idx.table.eq_ignore_ascii_case(&table_name)
+                        && idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&old_name))
+                    {
+                        if let Ok(new_idx_sql) = rename_column_in_create_index(&idx.create_sql, &old_name, &new) {
+                            let mut rebuilt_idx = (*idx).clone();
+                            for ic in rebuilt_idx.columns.iter_mut() {
+                                if ic.name.eq_ignore_ascii_case(&old_name) {
+                                    ic.name = new.clone();
+                                }
+                            }
+                            rebuilt_idx.create_sql = new_idx_sql.clone();
+                            let idx_root = ctx.index_root(&idx);
+                            let display_name = idx.name.clone();
+                            catalog.replace_index(&idx_name, rebuilt_idx);
+                            delete_schema_row(ctx.pager, "index", &display_name)?;
+                            let schema_row = crate::schema::encode_schema_row(
+                                "index", &display_name, &table_name, idx_root, &new_idx_sql,
+                            );
+                            insert_schema_row(ctx.pager, &schema_row)?;
+                        }
+                    }
+                }
+
+                // 5. Triggers and views that reference the column: token-level
+                //    rewrite of their stored SQL (qualified refs, UPDATE OF
+                //    lists, INSERT column lists, SET targets).
+                rewrite_object_sql_column_refs(ctx.pager, catalog, &table_name, &old_name, &new)?;
+
+                // 6. Rewrite this table's schema row.
+                delete_schema_row(ctx.pager, "table", &table_name)?;
+                let schema_row = crate::schema::encode_schema_row(
+                    "table", &table_name, &table_name, root, &new_sql,
+                );
+                insert_schema_row(ctx.pager, &schema_row)?;
+                ctx.pager.flush()?;
+                Ok(())
+            }
+            AlterAction::DropColumn { name } => {
+                let table = catalog
+                    .get_table(&a.table)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                let name_lc = name.to_ascii_lowercase();
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.to_ascii_lowercase() == name_lc)
+                    .ok_or_else(|| Error::NotFound(format!("column: {}", name)))?;
+                // Rowid alias (INTEGER PRIMARY KEY) can't be dropped.
+                if table.rowid_alias == Some(col_idx) {
+                    return Err(Error::semantic("cannot drop the INTEGER PRIMARY KEY column"));
+                }
+                if table.columns.len() <= 1 {
+                    return Err(Error::semantic(format!(
+                        "cannot drop column \"{}\": no other columns exist",
+                        name
+                    )));
+                }
+                let col = &table.columns[col_idx];
+                // PRIMARY KEY / UNIQUE columns can't be dropped.
+                if col.primary_key {
+                    return Err(Error::semantic(format!(
+                        "cannot drop PRIMARY KEY column: \"{}\"",
+                        name
+                    )));
+                }
+                if col.unique {
+                    return Err(Error::semantic(format!(
+                        "cannot drop UNIQUE column: \"{}\"",
+                        name
+                    )));
+                }
+                // Indexed columns (explicit indexes, incl. partial-index
+                // WHERE clauses) can't be dropped.
+                for idx in catalog.indexes_on_table(&table.name) {
+                    if idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                        return Err(Error::semantic(format!(
+                            "cannot drop indexed column: \"{}\" (index \"{}\" uses it)",
+                            name, idx.name
+                        )));
+                    }
+                    if let Some(w) = &idx.partial_expr {
+                        if expr_references_column(w, &name, &table.name) {
+                            return Err(Error::semantic(format!(
+                                "cannot drop column \"{}\": referenced by partial index \"{}\"",
+                                name, idx.name
+                            )));
+                        }
+                    }
+                }
+                // CHECK constraints referencing it.
+                for ck in &table.check_exprs {
+                    if expr_references_column(ck, &name, &table.name) {
+                        return Err(Error::semantic(format!(
+                            "cannot drop column \"{}\": referenced by a CHECK constraint",
+                            name
+                        )));
+                    }
+                }
+                // Generated columns referencing it.
+                for c in &table.columns {
+                    if let Some((ge, _)) = &c.generated {
+                        if expr_references_column(ge, &name, &table.name) {
+                            return Err(Error::semantic(format!(
+                                "cannot drop column \"{}\": referenced by generated column \"{}\"",
+                                name, c.name
+                            )));
+                        }
+                    }
+                }
+                // FOREIGN KEYs (child or parent side) referencing it.
+                for fk in &table.foreign_keys {
+                    if fk.columns.iter().any(|&ci| {
+                        table.columns.get(ci).map(|c| c.name.eq_ignore_ascii_case(&name)).unwrap_or(false)
+                    }) {
+                        return Err(Error::semantic(format!(
+                            "cannot drop column \"{}\": used in a FOREIGN KEY constraint",
+                            name
+                        )));
+                    }
+                }
+                for (other_name, other) in catalog.all_tables() {
+                    if other.name.eq_ignore_ascii_case(&table.name) {
+                        continue;
+                    }
+                    let refs_us = other.foreign_keys.iter().any(|fk| {
+                        fk.ref_table.eq_ignore_ascii_case(&table.name)
+                            && fk.ref_columns.iter().any(|rc| rc.eq_ignore_ascii_case(&name))
+                    });
+                    if refs_us {
+                        return Err(Error::semantic(format!(
+                            "cannot drop column \"{}\": referenced by a FOREIGN KEY on table \"{}\"",
+                            name, other_name
+                        )));
+                    }
+                }
+                // Views/triggers referencing it. Views: bare references
+                // count only when the view reads exactly this table;
+                // qualified references always count. Triggers: bare
+                // references count for triggers on this table.
+                for (vname, view) in catalog.all_views() {
+                    let single_table_view = view_is_single_table_over(&view.select, &table.name);
+                    if object_sql_references_column(&view.create_sql, &table.name, &name, single_table_view)
+                        || (single_table_view
+                            && object_sql_references_column(&view.create_sql, &table.name, &name, false))
+                    {
+                        return Err(Error::semantic(format!(
+                            "cannot drop column \"{}\": referenced by view \"{}\"",
+                            name, vname
+                        )));
+                    }
+                }
+                for (tname, trig) in catalog.all_triggers() {
+                    if trig.table.eq_ignore_ascii_case(&table.name)
+                        && object_sql_references_column(&trig.create_sql, &table.name, &name, true)
+                    {
+                        return Err(Error::semantic(format!(
+                            "cannot drop column \"{}\": referenced by trigger \"{}\"",
+                            name, tname
+                        )));
+                    }
+                }
+
+                let root = ctx.table_root(&table);
+                let table_name = table.name.clone();
+                let old_n_cols = table.n_columns();
+                let old_alias = table.rowid_alias;
+                let dropped_is_before_alias = table
+                    .rowid_alias
+                    .map(|a| col_idx < a)
+                    .unwrap_or(false);
+
+                // 1. Rewrite the CREATE statement without the column.
+                let new_sql = drop_column_from_create_table(&table.create_sql, &name)?
+                    .ok_or_else(|| Error::NotFound(format!("column: {}", name)))?;
+
+                // 2. Rebuild the catalog entry.
+                let mut rebuilt = (*table).clone();
+                if let Ok(stmt) = crate::sql::parser::parse(&new_sql) {
+                    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                        columns, constraints, without_rowid, strict, ..
+                    }) = stmt
+                    {
+                        rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
+                    }
+                }
+                let new_n_cols = rebuilt.n_columns();
+                catalog.replace_table(&table_name, rebuilt);
+
+                // 3. Rewrite every row: decode with the OLD schema, drop
+                //    column `col_idx`, re-encode with the NEW schema.
+                //    (SQLite rewrites the table on disk too — see
+                //    sqlite3AlterDropColumn's "Edit rows of table on disk".)
+                {
+                    // Use the LIVE root (the catalog Arc may lag a split
+                    // that sync_schema_roots has only persisted to the
+                    // schema row, not the in-memory Table).
+                    let live_root = ctx.table_root(&table);
+                    let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
+                    {
+                        let mut bt = Btree::new(ctx.pager, live_root, false);
+                        bt.scan_table(|rowid, payload| {
+                            if let Ok(mut row) = decode_row(payload, old_n_cols, rowid, old_alias) {
+                                if (col_idx as usize) < row.len() {
+                                    row.remove(col_idx);
+                                }
+                                // Rowid-alias marker may shift: the alias
+                                // column's encoded position moved when a
+                                // column before it was dropped.
+                                let new_alias = if dropped_is_before_alias {
+                                    old_alias.map(|a| a - 1)
+                                } else {
+                                    old_alias
+                                };
+                                let new_payload = encode_row_aliased(&row, new_alias);
+                                updates.push((rowid, new_payload));
+                            }
+                            true
+                        })?;
+                    }
+                    let mut bt = Btree::new(ctx.pager, live_root, false);
+                    for (rowid, payload) in updates {
+                        let did = bt.update_table(rowid, &payload).unwrap_or(false);
+                        if !did {
+                            bt.delete_table(rowid)?;
+                            bt.insert_table(rowid, &payload)?;
+                        }
+                    }
+                    if bt.root != live_root {
+                        ctx.set_table_root(&table_name, bt.root);
+                    }
+                    let _ = new_n_cols;
+                }
+
+                // 4. Rewrite the schema row.
+                delete_schema_row(ctx.pager, "table", &table_name)?;
+                let schema_row = crate::schema::encode_schema_row(
+                    "table", &table_name, &table_name, root, &new_sql,
+                );
+                insert_schema_row(ctx.pager, &schema_row)?;
+                ctx.pager.flush()?;
+                Ok(())
+            }
         }
     }
 
@@ -2587,6 +3765,10 @@ impl Database {
                 "foreign_keys" => {
                     let on = v.is_truthy();
                     ctx.pager.set_foreign_keys_enabled(on);
+                }
+                "recursive_triggers" => {
+                    let on = v.is_truthy();
+                    ctx.pager.set_recursive_triggers_enabled(on);
                 }
                 "cache_size" => {
                     // Advisory: the pager's cache capacity is set at open.
@@ -2659,9 +3841,24 @@ fn expr_to_sql(e: &Expr) -> String {
         E::Column { table: None, name } => name.clone(),
         E::Column { table: Some(t), name } => format!("{}.{}", t, name),
         E::Binary { op, left, right } => {
-            format!("{} {:?} {}", expr_to_sql(left), op, expr_to_sql(right))
+            use crate::sql::ast::BinaryOp::*;
+            let sym = match op {
+                Add => "+", Sub => "-", Mul => "*", Div => "/", Mod => "%",
+                Concat => "||", BitAnd => "&", BitOr => "|", BitXor => "^",
+                ShiftLeft => "<<", ShiftRight => ">>",
+                Eq => "=", NotEq => "!=", Lt => "<", LtEq => "<=", Gt => ">",
+                GtEq => ">=",
+                And => "AND", Or => "OR",
+            };
+            format!("{} {} {}", expr_to_sql(left), sym, expr_to_sql(right))
         }
-        E::Unary { op, expr } => format!("{:?} {}", op, expr_to_sql(expr)),
+        E::Unary { op, expr } => {
+            use crate::sql::ast::UnaryOp::*;
+            let sym = match op {
+                Neg => "-", Not => "NOT ", BitNot => "~", Plus => "+",
+            };
+            format!("{}{}", sym, expr_to_sql(expr))
+        }
         E::Function { name, args, .. } => {
             let inner: Vec<String> = args.iter().map(expr_to_sql).collect();
             format!("{}({})", name, inner.join(", "))
@@ -3364,6 +4561,17 @@ impl<const N: usize> Params for [Value; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rename_column_in_object_sql() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO t (v, log) VALUES (NEW.v * -1, 'negated'); END";
+        let out = rename_column_in_object_sql(sql, "t", "v", "amount", true);
+        assert!(out.contains("(amount, log)"), "out: {out}");
+        assert!(out.contains("NEW.amount"), "out: {out}");
+        let sql2 = "CREATE VIEW big AS SELECT id FROM t WHERE v > 1";
+        let out2 = rename_column_in_object_sql(sql2, "t", "v", "val", true);
+        assert!(out2.contains("val > 1"), "out2: {out2}");
+    }
 
     fn memdb() -> Database {
         Database::open_in_memory().unwrap()

@@ -40,6 +40,13 @@ pub(crate) fn fire_triggers(
             MAX_TRIGGER_DEPTH, table.name
         )));
     }
+    // SQLite's default (PRAGMA recursive_triggers = OFF): a statement
+    // running inside another trigger's body does NOT fire triggers. This
+    // is what keeps self-inserting AFTER INSERT triggers (audit logs,
+    // derived rows) from exploding into infinite recursion.
+    if ctx.trigger_depth > 0 && !ctx.pager.recursive_triggers_enabled() {
+        return Ok(());
+    }
     let triggers = ctx.catalog().triggers_on_table(&table.name);
     if triggers.is_empty() {
         return Ok(());
