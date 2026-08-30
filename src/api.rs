@@ -2717,20 +2717,39 @@ impl Database {
                 };
                 let iroot = index_root.unwrap_or(index.root_page);
                 let mut ibt = Btree::new(&self.pager, iroot, true);
-                let rowids = ibt.lookup_index(&key_bytes)?;
-                if rowids.is_empty() {
-                    return Ok(Vec::new());
+                // Reusable per-thread rowid scratch: the results Vec
+                // (almost always 0-2 rowids on point lookups) cost a fresh
+                // malloc + free per query (~25-30 ns) on this hottest OLTP
+                // path. Borrowed only for the duration of the call.
+                thread_local! {
+                    static ROWID_SCRATCH: std::cell::RefCell<Vec<i64>> =
+                        std::cell::RefCell::new(Vec::with_capacity(8));
                 }
-                let troot = table_root.unwrap_or(table.root_page);
-                let mut tbt = Btree::new(&self.pager, troot, false);
-                let mut rows = Vec::with_capacity(rowids.len());
-                for rid in rowids {
-                    if let Some(row) = tbt.lookup_table_with(rid, |payload| {
-                        decode_projected(payload, table, rid, project.as_deref())
-                    })? {
-                        rows.push(row);
+                let rows = ROWID_SCRATCH.with(|scratch| {
+                    let mut rowids = std::mem::take(&mut *scratch.borrow_mut());
+                    let r = (|| -> Result<Vec<Row>> {
+                        ibt.lookup_index_into(&key_bytes, &mut rowids)?;
+                        if rowids.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let troot = table_root.unwrap_or(table.root_page);
+                        let mut tbt = Btree::new(&self.pager, troot, false);
+                        let mut rows = Vec::with_capacity(rowids.len());
+                        for &rid in &rowids {
+                            if let Some(row) = tbt.lookup_table_with(rid, |payload| {
+                                decode_projected(payload, table, rid, project.as_deref())
+                            })? {
+                                rows.push(row);
+                            }
+                        }
+                        Ok(rows)
+                    })();
+                    // Return the (possibly grown) buffer unless it ballooned.
+                    if rowids.capacity() <= 4096 {
+                        *scratch.borrow_mut() = rowids;
                     }
-                }
+                    r
+                })?;
                 Ok(rows)
             }
             FastPath::RowidRange { table, start, end, project, columns: _ } => {
@@ -3153,7 +3172,7 @@ impl Database {
                 // seed the leaf-hint cache through the read path, so the
                 // first user query after the build doesn't pay the
                 // read-path wake-up (see Btree::warm_read_path).
-                {
+                if std::env::var_os("RUSTQLITE_NO_WARM_TAP").is_none() {
                     let mut warm_bt = crate::storage::btree::Btree::new(ctx.pager, final_root, true);
                     let _ = warm_bt.warm_read_path();
                 }
