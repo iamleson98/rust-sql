@@ -462,6 +462,41 @@ use std::sync::Arc;
 use crate::storage::page::Page;
 use crate::storage::pager::{PageRef, PageIdHashBuild};
 
+/// Software-prefetch the page header + cell-pointer array (first 1 KiB).
+///
+/// A cold-leaf binary search touches the header line, then pointer-array
+/// lines, then scattered cell lines — each miss serializes behind the
+/// previous read (~100 ns each, ~1 µs per cold page). Issuing prefetches
+/// for the search region right after the lock lets those misses proceed
+/// in parallel while the lock returns. Warm pages pay ~16 prefetch
+/// instructions (~10 ns) and the hints are no-ops.
+///
+/// `_mm_prefetch` is a pure performance hint: it never faults, so a page
+/// being concurrently written stays correct (the reader still takes the
+/// mutex before interpreting bytes).
+#[inline(always)]
+fn prefetch_search_lines(data: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: prefetch is a hint with no fault semantics; the pointer
+        // derives from a live slice borrowed under the page lock.
+        unsafe {
+            let base = data.as_ptr();
+            let n = data.len().min(1024);
+            let mut off = 0usize;
+            while off < n {
+                core::arch::x86_64::_mm_prefetch(
+                    base.add(off) as *const i8,
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+                off += 64;
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = data;
+}
+
 struct TableLeafHint {
     page: PageRef,
     lo: i64,
@@ -789,6 +824,7 @@ impl<'a> Btree<'a> {
                 None => break 'hint,
             };
             let borrowed = page_ref.lock();
+            prefetch_search_lines(&borrowed.data);
             if borrowed.page_type()? != PageType::LeafTable {
                 break 'hint; // wrong page type — full descent
             }
@@ -831,6 +867,7 @@ impl<'a> Btree<'a> {
         loop {
             let page = self.pager.get_page(page_id)?;
             let borrowed = page.lock();
+            prefetch_search_lines(&borrowed.data);
             let pt = borrowed.page_type()?;
             match pt {
                 PageType::LeafTable => {
@@ -2459,16 +2496,22 @@ impl<'a> Btree<'a> {
                     b += sizes[if i > pos { i - 1 } else { i }] as usize;
                 }
             }
-            if mid == pos {
-                b += s_new;
-            }
+            // NOTE: when pos == mid the new cell belongs to the RIGHT half
+            // (sequence index `mid` is not in [0..mid)) — do NOT add it
+            // here. The old code added `s_new` in that case, which
+            // undercounted the RIGHT page's bytes by exactly `s_new`: a
+            // packed right page then overflowed its cell content into the
+            // pointer array and corrupted the tree (missing entries,
+            // cyclic child pointers). Found via 8 KiB-page backfill; latent
+            // at every page size whenever a mid-insert lands exactly at the
+            // split point.
             b
         };
         let avail = page_size - header_offset - PAGE_HEADER_SIZE as usize;
-        if left_bytes + left_cells * 2 > avail
-            || (total_bytes - left_bytes + s_new * (if pos >= mid { 1 } else { 0 }) + right_cells * 2)
-                > avail
-        {
+        // Exact byte sums for both halves: sequence bytes total =
+        // existing cells + the new cell.
+        let right_bytes = total_bytes + s_new - left_bytes;
+        if left_bytes + left_cells * 2 > avail || right_bytes + right_cells * 2 > avail {
             return Ok(None); // giant cell — general path
         }
 
@@ -3537,6 +3580,7 @@ impl<'a> Btree<'a> {
         let page = self.pager.get_page(page_id)?;
         // ONE lock per page: type check + leaf work under the same guard.
         let borrowed = page.lock();
+        prefetch_search_lines(&borrowed.data);
         let pt = borrowed.page_type()?;
         match pt {
             PageType::LeafTable => {
@@ -3875,6 +3919,16 @@ impl<'a> Btree<'a> {
     /// multiple leaves). Previously this was a full O(N) scan of every
     /// index page — the main reason indexed point lookups lagged SQLite.
     pub fn lookup_index(&mut self, key: &[u8]) -> Result<Vec<i64>> {
+        let mut out = Vec::new();
+        self.lookup_index_into(key, &mut out)?;
+        Ok(out)
+    }
+
+    /// `lookup_index` into a caller-provided buffer (cleared first) — lets
+    /// hot paths reuse one allocation across many lookups instead of paying
+    /// a fresh Vec malloc + free (~25-30 ns) per query.
+    pub fn lookup_index_into(&mut self, key: &[u8], out: &mut Vec<i64>) -> Result<()> {
+        out.clear();
         // --- Hint probe: if the key falls inside the remembered leaf's
         // bounds, search that leaf directly. All matches must be collected
         // from this leaf only if the leaf's LAST cell doesn't itself match
@@ -3882,36 +3936,42 @@ impl<'a> Btree<'a> {
         // sibling — fall back to the full scan for exactness).
         let epoch = self.pager.write_epoch();
         if let Some(page_ref) = index_hint_page(self.root, key, epoch) {
-            if let Ok(Some(rowids)) = self.lookup_index_leaf(&page_ref, key) {
-                return Ok(rowids);
+            if let Ok(true) = self.lookup_index_leaf(&page_ref, key, out) {
+                return Ok(());
             }
         }
-        let mut results = Vec::new();
+        // The hint attempt may have pushed a PARTIAL run before deciding
+        // it couldn't prove exactness (right-spill) — discard it; the full
+        // scan re-collects every matching entry from the true start.
+        out.clear();
         self.scan_index_from(key, |cell_rowid, cell_key| {
             if cell_key.starts_with(key) {
-                results.push(cell_rowid);
+                out.push(cell_rowid);
                 true // keep scanning (duplicates / composite prefix)
             } else {
                 false // past the prefix range — stop
             }
         })?;
-        Ok(results)
+        Ok(())
     }
 
     /// Search the hinted index leaf for all cells whose key starts with
-    /// `key`. The epoch was checked by the caller, so the remembered
-    /// bounds are exact and content unchanged. Returns `Ok(None)` to
-    /// signal "hint unusable — do the full scan" (wrong page type, or a
-    /// prefix run that may continue into the right sibling).
-    fn lookup_index_leaf(&self, page_ref: &PageRef, key: &[u8]) -> Result<Option<Vec<i64>>> {
+    /// `key`, appending their rowids to `out`. The epoch was checked by
+    /// the caller, so the remembered bounds are exact and content
+    /// unchanged. Returns `Ok(false)` to signal "hint unusable — do the
+    /// full scan" (wrong page type, or a prefix run that may continue
+    /// into either sibling); `out` may then hold a partial run which the
+    /// caller must clear before re-scanning.
+    fn lookup_index_leaf(&self, page_ref: &PageRef, key: &[u8], out: &mut Vec<i64>) -> Result<bool> {
         let borrowed = page_ref.lock();
+        prefetch_search_lines(&borrowed.data);
         let pt = borrowed.page_type()?;
         if pt != PageType::LeafIndex {
-            return Ok(None);
+            return Ok(false);
         }
         let n = borrowed.n_cells() as usize;
         if n == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         // The caller already verified key ∈ [first, last] via the hint
         // bounds; with no mutation since, that check stands.
@@ -3922,7 +3982,7 @@ impl<'a> Btree<'a> {
             let mid = (lo + hi) / 2;
             let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
             let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
-                return Ok(None);
+                return Ok(false);
             };
             if v.key < key {
                 lo = mid + 1;
@@ -3930,8 +3990,18 @@ impl<'a> Btree<'a> {
                 hi = mid;
             }
         }
+        // LEFT-SPILL guard: if the run starts at the leaf's very first
+        // cell, equal keys may ALSO exist in the left sibling — the hint
+        // bounds only prove the key is present in THIS leaf. (The hint-hit
+        // check guarantees key >= first-cell-key; lo == 0 then implies the
+        // first cell's key equals the key, so the run may extend left.)
+        // Only the full scan is exact. Found via the CREATE INDEX warm-tap
+        // seeding the rightmost leaf: `COUNT(*) WHERE cat = 'b'` then saw
+        // only the right leaf's half of a leaf-spanning duplicate run.
+        if lo == 0 {
+            return Ok(false);
+        }
         // Collect the prefix run.
-        let mut rowids = Vec::new();
         let mut i = lo;
         while i < n {
             let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
@@ -3939,7 +4009,7 @@ impl<'a> Btree<'a> {
                 break;
             };
             if v.key.starts_with(key) {
-                rowids.push(v.rowid);
+                out.push(v.rowid);
             } else {
                 break;
             }
@@ -3948,9 +4018,9 @@ impl<'a> Btree<'a> {
         if i == n && lo < n {
             // The run reached the END of the leaf — duplicates may continue
             // into the right sibling; only the full scan is exact.
-            return Ok(None);
+            return Ok(false);
         }
-        Ok(Some(rowids))
+        Ok(true)
     }
 
     /// Scan index entries in (key, rowid) order, starting at the first entry
@@ -3987,6 +4057,7 @@ impl<'a> Btree<'a> {
         // page_type, a second for n_cells, a third for the binary search,
         // then a full drop + re-get_page + fourth lock for the iteration).
         let borrowed = page.lock();
+        prefetch_search_lines(&borrowed.data);
         let pt = borrowed.page_type()?;
         match pt {
             PageType::LeafIndex => {
@@ -4210,8 +4281,18 @@ mod tests {
             bt.insert_table(i, b"aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         }
         let pages = pager.n_pages();
-        // With mid splits this would be ~80+ pages; append splits ~40.
-        assert!(pages < 50, "expected < 50 pages for sequential inserts, got {}", pages);
+        // With mid splits this would be ~2x the append-split count. Scale
+        // the bound with the page size (the test ran at 16 KiB pages
+        // historically; the default is now 8 KiB, so ~2x the pages).
+        let bound = (50 * 16384) / pager.page_size() as usize;
+        let bound = bound as u32;
+        assert!(
+            pages < bound,
+            "expected < {} pages for sequential inserts (page size {}), got {}",
+            bound,
+            pager.page_size(),
+            pages
+        );
         // All rows present and ordered.
         let mut seen = Vec::new();
         bt.scan_table_borrowed(|rowid, _p| {
