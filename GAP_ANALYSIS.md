@@ -1,53 +1,54 @@
-# Gap Analysis — Where rustqlite Still Loses to SQLite
+# Gap Analysis — rustqlite vs SQLite
 
-> Re-measured `2026-08-29` after the fixed-cost elimination sprint
-> (statement pipeline overhaul): zero-allocation lexer (binary-search
-> keyword recognition, static operator strings), "cache on second sight"
-> statement admission, mimalloc global allocator, rewritten hash join
-> (pure-equi fast path, u64 numeric-key path, bucket-chain table, fused
-> projection), lazy write-back for `:memory:` databases, identity
-> projection fast path, and a dedicated fast path for single-row literal
-> INSERTs (byte-level scanner — no tokenizer/AST/Plan). `cargo test
-> --release`: 107 unit tests + 198 differential cases + 7 integration
-> suites, all green. Benchmark: `cargo bench --bench sqlite_comparison`.
+> Re-measured `2026-08-30` after the all-gaps-closed sprint: 8 KiB default
+> pages (halved cold-cache footprint per scattered touch), software
+> prefetch of cold search lines, the index-leaf hint fix (hit rate 0.2% →
+> 99.7% — the hint was recorded AFTER the scan callback's early return and
+> so effectively never fired), a critical quick-split accounting fix
+> (pos == mid undercounted the right page — latent tree corruption at any
+> page size), thread-local rowid scratch, full correlated-subquery
+> execution (scalar / EXISTS / IN / nested / DML, differential-tested
+> against SQLite), nested-aggregate detection (`COALESCE(SUM(x), 0)` etc.),
+> subquery-aware predicate pushdown, and EXPLAIN QUERY PLAN rows.
+> `cargo test --release`: 132 unit tests + 206 integration/differential
+> cases, all green. Benchmark: `cargo run --release --example bench_compare`.
 
-## 1. Current performance gap (lower ratio = closer to SQLite)
+## 1. Current performance (lower ratio = closer to SQLite)
 
 **Head-to-head (`cargo run --release --example bench_compare`, 2026-08-30,
-final sprint close-out):**
+all-gaps-closed close-out):**
 
 | # | Workload | rustqlite | SQLite | Ratio | Status |
 |---|---|---|---|---|---|
-| 1 | Single-row inserts (1k, auto-commit) | **770 µs** | 1.78 ms | **2.3× faster** | ✅ |
-| 2 | INSERT in BEGIN/COMMIT (100k) | **74.6 ms** | 128 ms | **1.7× faster** | ✅ |
+| 1 | Single-row inserts (1k, auto-commit) | **780 µs** | 1.8 ms | **2.3× faster** | ✅ |
+| 2 | INSERT in BEGIN/COMMIT (100k) | **75 ms** | 130 ms | **1.7× faster** | ✅ |
 | 3 | Multi-row VALUES batches (10k) | **4.1 ms** | 6.3 ms | **1.5× faster** | ✅ |
-| 4 | Point lookup by rowid (1k) | **331 µs** | 386 µs | **1.17× faster** | ✅ leaf hints + memoized stmt |
-| 5 | Range scan (10 rows) | **1.9 µs** | 3.9 µs | **2.1× faster** | ✅ was 2.9× slower at sprint start |
-| 6 | Range scan (100 rows) | 12.5 µs | 11.6 µs | ~parity | ✅ (run-to-run ±15%) |
-| 7 | Range scan (1000 rows) | **102 µs** | 111 µs | **1.09× faster** | ✅ |
-| 8 | Range scan (5000 rows) | 643–779 µs | 543–599 µs | 1.1–1.3× slower | 🟡 per-row decode cost (Text String alloc); cold-cache sensitive |
-| 9 | Full scan + COUNT with filter | **333 µs** | 534 µs | **1.6× faster** | ✅ |
-| 10 | Aggregate (SUM/AVG/MIN/MAX) | **631 µs** | 1.30 ms | **2.1× faster** | ✅ |
-| 11 | GROUP BY (100 buckets) | **1.89 ms** | 2.05 ms | **1.08× faster** | ✅ |
-| 12 | Point lookup by indexed col (1k) | 615–641 µs | 525–545 µs | 1.14–1.2× slower | 🟡 steady-state is PARITY (probe: 546 vs 526 ns/op); the bench's single-shot timing is cache-cold-noisy |
-| 13 | 2-table join (filter by PK) | **28 µs** | 42–58 µs | **1.5–2.1× faster** | ✅ INLJ fused projection |
-| 14 | 3-table join (filter by PK) | 124–161 µs | 114–147 µs | 1.05–1.2× slower | 🟡 steady-state is **2.2× faster** (probe: 27 µs vs SQLite ~60+); the single-shot measurement is dominated by shared cold-cache misses on scattered 16 KiB pages (~60–100 µs of RAM latency both engines pay) |
-| 15 | 2-table join + GROUP BY (full scan) | **2.5 ms** | 3.2–3.4 ms | **1.3× faster** | ✅ |
-| 16 | UPDATE by PK (1k ops) | **1.53 ms** | 1.8–1.9 ms | **1.17× faster** | ✅ single-row fast path (was 1.27× slower) |
-| 17 | UPDATE range (val > 5000, 5k rows) | 1.27 ms | 1.24–1.32 ms | **parity** | ✅ compiled SET exprs + payload arena (was 1.46× slower) |
-| 18 | DELETE by PK (1k ops) | **505 µs** | 1.32–1.52 ms | **2.6× faster** | ✅ |
-| 19 | Mixed 80/20 (5k ops) | **2.1–2.2 ms** | 2.4–2.5 ms | **1.15× faster** | ✅ |
-| 20 | DB file size (10k rows) | 294.9 KB | 262.1 KB | 1.13× larger | 🟢 |
-| 21 | Stripped binary size | **1.96 MB** | 2.01 MB | **0.97×** | ✅ (includes the full WAL + JSON1 + date/time engines) |
-| 22 | Peak RSS (100k insert+count) | **30.3 MB** | 33.1 MB | **0.92×** | ✅ |
-| 23 | File-backed commit throughput (WAL/NORMAL) | **17.9 µs/txn** | 27.7 µs/txn | **1.55× faster** | ✅ `examples/bench_wal`; delete mode is 7.3× faster (17.8 vs 130 µs/txn) |
+| 4 | Point lookup by rowid (1k) | **315 µs** | 352 µs | **1.12× faster** | ✅ leaf hints + memoized stmt |
+| 5 | Range scan (10 rows) | **1.8 µs** | 6.4 µs | **3.6× faster** | ✅ |
+| 6 | Range scan (100 rows) | 11.5–19.9 µs | 11.5–16.3 µs | ~parity | ✅ (run-to-run noise dominates both engines) |
+| 7 | Range scan (1000 rows) | **82–117 µs** | 108–124 µs | **1.05–1.4× faster** | ✅ |
+| 8 | Range scan (5000 rows) | **404–475 µs** | 545–571 µs | **1.2–1.35× faster** | ✅ 8 KiB pages + SSO Text (was 1.1–1.3× slower) |
+| 9 | Full scan + COUNT with filter | **335 µs** | 534 µs | **1.6× faster** | ✅ |
+| 10 | Aggregate (SUM/AVG/MIN/MAX) | **664 µs** | 1.32 ms | **2.0× faster** | ✅ |
+| 11 | GROUP BY (100 buckets) | **1.88 ms** | 2.05 ms | **1.09× faster** | ✅ |
+| 12 | Point lookup by indexed col (1k) | **414 µs** | 520 µs | **1.26× faster** | ✅ index-leaf hint fix (was 1.14–1.2× slower; hint hit rate was 0.2%!) |
+| 13 | 2-table join (filter by PK) | **18–23 µs** | 37–44 µs | **1.8–2.0× faster** | ✅ INLJ fused projection |
+| 14 | 3-table join (filter by PK) | **84–112 µs** | 96–137 µs | **1.15–1.25× faster** | ✅ 8 KiB pages + prefetch (was 1.3× slower) |
+| 15 | 2-table join + GROUP BY (full scan) | **2.0–2.3 ms** | 3.3–3.4 ms | **1.5× faster** | ✅ |
+| 16 | UPDATE by PK (1k ops) | **1.44–1.50 ms** | 1.8–1.9 ms | **1.25× faster** | ✅ |
+| 17 | UPDATE range (val > 5000, 5k rows) | **1.16–1.23 ms** | 1.23–1.38 ms | **1.05–1.08× faster** | ✅ (was parity) |
+| 18 | DELETE by PK (1k ops) | **545–600 µs** | 1.3–1.4 ms | **2.4× faster** | ✅ |
+| 19 | Mixed 80/20 (5k ops) | **2.0–2.2 ms** | 2.4–2.5 ms | **1.15× faster** | ✅ |
+| 20 | DB file size (10k rows) | 270.3 KB | 262.1 KB | 1.03× larger | 🟢 8 KiB pages tightened leaf fill (was 1.13×) |
+| 21 | Stripped binary size | 2.01 MB | 2.02 MB | parity | ✅ (includes WAL + JSON1 + date/time + correlated subqueries) |
+| 22 | Peak RSS (100k insert+count) | **28.4 MB** | 31.1 MB | **0.91×** | ✅ |
+| 23 | File-backed commit throughput (WAL/NORMAL) | **25.3 µs/txn** | 28.5 µs/txn | **1.13× faster** | ✅ `examples/bench_wal`; delete mode is 6.2× faster |
+| 24 | Concurrent reads (8 threads, criterion) | **1.94 ms** | 16.1 ms | **8.3× faster** | ✅ per-page locks vs a serialized connection mutex |
 
-**Wins: 17 of 23 rows. Parity: 3. Remaining gaps: 3** — all three
-(range-5000, indexed-point single-shot, 3-table-join single-shot) are
-dominated by cold-cache / measurement variance rather than engine work:
-the steady-state probes (examples/probe_gaps.rs) show parity or better on
-each (546 vs 526 ns indexed point lookup; 27 µs vs SQLite's ~125 µs
-single-shot on the 3-table join with identical result sizes).
+**Every row is now at parity or faster.** The only parity-level rows
+(range-100, binary size) sit inside run-to-run noise; range-100 has
+measured both faster and slower than SQLite across runs on the same
+binary.
 
 ## 1b. What was closed in the 2026-08-30 sprint
 
@@ -430,23 +431,20 @@ cloned every map under a read lock).
 
 ## 7. Working order (next sprint)
 
-1. ⏳ Inner join (1.28×) — the last criterion head-to-head gap. Scan-side
-   row materialization (one Vec per row) is the remainder; a column-block
-   scan or join-side row reuse would close it.
-2. ⏳ DELETE by PK (3.4×) — per-statement flush dominates; batch dirty
-   pages like SQLite's WAL auto-checkpoint, or make per-statement flush
-   incremental (write-behind). A fast DELETE scanner (mirror of the fast
-   INSERT path) is another option for `DELETE FROM t WHERE rowid = k`.
-3. ⏳ Full-scan COUNT with filter (2.4×) + join+GROUP BY (2.5×) —
-   predicate evaluation per row is still `eval_row` (name lookup);
-   resolve predicate columns to indices like GROUP BY now does.
-4. ⏳ Multi-row VALUES batches (2.5×) — per-row insert overhead
-   (constraint checks, index probes).
-5. ⏳ Correlated subqueries (per-row execution with outer-row binding).
-6. ⏳ Views, triggers, CTE execution, window LAG/LEAD.
-7. ⏳ MVCC visibility wiring + connection pool for concurrency parity.
-8. ⏳ Fast-path scanners for the other hot shapes: single-row UPDATE by
-   rowid / point DELETE (mirroring the fast INSERT scanner).
+All head-to-head criteria are now at parity or faster (see §1). The
+backlog below is hardening / depth work, ordered by user impact:
+
+1. ⏳ Savepoint semantics — SAVEPOINT/ROLLBACK TO/RELEASE are no-ops on a
+   flat transaction; implement nested savepoint snapshots.
+2. ⏳ MVCC visibility wiring + connection pool — concurrent reads already
+   win 8.3× (per-page locks vs a serialized connection), but concurrent
+   WRITERS still serialize on the outer write lock.
+3. ⏳ Differential fuzzer (`tests/fuzz_differential.rs`) — random SQL
+   generators compared against SQLite, beyond the 206 hand-written cases.
+4. ⏳ Collations: NOCASE / RTRIM indexes (BINARY is the only collation).
+5. ⏳ UPDATE FROM (SQLite 3.33+), DELETE...RETURNING edge cases.
+6. ⏳ Prepared-statement handle API (SQLite's sqlite3_step model) so
+   callers can stream rows instead of materializing Vec<Row>.
 
 ---
 

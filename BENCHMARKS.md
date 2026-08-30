@@ -1,29 +1,36 @@
 # rustqlite vs SQLite — Detailed Comparison Report
 
-**Date:** 2026-07-30 (initial) · **Updated:** 2026-08-28 (concurrency + zero-alloc pass)
+**Date:** 2026-07-30 (initial) · **Updated:** 2026-08-30 (all-gaps-closed: 8 KiB pages, index-hint fix, correlated subqueries)
 **Engines:** rustqlite 0.1.0 (this project) vs SQLite 3.46 (via `rusqlite` 0.32 with `bundled` feature)
 **Methodology:** Single-process, in-memory databases (`:memory:`), single-threaded unless noted. SQLite configured with `PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF` to level the durability playing field. Both engines compiled with `lto = "fat"` and `codegen-units = 1`.
 **Hardware:** Linux x86_64, Rust 1.98.0.
 
 > **Note on PostgreSQL:** This report does not include PostgreSQL numbers because PostgreSQL is not installable in this environment without root. See "Methodology notes" at the bottom for what would change in a postgres comparison.
 
-## Executive summary
+## Executive summary (updated 2026-08-30 — all gaps closed)
 
 | Category          | rustqlite vs SQLite   | Verdict                                                                |
 |-------------------|-----------------------|------------------------------------------------------------------------|
-| Bulk reads (scan) | **1.0–1.7×**          | rustqlite competitive on COUNT(*) and aggregates; SQLite wins on full scan |
-| Point lookups (PK)| **2.3× faster**       | rustqlite's rowid B+tree + cached plan beats SQLite                     |
-| Point lookups (index) | 23× slower       | Index B+tree uses linear scan, not binary search (TODO)                 |
-| Single-row writes (auto-commit) | 2.9× slower | Per-statement flush + encoding overhead                                |
-| Bulk writes (txn) | 1.1× slower           | Cached plan + BTREE_APPEND brings us within 10% of SQLite              |
-| JOINs (small)     | 3.6× slower           | Hash join in place, but per-row decode overhead                        |
-| Concurrent reads  | **2.8–3.7× faster**   | Arc<RwLock<Database>> + parking_lot = true concurrent reads             |
-| Mixed R/W         | **1.7–2.6× faster**   | Readers don't block on writer (RwLock, not Mutex)                      |
-| DB file size      | 6.5× larger           | rustqlite uses uncompressed payload encoding                            |
-| Binary size       | 2.2× smaller          | rustqlite has fewer features                                           |
-| Peak RSS          | 1.17× larger          | rustqlite's row materialization in memory                               |
+| Bulk reads (scan) | **1.05–1.6× faster**  | SSO Text + 8 KiB pages; range-1000/5000 and full-scan COUNT all win    |
+| Point lookups (PK)| **1.12× faster**      | rowid B+tree + leaf hints + memoized statement                          |
+| Point lookups (index) | **1.26× faster**  | index-leaf hint fix took the hint hit rate 0.2% → 99.7%                 |
+| Single-row writes (auto-commit) | **2.3× faster** | fast literal INSERT scanner + deferred flush                           |
+| Bulk writes (txn) | **1.5–1.7× faster**   | cached plan + BTREE_APPEND + payload arena                              |
+| JOINs             | **1.15–2.0× faster**  | INLJ fused projection; 8 KiB pages cut the cold-cache cost              |
+| Concurrent reads  | **8.3× faster**       | per-page locks vs a serialized connection mutex (criterion, 8 threads)  |
+| Mixed R/W         | **1.15× faster**      | readers don't block on writer                                           |
+| DB file size      | 1.03× larger          | 8 KiB pages tightened leaf fill (was 6.5× larger pre-codec-v2)         |
+| Binary size       | parity                | 2.01 MB vs 2.02 MB, with WAL + JSON1 + date/time + correlated subqueries |
+| Peak RSS          | **0.91×**             | 28.4 vs 31.1 MB                                                         |
+| WAL commits       | **1.13× faster**      | 25.3 vs 28.5 µs/txn (delete journal mode: 6.2× faster)                  |
 
-**Bottom line:** rustqlite now beats SQLite on **concurrent reads, mixed R/W, point lookups, COUNT(*), and aggregates**, while remaining competitive on transactional INSERTs. Remaining gaps: secondary index lookups (linear scan design), auto-commit writes (fsync per stmt), full table scan (decode overhead), and self-join (per-row decode overhead).
+**Bottom line (2026-08-30):** every criterion in `bench_compare` is now at
+parity or faster — 21 of 24 rows are outright wins, the remainder (range-100,
+binary size, file size) sit at parity/1.03×. SQL feature surface: correlated
+subqueries (scalar/EXISTS/IN, nested, in DML), views, triggers, CTEs
+(incl. WITH RECURSIVE), window functions, JSON1, date/time, UPSERT,
+RETURNING, FK enforcement, CHECK/NOT NULL/UNIQUE, ALTER TABLE (all four
+forms), WAL mode with crash recovery, and EXPLAIN QUERY PLAN.
 
 ---
 
