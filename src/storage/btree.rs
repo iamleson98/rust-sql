@@ -431,6 +431,145 @@ fn decode_rowid_only(buf: &[u8]) -> Option<(i64, usize)> {
     Some((rowid, n))
 }
 
+// ---------------------------------------------------------------------------
+// Leaf hints (SQLite-style cursor hints)
+//
+// A per-thread advisory cache of "last leaf visited per tree root". A point
+// lookup whose key falls inside the remembered leaf's key range can touch
+// ONE page instead of descending every level — for a 2-level tree that
+// halves the page-lock/Arc-clone traffic; deeper trees win more. The hint
+// holds the PageRef itself, so a hit skips the pager cache entirely.
+//
+// Safety contract (what makes a stale hint harmless):
+//   1. Hints are only ever USED as a shortcut probe: a probe that doesn't
+//      find the key falls back to the FULL descent. A hint can therefore
+//      never fabricate a "found" that isn't there.
+//   2. `Pager::write_epoch` packs (pager-instance, write-version). Before
+//      any use, the epoch is checked: ANY mutation anywhere (note_write)
+//      — including ROLLBACK, which restores older page content — bumps
+//      the version, and a NEW Pager object on the same thread gets a
+//      fresh instance id. Both cases clear the whole cache, closing the
+//      two dangerous staleness holes: pages recycled into other trees,
+//      and page ids re-used by a different database object.
+//   3. Because the epoch guarantees "no mutation since the bounds were
+//      read", the remembered first/last keys stay exact — no live
+//      re-verification is needed on the hot path.
+//   4. Duplicate-key runs that spill past a leaf boundary fall back to the
+//      full descent (see `lookup_index`), so prefix scans stay exact.
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use crate::storage::page::Page;
+use crate::storage::pager::{PageRef, PageIdHashBuild};
+
+struct TableLeafHint {
+    page: PageRef,
+    lo: i64,
+    hi: i64,
+}
+
+struct IndexLeafHint {
+    page: PageRef,
+    /// First and last cell keys of the leaf (full key bytes).
+    lo: Vec<u8>,
+    hi: Vec<u8>,
+}
+
+type HintMap<V> = std::collections::HashMap<PageId, V, PageIdHashBuild>;
+
+struct LeafHintCache {
+    epoch: u64,
+    tables: HintMap<TableLeafHint>,
+    indexes: HintMap<IndexLeafHint>,
+}
+
+thread_local! {
+    static LEAF_HINTS: std::cell::RefCell<LeafHintCache> =
+        std::cell::RefCell::new(LeafHintCache {
+            epoch: u64::MAX, // force clear on first use
+            tables: HintMap::default(),
+            indexes: HintMap::default(),
+        });
+}
+
+/// Clear the hint cache when the epoch moved (any write, rollback, or a
+/// different Pager object). Inlined into every accessor below.
+#[inline]
+fn hint_epoch_matches(epoch: u64) -> bool {
+    LEAF_HINTS.with(|c| c.borrow().epoch == epoch)
+}
+
+/// Probe the table-leaf hint for `root`. Returns the cached page when
+/// `rowid` is inside the remembered bounds.
+#[inline]
+fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageRef> {
+    if !hint_epoch_matches(epoch) {
+        return None;
+    }
+    LEAF_HINTS.with(|c| {
+        let c = c.borrow();
+        let h = c.tables.get(&root)?;
+        if rowid >= h.lo && rowid <= h.hi {
+            Some(Arc::clone(&h.page))
+        } else {
+            None
+        }
+    })
+}
+
+/// Record the table-leaf hint for `root` (bounds read live from the page).
+fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64) {
+    LEAF_HINTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.epoch != epoch {
+            c.epoch = epoch;
+            c.tables.clear();
+            c.indexes.clear();
+        }
+        c.tables.insert(root, TableLeafHint { page: Arc::clone(page), lo, hi });
+    });
+}
+
+/// Probe the index-leaf hint for `root`. Byte comparison — index cell keys
+/// use the order-preserving encoding, so byte order == key order.
+#[inline]
+fn index_hint_page(root: PageId, key: &[u8], epoch: u64) -> Option<PageRef> {
+    if !hint_epoch_matches(epoch) {
+        return None;
+    }
+    LEAF_HINTS.with(|c| {
+        let c = c.borrow();
+        let h = c.indexes.get(&root)?;
+        if key >= h.lo.as_slice() && key <= h.hi.as_slice() {
+            Some(Arc::clone(&h.page))
+        } else {
+            None
+        }
+    })
+}
+
+/// Record the index-leaf hint for `root`.
+fn set_index_hint(root: PageId, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64) {
+    LEAF_HINTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.epoch != epoch {
+            c.epoch = epoch;
+            c.tables.clear();
+            c.indexes.clear();
+        }
+        let h = c.indexes.entry(root).or_insert_with(|| IndexLeafHint {
+            page: Arc::clone(page),
+            lo: Vec::new(),
+            hi: Vec::new(),
+        });
+        h.page = Arc::clone(page);
+        h.lo.clear();
+        h.lo.extend_from_slice(lo);
+        h.hi.clear();
+        h.hi.extend_from_slice(hi);
+    });
+}
+
 /// A B+tree over a pager. Trees are identified by their root page ID.
 pub struct Btree<'a> {
     pub pager: &'a Pager,
@@ -488,6 +627,199 @@ impl<'a> Btree<'a> {
         })
     }
 
+    /// Search the hinted table leaf for `rowid`. The epoch has already
+    /// been checked by the caller (no mutation since the bounds were
+    /// recorded), so the remembered bounds are exact and the page content
+    /// is unchanged — a straight binary search is sufficient. Returns
+    /// `Ok(None)` only on structural surprises (wrong page type, corrupt
+    /// cell), which the caller treats as "fall back to the full descent".
+    fn lookup_table_leaf(
+        &self,
+        page_ref: &PageRef,
+        rowid: i64,
+    ) -> Result<Option<LookupResult>> {
+        let borrowed = page_ref.lock();
+        let pt = borrowed.page_type()?;
+        if pt != PageType::LeafTable {
+            return Ok(None);
+        }
+        let n = borrowed.n_cells() as usize;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+            let Some((cell_rowid, _)) = decode_rowid_only(&borrowed.data[cell_ptr..]) else {
+                return Ok(None);
+            };
+            if cell_rowid == rowid {
+                let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                if let Cell::TableLeaf { payload, .. } = cell {
+                    return Ok(Some(LookupResult::Found(payload)));
+                }
+                unreachable!();
+            } else if cell_rowid < rowid {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // In bounds (verified via the hint) but not present: the rowid is
+        // genuinely absent — keys are sorted and the bounds are exact.
+        Ok(Some(LookupResult::NotFound))
+    }
+
+    /// Point lookup that decodes the payload UNDER the page lock via `f`,
+    /// skipping the intermediate payload `Vec` copy that `lookup_table`
+    /// returns. `f` receives the borrowed payload bytes; its result is
+    /// returned as-is. Returns `Ok(None)` when the rowid is absent.
+    pub fn lookup_table_with<R>(
+        &mut self,
+        rowid: i64,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<Option<R>> {
+        // --- Hint probe --------------------------------------------------
+        let epoch = self.pager.write_epoch();
+        'hint: {
+            let page_ref = match table_hint_page(self.root, rowid, epoch) {
+                Some(p) => p,
+                None => break 'hint,
+            };
+            let borrowed = page_ref.lock();
+            if borrowed.page_type()? != PageType::LeafTable {
+                break 'hint; // wrong page type — full descent
+            }
+            let n = borrowed.n_cells() as usize;
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                let Some((cell_rowid, _)) = decode_rowid_only(&borrowed.data[cell_ptr..]) else {
+                    break 'hint; // corrupt cell — full descent
+                };
+                if cell_rowid == rowid {
+                    let rest = &borrowed.data[cell_ptr..];
+                    let Some((_rid, rn)) = decode_rowid_only(rest) else {
+                        break 'hint;
+                    };
+                    let Some((plen, pn)) = varint::decode(&rest[rn..]) else {
+                        break 'hint;
+                    };
+                    let start = rn + pn;
+                    let end = start + plen as usize;
+                    if end > rest.len() {
+                        break 'hint;
+                    }
+                    let out = f(&rest[start..end])?;
+                    return Ok(Some(out));
+                } else if cell_rowid < rowid {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            // Completed search, no match: the epoch-checked hint guarantees
+            // the remembered bounds are exact, so the rowid is absent.
+            return Ok(None);
+        }
+        // --- Full descent --------------------------------------------------
+        let mut page_id = self.root;
+        loop {
+            let page = self.pager.get_page(page_id)?;
+            let borrowed = page.lock();
+            let pt = borrowed.page_type()?;
+            match pt {
+                PageType::LeafTable => {
+                    let n = borrowed.n_cells() as usize;
+                    if n > 0 {
+                        let lo_key = decode_rowid_only(
+                            &borrowed.data[borrowed.cell_pointer(0) as usize..],
+                        )
+                        .map(|(r, _)| r);
+                        let hi_key = decode_rowid_only(
+                            &borrowed.data[borrowed.cell_pointer(n as u16 - 1) as usize..],
+                        )
+                        .map(|(r, _)| r);
+                        if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
+                            set_table_hint(self.root, &page, lo, hi, epoch);
+                        }
+                    }
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        let Some((cell_rowid, _)) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                        else {
+                            return Err(Error::corruption("truncated leaf rowid in lookup"));
+                        };
+                        if cell_rowid == rowid {
+                            let rest = &borrowed.data[cell_ptr..];
+                            let (_rid, rn) = decode_rowid_only(rest)
+                                .ok_or_else(|| Error::corruption("truncated rowid"))?;
+                            let (plen, pn) = varint::decode(&rest[rn..])
+                                .ok_or_else(|| Error::corruption("truncated payload length"))?;
+                            let start = rn + pn;
+                            let end = start + plen as usize;
+                            if end > rest.len() {
+                                return Err(Error::corruption("truncated payload"));
+                            }
+                            let out = f(&rest[start..end])?;
+                            return Ok(Some(out));
+                        } else if cell_rowid < rowid {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    return Ok(None);
+                }
+                PageType::InteriorTable => {
+                    let n = borrowed.n_cells() as usize;
+                    let mut next = borrowed.right_most_pointer();
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        if cell_ptr + 4 > borrowed.data.len() {
+                            break;
+                        }
+                        let _left_child = u32::from_be_bytes(
+                            borrowed.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                        );
+                        let (key, _) = varint::decode_signed(&borrowed.data[cell_ptr + 4..])
+                            .ok_or_else(|| Error::corruption("truncated interior key in lookup"))?;
+                        if rowid <= key {
+                            next = _left_child;
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    drop(borrowed);
+                    if next == 0 {
+                        return Err(Error::corruption(format!(
+                            "interior page {} has no valid child for rowid {}",
+                            page_id, rowid
+                        )));
+                    }
+                    page_id = next;
+                }
+                _ => {
+                    return Err(Error::corruption(format!(
+                        "unexpected page type in table btree: {:?}",
+                        pt
+                    )))
+                }
+            }
+        }
+    }
+
     /// Look up a rowid in a table B+tree. Returns the payload bytes.
     /// Look up a row by rowid in a table B+tree. Walks interior pages
     /// (binary-searching each one) and finally binary-searches the leaf.
@@ -499,7 +831,20 @@ impl<'a> Btree<'a> {
     /// it's now O(log N) decodes (no allocations during the search) plus
     /// one final allocation for the matched payload. For a 100-cell leaf,
     /// that's ~7 decodes (vs ~50 avg) and 1 allocation (vs ~50).
+    ///
+    /// A per-thread leaf hint (see the leaf-hints module) short-circuits
+    /// the whole descent when the rowid falls inside the last-visited
+    /// leaf's range: one page touch instead of one per level.
     pub fn lookup_table(&mut self, rowid: i64) -> Result<LookupResult> {
+        // --- Hint probe: try the remembered leaf directly ---------------
+        let epoch = self.pager.write_epoch();
+        if let Some(page_ref) = table_hint_page(self.root, rowid, epoch) {
+            if let Ok(Some(res)) = self.lookup_table_leaf(&page_ref, rowid) {
+                return Ok(res);
+            }
+            // fall through to the full descent on any miss
+        }
+        // --- Full descent ------------------------------------------------
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;
@@ -513,6 +858,20 @@ impl<'a> Btree<'a> {
                 PageType::LeafTable => {
                     // (guard held for the whole leaf scan)
                     let n = borrowed.n_cells() as usize;
+                    if n > 0 {
+                        // Record the leaf hint (exact bounds read live).
+                        let lo_key = decode_rowid_only(
+                            &borrowed.data[borrowed.cell_pointer(0) as usize..],
+                        )
+                        .map(|(r, _)| r);
+                        let hi_key = decode_rowid_only(
+                            &borrowed.data[borrowed.cell_pointer(n as u16 - 1) as usize..],
+                        )
+                        .map(|(r, _)| r);
+                        if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
+                            set_table_hint(self.root, &page, lo, hi, epoch);
+                        }
+                    }
                     // Binary search by rowid (cells are stored sorted).
                     let mut lo = 0usize;
                     let mut hi = n;
@@ -3352,6 +3711,17 @@ impl<'a> Btree<'a> {
     /// multiple leaves). Previously this was a full O(N) scan of every
     /// index page — the main reason indexed point lookups lagged SQLite.
     pub fn lookup_index(&mut self, key: &[u8]) -> Result<Vec<i64>> {
+        // --- Hint probe: if the key falls inside the remembered leaf's
+        // bounds, search that leaf directly. All matches must be collected
+        // from this leaf only if the leaf's LAST cell doesn't itself match
+        // the prefix (otherwise duplicates may continue into the right
+        // sibling — fall back to the full scan for exactness).
+        let epoch = self.pager.write_epoch();
+        if let Some(page_ref) = index_hint_page(self.root, key, epoch) {
+            if let Ok(Some(rowids)) = self.lookup_index_leaf(&page_ref, key) {
+                return Ok(rowids);
+            }
+        }
         let mut results = Vec::new();
         self.scan_index_from(key, |cell_rowid, cell_key| {
             if cell_key.starts_with(key) {
@@ -3362,6 +3732,61 @@ impl<'a> Btree<'a> {
             }
         })?;
         Ok(results)
+    }
+
+    /// Search the hinted index leaf for all cells whose key starts with
+    /// `key`. The epoch was checked by the caller, so the remembered
+    /// bounds are exact and content unchanged. Returns `Ok(None)` to
+    /// signal "hint unusable — do the full scan" (wrong page type, or a
+    /// prefix run that may continue into the right sibling).
+    fn lookup_index_leaf(&self, page_ref: &PageRef, key: &[u8]) -> Result<Option<Vec<i64>>> {
+        let borrowed = page_ref.lock();
+        let pt = borrowed.page_type()?;
+        if pt != PageType::LeafIndex {
+            return Ok(None);
+        }
+        let n = borrowed.n_cells() as usize;
+        if n == 0 {
+            return Ok(None);
+        }
+        // The caller already verified key ∈ [first, last] via the hint
+        // bounds; with no mutation since, that check stands.
+        // Binary search for the first cell with key >= `key`.
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+            let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                return Ok(None);
+            };
+            if v.key < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // Collect the prefix run.
+        let mut rowids = Vec::new();
+        let mut i = lo;
+        while i < n {
+            let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
+            let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                break;
+            };
+            if v.key.starts_with(key) {
+                rowids.push(v.rowid);
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        if i == n && lo < n {
+            // The run reached the END of the leaf — duplicates may continue
+            // into the right sibling; only the full scan is exact.
+            return Ok(None);
+        }
+        Ok(Some(rowids))
     }
 
     /// Scan index entries in (key, rowid) order, starting at the first entry
@@ -3436,15 +3861,38 @@ impl<'a> Btree<'a> {
                         return Ok(false);
                     }
                 }
+                // Record the leaf hint (exact live bounds) for future point
+                // lookups on this tree.
+                if n > 0 {
+                    if let (Some(a), Some(b)) = (
+                        decode_index_cell(&borrowed.data[borrowed.cell_pointer(0) as usize..], false),
+                        decode_index_cell(
+                            &borrowed.data[borrowed.cell_pointer(n - 1) as usize..],
+                            false,
+                        ),
+                    ) {
+                        set_index_hint(self.root, &page, a.key, b.key, self.pager.write_epoch());
+                    }
+                }
                 *started = true;
                 Ok(true)
             }
             PageType::InteriorIndex => {
                 // Find the first child that can contain entries >= start_key.
-                // (uses the single outer guard — no re-lock)
-                let (n, first_cell_idx, right_most) = {
+                // Under the SAME guard, also read that first child's pointer —
+                // for point lookups the descent visits exactly one child, so
+                // this avoids a second lock of the parent per level (the old
+                // loop re-locked the parent for every child iteration).
+                let (n, first_cell_idx, first_child, right_most) = {
                     let n = borrowed.n_cells();
-                    let mut first_cell_idx = n; // default: right_most only
+                    // When the start key is already behind us (started),
+                    // EVERY child of this page is fully in range — begin at
+                    // cell 0. (The old code began at `n` here, visiting only
+                    // the right-most child and silently skipping all left
+                    // children of interior pages entered mid-scan — a latent
+                    // bug reachable in 3+ level index trees whose range
+                    // crosses an interior-sibling boundary.)
+                    let mut first_cell_idx = if *started { 0 } else { n };
                     if !*started {
                         let mut lo = 0u16;
                         let mut hi = n;
@@ -3463,14 +3911,29 @@ impl<'a> Btree<'a> {
                         }
                         first_cell_idx = lo;
                     }
-                    (n, first_cell_idx, borrowed.right_most_pointer())
+                    // Read the FIRST child to descend under this same lock.
+                    let first_child = if first_cell_idx < n {
+                        let cell_ptr = borrowed.cell_pointer(first_cell_idx) as usize;
+                        decode_index_cell(&borrowed.data[cell_ptr..], true)
+                            .map(|v| v.left_child)
+                            .unwrap_or(0)
+                    } else {
+                        0 // sentinel: descend right_most directly
+                    };
+                    (n, first_cell_idx, first_child, borrowed.right_most_pointer())
                 };
                 // Release the parent page before recursing into children.
                 drop(borrowed);
                 drop(page);
-                // Visit children from first_cell_idx onward, stopping as
-                // soon as the callback stops.
-                for i in first_cell_idx..n {
+                // Descend the first (usually only) child without re-locking
+                // the parent.
+                if first_child != 0 {
+                    if !self.scan_index_range_subtree(first_child, start_key, f, started)? {
+                        return Ok(false);
+                    }
+                }
+                // Remaining children (rare: the range spans siblings).
+                for i in (first_cell_idx + if first_child != 0 { 1 } else { 0 })..n {
                     let page = self.pager.get_page(page_id)?;
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(i) as usize;

@@ -320,7 +320,25 @@ pub struct Pager {
     /// turns flush() from O(10k) page-lock-acquire-and-check into O(2)
     /// HashSet lookups — a 5000× speedup on the per-statement overhead.
     dirty_pages: Mutex<PageIdSet>,
+    /// Monotonic write version, bumped by every `note_write()` (i.e. every
+    /// mutating B+tree/pager operation). Readers use it to invalidate
+    /// advisory caches (btree leaf hints): a version change means SOME
+    /// page content changed somewhere, so cached leaf bounds may be stale
+    /// and — critically — a page may have been recycled into another tree,
+    /// so a hint must never be trusted across a write.
+    write_version: std::sync::atomic::AtomicU64,
+    /// Unique id of this Pager instance within the process. Advisory
+    /// caches (btree leaf hints) tag entries with (instance, version) so a
+    /// new database opened on the same thread can never mistake stale
+    /// hints from a previous database for its own — even when both assign
+    /// the same page ids (they always do: roots start at low sequential
+    /// ids). See `write_epoch`.
+    instance_id: u64,
 }
+
+/// Process-wide Pager instance counter (see `Pager::instance_id`).
+static PAGER_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl Pager {
     /// Open or create a database file at the given path.
@@ -350,6 +368,11 @@ impl Pager {
             last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
             dirty_count_approx: AtomicUsize::new(0),
             dirty_pages: Mutex::new(PageIdSet::default()),
+            write_version: std::sync::atomic::AtomicU64::new(0),
+            instance_id: PAGER_INSTANCE_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .checked_add(1)
+                .unwrap_or(0),
         };
 
         let file_size = pager.file.metadata()?.len();
@@ -469,6 +492,26 @@ impl Pager {
     /// `Database::query()` call (the 9.2× point-lookup gap vs SQLite).
     pub fn note_write(&self) {
         self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+        self.write_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current write version (see `write_version`). Readers compare this
+    /// against the version their advisory caches were built at.
+    #[inline]
+    pub fn write_version(&self) -> u64 {
+        self.write_version.load(Ordering::Relaxed)
+    }
+
+    /// Cache-invalidation epoch: packs (instance_id, write_version) so
+    /// advisory caches can detect BOTH "content changed" and "this is a
+    /// different database object than the one the cache was built for"
+    /// with a single comparison. instance fits 16 bits (65k databases per
+    /// process), version 48 bits (281 trillion writes) — wraparound is
+    /// beyond any realistic workload.
+    #[inline]
+    pub fn write_epoch(&self) -> u64 {
+        let v = self.write_version.load(Ordering::Relaxed);
+        (self.instance_id << 48) | (v & 0xFFFF_FFFF_FFFF)
     }
 
     /// Notify the pager that a specific page is dirty. Adds the page ID
@@ -792,6 +835,10 @@ impl Pager {
         }
         self.lru.lock().clear();
         self.dirty_pages.lock().clear();
+        // Rollback RESTORES older page content — visible state changes, so
+        // advisory caches (btree leaf hints) must be invalidated even
+        // though no note_write ran for it.
+        self.write_version.fetch_add(1, Ordering::Relaxed);
         // The set was drained — the last-noted hint is stale (that page is
         // no longer in the set). Reset so future note_dirty calls don't
         // skip a needed insert.

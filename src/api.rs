@@ -145,6 +145,13 @@ pub struct Database {
     /// RwLock so concurrent readers can hit the cache simultaneously; only
     /// a cache miss takes the brief write lock to insert.
     stmt_cache: RwLock<StmtCacheMap>,
+    /// Last statement returned by `get_or_cache_stmt` (SQL text + the same
+    /// `Arc<CachedStmt>` the cache holds). Consecutive executions of the
+    /// same statement text — the dominant OLTP pattern — skip the FxHash
+    /// of the SQL text and the HashMap probe entirely: one read-lock, one
+    /// memcmp, one refcount bump. Mirrors SQLite's caller-held prepared
+    /// statement, where re-executing costs ZERO lookup.
+    last_stmt: RwLock<Option<(String, Arc<CachedStmt>)>>,
     /// FIFO order of insertion into `stmt_cache`, used for eviction when the
     /// cache reaches `stmt_cache_capacity`. The first item in this Vec is the
     /// oldest entry and the next to be evicted.
@@ -245,7 +252,7 @@ impl std::hash::BuildHasher for FxHashBuild {
 }
 
 /// Statement-cache map type with the fast string hasher.
-pub type StmtCacheMap = HashMap<String, CachedStmt, FxHashBuild>;
+pub type StmtCacheMap = HashMap<String, Arc<CachedStmt>, FxHashBuild>;
 
 /// Fast non-cryptographic hash (FxHash-style, as used by rustc) for the
 /// statement "seen" filter. ~5 ns for a typical 60-byte statement; used
@@ -473,6 +480,7 @@ impl Database {
             maps: RwLock::new(empty_maps()),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
+            last_stmt: RwLock::new(None),
             stmt_cache_order: Mutex::new(Vec::new()),
             stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
             seen_hashes: Mutex::new(std::collections::HashSet::default()),
@@ -718,7 +726,7 @@ impl Database {
         }
     }
 
-    fn get_or_cache_stmt(&self, sql: &str) -> Result<CachedStmt> {
+    fn get_or_cache_stmt(&self, sql: &str) -> Result<Arc<CachedStmt>> {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let t0 = profile::now();
@@ -733,19 +741,31 @@ impl Database {
                 .map(|p| crate::executor::plan_has_subqueries(p))
                 .unwrap_or(false);
             let fast_path = plan_arc.as_ref().and_then(|p| Self::detect_fast_path(p)).map(Arc::new);
-            return Ok(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path });
+            return Ok(Arc::new(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path }));
         }
-        // Fast path: read lock — concurrent readers can hit the cache
+        // Fast path 1: last-statement memo — consecutive calls with the
+        // same SQL text (the dominant pattern) skip hashing + probing.
+        {
+            let memo = self.last_stmt.read();
+            if let Some((last_sql, cached)) = memo.as_ref() {
+                if last_sql == sql {
+                    return Ok(Arc::clone(cached));
+                }
+            }
+        }
+        // Fast path 2: read lock — concurrent readers can hit the cache
         // simultaneously without serializing.
         {
             let cache = self.stmt_cache.read();
             if let Some(cached) = cache.get(sql) {
-                // Clone the Arcs, NOT the Plan — for an INSERT plan with
-                // Plan::Values { rows: Vec<Vec<Expr>> }, deep-cloning was
-                // 3+ heap allocations per cache hit. Arc clone is one atomic
-                // increment. For a 1k-statement INSERT batch, this saves
-                // ~3k heap allocations.
-                return Ok(cached.clone());
+                // One Arc refcount bump — the entry holds `Arc<Statement>`,
+                // `Option<Arc<Plan>>` and `Option<Arc<FastPath>>` internally,
+                // so the old per-field clone (three refcount pairs) is gone.
+                let out = Arc::clone(cached);
+                drop(cache);
+                let mut memo = self.last_stmt.write();
+                *memo = Some((sql.to_string(), Arc::clone(&out)));
+                return Ok(out);
             }
         }
         // Miss: parse + plan. Then decide whether to populate the cache.
@@ -757,12 +777,12 @@ impl Database {
         // execution. Planning here would also be wrong — the caller
         // materializes the CTEs first and plans with them in scope.
         if Self::stmt_needs_cte_materialization(&stmt) {
-            return Ok(CachedStmt {
+            return Ok(Arc::new(CachedStmt {
                 stmt: Arc::new(stmt),
                 plan: None,
                 has_subqueries: false,
                 fast_path: None,
-            });
+            }));
         }
         let t1 = profile::now();
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
@@ -773,7 +793,7 @@ impl Database {
             .map(|p| crate::executor::plan_has_subqueries(p))
             .unwrap_or(false);
         let fast_path = plan_arc.as_ref().and_then(|p| Self::detect_fast_path(p)).map(Arc::new);
-        let entry = CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path };
+        let entry = Arc::new(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path });
         let t2 = profile::now();
         // "Cache on second sight": only populate the cache for SQL text we
         // have seen before. A first sighting returns the freshly-parsed
@@ -803,11 +823,13 @@ impl Database {
                         order.remove(0);
                     }
                 }
-                cache.insert(sql.to_string(), entry.clone());
+                cache.insert(sql.to_string(), Arc::clone(&entry));
                 self.stmt_cache_order.lock().push(sql.to_string());
             }
         }
         profile::span(t2, &profile::CACHE_NS);
+        let mut memo = self.last_stmt.write();
+        *memo = Some((sql.to_string(), Arc::clone(&entry)));
         Ok(entry)
     }
 
@@ -902,6 +924,7 @@ impl Database {
     fn invalidate_stmt_cache(&self) {
         self.stmt_cache.write().clear();
         self.stmt_cache_order.lock().clear();
+        *self.last_stmt.write() = None;
     }
 
     /// Execute a statement that does not return rows (INSERT/UPDATE/DELETE/CREATE/...).
@@ -963,7 +986,7 @@ impl Database {
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &cached.stmt;
-        let plan_opt = cached.plan;
+        let plan_opt = cached.plan.clone();
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -1131,12 +1154,18 @@ impl Database {
                 return Ok(res.rows);
             }
         }
-        if let Some(plan) = cached.plan {
+        if let Some(plan) = cached.plan.clone() {
             // Pre-compiled point-lookup fast path: skips the ExecContext /
             // EvalContext / Plan dispatch entirely. Only fires for the
             // exact shapes detected at cache time (bare-column projections
             // over a rowid / index point lookup).
             if let Some(fp) = &cached.fast_path {
+                // Bind straight from the caller's parameter storage when
+                // it's already contiguous (arrays/Vec) — no per-query Vec.
+                if let Some(slice) = params.as_slice() {
+                    let rows = self.run_fast_path(fp, slice)?;
+                    return Ok(rows);
+                }
                 let params_v: Vec<Value> = params.into_iter().collect();
                 let rows = self.run_fast_path(fp, &params_v)?;
                 return Ok(rows);
@@ -1258,11 +1287,15 @@ impl Database {
                 return Ok((res.columns.to_vec(), res.rows));
             }
         }
-        if let Some(plan) = cached.plan {
+        if let Some(plan) = cached.plan.clone() {
             // Pre-compiled point-lookup fast path (see query()).
             if let Some(fp) = &cached.fast_path {
-                let params_v: Vec<Value> = params.into_iter().collect();
-                let rows = self.run_fast_path(fp, &params_v)?;
+                let owned;
+                let slice: &[Value] = match params.as_slice() {
+                    Some(s) => s,
+                    None => { owned = params.into_iter().collect::<Vec<Value>>(); &owned }
+                };
+                let rows = self.run_fast_path(fp, slice)?;
                 return Ok((fp.output_columns().to_vec(), rows));
             }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
@@ -1768,12 +1801,13 @@ impl Database {
                 let rid = rowid.resolve(params).as_integer();
                 let root = table_root.unwrap_or(table.root_page);
                 let mut bt = Btree::new(&self.pager, root, false);
-                match bt.lookup_table(rid)? {
-                    LookupResult::Found(payload) => {
-                        let row = decode_projected(&payload, table, rid, project.as_deref())?;
-                        Ok(vec![row])
-                    }
-                    LookupResult::NotFound => Ok(Vec::new()),
+                // Decode the projected row directly under the page lock —
+                // no intermediate payload Vec copy.
+                match bt.lookup_table_with(rid, |payload| {
+                    decode_projected(payload, table, rid, project.as_deref())
+                })? {
+                    Some(row) => Ok(vec![row]),
+                    None => Ok(Vec::new()),
                 }
             }
             FastPath::IndexCount { index, keys, pre_encoded, .. } => {
@@ -1818,8 +1852,10 @@ impl Database {
                 let mut tbt = Btree::new(&self.pager, troot, false);
                 let mut rows = Vec::with_capacity(rowids.len());
                 for rid in rowids {
-                    if let LookupResult::Found(payload) = tbt.lookup_table(rid)? {
-                        rows.push(decode_projected(&payload, table, rid, project.as_deref())?);
+                    if let Some(row) = tbt.lookup_table_with(rid, |payload| {
+                        decode_projected(payload, table, rid, project.as_deref())
+                    })? {
+                        rows.push(row);
                     }
                 }
                 Ok(rows)
@@ -3281,12 +3317,22 @@ fn is_ddl_sql(sql: &str) -> bool {
 pub trait Params {
     type Iter: Iterator<Item = Value>;
     fn into_iter(self) -> Self::Iter;
+    /// Borrow the parameters as a contiguous slice when possible (arrays,
+    /// Vecs, unit). The pre-compiled fast paths use this to bind directly
+    /// from the caller's storage instead of collecting a fresh `Vec` per
+    /// query — one heap allocation + N moves saved on every call.
+    fn as_slice(&self) -> Option<&[Value]> {
+        None
+    }
 }
 
 impl Params for () {
     type Iter = std::iter::Empty<Value>;
     fn into_iter(self) -> Self::Iter {
         std::iter::empty()
+    }
+    fn as_slice(&self) -> Option<&[Value]> {
+        Some(&[])
     }
 }
 
@@ -3295,12 +3341,18 @@ impl Params for Vec<Value> {
     fn into_iter(self) -> Self::Iter {
         <Vec<Value> as IntoIterator>::into_iter(self)
     }
+    fn as_slice(&self) -> Option<&[Value]> {
+        Some(self)
+    }
 }
 
 impl<const N: usize> Params for [Value; N] {
     type Iter = std::array::IntoIter<Value, N>;
     fn into_iter(self) -> Self::Iter {
         std::array::IntoIter::new(self)
+    }
+    fn as_slice(&self) -> Option<&[Value]> {
+        Some(self.as_slice())
     }
 }
 
