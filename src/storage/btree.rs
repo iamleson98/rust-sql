@@ -4084,6 +4084,23 @@ impl<'a> Btree<'a> {
                     }
                     lo
                 };
+                // Record the leaf hint (exact live bounds) for future point
+                // lookups on this tree. MUST happen before the cell loop:
+                // a point lookup's callback returns false at the first
+                // non-matching cell, and the resulting early return skipped
+                // this — so every indexed point lookup paid a full root->
+                // interior->leaf descent forever (measured hit rate 0.2%).
+                if n > 0 {
+                    if let (Some(a), Some(b)) = (
+                        decode_index_cell(&borrowed.data[borrowed.cell_pointer(0) as usize..], false),
+                        decode_index_cell(
+                            &borrowed.data[borrowed.cell_pointer(n - 1) as usize..],
+                            false,
+                        ),
+                    ) {
+                        set_index_hint(self.root, &page, a.key, b.key, self.pager.write_epoch());
+                    }
+                }
                 // Iterate the leaf under the SAME lock, borrowing key slices
                 // straight from the page buffer (Cell::decode allocated a
                 // key Vec per cell here).
@@ -4094,19 +4111,6 @@ impl<'a> Btree<'a> {
                     };
                     if !f(v.rowid, v.key) {
                         return Ok(false);
-                    }
-                }
-                // Record the leaf hint (exact live bounds) for future point
-                // lookups on this tree.
-                if n > 0 {
-                    if let (Some(a), Some(b)) = (
-                        decode_index_cell(&borrowed.data[borrowed.cell_pointer(0) as usize..], false),
-                        decode_index_cell(
-                            &borrowed.data[borrowed.cell_pointer(n - 1) as usize..],
-                            false,
-                        ),
-                    ) {
-                        set_index_hint(self.root, &page, a.key, b.key, self.pager.write_epoch());
                     }
                 }
                 *started = true;

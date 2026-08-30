@@ -1997,22 +1997,24 @@ impl Database {
                 return Ok(res.rows);
             }
         }
-        if let Some(plan) = cached.plan.clone() {
-            // Pre-compiled point-lookup fast path: skips the ExecContext /
-            // EvalContext / Plan dispatch entirely. Only fires for the
-            // exact shapes detected at cache time (bare-column projections
-            // over a rowid / index point lookup).
-            if let Some(fp) = &cached.fast_path {
-                // Bind straight from the caller's parameter storage when
-                // it's already contiguous (arrays/Vec) — no per-query Vec.
-                if let Some(slice) = params.as_slice() {
-                    let rows = self.run_fast_path(fp, slice)?;
-                    return Ok(rows);
-                }
-                let params_v: Vec<Value> = params.into_iter().collect();
-                let rows = self.run_fast_path(fp, &params_v)?;
+        // Pre-compiled point-lookup fast path: skips the ExecContext /
+        // EvalContext / Plan dispatch entirely. Only fires for the
+        // exact shapes detected at cache time (bare-column projections
+        // over a rowid / index point lookup). Checked BEFORE the plan
+        // Arc clone — the fast path never touches the plan, and the
+        // refcount pair cost ~15 ns per OLTP query.
+        if let Some(fp) = &cached.fast_path {
+            // Bind straight from the caller's parameter storage when
+            // it's already contiguous (arrays/Vec) — no per-query Vec.
+            if let Some(slice) = params.as_slice() {
+                let rows = self.run_fast_path(fp, slice)?;
                 return Ok(rows);
             }
+            let params_v: Vec<Value> = params.into_iter().collect();
+            let rows = self.run_fast_path(fp, &params_v)?;
+            return Ok(rows);
+        }
+        if let Some(plan) = cached.plan.clone() {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             // Skip the txn-snapshot Mutex entirely when not inside a
@@ -2630,19 +2632,26 @@ impl Database {
     /// `lookup_index` / `decode_row*` calls, same `.as_integer()` binding).
     fn run_fast_path(&self, fp: &FastPath, params: &[Value]) -> Result<Vec<Row>> {
         // One combined snapshot read for root overrides (tables + indexes).
-        // Cheap: usually the maps are empty and this is a failed lookup on
-        // an empty HashMap behind one read lock.
+        // The maps are empty for the vast majority of OLTP databases (they
+        // only gain entries after a B+tree split moves a root), and a
+        // failed HashMap probe still pays name-hash + bucket-walk per map
+        // per query. An empty check is a load + compare: skip all four
+        // probes until the first split actually populates them.
         let (table_root, index_root) = {
             let m = self.maps.read();
-            let name = fp.table_name();
-            let t = m.roots.get(name).copied()
-                .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
-            let i = match fp {
-                FastPath::IndexPoint { index, .. } => m.index_roots.get(&index.name).copied()
-                    .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
-                _ => None,
-            };
-            (t, i)
+            if m.roots.is_empty() && m.index_roots.is_empty() {
+                (None, None)
+            } else {
+                let name = fp.table_name();
+                let t = m.roots.get(name).copied()
+                    .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
+                let i = match fp {
+                    FastPath::IndexPoint { index, .. } => m.index_roots.get(&index.name).copied()
+                        .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
+                    _ => None,
+                };
+                (t, i)
+            }
         };
         match fp {
             FastPath::RowidPoint { table, rowid, project, columns: _ } => {
