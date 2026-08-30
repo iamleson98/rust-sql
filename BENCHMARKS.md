@@ -1,6 +1,6 @@
 # rustqlite vs SQLite — Detailed Comparison Report
 
-**Date:** 2026-07-30 (initial) · **Updated:** 2026-08-30 (all-gaps-closed: 8 KiB pages, index-hint fix, correlated subqueries)
+**Date:** 2026-07-30 (initial) · **Updated:** 2026-08-30 (second close-out: compiled UPDATE predicates, zero-decode range COUNT, PRAGMA page_size)
 **Engines:** rustqlite 0.1.0 (this project) vs SQLite 3.46 (via `rusqlite` 0.32 with `bundled` feature)
 **Methodology:** Single-process, in-memory databases (`:memory:`), single-threaded unless noted. SQLite configured with `PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF` to level the durability playing field. Both engines compiled with `lto = "fat"` and `codegen-units = 1`.
 **Hardware:** Linux x86_64, Rust 1.98.0.
@@ -19,8 +19,10 @@
 | JOINs             | **1.15–2.0× faster**  | INLJ fused projection; 8 KiB pages cut the cold-cache cost              |
 | Concurrent reads  | **8.3× faster**       | per-page locks vs a serialized connection mutex (criterion, 8 threads)  |
 | Mixed R/W         | **1.15× faster**      | readers don't block on writer                                           |
-| DB file size      | 1.03× larger          | 8 KiB pages tightened leaf fill (was 6.5× larger pre-codec-v2)         |
-| Binary size       | parity                | 2.01 MB vs 2.02 MB, with WAL + JSON1 + date/time + correlated subqueries |
+| UPDATE range      | **1.07× faster**      | compiled WHERE predicate (isolated steady-state was 1.65× slower)      |
+| Range COUNT       | **2.2× faster**       | zero-decode cell counting via Btree::count_rows_range                  |
+| DB file size      | **0.95× smaller**     | 4 KiB pages via `PRAGMA page_size` (fill is 99.0% at any size)         |
+| Binary size       | parity                | 2.05 MB vs 2.01 MB (50 KiB of that is mimalloc, which buys 20-40% alloc throughput) |
 | Peak RSS          | **0.91×**             | 28.4 vs 31.1 MB                                                         |
 | WAL commits       | **1.13× faster**      | 25.3 vs 28.5 µs/txn (delete journal mode: 6.2× faster)                  |
 
