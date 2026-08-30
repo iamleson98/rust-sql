@@ -409,7 +409,7 @@ fn bench_mixed_rw(c: &mut Criterion) {
                             let mut guard = db.write();
                             let _ = guard.execute(
                                 "INSERT INTO t (id, name, val) VALUES (?, ?, ?)",
-                                [Value::Integer(id), Value::Text(format!("new{i}")), Value::Integer(i)],
+                                [Value::Integer(id), Value::Text(format!("new{i}").into()), Value::Integer(i)],
                             );
                             drop(guard);
                         }

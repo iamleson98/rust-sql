@@ -78,19 +78,17 @@ impl Parser {
                 "SAVEPOINT" => {
                     self.advance();
                     let name = self.parse_ident()?;
-                    // Treat as a no-op savepoint creation.
-                    Ok(Statement::Begin(BeginStatement { mode: BeginMode::Deferred }))
+                    Ok(Statement::Savepoint(name))
                 }
                 "RELEASE" => {
-                    // RELEASE [SAVEPOINT] name — savepoints are no-ops here
-                    // (nested BEGIN is not tracked), so releasing one is a
-                    // no-op too. Consume and succeed for compatibility.
+                    // RELEASE [SAVEPOINT] name — discards the savepoint (and
+                    // everything above it) without rolling back.
                     self.advance();
                     if self.peek().is_keyword("SAVEPOINT") {
                         self.advance();
                     }
-                    let _ = self.parse_ident()?;
-                    Ok(Statement::Commit)
+                    let name = self.parse_ident()?;
+                    Ok(Statement::Release(name))
                 }
                 "PRAGMA" => self.parse_pragma(),
                 "ALTER" => self.parse_alter(),

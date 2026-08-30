@@ -372,6 +372,177 @@ pub struct Pager {
     /// the same page ids (they always do: roots start at low sequential
     /// ids). See `write_epoch`.
     instance_id: u64,
+    /// SAVEPOINT undo stack (SQLite-style nested transactions).
+    ///
+    /// Each level holds the pager metadata at SAVEPOINT time plus page
+    /// PRE-IMAGES: every page fetched (get_page) while this level is the
+    /// newest gets its bytes copied into the level's log on FIRST fetch —
+    /// and every mutation necessarily get_page()s the page before
+    /// modifying it, so the copy is always the pre-mutation state.
+    /// ROLLBACK TO <name> restores those bytes (in cache, marked dirty),
+    /// drops pages allocated after the savepoint, and rewinds metadata.
+    savepoints: Mutex<Vec<SavepointLevel>>,
+    /// Mirror of `savepoints.len()` for the get_page fast path (an atomic
+    /// load when no savepoint is active — the common case — instead of a
+    /// Mutex lock).
+    savepoint_depth: std::sync::atomic::AtomicUsize,
+}
+
+/// One SAVEPOINT level: the metadata snapshot plus page pre-images.
+struct SavepointLevel {
+    name: String,
+    base: PagerSnapshot,
+    /// page id -> page bytes as of this savepoint's creation (captured at
+    /// first fetch after creation). Pages allocated AFTER the savepoint
+    /// (id >= base.n_pages) are dropped rather than restored.
+    pages: std::collections::HashMap<PageId, Vec<u8>, PageIdHashBuild>,
+}
+
+impl Pager {
+    /// Create a savepoint. Must be called while `in_transaction` is true
+    /// (the caller ensures a transaction is open, starting one if needed).
+    pub fn savepoint(&self, name: &str) {
+        let mut sp = self.savepoints.lock();
+        sp.push(SavepointLevel {
+            name: name.to_ascii_lowercase(),
+            base: PagerSnapshot::capture(self),
+            pages: std::collections::HashMap::default(),
+        });
+        self.savepoint_depth.store(sp.len(), Ordering::Release);
+    }
+
+    /// ROLLBACK TO SAVEPOINT <name>: restore the pager to the savepoint's
+    /// state. The savepoint itself stays active (SQLite semantics);
+    /// savepoints created after it are discarded. Returns the savepoint's
+    /// new stack depth, or None when no savepoint with that name exists.
+    pub fn rollback_savepoint(&self, name: &str) -> Result<Option<usize>> {
+        // Phase 1 (under the savepoints lock): locate the level and TAKE
+        // its undo data + base snapshot, truncating the levels above it.
+        // The lock is released before any page work — get_page's undo
+        // capture re-locks this mutex, and std::sync::Mutex is not
+        // reentrant (holding it across get_page deadlocked).
+        let (undo, base) = {
+            let mut sp = self.savepoints.lock();
+            let idx = match sp.iter().rposition(|s| s.name == name.to_ascii_lowercase()) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let level = sp.split_off(idx);
+            let level = level.into_iter().next().unwrap();
+            let keep_depth = sp.len() + 1; // this savepoint stays active
+            self.savepoint_depth.store(keep_depth, Ordering::Release);
+            (level.pages, level.base)
+        };
+        // Phase 2 (no savepoints lock): restore pre-images for pages that
+        // existed at savepoint time. Pages below this savepoint keep their
+        // existing undo entries (any page in OUR log was fetched after the
+        // lower savepoints were created, so they logged it first — the
+        // capture hook's or_insert is a no-op for them).
+        for (id, bytes) in undo {
+            if id >= base.n_pages {
+                continue; // allocated after the savepoint — dropped below
+            }
+            let page = self.get_page(id)?;
+            {
+                let mut b = page.lock();
+                if b.data.len() == bytes.len() {
+                    b.data.copy_from_slice(&bytes);
+                    b.dirty = true;
+                } else {
+                    // Page-size mismatch can't happen within one file;
+                    // be defensive rather than corrupt.
+                    return Err(Error::corruption(format!(
+                        "savepoint restore: page {id} size mismatch"
+                    )));
+                }
+            }
+            self.note_dirty(id);
+        }
+        // Phase 3: drop pages allocated after the savepoint (evict from
+        // cache, remove from the dirty set).
+        {
+            let mut cache = self.cache.write();
+            // Low ids are dense Vec slots; clear everything above the base.
+            let base_n = base.n_pages as usize;
+            if base_n < PAGE_VEC_DIRECT_LIMIT {
+                let slots_len = cache.slots.len();
+                for idx in base_n..slots_len.min(PAGE_VEC_DIRECT_LIMIT) {
+                    cache.slots[idx] = None;
+                }
+                cache.count = cache.slots.iter().filter(|s| s.is_some()).count()
+                    + cache.overflow.len();
+            }
+            cache.overflow.retain(|&id, _| id < base.n_pages);
+            let mut dp = self.dirty_pages.lock();
+            dp.retain(|&id| id < base.n_pages);
+            self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+        }
+        self.lru.lock().clear();
+        // Phase 4: rewind mutable metadata + truncate the file if it grew.
+        self.n_pages.store(base.n_pages, Ordering::Release);
+        self.freelist_head.store(base.freelist_head, Ordering::Release);
+        self.freelist_count.store(base.freelist_count, Ordering::Release);
+        self.schema_cookie.store(base.schema_cookie, Ordering::Release);
+        let target_size = base.n_pages as u64 * self.page_size() as u64;
+        if let Ok(meta) = self.file.metadata() {
+            if meta.len() > target_size {
+                self.file.set_len(target_size)?;
+            }
+        }
+        // Phase 5: restored content differs from disk → restored pages are
+        // dirty. Invalidate advisory caches (leaf hints).
+        self.write_version.fetch_add(1, Ordering::Relaxed);
+        let n_dirty = self.dirty_pages.lock().len();
+        self.dirty_count_approx.store(n_dirty, Ordering::Release);
+        Ok(Some(self.savepoint_depth.load(Ordering::Acquire)))
+    }
+
+    /// RELEASE [SAVEPOINT] <name>: discard the savepoint and everything
+    /// above it WITHOUT rolling back. Returns the remaining stack depth
+    /// (0 = none left), or None when the name is unknown.
+    pub fn release_savepoint(&self, name: &str) -> Option<usize> {
+        let mut sp = self.savepoints.lock();
+        let idx = sp.iter().rposition(|s| s.name == name.to_ascii_lowercase())?;
+        sp.truncate(idx);
+        let remaining = sp.len();
+        self.savepoint_depth.store(remaining, Ordering::Release);
+        Some(remaining)
+    }
+
+    /// Discard all savepoints (COMMIT / plain ROLLBACK).
+    pub fn clear_savepoints(&self) {
+        let mut sp = self.savepoints.lock();
+        sp.clear();
+        self.savepoint_depth.store(0, Ordering::Release);
+    }
+
+    /// True when at least one savepoint is active.
+    pub fn has_savepoints(&self) -> bool {
+        self.savepoint_depth.load(Ordering::Acquire) > 0
+    }
+
+    /// Capture the page's current bytes into every savepoint level that
+    /// hasn't seen this page yet. Called from get_page (both hit and
+    /// insert paths) — the bytes at fetch time are the pre-mutation state
+    /// because every mutation locks the page through get_page first.
+    fn capture_savepoint_undo(&self, id: PageId, page: &PageRef) {
+        let mut sp = self.savepoints.lock();
+        if sp.is_empty() {
+            return;
+        }
+        // Fast exit: the newest level already has this page (the common
+        // re-fetch loop on a hot page).
+        if sp.last().map(|s| s.pages.contains_key(&id)).unwrap_or(false) {
+            return;
+        }
+        let bytes = {
+            let b = page.lock();
+            b.data.clone()
+        };
+        for level in sp.iter_mut() {
+            level.pages.entry(id).or_insert_with(|| bytes.clone());
+        }
+    }
 }
 
 /// Process-wide Pager instance counter (see `Pager::instance_id`).
@@ -428,6 +599,8 @@ impl Pager {
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
                 .unwrap_or(0),
+            savepoints: Mutex::new(Vec::new()),
+            savepoint_depth: std::sync::atomic::AtomicUsize::new(0),
         };
 
         let file_size = pager.file.metadata()?.len();
@@ -664,6 +837,13 @@ impl Pager {
         {
             let cache = self.cache.read();
             if let Some(page_ref) = cache.get(id).cloned() {
+                drop(cache);
+                // SAVEPOINT undo capture: the bytes at fetch time are the
+                // pre-mutation state (every mutation get_page()s before it
+                // modifies). One atomic load when no savepoint is active.
+                if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
+                    self.capture_savepoint_undo(id, &page_ref);
+                }
                 return Ok(page_ref);
             }
         }
@@ -712,6 +892,9 @@ impl Pager {
             self.lru.lock().push_back(id);
             page_ref
         };
+        if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
+            self.capture_savepoint_undo(id, &page_ref);
+        }
         Ok(page_ref)
     }
 

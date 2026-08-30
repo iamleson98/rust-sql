@@ -109,6 +109,14 @@ pub struct Database {
     /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager's
     /// state to the pre-transaction point.
     txn_snapshot: Mutex<Option<crate::storage::pager::PagerSnapshot>>,
+    /// SAVEPOINT support: bookkeeping-map snapshots aligned with the
+    /// pager's savepoint stack (index i corresponds to pager savepoint i).
+    /// ROLLBACK TO restores the maps Arc wholesale — root overrides and
+    /// max-rowid caches move with the rolled-back pages.
+    savepoint_maps: Mutex<Vec<std::sync::Arc<crate::executor::StmtMaps>>>,
+    /// True when the open transaction was started by SAVEPOINT (not
+    /// BEGIN) — releasing the outermost savepoint then COMMITS.
+    savepoint_txn: AtomicBool,
     /// Combined bookkeeping maps (table root overrides, index roots,
     /// max-rowid cache) behind ONE Arc — a query snapshot is a single
     /// read-lock + one refcount bump (previously three separate
@@ -1295,6 +1303,28 @@ fn drop_column_from_create_table(sql: &str, name: &str) -> Result<Option<String>
 }
 
 
+
+/// Pre-classification of savepoint-adjacent statements for execute()'s
+/// interception (the static dispatcher has no &self for map snapshots).
+enum StmtPre {
+    Savepoint(String),
+    Release(String),
+    RollbackTo(String),
+    Other,
+}
+
+fn stmt_ref_pre(stmt: &Statement) -> StmtPre {
+    match stmt {
+        Statement::Savepoint(name) => StmtPre::Savepoint(name.clone()),
+        Statement::Release(name) => StmtPre::Release(name.clone()),
+        Statement::Rollback(rb) => match &rb.savepoint {
+            Some(name) => StmtPre::RollbackTo(name.clone()),
+            None => StmtPre::Other,
+        },
+        _ => StmtPre::Other,
+    }
+}
+
 impl Database {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -1320,6 +1350,8 @@ impl Database {
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
+            savepoint_maps: Mutex::new(Vec::new()),
+            savepoint_txn: AtomicBool::new(false),
             maps: RwLock::new(empty_maps()),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
@@ -1827,6 +1859,23 @@ impl Database {
                 return Ok(());
             }
         }
+        // SAVEPOINT / RELEASE / ROLLBACK TO SAVEPOINT: need &self for the
+        // bookkeeping-map snapshots, so they bypass the static dispatcher.
+        match stmt_ref_pre(&cached.stmt) {
+            StmtPre::Savepoint(name) => {
+                self.exec_savepoint(&name)?;
+                return Ok(());
+            }
+            StmtPre::Release(name) => {
+                self.exec_release_savepoint(&name)?;
+                return Ok(());
+            }
+            StmtPre::RollbackTo(name) => {
+                self.exec_rollback_to_savepoint(&name)?;
+                return Ok(());
+            }
+            StmtPre::Other => {}
+        }
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &cached.stmt;
@@ -2289,6 +2338,62 @@ impl Database {
 
     /// Execute a SELECT statement with a set of pre-materialized CTEs in
     /// scope. Returns the ExecResult (columns + rows).
+    /// SAVEPOINT <name> — start (or nest) a savepoint. Outside a
+    /// transaction, the savepoint OPENS one (releasing the outermost
+    /// savepoint then commits, per SQLite semantics).
+    fn exec_savepoint(&mut self, name: &str) -> Result<()> {
+        if !self.in_transaction.load(Ordering::Acquire) {
+            // Implicit BEGIN (mirrors Statement::Begin handling): flush the
+            // current dirty set so a plain ROLLBACK (file-based restore)
+            // sees pre-savepoint state, then snapshot.
+            self.pager.flush_before_snapshot()?;
+            self.in_transaction.store(true, Ordering::Release);
+            *self.txn_snapshot.lock() = Some(self.pager.snapshot());
+            self.savepoint_txn.store(true, Ordering::Release);
+        }
+        self.pager.savepoint(name);
+        self.savepoint_maps.lock().push(self.maps.read().clone());
+        Ok(())
+    }
+
+    /// ROLLBACK TO SAVEPOINT <name> — restore pager + bookkeeping maps to
+    /// the savepoint; the transaction stays open.
+    fn exec_rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        match self.pager.rollback_savepoint(name)? {
+            Some(depth) => {
+                let mut maps_snaps = self.savepoint_maps.lock();
+                maps_snaps.truncate(depth);
+                if let Some(restored) = maps_snaps.last().cloned() {
+                    *self.maps.get_mut() = restored;
+                }
+                Ok(())
+            }
+            None => Err(Error::semantic(format!("no such savepoint: {name}"))),
+        }
+    }
+
+    /// RELEASE [SAVEPOINT] <name> — discard the savepoint and everything
+    /// above it without rolling back. Releasing the outermost savepoint of
+    /// a savepoint-started transaction COMMITS.
+    fn exec_release_savepoint(&mut self, name: &str) -> Result<()> {
+        match self.pager.release_savepoint(name) {
+            Some(remaining) => {
+                self.savepoint_maps.lock().truncate(remaining);
+                if remaining == 0 && self.savepoint_txn.load(Ordering::Acquire) {
+                    // Outermost savepoint released -> COMMIT.
+                    self.pager.clear_savepoints();
+                    self.savepoint_maps.lock().clear();
+                    self.savepoint_txn.store(false, Ordering::Release);
+                    self.in_transaction.store(false, Ordering::Release);
+                    *self.txn_snapshot.lock() = None;
+                    self.pager.flush()?;
+                }
+                Ok(())
+            }
+            None => Err(Error::semantic(format!("no such savepoint: {name}"))),
+        }
+    }
+
     fn exec_select_with_ctes(
         &self,
         ctx: &mut ExecContext<'_>,
@@ -2948,11 +3053,14 @@ impl Database {
             Statement::Commit => {
                 ctx.in_transaction = false;
                 ctx.txn_snapshot = None;
+                ctx.pager.clear_savepoints();
                 ctx.pager.flush()?;
                 Ok(())
             }
             Statement::Rollback(_) => {
-                // Restore the pager to the snapshot taken at BEGIN.
+                // Restore the pager to the snapshot taken at BEGIN. Any
+                // active savepoints die with the transaction.
+                ctx.pager.clear_savepoints();
                 if let Some(snap) = ctx.txn_snapshot.take() {
                     ctx.pager.rollback_to(&snap)?;
                 }
@@ -2971,6 +3079,11 @@ impl Database {
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
             Statement::Explain(_) => Ok(()),
+            // Savepoint statements are intercepted in execute() (they need
+            // &self for the bookkeeping-map snapshots); reaching this arm
+            // means they were executed through a path without map access —
+            // treat as no-ops to stay total.
+            Statement::Savepoint(_) | Statement::Release(_) => Ok(()),
             Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 // These produce rows; for `execute`, we just discard them.
                 let plan_opt = match stmt {

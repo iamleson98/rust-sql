@@ -18,6 +18,8 @@ pub enum Statement {
     Begin(BeginStatement),
     Commit,
     Rollback(RollbackStatement),
+    Savepoint(String),
+    Release(String),
     Explain(Box<Statement>),
     Pragma(PragmaStatement),
     Attach(AttachStatement),
