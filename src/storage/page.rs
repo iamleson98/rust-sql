@@ -26,7 +26,7 @@ use std::convert::TryInto;
 
 /// Default page size. 4 KiB matches SQLite's default and is a good fit for
 /// most modern file systems and CPU caches.
-pub const DEFAULT_PAGE_SIZE: u32 = 16384;
+pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 
 /// Smallest allowed page size.
 pub const MIN_PAGE_SIZE: u32 = 512;
