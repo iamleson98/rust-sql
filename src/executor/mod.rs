@@ -6033,6 +6033,23 @@ fn try_streaming_update(
     let mut new_row: Vec<Value> = Vec::with_capacity(n_cols);
     let mut payload_buf: Vec<u8> = Vec::with_capacity(256);
 
+    // Compile SET expressions positionally ONCE per statement: `score =
+    // score + 1.0` costs an AST walk + name resolution per row on the
+    // general path (~80-120 ns); compiled evaluation is ~5-15 ns.
+    let compiled_assignments: Vec<Option<crate::executor::predicate::CompiledExpr>> =
+        assignments
+            .iter()
+            .map(|(_, e)| {
+                crate::executor::predicate::compile_expr(e, col_names, params.len())
+            })
+            .collect();
+    let compiled_ref: Option<&[Option<crate::executor::predicate::CompiledExpr>]> =
+        if compiled_assignments.iter().any(|c| c.is_some()) {
+            Some(&compiled_assignments)
+        } else {
+            None
+        };
+
     // Pre-compute which indexes might be touched by the SET assignments
     // BEFORE the scan — when any index column is assigned, the OLD payload
     // must be stashed during the scan phase so phase 2 can compute the old
@@ -6065,7 +6082,11 @@ fn try_streaming_update(
     // update phase. We can't update inside the scan callback because the
     // scan holds the pager via the Btree, so we collect first, then update
     // after the scan completes.
-    let mut updates: Vec<(i64, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    // (rowid, payload range in the arena, old-payload stash). The arena
+    // replaces one Vec<u8> allocation PER ROW — a 5000-row UPDATE paid
+    // 5000 alloc+copy pairs just to hand payloads to phase 2.
+    let mut updates: Vec<(i64, std::ops::Range<usize>, Option<Vec<u8>>)> = Vec::new();
+    let mut update_arena: Vec<u8> = Vec::new();
     // RETURNING: stash decoded new rows too (only when needed).
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     // First constraint error encountered during the scan (if any).
@@ -6145,7 +6166,8 @@ fn try_streaming_update(
                 if let Err(e) = process_update_row(
                     ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
-                    residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
+                    residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                    compiled_ref,
                 ) {
                     first_error = Some(e);
                 }
@@ -6159,7 +6181,8 @@ fn try_streaming_update(
             if let Err(e) = process_update_row(
                 ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
-                residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
+                residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                compiled_ref,
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -6241,7 +6264,8 @@ fn try_streaming_update(
                 if let Err(e) = process_update_row(
                     ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                     assignments, &col_names, &params, &named_params, table,
-                    residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
+                    residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                    compiled_ref,
                 ) {
                     err = Some(e);
                     return false;
@@ -6262,7 +6286,8 @@ fn try_streaming_update(
                     if let Err(e) = process_update_row(
                         ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                         assignments, &col_names, &params, &named_params, table,
-                        residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
+                        residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                        compiled_ref,
                     ) {
                         first_error = Some(e);
                         break;
@@ -6279,7 +6304,8 @@ fn try_streaming_update(
             if let Err(e) = process_update_row(
                 ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
                 assignments, &col_names, &params, &named_params, table,
-                residual_pred, &mut updates, &mut returning_rows, returning, old_owned,
+                residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                compiled_ref,
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -6326,8 +6352,13 @@ fn try_streaming_update(
     // bulk-applied rows skip the per-row index maintenance, so any
     // touched index forces the per-row path (defer everything).
     if touched_indexes.is_empty() && !has_update_triggers {
-        let sorted_updates: Vec<(i64, &[u8])> =
-            order.iter().map(|&i| (updates[i].0, updates[i].1.as_slice())).collect();
+        let sorted_updates: Vec<(i64, &[u8])> = order
+            .iter()
+            .map(|&i| {
+                let r = updates[i].1.clone();
+                (updates[i].0, &update_arena[r])
+            })
+            .collect();
         let mut bt = Btree::new(ctx.pager, root, false);
         bt.update_table_bulk(&sorted_updates, &mut deferred)?;
         if bt.root != root {
@@ -6346,7 +6377,8 @@ fn try_streaming_update(
         if done_mask[i] {
             continue;
         }
-        let (rowid, new_payload, old_payload_stash) = &updates[i];
+        let (rowid, new_payload_range, old_payload_stash) = &updates[i];
+        let new_payload: &[u8] = &update_arena[new_payload_range.clone()];
         let old_payload_opt: Option<&[u8]> = old_payload_stash.as_deref();
         let new_root;
         {
@@ -6468,7 +6500,8 @@ fn process_update_row(
     named_params: &HashMap<String, Value>,
     table: &Arc<Table>,
     residual_pred: Option<&Expr>,
-    updates: &mut Vec<(i64, Vec<u8>, Option<Vec<u8>>)>,
+    updates: &mut Vec<(i64, std::ops::Range<usize>, Option<Vec<u8>>)>,
+    update_arena: &mut Vec<u8>,
     returning_rows: &mut Vec<Vec<Value>>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
     // Old row payload, owned (pre-stashed by lookup-based sources) or
@@ -6476,6 +6509,9 @@ fn process_update_row(
     // being SET — phase 2 needs it for index maintenance without a
     // per-row re-fetch descent.
     old_payload_stash: Option<Vec<u8>>,
+    // Pre-compiled positional SET expressions (None per assignment when
+    // the shape isn't compilable — the general AST walk is used then).
+    compiled: Option<&[Option<crate::executor::predicate::CompiledExpr>]>,
 ) -> Result<()> {
     row_buf.clear();
     if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {
@@ -6496,8 +6532,13 @@ fn process_update_row(
     // Build the new row: copy old values, apply SET assignments.
     new_row.clear();
     new_row.extend_from_slice(row_buf);
-    for (col_idx, expr) in assignments {
-        let v = eval_row(expr, row_buf, col_names, params, named_params)?;
+    for (i, (col_idx, expr)) in assignments.iter().enumerate() {
+        let v = if let Some(Some(cexpr)) = compiled.and_then(|c| c.get(i)) {
+            // Compiled positional evaluation: no AST walk, no name lookup.
+            cexpr.eval(row_buf, params)
+        } else {
+            eval_row(expr, row_buf, col_names, params, named_params)?
+        };
         let aff = table.columns[*col_idx].affinity;
         new_row[*col_idx] = aff.coerce(v);
     }
@@ -6514,8 +6555,11 @@ fn process_update_row(
     if let Some(ret) = returning {
         returning_rows.push(project_returning_row(ret, new_row, col_names, params, named_params)?);
     }
-    // Stash the (rowid, new payload, old payload) for phase 2.
-    updates.push((rowid, payload_buf.clone(), old_payload_stash));
+    // Stash the (rowid, new payload, old payload) for phase 2. The new
+    // payload goes into the shared arena — no per-row allocation.
+    let start = update_arena.len();
+    update_arena.extend_from_slice(payload_buf);
+    updates.push((rowid, start..update_arena.len(), old_payload_stash));
     Ok(())
 }
 

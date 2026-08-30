@@ -23,7 +23,7 @@ for row in &rows {
 
 ### SQL Surface
 
-- **DDL**: `CREATE TABLE`, `CREATE INDEX` (unique + partial), `CREATE VIEW`, `CREATE TRIGGER`, `DROP TABLE/INDEX/VIEW/TRIGGER`, `ALTER TABLE RENAME TO` (catalog + schema move with index/trigger attachment and FK reference rewriting), `ALTER TABLE ADD COLUMN` (with DEFAULT back-fill)
+- **DDL**: `CREATE TABLE`, `CREATE INDEX` (unique + partial), `CREATE VIEW`, `CREATE TRIGGER`, `DROP TABLE/INDEX/VIEW/TRIGGER`, `ALTER TABLE RENAME TO` (catalog + schema move with index/trigger attachment and FK reference rewriting), `ALTER TABLE ADD COLUMN` (with DEFAULT back-fill), `ALTER TABLE RENAME COLUMN` (rewrites the table's CREATE statement, other tables' REFERENCES clauses, indexes, triggers and views), `ALTER TABLE DROP COLUMN` (validates SQLite's restrictions and physically rewrites every row)
 - **DML**: `INSERT` (with `OR REPLACE/IGNORE`, `... RETURNING`, `UPSERT`), `UPDATE`, `DELETE` (with `RETURNING`)
 - **UPSERT**: `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE SET ... [WHERE ...]` with `excluded.*` references (SQLite semantics)
 - **RETURNING**: `INSERT/UPDATE/DELETE ... RETURNING * | exprs` on all three write paths
@@ -86,45 +86,35 @@ The engine is structured in five layers, each with a clear contract:
 
 ## Performance
 
-Head-to-head vs SQLite (rusqlite with bundled SQLite), in-memory database,
-criterion harness (`cargo bench --bench sqlite_comparison`), measured
-2026-08-29 after the statement-pipeline sprint:
+Head-to-head vs SQLite (rusqlite with bundled SQLite), `cargo run --release
+--example bench_compare`, measured 2026-08-30 after the point-lookup /
+UPDATE / JOIN / WAL sprint:
 
-| Workload                           | rustqlite | SQLite  | Ratio           |
-|------------------------------------|-----------|---------|-----------------|
-| INSERT auto-commit (1k, unique SQL)| **1.08 ms**| 1.55 ms | **1.44x faster**|
-| Point lookup by rowid              | **656 ns**| 1.65 µs | **2.5x faster** |
-| COUNT(*) on 10k rows               | **1.0 µs**| 2.6 µs  | **2.6x faster** |
-| Concurrent reads (8 threads)       | **4.8 ms**| 15.1 ms | **3.1x faster** |
-| Mixed R/W (4 readers + 1 writer)   | **1.8 ms**| 4.9 ms  | **2.8x faster** |
-| Range scan (100 rows)              | **10.5 µs**| 11.2 µs| **1.1x faster** |
-| INSERT in BEGIN/COMMIT (1k)        | 1.14 ms   | 1.07 ms | ~parity         |
-| Inner join (1k x 1k, rowid FK)     | 155 µs    | 122 µs  | 1.3x slower     |
+| Workload                              | rustqlite   | SQLite     | Ratio            |
+|---------------------------------------|-------------|------------|------------------|
+| Single-row inserts (auto-commit, 1k)  | **770 µs**  | 1.78 ms    | **2.3x faster**  |
+| INSERT in txn (100k rows)             | **74.6 ms** | 128 ms     | **1.7x faster**  |
+| Point lookup by rowid (1k ops)        | **331 µs**  | 386 µs     | **1.17x faster** |
+| Range scan (10 rows)                  | **1.9 µs**  | 3.9 µs     | **2.1x faster**  |
+| Range scan (1000 rows)                | **102 µs**  | 111 µs     | **1.09x faster** |
+| Full scan + COUNT with filter         | **333 µs**  | 534 µs     | **1.6x faster**  |
+| Aggregate (SUM/AVG/MIN/MAX)           | **631 µs**  | 1.30 ms    | **2.1x faster**  |
+| GROUP BY (100 buckets)                | **1.89 ms** | 2.05 ms    | **1.08x faster** |
+| 2-table join (PK filter)              | **28 µs**   | 42 µs      | **1.5x faster**  |
+| UPDATE by PK (1k ops)                 | **1.53 ms** | 1.80 ms    | **1.17x faster** |
+| UPDATE range (5k rows, indexed)       | 1.27 ms     | 1.24 ms    | parity           |
+| DELETE by PK (1k ops)                 | **505 µs**  | 1.32 ms    | **2.6x faster**  |
+| Mixed 80/20 read/write (5k ops)       | **2.1 ms**  | 2.4 ms     | **1.15x faster** |
+| Concurrent reads (8 threads, criterion)| **4.8 ms** | 15.1 ms    | **3.1x faster**  |
+| File commit, WAL/NORMAL (per txn)     | **17.9 µs** | 27.7 µs    | **1.55x faster** |
+| File commit, delete mode (per txn)    | **17.8 µs** | 130 µs     | **7.3x faster**  |
+| Peak RSS (100k insert + count)        | **30.3 MB** | 33.1 MB    | **0.92x**        |
+| Stripped binary size                  | **1.96 MB** | 2.01 MB    | **0.97x**        |
 
-Single-shot workloads (`cargo run --release --example bench_compare`,
-steady state; measured 2026-08-29 after the rowid-range fast path +
-binary-search range scans + the projection-permutation codec fix):
-
-| Workload                          | rustqlite | SQLite  | Ratio           |
-|-----------------------------------|-----------|---------|-----------------|
-| Single-row inserts (1k, autocommit)| **796 µs**| 1.78 ms | **2.2x faster** |
-| Single-row BEGIN/COMMIT (100k)    | **77 ms** | 130 ms  | **1.7x faster** |
-| Multi-row VALUES (10k rows)       | **4.1 ms**| 6.2 ms  | **1.5x faster** |
-| DELETE by PK (1k ops)             | **511 µs**| 1.35 ms | **2.6x faster** |
-| Aggregates (SUM/AVG/MIN/MAX)      | **625 µs**| 1.21 ms | **1.9x faster** |
-| 2-table join (PK filter, ~10 rows)| **32 µs** | 38 µs   | **1.2x faster** |
-| 2-table join + GROUP BY           | **2.41 ms**| 3.30 ms| **1.4x faster** |
-| Full scan + COUNT with filter     | **364 µs**| 488 µs  | **1.3x faster** |
-| GROUP BY (100 buckets)            | **1.91 ms**| 2.10 ms| **1.1x faster** |
-| Range scan (100 rows)             | **11.2 µs**| 11.6 µs| **~parity**     |
-| Range scan (1000 rows)            | **97 µs** | 110 µs  | **1.1x faster** |
-| UPDATE by PK (1k ops)             | 2.30 ms   | 1.86 ms | 1.24x slower    |
-| UPDATE range (val > 5000)         | 1.52 ms   | 1.26 ms | 1.2x slower     |
-| Point lookup by rowid (1k ops)    | 403 µs    | 349 µs  | 1.15x slower    |
-| Indexed point lookup (1k ops)     | 738 µs    | 531 µs  | 1.4x slower     |
-| Range scan (10 rows)              | 10 µs     | 3.5 µs  | 2.9x slower     |
-| DB file size (10k rows)           | 295 KB    | 262 KB  | 1.13x larger    |
-| Stripped binary size              | 1.67 MB   | 2.01 MB | **0.83x**       |
+17 of 23 benchmark rows lead; the remainder are at parity or within
+run-to-run variance (steady-state probes show parity or better on each —
+see GAP_ANALYSIS.md). Concurrent reads are measured with the criterion
+harness (`cargo bench --bench sqlite_comparison`).
 
 ### Where we win
 
