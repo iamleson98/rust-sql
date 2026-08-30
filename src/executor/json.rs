@@ -463,8 +463,8 @@ pub fn json_to_sql(j: &Json) -> Value {
         Json::False => Value::Integer(0),
         Json::Integer(i) => Value::Integer(*i),
         Json::Real(r) => Value::Real(*r),
-        Json::Str(s) | Json::Text(s) => Value::Text(s.clone()),
-        Json::Array(_) | Json::Object(_) => Value::Text(json_to_string(j)),
+        Json::Str(s) | Json::Text(s) => Value::Text(s.clone().into()),
+        Json::Array(_) | Json::Object(_) => Value::Text(json_to_string(j).into()),
     }
 }
 
@@ -474,7 +474,7 @@ pub fn sql_to_json(v: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Integer(i) => Json::Integer(*i),
         Value::Real(r) => Json::Real(*r),
-        Value::Text(s) => Json::Str(s.clone()),
+        Value::Text(s) => Json::Str(s.as_str().to_owned()),
         Value::Blob(b) => Json::Str(String::from_utf8_lossy(b).to_string()),
     }
 }
@@ -621,9 +621,9 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
         "json" => Some(match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => match parse_json(&v.as_text()) {
-                Some(j) => Value::Text(json_to_string(&j)),
+                Some(j) => Value::Text(json_to_string(&j).into()),
                 None => {
-                    Value::Text(format!("malformed JSON: {}", trunc(&v.as_text())))
+                    Value::Text(format!("malformed JSON: {}", trunc(&v.as_text())).into())
                 }
             }
         }),
@@ -631,28 +631,28 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
             let (doc, path) = doc_and_path(args)?;
             Some(match path {
                 Some(p) => match p.resolve(&doc) {
-                    Some(node) => Value::Text(node.type_name().to_string()),
+                    Some(node) => Value::Text(node.type_name().to_string().into()),
                     None => Value::Null,
                 },
-                None => Value::Text(doc.type_name().to_string()),
+                None => Value::Text(doc.type_name().to_string().into()),
             })
         }
         "json_quote" => Some(match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
                 let j = sql_to_json(v);
-                Value::Text(json_to_string(&j))
+                Value::Text(json_to_string(&j).into())
             }
         }),
         "json_array" => {
             let items: Vec<Json> = args.iter().map(sql_to_json).collect();
-            Some(Value::Text(json_to_string(&Json::Array(items))))
+            Some(Value::Text(json_to_string(&Json::Array(items)).into()))
         }
         "json_object" => {
             // json_object(k1, v1, k2, v2, ...) — odd arg count is an error
             // in SQLite; we mirror by returning a malformed marker text.
             if args.len() % 2 != 0 {
-                return Some(Value::Text("json_object() requires an even number of arguments".to_string()));
+                return Some(Value::Text("json_object() requires an even number of arguments".to_string().into()));
             }
             let mut members = Vec::with_capacity(args.len() / 2);
             let mut i = 0;
@@ -661,7 +661,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
                 members.push((k, sql_to_json(&args[i + 1])));
                 i += 2;
             }
-            Some(Value::Text(json_to_string(&Json::Object(members))))
+            Some(Value::Text(json_to_string(&Json::Object(members)).into()))
         }
         "json_array_length" => {
             let (doc, path) = doc_and_path(args)?;
@@ -700,7 +700,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
                 Some(if any { results.pop().unwrap() } else { Value::Null })
             } else {
                 Some(Value::Text(
-                    json_to_string(&Json::Array(results.into_iter().map(|v| sql_to_json(&v)).collect())),
+                    json_to_string(&Json::Array(results.into_iter().map(|v| sql_to_json(&v)).collect())).into(),
                 ))
             }
         }
@@ -713,7 +713,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
             let mut i = 1;
             while i + 1 < args.len() {
                 let Some(path) = parse_path(&args[i].as_text()) else {
-                    return Some(Value::Text("bad JSON path".to_string()));
+                    return Some(Value::Text("bad JSON path".to_string().into()));
                 };
                 let new_val = sql_to_json(&args[i + 1]);
                 let exists = path.resolve(&doc).is_some();
@@ -730,7 +730,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
                 }
                 i += 2;
             }
-            Some(Value::Text(json_to_string(&doc)))
+            Some(Value::Text(json_to_string(&doc).into()))
         }
         "json_remove" => {
             // (doc, path...)
@@ -743,7 +743,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
                     doc = json_remove_at(doc, &path);
                 }
             }
-            Some(Value::Text(json_to_string(&doc)))
+            Some(Value::Text(json_to_string(&doc).into()))
         }
         "json_patch" => {
             if args.len() != 2 {
@@ -751,7 +751,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
             }
             let target = parse_json(&args[0].as_text())?;
             let patch = parse_json(&args[1].as_text())?;
-            Some(Value::Text(json_to_string(&json_patch_target(&target, &patch))))
+            Some(Value::Text(json_to_string(&json_patch_target(&target, &patch)).into()))
         }
         _ => None,
     }

@@ -419,11 +419,11 @@ mod tests {
     #[test]
     fn large_varint_text() {
         let s = "x".repeat(300);
-        let row = vec![Value::Text(s.clone())];
+        let row = vec![Value::Text(s.clone().into())];
         let bytes = encode_row(&row);
         // tag(1) + varint(2 bytes for 300) + 300 = 303
         assert_eq!(bytes.len(), 303);
         let decoded = decode_row(&bytes, 1, 0, None).unwrap();
-        assert_eq!(decoded[0], Value::Text(s));
+        assert_eq!(decoded[0], Value::Text(s.clone().into()));
     }
 }

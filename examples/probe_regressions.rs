@@ -9,7 +9,7 @@ fn main() {
     let ins = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
     for i in 1..=10_000i64 {
         db.execute(ins, [
-            rustqlite::Value::Text(format!("name{}", i)),
+            rustqlite::Value::Text(format!("name{}", i).into()),
             rustqlite::Value::Integer(i * 2),
             rustqlite::Value::Real(i as f64 * 1.5),
         ]).unwrap();
@@ -57,7 +57,7 @@ fn main() {
         db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)", []).unwrap();
         db.execute("BEGIN", []).unwrap();
         for i in 1..=1000i64 {
-            db.execute("INSERT INTO users (name) VALUES (?)", [rustqlite::Value::Text(format!("user{}", i))]).unwrap();
+            db.execute("INSERT INTO users (name) VALUES (?)", [rustqlite::Value::Text(format!("user{}", i).into())]).unwrap();
         }
         for i in 1..=10_000i64 {
             db.execute("INSERT INTO orders (user_id, total) VALUES (?, ?)", [rustqlite::Value::Integer((i % 1000) + 1), rustqlite::Value::Real(i as f64)]).unwrap();

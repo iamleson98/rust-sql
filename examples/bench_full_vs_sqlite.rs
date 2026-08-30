@@ -52,7 +52,7 @@ fn setup_rustqlite(n: i64, with_index: bool) -> Database {
     for i in 1..=n {
         db.execute(
             "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("name{}", i)), Value::Integer(i), Value::Real(i as f64 * 1.5)],
+            [Value::Text(format!("name{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)],
         ).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
@@ -119,7 +119,7 @@ fn bench_insert_autocommit() -> BenchResult {
         for i in 1..=n {
             db.execute(
                 "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("name{}", i)), Value::Integer(i)],
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
             ).unwrap();
         }
     }, n as usize);
@@ -142,7 +142,7 @@ fn bench_insert_transaction() -> BenchResult {
         for i in 1..=n {
             db.execute(
                 "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("name{}", i)), Value::Integer(i)],
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
             ).unwrap();
         }
         db.execute("COMMIT", []).unwrap();
@@ -372,7 +372,7 @@ fn bench_delete_insert_cycle() -> BenchResult {
         for i in 1..=n {
             db.execute("DELETE FROM t WHERE id = ?", [Value::Integer(i)]).unwrap();
             db.execute("INSERT INTO t (id, name, val, score) VALUES (?, ?, ?, ?)",
-                [Value::Integer(i), Value::Text(format!("name{}", i)), Value::Integer(i), Value::Real(i as f64)]).unwrap();
+                [Value::Integer(i), Value::Text(format!("name{}", i).into()), Value::Integer(i), Value::Real(i as f64)]).unwrap();
         }
     }, n as usize * 2);
     let (rs_ops, _) = measure("rusqlite delete+insert cycle", || {

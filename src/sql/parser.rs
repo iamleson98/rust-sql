@@ -1002,7 +1002,7 @@ impl Parser {
                 t if keyword_text(&t.token).is_some() => {
                     let txt = keyword_text(&t.token).unwrap();
                     self.advance();
-                    Expr::Literal(Value::Text(txt))
+                    Expr::Literal(Value::Text(txt.into()))
                 }
                 _ => self.parse_primary_expr()?,
             };
@@ -1987,7 +1987,7 @@ impl Parser {
             }
             Token::String(s) => {
                 self.advance();
-                Ok(Expr::Literal(Value::Text(s.clone())))
+                Ok(Expr::Literal(Value::Text(s.clone().into())))
             }
             Token::Blob(b) => {
                 self.advance();

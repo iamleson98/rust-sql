@@ -314,7 +314,7 @@ fn format_value(v: &Value) -> String {
                 s
             }
         }
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str().to_owned(),
         Value::Blob(b) => {
             // SLT prints blobs as X'...hex...' but we don't have blob tests yet.
             let hex: String = b.iter().map(|x| format!("{:02x}", x)).collect();

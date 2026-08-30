@@ -667,11 +667,11 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
 /// Columns: (type, name, tbl_name, rootpage, sql).
 pub fn encode_schema_row(kind: &str, name: &str, tbl_name: &str, rootpage: PageId, sql: &str) -> Vec<Value> {
     vec![
-        Value::Text(kind.to_string()),
-        Value::Text(name.to_string()),
-        Value::Text(tbl_name.to_string()),
+        Value::Text(kind.to_string().into()),
+        Value::Text(name.to_string().into()),
+        Value::Text(tbl_name.to_string().into()),
         Value::Integer(rootpage as i64),
-        Value::Text(sql.to_string()),
+        Value::Text(sql.to_string().into()),
     ]
 }
 

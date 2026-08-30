@@ -308,7 +308,7 @@ fn extract_json_array(body: &str, key: &str) -> Option<Vec<Value>> {
         if item == "null" {
             params.push(Value::Null);
         } else if item.starts_with('"') && item.ends_with('"') {
-            params.push(Value::Text(item[1..item.len() - 1].to_string()));
+            params.push(Value::Text(item[1..item.len() - 1].to_string().into()));
         } else if item.contains('.') {
             params.push(Value::Real(item.parse().unwrap_or(0.0)));
         } else {

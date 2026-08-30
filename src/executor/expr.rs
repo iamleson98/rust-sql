@@ -325,30 +325,30 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         "lower" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().to_lowercase()),
+            Some(v) => Value::Text(v.as_text().to_lowercase().into()),
         },
         "upper" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().to_uppercase()),
+            Some(v) => Value::Text(v.as_text().to_uppercase().into()),
         },
         "trim" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().trim().to_string()),
+            Some(v) => Value::Text(v.as_text().trim().to_string().into()),
         },
         "ltrim" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().trim_start().to_string()),
+            Some(v) => Value::Text(v.as_text().trim_start().to_string().into()),
         },
         "rtrim" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().trim_end().to_string()),
+            Some(v) => Value::Text(v.as_text().trim_end().to_string().into()),
         },
         "replace" => {
             if args.len() == 3 && args.iter().all(|v| !v.is_null()) {
                 let s = args[0].as_text();
                 let from = args[1].as_text();
                 let to = args[2].as_text();
-                Value::Text(s.replace(&from, &to))
+                Value::Text(s.replace(&from, &to).into())
             } else {
                 Value::Null
             }
@@ -360,14 +360,14 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
                 let s = args[0].as_text();
                 let start = args[1].as_integer();
                 if start <= 0 {
-                    Value::Text(s[..((start.unsigned_abs() as usize).min(s.len()))].to_string())
+                    Value::Text(s[..((start.unsigned_abs() as usize).min(s.len()))].to_string().into())
                 } else {
                     let start = (start - 1) as usize;
                     if args.len() == 3 {
                         let len = args[2].as_integer() as usize;
-                        Value::Text(s[start..(start + len).min(s.len())].to_string())
+                        Value::Text(s[start..(start + len).min(s.len())].to_string().into())
                     } else {
-                        Value::Text(s[start..].to_string())
+                        Value::Text(s[start..].to_string().into())
                     }
                 }
             } else {
@@ -425,7 +425,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         }
         "hex" => {
             let s = args.first().map(|v| v.as_text()).unwrap_or_default();
-            Value::Text(s.bytes().map(|b| format!("{:02X}", b)).collect())
+            Value::Text(s.bytes().map(|b| format!("{:02X}", b)).collect::<String>().into())
         }
         "typeof" => Value::Text(
             match args.first() {
@@ -436,7 +436,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
                 Some(Value::Blob(_)) => "blob",
                 None => "null",
             }
-            .to_string(),
+            .to_string().into(),
         ),
         "date" | "time" | "datetime" | "strftime" | "julianday" | "unixepoch" | "timediff" => {
             // Full SQLite-compatible date/time engine (see datetime.rs).
@@ -448,10 +448,10 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         "last_insert_rowid" => Value::Integer(0), // overridden by executor
         "changes" => Value::Integer(crate::executor::change_counters::last()),
         "total_changes" => Value::Integer(crate::executor::change_counters::total()),
-        "sqlite_version" => Value::Text("3.0.0".to_string()),
+        "sqlite_version" => Value::Text("3.0.0".to_string().into()),
         "quote" => {
             let v = args.first().cloned().unwrap_or(Value::Null);
-            Value::Text(quote_value(&v))
+            Value::Text(quote_value(&v).into())
         }
         // INSTR(s, sub) — returns the 1-indexed position of `sub` in `s`,
         // or 0 if not found. NULL inputs return NULL.
@@ -526,7 +526,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
                     }
                 }
             }
-            Value::Text(out)
+            Value::Text(out.into())
         }
         // MIN(a, b, c, ...) — scalar form (not the aggregate form).
         // Returns the smallest argument. SQLite semantics: if ANY arg is
@@ -655,7 +655,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
                     s.push(ch);
                 }
             }
-            Value::Text(s)
+            Value::Text(s.into())
         }
         // UNICODE(s) — code point of the first character of s.
         "unicode" => match args.first() {
@@ -1002,7 +1002,7 @@ mod tests {
         let ctx = EvalContext::new(&row, &col_names, &p, &np);
         assert_eq!(
             evaluate(&parse_expr("upper('hello')"), &ctx).unwrap(),
-            Value::Text("HELLO".to_string())
+            Value::Text("HELLO".to_string().into())
         );
         assert_eq!(
             evaluate(&parse_expr("length('hello')"), &ctx).unwrap(),
@@ -1010,7 +1010,7 @@ mod tests {
         );
         assert_eq!(
             evaluate(&parse_expr("coalesce(NULL, 'x')"), &ctx).unwrap(),
-            Value::Text("x".to_string())
+            Value::Text("x".to_string().into())
         );
     }
 

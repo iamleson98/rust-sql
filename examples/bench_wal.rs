@@ -31,7 +31,7 @@ fn bench_rustqlite(mode: &str, sync: Option<&str>, n_txns: usize, rows_per_txn: 
             db.execute(
                 "INSERT INTO t (v, s) VALUES (?, ?)",
                 [rustqlite::Value::Integer(id as i64),
-                 rustqlite::Value::Text(format!("row{id}"))],
+                 rustqlite::Value::Text(format!("row{id}").into())],
             )
             .unwrap();
         }

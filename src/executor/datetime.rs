@@ -1178,9 +1178,9 @@ pub fn date_func(args: &[Value]) -> Option<Value> {
     }
     let y = x.y.abs();
     if x.y < 0 {
-        Some(Value::Text(format!("-{:04}-{:02}-{:02}", y, x.m, x.d)))
+        Some(Value::Text(format!("-{:04}-{:02}-{:02}", y, x.m, x.d).into()))
     } else {
-        Some(Value::Text(format!("{:04}-{:02}-{:02}", y, x.m, x.d)))
+        Some(Value::Text(format!("{:04}-{:02}-{:02}", y, x.m, x.d).into()))
     }
 }
 
@@ -1199,9 +1199,9 @@ pub fn time_func(args: &[Value]) -> Option<Value> {
             x.min,
             s / 1000,
             s % 1000
-        )))
+        ).into()))
     } else {
-        Some(Value::Text(format!("{:02}:{:02}:{:02}", x.h, x.min, x.s as i64)))
+        Some(Value::Text(format!("{:02}:{:02}:{:02}", x.h, x.min, x.s as i64).into()))
     }
 }
 
@@ -1219,23 +1219,23 @@ pub fn datetime_func(args: &[Value]) -> Option<Value> {
             Some(Value::Text(format!(
                 "-{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
                 y, x.m, x.d, x.h, x.min, s / 1000, s % 1000
-            )))
+            ).into()))
         } else {
             Some(Value::Text(format!(
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
                 y, x.m, x.d, x.h, x.min, s / 1000, s % 1000
-            )))
+            ).into()))
         }
     } else if x.y < 0 {
         Some(Value::Text(format!(
             "-{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             y, x.m, x.d, x.h, x.min, x.s as i64
-        )))
+        ).into()))
     } else {
         Some(Value::Text(format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             y, x.m, x.d, x.h, x.min, x.s as i64
-        )))
+        ).into()))
     }
 }
 
@@ -1306,7 +1306,7 @@ pub fn timediff_func(args: &[Value]) -> Option<Value> {
     Some(Value::Text(format!(
         "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
         sign, y, m, d, h, min, s, ms_frac
-    )))
+    ).into()))
 }
 
 /// Day number after the most recent Jan 1 (0-based).
@@ -1452,7 +1452,7 @@ pub fn strftime_func(args: &[Value]) -> Option<Value> {
             _ => return None, // unknown conversion → NULL
         }
     }
-    Some(Value::Text(out))
+    Some(Value::Text(out.into()))
 }
 
 /// Dispatch a date/time SQL function. Returns `Value::Null` on bad input
@@ -1482,7 +1482,7 @@ mod tests {
 
     fn text(v: Option<Value>) -> String {
         match v {
-            Some(Value::Text(s)) => s,
+            Some(Value::Text(s)) => s.as_str().to_owned(),
             other => format!("{:?}", other),
         }
     }

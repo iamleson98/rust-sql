@@ -10,7 +10,7 @@ fn main() {
     db.execute("BEGIN", []).unwrap();
     for i in 1..=10000i64 {
         db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i)), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();

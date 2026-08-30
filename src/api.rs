@@ -2679,15 +2679,40 @@ impl Database {
                 // Encode the key (same order-preserving encoding as the
                 // general path's exec_index_lookup). All-literal keys were
                 // pre-encoded at cache time — borrow, don't re-encode.
-                let mut key_scratch: Vec<u8>;
+                // Short keys encode into a STACK buffer: a heap Vec costs
+                // ~30 ns per lookup (alloc + free) on the dominant
+                // single-key path.
+                let mut key_heap: Vec<u8>;
+                let mut key_stack = [0u8; 64];
+                let mut key_stack_len = 0usize;
                 let key_bytes: &[u8] = match pre_encoded {
                     Some(pre) => &pre[..],
                     None => {
-                        key_scratch = Vec::with_capacity(keys.len() * 8);
-                        for k in keys {
-                            k.resolve(params).encode_order_key_into(&mut key_scratch);
+                        // Resolve + encode each bound into the stack slice;
+                        // spill to a heap Vec if any key doesn't fit.
+                        let mut spilled = false;
+                        'outer: {
+                            for k in keys {
+                                match k.resolve(params).encode_order_key_into_slice(
+                                    &mut key_stack[key_stack_len..],
+                                ) {
+                                    Some(n) => key_stack_len += n,
+                                    None => {
+                                        spilled = true;
+                                        break 'outer;
+                                    }
+                                }
+                            }
                         }
-                        &key_scratch
+                        if !spilled {
+                            &key_stack[..key_stack_len]
+                        } else {
+                            key_heap = Vec::with_capacity(keys.len() * 8);
+                            for k in keys {
+                                k.resolve(params).encode_order_key_into(&mut key_heap);
+                            }
+                            &key_heap
+                        }
                     }
                 };
                 let iroot = index_root.unwrap_or(index.root_page);
@@ -2713,7 +2738,19 @@ impl Database {
                 let hi = end.resolve(params).as_integer();
                 let root = table_root.unwrap_or(table.root_page);
                 let mut bt = Btree::new(&self.pager, root, false);
-                let mut rows = Vec::new();
+                // Pre-size the result from the range width: a growing Vec
+                // pays ~13 realloc+copy rounds on a 5000-row scan, and the
+                // FIRST big query after a write storm additionally pays
+                // fresh large-object carving for every doubling — measured
+                // 711 us vs 368 us steady for range-5000. Cap the estimate
+                // so absurdly wide ranges (BETWEEN 1 AND 9e18) don't
+                // over-allocate.
+                let est = if hi > lo {
+                    (hi - lo).min(1 << 20) as usize + 1
+                } else {
+                    0
+                };
+                let mut rows = Vec::with_capacity(est);
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
                     // Match the general path: skip undecodable rows.
                     if let Ok(row) = decode_projected(payload, table, rowid, project.as_deref()) {
@@ -3112,6 +3149,14 @@ impl Database {
                 );
                 insert_schema_row(ctx.pager, &schema_row)?;
                 catalog.add_index(index);
+                // Post-build warm tap: validate the boundary leaves and
+                // seed the leaf-hint cache through the read path, so the
+                // first user query after the build doesn't pay the
+                // read-path wake-up (see Btree::warm_read_path).
+                {
+                    let mut warm_bt = crate::storage::btree::Btree::new(ctx.pager, final_root, true);
+                    let _ = warm_bt.warm_read_path();
+                }
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -4437,7 +4482,7 @@ fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
             }
         }
         let s = String::from_utf8(bytes).ok()?;
-        Some((Value::Text(s), k))
+        Some((Value::Text(s.into()), k))
     } else {
         None
     }
@@ -5224,7 +5269,7 @@ mod persist_tests {
         for i in 1..=n {
             db.execute(
                 "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("row-{i}")), Value::Integer(i * 7)],
+                [Value::Text(format!("row-{i}").into()), Value::Integer(i * 7)],
             )
             .unwrap();
         }

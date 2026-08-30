@@ -611,6 +611,106 @@ impl<'a> Btree<'a> {
         }
     }
 
+    /// Post-build warm tap: descend to the leftmost and rightmost leaves,
+    /// verify they decode, and seed the thread-local leaf-hint cache.
+    ///
+    /// Two purposes:
+    /// 1. Cheap structural validation of a freshly built tree (page types
+    ///    and boundary cells must decode — catches split bugs early).
+    /// 2. The descent runs the READ path (page fetch, lock, cell decode,
+    ///    hint seeding) right after a write storm, so the first user query
+    ///    doesn't pay the read-path wake-up (~40 µs of allocator pool
+    ///    carving + cold code on the first read after heavy writes —
+    ///    measured in examples/probe_storm.rs).
+    pub fn warm_read_path(&mut self) -> Result<()> {
+        let epoch = self.pager.write_epoch();
+        // Leftmost then rightmost leaf.
+        for side in [0u8, 1] {
+            let mut page_id = self.root;
+            loop {
+                let page = self.pager.get_page(page_id)?;
+                let borrowed = page.lock();
+                let pt = borrowed.page_type()?;
+                match pt {
+                    PageType::LeafTable => {
+                        let n = borrowed.n_cells() as usize;
+                        if n > 0 {
+                            let lo_ptr = borrowed.cell_pointer(0) as usize;
+                            let hi_ptr = borrowed.cell_pointer((n - 1) as u16) as usize;
+                            let lo = varint::decode_signed(&borrowed.data[lo_ptr..])
+                                .map(|(r, _)| r)
+                                .unwrap_or(i64::MIN);
+                            let hi = varint::decode_signed(&borrowed.data[hi_ptr..])
+                                .map(|(r, _)| r)
+                                .unwrap_or(i64::MAX);
+                            drop(borrowed);
+                            set_table_hint(self.root, &page, lo, hi, epoch);
+                        }
+                        break;
+                    }
+                    PageType::LeafIndex => {
+                        let n = borrowed.n_cells() as usize;
+                        if n > 0 {
+                            let lo_ptr = borrowed.cell_pointer(0) as usize;
+                            let hi_ptr = borrowed.cell_pointer((n - 1) as u16) as usize;
+                            let lo = decode_index_cell(&borrowed.data[lo_ptr..], false)
+                                .map(|c| c.key.to_vec());
+                            let hi = decode_index_cell(&borrowed.data[hi_ptr..], false)
+                                .map(|c| c.key.to_vec());
+                            if let (Some(lo), Some(hi)) = (lo, hi) {
+                                drop(borrowed);
+                                set_index_hint(self.root, &page, &lo, &hi, epoch);
+                            }
+                        }
+                        break;
+                    }
+                    PageType::InteriorTable => {
+                        let n = borrowed.n_cells();
+                        let next = if side == 0 {
+                            // Leftmost child: cell 0's left pointer.
+                            if n == 0 {
+                                borrowed.right_most_pointer()
+                            } else {
+                                let ptr = borrowed.cell_pointer(0) as usize;
+                                u32::from_be_bytes(
+                                    borrowed.data[ptr..ptr + 4].try_into().unwrap_or([0; 4]),
+                                )
+                            }
+                        } else {
+                            borrowed.right_most_pointer()
+                        };
+                        drop(borrowed);
+                        if next == 0 {
+                            return Err(Error::corruption("interior page with null child"));
+                        }
+                        page_id = next;
+                    }
+                    PageType::InteriorIndex => {
+                        let n = borrowed.n_cells();
+                        let next = if side == 0 {
+                            if n == 0 {
+                                borrowed.right_most_pointer()
+                            } else {
+                                let ptr = borrowed.cell_pointer(0) as usize;
+                                u32::from_be_bytes(
+                                    borrowed.data[ptr..ptr + 4].try_into().unwrap_or([0; 4]),
+                                )
+                            }
+                        } else {
+                            borrowed.right_most_pointer()
+                        };
+                        drop(borrowed);
+                        if next == 0 {
+                            return Err(Error::corruption("interior page with null child"));
+                        }
+                        page_id = next;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Initialize a new B+tree (create the root page as an empty leaf).
     pub fn create(pager: &'a Pager, is_index: bool) -> Result<Self> {
         let root = pager.allocate_page()?;

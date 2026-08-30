@@ -364,7 +364,7 @@ fn rustqlite_insert_single(db: &mut rustqlite::Database, n: usize) -> Duration {
     let start = Instant::now();
     for i in 1..=n as i64 {
         db.execute(sql, [
-            Value::Text(format!("name{}", i)),
+            Value::Text(format!("name{}", i).into()),
             Value::Integer(i * 2),
             Value::Real(i as f64 * 1.5),
         ]).unwrap();
@@ -378,7 +378,7 @@ fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Dur
     db.execute("BEGIN", []).unwrap();
     for i in 1..=n as i64 {
         db.execute(sql, [
-            Value::Text(format!("name{}", i)),
+            Value::Text(format!("name{}", i).into()),
             Value::Integer(i * 2),
             Value::Real(i as f64 * 1.5),
         ]).unwrap();
@@ -428,6 +428,10 @@ fn rustqlite_point_lookup_rowid(db: &mut rustqlite::Database, n: usize) -> Durat
 
 fn rustqlite_point_lookup_indexed(db: &mut rustqlite::Database, n: usize) -> Duration {
     let sql = "SELECT id, name, score FROM t WHERE val = ?";
+    // Steady-state warmup (see rustqlite_range_scan): SQLite's harness
+    // PREPARES its statement outside the timer; this matches that
+    // convention by populating the statement cache before timing.
+    let _ = db.query(sql, [Value::Integer(2)]).unwrap();
     let start = Instant::now();
     for i in 1..=n as i64 {
         let target = ((i % 1000) + 1) * 2;
@@ -588,7 +592,7 @@ fn rustqlite_mixed_workload(db: &mut rustqlite::Database, ops: usize) -> Duratio
                 if i % 2 == 0 {
                     next_id += 1;
                     let _ = db.execute(ins_sql, [
-                        Value::Text(format!("new{}", next_id)),
+                        Value::Text(format!("new{}", next_id).into()),
                         Value::Integer(next_id * 2),
                         Value::Real(next_id as f64),
                     ]).unwrap();

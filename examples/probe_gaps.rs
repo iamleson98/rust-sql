@@ -18,7 +18,7 @@ fn main() {
     db.execute("BEGIN", []).unwrap();
     for i in 1..=10000i64 {
         db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i)), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 
@@ -87,7 +87,7 @@ fn main() {
     dbj.execute("BEGIN", []).unwrap();
     for i in 1..=1000i64 {
         dbj.execute("INSERT INTO users VALUES (?, ?, ?)",
-            [Value::Integer(i), Value::Text(format!("u{}", i)), Value::Text(format!("d{}", i % 10))]).unwrap();
+            [Value::Integer(i), Value::Text(format!("u{}", i).into()), Value::Text(format!("d{}", i % 10).into())]).unwrap();
     }
     for i in 1..=10000i64 {
         dbj.execute("INSERT INTO orders VALUES (?, ?, ?)",
@@ -95,7 +95,7 @@ fn main() {
     }
     for i in 1..=50000i64 {
         dbj.execute("INSERT INTO items VALUES (?, ?, ?, ?)",
-            [Value::Integer(i), Value::Integer((i % 10000) + 1), Value::Text(format!("item{}", i)), Value::Real(i as f64 * 0.5)]).unwrap();
+            [Value::Integer(i), Value::Integer((i % 10000) + 1), Value::Text(format!("item{}", i).into()), Value::Real(i as f64 * 0.5)]).unwrap();
     }
     dbj.execute("COMMIT", []).unwrap();
     dbj.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();

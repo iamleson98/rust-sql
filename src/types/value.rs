@@ -8,6 +8,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::types::text::Text;
+
 /// A single SQL value.
 ///
 /// Ordering follows SQLite's type affinity rules:
@@ -17,7 +19,11 @@ pub enum Value {
     Null,
     Integer(i64),
     Real(f64),
-    Text(String),
+    /// TEXT with small-string optimization: strings of up to 23 bytes
+    /// are stored inline in the `Value` itself — zero heap allocation on
+    /// decode (mirrors SQLite's zero-copy column reads for the common
+    /// short-string case). See [`crate::types::text`].
+    Text(Text),
     Blob(Vec<u8>),
 }
 
@@ -160,7 +166,7 @@ impl Value {
             Value::Null => String::new(),
             Value::Integer(i) => i.to_string(),
             Value::Real(f) => format_real(*f),
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.as_str().to_owned(),
             Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
         }
     }
@@ -197,7 +203,7 @@ impl Value {
         if self.is_null() || other.is_null() {
             return Value::Null;
         }
-        Value::Text(format!("{}{}", self.as_text(), other.as_text()))
+        Value::Text(format!("{}{}", self.as_text(), other.as_text()).into())
     }
 
     /// Encode the value for B+tree storage (compact binary form).
@@ -365,6 +371,75 @@ impl Value {
         out
     }
 
+    /// Slice-based order-key encoder for stack buffers: writes into `out`,
+    /// returning the number of bytes written, or `None` when `out` is too
+    /// small (caller falls back to a heap Vec). Avoids the per-lookup heap
+    /// allocation on the index point-lookup fast path.
+    pub fn encode_order_key_into_slice(&self, out: &mut [u8]) -> Option<usize> {
+        let need = self.order_key_len();
+        if out.len() < need {
+            return None;
+        }
+        let o = &mut out[..need];
+        match self {
+            Value::Null => {
+                o[0] = 0x00;
+            }
+            Value::Integer(i) => {
+                o[0] = 0x01;
+                if i.unsigned_abs() <= (1u64 << 53) {
+                    o[1..9].copy_from_slice(&double_order_key(*i as f64).to_be_bytes());
+                } else {
+                    let mut lo = *i as f64;
+                    if (lo as i128) > (*i as i128) {
+                        let b = lo.to_bits();
+                        lo = if lo > 0.0 {
+                            f64::from_bits(b - 1)
+                        } else {
+                            f64::from_bits(b + 1)
+                        };
+                    }
+                    let delta = (*i as i128 - lo as i128) as u16;
+                    o[1..9].copy_from_slice(&double_order_key(lo).to_be_bytes());
+                    o[9..11].copy_from_slice(&delta.to_be_bytes());
+                }
+            }
+            Value::Real(f) => {
+                o[0] = 0x01;
+                o[1..9].copy_from_slice(&double_order_key(*f).to_be_bytes());
+            }
+            Value::Text(s) => {
+                o[0] = 0x02;
+                o[1..5].copy_from_slice(&(s.len() as u32).to_be_bytes());
+                o[5..].copy_from_slice(s.as_bytes());
+            }
+            Value::Blob(b) => {
+                o[0] = 0x03;
+                o[1..5].copy_from_slice(&(b.len() as u32).to_be_bytes());
+                o[5..].copy_from_slice(b);
+            }
+        }
+        Some(need)
+    }
+
+    /// Exact encoded length of the order key for this value.
+    #[inline]
+    pub fn order_key_len(&self) -> usize {
+        match self {
+            Value::Null => 1,
+            Value::Integer(i) => {
+                if i.unsigned_abs() <= (1u64 << 53) {
+                    9
+                } else {
+                    11
+                }
+            }
+            Value::Real(_) => 9,
+            Value::Text(s) => 5 + s.len(),
+            Value::Blob(b) => 5 + b.len(),
+        }
+    }
+
     /// Decode a value from bytes (storage codec v2). Returns (value, bytes
     /// consumed). The rowid marker 0x09 decodes as NULL at this level — the
     /// row-level decoder (`decode_row*`) substitutes the B+tree cell key.
@@ -421,10 +496,12 @@ impl Value {
                 if rest.len() < n + len {
                     return Err("truncated text body");
                 }
-                let s = std::str::from_utf8(&rest[n..n + len])
-                    .map_err(|_| "invalid utf8 in text")?
-                    .to_string();
-                Ok((Value::Text(s), 1 + n + len))
+                // Small-string optimization: short payloads (the dominant
+                // OLTP case) decode INLINE — no heap allocation. Longer
+                // payloads spill to a heap String exactly as before.
+                let t = Text::from_utf8(&rest[n..n + len])
+                    .map_err(|_| "invalid utf8 in text")?;
+                Ok((Value::Text(t), 1 + n + len))
             }
             0x08 => {
                 let (len, n) = decode_uvarint(rest)?;
@@ -569,10 +646,10 @@ impl Affinity {
             },
             (Affinity::Real, Value::Null) => Value::Null,
 
-            (Affinity::Text, Value::Integer(i)) => Value::Text(i.to_string()),
-            (Affinity::Text, Value::Real(f)) => Value::Text(format_real(f)),
-            (Affinity::Text, Value::Text(s)) => Value::Text(s),
-            (Affinity::Text, Value::Blob(b)) => Value::Text(String::from_utf8_lossy(&b).into_owned()),
+            (Affinity::Text, Value::Integer(i)) => Value::Text(i.to_string().into()),
+            (Affinity::Text, Value::Real(f)) => Value::Text(format_real(f).into()),
+            (Affinity::Text, Value::Text(s)) => Value::Text(s.duplicate()),
+            (Affinity::Text, Value::Blob(b)) => Value::Text(Text::from_utf8_lossy(&b)),
             (Affinity::Text, Value::Null) => Value::Null,
 
             // BLOB and None: leave as-is
@@ -694,9 +771,9 @@ mod tests {
         assert!(Value::Null < Value::Integer(0));
         assert!(Value::Integer(5) < Value::Integer(10));
         assert!(Value::Integer(5) < Value::Real(5.5));
-        assert!(Value::Real(5.5) < Value::Text("a".to_string()));
-        assert!(Value::Text("a".to_string()) < Value::Text("b".to_string()));
-        assert!(Value::Text("z".to_string()) < Value::Blob(b"z".to_vec()));
+        assert!(Value::Real(5.5) < Value::Text("a".to_string().into()));
+        assert!(Value::Text("a".to_string().into()) < Value::Text("b".to_string().into()));
+        assert!(Value::Text("z".to_string().into()) < Value::Blob(b"z".to_vec()));
     }
 
     #[test]
@@ -706,8 +783,8 @@ mod tests {
             Value::Integer(42),
             Value::Integer(-1_000_000),
             Value::Real(3.14159),
-            Value::Text("hello".to_string()),
-            Value::Text("unicode: 你好".to_string()),
+            Value::Text("hello".to_string().into()),
+            Value::Text("unicode: 你好".to_string().into()),
             Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
         ];
         for v in values {

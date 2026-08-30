@@ -13,7 +13,7 @@ fn main() {
         let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
         for i in 1..=10_000i64 {
             db.execute(sql, [
-                rustqlite::Value::Text(format!("name{}", i)),
+                rustqlite::Value::Text(format!("name{}", i).into()),
                 rustqlite::Value::Integer(i * 2),
                 rustqlite::Value::Real(i as f64 * 1.5),
             ]).unwrap();

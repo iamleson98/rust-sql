@@ -3344,7 +3344,7 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
         }
         "min" => state.min.clone().unwrap_or(Value::Null),
         "max" => state.max.clone().unwrap_or(Value::Null),
-        "group_concat" => Value::Text(state.concat.clone()),
+        "group_concat" => Value::Text(state.concat.clone().into()),
         _ => Value::Null,
     }
 }

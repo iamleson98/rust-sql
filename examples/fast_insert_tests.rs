@@ -11,7 +11,7 @@ fn main() {
     let rows = db.query("SELECT id, name, val FROM t", []).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], rustqlite::Value::Integer(7));
-    assert_eq!(rows[0][1], rustqlite::Value::Text("it's «héllo»".to_string()));
+    assert_eq!(rows[0][1], rustqlite::Value::Text("it's «héllo»".to_string().into()));
     assert_eq!(rows[0][2], rustqlite::Value::Real(-2.5));
     println!("[ok] permutation + utf8 + escapes + negative real");
 
@@ -47,7 +47,7 @@ fn main() {
 
     // 6. Multi-row and parameterized inserts still work (slow path).
     db.execute("INSERT INTO t (name) VALUES ('m1'), ('m2')", []).unwrap();
-    db.execute("INSERT INTO t (name) VALUES (?)", [rustqlite::Value::Text("p1".to_string())]).unwrap();
+    db.execute("INSERT INTO t (name) VALUES (?)", [rustqlite::Value::Text("p1".to_string().into())]).unwrap();
     let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(n[0][0], rustqlite::Value::Integer(6));
     println!("[ok] multi-row + parameterized inserts (slow path)");
@@ -78,7 +78,7 @@ fn main() {
         let db3 = Database::open(&path).unwrap();
         let rows = db3.query("SELECT name FROM d", []).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], rustqlite::Value::Text("persisted".to_string()));
+        assert_eq!(rows[0][0], rustqlite::Value::Text("persisted".to_string().into()));
     }
     let _ = std::fs::remove_file(&path);
     println!("[ok] file-backed durability across reopen");

@@ -166,7 +166,7 @@ fn wal_auto_checkpoint_under_churn() {
         for i in 1..=40i64 {
             db.execute(
                 "INSERT INTO t (v) VALUES (?)",
-                [Value::Text(format!("b{batch}r{i}"))],
+                [Value::Text(format!("b{batch}r{i}").into())],
             )
             .unwrap();
         }
@@ -240,7 +240,7 @@ fn wal_indexes_and_dml_roundtrip() {
     db.execute("BEGIN", []).unwrap();
     for i in 1..=300i64 {
         db.execute("INSERT INTO t (k, v) VALUES (?, ?)",
-            [Value::Integer(i % 10), Value::Text(format!("v{i}"))]).unwrap();
+            [Value::Integer(i % 10), Value::Text(format!("v{i}").into())]).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 

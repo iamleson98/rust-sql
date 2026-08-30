@@ -292,7 +292,7 @@ fn drop_column_many_rows() {
     db.execute("BEGIN", []).unwrap();
     for i in 1..=1000i64 {
         db.execute("INSERT INTO t (a, b) VALUES (?, ?)",
-            [Value::Integer(i), Value::Text(format!("row{}", i))]).unwrap();
+            [Value::Integer(i), Value::Text(format!("row{}", i).into())]).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 

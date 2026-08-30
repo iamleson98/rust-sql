@@ -35,7 +35,7 @@ fn setup_concurrent_db(n_rows: i64) -> Arc<RwLock<Database>> {
         let name = format!("item_{i}");
         db.execute(
             "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-            [Value::Integer(i), Value::Text(name), Value::Integer(i % 100), Value::Real((i as f64) * 0.5)],
+            [Value::Integer(i), Value::Text(name.into()), Value::Integer(i % 100), Value::Real((i as f64) * 0.5)],
         ).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
@@ -121,7 +121,7 @@ fn mixed_rw_concurrency_8_readers_1_writer() {
                 let mut guard = db.write();
                 guard.execute(
                     "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-                    [Value::Integer(id), Value::Text(name), Value::Integer((i % 50) as i64), Value::Real((i as f64) * 1.5)],
+                    [Value::Integer(id), Value::Text(name.into()), Value::Integer((i % 50) as i64), Value::Real((i as f64) * 1.5)],
                 ).expect("insert failed");
                 writes_done.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -190,7 +190,7 @@ fn concurrent_writers_serialize_correctly() {
                 let mut guard = db.write();
                 guard.execute(
                     "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-                    [Value::Integer(id), Value::Text(format!("w{writer_id}_item_{i}")), Value::Integer(i as i64), Value::Real(0.0)],
+                    [Value::Integer(id), Value::Text(format!("w{writer_id}_item_{i}").into()), Value::Integer(i as i64), Value::Real(0.0)],
                 ).expect("insert failed");
             }
         }));
@@ -376,7 +376,7 @@ fn stress_32_threads_2_seconds_no_deadlock() {
                 let mut guard = db.write();
                 let _ = guard.execute(
                     "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-                    [Value::Integer(id), Value::Text(format!("w{writer_id}_{i}")), Value::Integer(i as i64), Value::Real(0.0)],
+                    [Value::Integer(id), Value::Text(format!("w{writer_id}_{i}").into()), Value::Integer(i as i64), Value::Real(0.0)],
                 );
                 drop(guard);
                 i += 1;

@@ -13,7 +13,7 @@ fn main() {
     db.execute("BEGIN", []).unwrap();
     for i in 1..=10_000i64 {
         db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)", [
-            Value::Text(format!("name{}", i)),
+            Value::Text(format!("name{}", i).into()),
             Value::Integer(i * 2),
             Value::Real(i as f64 * 1.5),
         ]).unwrap();

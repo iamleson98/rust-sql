@@ -42,7 +42,7 @@ fn setup_rustqlite(n: i64) -> Database {
     for i in 1..=n {
         db.execute(
             "INSERT INTO t (name, val) VALUES (?, ?)",
-            [Value::Text(format!("name{}", i)), Value::Integer(i * 2)],
+            [Value::Text(format!("name{}", i).into()), Value::Integer(i * 2)],
         ).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
@@ -110,7 +110,7 @@ fn bench_insert_autocommit() -> Result {
         for i in 1..=n {
             db.execute(
                 "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("name{}", i)), Value::Integer(i)],
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
             ).unwrap();
         }
     }, n as usize);
@@ -144,7 +144,7 @@ fn bench_insert_transaction() -> Result {
         for i in 1..=n {
             db.execute(
                 "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("name{}", i)), Value::Integer(i)],
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
             ).unwrap();
         }
         db.execute("COMMIT", []).unwrap();
@@ -343,7 +343,7 @@ fn bench_mixed_rw_4r_1w() -> Result {
                     let mut guard = db.write();
                     let _ = guard.execute(
                         "INSERT INTO t (id, name, val) VALUES (?, ?, ?)",
-                        [Value::Integer(id), Value::Text(format!("new{i}")), Value::Integer(i as i64)],
+                        [Value::Integer(id), Value::Text(format!("new{i}").into()), Value::Integer(i as i64)],
                     );
                 }
             }));
