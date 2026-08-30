@@ -3382,6 +3382,7 @@ impl<'a> Btree<'a> {
                 // lock we read cell pointers and slice payload bytes
                 // directly into the page's data buffer — no allocation.
                 let borrowed = page.lock();
+                prefetch_search_lines(&borrowed.data);
                 let n = borrowed.n_cells();
                 let psz = borrowed.data.len();
                 for i in 0..n {
@@ -3448,6 +3449,123 @@ impl<'a> Btree<'a> {
     /// table cells, which is the row count for a table B+tree.
     pub fn count_rows(&mut self) -> Result<u64> {
         self.count_subtree(self.root)
+    }
+
+    /// Count rows with rowid in [start, end] WITHOUT decoding any cell
+    /// payloads — the rowid range analog of `count_rows`. Mirrors the
+    /// page-descent structure of `scan_range_subtree_borrowed`: binary
+    /// search each leaf for the first rowid >= start, then count cells
+    /// until the first rowid > end. For `SELECT COUNT(*) FROM t WHERE
+    /// id BETWEEN ? AND ?` this turns a full materialize-and-count of N
+    /// rows (N payload decodes + N Value allocs + the row Vec) into
+    /// ~2 binary searches per leaf page.
+    pub fn count_rows_range(&mut self, start: i64, end: i64) -> Result<u64> {
+        self.count_range_subtree(self.root, start, end)
+    }
+
+    fn count_range_subtree(&mut self, page_id: PageId, start: i64, end: i64) -> Result<u64> {
+        let page = self.pager.get_page(page_id)?;
+        let borrowed = page.lock();
+        prefetch_search_lines(&borrowed.data);
+        let pt = borrowed.page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                let n = borrowed.n_cells();
+                let psz = borrowed.data.len();
+                // Binary search: first cell with rowid >= start.
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                        Some((rowid, _)) if rowid < start => lo = mid + 1,
+                        _ => hi = mid,
+                    }
+                }
+                // Count cells from lo while rowid <= end.
+                let mut count: u64 = 0;
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                        Some((rowid, _)) => {
+                            if rowid > end {
+                                break;
+                            }
+                            count += 1;
+                        }
+                        None => {
+                            return Err(Error::corruption(
+                                "truncated leaf rowid in count_range",
+                            ))
+                        }
+                    }
+                }
+                Ok(count)
+            }
+            PageType::InteriorTable => {
+                let n = borrowed.n_cells();
+                let right = borrowed.right_most_pointer();
+                // Binary search for the FIRST child whose separator >=
+                // start; children to the left hold only rowids < start.
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    let key = decode_table_interior_key(&borrowed.data[cell_ptr..])
+                        .ok_or_else(|| {
+                            Error::corruption("truncated interior cell in count_range")
+                        })?;
+                    if key < start {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let mut children: Vec<PageId> = Vec::with_capacity((n - lo) as usize + 1);
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if let Some(child) =
+                        decode_table_interior_child(&borrowed.data[cell_ptr..])
+                    {
+                        children.push(child);
+                    }
+                }
+                if right != 0 {
+                    children.push(right);
+                }
+                drop(borrowed);
+                drop(page);
+                let mut total: u64 = 0;
+                for child in children {
+                    total += self.count_range_subtree(child, start, end)?;
+                    // If any child reports zero rows in range AND we've
+                    // already passed the range (children are in rowid
+                    // order), the rest are past `end` — but the per-leaf
+                    // early break already handles the common case; a zero
+                    // count alone can also mean an empty sub-range, so we
+                    // keep descending only while children may overlap.
+                }
+                Ok(total)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in count_range: {:?}",
+                pt
+            ))),
+        }
     }
 
     fn count_subtree(&mut self, page_id: PageId) -> Result<u64> {

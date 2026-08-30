@@ -61,22 +61,27 @@ fn main() {
                     "  ".repeat(depth), page_id, n, &f.index_key()[..f.index_key().len().min(12)], &l.index_key()[..l.index_key().len().min(12)]);
             }
             PageType::InteriorIndex => {
-                eprintln!("{}interior p{} n={} right={}", "  ".repeat(depth), page_id, n, borrowed.right_most_pointer());
-                for i in 0..n {
-                    let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
-                    let c = rustqlite::storage::btree::Cell::decode(&borrowed.data[cell_ptr..], pt).unwrap();
-                    eprintln!("{}  cell{}: left_child={} key_bytes={:?} rowid={}",
-                        "  ".repeat(depth), i, c.left_child(),
-                        &c.index_key()[..c.index_key().len().min(10)], c.key());
-                    if c.left_child() > 0 && c.left_child() != page_id {
-                        let child = c.left_child();
-                        drop(borrowed);
-                        walk(pager, child, depth + 1, out);
-                        let borrowed2 = pager.get_page(page_id).unwrap();
-                        let _ = borrowed2.lock();
+                // Re-read the page after each recursive walk — the guard
+                // can't be held across the recursion (the walker takes its
+                // own page locks).
+                let mut child_ids: Vec<u32> = Vec::new();
+                {
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
+                        let c = rustqlite::storage::btree::Cell::decode(&borrowed.data[cell_ptr..], pt).unwrap();
+                        eprintln!("{}  cell{}: left_child={} key_bytes={:?} rowid={}",
+                            "  ".repeat(depth), i, c.left_child(),
+                            &c.index_key()[..c.index_key().len().min(10)], c.key());
+                        if c.left_child() > 0 && c.left_child() != page_id {
+                            child_ids.push(c.left_child());
+                        }
                     }
                 }
                 let right = borrowed.right_most_pointer();
+                drop(borrowed);
+                for child in child_ids {
+                    walk(pager, child, depth + 1, out);
+                }
                 if right > 0 {
                     walk(pager, right, depth + 1, out);
                 }

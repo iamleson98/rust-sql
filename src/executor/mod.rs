@@ -3361,6 +3361,43 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     if let Plan::Scan { table, alias, index: None, predicate: None } = input {
         return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), None, group_by, aggregates);
     }
+    // Fast path #1b: COUNT(*) over a RowidRange — count leaf CELLS in the
+    // rowid range with no payload decoding. `SELECT COUNT(*) FROM t WHERE
+    // id BETWEEN ? AND ?` used to fall to the general path, which
+    // materialized every row in the range (full payload decode + a Vec of
+    // Values per row) just to count them. `count_rows_range` binary
+    // searches each leaf for the first rowid >= start and counts cells
+    // until rowid > end. Only for a residual-free range: a residual
+    // predicate (strict < / >, extra filters) needs row data.
+    if group_by.is_empty()
+        && aggregates.len() == 1
+        && aggregates[0].func == "count"
+        && aggregates[0].arg.is_none()
+        && !aggregates[0].distinct
+    {
+        if let Plan::RowidRange { table, start, end, residual: None, .. } = input {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let start_v = match start {
+                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+                None => i64::MIN,
+            };
+            let end_v = match end {
+                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+                None => i64::MAX,
+            };
+            let root = ctx.table_root(table);
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let n = bt.count_rows_range(start_v, end_v)?;
+            let mut row = Vec::with_capacity(1);
+            row.push(Value::Integer(n as i64));
+            return Ok(ExecResult {
+                columns: Arc::from(vec!["__agg_0".to_string()]),
+                rows: vec![row],
+            });
+        }
+    }
     // Fast path #2: input is Filter(Scan, predicate).
     // Handles: `SELECT COUNT(*) FROM t WHERE val > 5000`
     //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
@@ -4734,6 +4771,22 @@ fn exec_rowid_range(
 
     Ok(ExecResult { columns, rows })
 }
+
+/// Identity position table: `positions[i] == i` for every column index
+/// up to MAX_TABLE_COLUMNS. `process_update_row` evaluates compiled
+/// residual predicates against the FULL table-order row buffer, so column
+/// i of the table is at position i of the slice. A lazily-built static
+/// (const-friendly) avoids re-allocating a `Vec<usize>` per statement —
+/// the old path built `(0..n_cols).collect()` per call.
+const IDENTITY_POSITIONS: &[usize] = &{
+    let mut a = [0usize; 1024];
+    let mut i = 0;
+    while i < 1024 {
+        a[i] = i;
+        i += 1;
+    }
+    a
+};
 
 /// Resolve a projection list against a base table: returns
 /// `(project, out_cols)` where `project == None` means identity (SELECT *,
@@ -6328,6 +6381,15 @@ fn try_streaming_update(
         StreamingSource::RowidLookup { .. } => None,
         StreamingSource::IndexRange { residual, .. } => *residual,
     };
+    // Compile the residual predicate ONCE per statement (mirrors
+    // exec_filter / the aggregate streaming scan): positional evaluation
+    // against the full table-order row is ~5-15 ns/row vs the ~60-120
+    // ns/row AST walk + name-resolution of eval_row. `UPDATE t SET ...
+    // WHERE val > ?` over 10k rows saves ~0.5-1 ms per statement.
+    let compiled_residual: Option<crate::executor::predicate::CompiledPredicate> =
+        residual_pred.and_then(|p| {
+            crate::executor::predicate::compile_predicate(p, table, &table.name)
+        });
 
     // For RowidLookup, evaluate the rowid expression now.
     let lookup_rowid: Option<i64> = match &src {
@@ -6480,6 +6542,7 @@ fn try_streaming_update(
                     assignments, &col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                     compiled_ref,
+                    compiled_residual.as_ref(),
                 ) {
                     first_error = Some(e);
                 }
@@ -6495,6 +6558,7 @@ fn try_streaming_update(
                 assignments, &col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                 compiled_ref,
+                compiled_residual.as_ref(),
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -6578,6 +6642,7 @@ fn try_streaming_update(
                     assignments, &col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                     compiled_ref,
+                    compiled_residual.as_ref(),
                 ) {
                     err = Some(e);
                     return false;
@@ -6600,6 +6665,7 @@ fn try_streaming_update(
                         assignments, &col_names, &params, &named_params, table,
                         residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                         compiled_ref,
+                        compiled_residual.as_ref(),
                     ) {
                         first_error = Some(e);
                         break;
@@ -6618,6 +6684,7 @@ fn try_streaming_update(
                 assignments, &col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                 compiled_ref,
+                compiled_residual.as_ref(),
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -6824,6 +6891,10 @@ fn process_update_row(
     // Pre-compiled positional SET expressions (None per assignment when
     // the shape isn't compilable — the general AST walk is used then).
     compiled: Option<&[Option<crate::executor::predicate::CompiledExpr>]>,
+    // Pre-compiled positional residual predicate (None when the residual
+    // doesn't compile — the general AST walk is used then). Identity
+    // positions: row_buf holds the full table-order row.
+    compiled_pred: Option<&crate::executor::predicate::CompiledPredicate>,
 ) -> Result<()> {
     row_buf.clear();
     if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {
@@ -6832,13 +6903,20 @@ fn process_update_row(
     // Rowid comes from the B+tree cell key (passed in by the caller).
     // Apply filter predicate (if any).
     if let Some(pred) = residual_pred {
-        match eval_row(pred, row_buf, col_names, params, named_params) {
-            Ok(v) => {
-                if !v.is_truthy() {
-                    return Ok(());
-                }
+        let keep = if let Some(cp) = compiled_pred {
+            // Compiled positional evaluation: no AST walk, no name
+            // lookup — the same ~5-15 ns/row cost the SELECT Filter path
+            // enjoys (eval_row costs ~60-120 ns/row).
+            let positions: &[usize] = IDENTITY_POSITIONS;
+            cp.eval(row_buf, positions, params)
+        } else {
+            match eval_row(pred, row_buf, col_names, params, named_params) {
+                Ok(v) => v.is_truthy(),
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+        };
+        if !keep {
+            return Ok(());
         }
     }
     // Build the new row: copy old values, apply SET assignments.

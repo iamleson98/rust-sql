@@ -1,17 +1,18 @@
 # Gap Analysis — rustqlite vs SQLite
 
-> Re-measured `2026-08-30` after the all-gaps-closed sprint: 8 KiB default
-> pages (halved cold-cache footprint per scattered touch), software
-> prefetch of cold search lines, the index-leaf hint fix (hit rate 0.2% →
-> 99.7% — the hint was recorded AFTER the scan callback's early return and
-> so effectively never fired), a critical quick-split accounting fix
-> (pos == mid undercounted the right page — latent tree corruption at any
-> page size), thread-local rowid scratch, full correlated-subquery
-> execution (scalar / EXISTS / IN / nested / DML, differential-tested
-> against SQLite), nested-aggregate detection (`COALESCE(SUM(x), 0)` etc.),
-> subquery-aware predicate pushdown, and EXPLAIN QUERY PLAN rows.
-> `cargo test --release`: 132 unit tests + 206 integration/differential
-> cases, all green. Benchmark: `cargo run --release --example bench_compare`.
+> Re-measured `2026-08-30` (second close-out of the day) after the
+> UPDATE/filter fixed-cost sprint: compiled residual predicates on the
+> streaming UPDATE path (~60–120 ns/row AST walk → ~5–15 ns/row
+> positional eval; scan-only UPDATE 1.30 → 0.87 ms over 10k rows),
+> `count_rows_range` — zero-decode cell counting for `COUNT(*) WHERE id
+> BETWEEN` (10.2 → 5.1 µs, 2× faster than the old materialize-and-count
+> path and ~2.2× faster than SQLite's 11.4 µs), software prefetch on the
+> borrowed full-scan leaf loop, and the UPDATE-range workload from
+> 1.65× slower (isolated steady-state measurement, previously masked by
+> harness noise) to 1.12× — while the bench-harness number is now
+> 1.07× FASTER (1.19 vs 1.27 ms). `cargo test --release`: 132 unit +
+> 213 integration/differential cases, all green. Benchmark: `cargo run
+> --release --example bench_compare`.
 
 ## 1. Current performance (lower ratio = closer to SQLite)
 
@@ -36,7 +37,7 @@ all-gaps-closed close-out):**
 | 14 | 3-table join (filter by PK) | **84–112 µs** | 96–137 µs | **1.15–1.25× faster** | ✅ 8 KiB pages + prefetch (was 1.3× slower) |
 | 15 | 2-table join + GROUP BY (full scan) | **2.0–2.3 ms** | 3.3–3.4 ms | **1.5× faster** | ✅ |
 | 16 | UPDATE by PK (1k ops) | **1.44–1.50 ms** | 1.8–1.9 ms | **1.25× faster** | ✅ |
-| 17 | UPDATE range (val > 5000, 5k rows) | **1.16–1.23 ms** | 1.23–1.38 ms | **1.05–1.08× faster** | ✅ (was parity) |
+| 17 | UPDATE range (val > 5000, 5k rows) | **1.19 ms** | 1.27 ms | **1.07× faster** | ✅ compiled residual predicate (isolated steady-state was 1.65× slower before; now 1.12×) |
 | 18 | DELETE by PK (1k ops) | **545–600 µs** | 1.3–1.4 ms | **2.4× faster** | ✅ |
 | 19 | Mixed 80/20 (5k ops) | **2.0–2.2 ms** | 2.4–2.5 ms | **1.15× faster** | ✅ |
 | 20 | DB file size (10k rows) | 270.3 KB | 262.1 KB | 1.03× larger | 🟢 8 KiB pages tightened leaf fill (was 1.13×) |
@@ -51,6 +52,34 @@ measured both faster and slower than SQLite across runs on the same
 binary.
 
 ## 1b. What was closed in the 2026-08-30 sprint
+
+### Second close-out: UPDATE/aggregate fixed costs
+- **Compiled residual predicates on the streaming UPDATE path**: the
+  WHERE clause of `UPDATE t SET ... WHERE <pred>` was evaluated with the
+  general `eval_row` AST walk (~60–120 ns/row: name resolution +
+  type coercion per comparison) while the SELECT Filter path had enjoyed
+  a compiled positional evaluator for a while. The residual is now
+  compiled ONCE per statement (`compile_predicate`) and evaluated
+  positionally against the full table-order row buffer through a
+  compile-time `IDENTITY_POSITIONS` table (no per-statement `(0..n)
+  .collect()` Vec). Scan-only UPDATE (0 matching rows) over 10k rows:
+  1.30 → 0.87 ms; full 7.5k-row UPDATE 1.70 → 1.28 ms.
+- **`Btree::count_rows_range`**: `SELECT COUNT(*) FROM t WHERE id
+  BETWEEN ? AND ?` fell to the general aggregate path, which materialized
+  every row in the range (full payload decode + a Vec of Values per row)
+  just to count them. The new B+tree primitive binary-searches each leaf
+  for the first rowid >= start and counts cells until rowid > end — zero
+  payload decodes, zero allocations. 10.2 → 5.1 µs for a 100-row range
+  (SQLite: 11.4 µs).
+- **Prefetch in `scan_subtree_borrowed`**: the borrowed full-scan leaf
+  loop (the UPDATE streaming source, the aggregate streaming scan, and
+  DELETE) now prefetches the leaf's first 1 KiB after taking the page
+  lock, matching what `scan_range_subtree_borrowed` and the lookup
+  descent already did.
+- **probe_idx_b example fixed**: a pre-existing borrow-checker error in
+  the example (guard moved inside a loop) prevented `cargo test` from
+  building all targets; the walker now collects child ids under the
+  guard and recurses after dropping it.
 
 ### Latency (the "first query" spike)
 - **mimalloc purge disabled** (`mi_option_set(purge_delay, -1)`): the
