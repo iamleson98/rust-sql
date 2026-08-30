@@ -705,6 +705,60 @@ impl Pager {
         self.page_size.load(Ordering::Acquire)
     }
 
+    /// Set the page size for a database that has not been written yet
+    /// (SQLite's `PRAGMA page_size = N` semantics: the value is only
+    /// effective before the first content page is allocated). Returns
+    /// true when applied.
+    ///
+    /// On a brand-new database the header page (page 0) already exists on
+    /// disk at the OLD size — `Pager::open` initializes it eagerly. A
+    /// size swap must therefore REWRITE page 0 at the new size (it holds
+    /// no user data yet: n_cells = 0). Once any content page exists
+    /// (n_pages > 1 or the dirty set is non-empty), the pragma is
+    /// ignored — exactly like SQLite ignoring it mid-life without VACUUM.
+    ///
+    /// Accepted sizes: 4096, 8192, 16384, 32768, 65536.
+    pub fn try_set_page_size(&self, size: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        if !matches!(size, 4096 | 8192 | 16384 | 32768 | 65536) {
+            return false;
+        }
+        let n = self.n_pages.load(Ordering::Acquire);
+        if n > 1 {
+            return false;
+        }
+        // Any dirty page implies content beyond the header — too late.
+        if self.dirty_count_approx.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        // Drop any cached page-0 (it was materialized at the old size) so
+        // subsequent get_page(0) reads the rewritten bytes.
+        {
+            let mut cache = self.cache.write();
+            cache.remove(0);
+        }
+        // Rewrite page 0 at the new size. The schema table is still empty
+        // (n_cells = 0), so nothing else on the page needs preservation.
+        let mut page0 = Page::new(0, size);
+        FileHeader::write(&mut page0.data, size, 1, 0);
+        page0.data[DB_HEADER_SIZE as usize] = crate::storage::page::PageType::LeafTable as u8;
+        page0.data[DB_HEADER_SIZE as usize + 4..DB_HEADER_SIZE as usize + 6]
+            .copy_from_slice(&0u16.to_be_bytes());
+        page0.data[DB_HEADER_SIZE as usize + 6..DB_HEADER_SIZE as usize + 8]
+            .copy_from_slice(&0u16.to_be_bytes());
+        page0.data[DB_HEADER_SIZE as usize + 8..DB_HEADER_SIZE as usize + 12]
+            .copy_from_slice(&0u32.to_be_bytes());
+        // Truncate the file to exactly one page at the NEW size: the old
+        // header page may have been larger (or the file smaller).
+        let _ = self.file.set_len(size as u64);
+        if self.write_file_at(0, &page0.data).is_err() {
+            return false;
+        }
+        let _ = self.file.sync_all();
+        self.page_size.store(size, Ordering::Release);
+        true
+    }
+
     pub fn n_pages(&self) -> u32 {
         self.n_pages.load(Ordering::Acquire)
     }

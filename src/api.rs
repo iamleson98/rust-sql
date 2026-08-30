@@ -4045,6 +4045,15 @@ impl Database {
                     // Accept and ignore (no error) — SQLite treats this as
                     // a hint too.
                 }
+                "page_size" => {
+                    // SQLite semantics: only effective before the database
+                    // has content (or after VACUUM, which we don't have).
+                    // Accepted silently (no error) when too late — matches
+                    // SQLite ignoring the pragma mid-life.
+                    if let Value::Integer(sz) = &v {
+                        let _ = ctx.pager.try_set_page_size(*sz as u32);
+                    }
+                }
                 _ => {}
             }
         }
