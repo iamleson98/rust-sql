@@ -1401,6 +1401,11 @@ impl Database {
         &mut self.pager as *mut Pager
     }
 
+    /// Read-only pager access (diagnostics: cache stats, page count).
+    pub fn pager(&self) -> &Pager {
+        &self.pager
+    }
+
     // ====================================================================
     // CTE (WITH clause) materialization
     // ====================================================================

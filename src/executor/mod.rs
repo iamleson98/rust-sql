@@ -469,6 +469,12 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     return exec_rowid_lookup_projected(ctx, table.clone(), rowid, project.as_deref(), out_cols);
                 }
             }
+            // FUSED PATH: Project over an Index Nested-Loop Join — the join
+            // emits only the projected columns (no full-width combined row,
+            // no second cloning pass). Mirrors the Hash Join fusion.
+            if let Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, inner_index, outer_key_col } = &**input {
+                return exec_index_nested_loop_join(ctx, outer, inner_table.clone(), inner_alias.clone(), inner_index.clone(), *outer_key_col, Some(columns));
+            }
             exec_project(ctx, input, columns)
         }
         Plan::Sort { input, terms } => exec_sort(ctx, input, terms),
@@ -483,7 +489,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             }
         }
         Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, inner_index, outer_key_col } => {
-            exec_index_nested_loop_join(ctx, outer, inner_table.clone(), inner_alias.clone(), inner_index.clone(), *outer_key_col)
+            exec_index_nested_loop_join(ctx, outer, inner_table.clone(), inner_alias.clone(), inner_index.clone(), *outer_key_col, None)
         }
         Plan::Distinct { input } => exec_distinct(ctx, input),
         Plan::Union { left, right, all } => exec_union(ctx, left, right, *all),
@@ -4127,6 +4133,7 @@ fn exec_index_nested_loop_join(
     inner_alias: Option<String>,
     inner_index: Arc<crate::schema::Index>,
     outer_key_col: usize,
+    projection: Option<&[crate::planner::plan::ProjectExpr]>,
 ) -> Result<ExecResult> {
     let outer_res = execute(outer_plan, ctx)?;
     let n_inner_cols = inner_table.n_columns();
@@ -4137,6 +4144,47 @@ fn exec_index_nested_loop_join(
     combined_cols.extend(
         inner_table.columns.iter().map(|c| format!("{}.{}", inner_prefix, c.name)),
     );
+
+    // ---- FUSED PROJECTION resolution ----
+    // When this join sits under a Project of bare column references, the
+    // join emits ONLY those columns directly: no full-width combined row,
+    // no second cloning pass, and text values are cloned once (into the
+    // output) instead of twice (combined row, then projection).
+    let mut fused: Option<(Vec<usize>, Arc<[String]>)> = None;
+    if let Some(columns) = projection {
+        if !columns.is_empty()
+            && columns.iter().all(|c| {
+                matches!(&c.expr, Expr::Column { name, .. } if name != "*")
+            })
+        {
+            let mut indices = Vec::with_capacity(columns.len());
+            let mut names = Vec::with_capacity(columns.len());
+            let mut all_ok = true;
+            for c in columns {
+                if let Expr::Column { table, name } = &c.expr {
+                    match resolve_column_index(&combined_cols, table.as_deref(), name) {
+                        Some(i) => {
+                            indices.push(i);
+                            names.push(match &c.alias {
+                                Some(a) => a.clone(),
+                                None => expr_display_name(&c.expr, &combined_cols),
+                            });
+                        }
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                fused = Some((indices, names.into()));
+            }
+        }
+    }
 
     let mut out_rows: Vec<Row> = Vec::new();
     let inner_root = ctx.table_root(&inner_table);
@@ -4149,6 +4197,10 @@ fn exec_index_nested_loop_join(
     let outer_width = outer_res.columns.len();
     let total_width = outer_width + n_inner_cols;
     let mut key_buf: Vec<u8> = Vec::with_capacity(16);
+    // Dedup set, allocated lazily ONLY when a probe returns multiple
+    // rowids (defensive against index corruption; single-rowid probes —
+    // the overwhelmingly common case — skip the HashSet allocation).
+    let mut seen: Option<std::collections::HashSet<i64>> = None;
 
     for outer_row in &outer_res.rows {
         // Extract the join key from the outer row.
@@ -4169,33 +4221,53 @@ fn exec_index_nested_loop_join(
             inner_index_root = index_bt.root;
         }
 
-        // Fetch each matching row from the inner table. Deduplicate rowids
-        // defensively — the index B+tree may (in pathological cases) contain
-        // duplicate entries if an UPDATE's index-maintenance delete missed
-        // the cell (older versions of the delete path didn't handle index
-        // page types). Deduplication here guarantees correctness even when
-        // the index is in an inconsistent state.
-        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // Fetch each matching row from the inner table, decoding directly
+        // under the page lock (no intermediate payload Vec copy).
+        let dedup_needed = rowids.len() > 1;
         for rowid in rowids {
-            if !seen.insert(rowid) {
-                continue;
+            if dedup_needed {
+                let set = seen.get_or_insert_with(std::collections::HashSet::new);
+                if !set.insert(rowid) {
+                    continue;
+                }
             }
             let mut table_bt = Btree::new(ctx.pager, inner_root, false);
-            if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                if let Ok(inner_row) = decode_row(&payload, n_inner_cols, rowid, inner_table.rowid_alias) {
-                    // Single allocation for the combined row (was: clone the
-                    // outer row into a fresh Vec, then grow it with extend —
-                    // two allocations and two copies per output row).
-                    let mut combined: Row = Vec::with_capacity(total_width);
-                    combined.extend_from_slice(outer_row);
-                    combined.extend_from_slice(&inner_row);
-                    out_rows.push(combined);
+            if let Some(inner_row) = table_bt.lookup_table_with(rowid, |payload| {
+                decode_row(payload, n_inner_cols, rowid, inner_table.rowid_alias)
+            })? {
+                match &fused {
+                    Some((indices, _)) => {
+                        // Emit ONLY the projected columns.
+                        let mut out: Row = Vec::with_capacity(indices.len());
+                        for &i in indices {
+                            let v = if i < outer_width {
+                                &outer_row[i]
+                            } else {
+                                &inner_row[i - outer_width]
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                    }
+                    None => {
+                        // Single allocation for the combined row (was: clone the
+                        // outer row into a fresh Vec, then grow it with extend —
+                        // two allocations and two copies per output row).
+                        let mut combined: Row = Vec::with_capacity(total_width);
+                        combined.extend_from_slice(outer_row);
+                        combined.extend_from_slice(&inner_row);
+                        out_rows.push(combined);
+                    }
                 }
             }
         }
     }
 
-    Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
+    let out_columns: Arc<[String]> = match &fused {
+        Some((_, names)) => names.clone(),
+        None => combined_cols.into(),
+    };
+    Ok(ExecResult { columns: out_columns, rows: out_rows })
 }
 
 // ============================================================================
@@ -5904,13 +5976,16 @@ fn try_streaming_update(
         StreamingSource::RowidLookup { table: t, .. } => t.clone(),
         StreamingSource::IndexRange { table: t, .. } => t.clone(),
     };
-    if src_table.name.to_ascii_lowercase() != table.name.to_ascii_lowercase() {
+    if !src_table.name.eq_ignore_ascii_case(&table.name) {
         return Ok(None);
     }
 
     let params = ctx.params.clone();
     let named_params = ctx.named_params.clone();
-    let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    // Reuse the cached Arc<[String]> column names — rebuilding a Vec of
+    // cloned Strings was one alloc + N String clones per UPDATE statement.
+    let col_names: std::sync::Arc<[String]> = table.col_names.clone();
+    let col_names: &[String] = &col_names;
     let n_cols = table.n_columns();
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let root = ctx.table_root(table);
@@ -5956,19 +6031,19 @@ fn try_streaming_update(
     // index keys WITHOUT re-fetching the row (one full B+tree descent +
     // decode per row). The lookup-based sources (RowidLookup / IndexRange)
     // already hold the payload as an owned Vec — stashing it is free.
-    let touched_indexes: Vec<&Arc<crate::schema::Index>> = {
-        let assignment_cols: std::collections::HashSet<usize> =
-            assignments.iter().map(|(idx, _)| *idx).collect();
-        indexes.iter().filter(|idx| {
+    let touched_indexes: Vec<&Arc<crate::schema::Index>> = indexes
+        .iter()
+        .filter(|idx| {
             idx.columns.iter().any(|c| {
-                if let Some(col_idx) = table.find_column(&c.name) {
-                    assignment_cols.contains(&col_idx)
-                } else {
-                    false
-                }
+                table
+                    .find_column(&c.name)
+                    .map(|col_idx| {
+                        assignments.iter().any(|(a_idx, _)| *a_idx == col_idx)
+                    })
+                    .unwrap_or(false)
             })
-        }).collect()
-    };
+        })
+        .collect();
     // AFTER UPDATE triggers need the OLD row too — stash old payloads
     // whenever triggers exist, not just for index maintenance.
     let has_update_triggers = crate::executor::triggers::has_triggers_for(
@@ -5990,6 +6065,69 @@ fn try_streaming_update(
 
     let mut bt = Btree::new(ctx.pager, root, false);
     if let Some(rowid) = lookup_rowid {
+        // ---- SINGLE-ROW FAST PATH --------------------------------------
+        // `UPDATE t SET ... WHERE id = ?` — the OLTP workhorse. When no
+        // indexed column is assigned and no AFTER UPDATE triggers exist,
+        // process and apply the row in ONE pass: fetch (leaf-hinted) →
+        // decode → SET → constraints → encode → in-place patch. Skips the
+        // `updates` / `order` / `sorted_updates` / `deferred` / `done_mask`
+        // Vec machinery and its per-statement allocations entirely.
+        if touched_indexes.is_empty()
+            && !has_update_triggers
+            && residual_pred.is_none()
+        {
+            let mut applied = false;
+            let fetch = bt.lookup_table_with(rowid, |payload| {
+                // Decode + SET + constraints + encode, all before the page
+                // lock is released (payload borrowed, no copy).
+                row_buf.clear();
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err() {
+                    return Ok(());
+                }
+                new_row.clear();
+                new_row.extend_from_slice(&row_buf);
+                for (col_idx, expr) in assignments {
+                    let v = eval_row(expr, &row_buf, col_names, &params, &named_params)?;
+                    let aff = table.columns[*col_idx].affinity;
+                    new_row[*col_idx] = aff.coerce(v);
+                }
+                enforce_row_constraints(table, &new_row, col_names, &params, &named_params)?;
+                enforce_child_fks(ctx, table, &new_row)?;
+                payload_buf.clear();
+                encode_row_aliased_into(&new_row, table.rowid_alias, &mut payload_buf);
+                if let Some(ret) = returning {
+                    returning_rows.push(project_returning_row(ret, &new_row, col_names, &params, &named_params)?);
+                }
+                applied = true;
+                Ok(())
+            })?;
+            if fetch.is_some() && applied {
+                // Patch in place (leaf-hinted); size changes fall back to
+                // delete + insert.
+                let did = bt.update_table(rowid, &payload_buf)?;
+                if !did {
+                    bt.delete_table(rowid)?;
+                    bt.insert_table(rowid, &payload_buf)?;
+                }
+                if bt.root != root {
+                    ctx.set_table_root(&table.name, bt.root);
+                }
+                return Ok(Some(ExecResult {
+                    columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names).into(),
+                    rows: returning_rows,
+                }));
+            }
+            if fetch.is_some() {
+                // Row exists but was skipped (decode failure) — fall through
+                // to the general path for identical semantics.
+            } else {
+                // Rowid absent: zero rows updated.
+                return Ok(Some(ExecResult {
+                    columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names).into(),
+                    rows: returning_rows,
+                }));
+            }
+        }
         // RowidLookup source — fetch exactly one row by rowid.
         match bt.lookup_table(rowid)? {
             LookupResult::Found(payload) => {
@@ -6416,7 +6554,7 @@ fn try_streaming_delete(
         }
         _ => return Ok(None),
     };
-    if src_table.name.to_ascii_lowercase() != table.name.to_ascii_lowercase() {
+    if !src_table.name.eq_ignore_ascii_case(&table.name) {
         return Ok(None);
     }
 

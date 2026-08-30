@@ -1391,7 +1391,10 @@ impl<'a> Btree<'a> {
         if updates.is_empty() {
             return Ok(());
         }
-        self.pager.note_write();
+        // Same-size in-place patches never change leaf bounds, so advisory
+        // leaf hints stay valid (no write-epoch bump). Size-changed rows
+        // are deferred to delete+insert, which bump the epoch themselves.
+        self.pager.note_write_in_place();
         let mut ui = 0usize;
         self.update_table_bulk_subtree(self.root, updates, &mut ui, deferred)?;
         Ok(())
@@ -1549,7 +1552,68 @@ impl<'a> Btree<'a> {
 
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
         // Notify the pager that a write is about to happen (in-place UPDATE).
-        self.pager.note_write();
+        // Same-size payload patches never change leaf bounds — use the
+        // non-invalidating variant so advisory leaf hints survive. Callers
+        // that fall back to delete+insert bump the epoch through those.
+        self.pager.note_write_in_place();
+        // Hint probe: try patching directly in the remembered leaf (the
+        // epoch check guarantees the hint bounds are exact, so a completed
+        // binary search that misses means "not in this tree" — but a
+        // size-change still needs the caller's fallback, so miss here just
+        // falls through to the full descent).
+        {
+            let epoch = self.pager.write_epoch();
+            if let Some(page_ref) = table_hint_page(self.root, rowid, epoch) {
+                let mut borrowed = page_ref.lock();
+                if borrowed.page_type()? == PageType::LeafTable {
+                    let n = borrowed.n_cells() as usize;
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    let mut hit: Option<(usize, usize, usize)> = None; // (cell_ptr, payload_off, plen)
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        let Some((cell_rowid, n_rid)) =
+                            decode_rowid_only(&borrowed.data[cell_ptr..])
+                        else {
+                            break;
+                        };
+                        match cell_rowid.cmp(&rowid) {
+                            std::cmp::Ordering::Equal => {
+                                let plen_pos = cell_ptr + n_rid;
+                                let Some((plen, n_plen)) =
+                                    varint::decode(&borrowed.data[plen_pos..])
+                                else {
+                                    break;
+                                };
+                                hit = Some((cell_ptr, plen_pos + n_plen, plen as usize));
+                                break;
+                            }
+                            std::cmp::Ordering::Less => lo = mid + 1,
+                            std::cmp::Ordering::Greater => hi = mid,
+                        }
+                    }
+                    let page_id_now = borrowed.id;
+                    if let Some((_cp, off, plen)) = hit {
+                        if plen == new_payload.len()
+                            && off + new_payload.len() <= borrowed.data.len()
+                        {
+                            borrowed.data[off..off + new_payload.len()]
+                                .copy_from_slice(new_payload);
+                            borrowed.dirty = true;
+                            drop(borrowed);
+                            self.pager.note_dirty(page_id_now);
+                            return Ok(true);
+                        }
+                        // Found but size differs — caller falls back.
+                        return Ok(false);
+                    }
+                    // Not in the hinted leaf and bounds are epoch-exact:
+                    // not in the tree at all.
+                    return Ok(false);
+                }
+            }
+        }
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;

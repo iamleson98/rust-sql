@@ -327,6 +327,9 @@ pub struct Pager {
     /// and — critically — a page may have been recycled into another tree,
     /// so a hint must never be trusted across a write.
     write_version: std::sync::atomic::AtomicU64,
+    /// Count of get_page slow-path (cache-miss → file read) events.
+    /// Debug/diagnostic counter.
+    cache_misses: std::sync::atomic::AtomicU64,
     /// Unique id of this Pager instance within the process. Advisory
     /// caches (btree leaf hints) tag entries with (instance, version) so a
     /// new database opened on the same thread can never mistake stale
@@ -369,6 +372,7 @@ impl Pager {
             dirty_count_approx: AtomicUsize::new(0),
             dirty_pages: Mutex::new(PageIdSet::default()),
             write_version: std::sync::atomic::AtomicU64::new(0),
+            cache_misses: std::sync::atomic::AtomicU64::new(0),
             instance_id: PAGER_INSTANCE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
@@ -495,6 +499,21 @@ impl Pager {
         self.write_version.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Number of cache-miss file reads so far (diagnostics).
+    pub fn cache_misses(&self) -> u64 {
+        self.cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Variant of `note_write` for mutations that CANNOT change any B+tree
+    /// layout: same-size in-place payload patches. The dirty counter still
+    /// moves (flush must write the page) but the write epoch does NOT —
+    /// leaf first/last keys are untouched, so advisory leaf hints stay
+    /// valid across bulk in-place UPDATEs. Any op that can move keys,
+    /// split pages, or recycle pages must use the full `note_write`.
+    pub fn note_write_in_place(&self) {
+        self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Current write version (see `write_version`). Readers compare this
     /// against the version their advisory caches were built at.
     #[inline]
@@ -590,6 +609,7 @@ impl Pager {
         }
 
         // Slow path: cache miss — take write lock, double-check, then read from disk.
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
         let page_ref = {
             let mut cache = self.cache.write();
             // Double-check: another thread may have inserted while we waited.
