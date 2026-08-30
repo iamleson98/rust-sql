@@ -532,7 +532,11 @@ pub fn rewrite_aggregates_and_groups(
     // Otherwise, rewrite aggregates and recurse.
     match e {
         Expr::Function { name, distinct, args, over, filter } => {
-            if over.is_none() && is_aggregate_fn(&name.to_ascii_lowercase()) {
+            // Use is_aggregate_call so the polymorphic scalar forms
+            // (MIN(a,b), MAX(a,b,c)) are NOT rewritten to aggregate
+            // columns when a real same-name aggregate exists elsewhere in
+            // the query.
+            if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
                 let first_arg_is_star = args.first().map(|a| matches!(a, Expr::Column { name, .. } if name == "*")).unwrap_or(false);
                 for (i, agg) in aggregates.iter().enumerate() {
                     let agg_arg_is_star = agg.arg.is_none();
@@ -611,7 +615,18 @@ pub fn rewrite_aggregates(e: &Expr, aggregates: &[AggExpr], n_group: usize) -> E
 /// Check if an expression contains an aggregate function call.
 pub fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::Function { name, over, .. } => over.is_none() && is_aggregate_fn(&name.to_ascii_lowercase()),
+        Expr::Function { name, over, args, filter, .. } => {
+            if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
+                return true;
+            }
+            // Aggregates can nest inside scalar-function arguments —
+            // `COALESCE(SUM(x), 0)`, `ABS(AVG(x))`, `ROUND(SUM(x), 2)` are
+            // aggregate queries. The top-level call alone must NOT decide
+            // (it previously did, so those shapes silently lost their
+            // Aggregate plan and evaluated per-row instead of per-group).
+            args.iter().any(expr_has_aggregate)
+                || filter.as_ref().map(|e| expr_has_aggregate(e)).unwrap_or(false)
+        }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::Unary { expr, .. } => expr_has_aggregate(expr),
         Expr::Between { expr, low, high, .. } => {
@@ -1384,6 +1399,16 @@ pub fn plan_column_refs(catalog: &Catalog, plan: &Plan) -> Vec<(Option<String>, 
 /// A column with `table=None` matches any column with the same `name` regardless of prefix.
 /// A column with `table=Some(t)` requires a matching `(Some(t), name)`.
 fn conjunct_bound_by(conjunct: &Expr, cols: &[(Option<String>, String)]) -> bool {
+    // A conjunct containing a subquery can hide OUTER column references
+    // (`WHERE (SELECT COUNT(*) FROM t WHERE t.k = o.id) >= 2` — `o.id`
+    // lives inside the subquery, invisible to collect_column_refs).
+    // Bound-by would see zero refs and vacuously match BOTH sides, pushing
+    // the conjunct into one side where the outer alias resolves to the
+    // wrong column (or NULL). Keep subquery conjuncts at the top of the
+    // Join, where the full combined row is in scope.
+    if crate::executor::expr_has_subquery(conjunct) {
+        return false;
+    }
     let refs = collect_column_refs(conjunct);
     if refs.is_empty() {
         // No column references — it's a constant; safe to push down (or keep up).

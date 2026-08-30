@@ -62,6 +62,15 @@ impl<'a> EvalContext<'a> {
                     return self.row.get(i).cloned().unwrap_or(Value::Null);
                 }
             }
+            // Qualified ref that doesn't match a local qualified name: if an
+            // outer scope knows "qual.column", it is a correlated reference
+            // (SQL scope rules — the qualifier names an outer table). This
+            // MUST be consulted BEFORE the local unqualified fallback, or an
+            // inner column with the same bare name would shadow the outer
+            // reference (`u2.active = u.active` would compare u2 to u2).
+            if let Some(v) = crate::executor::corr_outer_qualified(t, name) {
+                return v;
+            }
             // Fall back: try unqualified (the first column with this name).
             return self.lookup_in_main(name);
         }
@@ -96,6 +105,11 @@ impl<'a> EvalContext<'a> {
                     return self.row.get(i).cloned().unwrap_or(Value::Null);
                 }
             }
+        }
+        // Not found locally — correlated-subquery outer scope (innermost
+        // frame first). No-op when no correlated subquery is executing.
+        if let Some(v) = crate::executor::corr_outer_lookup(None, name) {
+            return v;
         }
         Value::Null
     }
@@ -229,10 +243,15 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             }
         }
         Expr::Row(_) => Err(Error::Unsupported("row value expressions in this context")),
-        Expr::Subquery(_) => Err(Error::Unsupported(
-            "scalar subqueries via evaluator (use executor)",
-        )),
-        Expr::Exists(_) => Err(Error::Unsupported("EXISTS via evaluator (use executor)")),
+        Expr::Subquery(sel) => {
+            // Correlated subqueries execute per-row through the statement
+            // bridge (see executor::corr). Uncorrelated ones were already
+            // substituted at plan-rewrite time; reaching this arm means the
+            // bridge must be active — e.g. a correlated ref inside a DML
+            // SET/CHECK expression evaluated outside a plan rewrite.
+            crate::executor::corr_exec_scalar(sel, ctx)
+        }
+        Expr::Exists(sel) => crate::executor::corr_exec_exists(sel, ctx),
         Expr::Cast { expr, type_name } => {
             let v = evaluate(expr, ctx)?;
             let affinity = Affinity::from_declared_type(type_name);
@@ -281,9 +300,26 @@ fn evaluate_in(
             }
             (found, list_has_null)
         }
-        InSource::Subquery(_) | InSource::Table(_) => {
+        InSource::Subquery(sel) => {
+            // Correlated IN-subquery: execute per-row through the bridge
+            // (uncorrelated ones became literal lists at rewrite time).
+            let list = crate::executor::corr_exec_in_list(sel, ctx)?;
+            let mut found = false;
+            let mut list_has_null = false;
+            for candidate in list {
+                if candidate.is_null() {
+                    list_has_null = true;
+                    continue;
+                }
+                if v == candidate {
+                    found = true;
+                }
+            }
+            (found, list_has_null)
+        }
+        InSource::Table(_) => {
             return Err(Error::Unsupported(
-                "IN subquery via evaluator (use executor)",
+                "IN table via evaluator (use executor)",
             ));
         }
     };

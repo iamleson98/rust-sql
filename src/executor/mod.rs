@@ -19,6 +19,317 @@ pub(crate) mod predicate;
 
 pub use expr::{apply_binary, evaluate, EvalContext};
 
+// ============================================================================
+// Correlated subqueries — evaluate-time execution bridge
+// ----------------------------------------------------------------------------
+// Uncorrelated subqueries are substituted at plan-rewrite time (mirrors
+// SQLite's OP_Once). A CORRELATED subquery must re-execute per outer row
+// with the outer row's columns in scope (SQLite's EP_VarSelect). The
+// evaluator (`expr::evaluate`) has no access to the heavy `ExecContext`
+// (pager, catalog, snapshots) needed to run a SELECT, so the statement
+// executor installs a bridge into a thread-local before executing plans
+// whose expressions may contain correlated subqueries:
+//
+//   api::query / api::execute   ──install──▶  CORR_STATE.ctx = *mut ExecContext
+//        │
+//        ▼
+//   expr::evaluate(Expr::Subquery)  ──uses──▶ CORR_STATE.ctx + outer-scope stack
+//        │   pushes (row, column_names) of the EvalContext being evaluated
+//        ▼
+//   exec_select_statement(subquery) ──column refs miss locally──▶ outer stack
+//
+// The outer-scope stack holds raw slices borrowed from the EvalContext
+// that triggered the subquery — valid for the whole nested execution
+// (it lives on the call stack above us). Frames are pushed/popped with a
+// panic-safe guard; the bridge itself is cleared by a Drop guard at
+// statement end, so a panic can never leave a dangling pointer behind.
+// ============================================================================
+
+mod corr {
+    use super::{ExecContext, ExecResult};
+    use crate::error::Result;
+    use crate::sql::ast::SelectStatement;
+    use crate::types::Value;
+    use std::cell::RefCell;
+
+    /// One outer-row scope: the (row, column_names) of the EvalContext
+    /// whose expression is executing a correlated subquery.
+    pub(crate) struct OuterFrame {
+        pub(crate) row: *const [Value],
+        pub(crate) names: *const [String],
+    }
+
+    impl OuterFrame {
+        #[inline]
+        fn row(&self) -> &[Value] {
+            // SAFETY: the frame is pushed by `push_outer` from a live
+            // `&EvalContext` and popped (innermost-first) before that
+            // context can end. The borrow outlives every nested execution.
+            unsafe { &*self.row }
+        }
+        #[inline]
+        fn names(&self) -> &[String] {
+            // SAFETY: as above.
+            unsafe { &*self.names }
+        }
+    }
+
+    struct CorrState {
+        /// Statement's ExecContext — installed while a statement executes.
+        /// SAFETY: only dereferenced while the installing guard is alive
+        /// (guard Drop clears it before the ExecContext can be dropped).
+        ctx: *mut ExecContext<'static>,
+        depth: usize,
+        outer: Vec<OuterFrame>,
+    }
+
+    thread_local! {
+        static CORR: RefCell<CorrState> = RefCell::new(CorrState {
+            ctx: std::ptr::null_mut(),
+            depth: 0,
+            outer: Vec::new(),
+        });
+    }
+
+    /// Install the execution bridge for a statement. Nested installs (an
+    /// API call inside a statement — rare) keep the outermost bridge.
+    pub(crate) struct Guard {
+        installed: bool,
+    }
+
+    impl Guard {
+        pub(crate) fn install(ctx: *mut ExecContext<'_>) -> Guard {
+            // SAFETY: the pointer is erased to 'static only for storage;
+            // it is only dereferenced while `guard` is alive, which the
+            // caller keeps on the same stack frame as the real borrow.
+            let erased = ctx as *mut ExecContext<'static>;
+            let installed = CORR.with(|c| {
+                let mut c = c.borrow_mut();
+                c.depth += 1;
+                if c.depth == 1 {
+                    c.ctx = erased;
+                    true
+                } else {
+                    false
+                }
+            });
+            Guard { installed }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CORR.with(|c| {
+                let mut c = c.borrow_mut();
+                if self.installed {
+                    c.ctx = std::ptr::null_mut();
+                    c.outer.clear();
+                }
+                c.depth = c.depth.saturating_sub(1);
+            });
+        }
+    }
+
+    /// Push one outer scope while a correlated subquery executes.
+    /// Returns a guard that pops it.
+    struct FrameGuard;
+    impl Drop for FrameGuard {
+        fn drop(&mut self) {
+            CORR.with(|c| {
+                c.borrow_mut().outer.pop();
+            });
+        }
+    }
+
+    fn push_outer(row: *const [Value], names: *const [String]) -> FrameGuard {
+        CORR.with(|c| {
+            c.borrow_mut().outer.push(OuterFrame { row, names });
+        });
+        FrameGuard
+    }
+
+    /// True when a statement bridge is installed (correlated subqueries
+    /// are executable from the evaluator).
+    #[inline]
+    pub(crate) fn active() -> bool {
+        CORR.with(|c| c.borrow().depth > 0)
+    }
+
+    /// Resolve a column against the outer-scope stack, innermost first.
+    /// Mirrors `EvalContext::lookup_in_main`'s matching rules per frame:
+    /// exact (case-insensitive) name, then suffix ("u.id" matches "id").
+    /// Qualified refs try "qual.name" exactly in every frame FIRST, then
+    /// fall back to bare-name matching — the outer frame's column list can
+    /// be bare (the UPDATE/DELETE paths push unqualified names), and a
+    /// `users.id` reference must resolve there, not to an inner table's
+    /// same-named column.
+    pub(crate) fn lookup_outer(table: Option<&str>, name: &str) -> Option<Value> {
+        CORR.with(|c| {
+            let c = c.borrow();
+            if c.outer.is_empty() {
+                return None;
+            }
+            if let Some(t) = table {
+                // Pass 1: exact "qual.name" in each frame, innermost first.
+                let qual_lower = format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
+                for frame in c.outer.iter().rev() {
+                    let names = frame.names();
+                    for (i, n) in names.iter().enumerate() {
+                        if n.to_ascii_lowercase() == qual_lower {
+                            return frame.row().get(i).cloned();
+                        }
+                    }
+                }
+                // Pass 2: bare-name match (frame stores unqualified names —
+                // UPDATE/DELETE source rows).
+                for frame in c.outer.iter().rev() {
+                    let names = frame.names();
+                    for (i, n) in names.iter().enumerate() {
+                        if n.eq_ignore_ascii_case(name) {
+                            return frame.row().get(i).cloned();
+                        }
+                    }
+                    for (i, n) in names.iter().enumerate() {
+                        if let Some(pos) = n.rfind('.') {
+                            if n[pos + 1..].eq_ignore_ascii_case(name) {
+                                return frame.row().get(i).cloned();
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Unqualified: exact, then suffix — same as local.
+                for frame in c.outer.iter().rev() {
+                    let names = frame.names();
+                    for (i, n) in names.iter().enumerate() {
+                        if n.eq_ignore_ascii_case(name) {
+                            return frame.row().get(i).cloned();
+                        }
+                    }
+                    for (i, n) in names.iter().enumerate() {
+                        if let Some(pos) = n.rfind('.') {
+                            if n[pos + 1..].eq_ignore_ascii_case(name) {
+                                return frame.row().get(i).cloned();
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    /// Execute a correlated scalar subquery against the installed
+    /// statement context, with the given EvalContext as the outer scope.
+    pub(crate) fn exec_scalar(
+        sel: &SelectStatement,
+        outer_row: *const [Value],
+        outer_names: *const [String],
+    ) -> Result<Value> {
+        let ctx_ptr = CORR.with(|c| c.borrow().ctx);
+        if ctx_ptr.is_null() {
+            return Err(crate::error::Error::Unsupported(
+                "scalar subqueries via evaluator (use executor)",
+            ));
+        }
+        let _frame = push_outer(outer_row, outer_names);
+        // SAFETY: the pointer is valid for the lifetime of the installing
+        // Guard, which our caller keeps alive above this frame.
+        let res: ExecResult = unsafe { exec_select(sel, ctx_ptr)? };
+        Ok(res
+            .rows
+            .first()
+            .and_then(|r| r.first().cloned())
+            .unwrap_or(Value::Null))
+    }
+
+    /// Execute a correlated EXISTS subquery.
+    pub(crate) fn exec_exists(
+        sel: &SelectStatement,
+        outer_row: *const [Value],
+        outer_names: *const [String],
+    ) -> Result<Value> {
+        let ctx_ptr = CORR.with(|c| c.borrow().ctx);
+        if ctx_ptr.is_null() {
+            return Err(crate::error::Error::Unsupported(
+                "EXISTS via evaluator (use executor)",
+            ));
+        }
+        let _frame = push_outer(outer_row, outer_names);
+        // SAFETY: as in exec_scalar.
+        let res: ExecResult = unsafe { exec_select(sel, ctx_ptr)? };
+        Ok(Value::Integer(if res.rows.is_empty() { 0 } else { 1 }))
+    }
+
+    /// Execute a correlated IN-subquery and collect its first column.
+    pub(crate) fn exec_in_list(
+        sel: &SelectStatement,
+        outer_row: *const [Value],
+        outer_names: *const [String],
+    ) -> Result<Vec<Value>> {
+        let ctx_ptr = CORR.with(|c| c.borrow().ctx);
+        if ctx_ptr.is_null() {
+            return Err(crate::error::Error::Unsupported(
+                "IN subquery via evaluator (use executor)",
+            ));
+        }
+        let _frame = push_outer(outer_row, outer_names);
+        // SAFETY: as in exec_scalar.
+        let res: ExecResult = unsafe { exec_select(sel, ctx_ptr)? };
+        Ok(res
+            .rows
+            .iter()
+            .map(|r| r.first().cloned().unwrap_or(Value::Null))
+            .collect())
+    }
+
+    /// SAFETY: caller must guarantee `ctx` is alive and not mutably
+    /// aliased outside this call.
+    unsafe fn exec_select(sel: &SelectStatement, ctx: *mut ExecContext<'static>) -> Result<ExecResult> {
+        let ctx = unsafe { &mut *ctx };
+        super::exec_select_statement(sel, ctx)
+    }
+}
+
+pub(crate) use corr::Guard as CorrGuard;
+
+/// Evaluator-facing wrapper: execute a correlated scalar subquery with the
+/// given EvalContext as the outer scope.
+pub(crate) fn corr_exec_scalar(
+    sel: &SelectStatement,
+    eval_ctx: &EvalContext<'_>,
+) -> Result<Value> {
+    corr::exec_scalar(sel, eval_ctx.row as *const [Value], eval_ctx.column_names as *const [String])
+}
+
+/// Evaluator-facing wrapper: correlated EXISTS.
+pub(crate) fn corr_exec_exists(
+    sel: &SelectStatement,
+    eval_ctx: &EvalContext<'_>,
+) -> Result<Value> {
+    corr::exec_exists(sel, eval_ctx.row as *const [Value], eval_ctx.column_names as *const [String])
+}
+
+/// Evaluator-facing wrapper: correlated IN-subquery list.
+pub(crate) fn corr_exec_in_list(
+    sel: &SelectStatement,
+    eval_ctx: &EvalContext<'_>,
+) -> Result<Vec<Value>> {
+    corr::exec_in_list(sel, eval_ctx.row as *const [Value], eval_ctx.column_names as *const [String])
+}
+
+/// Outer-scope lookup for a qualified column ref (unqualified refs go
+/// through the `lookup_in_main` fallback instead).
+pub(crate) fn corr_outer_qualified(table: &str, name: &str) -> Option<Value> {
+    corr::lookup_outer(Some(table), name)
+}
+
+/// Outer-scope lookup for an unqualified column ref.
+pub(crate) fn corr_outer_lookup(table: Option<&str>, name: &str) -> Option<Value> {
+    corr::lookup_outer(table, name)
+}
+
+
 use crate::error::{Error, Result};
 use crate::planner::plan::*;
 use crate::schema::Table;

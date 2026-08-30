@@ -1815,6 +1815,7 @@ impl Database {
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new());
                 self.in_transaction.store(ctx.in_transaction, Ordering::Release);
                 *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
@@ -1859,6 +1860,10 @@ impl Database {
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
+        // Correlated-subquery execution bridge: installs the statement's
+        // ExecContext for evaluate-time subquery re-execution (DML SET /
+        // CHECK / WHERE expressions). Cleared by Drop before ctx ends.
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
         // Use the cached plan if available — execute_statement_static
         // otherwise re-parses + re-plans, which for a 1k-row INSERT batch
         // means 1k wasted planning passes (each builds a Plan::Insert
@@ -1993,6 +1998,7 @@ impl Database {
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
                 return Ok(res.rows);
             }
@@ -2036,6 +2042,10 @@ impl Database {
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
+            // Correlated-subquery bridge (see execute): must span the
+            // subquery rewrite AND execution — rewrite-time execution of
+            // UNcorrelated subqueries may itself hit nested correlated ones.
+            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
             let plan_local;
@@ -2128,6 +2138,7 @@ impl Database {
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
                 return Ok((res.columns.to_vec(), res.rows));
             }
@@ -2159,6 +2170,10 @@ impl Database {
             for v in params.into_iter() {
                 ctx.bind_positional(v);
             }
+            // Correlated-subquery bridge (see execute): must span the
+            // subquery rewrite AND execution — rewrite-time execution of
+            // UNcorrelated subqueries may itself hit nested correlated ones.
+            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
             let plan_local;
@@ -5100,14 +5115,22 @@ mod tests {
     }
 
     #[test]
-    fn correlated_subquery_errors_cleanly() {
+    fn correlated_subquery_executes_correctly() {
         let mut db = memdb();
         db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
         db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
-        db.execute("INSERT INTO a (v) VALUES (1)", []).unwrap();
-        // Correlated (a.v referenced inside subquery) → clean error, not a panic.
-        let result = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = a.v)", []);
-        assert!(result.is_err());
+        db.execute("INSERT INTO a (v) VALUES (1), (2)", []).unwrap();
+        db.execute("INSERT INTO b (v) VALUES (1), (1), (7)", []).unwrap();
+        // Correlated (a.v referenced inside subquery): for a.v=1, MAX(b.v)
+        // over b.v=1 rows is 1 → matches. For a.v=2, no b rows → NULL → no
+        // match. (Previously this shape errored 'unsupported'.)
+        let result = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = a.v)", []).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], Value::Integer(1));
+        // Empty outer match: b has no v=2 rows, so the scalar subquery is
+        // NULL and the equality filters the row out (NULL = NULL is not true).
+        let result2 = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = 99)", []).unwrap();
+        assert_eq!(result2.len(), 0);
     }
 
     // ========================================================================
