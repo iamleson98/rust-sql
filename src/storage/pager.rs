@@ -250,6 +250,21 @@ impl Default for PageCache {
     }
 }
 
+/// WAL-mode pager state (see `Pager::wal`).
+pub struct WalState {
+    /// The WAL (writer-side handle; also used for frame reads via
+    /// `read_frame_at`, which is `&self`).
+    pub wal: crate::storage::wal::Wal,
+    /// Committed page-id → frame offset ("WAL-served reads" index).
+    pub map: std::collections::HashMap<PageId, u64, PageIdHashBuild>,
+}
+
+/// Auto-checkpoint threshold: after a commit leaves this many frames in
+/// the WAL, copy them back to the main file and reset (SQLite's default
+/// `wal_autocheckpoint` is 1000 pages at 4 KiB; ours is the same frame
+/// count).
+const WAL_AUTOCHECKPOINT_FRAMES: u32 = 1000;
+
 pub struct Pager {
     file: File,
     path: PathBuf,
@@ -326,6 +341,20 @@ pub struct Pager {
     /// turns flush() from O(10k) page-lock-acquire-and-check into O(2)
     /// HashSet lookups — a 5000× speedup on the per-statement overhead.
     dirty_pages: Mutex<PageIdSet>,
+    /// Write-Ahead Log state. `None` = journal_mode=delete (writes go
+    /// straight to the main file). `Some(...)` = journal_mode=wal: commits
+    /// APPEND frames here, reads consult the committed-page map before the
+    /// main file (WAL-served reads), and checkpoints copy pages back.
+    ///
+    /// The RwLock is for the page map: readers take the read lock to
+    /// resolve a page → frame offset while the (single) writer appends
+    /// under the write lock. `Wal` itself is writer-only; the read path
+    /// goes through `Wal::read_frame_at` on a shared handle.
+    wal: RwLock<Option<WalState>>,
+    /// PRAGMA synchronous: 0=OFF, 1=NORMAL, 2=FULL (SQLite default).
+    /// In WAL mode NORMAL skips the per-commit fsync (checkpoints carry
+    /// durability) — SQLite's recommended high-throughput setting.
+    synchronous: std::sync::atomic::AtomicU8,
     /// Monotonic write version, bumped by every `note_write()` (i.e. every
     /// mutating B+tree/pager operation). Readers use it to invalidate
     /// advisory caches (btree leaf hints): a version change means SOME
@@ -348,6 +377,19 @@ pub struct Pager {
 /// Process-wide Pager instance counter (see `Pager::instance_id`).
 static PAGER_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        // Clean shutdown: checkpoint committed WAL frames into the main
+        // file and remove the -wal file (SQLite's last-connection-close
+        // behavior). Best-effort — an unclean exit (crash, kill) skips
+        // this and recovery on next open serves the committed frames.
+        if self.wal.read().is_some() {
+            let _ = self.checkpoint_wal();
+            let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(&self.path));
+        }
+    }
+}
 
 impl Pager {
     /// Open or create a database file at the given path.
@@ -379,6 +421,8 @@ impl Pager {
             dirty_count_approx: AtomicUsize::new(0),
             dirty_pages: Mutex::new(PageIdSet::default()),
             write_version: std::sync::atomic::AtomicU64::new(0),
+            wal: RwLock::new(None),
+            synchronous: std::sync::atomic::AtomicU8::new(2),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             instance_id: PAGER_INSTANCE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
@@ -392,6 +436,15 @@ impl Pager {
             pager.initialize_new_db()?;
         } else {
             pager.read_header()?;
+            // Crash recovery: a leftover -wal file holds committed pages
+            // newer than the main file. Opening it switches the pager to
+            // WAL mode and makes those frames visible through the page map
+            // (WAL-served reads) — committed data survives an unclean
+            // shutdown, torn transactions are discarded at frame level.
+            let wal_file = crate::storage::wal::wal_path_for(&pager.path);
+            if wal_file.exists() && std::fs::metadata(&wal_file).map(|m| m.len() > 0).unwrap_or(false) {
+                pager.enable_wal()?;
+            }
         }
         Ok(pager)
     }
@@ -625,13 +678,33 @@ impl Pager {
             }
             let psz = self.page_size();
             let mut page = Page::new(id, psz);
-            let offset = id as u64 * psz as u64;
-            let n = self.read_file_at(offset, &mut page.data)?;
-            if n != psz as usize {
-                return Err(Error::corruption(format!(
-                    "short read on page {}: {} of {} bytes",
-                    id, n, psz
-                )));
+            // WAL-served read: pages committed to the WAL since the last
+            // checkpoint are the newest version — read the frame, not the
+            // (stale) main-file page. One read-lock + map probe; falls
+            // through to the main file when absent.
+            let served_from_wal = {
+                let wal_guard = self.wal.read();
+                match wal_guard.as_ref() {
+                    Some(state) => {
+                        if let Some(&offset) = state.map.get(&id) {
+                            state.wal.read_frame_at(offset, &mut page.data)?;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            };
+            if !served_from_wal {
+                let offset = id as u64 * psz as u64;
+                let n = self.read_file_at(offset, &mut page.data)?;
+                if n != psz as usize {
+                    return Err(Error::corruption(format!(
+                        "short read on page {}: {} of {} bytes",
+                        id, n, psz
+                    )));
+                }
             }
             let page_ref = Arc::new(Mutex::new(page));
             self.maybe_evict_locked(&mut cache);
@@ -712,6 +785,227 @@ impl Pager {
     }
 
     /// Flush all dirty pages to disk and sync.
+    /// Switch to WAL mode (`PRAGMA journal_mode = WAL`).
+    ///
+    /// First flushes any dirty pages to the main file (the switch point),
+    /// then opens (or recovers) the `-wal` file alongside the database.
+    /// Committed frames left over from a previous session become visible
+    /// through the page map — this IS crash recovery: un-checkpointed
+    /// committed data is served from the WAL.
+    pub fn enable_wal(&self) -> Result<()> {
+        {
+            let guard = self.wal.read();
+            if guard.is_some() {
+                return Ok(()); // already in WAL mode
+            }
+        }
+        // Flush pending dirty pages in DELETE mode first.
+        self.flush()?;
+        let mut wal = crate::storage::wal::Wal::open(&self.path, self.page_size())?;
+        let map: std::collections::HashMap<PageId, u64, PageIdHashBuild> = wal
+            .committed_page_map()?
+            .into_iter()
+            .collect();
+        let n = wal.n_frames();
+        let mut guard = self.wal.write();
+        *guard = Some(WalState { wal, map });
+        drop(guard);
+        // Reload the header through the WAL (page 0 may be newer there):
+        // n_pages / freelist / schema_cookie must reflect committed state.
+        if n > 0 {
+            self.reload_header_from_committed()?;
+        }
+        Ok(())
+    }
+
+    /// Switch back to DELETE mode (`PRAGMA journal_mode = DELETE`):
+    /// checkpoint the WAL into the main file, then remove it.
+    pub fn disable_wal(&self) -> Result<()> {
+        if self.wal.read().is_none() {
+            return Ok(());
+        }
+        self.checkpoint_wal()?;
+        {
+            let mut guard = self.wal.write();
+            *guard = None;
+        }
+        let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(&self.path));
+        Ok(())
+    }
+
+    /// Is the pager in WAL mode?
+    pub fn wal_enabled(&self) -> bool {
+        self.wal.read().is_some()
+    }
+
+    /// Copy every committed WAL page back into the main database file,
+    /// sync it, and reset the WAL. Readers stay correct throughout: the
+    /// map is dropped only after the main file holds every page.
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        let mut guard = self.wal.write();
+        let Some(state) = guard.as_mut() else {
+            return Ok(());
+        };
+        let psz = self.page_size();
+        // Sort page ids for sequential main-file writes.
+        let mut ids: Vec<PageId> = state.map.keys().copied().collect();
+        ids.sort_unstable();
+        let mut buf = vec![0u8; psz as usize];
+        for id in ids {
+            let offset = state.map[&id];
+            state.wal.read_frame_at(offset, &mut buf)?;
+            self.write_file_at(id as u64 * psz as u64, &buf)?;
+        }
+        // Ensure the main file covers every page we just wrote (the file
+        // may be shorter than the committed page count — new pages live
+        // only in the WAL until now).
+        let want_len = self.n_pages.load(Ordering::Acquire) as u64 * psz as u64;
+        let cur_len = self.file.metadata()?.len();
+        if want_len > cur_len {
+            self.file.set_len(want_len)?;
+        }
+        if !self.skip_fsync.load(Ordering::Acquire) {
+            self.file.sync_all()?;
+        }
+        state.wal.reset()?;
+        state.map.clear();
+        Ok(())
+    }
+
+    /// WAL-mode commit: append every dirty page as a frame, mark the last
+    /// frame as the commit frame, sync per `PRAGMA synchronous`, and
+    /// auto-checkpoint when the WAL grows past the threshold.
+    fn flush_wal(&self) -> Result<()> {
+        let psz = self.page_size();
+
+        // --- header page: refresh in-cache page 0 and mark it dirty ---
+        let n_pages_val = self.n_pages.load(Ordering::Acquire);
+        let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
+        let freelist_count_val = self.freelist_count.load(Ordering::Acquire);
+        let schema_cookie_val = self.schema_cookie.load(Ordering::Acquire);
+        // Page 0 carries the header (n_pages, freelist, cookie). Refresh
+        // it through the normal page path (cache → WAL → file) so the
+        // newest committed version is the base.
+        let page0 = self.get_page(0)?;
+        {
+            let mut borrowed = page0.lock();
+            FileHeader::write(&mut borrowed.data, psz, n_pages_val, schema_cookie_val);
+            borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
+            borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
+            borrowed.dirty = true;
+        }
+        self.dirty_pages.lock().insert(0);
+
+        // --- collect dirty page ids ---
+        let dirty_ids: Vec<PageId> = {
+            let mut set = self.dirty_pages.lock();
+            let ids = set.drain().collect::<Vec<_>>();
+            // The set was drained — reset the last-noted hint so a page
+            // re-dirtied after this flush is not silently skipped by
+            // note_dirty's fast path (its content must reach the next WAL
+            // commit).
+            self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+            ids
+        };
+        if dirty_ids.is_empty() {
+            // Only the header changed but nothing was dirty — nothing to
+            // commit. (Cannot normally happen: dirty_count > 0 implies
+            // dirty pages.)
+            self.dirty_count_approx.store(0, Ordering::Release);
+            return Ok(());
+        }
+
+        // --- append frames under the WAL write lock ---
+        let mut frame_offsets: Vec<(PageId, u64)> = Vec::with_capacity(dirty_ids.len());
+        let sync_needed;
+        {
+            let mut guard = self.wal.write();
+            let Some(state) = guard.as_mut() else {
+                // Mode flipped to DELETE between the dispatch check and
+                // here (single writer, but be safe): fall back.
+                drop(guard);
+                return self.flush_inner_delete();
+            };
+            let mut scratch = vec![0u8; psz as usize];
+            for (i, id) in dirty_ids.iter().enumerate() {
+                let page_ref = self.cache.read().get(*id).cloned();
+                let Some(page_ref) = page_ref else { continue };
+                {
+                    let mut borrowed = page_ref.lock();
+                    if !borrowed.dirty {
+                        continue;
+                    }
+                    scratch.copy_from_slice(&borrowed.data);
+                    borrowed.dirty = false;
+                }
+                let is_last = i + 1 == dirty_ids.len();
+                let offset = state.wal.append(*id, &scratch, is_last)?;
+                frame_offsets.push((*id, offset));
+            }
+            // Durability point. synchronous=NORMAL (the recommended WAL
+            // setting) skips this fsync: commits survive process crashes
+            // (the OS page cache holds them) but not power loss; the next
+            // checkpoint makes them fully durable — SQLite's documented
+            // trade-off.
+            let sync_mode = self.synchronous.load(Ordering::Acquire);
+            sync_needed = sync_mode >= 2 && !self.skip_fsync.load(Ordering::Acquire);
+            if sync_needed {
+                state.wal.sync()?;
+            }
+            for (id, off) in &frame_offsets {
+                state.map.insert(*id, *off);
+            }
+        }
+
+        self.dirty_count_approx.store(0, Ordering::Release);
+
+        // --- auto-checkpoint ---
+        let frames = {
+            self.wal
+                .read()
+                .as_ref()
+                .map(|s| s.wal.n_frames())
+                .unwrap_or(0)
+        };
+        if frames >= WAL_AUTOCHECKPOINT_FRAMES {
+            self.checkpoint_wal()?;
+        }
+        Ok(())
+    }
+
+    /// Re-read the file header through the committed page map (WAL) and
+    /// refresh n_pages / freelist / schema_cookie in memory. Used after
+    /// WAL recovery on open.
+    fn reload_header_from_committed(&self) -> Result<()> {
+        let psz = self.page_size();
+        let mut header = vec![0u8; psz as usize];
+        let got = {
+            let guard = self.wal.read();
+            match guard.as_ref() {
+                Some(state) => match state.map.get(&0) {
+                    Some(&offset) => {
+                        state.wal.read_frame_at(offset, &mut header)?;
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            }
+        };
+        if !got {
+            self.read_file_at(0, &mut header)?;
+        }
+        let n_pages = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let freelist_head = u32::from_le_bytes(header[20..24].try_into().unwrap());
+        let freelist_count = u32::from_le_bytes(header[24..28].try_into().unwrap());
+        let schema_cookie = u32::from_le_bytes(header[28..32].try_into().unwrap());
+        self.n_pages.store(n_pages, Ordering::Release);
+        self.freelist_head.store(freelist_head, Ordering::Release);
+        self.freelist_count.store(freelist_count, Ordering::Release);
+        self.schema_cookie.store(schema_cookie, Ordering::Release);
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<()> {
         // LAZY WRITE-BACK MODE (in-memory databases): pure no-op. Do NOT
         // clear the dirty bookkeeping — the dirty_pages set and count are
@@ -731,6 +1025,19 @@ impl Pager {
             return Ok(());
         }
 
+        // WAL mode: commits append dirty pages as frames to the -wal file
+        // instead of writing the main database file. Readers see the
+        // newest page versions through the committed-page map; a
+        // checkpoint later copies them back to the main file.
+        if self.wal.read().is_some() {
+            return self.flush_wal();
+        }
+        self.flush_inner_delete()
+    }
+
+    /// DELETE-mode flush body: header refresh + scattered page writes +
+    /// fsync.
+    fn flush_inner_delete(&self) -> Result<()> {
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
         let freelist_count_val = self.freelist_count.load(Ordering::Acquire);
@@ -772,7 +1079,15 @@ impl Pager {
         // flush; now we iterate only the dirty set (~1-2 entries).
         let dirty_ids: Vec<PageId> = {
             let mut set = self.dirty_pages.lock();
-            set.drain().collect::<Vec<_>>()
+            let ids = set.drain().collect::<Vec<_>>();
+            // Reset the last-noted hint: the set was drained, so a page
+            // re-dirtied after this flush MUST re-enter the set or its new
+            // content would never reach the file (the hint fast-path
+            // assumed "flush resets this" but nothing did — a page updated
+            // twice across two autocommit statements silently kept its
+            // first version on disk).
+            self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+            ids
         };
 
         for id in dirty_ids {
@@ -964,6 +1279,15 @@ impl Pager {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.foreign_keys_enabled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// PRAGMA synchronous level: 0=OFF, 1=NORMAL, 2=FULL (default).
+    pub fn set_synchronous(&self, level: u8) {
+        self.synchronous.store(level.min(3), Ordering::Release);
+    }
+
+    pub fn synchronous(&self) -> u8 {
+        self.synchronous.load(Ordering::Acquire)
     }
 
     /// Trigger recursion toggle (PRAGMA recursive_triggers). Default OFF —

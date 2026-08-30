@@ -996,6 +996,14 @@ impl Parser {
                     self.advance();
                     Expr::Literal(Value::Integer(0))
                 }
+                // Bare keyword values (`PRAGMA journal_mode = DELETE`,
+                // `= WAL`, `= NORMAL`, ...): capture the spelled keyword as
+                // text — SQLite treats pragma values as plain words.
+                t if keyword_text(&t.token).is_some() => {
+                    let txt = keyword_text(&t.token).unwrap();
+                    self.advance();
+                    Expr::Literal(Value::Text(txt))
+                }
                 _ => self.parse_primary_expr()?,
             };
             Some(PragmaValue::Expr(v))
@@ -2482,5 +2490,21 @@ mod tests {
         let _ = parse_ok("PRAGMA page_size");
         let _ = parse_ok("PRAGMA page_size = 4096");
         let _ = parse_ok("PRAGMA journal_mode(WAL)");
+    }
+}
+
+/// Pragma-value keywords: bare words accepted where an expression is
+/// normally expected (`PRAGMA journal_mode = WAL`). Returns the canonical
+/// uppercase spelling.
+fn keyword_text(t: &crate::sql::lexer::Token) -> Option<String> {
+    if let crate::sql::lexer::Token::Keyword(k) = t {
+        match *k {
+            "DELETE" | "WAL" | "MEMORY" | "TRUNCATE" | "PERSIST" | "NORMAL"
+            | "FULL" | "EXTRA" | "ROW" | "STATEMENT" | "QUERY" | "INCREMENTAL"
+            | "RESTART" | "PASSIVE" | "FORCE" | "OPTIMIZE" => Some(k.to_string()),
+            _ => None,
+        }
+    } else {
+        None
     }
 }

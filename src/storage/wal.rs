@@ -232,6 +232,7 @@ impl Wal {
         let frame_size = (FRAME_HEADER_SIZE + self.page_size) as u64;
         let n_frames_in_file = (file_size - WAL_HEADER_SIZE as u64) / frame_size;
         let mut last_valid_frame: u32 = 0;
+        let mut last_commit_frame: u32 = 0;
         let mut running_checksum = self.checksum;
 
         for i in 0..n_frames_in_file {
@@ -260,11 +261,42 @@ impl Wal {
                 break;
             }
             running_checksum = (c1, c2);
+            if fh.commit != 0 {
+                last_commit_frame = (i + 1) as u32;
+            }
             last_valid_frame = (i + 1) as u32;
         }
-        self.n_frames = last_valid_frame;
+        // Only frames up to the last COMMIT are durable/visible — a torn
+        // transaction (frames appended but never commit-marked) is
+        // discarded. This is the WAL's atomic-commit guarantee.
+        self.n_frames = last_commit_frame;
         self.checksum = running_checksum;
+        // Truncate torn trailing frames so future appends overwrite them.
+        if last_commit_frame < last_valid_frame {
+            let end = WAL_HEADER_SIZE as u64
+                + last_commit_frame as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;
+            self.file.set_len(end)?;
+        }
         Ok(())
+    }
+
+    /// Build a page-id → frame-offset map of the LATEST committed version
+    /// of each page in the WAL — the "WAL-served reads" index. Call after
+    /// `open` (recovery already bounded frames to the last commit).
+    pub fn committed_page_map(&mut self) -> Result<std::collections::HashMap<PageId, u64>> {
+        let mut map = std::collections::HashMap::new();
+        let frame_size = (FRAME_HEADER_SIZE + self.page_size) as u64;
+        for i in 0..self.n_frames {
+            let offset = WAL_HEADER_SIZE as u64 + i as u64 * frame_size;
+            let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
+            self.file.seek(SeekFrom::Start(offset))?;
+            if self.file.read_exact(&mut fh_buf).is_err() {
+                break;
+            }
+            let fh = FrameHeader::decode(&fh_buf)?;
+            map.insert(fh.page_id, offset);
+        }
+        Ok(map)
     }
 
     /// Reset the WAL to empty. Called after a checkpoint.
@@ -279,9 +311,39 @@ impl Wal {
         Ok(())
     }
 
-    /// Append a frame to the WAL. The frame is not committed unless `commit`
-    /// is true (in which case the WAL is fsynced).
-    pub fn append(&mut self, page_id: PageId, data: &[u8], commit: bool) -> Result<()> {
+    /// fsync the WAL file (the durability point of a commit; callers decide
+    /// based on `PRAGMA synchronous`).
+    pub fn sync(&mut self) -> Result<()> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Read one frame's page data into `buf`. `offset` is a frame-header
+    /// start previously returned by `append` or `committed_page_map`.
+    pub fn read_frame_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        if buf.len() != self.page_size as usize {
+            return Err(Error::InvalidArgument("read_frame_at: wrong buffer size".to_string()));
+        }
+        let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
+        self.file.read_exact_at(&mut fh_buf, offset)?;
+        let fh = FrameHeader::decode(&fh_buf)?;
+        if fh.salt1 != self.header.salt1 || fh.salt2 != self.header.salt2 {
+            return Err(Error::corruption("WAL frame salt mismatch"));
+        }
+        self.file.read_exact_at(buf, offset + FRAME_HEADER_SIZE as u64)?;
+        Ok(())
+    }
+
+    /// Current salts (diagnostics).
+    pub fn salts(&self) -> (u32, u32) {
+        (self.header.salt1, self.header.salt2)
+    }
+
+    /// Append a frame to the WAL. Returns the byte offset of the frame
+    /// header so the caller can record it in its page map. `commit` marks
+    /// the frame as ending a transaction; syncing is the caller's decision.
+    pub fn append(&mut self, page_id: PageId, data: &[u8], commit: bool) -> Result<u64> {
         if data.len() != self.page_size as usize {
             return Err(Error::InvalidArgument(format!(
                 "WAL append: data length {} != page_size {}",
@@ -310,11 +372,8 @@ impl Wal {
         };
         self.file.write_all(&fh.encode())?;
         self.file.write_all(data)?;
-        if commit {
-            self.file.sync_all()?;
-        }
         self.n_frames += 1;
-        Ok(())
+        Ok(offset)
     }
 
     /// Iterate over all valid frames in the WAL. The closure receives

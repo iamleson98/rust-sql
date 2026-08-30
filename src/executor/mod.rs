@@ -5818,6 +5818,14 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     // (also reused). Cuts ~80% of the allocations on a 10k-row UPDATE,
     // closing the 23× UPDATE-range gap vs SQLite.
     if let Some(result) = try_streaming_update(ctx, &table, source, assignments, returning)? {
+        // Autocommit flush (transactional execution defers this to COMMIT;
+        // deferred_flush leaves it to the threshold/requery logic). The
+        // flush used to live at the end of the general path — the fast
+        // path's early return skipped it, losing autocommit UPDATEs on
+        // disk (in-memory reads stayed correct until eviction/reopen).
+        if !ctx.in_transaction && !ctx.deferred_flush {
+            ctx.pager.flush()?;
+        }
         return Ok(result);
     }
 

@@ -3762,13 +3762,65 @@ impl Database {
             );
             let v = crate::executor::evaluate(&value_as_expr(value), &eval_ctx)?;
             match name.as_str() {
-                "foreign_keys" => {
-                    let on = v.is_truthy();
-                    ctx.pager.set_foreign_keys_enabled(on);
+                "foreign_keys" | "recursive_triggers" => {
+                    // Accept booleans, numbers, and ON/OFF bare words.
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            matches!(name.to_ascii_lowercase().as_str(), "on" | "true" | "1")
+                        }
+                        _ => v.is_truthy(),
+                    };
+                    if name == "foreign_keys" {
+                        ctx.pager.set_foreign_keys_enabled(on);
+                    } else {
+                        ctx.pager.set_recursive_triggers_enabled(on);
+                    }
                 }
-                "recursive_triggers" => {
-                    let on = v.is_truthy();
-                    ctx.pager.set_recursive_triggers_enabled(on);
+                "journal_mode" => {
+                    // `PRAGMA journal_mode = WAL` parses WAL as a bare
+                    // identifier (column ref), which evaluates to NULL —
+                    // recover the spelled name from the expression.
+                    let mode = match (&v, value_as_expr(value)) {
+                        (Value::Text(t), _) => t.to_ascii_lowercase(),
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            name.to_ascii_lowercase()
+                        }
+                        (Value::Integer(i), _) => {
+                            if *i == 0 { "delete".to_string() } else { "wal".to_string() }
+                        }
+                        _ => String::new(),
+                    };
+                    match mode.as_str() {
+                        "wal" => ctx.pager.enable_wal()?,
+                        "delete" | "truncate" | "persist" | "memory" | "off" => {
+                            ctx.pager.disable_wal()?;
+                        }
+                        _ => {}
+                    }
+                }
+                "synchronous" => {
+                    let level = match (&v, value_as_expr(value)) {
+                        (Value::Integer(i), _) => (*i).clamp(0, 3) as u8,
+                        (Value::Text(t), _) => match t.to_ascii_lowercase().as_str() {
+                            "off" => 0,
+                            "normal" => 1,
+                            "full" | "extra" => 2,
+                            _ => 2,
+                        },
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            match name.to_ascii_lowercase().as_str() {
+                                "off" => 0,
+                                "normal" => 1,
+                                "full" | "extra" => 2,
+                                _ => 2,
+                            }
+                        }
+                        _ => 2,
+                    };
+                    ctx.pager.set_synchronous(level);
+                }
+                "wal_checkpoint" => {
+                    ctx.pager.checkpoint_wal()?;
                 }
                 "cache_size" => {
                     // Advisory: the pager's cache capacity is set at open.
@@ -3798,9 +3850,8 @@ fn read_pragma(p: &PragmaStatement, pager: &Pager) -> Option<Vec<Value>> {
         "page_count" => Value::Integer(pager.n_pages() as i64),
         "cache_size" => Value::Integer(pager.cache_capacity() as i64),
         "schema_version" => Value::Integer(pager.schema_cookie() as i64),
-        // Accepted no-op pragmas report SQLite's documented defaults.
-        "journal_mode" => Value::Text("delete".into()),
-        "synchronous" => Value::Integer(2),
+        "journal_mode" => Value::Text(if pager.wal_enabled() { "wal".into() } else { "delete".into() }),
+        "synchronous" => Value::Integer(pager.synchronous() as i64),
         "temp_store" => Value::Integer(0),
         "locking_mode" => Value::Text("normal".into()),
         "user_version" => Value::Integer(0),
