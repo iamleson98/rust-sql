@@ -1979,6 +1979,15 @@ impl Database {
                 return Ok(vec![row]);
             }
         }
+        // EXPLAIN [QUERY PLAN]: plan the inner statement and render rows;
+        // never execute it.
+        if let Statement::Explain(inner) = cached.stmt.as_ref() {
+            let plan = Self::plan_for_statement(&self.catalog, inner)?;
+            return Ok(match plan {
+                Some(p) => crate::executor::explain::explain_plan_rows(&p),
+                None => Vec::new(),
+            });
+        }
         // WITH-clause statements: materialize CTEs, plan with them in
         // scope, execute — never cached (rows are recomputed per call).
         if let Statement::Select(sel) = cached.stmt.as_ref() {
@@ -2120,6 +2129,14 @@ impl Database {
             if let Some(row) = read_pragma(p, &self.pager) {
                 return Ok((vec![p.name.clone()], vec![row]));
             }
+        }
+        if let Statement::Explain(inner) = cached.stmt.as_ref() {
+            let plan = Self::plan_for_statement(&self.catalog, inner)?;
+            let rows = match plan {
+                Some(p) => crate::executor::explain::explain_plan_rows(&p),
+                None => Vec::new(),
+            };
+            return Ok((vec!["id".into(), "parent".into(), "notused".into(), "detail".into()], rows));
         }
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {

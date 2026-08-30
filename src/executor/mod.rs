@@ -15,6 +15,7 @@ pub mod datetime;
 pub mod expr;
 pub mod json;
 pub(crate) mod triggers;
+pub(crate) mod explain;
 pub(crate) mod predicate;
 
 pub use expr::{apply_binary, evaluate, EvalContext};

@@ -1,6 +1,6 @@
 //! Correlated-subquery differential tests: every case runs against BOTH
 //! rustqlite and SQLite (rusqlite) and must agree exactly.
-use rustqlite::Database;
+use rustqlite::{Database, Value};
 
 fn both(db: &mut Database, conn: &rusqlite::Connection, sql: &str) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
     let ours = match db.query(sql, []) {
@@ -210,4 +210,38 @@ fn correlated_dml() {
     conn.execute("INSERT INTO deleted_users (id, name) SELECT id, name FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) = 0", []).unwrap();
     let v3 = both(&mut db, &conn, "SELECT id, name FROM deleted_users ORDER BY id");
     assert_eq!(v3.0, v3.1, "post-INSERT state");
+}
+
+#[test]
+fn explain_query_plan_rows() {
+    let (mut db, _conn) = setup();
+    // EXPLAIN QUERY PLAN returns SQLite-schema rows and never executes.
+    let rows = db.query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE id = 1", []).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][3], Value::Text("SEARCH users USING INTEGER PRIMARY KEY (rowid=?)".into()));
+    // Join: two SEARCH rows (needs the join-key index for INLJ).
+    db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
+    let rows = db.query(
+        "EXPLAIN QUERY PLAN SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id = 1",
+        [],
+    ).unwrap();
+    assert_eq!(rows.len(), 2);
+    let details: Vec<String> = rows.iter().map(|r| match &r[3] {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => String::new(),
+    }).collect();
+    assert!(details.iter().any(|d| d.starts_with("SEARCH u USING INTEGER PRIMARY KEY")), "{details:?}");
+    assert!(details.iter().any(|d| d.starts_with("SEARCH o USING INDEX") || d == "SCAN o"), "{details:?}");
+    // ORDER BY emits the temp b-tree note.
+    let rows = db.query("EXPLAIN QUERY PLAN SELECT name FROM users ORDER BY name", []).unwrap();
+    let details: Vec<String> = rows.iter().map(|r| match &r[3] {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => String::new(),
+    }).collect();
+    assert!(details.iter().any(|d| d == "USE TEMP B-TREE FOR ORDER BY"), "{details:?}");
+    // EXPLAIN must not mutate: the UPDATE inside is only planned.
+    let before = db.query("SELECT COUNT(*) FROM users", []).unwrap();
+    db.query("EXPLAIN QUERY PLAN UPDATE users SET salary = 1.0", []).unwrap();
+    let after = db.query("SELECT COUNT(*) FROM users", []).unwrap();
+    assert_eq!(before, after);
 }
