@@ -448,6 +448,7 @@ fn split_compound_cte(
 impl Database {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        crate::engine_init();
         let path = path.as_ref().to_path_buf();
         let mut pager = Pager::open(&path, DEFAULT_CACHE_PAGES)?;
         let mut catalog = Catalog::new();

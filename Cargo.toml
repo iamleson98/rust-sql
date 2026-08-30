@@ -45,6 +45,9 @@ parking_lot = "0.12"
 # shows up directly in scan/insert/join throughput. Optional — opt out
 # with `default-features = false`.
 mimalloc = { version = "0.1", optional = true }
+# Raw FFI for the mimalloc option API (purge-delay tuning); version-locked
+# to whatever `mimalloc` resolves to (same upstream).
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -55,7 +58,7 @@ rand = "0.8"
 [features]
 default = ["mimalloc"]
 # Fast global allocator (see the mimalloc dependency note above).
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Disable to remove rustyline (smaller binary)
 no-cli-readline = []
 

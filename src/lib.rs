@@ -44,6 +44,37 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Disable mimalloc's delayed page purging.
+///
+/// By default mimalloc madvises freed pages back to the OS after a 10 ms
+/// idle window; the next allocation then re-faults them, costing 10-15 µs
+/// on the first query after any free storm. glibc — the allocator SQLite
+/// is measured against — never returns small-object pages to the OS, so it
+/// never pays this tax. mimalloc's own docs recommend `-1` (never purge)
+/// for latency-sensitive services; we set it once, at engine init.
+#[cfg(feature = "mimalloc")]
+fn tune_mimalloc() {
+    use std::sync::Once;
+    static TUNED: Once = Once::new();
+    TUNED.call_once(|| unsafe {
+        // `mi_option_purge_delay` sits at enum position 15 in mimalloc.h
+        // (eager_commit_delay = 14, use_numa_nodes = 16 bracket it); the
+        // sys crate's bindings don't name it, so use the raw value.
+        const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), -1);
+    });
+}
+
+#[cfg(not(feature = "mimalloc"))]
+fn tune_mimalloc() {}
+
+/// Engine one-time init: allocator tuning. Called from every `Database`
+/// constructor before any page is touched.
+fn engine_init() {
+    tune_mimalloc();
+}
+
 pub mod error;
 pub mod planner;
 pub mod schema;
