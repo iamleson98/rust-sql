@@ -314,13 +314,16 @@ fn sqlite_update_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
 }
 
 fn sqlite_update_range(conn: &rusqlite::Connection) -> Duration {
-    // Mutating: best-of-N would keep flipping the same rows. Run once,
-    // then once more in the same direction (idempotent + 1.0 per run, so
-    // the second run does identical work) and keep the second timing.
-    conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
-    let start = Instant::now();
-    conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
-    start.elapsed()
+    // Mutating: identical work per run (see the rustqlite harness) —
+    // warm 3, then best-of-5, mirroring our engine's harness exactly.
+    for _ in 0..3 {
+        conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+    }
+    best_of::<5>(|| {
+        let start = Instant::now();
+        conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn sqlite_delete_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
@@ -600,12 +603,18 @@ fn rustqlite_update_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
 }
 
 fn rustqlite_update_range(db: &mut rustqlite::Database) -> Duration {
-    // Mutating: mirror the SQLite harness — run once to warm, then time the
-    // identical second run (+ 1.0 is idempotent in cost).
-    db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
-    let start = Instant::now();
-    db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
-    start.elapsed()
+    // Mutating: `score = score + 1.0` does identical work on every run
+    // (row set and payload sizes are unchanged), so best-of-N is sound —
+    // the first run pays one-time warmup (allocator, page faults) that
+    // the steady state doesn't.
+    for _ in 0..3 {
+        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+    }
+    best_of::<5>(|| {
+        let start = Instant::now();
+        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_delete_by_pk(_db: &mut rustqlite::Database, n: usize) -> Duration {

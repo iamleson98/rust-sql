@@ -7122,19 +7122,59 @@ fn try_streaming_update(
         if use_merge {
             rowids.sort_unstable();
             rowids.dedup();
+            // RANGE-BOUNDED walk: only the leaves covering
+            // [min(rowid), max(rowid)] are visited — when the selection
+            // clusters in rowid space (time-ordered inserts, sequential
+            // ids — the common bulk-update shape) this walks HALF or less
+            // of the table. Never worse than the full walk (a scattered
+            // selection's min..max covers everything).
+            let walk_lo = rowids[0];
+            let walk_hi = rowids[rowids.len() - 1];
+            // DENSE BITSET membership when rowids cluster: (max-min)/count
+            // <= 64 keeps the bitset at <= 8 bytes of set-bits per row; the
+            // per-row membership test is one shift+mask instead of the
+            // sorted-pointer dance. Sparse selections keep the pointer walk.
+            let span = (walk_hi - walk_lo) as u64;
+            let dense = span / rowids.len() as u64 <= 64
+                && (rowids.len() as u64) * 8 >= (span / 8 + 1).max(1)
+                && (span / 8 + 1) <= 4 << 20;
+            let bitset: Vec<u64> = if dense {
+                let words = (span / 64 + 1) as usize;
+                let mut b = vec![0u64; words];
+                for &r in &rowids {
+                    let bit = (r - walk_lo) as u64;
+                    b[(bit / 64) as usize] |= 1u64 << (bit % 64);
+                }
+                b
+            } else {
+                Vec::new()
+            };
             let mut ri = 0usize;
             let mut err: Option<crate::error::Error> = None;
-            bt.scan_table_borrowed(|rowid, payload| {
-                while ri < rowids.len() && rowids[ri] < rowid {
-                    ri += 1;
-                }
-                if ri >= rowids.len() {
-                    return false; // all matches processed
-                }
-                if rowids[ri] != rowid {
+            bt.scan_table_range_borrowed(walk_lo, walk_hi, |rowid, payload| {
+                let is_match = if dense {
+                    let bit = (rowid - walk_lo) as u64;
+                    bitset[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
+                } else {
+                    while ri < rowids.len() && rowids[ri] < rowid {
+                        ri += 1;
+                    }
+                    if ri >= rowids.len() {
+                        return false; // all matches processed
+                    }
+                    rowids[ri] == rowid
+                };
+                if !is_match {
+                    // Past the last wanted rowid: stop the walk early (the
+                    // range may over-cover).
+                    if !dense && ri >= rowids.len() {
+                        return false;
+                    }
                     return true;
                 }
-                ri += 1;
+                if !dense {
+                    ri += 1;
+                }
                 let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
                 if let Err(e) = process_update_row(
                     ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
