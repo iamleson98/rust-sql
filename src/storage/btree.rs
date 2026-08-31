@@ -528,12 +528,9 @@ fn hint_epoch_matches(epoch: u64) -> bool {
 #[inline]
 fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageRef> {
     TABLE_HINTS.with(|c| {
-        let (ep, slots) = &*c.borrow();
-        if *ep != epoch {
-            return None;
-        }
+        let slots = &*c.borrow();
         let slot = slots.get((rowid as usize) & (TABLE_HINT_SLOTS - 1))?.as_ref()?;
-        if slot.root == root && rowid >= slot.lo && rowid <= slot.hi {
+        if slot.epoch == epoch && slot.root == root && rowid >= slot.lo && rowid <= slot.hi {
             Some(Arc::clone(&slot.page))
         } else {
             None
@@ -542,17 +539,17 @@ fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageRef> {
 }
 
 /// Record the table-leaf hint for `root` (bounds read live from the page).
+#[inline]
 fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64) {
+    // Generation-tagged slots: each entry carries the write-epoch it was
+    // recorded under; stale entries fail their per-slot epoch check on
+    // probe. Epoch changes are therefore FREE (the old global-clear design
+    // paid an O(slots) wipe on EVERY write — which is also why it could
+    // not afford more than 64 slots).
     TABLE_HINTS.with(|c| {
-        let (ep, slots) = &mut *c.borrow_mut();
-        if *ep != epoch {
-            *ep = epoch;
-            for s in slots.iter_mut() {
-                *s = None;
-            }
-        }
+        let mut slots = c.borrow_mut();
         let slot = (probed_rowid as usize) & (TABLE_HINT_SLOTS - 1);
-        slots[slot] = Some(TableHintSlot { root, page: Arc::clone(page), lo, hi });
+        slots[slot] = Some(TableHintSlot { epoch, root, page: Arc::clone(page), lo, hi });
     });
 }
 
@@ -564,9 +561,10 @@ fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64, pr
 /// the SAME scattered rowids (fixed-parameter OLTP, join inner loops)
 /// hit ~10/10 instead of 1/10, skipping the root→interior→leaf descent
 /// entirely. Probe cost: a RefCell borrow + one slot check (~8 ns).
-const TABLE_HINT_SLOTS: usize = 64;
+const TABLE_HINT_SLOTS: usize = 1024;
 
 struct TableHintSlot {
+    epoch: u64,
     root: PageId,
     page: PageRef,
     lo: i64,
@@ -574,8 +572,8 @@ struct TableHintSlot {
 }
 
 thread_local! {
-    static TABLE_HINTS: std::cell::RefCell<(u64, Vec<Option<TableHintSlot>>)> =
-        std::cell::RefCell::new((u64::MAX, (0..TABLE_HINT_SLOTS).map(|_| None).collect()));
+    static TABLE_HINTS: std::cell::RefCell<Vec<Option<TableHintSlot>>> =
+        std::cell::RefCell::new((0..TABLE_HINT_SLOTS).map(|_| None).collect());
 }
 
 /// Struct-local TABLE leaf hint: the last leaf visited by THIS B+tree
