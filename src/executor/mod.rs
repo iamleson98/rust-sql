@@ -2440,6 +2440,80 @@ fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContex
 ///
 /// Returns `None` when the reference can't be statically resolved (caller
 /// falls back to the general evaluator, which yields NULL for unknown cols).
+/// Two-side column resolution over a JOIN's combined schema WITHOUT
+/// materializing the combined `Vec<String>` (which cost a `to_vec` clone
+/// of the outer names + one `format!` per inner column, per query, in the
+/// join fusion path). Semantics replicate `resolve_column_index` applied
+/// to `outer_cols ++ ["prefix.col" for each inner col]`: three passes
+/// (qualified exact, unqualified exact, suffix), outer entries before
+/// inner entries WITHIN each pass. Inner entries are virtual
+/// "inner_prefix.col" strings — compared structurally, never built.
+#[allow(clippy::too_many_arguments)]
+fn resolve_column_index_two_sides(
+    outer_cols: &[String],
+    inner_prefix: &str,
+    inner_cols: &[crate::schema::Column],
+    table: Option<&str>,
+    name: &str,
+) -> Option<usize> {
+    let n_outer = outer_cols.len();
+    // Pass 1: qualified exact "t.c".
+    if let Some(t) = table {
+        for (i, n) in outer_cols.iter().enumerate() {
+            if n.len() == t.len() + 1 + name.len()
+                && n.as_bytes().get(t.len()) == Some(&b'.')
+                && n[..t.len()].eq_ignore_ascii_case(t)
+                && n[t.len() + 1..].eq_ignore_ascii_case(name)
+            {
+                return Some(i);
+            }
+        }
+        // Inner virtual entries: "prefix.col".
+        for (j, c) in inner_cols.iter().enumerate() {
+            let cname = c.name.as_str();
+            if inner_prefix.len() == t.len() && cname.len() == name.len()
+                && inner_prefix.eq_ignore_ascii_case(t)
+                && cname.eq_ignore_ascii_case(name)
+            {
+                return Some(n_outer + j);
+            }
+        }
+        // Fall through to unqualified resolution.
+    }
+    // Pass 2: exact unqualified match against the full (virtual) entry.
+    for (i, n) in outer_cols.iter().enumerate() {
+        if n.eq_ignore_ascii_case(name) {
+            return Some(i);
+        }
+    }
+    for (j, c) in inner_cols.iter().enumerate() {
+        let cname = c.name.as_str();
+        if name.len() == inner_prefix.len() + 1 + cname.len()
+            && name.as_bytes().get(inner_prefix.len()) == Some(&b'.')
+            && name[..inner_prefix.len()].eq_ignore_ascii_case(inner_prefix)
+            && name[inner_prefix.len() + 1..].eq_ignore_ascii_case(cname)
+        {
+            return Some(n_outer + j);
+        }
+    }
+    // Pass 3: suffix match (after the last dot).
+    for (i, n) in outer_cols.iter().enumerate() {
+        if let Some(pos) = n.rfind('.') {
+            if n[pos + 1..].eq_ignore_ascii_case(name) {
+                return Some(i);
+            }
+        }
+    }
+    // Inner virtual "prefix.col": suffix = col name (prefix has no dot in
+    // any realistic schema).
+    for (j, c) in inner_cols.iter().enumerate() {
+        if c.name.eq_ignore_ascii_case(name) {
+            return Some(n_outer + j);
+        }
+    }
+    None
+}
+
 fn resolve_column_index(
     col_names: &[String],
     table: Option<&str>,
@@ -4630,10 +4704,10 @@ fn exec_index_nested_loop_join(
 
     // Output columns: outer.cols ++ inner.cols (with inner prefix from alias).
     let inner_prefix = inner_alias.as_deref().unwrap_or(&inner_table.name);
-    let mut combined_cols: Vec<String> = outer_res.columns.to_vec();
-    combined_cols.extend(
-        inner_table.columns.iter().map(|c| format!("{}.{}", inner_prefix, c.name)),
-    );
+    // NOTE: the combined Vec<String> is NOT built here anymore — the fused
+    // projection resolves structurally against the two sides (see
+    // `resolve_column_index_two_sides`), and only the non-fused path pays
+    // the `to_vec` + per-inner-column `format!`.
 
     // ---- FUSED PROJECTION resolution ----
     // When this join sits under a Project of bare column references, the
@@ -4652,7 +4726,13 @@ fn exec_index_nested_loop_join(
             let mut all_ok = true;
             for c in columns {
                 if let Expr::Column { table, name } = &c.expr {
-                    match resolve_column_index(&combined_cols, table.as_deref(), name) {
+                    match resolve_column_index_two_sides(
+                        &outer_res.columns,
+                        inner_prefix,
+                        &inner_table.columns,
+                        table.as_deref(),
+                        name,
+                    ) {
                         Some(i) => {
                             indices.push(i);
                             names.push(match &c.alias {
@@ -4833,7 +4913,15 @@ fn exec_index_nested_loop_join(
 
     let out_columns: Arc<[String]> = match &fused {
         Some((_, names)) => names.clone(),
-        None => combined_cols.into(),
+        None => {
+            // Non-fused path only: build the combined schema now (the
+            // fused path never pays this).
+            let mut combined: Vec<String> = outer_res.columns.to_vec();
+            combined.extend(
+                inner_table.columns.iter().map(|c| format!("{}.{}", inner_prefix, c.name)),
+            );
+            combined.into()
+        }
     };
     Ok(ExecResult { columns: out_columns, rows: out_rows })
 }
