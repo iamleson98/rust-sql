@@ -791,6 +791,15 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     return exec_rowid_lookup_projected(ctx, table.clone(), rowid, project.as_deref(), out_cols);
                 }
             }
+            // FUSED PATH: Project over an IndexLookup (WHERE indexed_col = ?)
+            // — decode only the projected columns, reuse one B+tree handle
+            // across the rowid batch (pinned root survives). Non-bare
+            // projections fall through to the generic Project.
+            if let Plan::IndexLookup { table, alias: _, index, key_exprs } = &**input {
+                if bare_column_projection(columns, table).is_some() {
+                    return exec_index_lookup_projected(ctx, table.clone(), index.clone(), key_exprs, Some(columns));
+                }
+            }
             // FUSED PATH: Project over an Index Nested-Loop Join — the join
             // emits only the projected columns (no full-width combined row,
             // no second cloning pass). Mirrors the Hash Join fusion.
@@ -2436,19 +2445,20 @@ fn resolve_column_index(
     table: Option<&str>,
     name: &str,
 ) -> Option<usize> {
+    // Allocation-free: the old version built `to_ascii_lowercase()` copies
+    // of the qualifier, the name, AND every candidate column name — 3+
+    // heap Strings per resolution, paid per projected column per query in
+    // the join fusion paths.
     if let Some(t) = table {
-        let tl = t.to_ascii_lowercase();
-        let nl = name.to_ascii_lowercase();
-        // Qualified exact match: "table.column".
+        // Qualified exact match: "table.column" (case-insensitive on both
+        // components, dot at exactly `t.len()`).
         for (i, n) in col_names.iter().enumerate() {
-            if n.len() == tl.len() + 1 + nl.len() {
-                let n_lower = n.to_ascii_lowercase();
-                if n_lower.as_str().get(tl.len()..tl.len() + 1) == Some(".")
-                    && n_lower[..tl.len()] == tl
-                    && n_lower[tl.len() + 1..] == nl
-                {
-                    return Some(i);
-                }
+            if n.len() == t.len() + 1 + name.len()
+                && n.as_bytes().get(t.len()) == Some(&b'.')
+                && n[..t.len()].eq_ignore_ascii_case(t)
+                && n[t.len() + 1..].eq_ignore_ascii_case(name)
+            {
+                return Some(i);
             }
         }
         // Fall through to unqualified resolution (mirrors lookup()).
@@ -2462,8 +2472,7 @@ fn resolve_column_index(
     // Qualified match by suffix (e.g. "u.id" matches ref "id").
     for (i, n) in col_names.iter().enumerate() {
         if let Some(pos) = n.rfind('.') {
-            let suffix = &n[pos + 1..];
-            if suffix.eq_ignore_ascii_case(name) {
+            if n[pos + 1..].eq_ignore_ascii_case(name) {
                 return Some(i);
             }
         }
@@ -4696,11 +4705,21 @@ fn exec_index_nested_loop_join(
         }
     });
     let mut key_buf: Vec<u8> = Vec::with_capacity(16);
+    // Reused rowid batch + decode buffer across outer rows (one malloc per
+    // STATEMENT instead of one per outer row / per matched row).
+    let mut rowids: Vec<i64> = Vec::new();
+    let mut inner_vals: Row = Vec::new();
+    // ONE index + ONE table B+tree handle for the whole join: the pinned
+    // root pages and thread-local leaf hints survive across every probe
+    // (a fresh `Btree::new` per rowid re-fetched the root page per row).
+    let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
+    let mut table_bt = Btree::new(ctx.pager, inner_root, false);
 
     for outer_row in &outer_res.rows {
-        // Extract the join key from the outer row.
+        // Extract the join key from the outer row (borrowed — no clone;
+        // the order-key encoder only reads it).
         let key_value = match outer_row.get(outer_key_col) {
-            Some(v) => v.clone(),
+            Some(v) => v,
             None => continue, // NULL join key — no matches in INNER join.
         };
 
@@ -4709,9 +4728,13 @@ fn exec_index_nested_loop_join(
         key_buf.clear();
         key_value.encode_order_key_into(&mut key_buf);
 
-        // Look up matching rowids in the index B+tree.
-        let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
-        let rowids = index_bt.lookup_index(&key_buf)?;
+        // Look up matching rowids in the index B+tree (reused handle +
+        // reused output buffer). A mid-join index split moves the root:
+        // re-target the handle when that happens.
+        if index_bt.root != inner_index_root {
+            index_bt = Btree::new(ctx.pager, inner_index_root, true);
+        }
+        index_bt.lookup_index_into(&key_buf, &mut rowids)?;
         if index_bt.root != inner_index_root {
             inner_index_root = index_bt.root;
         }
@@ -4724,8 +4747,7 @@ fn exec_index_nested_loop_join(
         // most once. (A corrupted index producing duplicates is
         // `PRAGMA integrity_check`'s to report, not the join's to paper
         // over — and it saves a HashSet allocation per multi-row key.)
-        for rowid in rowids {
-            let mut table_bt = Btree::new(ctx.pager, inner_root, false);
+        for &rowid in &rowids {
             match &fused_inner_cols {
                 Some(wanted) => {
                     // Fused + selective: decode ONLY the needed inner
@@ -4733,10 +4755,9 @@ fn exec_index_nested_loop_join(
                     // into the output row (a decoded inner row is consumed
                     // by exactly one output row — cloning its Text values
                     // was a pure waste).
-                    // Decode into a reused buffer — no per-row Vec
-                    // allocation (the closure borrows it; the found/not-found
-                    // signal comes from lookup_table_with's Option).
-                    let mut inner_vals: Row = Vec::with_capacity(wanted.len());
+                    // Decode into a REUSED buffer (cleared per row) — no
+                    // per-row Vec allocation.
+                    inner_vals.clear();
                     let found = table_bt.lookup_table_with(rowid, |payload| {
                         decode_row_selective(
                             payload,
@@ -5236,6 +5257,42 @@ fn exec_index_lookup(
     index: Arc<crate::schema::Index>,
     key_exprs: &[Expr],
 ) -> Result<ExecResult> {
+    exec_index_lookup_impl(ctx, table.clone(), index, key_exprs, None, table.col_names.clone())
+}
+
+/// IndexLookup with the projection FUSED into the fetch: decodes ONLY the
+/// projected columns per row (selective decode), skips the payload Vec
+/// copy (`lookup_table_with`), and reuses ONE table B+tree handle across
+/// all rowids so the pinned root + leaf hint survive between fetches.
+/// `SELECT c FROM t WHERE indexed_col = ?` previously paid a fresh
+/// `Btree::new` + root cache-lock + payload malloc per row.
+fn exec_index_lookup_projected(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    index: Arc<crate::schema::Index>,
+    key_exprs: &[Expr],
+    projection: Option<&[crate::planner::plan::ProjectExpr]>,
+) -> Result<ExecResult> {
+    if std::env::var_os("RSQL_DBG_IDXL").is_some() {
+        eprintln!("[dbg] fused IndexLookup path taken");
+    }
+    let (project, out_cols) = match projection
+        .and_then(|columns| bare_column_projection(columns, &table))
+    {
+        Some((p, n)) => (p, n),
+        None => (None, table.col_names.clone()),
+    };
+    exec_index_lookup_impl(ctx, table, index, key_exprs, project.as_deref(), out_cols)
+}
+
+fn exec_index_lookup_impl(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    index: Arc<crate::schema::Index>,
+    key_exprs: &[Expr],
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
     // Evaluate the key expressions to get the lookup values.
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
@@ -5251,10 +5308,12 @@ fn exec_index_lookup(
         v.encode_order_key_into(&mut key_bytes);
     }
 
-    // Look up matching rowids in the index (override-aware root).
+    // Look up matching rowids in the index (override-aware root), into a
+    // reusable buffer (no fresh Vec malloc per query).
     let index_root = ctx.index_root(&index);
     let mut index_bt = Btree::new(ctx.pager, index_root, true);
-    let rowids = index_bt.lookup_index(&key_bytes)?;
+    let mut rowids: Vec<i64> = Vec::new();
+    index_bt.lookup_index_into(&key_bytes, &mut rowids)?;
 
     // Fetch each row by rowid from the table B+tree. Use the
     // override-aware root: the catalog's Arc<Table> holds the root from
@@ -5262,19 +5321,67 @@ fn exec_index_lookup(
     // (tracked in ctx.root_overrides). Using the stale root made rows
     // beyond the first subtree invisible to indexed lookups after the
     // table had grown.
+    //
+    // ONE table B+tree handle for the whole batch: the pinned root and
+    // the thread-local leaf hint persist across fetches (a fresh
+    // `Btree::new` per rowid re-fetched the root page on EVERY row).
     let table_root = ctx.table_root(&table);
-    let mut rows = Vec::with_capacity(rowids.len());
-    for rowid in rowids {
-        let mut table_bt = Btree::new(ctx.pager, table_root, false);
-        if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-            rows.push(decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?);
-        }
-    }
+    let mut table_bt = Btree::new(ctx.pager, table_root, false);
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let mut rows: Vec<Row> = Vec::with_capacity(rowids.len());
+    fetch_rows_by_rowids(
+        &mut table_bt,
+        &rowids,
+        n_cols,
+        rowid_alias,
+        project,
+        &mut rows,
+    )?;
 
     Ok(ExecResult {
-        columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+        columns: out_cols,
         rows,
     })
+}
+
+/// Fetch table rows for a batch of rowids into `rows`, decoding each row
+/// directly under the page lock (no intermediate payload Vec copy). With
+/// `project`, decodes ONLY the projected columns (selective decode);
+/// decoded values are MOVED into the output rows (no clone pass).
+/// The caller's B+tree handle is reused across all fetches so its pinned
+/// root page and leaf-hint warmth carry over.
+fn fetch_rows_by_rowids(
+    table_bt: &mut Btree<'_>,
+    rowids: &[i64],
+    n_cols: usize,
+    rowid_alias: Option<usize>,
+    project: Option<&[usize]>,
+    rows: &mut Vec<Row>,
+) -> Result<()> {
+    for &rowid in rowids {
+        match project {
+            Some(idxs) => {
+                let mut row: Row = Vec::with_capacity(idxs.len());
+                let found = table_bt.lookup_table_with(rowid, |payload| {
+                    decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
+                })?;
+                if found.is_some() {
+                    rows.push(row);
+                }
+            }
+            None => {
+                let found = table_bt
+                    .lookup_table_with(rowid, |payload| {
+                        decode_row(payload, n_cols, rowid, rowid_alias)
+                    })?;
+                if let Some(row) = found {
+                    rows.push(row);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compare an index entry key against a bound's encoded value, considering

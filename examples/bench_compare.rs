@@ -269,10 +269,17 @@ fn sqlite_join_2table(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn.prepare(
         "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1",
     ).unwrap();
+    // Like-for-like with `Database::query` (which materializes Vec<Row>):
+    // materialize typed rows on the SQLite side too. Stepping without
+    // reading values would compare DIFFERENT amounts of work.
     best_of::<5>(|| {
         let start = Instant::now();
-        let mut rows = stmt.query(params![500]).unwrap();
-        while rows.next().unwrap().is_some() {}
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![500], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        std::hint::black_box(&rows);
         start.elapsed()
     })
 }
@@ -281,10 +288,22 @@ fn sqlite_join_3table(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn.prepare(
         "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = ?1",
     ).unwrap();
+    // Like-for-like with `Database::query` (materialize typed rows).
     best_of::<5>(|| {
         let start = Instant::now();
-        let mut rows = stmt.query(params![500]).unwrap();
-        while rows.next().unwrap().is_some() {}
+        let rows: Vec<(String, i64, String, f64)> = stmt
+            .query_map(params![500], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        std::hint::black_box(&rows);
         start.elapsed()
     })
 }

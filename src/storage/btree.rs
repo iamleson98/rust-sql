@@ -491,12 +491,6 @@ fn prefetch_search_lines(data: &[u8]) {
     let _ = data;
 }
 
-struct TableLeafHint {
-    page: PageRef,
-    lo: i64,
-    hi: i64,
-}
-
 struct IndexLeafHint {
     page: PageRef,
     /// First and last cell keys of the leaf (full key bytes).
@@ -506,9 +500,11 @@ struct IndexLeafHint {
 
 type HintMap<V> = std::collections::HashMap<PageId, V, PageIdHashBuild>;
 
+/// Thread-local INDEX-leaf hint state (single remembered leaf per root,
+/// epoch-validated). Table leaves moved to the direct-mapped multi-slot
+/// cache (`TABLE_HINTS`) that keeps a working set of leaves hot.
 struct LeafHintCache {
     epoch: u64,
-    tables: HintMap<TableLeafHint>,
     indexes: HintMap<IndexLeafHint>,
 }
 
@@ -516,7 +512,6 @@ thread_local! {
     static LEAF_HINTS: std::cell::RefCell<LeafHintCache> =
         std::cell::RefCell::new(LeafHintCache {
             epoch: u64::MAX, // force clear on first use
-            tables: HintMap::default(),
             indexes: HintMap::default(),
         });
 }
@@ -532,14 +527,14 @@ fn hint_epoch_matches(epoch: u64) -> bool {
 /// `rowid` is inside the remembered bounds.
 #[inline]
 fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageRef> {
-    if !hint_epoch_matches(epoch) {
-        return None;
-    }
-    LEAF_HINTS.with(|c| {
-        let c = c.borrow();
-        let h = c.tables.get(&root)?;
-        if rowid >= h.lo && rowid <= h.hi {
-            Some(Arc::clone(&h.page))
+    TABLE_HINTS.with(|c| {
+        let (ep, slots) = &*c.borrow();
+        if *ep != epoch {
+            return None;
+        }
+        let slot = slots.get((rowid as usize) & (TABLE_HINT_SLOTS - 1))?.as_ref()?;
+        if slot.root == root && rowid >= slot.lo && rowid <= slot.hi {
+            Some(Arc::clone(&slot.page))
         } else {
             None
         }
@@ -547,16 +542,64 @@ fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageRef> {
 }
 
 /// Record the table-leaf hint for `root` (bounds read live from the page).
-fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64) {
-    LEAF_HINTS.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.epoch != epoch {
-            c.epoch = epoch;
-            c.tables.clear();
-            c.indexes.clear();
+fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64) {
+    TABLE_HINTS.with(|c| {
+        let (ep, slots) = &mut *c.borrow_mut();
+        if *ep != epoch {
+            *ep = epoch;
+            for s in slots.iter_mut() {
+                *s = None;
+            }
         }
-        c.tables.insert(root, TableLeafHint { page: Arc::clone(page), lo, hi });
+        let slot = (probed_rowid as usize) & (TABLE_HINT_SLOTS - 1);
+        slots[slot] = Some(TableHintSlot { root, page: Arc::clone(page), lo, hi });
     });
+}
+
+/// Direct-mapped table-leaf hint slots: `rowid & (SLOTS-1)` → the leaf
+/// covering that rowid (validated by [lo, hi] + root + epoch). A single
+/// leaf can appear in several slots (its whole rowid range hashes across
+/// them); collisions simply overwrite. This lifts the per-root hint from
+/// ONE remembered leaf to a working set of 64 leaves — repeated probes of
+/// the SAME scattered rowids (fixed-parameter OLTP, join inner loops)
+/// hit ~10/10 instead of 1/10, skipping the root→interior→leaf descent
+/// entirely. Probe cost: a RefCell borrow + one slot check (~8 ns).
+const TABLE_HINT_SLOTS: usize = 64;
+
+struct TableHintSlot {
+    root: PageId,
+    page: PageRef,
+    lo: i64,
+    hi: i64,
+}
+
+thread_local! {
+    static TABLE_HINTS: std::cell::RefCell<(u64, Vec<Option<TableHintSlot>>)> =
+        std::cell::RefCell::new((u64::MAX, (0..TABLE_HINT_SLOTS).map(|_| None).collect()));
+}
+
+/// Struct-local TABLE leaf hint: the last leaf visited by THIS B+tree
+/// handle, with its exact [lo, hi] rowid bounds and the write epoch it
+/// was recorded under. A probe costs ~2 ns (borrow + two integer
+/// compares), versus ~40 ns for the thread-local `RefCell<HashMap>`
+/// probe — hoisted B+tree handles (join inner loops, rowid batches)
+/// check this first and skip the map on every miss.
+#[derive(Clone)]
+struct StructTableHint {
+    page: PageRef,
+    lo: i64,
+    hi: i64,
+    epoch: u64,
+}
+
+/// Struct-local INDEX leaf hint (byte-key bounds — order-preserving
+/// encoding, so byte order == key order).
+#[derive(Clone)]
+struct StructIndexHint {
+    page: PageRef,
+    lo: Vec<u8>,
+    hi: Vec<u8>,
+    epoch: u64,
 }
 
 /// Probe the index-leaf hint for `root`. Byte comparison — index cell keys
@@ -583,7 +626,6 @@ fn set_index_hint(root: PageId, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64
         let mut c = c.borrow_mut();
         if c.epoch != epoch {
             c.epoch = epoch;
-            c.tables.clear();
             c.indexes.clear();
         }
         let h = c.indexes.entry(root).or_insert_with(|| IndexLeafHint {
@@ -599,6 +641,21 @@ fn set_index_hint(root: PageId, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64
     });
 }
 
+/// Lifetime-free snapshot of a `Btree` handle's advisory read state
+/// (pinned root + struct-local leaf hints), keyed to a (root, is_index)
+/// pair and the pager write-epoch it was captured under. The SQL layer's
+/// fast paths cache these per thread so consecutive statements reuse the
+/// pinned root page and warm leaf hints instead of re-creating a bare
+/// `Btree` (and re-fetching the root page) on every query.
+pub struct BtreeHandleState {
+    pub root: PageId,
+    pub is_index: bool,
+    pinned_root: Option<PageRef>,
+    pinned_epoch: u64,
+    table_leaf: Option<StructTableHint>,
+    index_leaf: Option<StructIndexHint>,
+}
+
 /// A B+tree over a pager. Trees are identified by their root page ID.
 pub struct Btree<'a> {
     pub pager: &'a Pager,
@@ -611,6 +668,10 @@ pub struct Btree<'a> {
     /// next call re-fetches. Write paths never use the pin.
     pinned_root: Option<PageRef>,
     pinned_epoch: u64,
+    /// Last table leaf visited by this handle (see `StructTableHint`).
+    table_leaf: Option<StructTableHint>,
+    /// Last index leaf visited by this handle (see `StructIndexHint`).
+    index_leaf: Option<StructIndexHint>,
 }
 
 /// Result of inserting into a page: either the insert succeeded, or the
@@ -646,7 +707,82 @@ impl<'a> Btree<'a> {
             is_index,
             pinned_root: None,
             pinned_epoch: 0,
+            table_leaf: None,
+            index_leaf: None,
         }
+    }
+
+    /// Export this handle's advisory state for cross-statement reuse
+    /// (see `BtreeHandleState`). Cheap: clones one Arc + optional hint
+    /// bounds.
+    pub fn export_handle_state(&self) -> BtreeHandleState {
+        BtreeHandleState {
+            root: self.root,
+            is_index: self.is_index,
+            pinned_root: self.pinned_root.clone(),
+            pinned_epoch: self.pinned_epoch,
+            table_leaf: self.table_leaf.clone(),
+            index_leaf: self.index_leaf.clone(),
+        }
+    }
+
+    /// Import advisory state exported by a previous handle for the SAME
+    /// (root, is_index) — a no-op when the roots differ or a write has
+    /// occurred since the state was captured (epoch mismatch).
+    pub fn import_handle_state(&mut self, st: BtreeHandleState) {
+        if st.root != self.root || st.is_index != self.is_index {
+            return;
+        }
+        // Stale-pinned detection is handled lazily by `root_page()`
+        // (epoch compare), so a mismatched epoch simply makes the pin a
+        // miss; hints carry their own epoch checks. Import unconditionally.
+        self.pinned_root = st.pinned_root;
+        self.pinned_epoch = st.pinned_epoch;
+        self.table_leaf = st.table_leaf;
+        self.index_leaf = st.index_leaf;
+    }
+
+    /// Probe the struct-local TABLE leaf hint. ~2 ns; checked before the
+    /// thread-local hint map.
+    #[inline]
+    fn probe_struct_table_hint(&self, rowid: i64, epoch: u64) -> Option<PageRef> {
+        let h = self.table_leaf.as_ref()?;
+        if h.epoch != epoch {
+            return None;
+        }
+        if rowid >= h.lo && rowid <= h.hi {
+            Some(Arc::clone(&h.page))
+        } else {
+            None
+        }
+    }
+
+    /// Probe the struct-local INDEX leaf hint (byte bounds).
+    #[inline]
+    fn probe_struct_index_hint(&self, key: &[u8], epoch: u64) -> Option<PageRef> {
+        let h = self.index_leaf.as_ref()?;
+        if h.epoch != epoch {
+            return None;
+        }
+        if key >= h.lo.as_slice() && key <= h.hi.as_slice() {
+            Some(Arc::clone(&h.page))
+        } else {
+            None
+        }
+    }
+
+    /// Record both the struct-local and thread-local table hints.
+    #[inline]
+    fn record_table_hint(&mut self, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64) {
+        self.table_leaf = Some(StructTableHint { page: Arc::clone(page), lo, hi, epoch });
+        set_table_hint(self.root, page, lo, hi, epoch, probed_rowid);
+    }
+
+    /// Record both the struct-local and thread-local index hints.
+    #[inline]
+    fn record_index_hint(&mut self, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64) {
+        self.index_leaf = Some(StructIndexHint { page: Arc::clone(page), lo: lo.to_vec(), hi: hi.to_vec(), epoch });
+        set_index_hint(self.root, page, lo, hi, epoch);
     }
 
     /// The root page, pinned across seeks when no write has happened since
@@ -708,7 +844,7 @@ impl<'a> Btree<'a> {
                                 .map(|(r, _)| r)
                                 .unwrap_or(i64::MAX);
                             drop(borrowed);
-                            set_table_hint(self.root, &page, lo, hi, epoch);
+                            self.record_table_hint(&page, lo, hi, epoch, lo);
                         }
                         break;
                     }
@@ -802,6 +938,8 @@ impl<'a> Btree<'a> {
             is_index,
             pinned_root: None,
             pinned_epoch: 0,
+            table_leaf: None,
+            index_leaf: None,
         })
     }
 
@@ -860,9 +998,15 @@ impl<'a> Btree<'a> {
         f: impl FnOnce(&[u8]) -> Result<R>,
     ) -> Result<Option<R>> {
         // --- Hint probe --------------------------------------------------
+        // Struct-local FIRST (~2 ns), then the thread-local map (~40 ns):
+        // a hoisted B+tree handle probing scattered rowids misses both, but
+        // the struct probe makes the miss nearly free.
         let epoch = self.pager.write_epoch();
         'hint: {
-            let page_ref = match table_hint_page(self.root, rowid, epoch) {
+            let page_ref = match self
+                .probe_struct_table_hint(rowid, epoch)
+                .or_else(|| table_hint_page(self.root, rowid, epoch))
+            {
                 Some(p) => p,
                 None => break 'hint,
             };
@@ -931,7 +1075,7 @@ impl<'a> Btree<'a> {
                             .ok()
                             .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
                         if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
-                            set_table_hint(self.root, &page, lo, hi, epoch);
+                            self.record_table_hint(&page, lo, hi, epoch, rowid);
                         }
                     }
                     let mut lo = 0usize;
@@ -1060,7 +1204,7 @@ impl<'a> Btree<'a> {
                             .ok()
                             .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
                         if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
-                            set_table_hint(self.root, &page, lo, hi, epoch);
+                            self.record_table_hint(&page, lo, hi, epoch, rowid);
                         }
                     }
                     // Binary search by rowid (cells are stored sorted).
@@ -4132,8 +4276,15 @@ impl<'a> Btree<'a> {
         // from this leaf only if the leaf's LAST cell doesn't itself match
         // the prefix (otherwise duplicates may continue into the right
         // sibling — fall back to the full scan for exactness).
+        // --- Hint probe --------------------------------------------------
+        // Struct-local FIRST (~2 ns), then the thread-local map (~40 ns):
+        // a hoisted B+tree handle probing scattered keys misses both, but
+        // the struct probe makes the miss nearly free.
         let epoch = self.pager.write_epoch();
-        if let Some(page_ref) = index_hint_page(self.root, key, epoch) {
+        let hinted: Option<PageRef> = self
+            .probe_struct_index_hint(key, epoch)
+            .or_else(|| index_hint_page(self.root, key, epoch));
+        if let Some(page_ref) = hinted {
             if let Ok(true) = self.lookup_index_leaf(&page_ref, key, out) {
                 return Ok(());
             }
@@ -4299,7 +4450,7 @@ impl<'a> Btree<'a> {
                             .ok()
                             .and_then(|s| decode_index_cell(s, false)),
                     ) {
-                        set_index_hint(self.root, &page, a.key, b.key, self.pager.write_epoch());
+                        self.record_index_hint(&page, a.key, b.key, self.pager.write_epoch());
                     }
                 }
                 // Iterate the leaf under the SAME lock, borrowing key slices
