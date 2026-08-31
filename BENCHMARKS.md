@@ -7,23 +7,37 @@
 
 > **Note on PostgreSQL:** This report does not include PostgreSQL numbers because PostgreSQL is not installable in this environment without root. See "Methodology notes" at the bottom for what would change in a postgres comparison.
 
-## Executive summary (updated 2026-08-30 — all gaps closed)
+## Executive summary (updated 2026-08-31 — best-of-N methodology, IN-list/join/planner fixes)
+
+**2026-08-31 pass:** benchmark methodology hardened (best-of-N on every
+single-shot measurement, both engines identically — single-shot timings
+fluctuate ±40% on a shared machine); `WHERE id IN (...)` and
+`WHERE indexed_col IN (...)` now use batched multi-seeks (375× on the
+IN-list microbenchmark); equi-join key extraction is side-aware (the
+textual order of `ON a.k = b.k` no longer hides the index); INLJ does
+selective inner decode with value moves; the UPDATE-range merge walk is
+range-bounded with a dense bitset (walks only the leaves covering the
+selection). Run `cargo run --release --example bench_compare`.
 
 | Category          | rustqlite vs SQLite   | Verdict                                                                |
 |-------------------|-----------------------|------------------------------------------------------------------------|
-| Bulk reads (scan) | **1.05–1.6× faster**  | SSO Text + 8 KiB pages; range-1000/5000 and full-scan COUNT all win    |
-| Point lookups (PK)| **1.12× faster**      | rowid B+tree + leaf hints + memoized statement                          |
-| Point lookups (index) | **1.26× faster**  | index-leaf hint fix took the hint hit rate 0.2% → 99.7%                 |
-| Single-row writes (auto-commit) | **2.3× faster** | fast literal INSERT scanner + deferred flush                           |
-| Bulk writes (txn) | **1.5–1.7× faster**   | cached plan + BTREE_APPEND + payload arena                              |
-| JOINs             | **1.15–2.0× faster**  | INLJ fused projection; 8 KiB pages cut the cold-cache cost              |
+| Bulk reads (scan) | **1.3–1.6× faster**   | SSO Text + 8 KiB pages; every range size, full-scan COUNT, aggregates  |
+| Point lookups (PK)| **1.3× faster**       | rowid B+tree + leaf hints + memoized statement                          |
+| Point lookups (index) | **1.33× faster**  | index-leaf hint fix took the hint hit rate 0.2% → 99.7%                 |
+| Single-row writes (auto-commit) | **2.1× faster** | fast literal INSERT scanner + deferred flush                           |
+| Bulk writes (txn) | **1.5–1.6× faster**   | cached plan + BTREE_APPEND + payload arena                              |
+| Bulk JOINs        | **1.45× faster**      | join+GROUP BY 1.99 vs 2.88 ms (INLJ + fused projection)                 |
+| Small filtered joins | 0.6× (2-tbl) / 0.7× (3-tbl) | per-row B+tree seeks are at parity; SQLite streams rows (rusqlite iterator) while our API materializes them — the eager Vec is the delta |
 | Concurrent reads  | **8.3× faster**       | per-page locks vs a serialized connection mutex (criterion, 8 threads)  |
-| Mixed R/W         | **1.15× faster**      | readers don't block on writer                                           |
-| UPDATE range      | **1.07× faster**      | compiled WHERE predicate (isolated steady-state was 1.65× slower)      |
+| Mixed R/W         | **1.2× faster**       | readers don't block on writer                                           |
+| UPDATE by PK      | **1.24× faster**      | streaming update + compiled SET predicates                              |
+| UPDATE range      | parity (0.98×)        | 1.18 vs 1.14 ms in-bench; isolated steady state is 1.4× FASTER (0.82 vs 1.17 ms) |
+| DELETE by PK      | **2.27× faster**      | streaming delete                                                        |
+| GROUP BY (100 buckets) | parity (1.02×)    | 1.87 vs 1.83 ms — within run-to-run variance                            |
 | Range COUNT       | **2.2× faster**       | zero-decode cell counting via Btree::count_rows_range                  |
-| DB file size      | **0.95× smaller**     | 4 KiB pages via `PRAGMA page_size` (fill is 99.0% at any size)         |
-| Binary size       | parity                | 2.05 MB vs 2.01 MB (50 KiB of that is mimalloc, which buys 20-40% alloc throughput) |
-| Peak RSS          | **0.91×**             | 28.4 vs 31.1 MB                                                         |
+| DB file size      | 1.03× larger          | 8 KiB default pages: last-page rounding per tree (fill is 99.7% at any page size; `PRAGMA page_size = 4096` matches SQLite's file size) |
+| Binary size       | parity                | 2.06 MB vs 2.11 MB                                                     |
+| Peak RSS          | **0.92×**             | 30.4 vs 33.1 MB                                                        |
 | WAL commits       | **1.13× faster**      | 25.3 vs 28.5 µs/txn (delete journal mode: 6.2× faster)                  |
 
 **Bottom line (2026-08-30):** every criterion in `bench_compare` is now at
