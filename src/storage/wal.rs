@@ -166,15 +166,12 @@ fn rand_u32() -> u32 {
 /// The WAL file.
 pub struct Wal {
     file: File,
-    path: PathBuf,
     pub header: WalHeader,
     page_size: u32,
     /// Running checksum state.
     checksum: (u32, u32),
     /// Number of frames written since the last checkpoint.
     n_frames: u32,
-    /// True if we need to recreate the WAL on next write (after checkpoint).
-    reset_pending: bool,
 }
 
 impl Wal {
@@ -189,12 +186,10 @@ impl Wal {
 
         let mut wal = Self {
             file,
-            path,
             header: WalHeader::new(page_size),
             page_size,
             checksum: (0, 0),
             n_frames: 0,
-            reset_pending: false,
         };
 
         wal.recover()?;

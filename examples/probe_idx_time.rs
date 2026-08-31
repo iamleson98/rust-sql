@@ -84,7 +84,7 @@ fn main() {
     println!("raw table lookup: {:?}/op (found={})", dt.as_nanos() / (n as u128), found_t);
 
     // Full SQL path for comparison.
-    let mut db2 = rustqlite::Database::open(path).unwrap();
+    let db2 = rustqlite::Database::open(path).unwrap();
     let sql = "SELECT id, name, score FROM t WHERE val = ?";
     let _ = db2.query(sql, [Value::Integer(2)]).unwrap();
     let start = Instant::now();

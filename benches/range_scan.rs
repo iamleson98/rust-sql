@@ -37,7 +37,7 @@ fn bench_rusqlite_range_scan(c: &mut Criterion) {
 }
 
 fn bench_rustqlite_range_scan(c: &mut Criterion) {
-    let mut db = setup_rustqlite(10000);
+    let db = setup_rustqlite(10000);
     c.bench_function("rustqlite_range_scan", |b| {
         b.iter(|| {
             let _rows = db.query(

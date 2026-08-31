@@ -31,21 +31,17 @@
 //! because they take only a read lock on the cache.
 
 use crate::error::{Error, Result};
-use crate::storage::page::{
-    FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAGE_SIZE, FIRST_PAGE_ID,
-};
+use crate::storage::page::{FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAGE_SIZE};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
+// Seek/Read/Write are only needed by the non-unix fallback I/O helpers
+// below; the unix path uses positioned I/O (read_at/write_all_at).
+#[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-
-// On Unix, use positioned I/O (pread/pwrite) so multiple threads can read
-// and write the file concurrently without serializing on the file offset.
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 
 /// A shared mutable reference to a page.
 ///

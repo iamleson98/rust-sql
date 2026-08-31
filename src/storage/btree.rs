@@ -459,7 +459,6 @@ fn decode_rowid_only(buf: &[u8]) -> Option<(i64, usize)> {
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;
-use crate::storage::page::Page;
 use crate::storage::pager::{PageRef, PageIdHashBuild};
 
 /// Software-prefetch the page header + cell-pointer array (first 1 KiB).
@@ -2111,7 +2110,7 @@ impl<'a> Btree<'a> {
 
                     // Read all cells + the right_most pointer.
                     let mut cells: Vec<Cell> = Vec::new();
-                    let mut right_most = 0u32;
+                    let mut right_most;
                     let mut found_idx: Option<usize> = None;
                     {
                         let p = self.pager.get_page(page_id)?;
@@ -3262,18 +3261,17 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let (sep, child) = if pt == PageType::InteriorIndex {
+                        // Only the separator key is needed for the binary
+                        // search; the child pointer is re-decoded once the
+                        // position is found below, so skip it here.
+                        let sep = if pt == PageType::InteriorIndex {
                             match decode_index_cell(&borrowed.data[cell_ptr..], true) {
-                                Some(v) => (v.rowid, v.left_child),
+                                Some(v) => v.rowid,
                                 None => return Err(Error::corruption("truncated index interior cell")),
                             }
                         } else {
                             match decode_table_interior_key(&borrowed.data[cell_ptr..]) {
-                                Some(k) => {
-                                    let ch = decode_table_interior_child(&borrowed.data[cell_ptr..])
-                                        .unwrap_or(0);
-                                    (k, ch)
-                                }
+                                Some(k) => k,
                                 None => return Err(Error::corruption("truncated interior cell")),
                             }
                         };
@@ -3309,10 +3307,6 @@ impl<'a> Btree<'a> {
                 }
                 Ok(deleted)
             }
-            _ => Err(Error::corruption(format!(
-                "unexpected page type in delete: {:?}",
-                pt
-            ))),
         }
     }
 

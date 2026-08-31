@@ -1,5 +1,4 @@
 //! Probe: page fill factor + file size breakdown vs SQLite for the same data.
-use std::time::Instant;
 
 fn main() {
     let path = "/tmp/fillprobe_rust.db";

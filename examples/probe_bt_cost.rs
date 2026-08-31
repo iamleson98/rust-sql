@@ -1,7 +1,6 @@
 //! Isolate B-tree lookup costs from API plumbing, with the real
 //! benchmark shape (10k rows, index on val, rotating probe pattern).
 use rustqlite::storage::btree::Btree;
-use rustqlite::storage::pager::Pager;
 use rustqlite::types::Value;
 use rustqlite::Database;
 use std::time::Instant;
@@ -76,7 +75,7 @@ fn main() {
         println!("index lookup rotate-1.3k:  {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
         // single val (100% hint hit, same binary search position)
         let t = Instant::now();
-        for i in 0..n {
+        for _i in 0..n {
             key.clear();
             Value::Integer(6666).encode_order_key_into(&mut key);
             ibt.lookup_index_into(&key, &mut out).unwrap();
@@ -87,7 +86,7 @@ fn main() {
     // (2) table lookups only — rotate rowids 1..10000.
     {
         let mut tbt = Btree::new(pager, t_root, false);
-        let mut cnt = 0usize;
+        let _cnt = 0usize;
         let _ = tbt.lookup_table_with(1, |_p| Ok::<_, rustqlite::Error>(0));
         let t = Instant::now();
         for i in 0..n {

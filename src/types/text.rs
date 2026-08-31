@@ -185,8 +185,7 @@ impl Text {
     /// Borrow the raw bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: delegates to as_str's guarantees.
-        unsafe { self.as_str().as_bytes() }
+        self.as_str().as_bytes()
     }
 
     /// Consume and convert to a heap `String`. Short strings allocate

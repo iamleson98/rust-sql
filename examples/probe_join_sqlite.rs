@@ -90,7 +90,7 @@ fn main() {
     // cold DATA: user 500 (never touched since setup)
     let start = Instant::now();
     let cnt = {
-        let mut rows = db.query(SQL, [Value::Integer(500)]).unwrap();
+        let rows = db.query(SQL, [Value::Integer(500)]).unwrap();
         rows.len()
     };
     println!("rustqlite single (id=500 cold): {:>7.1} us ({} rows)", us(start.elapsed()), cnt);

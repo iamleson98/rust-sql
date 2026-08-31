@@ -4,7 +4,7 @@
 //! walks the tree, pulling rows from children in a Volcano-style iterator
 //! model.
 
-use crate::sql::ast::{Expr, OrderTerm};
+use crate::sql::ast::{Expr, JoinType, OrderTerm};
 use std::sync::Arc;
 
 use crate::schema::{Index, Table};
@@ -159,15 +159,6 @@ pub enum Plan {
         source: Box<Plan>,
         returning: Option<Vec<crate::sql::ast::ResultColumn>>,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JoinType {
-    Inner,
-    Left,
-    Right,
-    Full,
-    Cross,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

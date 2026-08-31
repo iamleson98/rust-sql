@@ -355,12 +355,12 @@ pub struct JsonPath {
 /// Returns None on malformed paths.
 pub fn parse_path(p: &str) -> Option<JsonPath> {
     let b = p.as_bytes();
-    let mut i = 0usize;
     let mut segs = Vec::new();
     if b.first() != Some(&b'$') {
         return None;
     }
-    i = 1;
+    // Position 0 is the '$' root marker; the path body starts after it.
+    let mut i = 1usize;
     while i < b.len() {
         match b[i] {
             b'.' => {

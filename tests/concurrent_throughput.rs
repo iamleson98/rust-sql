@@ -59,7 +59,7 @@ fn pure_read_concurrency_16_threads() {
         let total = Arc::clone(&total_queries);
         handles.push(thread::spawn(move || {
             for i in 0..queries_per_thread {
-                let id = ((i % n_rows as usize) as i64);
+                let id = (i % n_rows as usize) as i64;
                 // READ lock — concurrent readers.
                 let guard = db.read();
                 let rows = guard

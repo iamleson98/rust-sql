@@ -728,7 +728,7 @@ pub fn int_to_fk_action(i: i64) -> ForeignKeyAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::Parser;
+    
 
     fn parse_table(sql: &str) -> (String, Vec<ColumnDef>, Vec<TableConstraint>, bool, bool) {
         let stmt = crate::sql::parse(sql).unwrap();

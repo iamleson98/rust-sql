@@ -149,13 +149,6 @@ mod corr {
         FrameGuard
     }
 
-    /// True when a statement bridge is installed (correlated subqueries
-    /// are executable from the evaluator).
-    #[inline]
-    pub(crate) fn active() -> bool {
-        CORR.with(|c| c.borrow().depth > 0)
-    }
-
     /// Resolve a column against the outer-scope stack, innermost first.
     /// Mirrors `EvalContext::lookup_in_main`'s matching rules per frame:
     /// exact (case-insensitive) name, then suffix ("u.id" matches "id").
@@ -338,7 +331,7 @@ use crate::sql::ast::*;
 use crate::storage::btree::{Btree, LookupResult};
 use crate::storage::page::PageId;
 use crate::storage::pager::Pager;
-use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row, encode_row_aliased, encode_row_aliased_into, encode_row_into};
+use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row_aliased, encode_row_aliased_into};
 use crate::types::{Row, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -1008,7 +1001,6 @@ fn fk_find_child_rows(
     ctx: &ExecContext<'_>,
     child_table: &Table,
     fk: &crate::schema::ForeignKeyClause,
-    parent_table: &Table,
     parent_col_idxs: &[usize],
     old_row: &[Value],
     parent_rowid: i64,
@@ -1108,7 +1100,7 @@ fn enforce_parent_delete_fks(
             // when those columns are part of the parent key set — otherwise
             // (FK on a non-key column) it's still a reference we must check.
             let children = fk_find_child_rows(
-                ctx, &child, fk, parent, &parent_cols, old_row, parent_rowid,
+                ctx, &child, fk, &parent_cols, old_row, parent_rowid,
             )?;
             if children.is_empty() {
                 continue;
@@ -1226,7 +1218,7 @@ fn returning_column_names(
                 if let Some(a) = alias {
                     out.push(a.clone());
                 } else {
-                    out.push(expr_display_name(expr, col_names));
+                    out.push(expr_display_name(expr));
                 }
             }
         }
@@ -2301,7 +2293,7 @@ fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContex
         let display = if let Some(a) = &c.alias {
             a.clone()
         } else {
-            expr_display_name(&c.expr, &inner.columns)
+            expr_display_name(&c.expr)
         };
         out_columns.push(display);
         star_expansions.push(Vec::new());
@@ -2431,9 +2423,10 @@ fn resolve_column_index(
 }
 
 /// Pretty-print an expression for column header display.
-/// For aggregate references (rewritten to `__agg_N`), we look up the
-/// original column name from the input's column list.
-fn expr_display_name(e: &Expr, input_cols: &[String]) -> String {
+/// For aggregate references (rewritten to `__agg_N`) the original function
+/// name is not recoverable at this point — the Project's caller should
+/// supply an alias.
+fn expr_display_name(e: &Expr) -> String {
     match e {
         Expr::Column { table: _, name } => {
             if name.starts_with("__agg_") {
@@ -3424,7 +3417,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                     None
                 }
             }
-            Plan::Filter { input: inner, predicate } => {
+            Plan::Filter { input: inner, .. } => {
                 // The planner sometimes wraps IndexRange in a Filter with
                 // the range predicate as residual; only cover when the
                 // filter is exactly the index range (residual == predicate).
@@ -3445,7 +3438,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
             }
             _ => None,
         };
-        if let Some((table, index, start, end)) = covering {
+        if let Some((_table, index, start, end)) = covering {
             // Evaluate the bounds (same logic as exec_index_range).
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
@@ -3737,7 +3730,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
                 });
             }
 
-            let mut row_num = 0i64;
+            let mut row_num;
             let mut rank = 0i64;
             let mut dense_rank = 0i64;
             let mut prev_key: Option<Vec<Value>> = None;
@@ -3812,7 +3805,7 @@ fn compute_window_value(
 // Join (nested-loop)
 // ============================================================================
 
-fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: crate::planner::plan::JoinType, condition: &Option<Expr>) -> Result<ExecResult> {
+fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: crate::sql::ast::JoinType, condition: &Option<Expr>) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
     let mut combined_cols: Vec<String> = left_res.columns.to_vec();
@@ -3842,7 +3835,7 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
                 right_matched[ri] = true;
             }
         }
-        if !matched && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
+        if !matched && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
             let mut combined = left_row.clone();
             combined.extend(vec![Value::Null; n_right]);
             out_rows.push(combined);
@@ -3850,7 +3843,7 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
     }
 
     // RIGHT and FULL: emit unmatched right rows with NULL left.
-    if matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
+    if matches!(join_type, crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full) {
         for (ri, right_row) in right_res.rows.iter().enumerate() {
             if !right_matched[ri] {
                 let mut combined = vec![Value::Null; n_left];
@@ -3902,7 +3895,7 @@ fn exec_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
     right: &Plan,
-    join_type: crate::planner::plan::JoinType,
+    join_type: crate::sql::ast::JoinType,
     condition: &Option<Expr>,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
 ) -> Result<ExecResult> {
@@ -3959,7 +3952,7 @@ fn exec_hash_join(
                             indices.push(i);
                             names.push(match &c.alias {
                                 Some(a) => a.clone(),
-                                None => expr_display_name(&c.expr, &combined_cols),
+                                None => expr_display_name(&c.expr),
                             });
                         }
                         None => {
@@ -3983,7 +3976,7 @@ fn exec_hash_join(
     // joins we must preserve the side that's preserved by the join type, so
     // we fall back to the (correct-but-slower) right-side-build path. This
     // is the common case (real OLTP joins are overwhelmingly inner).
-    let is_inner = matches!(join_type, crate::planner::plan::JoinType::Inner | crate::planner::plan::JoinType::Cross);
+    let is_inner = matches!(join_type, crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross);
     let left_is_smaller = left_res.rows.len() <= right_res.rows.len();
     let build_left = is_inner && left_is_smaller;
 
@@ -4215,7 +4208,7 @@ fn exec_hash_join(
         // If probe is left and the join preserves left (LEFT/FULL), emit [probe, NULLs].
         // If probe is right and the join preserves right (RIGHT/FULL), emit [NULLs, probe].
         if !matched {
-            if probe_is_left && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
+            if probe_is_left && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
                 match proj_indices {
                     Some(idxs) => {
                         let mut out = Vec::with_capacity(idxs.len());
@@ -4237,7 +4230,7 @@ fn exec_hash_join(
                         out_rows.push(c);
                     }
                 }
-            } else if !probe_is_left && matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
+            } else if !probe_is_left && matches!(join_type, crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full) {
                 match proj_indices {
                     Some(idxs) => {
                         let mut out = Vec::with_capacity(idxs.len());
@@ -4267,7 +4260,7 @@ fn exec_hash_join(
     // Emit unmatched build-side rows for the outer-join case where the build
     // side is the preserved side (LEFT preserved by LEFT/FULL if build was left;
     // RIGHT preserved by RIGHT/FULL if build was right).
-    if build_left && matches!(join_type, crate::planner::plan::JoinType::Left | crate::planner::plan::JoinType::Full) {
+    if build_left && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
         for (bi, build_row) in build_rows.iter().enumerate() {
             if !build_matched[bi] {
                 match proj_indices {
@@ -4293,7 +4286,7 @@ fn exec_hash_join(
                 }
             }
         }
-    } else if !build_left && matches!(join_type, crate::planner::plan::JoinType::Right | crate::planner::plan::JoinType::Full) {
+    } else if !build_left && matches!(join_type, crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full) {
         for (bi, build_row) in build_rows.iter().enumerate() {
             if !build_matched[bi] {
                 match proj_indices {
@@ -4516,7 +4509,7 @@ fn exec_index_nested_loop_join(
                             indices.push(i);
                             names.push(match &c.alias {
                                 Some(a) => a.clone(),
-                                None => expr_display_name(&c.expr, &combined_cols),
+                                None => expr_display_name(&c.expr),
                             });
                         }
                         None => {
@@ -6343,11 +6336,13 @@ fn try_streaming_update(
     // The source table must match the UPDATE's target table (otherwise
     // we'd be updating rows from a different table, which isn't what
     // this fast path is for).
-    let src_table = match &src {
-        StreamingSource::Scan { table: t, .. } => t.clone(),
-        StreamingSource::RowidRange { table: t, .. } => t.clone(),
-        StreamingSource::RowidLookup { table: t, .. } => t.clone(),
-        StreamingSource::IndexRange { table: t, .. } => t.clone(),
+    // `*t` copies the `&Arc<Table>` field out of the match-ergonomics
+    // double reference (`.clone()` on a `&&Arc` only clones the reference).
+    let src_table: &Arc<Table> = match &src {
+        StreamingSource::Scan { table: t, .. } => *t,
+        StreamingSource::RowidRange { table: t, .. } => *t,
+        StreamingSource::RowidLookup { table: t, .. } => *t,
+        StreamingSource::IndexRange { table: t, .. } => *t,
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
         return Ok(None);

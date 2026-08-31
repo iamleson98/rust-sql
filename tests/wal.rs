@@ -34,7 +34,7 @@ fn wal_basic_commit_and_read() {
     drop(db);
 
     // Clean close checkpointed the WAL; reopen sees everything, no -wal.
-    let mut db = Database::open(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     assert_eq!(db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(), "delete");
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 3);
@@ -116,7 +116,7 @@ fn wal_checkpoint_persists_to_main_file() {
     // After the checkpoint, a reopen (WAL deleted on clean drop) reads the
     // main file alone.
     drop(db);
-    let mut db2 = Database::open(&path).unwrap();
+    let db2 = Database::open(&path).unwrap();
     let rows = db2.query("SELECT COUNT(*), SUM(v) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 200);
     let expected: i64 = (1..=200).map(|i| i * 3).sum();
@@ -148,7 +148,7 @@ fn wal_rollback_discards_uncommitted() {
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 2);
     drop(db);
-    let mut db2 = Database::open(&path).unwrap();
+    let db2 = Database::open(&path).unwrap();
     let rows = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 2);
     cleanup(&path);
@@ -178,7 +178,7 @@ fn wal_auto_checkpoint_under_churn() {
     assert_eq!(rows[0][0].as_text(), "b79r40");
     drop(db);
 
-    let mut db2 = Database::open(&path).unwrap();
+    let db2 = Database::open(&path).unwrap();
     let rows = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 80 * 40);
     cleanup(&path);
@@ -200,7 +200,7 @@ fn wal_synchronous_normal_and_level_reads() {
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 50);
     drop(db);
-    let mut db2 = Database::open(&path).unwrap();
+    let db2 = Database::open(&path).unwrap();
     let rows = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 50);
     cleanup(&path);
@@ -257,7 +257,7 @@ fn wal_indexes_and_dml_roundtrip() {
     assert_eq!(rows[0][0].as_integer(), 270);
 
     std::mem::forget(db);
-    let mut db2 = Database::open(&path).unwrap();
+    let db2 = Database::open(&path).unwrap();
     let rows = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 270);
     let rows = db2.query("SELECT COUNT(*) FROM t WHERE k = 3", []).unwrap();

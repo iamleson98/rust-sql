@@ -85,13 +85,12 @@ enum Record {
     Query { types: Vec<char>, sort: SortMode, sql: String, expected: Vec<Vec<String>> },
     HashThreshold(usize),
     Halt,
-    Skip,
 }
 
 /// Parse a `.test` file into a list of records.
 fn parse_test_file(content: &str) -> Vec<Record> {
     let mut records = Vec::new();
-    let mut lines: Vec<&str> = content.lines().collect();
+    let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
     let mut skip_next = false;
     while i < lines.len() {
@@ -328,7 +327,6 @@ fn run_record(db: &mut Database, rec: &Record, hash_threshold: usize) -> Result<
     match rec {
         Record::HashThreshold(_) => Ok(()), // handled at runner level
         Record::Halt => Ok(()),
-        Record::Skip => Ok(()),
         Record::Statement { expect_error, sql } => {
             let result = db.execute(sql, []);
             match (result, expect_error) {

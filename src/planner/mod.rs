@@ -431,13 +431,8 @@ impl<'a> Planner<'a> {
                     JoinConstraint::Natural => None,
                     JoinConstraint::None => None,
                 };
-                let jt = match join_type {
-                    crate::sql::ast::JoinType::Inner => plan::JoinType::Inner,
-                    crate::sql::ast::JoinType::Left => plan::JoinType::Left,
-                    crate::sql::ast::JoinType::Right => plan::JoinType::Right,
-                    crate::sql::ast::JoinType::Full => plan::JoinType::Full,
-                    crate::sql::ast::JoinType::Cross => plan::JoinType::Cross,
-                };
+                // JoinType is shared with the AST — no conversion needed.
+                let jt = *join_type;
                 let algo = if matches!(constraint, JoinConstraint::Natural | JoinConstraint::Using(_)) {
                     JoinAlgorithm::Hash
                 } else if let Some(Expr::Binary { op: BinaryOp::Eq, .. }) = &condition {
@@ -1622,7 +1617,7 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             // rows from the preserved side, which forbids index-only access
             // to the inner side (the join needs to emit NULL-extended rows
             // when no match exists, which requires materializing the outer).
-            let is_inner = matches!(join_type, plan::JoinType::Inner | plan::JoinType::Cross);
+            let is_inner = matches!(join_type, JoinType::Inner | JoinType::Cross);
             let is_hash = matches!(algorithm, plan::JoinAlgorithm::Hash);
             if !is_inner || !is_hash {
                 return Plan::Join { left, right, join_type, condition, algorithm };

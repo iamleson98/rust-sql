@@ -10,7 +10,7 @@
 //!
 //! Output is printed to stdout with a final summary table.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use rusqlite::params;
 use rustqlite::{Database, Value};
 use std::sync::Arc;

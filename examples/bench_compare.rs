@@ -557,7 +557,7 @@ fn rustqlite_update_range(db: &mut rustqlite::Database) -> Duration {
     start.elapsed()
 }
 
-fn rustqlite_delete_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
+fn rustqlite_delete_by_pk(_db: &mut rustqlite::Database, n: usize) -> Duration {
     // Use a fresh in-memory database to avoid page reuse issues.
     let mut del_db = rustqlite::Database::open_in_memory().unwrap();
     del_db.execute("CREATE TABLE t_del (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();

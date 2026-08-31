@@ -37,7 +37,7 @@ fn main() {
 
     // Decay pattern: warm once, then time 8 consecutive new-param queries.
     {
-        let mut db = setup();
+        let db = setup();
         let _ = db.query(sql, [Value::Integer(1)]).unwrap();
         for k in [300u64, 301, 302, 303, 400, 401, 700, 701] {
             let start = Instant::now();
@@ -48,7 +48,7 @@ fn main() {
 
     // Case 1: bench pattern — exactly one warmup (param 1), then time param 500.
     {
-        let mut db = setup();
+        let db = setup();
         let _ = db.query(sql, [Value::Integer(1)]).unwrap();
         let start = Instant::now();
         let _ = db.query(sql, [Value::Integer(500)]).unwrap();
@@ -56,7 +56,7 @@ fn main() {
     }
     // Case 2: warmup with SAME param, then time.
     {
-        let mut db = setup();
+        let db = setup();
         let _ = db.query(sql, [Value::Integer(500)]).unwrap();
         let m0 = db.pager().cache_misses();
         let start = Instant::now();
@@ -65,7 +65,7 @@ fn main() {
     }
     // Case 1b: how many misses does the new-param query pay?
     {
-        let mut db = setup();
+        let db = setup();
         let _ = db.query(sql, [Value::Integer(1)]).unwrap();
         let m0 = db.pager().cache_misses();
         let start = Instant::now();
@@ -74,7 +74,7 @@ fn main() {
     }
     // Case 3: steady state (500 iterations of param 500).
     {
-        let mut db = setup();
+        let db = setup();
         for _ in 0..20 {
             let _ = db.query(sql, [Value::Integer(500)]).unwrap();
         }
@@ -87,7 +87,7 @@ fn main() {
     // Case 4: interleaved single shots, params cycling 100..600 — simulates
     // the bench's single-shot measurement across different users.
     {
-        let mut db = setup();
+        let db = setup();
         let _ = db.query(sql, [Value::Integer(1)]).unwrap();
         for k in 100..601i64 {
             let start = Instant::now();

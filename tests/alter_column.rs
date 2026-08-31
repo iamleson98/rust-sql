@@ -43,7 +43,7 @@ fn rename_column_survives_reopen() {
         db.execute("ALTER TABLE t RENAME COLUMN x TO alpha", []).unwrap();
         db.flush().unwrap();
     }
-    let mut db = Database::open(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     let rows = db.query("SELECT alpha, y FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 10);
     assert_eq!(rows[0][1].as_text(), "ten");
@@ -225,7 +225,7 @@ fn drop_column_survives_reopen() {
         db.execute("ALTER TABLE t DROP COLUMN a", []).unwrap();
         db.flush().unwrap();
     }
-    let mut db = Database::open(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     let rows = db.query("SELECT id, b FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 1);
     assert_eq!(rows[0][1].as_text(), "x");

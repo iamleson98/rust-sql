@@ -23,7 +23,7 @@ fn main() {
     let d_r = start.elapsed();
     // Fixed-overhead: DELETE matching nothing.
     let start = Instant::now();
-    for i in 0..1000 {
+    for _i in 0..1000 {
         db.execute("DELETE FROM t WHERE id = ?", [rustqlite::Value::Integer(-1)]).unwrap();
     }
     println!("rustqlite DELETE no-match 1k: {:?} ({} ns/op)", start.elapsed(), start.elapsed().as_nanos() as f64 / 1000.0);

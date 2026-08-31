@@ -13,7 +13,6 @@ use parking_lot::RwLock;
 use rusqlite::params;
 use rustqlite::{Database, Value};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -78,7 +77,7 @@ impl Result {
     }
 }
 
-fn measure<F: Fn()>(name: &str, f: F, total_ops: usize) -> (f64, f64) {
+fn measure<F: Fn()>(_name: &str, f: F, total_ops: usize) -> (f64, f64) {
     // warm up
     for _ in 0..3 {
         f();

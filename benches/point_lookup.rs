@@ -37,7 +37,7 @@ fn bench_rusqlite_point_lookup(c: &mut Criterion) {
 }
 
 fn bench_rustqlite_point_lookup(c: &mut Criterion) {
-    let mut db = setup_rustqlite(1000);
+    let db = setup_rustqlite(1000);
     c.bench_function("rustqlite_point_lookup", |b| {
         b.iter(|| {
             let _rows = db.query(

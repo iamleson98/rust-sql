@@ -50,7 +50,7 @@ fn main() {
     // Case C: does a pure computational lambda also spike after sleep?
     // (isolates CPU frequency / C-state wake latency)
     let mut acc = 0u64;
-    let mut f = |x: u64| {
+    let f = |x: u64| {
         let mut s = x;
         for _ in 0..200 {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1);

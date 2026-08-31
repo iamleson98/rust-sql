@@ -705,7 +705,6 @@ fn parse_numeric_modifier(z: &str, p: &mut DateTime) -> bool {
             return false;
         }
         // Parse Y-M-D from the numeric part + following text.
-        let full = &z[1..]; // skip sign
         let (y, m, d) = if num_str.len() == 5 {
             // -YYYY from num_str, then -MM-DD from the rest
             match split_ymd(&z[1..], 4) {
@@ -877,10 +876,7 @@ fn apply_hhmm_shift(p: &mut DateTime, hhmm: (i32, i32), negative: bool) {
 /// for 1970..2038 range checks in C `localtime_r`).
 fn to_localtime(p: &mut DateTime) {
     compute_jd(p);
-    let t = p.i_jd / 1000 - 210866760_000 / 1000 * 1000;
-    // t should be unix seconds: iJD/1000 - 21086676*10000
-    let t = p.i_jd / 1000 - 21086676 * 10000;
-    let _ = t;
+    // Unix epoch seconds from the Julian-day milliseconds.
     let unix_secs = p.i_jd / 1000 - 21086676 * 10000;
     if let Some(offset_secs) = tz_offset_for_unix(unix_secs) {
         let mut shifted = p.clone();
@@ -1024,7 +1020,7 @@ fn parse_tzif(data: &[u8]) -> Option<TzTransition> {
     let mut offsets = Vec::new();
     let mut isdst = Vec::new();
 
-    let mut pos = parse_tzif_block(data, 20, 4, &mut times, &mut idx, &mut offsets, &mut isdst)?;
+    let pos = parse_tzif_block(data, 20, 4, &mut times, &mut idx, &mut offsets, &mut isdst)?;
     if version >= b'2' {
         // Skip the v1 block, parse the 64-bit block.
         times.clear();
@@ -1036,8 +1032,7 @@ fn parse_tzif(data: &[u8]) -> Option<TzTransition> {
         if data.len() < hdr2 + 44 || &data[hdr2..hdr2 + 4] != b"TZif" {
             return None;
         }
-        pos = parse_tzif_block(data, hdr2 + 20, 8, &mut times, &mut idx, &mut offsets, &mut isdst)?;
-        let _ = 0usize;
+        parse_tzif_block(data, hdr2 + 20, 8, &mut times, &mut idx, &mut offsets, &mut isdst)?;
     }
     Some(TzTransition { times, idx, offsets, isdst })
 }
@@ -1072,7 +1067,9 @@ fn parse_tzif_block(
         if pos + time_size > data.len() {
             return None;
         }
-        let mut v: i64 = if time_size == 4 {
+        // A 4-byte transition time is a signed 32-bit value (the i32 cast
+        // sign-extends); 8-byte values are read directly as i64.
+        let v: i64 = if time_size == 4 {
             i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as i64
         } else {
             i64::from_be_bytes([
@@ -1086,10 +1083,6 @@ fn parse_tzif_block(
                 data[pos + 7],
             ])
         };
-        if time_size == 4 {
-            // sign-extend already done via i32 cast
-        }
-        v = v; // silence unused when time_size==8 path reassigns
         times.push(v);
         pos += time_size;
     }
@@ -1271,7 +1264,6 @@ pub fn timediff_func(args: &[Value]) -> Option<Value> {
     }
     let a = is_date(&args[..1])?;
     let b = is_date(&args[1..2])?;
-    let mut x = DateTime::default();
     // Compute A - B in ms, then break into Y/M/D HH:MM:SS.SSS using
     // SQLite's algorithm (see timediffFunc in date.c).
     let diff_ms = a.i_jd - b.i_jd;
@@ -1282,9 +1274,8 @@ pub fn timediff_func(args: &[Value]) -> Option<Value> {
     ms -= days * 86400000;
     let secs_of_day = ms / 1000;
     let ms_frac = ms % 1000;
-    // Convert days into Y/M/D with month arithmetic.
-    x.i_jd = 0; // 2000-01-01 12:00? No — compute from epoch -4713-11-24 12:00
-    // Simply: start at julian day 0 (i.e. -4713-11-24 12:00) and add `days`.
+    // Convert days into Y/M/D with month arithmetic: start at julian day 0
+    // (i.e. -4713-11-24 12:00) and add `days`.
     let mut dt = DateTime::default();
     dt.i_jd = days * 86400000;
     dt.valid_jd = true;
@@ -1297,8 +1288,6 @@ pub fn timediff_func(args: &[Value]) -> Option<Value> {
         m += 12;
         y -= 1;
     }
-    // Normalize overflow the same way SQLite does (ceil by default).
-    compute_floor(&mut dt);
     let h = secs_of_day / 3600;
     let min = (secs_of_day % 3600) / 60;
     let s = secs_of_day % 60;

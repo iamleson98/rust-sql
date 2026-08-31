@@ -18,7 +18,7 @@ use crate::planner::Planner;
 use crate::schema::{build_table, Catalog, Index, Table};
 use crate::sql::ast::*;
 use crate::sql::parse;
-use crate::storage::btree::{Btree, LookupResult};
+use crate::storage::btree::Btree;
 use crate::storage::pager::Pager;
 use crate::storage::row_codec::{decode_row, decode_row_selective, encode_row, encode_row_aliased};
 use crate::types::{Row, Value};
@@ -259,8 +259,9 @@ impl std::hash::BuildHasher for FxHashBuild {
     }
 }
 
-/// Statement-cache map type with the fast string hasher.
-pub type StmtCacheMap = HashMap<String, Arc<CachedStmt>, FxHashBuild>;
+/// Statement-cache map type with the fast string hasher. Private: only
+/// `Database`'s internal `stmt_cache` field uses it.
+type StmtCacheMap = HashMap<String, Arc<CachedStmt>, FxHashBuild>;
 
 /// Fast non-cryptographic hash (FxHash-style, as used by rustc) for the
 /// statement "seen" filter. ~5 ns for a typical 60-byte statement; used
@@ -1218,7 +1219,7 @@ fn rewrite_object_sql_column_refs(
     // Refresh catalog entries (re-parse from the new SQL).
     for (rowid, row) in &schema_updates {
         let _ = rowid;
-        if let Some((kind, _name, _tbl, _root, sql)) = crate::schema::decode_schema_row(row) {
+        if let Some((_kind, _name, _tbl, _root, sql)) = crate::schema::decode_schema_row(row) {
             if let Ok(stmt) = crate::sql::parser::parse(&sql) {
                 match stmt {
                     crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::View {
@@ -3631,6 +3632,9 @@ impl Database {
                     .get_table(&a.table)
                     .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
                 // LIVE root (catalog Arc may lag a split).
+                // LIVE root (catalog Arc may lag a split): use the
+                // override-aware root for both the rebuilt table entry and
+                // the rewritten schema row.
                 let root = ctx.table_root(&table);
                 let old_name_lc = old.to_ascii_lowercase();
                 // Resolve the column (case-insensitive).
@@ -3653,7 +3657,6 @@ impl Database {
                 {
                     return Err(Error::semantic(format!("invalid column name: {}", new)));
                 }
-                let root = table.root_page;
                 let old_name = table.columns[col_idx].name.clone();
                 let table_name = table.name.clone();
 
@@ -4133,7 +4136,7 @@ fn expr_to_sql(e: &Expr) -> String {
         E::Unary { op, expr } => {
             use crate::sql::ast::UnaryOp::*;
             let sym = match op {
-                Neg => "-", Not => "NOT ", BitNot => "~", Plus => "+",
+                Neg => "-", Pos => "+", Not => "NOT ", BitNot => "~",
             };
             format!("{}{}", sym, expr_to_sql(expr))
         }
@@ -4829,7 +4832,9 @@ impl Params for Vec<Value> {
 impl<const N: usize> Params for [Value; N] {
     type Iter = std::array::IntoIter<Value, N>;
     fn into_iter(self) -> Self::Iter {
-        std::array::IntoIter::new(self)
+        // Explicit IntoIterator call: a bare `self.into_iter()` here would
+        // resolve to this very method (infinite recursion).
+        IntoIterator::into_iter(self)
     }
     fn as_slice(&self) -> Option<&[Value]> {
         Some(self.as_slice())
@@ -4924,7 +4929,7 @@ mod tests {
             db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
             db.execute("INSERT INTO t (name) VALUES ('Alice')", []).unwrap();
         }
-        let mut db = Database::open(tmp.path()).unwrap();
+        let db = Database::open(tmp.path()).unwrap();
         let rows = db.query("SELECT name FROM t", []).unwrap();
         assert_eq!(rows[0][0], Value::Text("Alice".into()));
     }
@@ -5121,7 +5126,7 @@ mod tests {
 
     #[test]
     fn datetime_functions_end_to_end() {
-        let mut db = memdb();
+        let db = memdb();
         let rows = db.query("SELECT date('2023-07-14'), datetime('2023-07-14 13:45:28'), time('23:59:59')", []).unwrap();
         assert_eq!(rows[0][0], Value::Text("2023-07-14".into()));
         assert_eq!(rows[0][1], Value::Text("2023-07-14 13:45:28".into()));

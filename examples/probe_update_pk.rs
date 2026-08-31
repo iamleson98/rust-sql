@@ -24,7 +24,7 @@ fn main() {
 
     // no-match fixed cost
     let start = Instant::now();
-    for i in 0..1000 {
+    for _i in 0..1000 {
         db.execute("UPDATE t SET score = ? WHERE id = ?", [rustqlite::Value::Real(0.0), rustqlite::Value::Integer(-1)]).unwrap();
     }
     println!("rustqlite UPDATE no-match 1k: {:?} ({} ns/op)", start.elapsed(), start.elapsed().as_nanos() as f64 / 1000.0);

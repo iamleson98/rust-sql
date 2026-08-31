@@ -55,7 +55,7 @@ fn values_equal(a: &rustqlite::Value, b: &rusqlite::types::Value) -> bool {
 /// Run a single case against both engines and assert equality.
 fn run_case(case: &Case) {
     // ---- SQLite (oracle) ----
-    let mut sqlite = rusqlite::Connection::open_in_memory().expect("open sqlite");
+    let sqlite = rusqlite::Connection::open_in_memory().expect("open sqlite");
     let mut oracle_columns: Vec<String> = Vec::new();
     let mut oracle_rows: Vec<Vec<rusqlite::types::Value>> = Vec::new();
     for stmt_sql in case.sql {

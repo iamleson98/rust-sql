@@ -72,7 +72,7 @@ mod concurrency_stress {
         // Readers: query COUNT(*) in a tight loop until the writer is done.
         for _ in 0..n_readers {
             let state = Arc::clone(&state);
-            let errors = Arc::clone(&errors);
+            let _errors = Arc::clone(&errors);
             let reads_done = Arc::clone(&reads_done);
             handles.push(thread::spawn(move || {
                 for _ in 0..50 {
@@ -101,7 +101,7 @@ mod concurrency_stress {
 
         // Final consistency check: the writer inserted n_writes_per_writer
         // rows on top of the 100 we seeded.
-        let mut guard = state.write();
+        let guard = state.write();
         let rows = guard
             .query("SELECT COUNT(*) FROM t", [])
             .expect("count");

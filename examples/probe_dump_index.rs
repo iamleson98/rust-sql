@@ -1,6 +1,5 @@
 use rustqlite::storage::btree::{Btree, Cell};
 use rustqlite::storage::pager::Pager;
-use rustqlite::storage::page::PageType;
 
 fn main() {
     // probe_idx_sql3.db left behind by the previous probe.

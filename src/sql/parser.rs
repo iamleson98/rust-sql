@@ -2263,7 +2263,10 @@ impl Parser {
             }
             Token::Keyword(k) => {
                 // Allow keywords as column names in qualified context.
-                let s = k.clone();
+                // `*k` copies the `&'static str` keyword out of the borrow
+                // from `peek()`, so `advance()` (which needs &mut self)
+                // isn't blocked by the borrow checker.
+                let s: &'static str = k;
                 self.advance();
                 Ok(s.to_ascii_lowercase())
             }

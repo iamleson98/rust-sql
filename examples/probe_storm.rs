@@ -87,7 +87,7 @@ fn main() {
     let n = 2000;
     let start = Instant::now();
     for i in 0..n {
-        let _ = db.query(sql, [Value::Integer(((i % 1000) + 1))]).unwrap();
+        let _ = db.query(sql, [Value::Integer((i % 1000) + 1)]).unwrap();
     }
     println!("steady idx-point:             {:>7.1} ns/op", us(start.elapsed()) / n as f64 * 1000.0);
 

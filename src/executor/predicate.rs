@@ -43,9 +43,9 @@ impl PredValue {
         match self {
             PredValue::Col(i) => {
                 let pos = positions[*i];
-                row.get(pos).unwrap_or(NULL_REF())
+                row.get(pos).unwrap_or(null_ref())
             }
-            PredValue::Param(i) => params.get(*i).unwrap_or(NULL_REF()),
+            PredValue::Param(i) => params.get(*i).unwrap_or(null_ref()),
             PredValue::Literal(v) => v,
         }
     }
@@ -54,7 +54,7 @@ impl PredValue {
 // A shared NULL singleton for the borrow-unfriendly cases above.
 static NULL_VALUE: Value = Value::Null;
 #[inline]
-fn NULL_REF() -> &'static Value {
+fn null_ref() -> &'static Value {
     &NULL_VALUE
 }
 
@@ -158,7 +158,7 @@ impl CompiledPredicate {
                 // SQL three-valued logic, mirroring the general path
                 // exactly: any NULL operand → result NULL → WHERE filters
                 // the row out (true for BETWEEN *and* NOT BETWEEN).
-                let v = row.get(positions[*col]).unwrap_or(NULL_REF());
+                let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let l = lo.eval(row, positions, params);
                 let h = hi.eval(row, positions, params);
                 if matches!(v, Value::Null) || matches!(l, Value::Null) || matches!(h, Value::Null) {
@@ -169,7 +169,7 @@ impl CompiledPredicate {
                 in_range != *negated
             }
             CompiledPredicate::InList { col, vals, negated } => {
-                let v = row.get(positions[*col]).unwrap_or(NULL_REF());
+                let v = row.get(positions[*col]).unwrap_or(null_ref());
                 // SQL IN semantics: NULL never matches; NOT IN with any
                 // NULL member yields NULL (not true). We mirror eval's
                 // behavior conservatively: membership = any equality true;
@@ -196,7 +196,7 @@ impl CompiledPredicate {
                 }
             }
             CompiledPredicate::Like { col, pattern, negated } => {
-                let v = row.get(positions[*col]).unwrap_or(NULL_REF());
+                let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let p = pattern.eval(row, positions, params);
                 let matched = crate::executor::expr::like_match(v, p, None, false);
                 matched != *negated

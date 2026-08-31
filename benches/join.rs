@@ -49,7 +49,7 @@ fn bench_rusqlite_join(c: &mut Criterion) {
 }
 
 fn bench_rustqlite_join(c: &mut Criterion) {
-    let mut db = setup_rustqlite(100);
+    let db = setup_rustqlite(100);
     c.bench_function("rustqlite_join", |b| {
         b.iter(|| {
             let _rows = db.query(
