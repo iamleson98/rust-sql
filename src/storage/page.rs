@@ -130,6 +130,32 @@ impl Page {
         self.data.len() as u32
     }
 
+    /// Bounds-checked cell-content slice. `ptr` is a byte offset read from
+    /// a page's cell-pointer array — and the page may be CORRUPTED (fuzzed
+    /// file, torn write), so the offset may point outside the page. Direct
+    /// `data[ptr..]` slicing panics on that; this returns SQLITE_CORRUPT
+    /// instead. Every read of cell content from a page that was not just
+    /// written by this engine must go through here.
+    pub fn cell_slice_checked(&self, ptr: usize) -> Result<&[u8]> {
+        if ptr >= self.data.len() {
+            return Err(crate::error::Error::corruption(format!(
+                "cell pointer {} out of range for {}-byte page",
+                ptr,
+                self.data.len()
+            )));
+        }
+        Ok(&self.data[ptr..])
+    }
+
+    /// Bounds-checked cell slice by cell INDEX (the common shape:
+    /// `cell_slice(i)` reads cell i's content). Combines the
+    /// cell-pointer-array read with the range check so callers cannot
+    /// forget one of the two.
+    pub fn cell_slice(&self, idx: u16) -> Result<&[u8]> {
+        let ptr = self.cell_pointer(idx) as usize;
+        self.cell_slice_checked(ptr)
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }

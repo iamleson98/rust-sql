@@ -52,14 +52,10 @@ pub mod varint {
                 max = (max << 7) | 0x7F;
             }
             // Emit n bytes, high bits first.
-            for i in 0..n {
+            for (i, slot) in out.iter_mut().enumerate().take(n) {
                 let shift = (n - 1 - i) * 7;
                 let byte = ((v >> shift) & 0x7F) as u8;
-                if i < n - 1 {
-                    out[i] = byte | 0x80;
-                } else {
-                    out[i] = byte;
-                }
+                *slot = if i < n - 1 { byte | 0x80 } else { byte };
             }
             n
         } else {
@@ -67,10 +63,9 @@ pub mod varint {
             // 9th byte holds the low 8 bits.
             let high = v >> 8;
             let low = (v & 0xFF) as u8;
-            for i in 0..8 {
+            for (i, slot) in out.iter_mut().enumerate().take(8) {
                 let shift = (7 - i) * 7;
-                let byte = ((high >> shift) & 0x7F) as u8;
-                out[i] = byte | 0x80;
+                *slot = (((high >> shift) & 0x7F) as u8) | 0x80;
             }
             out[8] = low;
             9
@@ -609,6 +604,13 @@ pub struct Btree<'a> {
     pub pager: &'a Pager,
     pub root: PageId,
     pub is_index: bool,
+    /// Pinned root page for the read path: avoids a page-cache read-lock +
+    /// Arc refcount round-trip on EVERY descent (a 10-row join seeks the
+    /// tree 10 times; each seek re-fetched the root). Validated against
+    /// the pager's write epoch — any write invalidates the pin and the
+    /// next call re-fetches. Write paths never use the pin.
+    pinned_root: Option<PageRef>,
+    pinned_epoch: u64,
 }
 
 /// Result of inserting into a page: either the insert succeeded, or the
@@ -642,7 +644,29 @@ impl<'a> Btree<'a> {
             pager,
             root,
             is_index,
+            pinned_root: None,
+            pinned_epoch: 0,
         }
+    }
+
+    /// The root page, pinned across seeks when no write has happened since
+    /// the last fetch (read-only statements reuse one Arc for every seek).
+    #[inline]
+    fn root_page(&mut self) -> Result<PageRef> {
+        let epoch = self.pager.write_epoch();
+        if let Some(p) = self.pinned_root.take() {
+            if self.pinned_epoch == epoch {
+                // Pin still valid — reuse.
+                let out = p.clone();
+                self.pinned_root = Some(p);
+                return Ok(out);
+            }
+            // Stale — drop and re-fetch below.
+        }
+        let p = self.pager.get_page(self.root)?;
+        self.pinned_root = Some(p.clone());
+        self.pinned_epoch = epoch;
+        Ok(p)
     }
 
     /// Post-build warm tap: descend to the leftmost and rightmost leaves,
@@ -669,12 +693,18 @@ impl<'a> Btree<'a> {
                     PageType::LeafTable => {
                         let n = borrowed.n_cells() as usize;
                         if n > 0 {
-                            let lo_ptr = borrowed.cell_pointer(0) as usize;
-                            let hi_ptr = borrowed.cell_pointer((n - 1) as u16) as usize;
-                            let lo = varint::decode_signed(&borrowed.data[lo_ptr..])
+                            // Corrupt pages may hold out-of-range cell
+                            // pointers: degrade to no-hint, never panic.
+                            let lo = borrowed
+                                .cell_slice(0)
+                                .ok()
+                                .and_then(varint::decode_signed)
                                 .map(|(r, _)| r)
                                 .unwrap_or(i64::MIN);
-                            let hi = varint::decode_signed(&borrowed.data[hi_ptr..])
+                            let hi = borrowed
+                                .cell_slice((n - 1) as u16)
+                                .ok()
+                                .and_then(varint::decode_signed)
                                 .map(|(r, _)| r)
                                 .unwrap_or(i64::MAX);
                             drop(borrowed);
@@ -685,11 +715,15 @@ impl<'a> Btree<'a> {
                     PageType::LeafIndex => {
                         let n = borrowed.n_cells() as usize;
                         if n > 0 {
-                            let lo_ptr = borrowed.cell_pointer(0) as usize;
-                            let hi_ptr = borrowed.cell_pointer((n - 1) as u16) as usize;
-                            let lo = decode_index_cell(&borrowed.data[lo_ptr..], false)
+                            let lo = borrowed
+                                .cell_slice(0)
+                                .ok()
+                                .and_then(|s| decode_index_cell(s, false))
                                 .map(|c| c.key.to_vec());
-                            let hi = decode_index_cell(&borrowed.data[hi_ptr..], false)
+                            let hi = borrowed
+                                .cell_slice((n - 1) as u16)
+                                .ok()
+                                .and_then(|s| decode_index_cell(s, false))
                                 .map(|c| c.key.to_vec());
                             if let (Some(lo), Some(hi)) = (lo, hi) {
                                 drop(borrowed);
@@ -705,10 +739,14 @@ impl<'a> Btree<'a> {
                             if n == 0 {
                                 borrowed.right_most_pointer()
                             } else {
-                                let ptr = borrowed.cell_pointer(0) as usize;
-                                u32::from_be_bytes(
-                                    borrowed.data[ptr..ptr + 4].try_into().unwrap_or([0; 4]),
-                                )
+                                // Bounds-checked: a corrupt cell pointer
+                                // must not panic the child read.
+                                borrowed
+                                    .cell_slice(0)
+                                    .ok()
+                                    .and_then(|s| s.get(..4))
+                                    .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                                    .unwrap_or(0)
                             }
                         } else {
                             borrowed.right_most_pointer()
@@ -725,10 +763,14 @@ impl<'a> Btree<'a> {
                             if n == 0 {
                                 borrowed.right_most_pointer()
                             } else {
-                                let ptr = borrowed.cell_pointer(0) as usize;
-                                u32::from_be_bytes(
-                                    borrowed.data[ptr..ptr + 4].try_into().unwrap_or([0; 4]),
-                                )
+                                // Bounds-checked: a corrupt cell pointer
+                                // must not panic the child read.
+                                borrowed
+                                    .cell_slice(0)
+                                    .ok()
+                                    .and_then(|s| s.get(..4))
+                                    .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                                    .unwrap_or(0)
                             }
                         } else {
                             borrowed.right_most_pointer()
@@ -758,6 +800,8 @@ impl<'a> Btree<'a> {
             pager,
             root,
             is_index,
+            pinned_root: None,
+            pinned_epoch: 0,
         })
     }
 
@@ -786,11 +830,11 @@ impl<'a> Btree<'a> {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-            let Some((cell_rowid, _)) = decode_rowid_only(&borrowed.data[cell_ptr..]) else {
+            let Some((cell_rowid, _)) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?) else {
                 return Ok(None);
             };
             if cell_rowid == rowid {
-                let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                 if let Cell::TableLeaf { payload, .. } = cell {
                     return Ok(Some(LookupResult::Found(payload)));
                 }
@@ -833,11 +877,11 @@ impl<'a> Btree<'a> {
             while lo < hi {
                 let mid = (lo + hi) / 2;
                 let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                let Some((cell_rowid, _)) = decode_rowid_only(&borrowed.data[cell_ptr..]) else {
+                let Some((cell_rowid, _)) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?) else {
                     break 'hint; // corrupt cell — full descent
                 };
                 if cell_rowid == rowid {
-                    let rest = &borrowed.data[cell_ptr..];
+                    let rest = borrowed.cell_slice_checked(cell_ptr)?;
                     let Some((_rid, rn)) = decode_rowid_only(rest) else {
                         break 'hint;
                     };
@@ -864,7 +908,13 @@ impl<'a> Btree<'a> {
         // --- Full descent --------------------------------------------------
         let mut page_id = self.root;
         loop {
-            let page = self.pager.get_page(page_id)?;
+            // Root pin: reuse the pinned Arc while no write has occurred
+            // (saves a cache read-lock + refcount round-trip per seek).
+            let page = if page_id == self.root {
+                self.root_page()?
+            } else {
+                self.pager.get_page(page_id)?
+            };
             let borrowed = page.lock();
             prefetch_search_lines(&borrowed.data);
             let pt = borrowed.page_type()?;
@@ -872,14 +922,14 @@ impl<'a> Btree<'a> {
                 PageType::LeafTable => {
                     let n = borrowed.n_cells() as usize;
                     if n > 0 {
-                        let lo_key = decode_rowid_only(
-                            &borrowed.data[borrowed.cell_pointer(0) as usize..],
-                        )
-                        .map(|(r, _)| r);
-                        let hi_key = decode_rowid_only(
-                            &borrowed.data[borrowed.cell_pointer(n as u16 - 1) as usize..],
-                        )
-                        .map(|(r, _)| r);
+                        let lo_key = borrowed
+                            .cell_slice(0)
+                            .ok()
+                            .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
+                        let hi_key = borrowed
+                            .cell_slice(n as u16 - 1)
+                            .ok()
+                            .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
                         if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
                             set_table_hint(self.root, &page, lo, hi, epoch);
                         }
@@ -889,12 +939,12 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                        let Some((cell_rowid, _)) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                        let Some((cell_rowid, _)) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
                         else {
                             return Err(Error::corruption("truncated leaf rowid in lookup"));
                         };
                         if cell_rowid == rowid {
-                            let rest = &borrowed.data[cell_ptr..];
+                            let rest = borrowed.cell_slice_checked(cell_ptr)?;
                             let (_rid, rn) = decode_rowid_only(rest)
                                 .ok_or_else(|| Error::corruption("truncated rowid"))?;
                             let (plen, pn) = varint::decode(&rest[rn..])
@@ -983,7 +1033,12 @@ impl<'a> Btree<'a> {
         // --- Full descent ------------------------------------------------
         let mut page_id = self.root;
         loop {
-            let page = self.pager.get_page(page_id)?;
+            // Root pin (see the lookup_table descent).
+            let page = if page_id == self.root {
+                self.root_page()?
+            } else {
+                self.pager.get_page(page_id)?
+            };
             // ONE lock per page: determine the type and do the leaf work
             // under the same guard (was: a temp lock for page_type plus a
             // second lock for the scan — two atomic RMWs per level per
@@ -996,14 +1051,14 @@ impl<'a> Btree<'a> {
                     let n = borrowed.n_cells() as usize;
                     if n > 0 {
                         // Record the leaf hint (exact bounds read live).
-                        let lo_key = decode_rowid_only(
-                            &borrowed.data[borrowed.cell_pointer(0) as usize..],
-                        )
-                        .map(|(r, _)| r);
-                        let hi_key = decode_rowid_only(
-                            &borrowed.data[borrowed.cell_pointer(n as u16 - 1) as usize..],
-                        )
-                        .map(|(r, _)| r);
+                        let lo_key = borrowed
+                            .cell_slice(0)
+                            .ok()
+                            .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
+                        let hi_key = borrowed
+                            .cell_slice(n as u16 - 1)
+                            .ok()
+                            .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
                         if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
                             set_table_hint(self.root, &page, lo, hi, epoch);
                         }
@@ -1015,11 +1070,11 @@ impl<'a> Btree<'a> {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
                         // Read just the rowid — no payload allocation.
-                        let (cell_rowid, _) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                        let (cell_rowid, _) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
                             .ok_or_else(|| Error::corruption("truncated leaf rowid in lookup"))?;
                         if cell_rowid == rowid {
                             // Found — decode the full cell ONCE.
-                            let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                            let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                             if let Cell::TableLeaf { payload, .. } = cell {
                                 return Ok(LookupResult::Found(payload));
                             }
@@ -1082,10 +1137,28 @@ impl<'a> Btree<'a> {
     }
 
     /// Insert a (rowid, payload) pair into a table B+tree.
+    /// Maximum payload that can be stored in a single cell. The engine
+    /// does not (yet) write overflow page chains, so a cell must fit in
+    /// one page alongside its header and the cell-pointer array; going
+    /// over must be a graceful error, never an allocator underflow.
+    fn max_cell_payload(&self) -> usize {
+        // Page header + cell pointer + a healthy margin for cell overhead
+        // (rowid varint, payload length varint) and the pointer array.
+        self.pager.page_size() as usize - 128
+    }
+
     pub fn insert_table(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
         // Notify the pager that a write is about to happen. This maintains
         // the O(1) dirty-page counter used by `flush()`'s fast path
         // (see `Pager::note_write`).
+        if payload.len() > self.max_cell_payload() {
+            return Err(Error::InvalidArgument(format!(
+                "string or blob too big ({} bytes; max in-page cell payload is {} \
+— overflow page chains are not yet supported)",
+                payload.len(),
+                self.max_cell_payload()
+            )));
+        }
         self.pager.note_write();
         let cell = Cell::TableLeaf {
             rowid,
@@ -1168,6 +1241,13 @@ impl<'a> Btree<'a> {
         payload: &[u8],
         hint: Option<PageId>,
     ) -> Result<Option<PageId>> {
+        if payload.len() > self.max_cell_payload() {
+            return Err(Error::InvalidArgument(format!(
+                "string or blob too big ({} bytes; max in-page cell payload is {})",
+                payload.len(),
+                self.max_cell_payload()
+            )));
+        }
         self.pager.note_write();
 
         // Fast path: validate the hinted leaf and append directly into it.
@@ -1262,7 +1342,7 @@ impl<'a> Btree<'a> {
         let n = borrowed.n_cells();
         if n > 0 {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
-            if let Some((last_rowid, _)) = varint::decode_signed(&borrowed.data[cell_ptr..]) {
+            if let Some((last_rowid, _)) = varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
                 if rowid <= last_rowid {
                     // Not an append — caller falls back to the normal path.
                     return Ok(None);
@@ -1450,7 +1530,7 @@ impl<'a> Btree<'a> {
         let n = borrowed.n_cells();
         if n > 0 {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
-            if let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) {
+            if let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) {
                 // Append requires (key, rowid) strictly after the last
                 // entry — index pages are sorted by (key, rowid).
                 if !(v.key < key || (v.key == key && v.rowid < rowid)) {
@@ -1566,7 +1646,7 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                        match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                        match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
                             Some((cell_rowid, _)) => {
                                 if cell_rowid < target {
                                     lo = mid + 1;
@@ -1584,7 +1664,7 @@ impl<'a> Btree<'a> {
                     if cell_ptr >= psz {
                         return Err(Error::corruption("cell pointer out of range in bulk update"));
                     }
-                    let (cell_rowid, n_rid) = varint::decode_signed(&borrowed.data[cell_ptr..])
+                    let (cell_rowid, n_rid) = varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
                         .ok_or_else(|| Error::corruption("truncated rowid in bulk update"))?;
                     let (rowid, new_payload) = updates[*ui];
                     match cell_rowid.cmp(&rowid) {
@@ -1710,7 +1790,7 @@ impl<'a> Btree<'a> {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
                         let Some((cell_rowid, n_rid)) =
-                            decode_rowid_only(&borrowed.data[cell_ptr..])
+                            decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
                         else {
                             break;
                         };
@@ -1774,7 +1854,7 @@ impl<'a> Btree<'a> {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
                             let (cell_rowid, n_rid) =
-                                decode_rowid_only(&borrowed.data[cell_ptr..]).ok_or_else(|| {
+                                decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?).ok_or_else(|| {
                                     Error::corruption("truncated leaf rowid in update")
                                 })?;
                             match cell_rowid.cmp(&rowid) {
@@ -1821,7 +1901,7 @@ impl<'a> Btree<'a> {
                     let mut next = borrowed.right_most_pointer();
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                         if let Cell::TableInterior { left_child, key } = cell {
                             if rowid <= key {
                                 next = left_child;
@@ -2118,7 +2198,7 @@ impl<'a> Btree<'a> {
                         right_most = borrowed.right_most_pointer();
                         for i in 0..n_cells {
                             let cell_ptr = borrowed.cell_pointer(i) as usize;
-                            let c = Cell::decode(&borrowed.data[cell_ptr..], pt2)?;
+                            let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt2)?;
                             if c.left_child() == child_id {
                                 found_idx = Some(i as usize);
                             }
@@ -2302,7 +2382,7 @@ impl<'a> Btree<'a> {
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                    let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], interior)
+                    let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, interior)
                     else {
                         return Err(Error::corruption("truncated index cell in search"));
                     };
@@ -2319,9 +2399,9 @@ impl<'a> Btree<'a> {
                     let mid = (lo + hi) / 2;
                     let cell_ptr = borrowed.cell_pointer(mid) as usize;
                     let sep = if interior {
-                        decode_table_interior_key(&borrowed.data[cell_ptr..])
+                        decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
                     } else {
-                        varint::decode_signed(&borrowed.data[cell_ptr..]).map(|(k, _)| k)
+                        varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?).map(|(k, _)| k)
                     };
                     match sep {
                         Some(k) if k < target => lo = mid + 1,
@@ -2470,7 +2550,7 @@ impl<'a> Btree<'a> {
         };
 
         // Merged sequence: existing[0..n) with the new cell at `pos`.
-        let mid = (n_usize + 1) / 2;
+        let mid = n_usize.div_ceil(2);
 
         // Per-sequence-entry byte source: (page-local offset, size) for
         // existing cells; the encoded new cell is separate.
@@ -2751,7 +2831,7 @@ impl<'a> Btree<'a> {
         for i in 0..n {
             let borrowed = page.lock();
             let cell_ptr = borrowed.cell_pointer(i) as usize;
-            let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+            let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
             let existing_before_new = if is_idx {
                 c.cmp_index_target(new_cell.index_key(), new_cell.key())
                     == std::cmp::Ordering::Less
@@ -2765,7 +2845,7 @@ impl<'a> Btree<'a> {
                 for j in i..n {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(j) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                     cells.push(c);
                 }
                 break;
@@ -2804,7 +2884,7 @@ impl<'a> Btree<'a> {
             // the very end (see `cells.len() == n` above).
             let new_is_last = cells.last().map(|c| {
                 if is_idx {
-                    c.index_key() == new_cell_key.as_ref().map(|k| k.as_slice()).unwrap_or(&[])
+                    c.index_key() == new_cell_key.as_deref().unwrap_or(&[])
                         && c.key() == new_cell_key_rowid
                 } else {
                     c.key() == new_cell_key_rowid
@@ -2821,7 +2901,7 @@ impl<'a> Btree<'a> {
                     let page_ref = self.pager.get_page(page_id)?;
                     let borrowed = page_ref.lock();
                     let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                     Some((c.index_key().to_vec(), c.key()))
                 } else {
                     None
@@ -2907,7 +2987,7 @@ impl<'a> Btree<'a> {
         }
     }
 
-    /// Split an interior page. Same idea but the middle cell moves up.
+    // Split an interior page. Same idea but the middle cell moves up.
     // fn split_interior(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
     //     let page = self.pager.get_page(page_id)?;
     //     let pt = page.lock().page_type()?;
@@ -2919,7 +2999,7 @@ impl<'a> Btree<'a> {
     //     for i in 0..n {
     //         let borrowed = page.lock();
     //         let cell_ptr = borrowed.cell_pointer(i) as usize;
-    //         let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+    //         let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
     //         if !inserted && new_cell.key() < c.key() {
     //             cells.push(new_cell.clone());
     //             inserted = true;
@@ -3008,7 +3088,7 @@ impl<'a> Btree<'a> {
             let mut found = None;
             for i in 0..n {
                 let cell_ptr = borrowed.cell_pointer(i) as usize;
-                let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                 if c.left_child() == child_id {
                     found = Some(i as usize);
                     break;
@@ -3048,7 +3128,7 @@ impl<'a> Btree<'a> {
                     let parent_ref = self.pager.get_page(parent_id)?;
                     let borrowed = parent_ref.lock();
                     let cell_ptr = borrowed.cell_pointer(last_idx as u16) as usize;
-                    let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                     c.left_child()
                 };
                 let parent_ref = self.pager.get_page(parent_id)?;
@@ -3098,7 +3178,7 @@ impl<'a> Btree<'a> {
                         while lo < hi {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                            let (cell_rowid, _) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                            let (cell_rowid, _) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
                                 .ok_or_else(|| Error::corruption("truncated leaf rowid in delete"))?;
                             match cell_rowid.cmp(&rowid) {
                                 std::cmp::Ordering::Equal => {
@@ -3114,7 +3194,7 @@ impl<'a> Btree<'a> {
                             Some(cell_ptr) => {
                                 // Decode the payload length + body.
                                 let plen_pos = {
-                                    let (_, n_rid) = decode_rowid_only(&borrowed.data[cell_ptr..])
+                                    let (_, n_rid) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
                                         .ok_or_else(|| Error::corruption("truncated rowid"))?;
                                     cell_ptr + n_rid
                                 };
@@ -3144,7 +3224,7 @@ impl<'a> Btree<'a> {
                         while lo < hi {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                            let sep = decode_table_interior_key(&borrowed.data[cell_ptr..])
+                            let sep = decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
                                 .ok_or_else(|| Error::corruption("truncated interior cell"))?;
                             if rowid <= sep {
                                 hi = mid;
@@ -3156,7 +3236,7 @@ impl<'a> Btree<'a> {
                             borrowed.right_most_pointer()
                         } else {
                             let cell_ptr = borrowed.cell_pointer(lo) as usize;
-                            decode_table_interior_child(&borrowed.data[cell_ptr..])
+                            decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
                                 .unwrap_or_else(|| borrowed.right_most_pointer())
                         }
                     };
@@ -3189,12 +3269,12 @@ impl<'a> Btree<'a> {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
                         let k = if pt == PageType::LeafIndex {
-                            match decode_index_cell(&borrowed.data[cell_ptr..], false) {
+                            match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) {
                                 Some(v) => v.rowid,
                                 None => return Err(Error::corruption("truncated index cell")),
                             }
                         } else {
-                            match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                            match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
                                 Some((k, _)) => k,
                                 None => return Err(Error::corruption("truncated rowid")),
                             }
@@ -3215,11 +3295,11 @@ impl<'a> Btree<'a> {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
                     if pt == PageType::LeafIndex {
-                        decode_index_cell(&borrowed.data[cell_ptr..], false)
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false)
                             .map(|v| v.rowid == rowid)
                             .unwrap_or(false)
                     } else {
-                        varint::decode_signed(&borrowed.data[cell_ptr..])
+                        varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
                             .map(|(k, _)| k == rowid)
                             .unwrap_or(false)
                     }
@@ -3265,12 +3345,12 @@ impl<'a> Btree<'a> {
                         // search; the child pointer is re-decoded once the
                         // position is found below, so skip it here.
                         let sep = if pt == PageType::InteriorIndex {
-                            match decode_index_cell(&borrowed.data[cell_ptr..], true) {
+                            match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true) {
                                 Some(v) => v.rowid,
                                 None => return Err(Error::corruption("truncated index interior cell")),
                             }
                         } else {
-                            match decode_table_interior_key(&borrowed.data[cell_ptr..]) {
+                            match decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?) {
                                 Some(k) => k,
                                 None => return Err(Error::corruption("truncated interior cell")),
                             }
@@ -3286,11 +3366,11 @@ impl<'a> Btree<'a> {
                     } else {
                         let cell_ptr = borrowed.cell_pointer(lo) as usize;
                         if pt == PageType::InteriorIndex {
-                            decode_index_cell(&borrowed.data[cell_ptr..], true)
+                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
                                 .map(|v| v.left_child)
                                 .unwrap_or_else(|| borrowed.right_most_pointer())
                         } else {
-                            decode_table_interior_child(&borrowed.data[cell_ptr..])
+                            decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
                                 .unwrap_or_else(|| borrowed.right_most_pointer())
                         }
                     }
@@ -3310,8 +3390,8 @@ impl<'a> Btree<'a> {
         }
     }
 
-    /// Delete a cell from an interior page by index (used during B+tree
-    /// maintenance when a child splits and we need to replace a cell).
+    // Delete a cell from an interior page by index (used during B+tree
+    // maintenance when a child splits and we need to replace a cell).
     // fn delete_cell_from_interior(&mut self, page_id: PageId, idx: u16) -> Result<()> {
     //     let page = self.pager.get_page(page_id)?;
     //     let pt = page.lock().page_type()?;
@@ -3389,7 +3469,7 @@ impl<'a> Btree<'a> {
                     }
                     // Decode rowid varint + payload length varint, then
                     // slice the payload bytes — all without allocating.
-                    let buf = &borrowed.data[cell_ptr..];
+                    let buf = borrowed.cell_slice_checked(cell_ptr)?;
                     let (rowid, n1) = varint::decode_signed(buf)
                         .ok_or_else(|| Error::corruption("truncated leaf rowid in scan_borrowed"))?;
                     let rest = &buf[n1..];
@@ -3415,7 +3495,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                         if let Cell::TableInterior { left_child, .. } = c {
                             v.push(left_child);
                         }
@@ -3478,7 +3558,7 @@ impl<'a> Btree<'a> {
                             cell_ptr
                         )));
                     }
-                    match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                    match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
                         Some((rowid, _)) if rowid < start => lo = mid + 1,
                         _ => hi = mid,
                     }
@@ -3493,7 +3573,7 @@ impl<'a> Btree<'a> {
                             cell_ptr
                         )));
                     }
-                    match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                    match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
                         Some((rowid, _)) => {
                             if rowid > end {
                                 break;
@@ -3519,7 +3599,7 @@ impl<'a> Btree<'a> {
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                    let key = decode_table_interior_key(&borrowed.data[cell_ptr..])
+                    let key = decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
                         .ok_or_else(|| {
                             Error::corruption("truncated interior cell in count_range")
                         })?;
@@ -3533,7 +3613,7 @@ impl<'a> Btree<'a> {
                 for i in lo..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
                     if let Some(child) =
-                        decode_table_interior_child(&borrowed.data[cell_ptr..])
+                        decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
                     {
                         children.push(child);
                     }
@@ -3577,7 +3657,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                         if let Cell::TableInterior { left_child, .. } = c {
                             v.push(left_child);
                         }
@@ -3614,7 +3694,7 @@ impl<'a> Btree<'a> {
                 let n = borrowed.n_cells();
                 for i in 0..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                     if let Cell::TableLeaf { rowid, payload } = cell {
                         if !f(rowid, &payload) {
                             return Ok(());
@@ -3630,7 +3710,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                         if let Cell::TableInterior { left_child, .. } = c {
                             v.push(left_child);
                         }
@@ -3713,7 +3793,7 @@ impl<'a> Btree<'a> {
                             cell_ptr
                         )));
                     }
-                    match varint::decode_signed(&borrowed.data[cell_ptr..]) {
+                    match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
                         Some((rowid, _)) if rowid < start => lo = mid + 1,
                         _ => hi = mid,
                     }
@@ -3726,7 +3806,7 @@ impl<'a> Btree<'a> {
                             cell_ptr
                         )));
                     }
-                    let buf = &borrowed.data[cell_ptr..];
+                    let buf = borrowed.cell_slice_checked(cell_ptr)?;
                     let (rowid, n1) = varint::decode_signed(buf)
                         .ok_or_else(|| Error::corruption("truncated leaf rowid in range_borrowed"))?;
                     if rowid > end {
@@ -3764,7 +3844,7 @@ impl<'a> Btree<'a> {
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                    let key = decode_table_interior_key(&borrowed.data[cell_ptr..])
+                    let key = decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
                         .ok_or_else(|| Error::corruption("truncated interior cell in range scan"))?;
                     if key < start {
                         lo = mid + 1;
@@ -3776,7 +3856,7 @@ impl<'a> Btree<'a> {
                 for i in lo..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
                     if let Some(child) =
-                        decode_table_interior_child(&borrowed.data[cell_ptr..])
+                        decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
                     {
                         children.push(child);
                     }
@@ -3815,16 +3895,15 @@ impl<'a> Btree<'a> {
                 for i in 0..n {
                     let cell_ptr = page.lock().cell_pointer(i) as usize;
                     let borrowed = page.lock();
-                    let cell = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                    let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                     if let Cell::TableLeaf { rowid, payload } = cell {
                         if rowid > end {
                             return Ok(());
                         }
-                        if rowid >= start {
-                            if !f(rowid, &payload) {
+                        if rowid >= start
+                            && !f(rowid, &payload) {
                                 return Ok(());
                             }
-                        }
                     }
                 }
                 Ok(())
@@ -3837,7 +3916,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(&borrowed.data[cell_ptr..], pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                         if let Cell::TableInterior { left_child, key } = c {
                             v.push((left_child, key));
                         }
@@ -3878,6 +3957,13 @@ impl<'a> Btree<'a> {
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
         // Notify the pager that a write is about to happen.
         self.pager.note_write();
+        if key.len() > self.max_cell_payload() {
+            return Err(Error::InvalidArgument(format!(
+                "indexed value too big ({} bytes; max in-page cell payload is {})",
+                key.len(),
+                self.max_cell_payload()
+            )));
+        }
         // Index entries are sorted by (key, rowid): the cell's btree order
         // is the byte-encoded key first, then the rowid as tiebreaker.
         let cell = Cell::IndexLeaf {
@@ -3937,7 +4023,7 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                        let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
                             return Err(Error::corruption("truncated index leaf cell"));
                         };
                         if (v.key, v.rowid) < (key, rowid) {
@@ -3954,7 +4040,7 @@ impl<'a> Btree<'a> {
                 let key_matches = {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
-                    match decode_index_cell(&borrowed.data[cell_ptr..], false) {
+                    match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) {
                         Some(v) => v.key == key && v.rowid == rowid,
                         None => false,
                     }
@@ -4093,7 +4179,7 @@ impl<'a> Btree<'a> {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-            let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
                 return Ok(false);
             };
             if v.key < key {
@@ -4117,7 +4203,7 @@ impl<'a> Btree<'a> {
         let mut i = lo;
         while i < n {
             let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
-            let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
                 break;
             };
             if v.key.starts_with(key) {
@@ -4185,7 +4271,7 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                        let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
                             return Err(Error::corruption("truncated index leaf cell in scan"));
                         };
                         if v.key < start_key {
@@ -4204,11 +4290,14 @@ impl<'a> Btree<'a> {
                 // interior->leaf descent forever (measured hit rate 0.2%).
                 if n > 0 {
                     if let (Some(a), Some(b)) = (
-                        decode_index_cell(&borrowed.data[borrowed.cell_pointer(0) as usize..], false),
-                        decode_index_cell(
-                            &borrowed.data[borrowed.cell_pointer(n - 1) as usize..],
-                            false,
-                        ),
+                        borrowed
+                            .cell_slice(0)
+                            .ok()
+                            .and_then(|s| decode_index_cell(s, false)),
+                        borrowed
+                            .cell_slice(n - 1)
+                            .ok()
+                            .and_then(|s| decode_index_cell(s, false)),
                     ) {
                         set_index_hint(self.root, &page, a.key, b.key, self.pager.write_epoch());
                     }
@@ -4218,7 +4307,7 @@ impl<'a> Btree<'a> {
                 // key Vec per cell here).
                 for i in begin..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                    let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
                         continue;
                     };
                     if !f(v.rowid, v.key) {
@@ -4250,7 +4339,7 @@ impl<'a> Btree<'a> {
                         while lo < hi {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                            let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], true)
+                            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
                             else {
                                 break;
                             };
@@ -4265,7 +4354,7 @@ impl<'a> Btree<'a> {
                     // Read the FIRST child to descend under this same lock.
                     let first_child = if first_cell_idx < n {
                         let cell_ptr = borrowed.cell_pointer(first_cell_idx) as usize;
-                        decode_index_cell(&borrowed.data[cell_ptr..], true)
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
                             .map(|v| v.left_child)
                             .unwrap_or(0)
                     } else {
@@ -4278,17 +4367,16 @@ impl<'a> Btree<'a> {
                 drop(page);
                 // Descend the first (usually only) child without re-locking
                 // the parent.
-                if first_child != 0 {
-                    if !self.scan_index_range_subtree(first_child, start_key, f, started)? {
+                if first_child != 0
+                    && !self.scan_index_range_subtree(first_child, start_key, f, started)? {
                         return Ok(false);
                     }
-                }
                 // Remaining children (rare: the range spans siblings).
                 for i in (first_cell_idx + if first_child != 0 { 1 } else { 0 })..n {
                     let page = self.pager.get_page(page_id)?;
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let child = match decode_index_cell(&borrowed.data[cell_ptr..], true) {
+                    let child = match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true) {
                         Some(v) => v.left_child,
                         None => break,
                     };
@@ -4298,11 +4386,10 @@ impl<'a> Btree<'a> {
                         return Ok(false);
                     }
                 }
-                if right_most != 0 {
-                    if !self.scan_index_range_subtree(right_most, start_key, f, started)? {
+                if right_most != 0
+                    && !self.scan_index_range_subtree(right_most, start_key, f, started)? {
                         return Ok(false);
                     }
-                }
                 Ok(true)
             }
             _ => Err(Error::corruption(format!(
@@ -4331,7 +4418,7 @@ impl<'a> Btree<'a> {
                 let n = borrowed.n_cells();
                 for i in 0..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let Some(v) = decode_index_cell(&borrowed.data[cell_ptr..], false) else {
+                    let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
                         continue;
                     };
                     if !f(v.rowid, v.key) {
@@ -4348,7 +4435,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        if let Some(c) = decode_index_cell(&borrowed.data[cell_ptr..], true) {
+                        if let Some(c) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true) {
                             v.push(c.left_child);
                         }
                     }
@@ -4369,7 +4456,7 @@ impl<'a> Btree<'a> {
     }
 }
 
-/// Helper: safely extract the key from any cell.
+// Helper: safely extract the key from any cell.
 // fn child_key_safe(c: &Cell) -> i64 {
 //     c.key()
 // }
@@ -4516,9 +4603,9 @@ mod tests {
 
     #[test]
     fn insert_and_lookup() {
-        let mut pager = open_pager();
+        let pager = open_pager();
         // Create a new B+tree rooted at page 1 (allocate).
-        let mut bt = Btree::create(&mut pager, false).unwrap();
+        let mut bt = Btree::create(&pager, false).unwrap();
         for i in 0..100i64 {
             let payload = format!("row-{}", i).into_bytes();
             bt.insert_table(i, &payload).unwrap();
@@ -4539,8 +4626,8 @@ mod tests {
 
     #[test]
     fn scan_returns_all_in_order() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, false).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, false).unwrap();
         // Insert in scrambled order
         let order: Vec<i64> = [5, 1, 9, 3, 7, 2, 8, 4, 6, 0].to_vec();
         for &i in &order {
@@ -4557,8 +4644,8 @@ mod tests {
 
     #[test]
     fn delete_removes_row() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, false).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, false).unwrap();
         for i in 0..50i64 {
             bt.insert_table(i, b"x").unwrap();
         }
@@ -4581,8 +4668,8 @@ mod tests {
 
     #[test]
     fn range_scan() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, false).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, false).unwrap();
         for i in 0..1000i64 {
             bt.insert_table(i, b"x").unwrap();
         }
@@ -4611,8 +4698,8 @@ mod tests {
     ///   3. The page types of leaf pages are LeafIndex, not LeafTable.
     #[test]
     fn index_split_preserves_page_type() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, true).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, true).unwrap();
         // Insert enough entries to force multiple splits.
         for i in 1..=500i64 {
             let key = Value::Integer(i).encode_order_key();
@@ -4643,8 +4730,8 @@ mod tests {
     ///   - lookup_index binary search after splits
     #[test]
     fn index_btree_random_insertion_order() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, true).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, true).unwrap();
         // Simple LCG shuffle of 1..=600.
         let mut vals: Vec<i64> = (1..=600).collect();
         let mut seed: u64 = 0x2545F4914F6CDD1D;
@@ -4694,8 +4781,8 @@ mod tests {
     /// scan_index_from: range scans start at the first key >= start.
     #[test]
     fn index_range_scan_from() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, true).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, true).unwrap();
         for i in 1..=500i64 {
             let key = Value::Integer(i * 2).encode_order_key();
             bt.insert_index(&key, i).unwrap();
@@ -4727,8 +4814,8 @@ mod tests {
     /// entry was inserted alongside it — producing duplicate index entries.
     #[test]
     fn index_delete_then_reinsert_no_duplicate() {
-        let mut pager = open_pager();
-        let mut bt = Btree::create(&mut pager, true).unwrap();
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, true).unwrap();
         // Insert a single entry.
         let key = Value::Integer(42).encode_order_key();
         bt.insert_index(&key, 7).unwrap();

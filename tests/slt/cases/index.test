@@ -1,0 +1,154 @@
+# SLT cases — secondary indexes: creation, backfill, lookups, ranges,
+# ordering, partial indexes, multi-column indexes, and index maintenance
+# under UPDATE/DELETE. Mirrors SQLite's index1/index2 SLT corpora.
+
+statement ok
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL)
+
+statement ok
+CREATE INDEX idx_a ON t1(a)
+
+statement ok
+CREATE INDEX idx_b ON t1(b)
+
+statement ok
+CREATE INDEX idx_ab ON t1(a, b)
+
+statement ok
+CREATE INDEX idx_partial ON t1(c) WHERE a > 500
+
+statement ok
+INSERT INTO t1 (a, b, c) VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', 3.5)
+
+statement ok
+INSERT INTO t1 (a, b, c) VALUES (4, 'four', 4.5), (5, 'five', 5.5)
+
+# Index backfill: rows inserted BEFORE the index exist too.
+statement ok
+CREATE TABLE t2 (id INTEGER PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO t2 (v) VALUES (10), (20), (30), (40), (50)
+
+statement ok
+CREATE INDEX idx_t2_v ON t2(v)
+
+query I
+SELECT id FROM t2 WHERE v = 30
+----
+3
+
+query II rowsort
+SELECT id, v FROM t2 WHERE v >= 20 AND v <= 40
+----
+2 20
+3 30
+4 40
+
+# Point lookups through each index.
+query T
+SELECT b FROM t1 WHERE a = 3
+----
+three
+
+query I
+SELECT id FROM t1 WHERE b = 'four'
+----
+4
+
+# Multi-column index: prefix and full matches.
+statement ok
+INSERT INTO t1 (a, b, c) VALUES (2, 'TWO', 20.0)
+
+query II rowsort
+SELECT id, b FROM t1 WHERE a = 2
+----
+2 two
+6 TWO
+
+query I rowsort
+SELECT id FROM t1 WHERE a = 2 AND b = 'two'
+----
+2
+
+# Range scans through the index in DESC order.
+query III rowsort
+SELECT id, a, b FROM t1 WHERE a BETWEEN 2 AND 4
+----
+2 2 two
+3 3 three
+4 4 four
+6 2 TWO
+
+# ORDER BY using an index (descending).
+query TI
+SELECT b, a FROM t1 WHERE a >= 3 AND a <= 5 ORDER BY a DESC
+----
+five 5
+four 4
+three 3
+
+# Index maintenance: UPDATE the indexed column.
+statement ok
+UPDATE t1 SET a = 100 WHERE b = 'five'
+
+query I
+SELECT id FROM t1 WHERE a = 100
+----
+5
+
+query I
+SELECT id FROM t1 WHERE a = 5
+----
+
+# Index maintenance: DELETE leaves no phantoms.
+statement ok
+DELETE FROM t1 WHERE b = 'two'
+
+query I
+SELECT id FROM t1 WHERE a = 2
+----
+6
+
+# UNIQUE index rejects duplicates.
+statement ok
+CREATE TABLE u1 (id INTEGER PRIMARY KEY, tag TEXT)
+
+statement ok
+CREATE UNIQUE INDEX idx_u_tag ON u1(tag)
+
+statement ok
+INSERT INTO u1 (tag) VALUES ('x'), ('y')
+
+statement error
+INSERT INTO u1 (tag) VALUES ('x')
+
+# NULLs are distinct in UNIQUE indexes.
+statement ok
+INSERT INTO u1 (tag) VALUES (NULL), (NULL)
+
+query I
+SELECT COUNT(*) FROM u1
+----
+4
+
+# Index-only scans (covering): count over the indexed column.
+query I
+SELECT COUNT(*) FROM t2 WHERE v > 15
+----
+4
+
+# Aggregate over index range.
+query II
+SELECT COUNT(*), SUM(v) FROM t2 WHERE v BETWEEN 10 AND 50
+----
+5 150
+
+# DROP INDEX removes it; queries still work via scan.
+statement ok
+DROP INDEX idx_t2_v
+
+query I
+SELECT id FROM t2 WHERE v = 30
+----
+3

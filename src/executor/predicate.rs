@@ -23,7 +23,7 @@
 //! comparison goes through `apply_binary` with the same `BinaryOp`.
 
 use crate::executor::expr::apply_binary;
-use crate::sql::ast::{BinaryOp, Expr};
+use crate::sql::ast::{BinaryOp, Expr, LikeOp};
 use crate::types::Value;
 
 /// A value on the right-hand side of a compiled comparison.
@@ -88,11 +88,14 @@ pub(crate) enum CompiledPredicate {
         vals: Vec<PredValue>,
         negated: bool,
     },
-    /// `col LIKE pattern` / `NOT LIKE` (literal or param pattern).
+    /// `col LIKE/GLOB pattern` / `NOT LIKE|GLOB ...` (literal or param
+    /// pattern). `glob` selects the matcher: GLOB is case-sensitive with
+    /// `*`/`?` wildcards, LIKE is case-insensitive with `%`/`_`.
     Like {
         col: usize,
         pattern: PredValue,
         negated: bool,
+        glob: bool,
     },
 }
 
@@ -195,10 +198,18 @@ impl CompiledPredicate {
                     found
                 }
             }
-            CompiledPredicate::Like { col, pattern, negated } => {
+            CompiledPredicate::Like { col, pattern, negated, glob } => {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let p = pattern.eval(row, positions, params);
-                let matched = crate::executor::expr::like_match(v, p, None, false);
+                // NULL operand -> NULL result -> row filtered out.
+                if v.is_null() || p.is_null() {
+                    return false;
+                }
+                let matched = if *glob {
+                    crate::executor::expr::glob_match(v, p)
+                } else {
+                    crate::executor::expr::like_match(v, p, None, false)
+                };
                 matched != *negated
             }
         }
@@ -213,7 +224,18 @@ fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<Pre
         Expr::Column { table: ref_t, name } => {
             let matches = ref_t
                 .as_ref()
-                .map(|t| t == &table.name || t == prefix)
+                .map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
                 .unwrap_or(true);
             if matches {
                 table.find_column(name).map(PredValue::Col)
@@ -271,7 +293,18 @@ pub(crate) fn compile_predicate(
             if let Expr::Column { table: ref_t, name } = expr.as_ref() {
                 let matches = ref_t
                     .as_ref()
-                    .map(|t| t == &table.name || t == prefix)
+                    .map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
                     .unwrap_or(true);
                 if matches {
                     if let Some(col) = table.find_column(name) {
@@ -285,7 +318,18 @@ pub(crate) fn compile_predicate(
             if let Expr::Column { table: ref_t, name } = expr.as_ref() {
                 let matches = ref_t
                     .as_ref()
-                    .map(|t| t == &table.name || t == prefix)
+                    .map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
                     .unwrap_or(true);
                 if matches {
                     if let Some(col) = table.find_column(name) {
@@ -309,7 +353,18 @@ pub(crate) fn compile_predicate(
             };
             let matches = ref_t
                 .as_ref()
-                .map(|t| t == &table.name || t == prefix)
+                .map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
                 .unwrap_or(true);
             if !matches {
                 return None;
@@ -321,18 +376,36 @@ pub(crate) fn compile_predicate(
             }
             Some(CompiledPredicate::InList { col, vals: bound, negated: *negated })
         }
-        Expr::Like { op: _, expr, pattern, escape, negated } => {
-            // LIKE only when the pattern is a compile-time literal or a
-            // positional parameter and there's no ESCAPE clause.
+        Expr::Like { op, expr, pattern, escape, negated } => {
+            // LIKE/GLOB only when the pattern is a compile-time literal or
+            // a positional parameter and there's no ESCAPE clause.
             if escape.is_some() {
                 return None;
             }
+            let glob = match op {
+                LikeOp::Like => false,
+                LikeOp::Glob => true,
+                // No regex engine: fall back to LIKE semantics, but keep
+                // the general path so the fallback stays in one place.
+                LikeOp::Regexp | LikeOp::Match => return None,
+            };
             let Expr::Column { table: ref_t, name } = expr.as_ref() else {
                 return None;
             };
             let matches = ref_t
                 .as_ref()
-                .map(|t| t == &table.name || t == prefix)
+                .map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
                 .unwrap_or(true);
             if !matches {
                 return None;
@@ -342,7 +415,7 @@ pub(crate) fn compile_predicate(
             if matches!(pat, PredValue::Col(_)) {
                 return None; // column-vs-column LIKE: general path
             }
-            Some(CompiledPredicate::Like { col, pattern: pat, negated: *negated })
+            Some(CompiledPredicate::Like { col, pattern: pat, negated: *negated, glob })
         }
         _ => None,
     }

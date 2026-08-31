@@ -1,0 +1,147 @@
+# SLT cases — aggregates: COUNT/SUM/AVG/MIN/MAX, GROUP BY/HAVING,
+# DISTINCT aggregates, empty-set behavior, mixed-type SUM, GROUP BY
+# expressions, and multiple group keys.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, h TEXT, v INTEGER, r REAL)
+
+statement ok
+INSERT INTO t (g, h, v, r) VALUES
+  ('a', 'x', 1, 1.5),
+  ('a', 'y', 2, 2.5),
+  ('a', 'x', 3, 3.5),
+  ('b', 'x', 4, 4.5),
+  ('b', 'y', 5, 5.5),
+  ('c', 'x', 6, 6.5)
+
+# Plain aggregates over the whole table.
+query IIIII
+SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t
+----
+6 21 3.5 1 6
+
+# COUNT(DISTINCT ...).
+query I
+SELECT COUNT(DISTINCT g) FROM t
+----
+3
+
+# GROUP BY one key.
+query TII rowsort
+SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g
+----
+a 3 6
+b 2 9
+c 1 6
+
+# GROUP BY two keys.
+query TI rowsort
+SELECT g, h, COUNT(*) FROM t GROUP BY g, h
+----
+a x 2
+a y 1
+b x 1
+b y 1
+c x 1
+
+# HAVING filters groups after aggregation.
+query TI rowsort
+SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 6
+----
+b 9
+
+query TI rowsort
+SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) >= 2
+----
+a 3
+b 2
+
+# Aggregates over the empty set: COUNT=0, others NULL.
+query IIII
+SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM t WHERE v > 100
+----
+0 NULL NULL NULL
+
+# AVG returns REAL.
+query R
+SELECT AVG(v) FROM t
+----
+3.5
+
+# SUM over REAL column keeps REAL.
+query R
+SELECT SUM(r) FROM t
+----
+24.0
+
+# SUM of mixed int/real becomes real.
+query R
+SELECT SUM(v + r) FROM t WHERE id <= 2
+----
+7.0
+
+# MIN/MAX over TEXT use collation order.
+query TT
+SELECT MIN(g), MAX(g) FROM t
+----
+a c
+
+# GROUP BY expression.
+query II rowsort
+SELECT v % 2, COUNT(*) FROM t GROUP BY v % 2
+----
+0 3
+1 3
+
+# Aggregates in a subquery (scalar).
+query II rowsort
+SELECT id, v FROM t WHERE v = (SELECT MAX(v) FROM t)
+----
+6 6
+
+# Aggregate + arithmetic on the result.
+query I
+SELECT MAX(v) - MIN(v) FROM t
+----
+5
+
+# COUNT of a nullable expression vs COUNT(*).
+statement ok
+CREATE TABLE nn (x INTEGER)
+
+statement ok
+INSERT INTO nn VALUES (1), (NULL), (2), (NULL)
+
+query II
+SELECT COUNT(*), COUNT(x) FROM nn
+----
+4 2
+
+# Group by with a NULL key.
+query II rowsort
+SELECT x, COUNT(*) FROM nn GROUP BY x
+----
+1 1
+2 1
+NULL 2
+
+# Aggregates with DISTINCT inside.
+query II
+SELECT COUNT(DISTINCT x), SUM(DISTINCT x) FROM nn
+----
+2 3
+
+# ORDER BY an aggregate result.
+query TI
+SELECT g, SUM(v) FROM t GROUP BY g ORDER BY SUM(v) DESC
+----
+b 9
+a 6
+c 6
+
+# LIMIT with GROUP BY.
+query TI
+SELECT g, SUM(v) FROM t GROUP BY g ORDER BY g LIMIT 2
+----
+a 6
+b 9

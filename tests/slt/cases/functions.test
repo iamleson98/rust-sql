@@ -1,0 +1,300 @@
+# SLT cases — built-in scalar functions: string, math, type/typeof,
+# quote/hex, datetime basics, LIKE/GLOB/ESCAPE, REPLACE, and JSON1.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)
+
+statement ok
+INSERT INTO t (s) VALUES ('Hello'), ('World'), ('hello world'), (NULL), ('')
+
+# ---- string functions ----
+query T
+SELECT upper('abc'), lower('ABC')
+----
+ABC abc
+
+query TI
+SELECT length('hello'), length(''), length(NULL)
+----
+5 0 NULL
+
+query TTT
+SELECT substr('hello', 2, 3), substr('hello', -3), substr('hello', 2)
+----
+ell llo ello
+
+# substr: negative start counts from the end.
+query TT
+SELECT substr('hello', -3, 2), substr('hello', -2, 10)
+----
+ll lo
+
+# substr: start 0 consumes one character of the length budget.
+query TT
+SELECT substr('hello', 0), substr('hello', 0, 2)
+----
+hello h
+
+# substr: start far left clamps, and eats into the length.
+query TT
+SELECT substr('hello', -10), substr('hello', -10, 3)
+----
+hello ''
+
+# substr: negative length selects |Z| characters BEFORE the start.
+query TTTT
+SELECT substr('hello', 2, -1), substr('hello', -3, -1), substr('hello', 3, -2), substr('hello', 2, -10)
+----
+h e he h
+
+# substr: start beyond the end is empty (quote() makes it visible).
+query TT
+SELECT quote(substr('hello', 10)), quote(substr('hello', 1, 0))
+----
+"''" "''"
+
+# substr: multi-byte UTF-8 counts CHARACTERS, never splits code points.
+query TT
+SELECT substr('日本語テキスト', 2, 3), substr('日本語', -2)
+----
+本語テ 本語
+
+# substr over a blob is byte-indexed and returns a blob.
+query TT
+SELECT hex(substr(x'00ff10', 2, 2)), typeof(substr(x'00ff10', 2, 2))
+----
+FF10 blob
+
+query T
+SELECT trim('  padded  '), ltrim('  x'), rtrim('x  ')
+----
+padded x x
+
+query I
+SELECT instr('hello world', 'world')
+----
+7
+
+query I
+SELECT instr('hello', 'z')
+----
+0
+
+query T
+SELECT replace('aaa-bbb-ccc', 'bb', 'X')
+----
+aaa-Xb-ccc
+
+query T
+SELECT replace('aaa', '', 'X')
+----
+aaa
+
+query II
+SELECT unicode('A'), char(65, 66, 67)
+----
+65 ABC
+
+query I
+SELECT length(char(128512))
+----
+1
+
+# ---- math functions ----
+query RRR
+SELECT abs(-2.5), round(2.567, 2), round(2.4)
+----
+2.5 2.57 2.0
+
+query III
+SELECT abs(-7), abs(0), abs(42)
+----
+7 0 42
+
+query RRR
+SELECT max(1.5, 2.5), min(1.5, 2.5), sqrt(16.0)
+----
+2.5 1.5 4.0
+
+query R
+SELECT power(2, 10)
+----
+1024.0
+
+# ---- type inspection / conversion ----
+query TTTTT
+SELECT typeof(1), typeof(1.5), typeof('x'), typeof(NULL), typeof(x'00')
+----
+integer real text null blob
+
+query TII
+SELECT CAST('42' AS INTEGER), CAST(3.9 AS INTEGER), CAST(-3.9 AS INTEGER)
+----
+42 3 -3
+
+query RR
+SELECT CAST('3.5' AS REAL), CAST(7 AS REAL)
+----
+3.5 7.0
+
+query II
+SELECT CAST('12abc' AS INTEGER), CAST('abc' AS INTEGER)
+----
+12 0
+
+query T
+SELECT CAST(123 AS TEXT)
+----
+123
+
+# ---- quote / hex / unicode ----
+query T
+SELECT quote('it''s')
+----
+"'it''s'"
+
+query T
+SELECT hex('AbC')
+----
+416243
+
+query T
+SELECT quote(x'00FF')
+----
+"X'00FF'"
+
+# ---- LIKE / GLOB / ESCAPE ----
+query I
+SELECT COUNT(*) FROM t WHERE s LIKE 'hello%'
+----
+2
+
+query I
+SELECT COUNT(*) FROM t WHERE s LIKE '%WORLD%'
+----
+2
+
+query I
+SELECT COUNT(*) FROM t WHERE s LIKE '%'
+----
+4
+
+query I
+SELECT COUNT(*) FROM t WHERE s GLOB 'H*'
+----
+1
+
+query I
+SELECT COUNT(*) FROM t WHERE s GLOB '*o'
+----
+1
+
+query I
+SELECT 'a%c' LIKE 'a\%c' ESCAPE '\'
+----
+1
+
+query I
+SELECT 'a%c' LIKE 'ax%c' ESCAPE 'x'
+----
+1
+
+# LIKE is case-insensitive for ASCII; GLOB is not.
+query I
+SELECT 'HELLO' LIKE 'hello'
+----
+1
+
+query I
+SELECT 'HELLO' GLOB 'hello'
+----
+0
+
+# ---- NULL propagation through functions ----
+query TT
+SELECT upper(NULL), substr(NULL, 1, 2)
+----
+NULL NULL
+
+query II
+SELECT abs(NULL), length(NULL)
+----
+NULL NULL
+
+# ---- coalesce family ----
+query II
+SELECT coalesce(NULL, NULL, 7), ifnull(NULL, 3)
+----
+7 3
+
+query II
+SELECT nullif(4, 4), nullif(4, 5)
+----
+NULL 4
+
+# ---- datetime basics ----
+query T
+SELECT date('2024-02-29')
+----
+2024-02-29
+
+query T
+SELECT date('2024-03-31', '-1 month')
+----
+2024-03-02
+
+query T
+SELECT time('12:34:56.789')
+----
+12:34:56
+
+query T
+SELECT datetime('2024-01-15 10:20:30')
+----
+"2024-01-15 10:20:30"
+
+query T
+SELECT strftime('%Y-%m-%d', '2024-07-04')
+----
+2024-07-04
+
+query II
+SELECT julianday('2000-01-01 12:00:00') > 2451545.0, strftime('%d', '2024-02-29')
+----
+0 29
+
+query I
+SELECT CAST(julianday('2000-01-01 12:00:00') AS INTEGER)
+----
+2451545
+
+# ---- JSON1 basics ----
+query T
+SELECT json('{"a": 1}')
+----
+'{"a":1}'
+
+query I
+SELECT json_extract('{"a": [1, 2, 3]}', '$.a[1]')
+----
+2
+
+query I
+SELECT json_array_length('[1, 2, 3, 4]')
+----
+4
+
+query T
+SELECT json_extract('{"x": {"y": "z"}}', '$.x.y')
+----
+z
+
+query I
+SELECT json_valid('{"a": 1}')
+----
+1
+
+query I
+SELECT json_valid('{bad json')
+----
+0

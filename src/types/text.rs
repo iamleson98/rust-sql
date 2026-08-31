@@ -30,7 +30,6 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
 #[cfg(target_pointer_width = "64")]
-
 /// Maximum byte length stored inline (23 bytes of payload + 1 length byte
 /// = 24 bytes, exactly `size_of::<String>()`).
 pub const INLINE_CAP: usize = 23;

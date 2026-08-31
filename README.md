@@ -230,6 +230,24 @@ cargo run --example transaction
 cargo run --example batch
 ```
 
+## Testing
+
+The test matrix is modeled on SQLite's own testing methodology
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)): crash and
+power-loss simulation (child processes aborting at every statement
+boundary), I/O-error and OOM fault injection, database-corruption fuzzing,
+SQL mutation fuzzing with differential verification against real SQLite,
+`PRAGMA integrity_check`, boundary values, regression tests, concurrency
+stress, and SQL Logic Tests. See [TESTING.md](TESTING.md) for the full
+matrix and how to run each harness.
+
+```bash
+cargo test                                              # the whole matrix
+cargo test --test crash_recovery                        # crash simulation
+cargo test --features oom-injection --test oom_fault    # OOM injection
+cargo run --release --example bench_compare             # vs SQLite
+```
+
 ## Limitations
 
 This is a proof-of-concept. Known gaps:

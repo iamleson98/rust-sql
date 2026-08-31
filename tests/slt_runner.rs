@@ -31,7 +31,7 @@
 //! Sort modes for `query`:
 //!   - `nosort`    — compare rows in the order produced by the engine.
 //!   - `rowsort`   — sort both expected and actual rows lexicographically
-//!                   before comparison (column-by-column, in declaration order).
+//!     before comparison (column-by-column, in declaration order).
 //!   - `valuesort` — flatten and sort all values from both sides.
 //!   - `rowid`     — sort by rowid (treat first column as rowid).
 //!
@@ -256,14 +256,15 @@ fn parse_directive(line: &str) -> (Directive, &str) {
 /// strings can contain spaces. `NULL` (case-insensitive) means SQL NULL.
 fn parse_expected_row(line: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = line.chars().peekable();
+    // Consumed by value by the `for` loop below — no peeking, so no `mut`.
+    let chars = line.chars().peekable();
     let mut cur = String::new();
     // 0 = unquoted, 1 = in double quotes, 2 = in single quotes.
     // Single-quoted values are verbatim — they exist so expected values
     // that CONTAIN double quotes (JSON1 output like [1,"two",3.5]) can be
     // written without escaping.
     let mut in_quotes = 0u8;
-    while let Some(c) = chars.next() {
+    for c in chars {
         if in_quotes == 1 {
             if c == '"' {
                 in_quotes = 0;

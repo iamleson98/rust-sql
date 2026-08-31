@@ -182,6 +182,9 @@ impl Wal {
             .read(true)
             .write(true)
             .create(true)
+            // An existing WAL is scanned for valid (checksummed) frames
+            // and appended after — never truncated away here.
+            .truncate(false)
             .open(&path)?;
 
         let mut wal = Self {

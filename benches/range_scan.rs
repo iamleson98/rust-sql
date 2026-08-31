@@ -31,7 +31,7 @@ fn bench_rusqlite_range_scan(c: &mut Criterion) {
         b.iter(|| {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id BETWEEN ?1 AND ?2").unwrap();
             let mut rows = stmt.query(params![black_box(1000), black_box(5000)]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 }

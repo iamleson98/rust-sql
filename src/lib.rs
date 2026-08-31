@@ -40,9 +40,18 @@
 /// 20-40% cheaper than the system malloc, which translates directly into
 /// scan/insert/join throughput. Opt out at build time with
 /// `default-features = false`.
-#[cfg(feature = "mimalloc")]
+///
+/// With the `oom-injection` feature (SQLite's SQLITE_MEMDEBUG/memsys2
+/// equivalent), mimalloc is replaced by [`crate::oom_alloc::OomAllocator`]
+/// so test harnesses can rig allocation failures — see `oom_alloc.rs`.
+#[cfg(all(feature = "mimalloc", not(feature = "oom-injection")))]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Fault-injecting allocator for OOM testing (`oom-injection` feature).
+#[cfg(feature = "oom-injection")]
+#[global_allocator]
+static GLOBAL_OOM_ALLOC: crate::oom_alloc::OomAllocator = crate::oom_alloc::OomAllocator;
 
 /// Disable mimalloc's delayed page purging.
 ///
@@ -76,6 +85,9 @@ fn engine_init() {
 }
 
 pub mod error;
+/// OOM fault-injection allocator (`oom-injection` feature).
+#[cfg(feature = "oom-injection")]
+pub mod oom_alloc;
 pub mod planner;
 pub mod schema;
 pub mod sql;

@@ -46,7 +46,7 @@ fn main() {
     let start = Instant::now();
     let mut hits = 0usize;
     for i in 0..n {
-        let key = Value::Integer(((i % 1000) as i64 + 1) * 2).encode_order_key();
+        let key = Value::Integer(((i % 1000) + 1) * 2).encode_order_key();
         let mut ibt = Btree::new(&pager, idx_root, true);
         let rids = ibt.lookup_index(&key).unwrap();
         hits += rids.len();
@@ -58,7 +58,7 @@ fn main() {
     let start = Instant::now();
     let mut rows = 0usize;
     for i in 0..n {
-        let key = Value::Integer(((i % 1000) as i64 + 1) * 2).encode_order_key();
+        let key = Value::Integer(((i % 1000) + 1) * 2).encode_order_key();
         let mut ibt = Btree::new(&pager, idx_root, true);
         let rids = ibt.lookup_index(&key).unwrap();
         for rid in rids {
@@ -89,7 +89,7 @@ fn main() {
     let _ = db2.query(sql, [Value::Integer(2)]).unwrap();
     let start = Instant::now();
     for i in 0..n {
-        let _ = db2.query(sql, [Value::Integer(((i % 1000) as i64 + 1) * 2)]).unwrap();
+        let _ = db2.query(sql, [Value::Integer(((i % 1000) + 1) * 2)]).unwrap();
     }
     let d3 = start.elapsed();
     println!("SQL query path:    {:?}/op", d3.as_nanos() / (n as u128));

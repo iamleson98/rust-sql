@@ -77,7 +77,7 @@ pub fn encode_row_aliased(row: &Row, alias: Option<usize>) -> Vec<u8> {
 /// Fill `out[alias]` with `Integer(rowid)` — the rowid-alias column's
 /// value comes from the B+tree cell key, not the payload.
 #[inline]
-fn materialize_alias(out: &mut Vec<Value>, alias: Option<usize>, rowid: i64) {
+fn materialize_alias(out: &mut [Value], alias: Option<usize>, rowid: i64) {
     if let Some(a) = alias {
         if a < out.len() {
             out[a] = Value::Integer(rowid);
@@ -298,14 +298,14 @@ fn value_encoded_len(buf: &[u8]) -> Result<usize> {
             // Integral REAL as zigzag varint: tag + varint.
             let rest = &buf[1..];
             let (_, n) = crate::types::value::decode_uvarint(rest)
-                .map_err(|e| crate::error::Error::corruption(e))?;
+                .map_err(crate::error::Error::corruption)?;
             1 + n
         }
         0x07 | 0x08 => {
             // Text / Blob: 1 (tag) + varint length + body.
             let rest = &buf[1..];
             let (len, n) = crate::types::value::decode_uvarint(rest)
-                .map_err(|e| crate::error::Error::corruption(e))?;
+                .map_err(crate::error::Error::corruption)?;
             1 + n + len as usize
         }
         _ => return Err(crate::error::Error::corruption("unknown value tag")),
@@ -328,7 +328,7 @@ mod tests {
         let row = vec![
             Value::Integer(42),
             Value::Text("hello".into()),
-            Value::Real(3.14),
+            Value::Real(1.5),
             Value::Null,
             Value::Blob(vec![1, 2, 3]),
         ];

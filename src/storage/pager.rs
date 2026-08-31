@@ -225,6 +225,11 @@ impl PageCache {
         self.count
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     pub fn clear(&mut self) {
         self.slots.clear();
         self.overflow.clear();
@@ -417,6 +422,12 @@ impl Pager {
         // The lock is released before any page work — get_page's undo
         // capture re-locks this mutex, and std::sync::Mutex is not
         // reentrant (holding it across get_page deadlocked).
+        //
+        // SQLite semantics: the savepoint STAYS ON THE STACK after
+        // ROLLBACK TO — it can be rolled back to again, or RELEASEd
+        // later. Its undo log is reset (changes were just undone) but its
+        // BASE snapshot is kept, so a second ROLLBACK TO restores to the
+        // same point.
         let (undo, base) = {
             let mut sp = self.savepoints.lock();
             let idx = match sp.iter().rposition(|s| s.name == name.to_ascii_lowercase()) {
@@ -425,7 +436,14 @@ impl Pager {
             };
             let level = sp.split_off(idx);
             let level = level.into_iter().next().unwrap();
-            let keep_depth = sp.len() + 1; // this savepoint stays active
+            // Re-push the savepoint (kept active) with the same base and
+            // an empty undo log.
+            sp.push(SavepointLevel {
+                name: name.to_ascii_lowercase(),
+                base: level.base.clone(),
+                pages: std::collections::HashMap::default(),
+            });
+            let keep_depth = sp.len();
             self.savepoint_depth.store(keep_depth, Ordering::Release);
             (level.pages, level.base)
         };
@@ -566,6 +584,10 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
+            // Never truncate: an existing database file's pages must be
+            // preserved (we open, read the header, and cache pages on
+            // demand); truncation would destroy the database.
+            .truncate(false)
             .open(&path)?;
 
         let pager = Self {
@@ -675,6 +697,17 @@ impl Pager {
             return Err(Error::corruption("invalid magic header"));
         }
         let page_size = FileHeader::page_size(&header)?;
+        // Validate before trusting it: a corrupted page-size field (bit
+        // flip, torn write) otherwise poisons every later Page allocation
+        // (a 0-byte page panics on first page_type(), a 4864-byte page
+        // misaligns every b-tree read). SQLite applies the same constraint
+        // on open: power of two, 512..=65536.
+        if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+            return Err(Error::corruption(format!(
+                "invalid page size {} (must be a power of two in 512..=65536)",
+                page_size
+            )));
+        }
         self.page_size.store(page_size, Ordering::Release);
         let n_pages = FileHeader::db_size_pages(&header);
         let freelist_head = u32::from_le_bytes(header[20..24].try_into().unwrap());
@@ -763,6 +796,18 @@ impl Pager {
     /// `allocate_page` without growing the file).
     pub fn freelist_count(&self) -> u32 {
         self.freelist_count.load(Ordering::Acquire)
+    }
+
+    /// Head page of the freelist (0 = empty). Read-only accessor for
+    /// integrity checking and diagnostics.
+    pub fn freelist_head(&self) -> PageId {
+        self.freelist_head.load(Ordering::Acquire)
+    }
+
+    /// Metadata of the underlying database file (size, mtime). Used by
+    /// `PRAGMA integrity_check` to validate the file's shape.
+    pub fn file_metadata(&self) -> Result<std::fs::Metadata> {
+        Ok(self.file.metadata()?)
     }
 
     pub fn schema_cookie(&self) -> u32 {

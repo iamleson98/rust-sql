@@ -108,7 +108,7 @@ mod concurrency_stress {
         let count = rows[0][0].as_integer();
         assert_eq!(
             count,
-            100 + n_writes_per_writer as i64,
+            100 + n_writes_per_writer,
             "final row count mismatch"
         );
     }

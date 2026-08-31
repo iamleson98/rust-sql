@@ -545,18 +545,38 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
+    /// Operator precedence, mirroring SQLite's `parse.y` declarations:
+    ///
+    /// ```text
+    /// %left OR.                                            -> 1
+    /// %left AND.                                           -> 2
+    /// %right NOT.                                          -> 3  (parser-level)
+    /// %left IS MATCH LIKE_KW BETWEEN IN ISNULL NOTNULL NE EQ. -> 4 (parser-level)
+    /// %left GT LE LT GE.                                   -> 5
+    /// %right ESCAPE.                                       -> 6  (parser-level)
+    /// %left BITAND BITOR BITXOR LSHIFT RSHIFT.             -> 7
+    /// %left PLUS MINUS.                                    -> 8
+    /// %left STAR SLASH REM.                                -> 9
+    /// %left CONCAT.                                        -> 10
+    /// %left COLLATE.                                       -> 11 (parser-level)
+    /// ```
+    ///
+    /// Note that `||` binds TIGHTER than `*`/`/`/`%` in SQLite
+    /// (`SELECT 2 || 3 * 4` is `'23' * 4` = 92), and `=`/`<>`/`IS` bind
+    /// LOOSER than `<`/`<=`/`>`/`>=` (`SELECT 0 = 1 < 0` is `0 = (1 < 0)`).
+    /// The IS-family, NOT, ESCAPE, and COLLATE levels are handled directly
+    /// in the parser (they are not `Expr::Binary` nodes).
     pub fn precedence(&self) -> u8 {
         use BinaryOp::*;
         match self {
             Or => 1,
             And => 2,
-            Eq | NotEq | Lt | LtEq | Gt | GtEq => 3,
-            BitOr => 4,
-            BitXor => 5,
-            BitAnd => 6,
-            ShiftLeft | ShiftRight => 7,
-            Add | Sub | Concat => 8,
+            Eq | NotEq => 4,
+            Lt | LtEq | Gt | GtEq => 5,
+            BitOr | BitXor | BitAnd | ShiftLeft | ShiftRight => 7,
+            Add | Sub => 8,
             Mul | Div | Mod => 9,
+            Concat => 10,
         }
     }
 }

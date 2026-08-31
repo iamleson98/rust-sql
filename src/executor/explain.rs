@@ -31,6 +31,24 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             let a = alias_of(alias, &table.name);
             push_row(parent, rows, next_id, format!("SEARCH {a} USING INTEGER PRIMARY KEY (rowid=?)"));
         }
+        Plan::IndexIn { table, alias, index, key_exprs, .. } => {
+            let a = alias_of(alias, &table.name);
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {} USING INDEX {} ({} IN values)", a, index.name, key_exprs.len()),
+            );
+        }
+        Plan::RowidIn { table, alias, values, .. } => {
+            let a = alias_of(alias, &table.name);
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {} USING INTEGER PRIMARY KEY (rowid IN {} values)", a, values.len()),
+            );
+        }
         Plan::RowidRange { table, alias, start, end, .. } => {
             let a = alias_of(alias, &table.name);
             let lo = if start.is_some() { "rowid>?" } else { "" };

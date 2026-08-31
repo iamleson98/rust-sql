@@ -187,7 +187,7 @@ fn bench_point_lookup() -> Result {
         for i in 1..=n {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
             let mut rows = stmt.query(params![i]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
 
@@ -213,7 +213,7 @@ fn bench_range_scan() -> Result {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
 
@@ -239,7 +239,7 @@ fn bench_aggregate() -> Result {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
 
@@ -265,7 +265,7 @@ fn bench_count_star() -> Result {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
 
@@ -310,7 +310,7 @@ fn bench_concurrent_8_readers() -> Result {
                     let guard = conn.lock().unwrap();
                     let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                     let mut rows = stmt.query(params![id]).unwrap();
-                    while let Some(_) = rows.next().unwrap() {}
+                    while rows.next().unwrap().is_some() {}
                 }
             }));
         }
@@ -389,7 +389,7 @@ fn bench_mixed_rw_4r_1w() -> Result {
                     let guard = conn.lock().unwrap();
                     let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                     let mut rows = stmt.query(params![id]).unwrap();
-                    while let Some(_) = rows.next().unwrap() {}
+                    while rows.next().unwrap().is_some() {}
                 }
             }));
         }

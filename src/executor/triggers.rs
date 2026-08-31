@@ -160,12 +160,11 @@ pub(crate) fn has_triggers_for(
 ) -> bool {
     let triggers = ctx.catalog().triggers_on_table(&table.name);
     triggers.iter().any(|t| {
-        t.events.iter().any(|e| match (e, event) {
-            (TriggerEvent::Insert, TriggerEvent::Insert) => true,
-            (TriggerEvent::Delete, TriggerEvent::Delete) => true,
-            (TriggerEvent::Update(_), TriggerEvent::Update(_)) => true,
-            _ => false,
-        })
+        t.events
+            .iter()
+            .any(|e| matches!((e, event), (TriggerEvent::Insert, TriggerEvent::Insert)
+                | (TriggerEvent::Delete, TriggerEvent::Delete)
+                | (TriggerEvent::Update(_), TriggerEvent::Update(_))))
     })
 }
 

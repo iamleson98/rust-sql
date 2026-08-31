@@ -85,11 +85,11 @@ mod corr {
     }
 
     thread_local! {
-        static CORR: RefCell<CorrState> = RefCell::new(CorrState {
+        static CORR: RefCell<CorrState> = const { RefCell::new(CorrState {
             ctx: std::ptr::null_mut(),
             depth: 0,
             outer: Vec::new(),
-        });
+        }) };
     }
 
     /// Install the execution bridge for a statement. Nested installs (an
@@ -103,7 +103,12 @@ mod corr {
             // SAFETY: the pointer is erased to 'static only for storage;
             // it is only dereferenced while `guard` is alive, which the
             // caller keeps on the same stack frame as the real borrow.
-            let erased = ctx as *mut ExecContext<'static>;
+            // Lifetime erasure for the thread-local: the pointee type is
+            // identical, only the lifetime parameter widens to 'static
+            // (the guard keeps the real borrow alive on the caller's
+            // stack). `.cast()` is the method form of the same pointer
+            // conversion.
+            let erased = ctx.cast::<ExecContext<'static>>();
             let installed = CORR.with(|c| {
                 let mut c = c.borrow_mut();
                 c.depth += 1;
@@ -431,7 +436,7 @@ pub struct ExecContext<'a> {
     /// Materialized CTEs of the statement being executed — consulted by
     /// subquery planning (exec_select_statement) so `IN (SELECT .. FROM cte)`
     /// inside a WITH statement resolves the CTE.
-    pub ctes: Option<HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>>,
+    pub ctes: Option<HashMap<String, crate::types::CteMaterialization>>,
     /// Current trigger-firing depth (guards runaway recursion).
     pub trigger_depth: u32,
     /// Marker to keep the lifetime.
@@ -656,17 +661,29 @@ impl<'a> ExecContext<'a> {
     /// `get_or_scan_max_rowid` seeds it) instead of re-allocating the key
     /// String on every inserted row.
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
-        // Fast path: local entry exists (seeded by get_or_scan_max_rowid's
-        // copy-on-read, or written earlier in this statement) — update in
-        // place. This is the INSERT hot path: the rowid always advances
-        // the max, so no unchanged-check is worthwhile.
+        // Monotonic: the max-rowid cache may only ever be RAISED. It feeds
+        // `next_auto_rowid` (max + 1), which is only collision-free when it
+        // is an upper bound of the rowids actually in the table. Lowering
+        // it (e.g. after `INSERT INTO t (rowid, ...) VALUES (5, ...)` into
+        // a table whose max is 100) would make the next auto-allocated
+        // rowid collide with an existing row — SQLite keeps the true max
+        // and so must we. DELETE of the max rowid invalidates the entry
+        // entirely (see `invalidate_max_rowid_if_deleted`), which is the
+        // only legitimate way the cached max shrinks.
         if let Some(v) = self.max_rowids.get_mut(table_name_lc) {
-            *v = rowid;
-            self.max_rowids_changed = true;
+            if rowid > *v {
+                *v = rowid;
+                self.max_rowids_changed = true;
+            }
             return;
         }
-        if self.shared.max_rowids.get(table_name_lc) == Some(&rowid) {
-            // Already at this value in the shared snapshot — nothing to do.
+        if let Some(&shared_max) = self.shared.max_rowids.get(table_name_lc) {
+            if rowid > shared_max {
+                self.max_rowids.insert(table_name_lc.to_string(), rowid);
+                self.max_rowids_changed = true;
+            }
+            // rowid <= shared_max: the shared snapshot is already an upper
+            // bound — recording a lower local value would poison allocation.
             return;
         }
         self.max_rowids.insert(table_name_lc.to_string(), rowid);
@@ -806,6 +823,12 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             rows: rows.as_ref().clone(),
         }),
         Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
+        Plan::RowidIn { table, alias: _, values, residual } => {
+            exec_rowid_in(ctx, table.clone(), values, residual.as_ref())
+        }
+        Plan::IndexIn { table, alias: _, index, key_exprs, residual } => {
+            exec_index_in(ctx, table.clone(), index.clone(), key_exprs, residual.as_ref())
+        }
         Plan::RowidRange { table, alias: _, start, end, residual } => exec_rowid_range(ctx, table.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
         Plan::IndexRange { table, alias, index, start, end, residual } => exec_index_range(ctx, table.clone(), alias.clone(), index.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
@@ -1381,6 +1404,22 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                 }
             }
             Plan::RowidLookup { rowid, .. } => out.push(rowid),
+            Plan::RowidIn { values, residual, .. } => {
+                for v in values.iter() {
+                    out.push(v);
+                }
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
+            Plan::IndexIn { key_exprs, residual, .. } => {
+                for k in key_exprs.iter() {
+                    out.push(k);
+                }
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
             Plan::RowidRange { start, end, residual, .. } => {
                 if let Some(s) = start.as_ref() {
                     out.push(s);
@@ -1508,6 +1547,22 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         }
         Plan::RowidLookup { rowid, .. } => {
             rewrite_expr_in_place(rowid, ctx)?;
+        }
+        Plan::RowidIn { values, residual, .. } => {
+            for v in values.iter_mut() {
+                rewrite_expr_in_place(v, ctx)?;
+            }
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
+            }
+        }
+        Plan::IndexIn { key_exprs, residual, .. } => {
+            for k in key_exprs.iter_mut() {
+                rewrite_expr_in_place(k, ctx)?;
+            }
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
+            }
         }
         Plan::RowidRange { start, end, residual, .. } => {
             if let Some(s) = start.as_mut() {
@@ -2049,11 +2104,7 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         }
         Expr::Cast { expr, .. } => collect_expr_refs(expr, out),
         Expr::Collate { expr, .. } => collect_expr_refs(expr, out),
-        Expr::Raise { message, .. } => {
-            if let Some(m) = message {
-                collect_expr_refs(m, out);
-            }
-        }
+        Expr::Raise { message: Some(m), .. } => collect_expr_refs(m, out),
         _ => {}
     }
 }
@@ -2093,11 +2144,9 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
             out.push(sel);
             collect_nested_selects(sel, out);
         }
-        Expr::In { source, .. } => {
-            if let InSource::Subquery(sel) = source {
-                out.push(sel);
-                collect_nested_selects(sel, out);
-            }
+        Expr::In { source: InSource::Subquery(sel), .. } => {
+            out.push(sel);
+            collect_nested_selects(sel, out);
         }
         Expr::Binary { left, right, .. } => {
             collect_expr_selects(left, out);
@@ -2396,7 +2445,7 @@ fn resolve_column_index(
                 let n_lower = n.to_ascii_lowercase();
                 if n_lower.as_str().get(tl.len()..tl.len() + 1) == Some(".")
                     && n_lower[..tl.len()] == tl
-                    && &n_lower[tl.len() + 1..] == &nl
+                    && n_lower[tl.len() + 1..] == nl
                 {
                     return Some(i);
                 }
@@ -2458,10 +2507,36 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
     let columns = inner.columns.clone();
+
+    // Ordinal validation up front: `ORDER BY <positive int K>` means the
+    // K-th OUTPUT column (SQLite semantics). A comparator closure cannot
+    // return Err, so out-of-range ordinals must be rejected before the
+    // sort begins. (Negative or zero literals are constants — SQLite
+    // treats them as no-op sort terms, not errors.)
+    //
+    // This is the execution-time half of ordinal resolution; the planner
+    // resolves ordinals against explicit projections, and this path serves
+    // star projections, compound (UNION/EXCEPT/INTERSECT) bodies and
+    // subqueries — every shape where the sort's input width equals the
+    // SELECT's output width.
+    let row_width = inner.rows.first().map_or(0, |r| r.len());
+    if row_width > 0 {
+        for term in terms {
+            if let Expr::Literal(Value::Integer(k)) = &term.expr {
+                if *k >= 1 && (*k as usize) > row_width {
+                    return Err(Error::semantic(format!(
+                        "{}st ORDER BY term out of range ({} output columns)",
+                        k, row_width
+                    )));
+                }
+            }
+        }
+    }
+
     inner.rows.sort_by(|a, b| {
         for term in terms {
-            let va = eval_row(&term.expr, a, &columns, params, named_params).unwrap_or(Value::Null);
-            let vb = eval_row(&term.expr, b, &columns, params, named_params).unwrap_or(Value::Null);
+            let va = sort_key(&term.expr, a, &columns, params, named_params);
+            let vb = sort_key(&term.expr, b, &columns, params, named_params);
             let ord = va.cmp(&vb);
             let ord = if term.order == Order::Desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
@@ -2471,6 +2546,29 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         std::cmp::Ordering::Equal
     });
     Ok(inner)
+}
+
+/// Evaluate one ORDER BY term for one row. Handles the two key shapes:
+/// - `Expr::Literal(Integer(k))` with k >= 1 — the ordinal form: the k-th
+///   column of the row itself (`ORDER BY 1, 2`).
+/// - anything else — ordinary expression evaluation against the row.
+///
+/// Ordinals were range-validated by `exec_sort` before sorting, so a
+/// missing index here degrades to NULL rather than panicking.
+#[inline]
+fn sort_key(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Value {
+    if let Expr::Literal(Value::Integer(k)) = expr {
+        if *k >= 1 {
+            return row.get(*k as usize - 1).cloned().unwrap_or(Value::Null);
+        }
+    }
+    eval_row(expr, row, columns, params, named_params).unwrap_or(Value::Null)
 }
 
 // ============================================================================
@@ -2604,17 +2702,13 @@ impl AggFunc {
 /// hundred ns PER ROW. This costs one hash per row and zero allocations
 /// after warmup (each bucket Vec amortizes), and preserves first-seen
 /// group order exactly like the old implementation.
+#[derive(Default)]
 struct HashGrouper {
     buckets: HashMap<u64, Vec<usize>>,
     /// (key values, per-aggregate states) in first-seen order.
     groups: Vec<(Vec<Value>, Vec<AggState>)>,
 }
 
-impl Default for HashGrouper {
-    fn default() -> Self {
-        Self { buckets: HashMap::new(), groups: Vec::new() }
-    }
-}
 
 impl HashGrouper {
     /// Find or create the group for `key`, returning its index.
@@ -2735,7 +2829,18 @@ fn exec_aggregate_streaming_scan(
         .iter()
         .map(|e| match e {
             Expr::Column { table: ref_t, name } => {
-                let matches = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+                let matches = ref_t.as_ref().map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                }).unwrap_or(true);
                 if matches {
                     table.find_column(name)
                 } else {
@@ -2749,7 +2854,18 @@ fn exec_aggregate_streaming_scan(
         .iter()
         .map(|agg| match &agg.arg {
             Some(Expr::Column { table: ref_t, name }) => {
-                let matches = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+                let matches = ref_t.as_ref().map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                }).unwrap_or(true);
                 if matches {
                     table.find_column(name)
                 } else {
@@ -2960,7 +3076,18 @@ fn exec_aggregate_no_group_by(
         if let Some(arg) = &agg.arg {
             if let Expr::Column { table: ref_t, name } = arg {
                 // Verify the table matches (or is None).
-                let matches = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+                let matches = ref_t.as_ref().map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                }).unwrap_or(true);
                 if matches {
                     if let Some(idx) = table.find_column(name) {
                         agg_col_indices.push(Some(idx));
@@ -3085,7 +3212,7 @@ fn exec_aggregate_no_group_by(
         wanted.dedup();
 
         // Build column names only for the wanted columns (used by filter eval).
-        let wanted_names: Option<Vec<String>> = if let Some(_) = filter_predicate {
+        let wanted_names: Option<Vec<String>> = if filter_predicate.is_some() {
             // The filter eval path needs `col_names` to match row indices.
             // Build the full col_names vec since eval_row expects all cols.
             Some(table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect())
@@ -3230,7 +3357,18 @@ fn expr_only_columns(expr: &Expr, table: &Table, prefix: &str) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) => true,
         Expr::Column { table: ref_t, name } => {
-            let matches_t = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+            let matches_t = ref_t.as_ref().map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                }).unwrap_or(true);
             matches_t && table.find_column(name).is_some()
         }
         Expr::Binary { left, right, .. } => {
@@ -3271,7 +3409,18 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) => {}
         Expr::Column { table: ref_t, name } => {
-            let matches_t = ref_t.as_ref().map(|t| t == &table.name || t == prefix).unwrap_or(true);
+            let matches_t = ref_t.as_ref().map(|t| {
+                    // SQL scoping: an alias REPLACES the table name —
+                    // `t.col` must NOT bind to a `FROM t t2` instance
+                    // (otherwise a correlated reference to an outer
+                    // un-aliased `t` is silently captured by the inner
+                    // alias and compared against itself).
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                }).unwrap_or(true);
             if matches_t {
                 if let Some(idx) = table.find_column(name) {
                     out.push(idx);
@@ -3339,8 +3488,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                 let root = ctx.table_root(table);
                 let mut bt = Btree::new(ctx.pager, root, false);
                 let n = bt.count_rows()?;
-                let mut row = Vec::with_capacity(1);
-                row.push(Value::Integer(n as i64));
+                let row: Vec<Value> = vec![Value::Integer(n as i64)];
                 return Ok(ExecResult {
                     columns: Arc::from(vec!["__agg_0".to_string()]),
                     rows: vec![row],
@@ -3383,8 +3531,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
             let root = ctx.table_root(table);
             let mut bt = Btree::new(ctx.pager, root, false);
             let n = bt.count_rows_range(start_v, end_v)?;
-            let mut row = Vec::with_capacity(1);
-            row.push(Value::Integer(n as i64));
+            let row: Vec<Value> = vec![Value::Integer(n as i64)];
             return Ok(ExecResult {
                 columns: Arc::from(vec!["__agg_0".to_string()]),
                 rows: vec![row],
@@ -3471,8 +3618,7 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                 n += 1;
                 true
             })?;
-            let mut row = Vec::with_capacity(1);
-            row.push(Value::Integer(n));
+            let row: Vec<Value> = vec![Value::Integer(n)];
             return Ok(ExecResult {
                 columns: Arc::from(vec!["__agg_0".to_string()]),
                 rows: vec![row],
@@ -3591,11 +3737,10 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
     // entirely. The key is a `SqlValueKey` (a Value clone — free for
     // Integer/Real) instead of the old `format!("{:?}")` String, saving
     // a heap allocation per row for DISTINCT aggregates.
-    if distinct {
-        if !state.distinct.insert(SqlValueKey(v.clone())) {
+    if distinct
+        && !state.distinct.insert(SqlValueKey(v.clone())) {
             return;
         }
-    }
     // Only mark "seen_value" for non-NULL inputs. This makes SUM of all
     // NULLs return NULL (matching SQLite), rather than the previous
     // behavior of returning Integer(0) because seen_value was set
@@ -3638,27 +3783,24 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
             }
         }
         AggFunc::Min => {
-            if !v.is_null() {
-                if state.min.is_none() || v < state.min.as_ref().unwrap() {
+            if !v.is_null()
+                && (state.min.is_none() || v < state.min.as_ref().unwrap()) {
                     state.min = Some(v.clone());
                 }
-            }
         }
         AggFunc::Max => {
-            if !v.is_null() {
-                if state.max.is_none() || v > state.max.as_ref().unwrap() {
+            if !v.is_null()
+                && (state.max.is_none() || v > state.max.as_ref().unwrap()) {
                     state.max = Some(v.clone());
                 }
-            }
         }
-        AggFunc::GroupConcat => {
-            if !v.is_null() {
+        AggFunc::GroupConcat
+            if !v.is_null() => {
                 if !state.concat.is_empty() {
                     state.concat.push(',');
                 }
                 state.concat.push_str(&v.as_text());
             }
-        }
         _ => {}
     }
 }
@@ -3709,7 +3851,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
         let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
         let mut partition_map: HashMap<String, usize> = HashMap::new();
         for (i, row) in inner.rows.iter().enumerate() {
-            let key: Vec<Value> = w.partition_by.iter().map(|e| eval_row(e, row, &inner.columns, &params, &named_params)).collect::<Result<_>>()?;
+            let key: Vec<Value> = w.partition_by.iter().map(|e| eval_row(e, row, &inner.columns, params, named_params)).collect::<Result<_>>()?;
             let key_str = key.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join("|");
             if let Some(&idx) = partition_map.get(&key_str) {
                 partitions[idx].1.push(i);
@@ -3723,8 +3865,8 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
             let mut sorted_indices = indices.clone();
             if !w.order_by.is_empty() {
                 sorted_indices.sort_by(|a, b| {
-                    let va = eval_row(&w.order_by[0].expr, &inner.rows[*a], &inner.columns, &params, &named_params).unwrap_or(Value::Null);
-                    let vb = eval_row(&w.order_by[0].expr, &inner.rows[*b], &inner.columns, &params, &named_params).unwrap_or(Value::Null);
+                    let va = eval_row(&w.order_by[0].expr, &inner.rows[*a], &inner.columns, params, named_params).unwrap_or(Value::Null);
+                    let vb = eval_row(&w.order_by[0].expr, &inner.rows[*b], &inner.columns, params, named_params).unwrap_or(Value::Null);
                     let ord = va.cmp(&vb);
                     if w.order_by[0].order == Order::Desc { ord.reverse() } else { ord }
                 });
@@ -3738,7 +3880,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
             for (pos_in_partition, &row_idx) in sorted_indices.iter().enumerate() {
                 row_num = (pos_in_partition + 1) as i64;
                 let row = &inner.rows[row_idx];
-                let key: Vec<Value> = w.order_by.iter().map(|t| eval_row(&t.expr, row, &inner.columns, &params, &named_params)).collect::<Result<_>>()?;
+                let key: Vec<Value> = w.order_by.iter().map(|t| eval_row(&t.expr, row, &inner.columns, params, named_params)).collect::<Result<_>>()?;
                 if prev_key.as_ref() != Some(&key) {
                     rank += count_in_rank + 1;
                     count_in_rank = 0;
@@ -3747,7 +3889,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
                 count_in_rank += 1;
                 prev_key = Some(key);
 
-                let val = compute_window_value(w, row_num, rank, dense_rank, row, &inner.columns, &params, &named_params)?;
+                let val = compute_window_value(w, row_num, rank, dense_rank, row, &inner.columns, params, named_params)?;
                 if extra_cols[row_idx].is_empty() {
                     extra_cols[row_idx] = vec![Value::Null; windows.len()];
                 }
@@ -3759,7 +3901,7 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
     // Append window columns to each row.
     for (i, row) in inner.rows.iter_mut().enumerate() {
         if !extra_cols[i].is_empty() {
-            row.extend(extra_cols[i].drain(..));
+            row.append(&mut extra_cols[i]);
         }
     }
 
@@ -4173,7 +4315,7 @@ fn exec_hash_join(
                 }
                 let bi = n as usize;
                 let build_row = &build_rows[bi];
-                if residual.is_some() {
+                if let Some(res) = residual {
                     // Residual predicates need the FULL combined row.
                     let mut combined: Row = Vec::with_capacity(n_left + n_right);
                     if probe_is_left {
@@ -4183,11 +4325,8 @@ fn exec_hash_join(
                         combined.extend_from_slice(build_row);
                         combined.extend_from_slice(probe_row);
                     }
-                    let ok = {
-                        let v = eval_row(residual.unwrap(), &combined, &combined_cols, &params, &named_params)?;
-                        v.is_truthy()
-                    };
-                    if ok {
+                    let v = eval_row(res, &combined, &combined_cols, &params, &named_params)?;
+                    if v.is_truthy() {
                         emit_row(&mut out_rows, proj_indices, probe_row, build_row, probe_is_left, n_left, out_width);
                         matched = true;
                         build_matched[bi] = true;
@@ -4538,11 +4677,25 @@ fn exec_index_nested_loop_join(
     let mut inner_index_root = ctx.index_root(&inner_index);
     let outer_width = outer_res.columns.len();
     let total_width = outer_width + n_inner_cols;
+    // Selective inner decode: when the fused projection only needs some
+    // inner columns, decode JUST those (skip the rest — the row codec's
+    // selective decoder walks the serial types without allocating Values
+    // for un-projected columns). Indices are per-table (0..n_inner_cols).
+    let fused_inner_cols: Option<Vec<usize>> = fused.as_ref().and_then(|(indices, _)| {
+        let mut inner_idx: Vec<usize> = indices
+            .iter()
+            .filter_map(|&i| i.checked_sub(outer_width))
+            .collect();
+        if inner_idx.is_empty() {
+            // No inner columns needed at all — an index-only join (rare).
+            None
+        } else {
+            inner_idx.sort_unstable();
+            inner_idx.dedup();
+            Some(inner_idx)
+        }
+    });
     let mut key_buf: Vec<u8> = Vec::with_capacity(16);
-    // Dedup set, allocated lazily ONLY when a probe returns multiple
-    // rowids (defensive against index corruption; single-rowid probes —
-    // the overwhelmingly common case — skip the HashSet allocation).
-    let mut seen: Option<std::collections::HashSet<i64>> = None;
 
     for outer_row in &outer_res.rows {
         // Extract the join key from the outer row.
@@ -4565,40 +4718,92 @@ fn exec_index_nested_loop_join(
 
         // Fetch each matching row from the inner table, decoding directly
         // under the page lock (no intermediate payload Vec copy).
-        let dedup_needed = rowids.len() > 1;
+        //
+        // No dedup set: index entries are (key, rowid) pairs, unique by
+        // B+tree construction, so ONE key's lookup yields each rowid at
+        // most once. (A corrupted index producing duplicates is
+        // `PRAGMA integrity_check`'s to report, not the join's to paper
+        // over — and it saves a HashSet allocation per multi-row key.)
         for rowid in rowids {
-            if dedup_needed {
-                let set = seen.get_or_insert_with(std::collections::HashSet::new);
-                if !set.insert(rowid) {
-                    continue;
-                }
-            }
             let mut table_bt = Btree::new(ctx.pager, inner_root, false);
-            if let Some(inner_row) = table_bt.lookup_table_with(rowid, |payload| {
-                decode_row(payload, n_inner_cols, rowid, inner_table.rowid_alias)
-            })? {
-                match &fused {
-                    Some((indices, _)) => {
-                        // Emit ONLY the projected columns.
+            match &fused_inner_cols {
+                Some(wanted) => {
+                    // Fused + selective: decode ONLY the needed inner
+                    // columns into a small buffer, then MOVE the values
+                    // into the output row (a decoded inner row is consumed
+                    // by exactly one output row — cloning its Text values
+                    // was a pure waste).
+                    // Decode into a reused buffer — no per-row Vec
+                    // allocation (the closure borrows it; the found/not-found
+                    // signal comes from lookup_table_with's Option).
+                    let mut inner_vals: Row = Vec::with_capacity(wanted.len());
+                    let found = table_bt.lookup_table_with(rowid, |payload| {
+                        decode_row_selective(
+                            payload,
+                            n_inner_cols,
+                            wanted,
+                            rowid,
+                            inner_table.rowid_alias,
+                            &mut inner_vals,
+                        )
+                    })?;
+                    if found.is_some() {
+                        let sel = &mut inner_vals;
+                        let (indices, _) = fused.as_ref().unwrap();
                         let mut out: Row = Vec::with_capacity(indices.len());
                         for &i in indices {
-                            let v = if i < outer_width {
-                                &outer_row[i]
+                            if i < outer_width {
+                                // Outer row values are shared across all
+                                // matching inner rows — clone (the source
+                                // row outlives this iteration).
+                                out.push(outer_row[i].clone());
                             } else {
-                                &inner_row[i - outer_width]
-                            };
-                            out.push(v.clone());
+                                // Inner values: find the decoded slot for
+                                // this inner column (wanted is sorted+dedup'd).
+                                let inner_col = i - outer_width;
+                                match wanted.binary_search(&inner_col) {
+                                    Ok(slot) => {
+                                        // Move out of the decoded row.
+                                        out.push(std::mem::replace(
+                                            &mut sel[slot],
+                                            Value::Null,
+                                        ));
+                                    }
+                                    Err(_) => out.push(Value::Null),
+                                }
+                            }
                         }
                         out_rows.push(out);
                     }
-                    None => {
-                        // Single allocation for the combined row (was: clone the
-                        // outer row into a fresh Vec, then grow it with extend —
-                        // two allocations and two copies per output row).
-                        let mut combined: Row = Vec::with_capacity(total_width);
-                        combined.extend_from_slice(outer_row);
-                        combined.extend_from_slice(&inner_row);
-                        out_rows.push(combined);
+                }
+                None => {
+                    if let Some(inner_row) = table_bt.lookup_table_with(rowid, |payload| {
+                        decode_row(payload, n_inner_cols, rowid, inner_table.rowid_alias)
+                    })? {
+                        match &fused {
+                            Some((indices, _)) => {
+                                // Emit ONLY the projected columns.
+                                let mut out: Row = Vec::with_capacity(indices.len());
+                                for &i in indices {
+                                    let v = if i < outer_width {
+                                        &outer_row[i]
+                                    } else {
+                                        &inner_row[i - outer_width]
+                                    };
+                                    out.push(v.clone());
+                                }
+                                out_rows.push(out);
+                            }
+                            None => {
+                                // Single allocation for the combined row (was: clone the
+                                // outer row into a fresh Vec, then grow it with extend —
+                                // two allocations and two copies per output row).
+                                let mut combined: Row = Vec::with_capacity(total_width);
+                                combined.extend_from_slice(outer_row);
+                                combined.extend_from_slice(&inner_row);
+                                out_rows.push(combined);
+                            }
+                        }
                     }
                 }
             }
@@ -4704,6 +4909,139 @@ fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &
 }
 
 // ============================================================================
+// RowidIn (WHERE id IN (?, ?, ...))
+// ============================================================================
+
+/// Batched rowid multi-lookup: evaluate the IN-list, sort + dedup the
+/// rowids, then seek each row with ONE shared B+tree handle. Rows are
+/// emitted in rowid order (ascending), like SQLite's rowid IN seek order.
+///
+/// Non-integer list members are skipped (SQLite's `id IN (1, 'x')` never
+/// matches a row for 'x'); NULLs contribute no rows. If a rowid is absent
+/// from the table it is simply skipped — IN semantics need no error.
+fn exec_rowid_in(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    values: &[Expr],
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+
+    // Evaluate the list ONCE (not per row — this is the whole point: the
+    // old full-scan + Filter path evaluated the IN predicate 10k times).
+    let mut rowids: Vec<i64> = Vec::with_capacity(values.len());
+    for e in values {
+        let v = evaluate(e, &eval_ctx)?;
+        // Text/blob/real members can never equal an integer rowid; skip
+        // them rather than erroring (SQLite IN semantics: type-mismatched
+        // members just don't match).
+        if let Value::Integer(i) = v {
+            rowids.push(i);
+        }
+    }
+    rowids.sort_unstable();
+    rowids.dedup();
+
+    let root = ctx.table_root(&table);
+    // ONE B+tree handle for all seeks (the root page stays cached in the
+    // pager; each seek then pays only the interior/leaf descent).
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let n_cols = table.n_columns();
+    let alias = table.rowid_alias;
+    let mut rows: Vec<Row> = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        if let Some(row) = bt.lookup_table_with(rowid, |payload| {
+            decode_row(payload, n_cols, rowid, alias)
+        })? {
+            // Residual predicate (e.g. `id IN (...) AND name = 'x'`).
+            if let Some(pred) = residual {
+                let v = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                if !v.is_truthy() {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+    }
+    Ok(ExecResult {
+        columns: table.col_names.clone(),
+        rows,
+    })
+}
+
+// ============================================================================
+// IndexIn (WHERE indexed_col IN (?, ?, ...))
+// ============================================================================
+
+/// Batched secondary-index multi-lookup: evaluate each key, seek the index
+/// once per key, collect the matching rowids, and fetch the rows in one
+/// sorted pass. Rows are emitted in rowid order per seek group (index
+/// order), matching SQLite's seek-per-member behavior.
+fn exec_index_in(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    index: Arc<crate::schema::Index>,
+    key_exprs: &[Expr],
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+
+    let index_root = ctx.index_root(&index);
+    let mut index_bt = Btree::new(ctx.pager, index_root, true);
+    let table_root = ctx.table_root(&table);
+    let mut table_bt = Btree::new(ctx.pager, table_root, false);
+    let n_cols = table.n_columns();
+    let alias = table.rowid_alias;
+
+    let mut key_buf: Vec<u8> = Vec::with_capacity(16);
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Evaluate ALL keys up front and dedup the ORDER-KEY BYTES: distinct
+    // keys can't overlap (one row holds one value), but a repeated literal
+    // (`k IN (1, 1)`) must seek only once — SQLite dedups IN lists the
+    // same way. Deduping on the encoded key is type-exact.
+    let mut encoded_keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
+    for e in key_exprs {
+        let v = evaluate(e, &eval_ctx)?;
+        // NULL keys never match an index entry (SQLite semantics); other
+        // types are encoded order-preservingly and simply miss.
+        if v.is_null() {
+            continue;
+        }
+        key_buf.clear();
+        v.encode_order_key_into(&mut key_buf);
+        encoded_keys.push(key_buf.clone());
+    }
+    encoded_keys.sort();
+    encoded_keys.dedup();
+
+    for key_buf in &encoded_keys {
+        let rowids = index_bt.lookup_index(key_buf)?;
+        for rowid in rowids {
+            if let Some(row) = table_bt.lookup_table_with(rowid, |payload| {
+                decode_row(payload, n_cols, rowid, alias)
+            })? {
+                if let Some(pred) = residual {
+                    let pv = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                    if !pv.is_truthy() {
+                        continue;
+                    }
+                }
+                rows.push(row);
+            }
+        }
+    }
+    Ok(ExecResult {
+        columns: table.col_names.clone(),
+        rows,
+    })
+}
+
+// ============================================================================
 // RowidRange (WHERE id BETWEEN ? AND ?, id > ?, id < ?, id >= ?, id <= ?)
 // ============================================================================
 
@@ -4786,7 +5124,7 @@ const IDENTITY_POSITIONS: &[usize] = &{
 /// decode the full row in table order) and `Some(indices)` means decode only
 /// those table column indices. Returns None unless EVERY projection expr is
 /// a bare column of the table (or the single "*" pseudo-column).
-fn bare_column_projection(columns: &[ProjectExpr], table: &Table) -> Option<(Option<Vec<usize>>, Arc<[String]>)> {
+fn bare_column_projection(columns: &[ProjectExpr], table: &Table) -> Option<crate::types::ProjectionMapping> {
     if columns.len() == 1 {
         if let Expr::Column { name, .. } = &columns[0].expr {
             if name == "*" {
@@ -5093,10 +5431,8 @@ fn exec_index_range(
             }
             true
         })?;
-        for slot in placed {
-            if let Some(row) = slot {
-                rows.push(row);
-            }
+        for row in placed.into_iter().flatten() {
+            rows.push(row);
         }
     } else {
         for rowid in rowids {
@@ -5155,6 +5491,26 @@ impl IndexMaintState {
             }
         }
         &self.key_buf
+    }
+}
+
+/// Sentinel column index in INSERT target lists meaning "the rowid
+/// pseudo-column" (`INSERT INTO t (rowid, ...)` on a table without an
+/// INTEGER PRIMARY KEY alias). Never a valid real column index.
+pub(crate) const ROWID_COLUMN_SENTINEL: usize = usize::MAX;
+
+/// Extract an explicit rowid from a supplied value: integers pass through,
+/// integral REALs convert exactly (2^63 is representable), NULL means
+/// auto-assign, anything else is an error.
+fn rowid_from_value(v: &Value) -> Result<Option<i64>> {
+    match v {
+        Value::Integer(r) => Ok(Some(*r)),
+        Value::Null => Ok(None),
+        Value::Real(f) if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 => {
+            Ok(Some(*f as i64))
+        }
+        Value::Real(f) if *f == 9_223_372_036_854_775_808.0 => Ok(Some(i64::MIN)), // 2^63 wraps to MIN in SQLite's conversion
+        _ => Err(Error::semantic("rowid must be an integer")),
     }
 }
 
@@ -5238,10 +5594,15 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
                 *v = Value::Null;
             }
             let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let mut explicit_rowid: Option<i64> = None;
             for (i, expr) in exprs.iter().enumerate() {
                 if i < target_indices.len() {
                     let col_idx = target_indices[i];
                     let val = evaluate(expr, &eval_ctx)?;
+                    if col_idx == ROWID_COLUMN_SENTINEL {
+                        explicit_rowid = rowid_from_value(&val)?;
+                        continue;
+                    }
                     let affinity = table.columns[col_idx].affinity;
                     full_row[col_idx] = affinity.coerce(val);
                 }
@@ -5262,8 +5623,11 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             let mut rowid_autogen = false;
             if let Some(idx) = table.rowid_alias {
                 if full_row[idx].is_null() {
-                    max_rowid += 1;
-                    full_row[idx] = Value::Integer(max_rowid);
+                    let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
+                    if r > max_rowid {
+                        max_rowid = r;
+                    }
+                    full_row[idx] = Value::Integer(r);
                     rowid_autogen = true;
                 }
             }
@@ -5301,6 +5665,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             let outcome = exec_insert_one_row(
                 ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
                 &mut full_row, &mut payload_buf, &mut index_states, on_conflict, upsert, rowid_autogen,
+                explicit_rowid,
             )?;
             let trigger_fired = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
             match outcome {
@@ -5362,9 +5727,18 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         for v in full_row.iter_mut() {
             *v = Value::Null;
         }
+        let mut explicit_rowid: Option<i64> = None;
         for (i, val) in row.iter().enumerate() {
             if i < target_indices.len() {
                 let col_idx = target_indices[i];
+                if col_idx == ROWID_COLUMN_SENTINEL {
+                    explicit_rowid = match val {
+                        Value::Integer(r) => Some(*r),
+                        Value::Null => None,
+                        _ => return Err(Error::semantic("rowid must be an integer")),
+                    };
+                    continue;
+                }
                 let affinity = table.columns[col_idx].affinity;
                 full_row[col_idx] = affinity.coerce(val.clone());
             }
@@ -5384,8 +5758,11 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
-                max_rowid += 1;
-                full_row[idx] = Value::Integer(max_rowid);
+                let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
+                if r > max_rowid {
+                    max_rowid = r;
+                }
+                full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
             }
         }
@@ -5397,6 +5774,7 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         let outcome = exec_insert_one_row(
             ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
             &mut full_row, &mut payload_buf, &mut index_states, on_conflict, upsert, rowid_autogen,
+            explicit_rowid,
         )?;
         match outcome {
             InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
@@ -5494,6 +5872,7 @@ enum InsertOutcome {
 ///     row buffer, and payload buffer are resolved ONCE for the whole
 ///     batch instead of per row,
 ///   * no AST, Plan, or statement cache.
+///
 /// `col_indices` empty = all columns in declared order.
 pub fn fast_insert_literal_rows(
     ctx: &mut ExecContext<'_>,
@@ -5522,6 +5901,7 @@ pub fn fast_insert_literal_rows(
         for v in full_row.iter_mut() {
             *v = Value::Null;
         }
+        let mut explicit_rowid: Option<i64> = None;
         if col_indices.is_empty() {
             // All columns in declared order.
             if row.len() != n_cols {
@@ -5542,6 +5922,10 @@ pub fn fast_insert_literal_rows(
                 )));
             }
             for (v, &col_idx) in row.into_iter().zip(col_indices.iter()) {
+                if col_idx == ROWID_COLUMN_SENTINEL {
+                    explicit_rowid = rowid_from_value(&v)?;
+                    continue;
+                }
                 full_row[col_idx] = table.columns[col_idx].affinity.coerce(v);
             }
         }
@@ -5551,8 +5935,11 @@ pub fn fast_insert_literal_rows(
         let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
-                max_rowid += 1;
-                full_row[idx] = Value::Integer(max_rowid);
+                let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
+                if r > max_rowid {
+                    max_rowid = r;
+                }
+                full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
             }
         }
@@ -5591,6 +5978,7 @@ pub fn fast_insert_literal_rows(
             crate::sql::ast::ConflictResolution::Abort,
             None,
             rowid_autogen,
+            explicit_rowid,
         )?;
         let ok = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
         if ok {
@@ -5652,8 +6040,11 @@ pub fn fast_insert_single_row(
     let mut rowid_autogen = false;
     if let Some(idx) = table.rowid_alias {
         if full_row[idx].is_null() {
-            max_rowid += 1;
-            full_row[idx] = Value::Integer(max_rowid);
+            let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
+            if r > max_rowid {
+                max_rowid = r;
+            }
+            full_row[idx] = Value::Integer(r);
             rowid_autogen = true;
         }
     }
@@ -5680,6 +6071,7 @@ pub fn fast_insert_single_row(
         crate::sql::ast::ConflictResolution::Abort,
         None,
         rowid_autogen,
+        None,
     )?;
     // Write back index roots that moved (splits).
     for st in index_states.iter() {
@@ -5701,10 +6093,11 @@ fn exec_insert_one_row(
     max_rowid: &mut i64,
     full_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
-    index_states: &mut Vec<IndexMaintState>,
+    index_states: &mut [IndexMaintState],
     on_conflict: ConflictResolution,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     rowid_autogen_hint: bool,
+    explicit_rowid: Option<i64>,
 ) -> Result<InsertOutcome> {
     // Compute rowid. `rowid_was_autogenerated` tracks whether WE assigned
     // the rowid (vs. the user providing it explicitly). This is used below
@@ -5716,24 +6109,38 @@ fn exec_insert_one_row(
     // The rowid may have been pre-assigned by the caller (for constraint
     // enforcement); `rowid_autogen_hint` says whether that happened.
     let rowid_was_autogenerated;
-    let rowid = if let Some(idx) = table.rowid_alias {
+    let rowid = if let Some(r) = explicit_rowid {
+        // `INSERT INTO t (rowid, ...)` on a table without an INTEGER
+        // PRIMARY KEY alias: the rowid is supplied positionally.
+        rowid_was_autogenerated = false;
+        if r > *max_rowid {
+            *max_rowid = r;
+        }
+        r
+    } else if let Some(idx) = table.rowid_alias {
         match &full_row[idx] {
             Value::Integer(i) => {
                 rowid_was_autogenerated = rowid_autogen_hint;
                 *i
             }
             Value::Null => {
-                *max_rowid += 1;
-                full_row[idx] = Value::Integer(*max_rowid);
+                let r = next_auto_rowid(ctx.pager, *current_root, *max_rowid)?;
+                if r > *max_rowid {
+                    *max_rowid = r;
+                }
+                full_row[idx] = Value::Integer(r);
                 rowid_was_autogenerated = true;
-                *max_rowid
+                r
             }
             _ => return Err(Error::semantic("rowid alias column must be an integer or NULL")),
         }
     } else {
-        *max_rowid += 1;
+        let r = next_auto_rowid(ctx.pager, *current_root, *max_rowid)?;
+        if r > *max_rowid {
+            *max_rowid = r;
+        }
         rowid_was_autogenerated = true;
-        *max_rowid
+        r
     };
 
     // Determine which constraint the UPSERT target refers to:
@@ -5792,16 +6199,27 @@ fn exec_insert_one_row(
     // UPSERT → DO NOTHING / DO UPDATE).
     let mut conflict_rowid: Option<i64> = None;
     let mut conflict_on_target = false;
-    for i in 0..index_states.len() {
-        if !index_states[i].idx.unique {
+    for (i, st) in index_states.iter_mut().enumerate() {
+        if !st.idx.unique {
+            continue;
+        }
+        // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
+        // with ANY NULL among the indexed columns is exempt from the
+        // uniqueness check, so multiple NULL rows coexist.
+        if st
+            .idx
+            .columns
+            .iter()
+            .any(|c| table.find_column(&c.name).map(|p| full_row.get(p).map(|v| v.is_null()).unwrap_or(false)).unwrap_or(false))
+        {
             continue;
         }
         // Any REPLACE/UPSERT path below mutates the index trees, so the
         // append hint may go stale — drop it (it re-pins on the next
         // plain insert).
-        index_states[i].hint = None;
-        let key_bytes = index_states[i].encode_key(full_row).to_vec();
-        let idx_root = index_states[i].root;
+        st.hint = None;
+        let key_bytes = st.encode_key(full_row).to_vec();
+        let idx_root = st.root;
         let mut ibt = Btree::new(ctx.pager, idx_root, true);
         let matches = ibt.lookup_index(&key_bytes)?;
         if !matches.is_empty() {
@@ -5991,13 +6409,13 @@ fn exec_upsert_row(
     current_root: &mut u32,
     full_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
-    index_states: &mut Vec<IndexMaintState>,
+    index_states: &mut [IndexMaintState],
     existing_rowid: i64,
     upsert: &crate::sql::ast::UpsertClause,
 ) -> Result<InsertOutcome> {
     match &upsert.action {
         crate::sql::ast::UpsertAction::DoNothing => {
-            return Ok(InsertOutcome::Skipped);
+            Ok(InsertOutcome::Skipped)
         }
         crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } => {
             // Read the existing row.
@@ -6144,6 +6562,92 @@ fn delete_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, t
 // tracks root pages inline. UPDATE and DELETE still use these, which is safe
 // because they use the catalog's root_page (which may be stale after splits
 // within the same statement — a known limitation to fix later).
+
+// ============================================================================
+// Auto-ROWID allocation (sqlite3BtreeNewRowid semantics)
+// ============================================================================
+
+/// Tiny xorshift64* PRNG for the rowid lottery taken when a table already
+/// contains the largest possible integer rowid. This path is rare enough
+/// (requires a row at i64::MAX) that a time-seeded shift register supplies
+/// plenty of entropy without pulling in a rand dependency.
+struct RowidRng(u64);
+
+impl RowidRng {
+    fn seeded() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        // xorshift64* must never start at zero.
+        RowidRng(nanos | 1)
+    }
+
+    /// Next *positive* candidate rowid (SQLite restricts the lottery to
+    /// positive candidates; see https://www.sqlite.org/autoinc.html).
+    fn next_positive(&mut self) -> i64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let r = (v >> 1) as i64; // clear the sign bit -> [0, i64::MAX]
+        if r == 0 {
+            1
+        } else {
+            r
+        }
+    }
+}
+
+/// Rowid to assign for an auto-allocated insert (NULL INTEGER PRIMARY KEY,
+/// or a rowid table with no alias). Normally `max_rowid + 1`; but when the
+/// table already holds the largest possible integer rowid, mirror SQLite:
+/// pick random positive candidates until one is unused (100 attempts),
+/// then linearly scan for the first gap in the rowid space, and finally
+/// fail gracefully instead of overflowing.
+pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> {
+    // Fast path: there is still room above the current maximum.
+    if max_rowid < i64::MAX {
+        return Ok(max_rowid + 1);
+    }
+    // Overflow lottery: random positive candidates, checked against the
+    // live tree (rows inserted earlier in this statement/transaction are
+    // already in the pager's dirty pages, so the lookup sees them).
+    let mut rng = RowidRng::seeded();
+    let mut bt = Btree::new(pager, root, false);
+    for _ in 0..100 {
+        let candidate = rng.next_positive();
+        if matches!(bt.lookup_table(candidate)?, LookupResult::NotFound) {
+            return Ok(candidate);
+        }
+    }
+    // Linear fallback: a table scan walks rowids in ascending order, so
+    // the first hole between consecutive rowids — or the slot below the
+    // smallest key — is provably unused.
+    let mut prev: Option<i64> = None;
+    let mut free: Option<i64> = None;
+    bt.scan_table(|rowid, _| {
+        match prev {
+            None => {
+                if rowid > i64::MIN {
+                    free = Some(rowid - 1);
+                    return false;
+                }
+            }
+            Some(p) => {
+                if rowid > p.wrapping_add(1) {
+                    free = Some(p + 1);
+                    return false;
+                }
+            }
+        }
+        prev = Some(rowid);
+        true
+    })?;
+    free.ok_or_else(|| Error::Runtime("table is full: every possible rowid is in use".into()))
+}
 
 fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
     let mut bt = Btree::new(pager, root, false);
@@ -6339,10 +6843,10 @@ fn try_streaming_update(
     // `*t` copies the `&Arc<Table>` field out of the match-ergonomics
     // double reference (`.clone()` on a `&&Arc` only clones the reference).
     let src_table: &Arc<Table> = match &src {
-        StreamingSource::Scan { table: t, .. } => *t,
-        StreamingSource::RowidRange { table: t, .. } => *t,
-        StreamingSource::RowidLookup { table: t, .. } => *t,
-        StreamingSource::IndexRange { table: t, .. } => *t,
+        StreamingSource::Scan { table: t, .. } => t,
+        StreamingSource::RowidRange { table: t, .. } => t,
+        StreamingSource::RowidLookup { table: t, .. } => t,
+        StreamingSource::IndexRange { table: t, .. } => t,
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
         return Ok(None);
@@ -6534,7 +7038,7 @@ fn try_streaming_update(
                 let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
                 if let Err(e) = process_update_row(
                     ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                    assignments, &col_names, &params, &named_params, table,
+                    assignments, col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                     compiled_ref,
                     compiled_residual.as_ref(),
@@ -6550,7 +7054,7 @@ fn try_streaming_update(
             let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
             if let Err(e) = process_update_row(
                 ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                assignments, &col_names, &params, &named_params, table,
+                assignments, col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                 compiled_ref,
                 compiled_residual.as_ref(),
@@ -6634,7 +7138,7 @@ fn try_streaming_update(
                 let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
                 if let Err(e) = process_update_row(
                     ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                    assignments, &col_names, &params, &named_params, table,
+                    assignments, col_names, &params, &named_params, table,
                     residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                     compiled_ref,
                     compiled_residual.as_ref(),
@@ -6657,7 +7161,7 @@ fn try_streaming_update(
                     let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
                     if let Err(e) = process_update_row(
                         ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                        assignments, &col_names, &params, &named_params, table,
+                        assignments, col_names, &params, &named_params, table,
                         residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                         compiled_ref,
                         compiled_residual.as_ref(),
@@ -6676,7 +7180,7 @@ fn try_streaming_update(
             let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
             if let Err(e) = process_update_row(
                 ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                assignments, &col_names, &params, &named_params, table,
+                assignments, col_names, &params, &named_params, table,
                 residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                 compiled_ref,
                 compiled_residual.as_ref(),
@@ -6781,7 +7285,7 @@ fn try_streaming_update(
                     .collect();
                 crate::executor::triggers::fire_triggers(
                     ctx,
-                    &table,
+                    table,
                     &crate::sql::ast::TriggerEvent::Update(changed_cols),
                     crate::sql::ast::TriggerWhen::After,
                     Some(&new_r),
@@ -6814,8 +7318,8 @@ fn try_streaming_update(
                         continue;
                     }
                     let ibt = &mut index_bts[ti];
-                    if ibt.delete_index(&old_key, *rowid).is_ok() {
-                        if ibt.insert_index(&new_key, *rowid).is_err() {
+                    if ibt.delete_index(&old_key, *rowid).is_ok()
+                        && ibt.insert_index(&new_key, *rowid).is_err() {
                             // Insert failed after a successful delete — the
                             // entry is gone; propagate a hard error.
                             return Err(Error::corruption(format!(
@@ -6823,7 +7327,6 @@ fn try_streaming_update(
                                 idx.name, rowid
                             )));
                         }
-                    }
                     if ibt.root != index_roots[ti] {
                         index_roots[ti] = ibt.root;
                         ctx.set_index_root(&idx.name, ibt.root);
@@ -6845,7 +7348,7 @@ fn try_streaming_update(
     }
     if let Some(ret) = returning {
         return Ok(Some(ExecResult {
-            columns: returning_column_names(ret, &col_names).into(),
+            columns: returning_column_names(ret, col_names).into(),
             rows: returning_rows,
         }));
     }
@@ -6874,7 +7377,7 @@ fn process_update_row(
     named_params: &HashMap<String, Value>,
     table: &Arc<Table>,
     residual_pred: Option<&Expr>,
-    updates: &mut Vec<(i64, std::ops::Range<usize>, Option<Vec<u8>>)>,
+    updates: &mut Vec<crate::types::CellUpdate>,
     update_arena: &mut Vec<u8>,
     returning_rows: &mut Vec<Vec<Value>>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
@@ -6905,9 +7408,9 @@ fn process_update_row(
             let positions: &[usize] = IDENTITY_POSITIONS;
             cp.eval(row_buf, positions, params)
         } else {
-            match eval_row(pred, row_buf, col_names, params, named_params) {
-                Ok(v) => v.is_truthy(),
-                Err(e) => return Err(e),
+            {
+                let v = eval_row(pred, row_buf, col_names, params, named_params)?;
+                v.is_truthy()
             }
         };
         if !keep {
@@ -7191,9 +7694,9 @@ fn try_streaming_delete(
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
-    if returning.is_some() {
+    if let Some(ret) = returning {
         return Ok(Some(ExecResult {
-            columns: returning_column_names(returning.unwrap(), &col_names).into(),
+            columns: returning_column_names(ret, &col_names).into(),
             rows: returning_rows,
         }));
     }

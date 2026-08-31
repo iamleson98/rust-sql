@@ -43,7 +43,7 @@ fn setup_concurrent_db(n_rows: i64) -> Arc<RwLock<Database>> {
 }
 
 /// 1. Pure read concurrency: many threads, all reading.
-/// Verifies: no panics, no deadlocks, throughput scales.
+///    Verifies: no panics, no deadlocks, throughput scales.
 #[test]
 fn pure_read_concurrency_16_threads() {
     let n_rows = 10_000;
@@ -88,7 +88,7 @@ fn pure_read_concurrency_16_threads() {
 }
 
 /// 2. Mixed read/write concurrency: 1 writer + N readers.
-/// Verifies: writer doesn't block readers, readers see consistent snapshots.
+///    Verifies: writer doesn't block readers, readers see consistent snapshots.
 #[test]
 fn mixed_rw_concurrency_8_readers_1_writer() {
     let db = setup_concurrent_db(1000);
@@ -171,8 +171,8 @@ fn mixed_rw_concurrency_8_readers_1_writer() {
 }
 
 /// 3. Concurrent writers are serialized — only one writer at a time.
-/// The outer `RwLock<Database>` write lock enforces this. Verifies
-/// the final state is consistent (no lost updates, no duplicates).
+///    The outer `RwLock<Database>` write lock enforces this. Verifies
+///    the final state is consistent (no lost updates, no duplicates).
 #[test]
 fn concurrent_writers_serialize_correctly() {
     let db = setup_concurrent_db(0); // empty table
@@ -216,8 +216,8 @@ fn concurrent_writers_serialize_correctly() {
 }
 
 /// 4. Read consistency: a reader's per-statement snapshot is consistent.
-/// We test this by issuing a COUNT + SUM in a single statement and verifying
-/// the result is internally consistent (sum matches count of non-zero values).
+///    We test this by issuing a COUNT + SUM in a single statement and verifying
+///    the result is internally consistent (sum matches count of non-zero values).
 #[test]
 fn read_consistency_under_concurrent_writes() {
     let db = setup_concurrent_db(5000);
@@ -288,11 +288,11 @@ fn read_consistency_under_concurrent_writes() {
 }
 
 /// 5. Throughput scaling: measure ops/sec for 1 thread vs many threads.
-/// Verifies the multi-thread throughput is at least comparable to single-thread
-/// (proving we're not silently serializing on a write lock). Note: short
-/// workloads can be dominated by thread spawn overhead (~50µs/thread),
-/// so we use a generous lower bound (multi >= 0.5 × single) and verify
-/// multi-thread OPS are reasonable.
+///    Verifies the multi-thread throughput is at least comparable to single-thread
+///    (proving we're not silently serializing on a write lock). Note: short
+///    workloads can be dominated by thread spawn overhead (~50µs/thread),
+///    so we use a generous lower bound (multi >= 0.5 × single) and verify
+///    multi-thread OPS are reasonable.
 #[test]
 fn read_throughput_scales_with_threads() {
     let db = setup_concurrent_db(20_000);
@@ -356,7 +356,7 @@ fn read_throughput_scales_with_threads() {
 }
 
 /// 6. Stress test: 32 threads mixed (28 readers + 4 writers) for 2 seconds.
-/// Verifies no deadlocks, no panics, no lost writes.
+///    Verifies no deadlocks, no panics, no lost writes.
 #[test]
 fn stress_32_threads_2_seconds_no_deadlock() {
     let db = setup_concurrent_db(5000);

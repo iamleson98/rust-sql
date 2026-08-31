@@ -1,0 +1,117 @@
+# SLT cases — joins: inner, left, cross, self, multi-table chains, join
+# with GROUP BY/ORDER BY. Mirrors the SLT join corpus shape.
+
+statement ok
+CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, s TEXT)
+
+statement ok
+CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, y INTEGER)
+
+statement ok
+CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER, z TEXT)
+
+statement ok
+INSERT INTO a (x, s) VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')
+
+statement ok
+INSERT INTO b (a_id, y) VALUES (1, 10), (1, 11), (2, 20), (3, 30), (NULL, 99)
+
+statement ok
+INSERT INTO c (b_id, z) VALUES (1, 'c1'), (2, 'c2'), (3, 'c3'), (NULL, 'cx')
+
+# Inner equi-join.
+query III rowsort
+SELECT a.id, b.id, b.y FROM a JOIN b ON a.id = b.a_id
+----
+1 1 10
+1 2 11
+2 3 20
+3 4 30
+
+# Left join preserves unmatched left rows.
+query III rowsort
+SELECT a.id, b.id, b.y FROM a LEFT JOIN b ON a.id = b.a_id
+----
+1 1 10
+1 2 11
+2 3 20
+3 4 30
+4 NULL NULL
+
+# Left join with NULL-filtering WHERE (semijoin).
+query II rowsort
+SELECT a.id, b.y FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.y IS NOT NULL
+----
+1 10
+1 11
+2 20
+3 30
+
+# Antijoin: left rows with no match.
+query I
+SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.id IS NULL
+----
+4
+
+# Three-table chain.
+query IIT rowsort
+SELECT a.s, b.y, c.z FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id
+----
+a1 10 c1
+a1 11 c2
+a2 20 c3
+
+# Cross join counts.
+query I
+SELECT COUNT(*) FROM a CROSS JOIN b
+----
+20
+
+# Implicit (comma) join with WHERE.
+query II rowsort
+SELECT a.id, b.id FROM a, b WHERE a.id = b.a_id
+----
+1 1
+1 2
+2 3
+3 4
+
+# Self-join.
+query III rowsort
+SELECT p.id, q.id, q.y FROM b p JOIN b q ON p.a_id = q.a_id WHERE p.id < q.id
+----
+1 2 11
+
+# Join + GROUP BY.
+query TI
+SELECT a.s, COUNT(b.id) FROM a LEFT JOIN b ON a.id = b.a_id GROUP BY a.s ORDER BY a.s
+----
+a1 2
+a2 1
+a3 1
+a4 0
+
+# Join with filter on both sides.
+query II rowsort
+SELECT a.id, b.id FROM a JOIN b ON a.id = b.a_id WHERE a.x >= 2 AND b.y > 15
+----
+2 3
+3 4
+
+# Join where the ON references columns of both tables non-equi.
+query III rowsort
+SELECT a.id, b.id, b.y FROM a JOIN b ON b.a_id = a.id AND b.y > a.x * 5
+----
+1 1 10
+1 2 11
+2 3 20
+3 4 30
+
+# UNION over joins.
+query I rowsort
+SELECT a.id FROM a JOIN b ON a.id = b.a_id UNION SELECT b.a_id FROM b
+----
+1
+2
+3
+NULL

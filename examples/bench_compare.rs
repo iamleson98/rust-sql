@@ -30,6 +30,22 @@ const LARGE: usize = 100_000;
 // Helpers
 // ===========================================================================
 
+/// Run a measurement closure N times and return the BEST (minimum) time.
+/// Single-shot timings fluctuate by microseconds on a shared machine (OS
+/// jitter, allocator warmup, page-cache state) — best-of-N is the standard
+/// way to compare engines on the work they actually do. Applied to BOTH
+/// engines identically.
+fn best_of<const N: usize>(mut f: impl FnMut() -> Duration) -> Duration {
+    let mut best = Duration::MAX;
+    for _ in 0..N {
+        let d = f();
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
 fn fmt_dur(d: Duration) -> String {
     if d.as_secs() > 0 {
         format!("{:.2}s", d.as_secs_f64())
@@ -175,46 +191,54 @@ fn sqlite_range_scan(conn: &rusqlite::Connection, range: usize) -> Duration {
     let mut stmt = conn
         .prepare("SELECT name, val, score FROM t WHERE id BETWEEN ?1 AND ?2")
         .unwrap();
-    let start = Instant::now();
-    let mut rows = stmt
-        .query(params![1000, 1000 + range as i64 - 1])
-        .unwrap();
-    while rows.next().unwrap().is_some() {}
-    start.elapsed()
+    best_of::<7>(|| {
+        let start = Instant::now();
+        let mut rows = stmt
+            .query(params![1000, 1000 + range as i64 - 1])
+            .unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
 }
 
 fn sqlite_full_scan_count(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM t WHERE val > 5000").unwrap();
-    let start = Instant::now();
-    let _ = stmt.query_row([], |row| Ok(row.get::<_, i64>(0)?)).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap();
+        start.elapsed()
+    })
 }
 
 fn sqlite_aggregate(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn
         .prepare("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t")
         .unwrap();
-    let start = Instant::now();
-    let _ = stmt.query_row([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, f64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .unwrap();
+        start.elapsed()
     })
-    .unwrap();
-    start.elapsed()
 }
 
 fn sqlite_group_by(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn
         .prepare("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket")
         .unwrap();
-    let start = Instant::now();
-    let mut rows = stmt.query([]).unwrap();
-    while rows.next().unwrap().is_some() {}
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let mut rows = stmt.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
 }
 
 fn sqlite_setup_join(conn: &rusqlite::Connection) {
@@ -245,30 +269,36 @@ fn sqlite_join_2table(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn.prepare(
         "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1",
     ).unwrap();
-    let start = Instant::now();
-    let mut rows = stmt.query(params![500]).unwrap();
-    while rows.next().unwrap().is_some() {}
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let mut rows = stmt.query(params![500]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
 }
 
 fn sqlite_join_3table(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn.prepare(
         "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = ?1",
     ).unwrap();
-    let start = Instant::now();
-    let mut rows = stmt.query(params![500]).unwrap();
-    while rows.next().unwrap().is_some() {}
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let mut rows = stmt.query(params![500]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
 }
 
 fn sqlite_join_full_scan(conn: &rusqlite::Connection) -> Duration {
     let mut stmt = conn.prepare(
         "SELECT u.dept, COUNT(*), SUM(o.total) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.dept",
     ).unwrap();
-    let start = Instant::now();
-    let mut rows = stmt.query([]).unwrap();
-    while rows.next().unwrap().is_some() {}
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let mut rows = stmt.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
 }
 
 fn sqlite_update_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
@@ -284,6 +314,10 @@ fn sqlite_update_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
 }
 
 fn sqlite_update_range(conn: &rusqlite::Connection) -> Duration {
+    // Mutating: best-of-N would keep flipping the same rows. Run once,
+    // then once more in the same direction (idempotent + 1.0 per run, so
+    // the second run does identical work) and keep the second timing.
+    conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
     let start = Instant::now();
     conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
     start.elapsed()
@@ -397,7 +431,7 @@ fn rustqlite_insert_multirow(db: &mut rustqlite::Database, n: usize) -> Duration
             .map(|i| format!("('warm{}', {}, {})", i, i, i as f64))
             .collect();
         let sql = format!("INSERT INTO t (name, val, score) VALUES {}", values.join(", "));
-        let _ = db.execute(&sql, []).unwrap();
+        db.execute(&sql, []).unwrap();
     }
     let start = Instant::now();
     for chunk_start in (1..=n as i64).step_by(batch) {
@@ -447,36 +481,44 @@ fn rustqlite_range_scan(db: &mut rustqlite::Database, range: usize) -> Duration 
     // timing. SQLite's harness prepares its statement OUTSIDE the timer, so
     // without this the comparison would charge us a cold compile.
     let _ = db.query(sql, [Value::Integer(1), Value::Integer(2)]).unwrap();
-    let start = Instant::now();
-    let _ = db.query(
-        sql,
-        [Value::Integer(1000), Value::Integer(1000 + range as i64 - 1)],
-    ).unwrap();
-    start.elapsed()
+    best_of::<7>(|| {
+        let start = Instant::now();
+        let _ = db.query(
+            sql,
+            [Value::Integer(1000), Value::Integer(1000 + range as i64 - 1)],
+        ).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_full_scan_count(db: &mut rustqlite::Database) -> Duration {
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
-    let start = Instant::now();
-    let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_aggregate(db: &mut rustqlite::Database) -> Duration {
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
-    let start = Instant::now();
-    let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_group_by(db: &mut rustqlite::Database) -> Duration {
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
-    let start = Instant::now();
-    let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_setup_join(db: &mut rustqlite::Database) {
@@ -517,27 +559,33 @@ fn rustqlite_join_2table(db: &mut rustqlite::Database) -> Duration {
     let sql = "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query(sql, [Value::Integer(1)]).unwrap();
-    let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(500)]).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = db.query(sql, [Value::Integer(500)]).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_join_3table(db: &mut rustqlite::Database) -> Duration {
     let sql = "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = ?";
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query(sql, [Value::Integer(1)]).unwrap();
-    let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(500)]).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = db.query(sql, [Value::Integer(500)]).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_join_full_scan(db: &mut rustqlite::Database) -> Duration {
     let sql = "SELECT u.dept, COUNT(*), SUM(o.total) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.dept";
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query(sql, []).unwrap();
-    let start = Instant::now();
-    let _ = db.query(sql, []).unwrap();
-    start.elapsed()
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = db.query(sql, []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_update_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
@@ -552,6 +600,9 @@ fn rustqlite_update_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
 }
 
 fn rustqlite_update_range(db: &mut rustqlite::Database) -> Duration {
+    // Mutating: mirror the SQLite harness — run once to warm, then time the
+    // identical second run (+ 1.0 is idempotent in cost).
+    db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
     let start = Instant::now();
     db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
     start.elapsed()
@@ -591,13 +642,13 @@ fn rustqlite_mixed_workload(db: &mut rustqlite::Database, ops: usize) -> Duratio
             4 => {
                 if i % 2 == 0 {
                     next_id += 1;
-                    let _ = db.execute(ins_sql, [
+                    db.execute(ins_sql, [
                         Value::Text(format!("new{}", next_id).into()),
                         Value::Integer(next_id * 2),
                         Value::Real(next_id as f64),
                     ]).unwrap();
                 } else {
-                    let _ = db.execute(upd_sql, [
+                    db.execute(upd_sql, [
                         Value::Real(i as f64),
                         Value::Integer(((i % 1000) + 1) as i64),
                     ]).unwrap();

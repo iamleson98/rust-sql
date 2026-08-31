@@ -12,12 +12,29 @@ use crate::types::Value;
 pub struct Parser {
     toks: Vec<SpannedToken>,
     pos: usize,
+    /// Current expression nesting depth (SQLite's sqlite3Parser stack
+    /// guard). Deeply nested input — `SELECT ((((...1...))))` — would
+    /// otherwise recurse once per paren and overflow the stack.
+    expr_depth: usize,
 }
+
+/// Maximum expression nesting depth, mirroring SQLite's
+/// SQLITE_MAX_EXPR_DEPTH default of 1000 (ours is a little lower because
+/// recursive-descent frames are larger than SQLite's parser stack slots).
+/// Beyond this the parser returns a graceful error instead of crashing.
+const MAX_EXPR_DEPTH: usize = 500;
+
+/// Precedence level of prefix `NOT` (SQLite's `%right NOT.`).
+const PREC_NOT: u8 = 3;
+/// Precedence level of the IS family and `=`/`<>` (SQLite's
+/// `%left IS ... ISNULL NOTNULL NE EQ.`).
+const PREC_IS: u8 = 4;
 
 impl Parser {
     pub fn new(src: &str) -> Result<Self> {
         let toks = Lexer::new(src).tokenize()?;
-        Ok(Self { toks, pos: 0 })
+        Ok(Self { toks, pos: 0, expr_depth: 0 })
+        // (expr_depth starts at 0; incremented per nesting level)
     }
 
     pub fn parse(&mut self) -> Result<Statement> {
@@ -69,7 +86,11 @@ impl Parser {
                     let savepoint = if self.peek().is_keyword("TO") {
                         self.advance();
                         self.expect_keyword("SAVEPOINT").ok();
-                        Some(self.parse_ident()?)
+                        // Savepoint names are unambiguous positions: any
+                        // keyword is a legal name here (SQLite's fallback
+                        // rule — `SAVEPOINT outer` / `ROLLBACK TO left`
+                        // parse fine in SQLite).
+                        Some(self.parse_ident_or_keyword()?)
                     } else {
                         None
                     };
@@ -77,7 +98,7 @@ impl Parser {
                 }
                 "SAVEPOINT" => {
                     self.advance();
-                    let name = self.parse_ident()?;
+                    let name = self.parse_ident_or_keyword()?;
                     Ok(Statement::Savepoint(name))
                 }
                 "RELEASE" => {
@@ -87,7 +108,7 @@ impl Parser {
                     if self.peek().is_keyword("SAVEPOINT") {
                         self.advance();
                     }
-                    let name = self.parse_ident()?;
+                    let name = self.parse_ident_or_keyword()?;
                     Ok(Statement::Release(name))
                 }
                 "PRAGMA" => self.parse_pragma(),
@@ -389,9 +410,7 @@ impl Parser {
         let action = if self.peek().is_keyword("ON") {
             self.advance();
             // Next should be DELETE or UPDATE
-            if self.peek().is_keyword("DELETE") {
-                self.advance();
-            } else if self.peek().is_keyword("UPDATE") {
+            if self.peek().is_keyword("DELETE") || self.peek().is_keyword("UPDATE") {
                 self.advance();
             } else {
                 let t = self.peek();
@@ -1387,6 +1406,20 @@ impl Parser {
     fn parse_table_expression(&mut self) -> Result<TableExpression> {
         let mut left = self.parse_table_primary()?;
         loop {
+            // Comma-separated FROM list (`FROM a, b, c`): an implicit CROSS
+            // JOIN per the SQL standard and SQLite's grammar. A WHERE
+            // conjunct over both sides gives it inner-join semantics.
+            if self.peek().is_punct(',') {
+                self.advance();
+                let right = self.parse_table_primary()?;
+                left = TableExpression::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    join_type: JoinType::Cross,
+                    constraint: JoinConstraint::None,
+                };
+                continue;
+            }
             let join_type = if self.peek().is_keyword("JOIN") {
                 self.advance();
                 JoinType::Inner
@@ -1680,8 +1713,45 @@ impl Parser {
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr> {
-        let mut left = self.parse_unary()?;
+        // Nesting guard (SQLite's SQLITE_MAX_EXPR_DEPTH): a deeply nested
+        // expression would recurse once per level and overflow the stack;
+        // fail with a graceful parse error instead.
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            let t = self.peek();
+            return Err(Error::parse(
+                t.line,
+                t.col,
+                format!(
+                    "expression tree is too large (maximum depth {})",
+                    MAX_EXPR_DEPTH
+                ),
+            ));
+        }
+        self.expr_depth += 1;
+        let r = self.parse_binary_body(min_prec);
+        self.expr_depth -= 1;
+        r
+    }
+
+    fn parse_binary_body(&mut self, min_prec: u8) -> Result<Expr> {
+        // Prefix NOT is right-associative at its own level (SQLite's
+        // `%right NOT.`): looser than comparisons/IS, tighter than AND —
+        // `NOT 1 = 2` is `NOT (1 = 2)`, not `(NOT 1) = 2`.
+        let mut left = if self.peek().is_keyword("NOT") && PREC_NOT >= min_prec {
+            self.advance();
+            let operand = self.parse_binary(PREC_NOT)?;
+            Expr::Unary { op: UnaryOp::Not, expr: Box::new(operand) }
+        } else {
+            self.parse_unary()?
+        };
         loop {
+            // The IS family sits at the `=`/`<>` precedence level (SQLite's
+            // `%left IS ... ISNULL NOTNULL NE EQ.`), NOT as a tight postfix:
+            // `1 + 1 IS NULL` must parse as `(1 + 1) IS NULL`.
+            if PREC_IS >= min_prec && self.starts_is_operator() {
+                left = self.parse_is_operator(left)?;
+                continue;
+            }
             let op = match self.try_binary_op() {
                 Some(o) => o,
                 None => break,
@@ -1700,6 +1770,36 @@ impl Parser {
             };
         }
         Ok(left)
+    }
+
+    /// Does the next token start an IS-family operator?
+    fn starts_is_operator(&self) -> bool {
+        let t = self.peek();
+        t.is_keyword("IS") || t.is_keyword("ISNULL") || t.is_keyword("NOTNULL")
+    }
+
+    /// Parse `IS [NOT] NULL` / `IS [NOT] expr` / `ISNULL` / `NOTNULL` as a
+    /// left-associative operator at the `=`/`<>` precedence level, applied
+    /// to `left`.
+    fn parse_is_operator(&mut self, left: Expr) -> Result<Expr> {
+        if self.peek().is_keyword("IS") {
+            self.advance();
+            let negated = self.consume_keyword("NOT");
+            if self.peek().is_keyword("NULL") {
+                self.advance();
+                Ok(Expr::IsNull { expr: Box::new(left), negated })
+            } else {
+                let right = self.parse_binary(PREC_IS + 1)?;
+                Ok(Expr::Is { left: Box::new(left), right: Box::new(right), negated })
+            }
+        } else if self.peek().is_keyword("ISNULL") {
+            self.advance();
+            Ok(Expr::IsNull { expr: Box::new(left), negated: false })
+        } else {
+            // NOTNULL
+            self.advance();
+            Ok(Expr::IsNull { expr: Box::new(left), negated: true })
+        }
     }
 
     fn try_binary_op(&self) -> Option<BinaryOp> {
@@ -1742,6 +1842,16 @@ impl Parser {
         let t = self.peek();
         if t.is_op("-") {
             self.advance();
+            // `-9223372036854775808` is the INTEGER i64::MIN in SQLite (the
+            // parser folds the negative literal; only the POSITIVE literal
+            // is a REAL). 2^63 is exactly representable, so the u64 check
+            // is exact.
+            if let Token::HugeInteger(u) = &self.peek().token {
+                if *u == 9_223_372_036_854_775_808u64 {
+                    self.advance();
+                    return Ok(Expr::Literal(Value::Integer(i64::MIN)));
+                }
+            }
             let e = self.parse_unary()?;
             return Ok(Expr::Unary { op: UnaryOp::Neg, expr: Box::new(e) });
         }
@@ -1755,11 +1865,8 @@ impl Parser {
             let e = self.parse_unary()?;
             return Ok(Expr::Unary { op: UnaryOp::BitNot, expr: Box::new(e) });
         }
-        if t.is_keyword("NOT") {
-            self.advance();
-            let e = self.parse_unary()?;
-            return Ok(Expr::Unary { op: UnaryOp::Not, expr: Box::new(e) });
-        }
+        // (Prefix NOT is handled in parse_binary at its own precedence
+        // level — see there.)
         self.parse_postfix()
     }
 
@@ -1770,22 +1877,6 @@ impl Parser {
                 self.advance();
                 let c = self.parse_ident()?;
                 e = Expr::Collate { expr: Box::new(e), collation: c };
-            } else if self.peek().is_keyword("IS") {
-                self.advance();
-                let negated = self.consume_keyword("NOT");
-                if self.peek().is_keyword("NULL") {
-                    self.advance();
-                    e = Expr::IsNull { expr: Box::new(e), negated };
-                } else {
-                    let right = self.parse_primary_expr()?;
-                    e = Expr::Is { left: Box::new(e), right: Box::new(right), negated };
-                }
-            } else if self.peek().is_keyword("ISNULL") {
-                self.advance();
-                e = Expr::IsNull { expr: Box::new(e), negated: false };
-            } else if self.peek().is_keyword("NOTNULL") {
-                self.advance();
-                e = Expr::IsNull { expr: Box::new(e), negated: true };
             } else if self.peek().is_keyword("NOT") {
                 // NOT LIKE / NOT IN / NOT BETWEEN
                 self.advance();
@@ -1817,9 +1908,9 @@ impl Parser {
                     e = Expr::In { expr: Box::new(e), source: src, negated: true };
                 } else if self.peek().is_keyword("BETWEEN") {
                     self.advance();
-                    let low = self.parse_binary(8)?;
+                    let low = self.parse_binary(PREC_IS)?;
                     self.expect_keyword("AND")?;
-                    let high = self.parse_binary(8)?;
+                    let high = self.parse_binary(PREC_IS)?;
                     e = Expr::Between { expr: Box::new(e), low: Box::new(low), high: Box::new(high), negated: true };
                 } else {
                     // NOT was consumed but no follow-up — that's a parse error.
@@ -1854,9 +1945,9 @@ impl Parser {
                 e = Expr::In { expr: Box::new(e), source: src, negated: false };
             } else if self.peek().is_keyword("BETWEEN") {
                 self.advance();
-                let low = self.parse_binary(8)?;
+                let low = self.parse_binary(PREC_IS)?;
                 self.expect_keyword("AND")?;
-                let high = self.parse_binary(8)?;
+                let high = self.parse_binary(PREC_IS)?;
                 e = Expr::Between { expr: Box::new(e), low: Box::new(low), high: Box::new(high), negated: false };
             } else if self.peek().is_keyword("FILTER") {
                 self.advance();
@@ -1993,6 +2084,11 @@ impl Parser {
             Token::Float(f) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Real(*f)))
+            }
+            Token::HugeInteger(u) => {
+                self.advance();
+                // Out-of-i64-range literal: a REAL (SQLite semantics).
+                Ok(Expr::Literal(Value::Real(*u as f64)))
             }
             Token::String(s) => {
                 self.advance();
@@ -2386,6 +2482,22 @@ pub fn parse(src: &str) -> Result<Statement> {
     Parser::new(src)?.parse()
 }
 
+/// Pragma-value keywords: bare words accepted where an expression is
+/// normally expected (`PRAGMA journal_mode = WAL`). Returns the canonical
+/// uppercase spelling.
+fn keyword_text(t: &crate::sql::lexer::Token) -> Option<String> {
+    if let crate::sql::lexer::Token::Keyword(k) = t {
+        match *k {
+            "DELETE" | "WAL" | "MEMORY" | "TRUNCATE" | "PERSIST" | "NORMAL"
+            | "FULL" | "EXTRA" | "ROW" | "STATEMENT" | "QUERY" | "INCREMENTAL"
+            | "RESTART" | "PASSIVE" | "FORCE" | "OPTIMIZE" => Some(k.to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2502,21 +2614,5 @@ mod tests {
         let _ = parse_ok("PRAGMA page_size");
         let _ = parse_ok("PRAGMA page_size = 4096");
         let _ = parse_ok("PRAGMA journal_mode(WAL)");
-    }
-}
-
-/// Pragma-value keywords: bare words accepted where an expression is
-/// normally expected (`PRAGMA journal_mode = WAL`). Returns the canonical
-/// uppercase spelling.
-fn keyword_text(t: &crate::sql::lexer::Token) -> Option<String> {
-    if let crate::sql::lexer::Token::Keyword(k) = t {
-        match *k {
-            "DELETE" | "WAL" | "MEMORY" | "TRUNCATE" | "PERSIST" | "NORMAL"
-            | "FULL" | "EXTRA" | "ROW" | "STATEMENT" | "QUERY" | "INCREMENTAL"
-            | "RESTART" | "PASSIVE" | "FORCE" | "OPTIMIZE" => Some(k.to_string()),
-            _ => None,
-        }
-    } else {
-        None
     }
 }

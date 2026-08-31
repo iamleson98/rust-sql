@@ -688,14 +688,30 @@ impl PartialOrd for Value {
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         use Value::*;
+        // SQLite's ordering: NULL < numbers < NaN < text < blob — NaN
+        // sorts after every finite number but before text. (The old code
+        // mapped NaN comparisons to Equal, so ORDER BY interleaved NaN
+        // unpredictably and DISTINCT/GROUP BY semantics were luck-based.)
+        let num_class = |v: &Value| match v {
+            Integer(_) => 1u8,
+            Real(f) if f.is_nan() => 2,
+            Real(_) => 1,
+            _ => 0,
+        };
         match (self, other) {
             (Null, Null) => Ordering::Equal,
             (Null, _) => Ordering::Less,
             (_, Null) => Ordering::Greater,
-            (Integer(a), Integer(b)) => a.cmp(b),
-            (Real(a), Real(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (Integer(a), Real(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
-            (Real(a), Integer(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
+            (Integer(_) | Real(_), Integer(_) | Real(_)) => {
+                let (ca, cb) = (num_class(self), num_class(other));
+                match ca.cmp(&cb) {
+                    Ordering::Equal => {
+                        let (a, b) = (self.as_real(), other.as_real());
+                        a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+                    }
+                    ord => ord,
+                }
+            }
             (Integer(_) | Real(_), Text(_) | Blob(_)) => Ordering::Less,
             (Text(_) | Blob(_), Integer(_) | Real(_)) => Ordering::Greater,
             (Text(a), Text(b)) => a.cmp(b),
@@ -782,7 +798,7 @@ mod tests {
             Value::Null,
             Value::Integer(42),
             Value::Integer(-1_000_000),
-            Value::Real(3.14159),
+            Value::Real(1.5),
             Value::Text("hello".to_string().into()),
             Value::Text("unicode: 你好".to_string().into()),
             Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),

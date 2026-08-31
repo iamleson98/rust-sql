@@ -21,7 +21,7 @@
 use crate::types::Value;
 
 /// Julian day number of the Unix epoch (1970-01-01 00:00:00), in ms units.
-const UNIX_EPOCH_JD_MS: i64 = 210866760_000_000;
+const UNIX_EPOCH_JD_MS: i64 = 210_866_760_000_000;
 /// Maximum valid iJD: 9999-12-31 23:59:59.999
 const MAX_JD_MS: i64 = 464_269_060_799_999;
 
@@ -166,7 +166,7 @@ fn compute_ymd(p: &mut DateTime) {
         datetime_error(p);
         return;
     } else {
-        let z = ((p.i_jd + 43200000) / 86400000) as i64;
+        let z = (p.i_jd + 43200000) / 86400000;
         let alpha = ((z as f64 + 32044.75) / 36524.25) as i64 - 52;
         let a = z + 1 + alpha - (alpha + 100) / 4 + 25;
         let b = a + 1524;
@@ -187,7 +187,7 @@ fn compute_hms(p: &mut DateTime) {
         return;
     }
     compute_jd(p);
-    let day_ms = ((p.i_jd + 43200000) % 86400000) as i64;
+    let day_ms = (p.i_jd + 43200000) % 86400000;
     p.s = (day_ms % 60000) as f64 / 1000.0;
     let day_min = day_ms / 60000;
     p.min = (day_min % 60) as i32;
@@ -506,11 +506,7 @@ fn parse_modifier(z: &str, idx: usize, p: &mut DateTime) -> bool {
                 p.m = 12;
                 p.d = 31;
                 true
-            } else if unit.eq_ignore_ascii_case("day") {
-                true
-            } else {
-                false
-            }
+            } else { unit.eq_ignore_ascii_case("day") }
         }
         b'f' => {
             // floor
@@ -563,11 +559,11 @@ fn parse_modifier(z: &str, idx: usize, p: &mut DateTime) -> bool {
                 false
             } else if z.eq_ignore_ascii_case("utc") {
                 if !p.is_utc {
-                    let i_orig_jd;
+                    
                     let mut i_guess;
                     let mut cnt = 0;
                     compute_jd(p);
-                    i_orig_jd = p.i_jd;
+                    let i_orig_jd = p.i_jd;
                     i_guess = i_orig_jd;
                     let mut i_err = 0i64;
                     loop {
@@ -785,10 +781,10 @@ fn parse_numeric_modifier(z: &str, p: &mut DateTime) -> bool {
     let unit = z[n..].trim_start();
     let mut unit = unit;
     let mut ulen = unit.len();
-    if ulen < 3 || ulen > 10 {
+    if !(3..=10).contains(&ulen) {
         return false;
     }
-    if unit.as_bytes()[ulen - 1].to_ascii_lowercase() == b's' {
+    if unit.as_bytes()[ulen - 1].eq_ignore_ascii_case(&b's') {
         ulen -= 1;
         unit = &unit[..ulen];
     }
@@ -1276,9 +1272,11 @@ pub fn timediff_func(args: &[Value]) -> Option<Value> {
     let ms_frac = ms % 1000;
     // Convert days into Y/M/D with month arithmetic: start at julian day 0
     // (i.e. -4713-11-24 12:00) and add `days`.
-    let mut dt = DateTime::default();
-    dt.i_jd = days * 86400000;
-    dt.valid_jd = true;
+    let mut dt = DateTime {
+        i_jd: days * 86400000,
+        valid_jd: true,
+        ..DateTime::default()
+    };
     compute_ymd(&mut dt);
     // Adjust: JD 0 is -4713-11-24 12:00; the Y/M/D from computeYMD at
     // iJD=0 is -4713-11-24 (with the 12:00 offset ignored).

@@ -42,7 +42,7 @@ fn main() {
     let before = std::fs::metadata(path).unwrap().len();
     db.execute("DELETE FROM t WHERE id > 1000", []).unwrap();
     let after = std::fs::metadata(path).unwrap().len();
-    println!("after delete 90%: {} -> {} pages={} freelist={}", before, after, db.page_count(), "?");
+    println!("after delete 90%: {} -> {} pages={} freelist=?", before, after, db.page_count());
     drop(db);
     let after_close = std::fs::metadata(path).unwrap().len();
     println!("after close: {}", after_close);
@@ -55,5 +55,5 @@ fn main() {
         db.execute(&sql, []).unwrap();
     }
     db.execute("COMMIT", []).unwrap();
-    println!("after reinsert 5k: pages={} freelist={} size={}", db.page_count(), "?", std::fs::metadata(path).unwrap().len());
+    println!("after reinsert 5k: pages={} freelist=? size={}", db.page_count(), std::fs::metadata(path).unwrap().len());
 }

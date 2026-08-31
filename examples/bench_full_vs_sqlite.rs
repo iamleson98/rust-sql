@@ -207,7 +207,7 @@ fn bench_point_lookup() -> BenchResult {
         for i in 1..=n {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
             let mut rows = stmt.query(params![i]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
     BenchResult { name: "Point lookup (SELECT by id, 1k queries)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: Some("PK index") }
@@ -226,7 +226,7 @@ fn bench_index_lookup() -> BenchResult {
         for i in 1..=n {
             let mut stmt = conn.prepare("SELECT name FROM t WHERE val = ?1").unwrap();
             let mut rows = stmt.query(params![i]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
     BenchResult { name: "Index lookup (SELECT by indexed col, 1k)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: Some("secondary idx") }
@@ -245,7 +245,7 @@ fn bench_range_scan() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
     BenchResult { name: "Range scan (100 rows, 500 queries)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: None }
@@ -264,7 +264,7 @@ fn bench_full_scan() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, N_ROWS as usize * n);
     BenchResult { name: "Full table scan (10k rows × 50 iters)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: None }
@@ -283,7 +283,7 @@ fn bench_aggregate_multi() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
     BenchResult { name: "Aggregate (COUNT/SUM/MIN/MAX/AVG over 10k rows)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: Some("5 aggs") }
@@ -302,7 +302,7 @@ fn bench_count_star() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
     BenchResult { name: "COUNT(*) only (no row decode)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: Some("count_rows fast path") }
@@ -321,7 +321,7 @@ fn bench_aggregate_with_where() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT SUM(val), COUNT(*), AVG(score) FROM t WHERE val > 5000").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, n as usize);
     BenchResult { name: "Aggregate + WHERE (filter 50% rows)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: None }
@@ -340,7 +340,7 @@ fn bench_group_by() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, N_ROWS as usize * n);
     BenchResult { name: "GROUP BY (10 buckets × 10k rows)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: None }
@@ -415,7 +415,7 @@ fn bench_concurrent_8_readers() -> BenchResult {
                     let guard = conn.lock().unwrap();
                     let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                     let mut rows = stmt.query(params![id]).unwrap();
-                    while let Some(_) = rows.next().unwrap() {}
+                    while rows.next().unwrap().is_some() {}
                 }
             }));
         }
@@ -453,7 +453,7 @@ fn bench_concurrent_16_readers() -> BenchResult {
                     let guard = conn.lock().unwrap();
                     let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                     let mut rows = stmt.query(params![id]).unwrap();
-                    while let Some(_) = rows.next().unwrap() {}
+                    while rows.next().unwrap().is_some() {}
                 }
             }));
         }
@@ -515,7 +515,7 @@ fn bench_mixed_rw() -> BenchResult {
                     let guard = conn.lock().unwrap();
                     let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                     let mut rows = stmt.query(params![id]).unwrap();
-                    while let Some(_) = rows.next().unwrap() {}
+                    while rows.next().unwrap().is_some() {}
                 }
             }));
         }
@@ -537,11 +537,9 @@ fn bench_concurrent_writes() -> BenchResult {
         for tid in 0..4 {
             let db = Arc::clone(&db);
             handles.push(thread::spawn(move || {
-                let mut local = tid * 1000;
-                for _ in 0..250 {
+                for local in (tid * 1000)..(tid * 1000 + 250) {
                     let mut guard = db.write();
                     guard.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(local)]).unwrap();
-                    local += 1;
                 }
             }));
         }
@@ -557,11 +555,9 @@ fn bench_concurrent_writes() -> BenchResult {
         for tid in 0..4 {
             let conn = Arc::clone(&conn);
             handles.push(thread::spawn(move || {
-                let mut local = tid * 1000;
-                for _ in 0..250 {
+                for local in (tid * 1000)..(tid * 1000 + 250) {
                     let guard = conn.lock().unwrap();
                     guard.execute("INSERT INTO t (val) VALUES (?1)", params![local]).unwrap();
-                    local += 1;
                 }
             }));
         }
@@ -584,7 +580,7 @@ fn bench_hash_join() -> BenchResult {
         for _ in 0..n {
             let mut stmt = conn.prepare("SELECT a.id, b.val FROM t a JOIN t b ON a.val = b.val").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         }
     }, (N_ROWS / 10) as usize * n * 2);
     BenchResult { name: "Self-join (1k rows × 50 iters)".into(), rustqlite_ops_per_sec: rq_ops, rusqlite_ops_per_sec: rs_ops, note: Some("hash join") }

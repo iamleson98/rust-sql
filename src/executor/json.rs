@@ -405,11 +405,7 @@ pub fn parse_path(p: &str) -> Option<JsonPath> {
                 } else if inner == "#" {
                     segs.push(PathSeg::Index(-0)); // # alone == 0 from end? SQLite: array length marker
                 } else if let Ok(n) = inner.parse::<i64>() {
-                    if n < 0 {
-                        segs.push(PathSeg::Index(n));
-                    } else {
-                        segs.push(PathSeg::Index(n));
-                    }
+                    segs.push(PathSeg::Index(n));
                 } else {
                     // ['key'] form
                     let k = inner.trim_matches(|c| c == '\'' || c == '"');

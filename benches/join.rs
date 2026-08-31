@@ -43,7 +43,7 @@ fn bench_rusqlite_join(c: &mut Criterion) {
                 "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1",
             ).unwrap();
             let mut rows = stmt.query(params![black_box(50)]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 }

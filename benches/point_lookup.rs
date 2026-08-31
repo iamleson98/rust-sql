@@ -31,7 +31,7 @@ fn bench_rusqlite_point_lookup(c: &mut Criterion) {
         b.iter(|| {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
             let mut rows = stmt.query(params![black_box(500)]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 }

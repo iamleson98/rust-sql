@@ -194,7 +194,7 @@ fn bench_point_lookup(c: &mut Criterion) {
         b.iter(|| {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
             let mut rows = stmt.query(params![black_box(500)]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 
@@ -225,7 +225,7 @@ fn bench_range_scan(c: &mut Criterion) {
         b.iter(|| {
             let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 
@@ -253,7 +253,7 @@ fn bench_aggregate(c: &mut Criterion) {
         b.iter(|| {
             let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 
@@ -286,7 +286,7 @@ fn bench_join(c: &mut Criterion) {
                 "SELECT a.id, a.x, b.id, b.y FROM a INNER JOIN b ON a.id = b.a_id LIMIT 1000"
             ).unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while let Some(_) = rows.next().unwrap() {}
+            while rows.next().unwrap().is_some() {}
         })
     });
 
@@ -364,7 +364,7 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
                                 let guard = conn.lock().unwrap();
                                 let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                                 let mut rows = stmt.query(params![id]).unwrap();
-                                while let Some(_) = rows.next().unwrap() {}
+                                while rows.next().unwrap().is_some() {}
                             }
                             total.fetch_add(1, Ordering::Relaxed);
                         }
@@ -474,7 +474,7 @@ fn bench_mixed_rw(c: &mut Criterion) {
                                 let guard = conn.lock().unwrap();
                                 let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
                                 let mut rows = stmt.query(params![id]).unwrap();
-                                while let Some(_) = rows.next().unwrap() {}
+                                while rows.next().unwrap().is_some() {}
                             }
                         }
                     }));

@@ -15,6 +15,11 @@ pub enum Token {
     /// (Previously `Keyword(String)`, which heap-allocated on every keyword
     /// token; a simple INSERT statement produced 5+ keyword allocations
     /// before the parser even started.)
+    /// An integer literal that overflows i64 but fits u64 (currently only
+    /// 9223372036854775808 = 2^63 in practice). Needed so the PARSER can
+    /// fold `-9223372036854775808` into the INTEGER i64::MIN — SQLite
+    /// parses that as an integer, not a real.
+    HugeInteger(u64),
     Keyword(&'static str),
     /// An unquoted identifier (e.g. `users`, `name`). Identifiers are stored
     /// as-is (case preserved).
@@ -287,9 +292,20 @@ impl<'a> Lexer<'a> {
                 Error::lex(self.line, self.col, "invalid float literal")
             })?))
         } else {
-            Ok(Token::Integer(s.parse().map_err(|_| {
-                Error::lex(self.line, self.col, "invalid integer literal")
-            })?))
+            match s.parse::<i64>() {
+                Ok(v) => Ok(Token::Integer(v)),
+                // Out-of-i64-range integer literal. If it still fits u64,
+                // keep it exact so the parser can fold `-9223372036854775808`
+                // into INTEGER i64::MIN (SQLite semantics); beyond u64 or
+                // with float syntax it becomes a REAL (SQLite:
+                // `SELECT 9223372036854775808` is 9.223372036854776e18).
+                Err(_) => match s.parse::<u64>() {
+                    Ok(u) => Ok(Token::HugeInteger(u)),
+                    Err(_) => Ok(Token::Float(s.parse::<f64>().map_err(
+                        |_| Error::lex(self.line, self.col, "invalid integer literal"),
+                    )?)),
+                },
+            }
         }
     }
 
@@ -342,17 +358,29 @@ impl<'a> Lexer<'a> {
         if self.pos >= self.src.len() {
             return Err(Error::lex(self.line, self.col, "unterminated blob literal"));
         }
-        let hex = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+        // Operate purely on BYTES: blob-literal content may be any byte
+        // sequence (fuzzed input, 0xFF junk), so it must never be routed
+        // through &str — `&hex[i..i+2]` panics when i+2 splits a multi-byte
+        // UTF-8 char, and `from_utf8().unwrap()` panics on invalid UTF-8.
+        let hex_bytes = &self.src[start..self.pos];
         self.advance(); // skip closing quote
-        if hex.len() % 2 != 0 {
+        if hex_bytes.len() % 2 != 0 {
             return Err(Error::lex(self.line, self.col, "blob literal must have even number of hex digits"));
         }
-        let mut bytes = Vec::with_capacity(hex.len() / 2);
-        for i in (0..hex.len()).step_by(2) {
-            let b = u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| {
-                Error::lex(self.line, self.col, "invalid hex digit in blob literal")
-            })?;
-            bytes.push(b);
+        let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
+        for i in (0..hex_bytes.len()).step_by(2) {
+            let hi = hex_byte_value(hex_bytes[i]);
+            let lo = hex_byte_value(hex_bytes[i + 1]);
+            match (hi, lo) {
+                (Some(h), Some(l)) => bytes.push((h << 4) | l),
+                _ => {
+                    return Err(Error::lex(
+                        self.line,
+                        self.col,
+                        "invalid hex digit in blob literal",
+                    ))
+                }
+            }
         }
         Ok(Token::Blob(bytes))
     }
@@ -457,6 +485,20 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Value of a single ASCII hex digit (0-9, a-f, A-F) as a nibble, or None
+/// for any other byte. Byte-oriented on purpose: blob literals must be
+/// validated byte-by-byte so arbitrary (fuzzed) input can never reach a
+/// `&str` slice that could split a multi-byte UTF-8 sequence.
+#[inline]
+fn hex_byte_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Returns true if `s` is a SQL keyword (case-insensitive).
 /// Zero-allocation (previously: `KEYWORDS.contains(&s.to_ascii_uppercase())`
 /// — one String allocation + a 144-entry linear scan per call).
@@ -525,18 +567,18 @@ mod tests {
     #[test]
     fn keywords_and_idents() {
         let toks = lex("SELECT name FROM users");
-        assert_eq!(toks[0], Token::Keyword("SELECT".into()));
+        assert_eq!(toks[0], Token::Keyword("SELECT"));
         assert_eq!(toks[1], Token::Ident("name".into()));
-        assert_eq!(toks[2], Token::Keyword("FROM".into()));
+        assert_eq!(toks[2], Token::Keyword("FROM"));
         assert_eq!(toks[3], Token::Ident("users".into()));
         assert_eq!(toks[4], Token::Eof);
     }
 
     #[test]
     fn numbers() {
-        let toks = lex("42 3.14 0x1F 1.5e-3");
+        let toks = lex("42 1.25 0x1F 1.5e-3");
         assert_eq!(toks[0], Token::Integer(42));
-        assert_eq!(toks[1], Token::Float(3.14));
+        assert_eq!(toks[1], Token::Float(1.25));
         assert_eq!(toks[2], Token::Integer(31));
         assert_eq!(toks[3], Token::Float(0.0015));
     }
@@ -552,22 +594,22 @@ mod tests {
     #[test]
     fn operators() {
         let toks = lex("a <= b >= c != d <> e == f || g << h >> i");
-        assert_eq!(toks[1], Token::Op("<=".into()));
-        assert_eq!(toks[3], Token::Op(">=".into()));
-        assert_eq!(toks[5], Token::Op("!=".into()));
-        assert_eq!(toks[7], Token::Op("<>".into()));
-        assert_eq!(toks[9], Token::Op("==".into()));
-        assert_eq!(toks[11], Token::Op("||".into()));
-        assert_eq!(toks[13], Token::Op("<<".into()));
-        assert_eq!(toks[15], Token::Op(">>".into()));
+        assert_eq!(toks[1], Token::Op("<="));
+        assert_eq!(toks[3], Token::Op(">="));
+        assert_eq!(toks[5], Token::Op("!="));
+        assert_eq!(toks[7], Token::Op("<>"));
+        assert_eq!(toks[9], Token::Op("=="));
+        assert_eq!(toks[11], Token::Op("||"));
+        assert_eq!(toks[13], Token::Op("<<"));
+        assert_eq!(toks[15], Token::Op(">>"));
     }
 
     #[test]
     fn comments() {
         let toks = lex("SELECT 1 -- comment\n+ /* block */ 2");
-        assert_eq!(toks[0], Token::Keyword("SELECT".into()));
+        assert_eq!(toks[0], Token::Keyword("SELECT"));
         assert_eq!(toks[1], Token::Integer(1));
-        assert_eq!(toks[2], Token::Op("+".into()));
+        assert_eq!(toks[2], Token::Op("+"));
         assert_eq!(toks[3], Token::Integer(2));
     }
 

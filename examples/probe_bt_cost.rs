@@ -54,7 +54,7 @@ fn main() {
         for i in 1..=1000 {
             key.clear();
             Value::Integer(i * 2).encode_order_key_into(&mut key);
-            let _ = ibt.lookup_index_into(&key, &mut out).unwrap();
+            ibt.lookup_index_into(&key, &mut out).unwrap();
         }
         let t = Instant::now();
         for i in 0..n {

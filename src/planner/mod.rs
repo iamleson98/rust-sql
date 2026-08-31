@@ -26,15 +26,26 @@ pub struct Planner<'a> {
     /// (lowercase CTE name -> (rows, qualified column names)). Populated
     /// by api.rs before planning; FROM references resolve against CTEs
     /// FIRST so a CTE shadows a real table of the same name (SQL standard).
-    ctes: HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>,
+    ctes: HashMap<String, crate::types::CteMaterialization>,
     /// Parent planner's CTE map, merged when a nested SELECT is planned
     /// (CTEs stay visible inside subqueries in the same statement).
-    outer_ctes: Option<HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>>,
+    outer_ctes: Option<HashMap<String, crate::types::CteMaterialization>>,
+    /// View-expansion recursion depth. Guards against circular view
+    /// definitions (`CREATE VIEW t AS SELECT ... FROM t`) and absurdly
+    /// deep view nesting, both of which would otherwise recurse until the
+    /// stack overflows. Mirrors SQLite's "view X is circularly defined"
+    /// error (fuzzers routinely produce self-referencing views).
+    view_depth: usize,
 }
+
+/// Maximum view-nesting depth before "circularly defined" is reported.
+/// Legitimate view chains never get anywhere near this; the limit exists
+/// to turn infinite recursion into a graceful semantic error.
+const MAX_VIEW_DEPTH: usize = 64;
 
 impl<'a> Planner<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
-        Self { catalog, scopes: vec![HashMap::new()], ctes: HashMap::new(), outer_ctes: None }
+        Self { catalog, scopes: vec![HashMap::new()], ctes: HashMap::new(), outer_ctes: None, view_depth: 0 }
     }
 
     /// Plan a SELECT statement.
@@ -53,7 +64,7 @@ impl<'a> Planner<'a> {
         // in the projection. SQLite semantics: ORDER BY may reference any
         // column in the FROM clause, or any projection alias.
         let plan = if !stmt.order_by.is_empty() {
-            let terms = self.resolve_order_by_terms(&stmt.body, &stmt.order_by);
+            let terms = self.resolve_order_by_terms(&stmt.body, &stmt.order_by)?;
             insert_sort_below_top(plan, terms)
         } else {
             plan
@@ -87,19 +98,63 @@ impl<'a> Planner<'a> {
     ///    `ORDER BY COUNT(*)` becomes `__agg_N` and `ORDER BY <group expr>`
     ///    becomes the group-key column, both of which exist in the
     ///    Aggregate operator's output.
-    fn resolve_order_by_terms(&mut self, body: &SelectBody, terms: &[OrderTerm]) -> Vec<OrderTerm> {
+    fn resolve_order_by_terms(
+        &mut self,
+        body: &SelectBody,
+        terms: &[OrderTerm],
+    ) -> Result<Vec<OrderTerm>> {
         let s = match body {
             SelectBody::Simple(s) => s,
             SelectBody::Binary { .. } => {
                 // Set operations resolve their own ORDER BY against the
                 // combined output; no rewrite needed here.
-                return terms.to_vec();
+                return Ok(terms.to_vec());
             }
         };
-        terms
+        // Ordinal range validation (SQLite errors on out-of-range
+        // ordinals for explicit projections; star projections have an
+        // unknown width at plan time and are validated at execution).
+        let has_star = s
+            .columns
+            .iter()
+            .any(|c| !matches!(c, ResultColumn::Expr { .. }));
+        if !has_star {
+            for t in terms {
+                if let Expr::Literal(Value::Integer(k)) = &t.expr {
+                    if *k >= 1 && (*k as usize) > s.columns.len() {
+                        return Err(Error::semantic(format!(
+                            "{}rd ORDER BY term out of range ({} output columns)",
+                            k,
+                            s.columns.len()
+                        )));
+                    }
+                }
+            }
+        }
+        let resolved: Vec<OrderTerm> = terms
             .iter()
             .map(|t| {
                 let mut expr = t.expr.clone();
+                // 0. Ordinal resolution (SQLite semantics): a bare
+                //    *positive integer literal* K in ORDER BY refers to
+                //    the K-th OUTPUT column of the projection, not to a
+                //    constant. `SELECT b, a FROM t ORDER BY 1` sorts by b.
+                //    We resolve it here to the K-th projection expression
+                //    when that arm is an explicit expression; star/table
+                //    projections and compound bodies keep the literal and
+                //    let exec_sort resolve it against the materialized row
+                //    width (where input order == output order).
+                if let Expr::Literal(Value::Integer(k)) = &expr {
+                    if *k >= 1 {
+                        if let Some(ResultColumn::Expr { expr: ce, .. }) =
+                            s.columns.get(*k as usize - 1)
+                        {
+                            expr = ce.clone();
+                        }
+                        // else: star projection (validated at execution) —
+                        // exec_sort turns the literal into `row[k-1]`.
+                    }
+                }
                 // 1. Alias resolution.
                 if let Expr::Column { table: None, name } = &expr {
                     for c in &s.columns {
@@ -142,9 +197,10 @@ impl<'a> Planner<'a> {
                         resolved_group_by.len(),
                     );
                 }
-                OrderTerm { expr, order: t.order, nulls: t.nulls.clone() }
+                OrderTerm { expr, order: t.order, nulls: t.nulls }
             })
-            .collect()
+            .collect();
+        Ok(resolved)
     }
 
     fn plan_select_body(&mut self, body: &SelectBody) -> Result<Plan> {
@@ -299,13 +355,13 @@ impl<'a> Planner<'a> {
     /// Provide the materialized CTE map for this statement (api.rs).
     pub fn set_ctes(
         &mut self,
-        ctes: HashMap<String, (std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)>,
+        ctes: HashMap<String, crate::types::CteMaterialization>,
     ) {
         self.ctes = ctes;
     }
 
     /// Effective CTE map: own + inherited from the enclosing planner.
-    fn effective_cte(&self, name: &str) -> Option<(std::sync::Arc<Vec<crate::types::Row>>, std::sync::Arc<[String]>)> {
+    fn effective_cte(&self, name: &str) -> Option<crate::types::CteMaterialization> {
         if let Some(v) = self.ctes.get(name) {
             return Some(v.clone());
         }
@@ -343,7 +399,22 @@ impl<'a> Planner<'a> {
                 // stale view definition.
                 if indexed.is_none() {
                     if let Some(view) = self.catalog.get_view(name) {
-                        let inner = self.plan_select(&view.select)?;
+                        // Circular-view guard: a view whose SELECT (directly
+                        // or transitively) references itself would recurse
+                        // plan_table_expression -> plan_select -> ... until
+                        // the stack overflows. Depth-limit it into the same
+                        // graceful error SQLite produces.
+                        if self.view_depth >= MAX_VIEW_DEPTH {
+                            return Err(Error::semantic(format!(
+                                "view {} is circularly defined (or nested more than {} levels deep)",
+                                name,
+                                MAX_VIEW_DEPTH
+                            )));
+                        }
+                        self.view_depth += 1;
+                        let inner = self.plan_select(&view.select);
+                        self.view_depth -= 1;
+                        let inner = inner?;
                         // Optional column rename (CREATE VIEW v(a, b) AS
                         // ...): wrap in a Project aliasing the view select's
                         // top-level output columns positionally.
@@ -718,9 +789,10 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
                 let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column { name, .. } if name == "*")) {
                     None
-                } else if args.len() == 1 {
-                    Some(args[0].clone())
                 } else {
+                    // MAX(x) / MIN(x) / SUM(x): the single argument is the
+                    // aggregate input; multi-arg calls (e.g. MAX(1,5,3))
+                    // also use the first argument.
                     Some(args[0].clone())
                 };
                 out.push(AggExpr {
@@ -728,7 +800,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     arg,
                     distinct: *distinct,
                     alias: alias.clone(),
-                    display_name: format!("{}", name),
+                    display_name: name.to_string(),
                 });
                 return;
             }
@@ -802,9 +874,10 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
                 };
                 let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column { name, .. } if name == "*")) {
                     None
-                } else if args.len() == 1 {
-                    Some(args[0].clone())
                 } else {
+                    // MAX(x) / MIN(x) / SUM(x): the single argument is the
+                    // aggregate input; multi-arg calls (e.g. MAX(1,5,3))
+                    // also use the first argument.
                     Some(args[0].clone())
                 };
                 out.push(WindowExpr {
@@ -815,7 +888,7 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
                     order_by,
                     frame,
                     alias: alias.clone(),
-                    display_name: format!("{}", name),
+                    display_name: name.to_string(),
                 });
                 return;
             }
@@ -840,12 +913,15 @@ pub fn find_index_for_column(
     table: &Table,
     col_name: &str,
 ) -> Option<Arc<Index>> {
-    for idx in catalog.indexes_on_table(&table.name) {
-        if idx.columns.first().map(|c| c.name.eq_ignore_ascii_case(col_name)).unwrap_or(false) {
-            return Some(idx);
-        }
-    }
-    None
+    catalog
+        .indexes_on_table(&table.name)
+        .into_iter()
+        .find(|idx| {
+            idx.columns
+                .first()
+                .map(|c| c.name.eq_ignore_ascii_case(col_name))
+                .unwrap_or(false)
+        })
 }
 
 /// Extract a top-level `col = value` equality predicate from a WHERE clause.
@@ -920,6 +996,33 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 start,
                 end,
                 residual,
+            };
+        }
+        // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
+        // multi-seek instead of a full scan + per-row IN evaluation (which
+        // previously cost a 10k-row table scan for 10 literal rowids).
+        if let Some((in_plan, residual_conjuncts)) =
+            try_rowid_in(&conjuncts, table, alias)
+        {
+            if residual_conjuncts.is_empty() {
+                return in_plan;
+            }
+            return Plan::Filter {
+                input: Box::new(in_plan),
+                predicate: combine_and(&residual_conjuncts),
+            };
+        }
+        // Indexed-column IN-list: `WHERE indexed_col IN (v1, v2, ...)` —
+        // one index seek per member instead of a full table scan.
+        if let Some((in_plan, residual_conjuncts)) =
+            try_index_in(catalog, &conjuncts, table, alias)
+        {
+            if residual_conjuncts.is_empty() {
+                return in_plan;
+            }
+            return Plan::Filter {
+                input: Box::new(in_plan),
+                predicate: combine_and(&residual_conjuncts),
             };
         }
         // Fall back to per-conjunct equality handling (original path).
@@ -1013,6 +1116,90 @@ fn exprs_equal_conjunct(a: &Expr, b: &Expr) -> bool {
     // Cheap structural compare via Debug string. Good enough — this is
     // only called during planning, not per-row.
     format!("{:?}", a) == format!("{:?}", b)
+}
+
+/// Detect `first-indexed-col IN (list-of-expressions)` among the
+/// conjuncts. Only single-column-key indexes (the common case) — the
+/// IN-list replaces the equality key. Non-negated only.
+fn try_index_in(
+    catalog: &Catalog,
+    conjuncts: &[Expr],
+    table: &Arc<Table>,
+    alias: &Option<String>,
+) -> Option<(Plan, Vec<Expr>)> {
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        if let Expr::In { expr, source: InSource::List(list), negated: false } = conjunct {
+            if let Expr::Column { table: None, name } = expr.as_ref() {
+                for index in catalog.indexes_on_table(&table.name) {
+                    // Single-column index whose (only) column matches: each
+                    // list member becomes one equality seek.
+                    if index.columns.len() == 1
+                        && index.columns[0].name.eq_ignore_ascii_case(name)
+                    {
+                        let others: Vec<Expr> = conjuncts
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, _)| *j != i)
+                            .map(|(_, c)| c.clone())
+                            .collect();
+                        return Some((
+                            Plan::IndexIn {
+                                table: table.clone(),
+                                alias: alias.clone(),
+                                index,
+                                key_exprs: list.clone(),
+                                residual: None,
+                            },
+                            others,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Detect `rowid-alias-col IN (list-of-expressions)` among the conjuncts.
+/// Returns the RowidIn plan plus the remaining conjuncts (for a residual
+/// Filter). Only handles the positive (non-negated) form; `NOT IN` keeps
+/// the generic Filter path (it must scan everything anyway).
+fn try_rowid_in(
+    conjuncts: &[Expr],
+    table: &Arc<Table>,
+    alias: &Option<String>,
+) -> Option<(Plan, Vec<Expr>)> {
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        if let Expr::In { expr, source: InSource::List(list), negated: false } = conjunct {
+            if let Expr::Column { table: None, name } = expr.as_ref() {
+                let is_rowid_alias = table
+                    .rowid_alias
+                    .map(|idx| table.columns[idx].name.eq_ignore_ascii_case(name))
+                    .unwrap_or(false);
+                let is_rowid_pseudo = name.eq_ignore_ascii_case("rowid")
+                    || name.eq_ignore_ascii_case("_rowid_")
+                    || name.eq_ignore_ascii_case("oid");
+                if is_rowid_alias || is_rowid_pseudo {
+                    let others: Vec<Expr> = conjuncts
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, c)| c.clone())
+                        .collect();
+                    return Some((
+                        Plan::RowidIn {
+                            table: table.clone(),
+                            alias: alias.clone(),
+                            values: list.clone(),
+                            residual: None,
+                        },
+                        others,
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Try to build a RowidRange (start, end, residual) from a list of conjuncts
@@ -1370,7 +1557,7 @@ fn collect_column_refs_rec(expr: &Expr, out: &mut Vec<(Option<String>, String)>)
 /// - Join: union of left + right
 /// - Subquery: empty (we can't introspect)
 /// - Other (Project, Aggregate, etc.): empty (we don't push past them)
-pub fn plan_column_refs(catalog: &Catalog, plan: &Plan) -> Vec<(Option<String>, String)> {
+pub fn plan_column_refs(plan: &Plan) -> Vec<(Option<String>, String)> {
     match plan {
         Plan::Scan { table, alias, .. } => {
             let prefix = alias.clone().unwrap_or_else(|| table.name.clone());
@@ -1378,12 +1565,10 @@ pub fn plan_column_refs(catalog: &Catalog, plan: &Plan) -> Vec<(Option<String>, 
                 .map(|c| (Some(prefix.clone()), c.name.clone()))
                 .collect()
         }
-        Plan::Filter { input, .. } | Plan::Subquery { plan: input } => {
-            plan_column_refs(catalog, input)
-        }
+        Plan::Filter { input, .. } | Plan::Subquery { plan: input } => plan_column_refs(input),
         Plan::Join { left, right, .. } => {
-            let mut v = plan_column_refs(catalog, left);
-            v.extend(plan_column_refs(catalog, right));
+            let mut v = plan_column_refs(left);
+            v.extend(plan_column_refs(right));
             v
         }
         _ => Vec::new(),
@@ -1472,8 +1657,25 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
     // If the plan is a Join, try to split conjuncts into left-only / right-only
     // / both-sides, and push down accordingly.
     if let Plan::Join { left, right, join_type, condition, algorithm } = &plan {
-        let left_cols = plan_column_refs(catalog, left);
-        let right_cols = plan_column_refs(catalog, right);
+        let left_cols = plan_column_refs(left);
+        let right_cols = plan_column_refs(right);
+
+        // Predicate pushdown below a join is only valid when the pushed
+        // side's rows appear in the join output UNCHANGED. For outer joins
+        // the null-extended side's rows are manufactured by the join, so a
+        // WHERE predicate on that side must be evaluated AFTER the join
+        // (pushing it into the scan would silently rewrite the ON clause):
+        //
+        //   INNER/CROSS: both sides pushable.
+        //   LEFT:        left pushable; right side is null-extended.
+        //   RIGHT:       right pushable; left side is null-extended.
+        //   FULL:        neither side pushable.
+        //
+        // (SQLite additionally converts a LEFT JOIN to INNER when the WHERE
+        // predicate is null-rejecting — an optimization we can add later;
+        // keeping the predicate on top is always correct.)
+        let left_pushable = matches!(join_type, JoinType::Inner | JoinType::Cross | JoinType::Left);
+        let right_pushable = matches!(join_type, JoinType::Inner | JoinType::Cross | JoinType::Right);
 
         let mut left_preds: Vec<Expr> = Vec::new();
         let mut right_preds: Vec<Expr> = Vec::new();
@@ -1481,9 +1683,17 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
 
         for c in conjuncts {
             if conjunct_bound_by(&c, &left_cols) && !conjunct_bound_by(&c, &right_cols) {
-                left_preds.push(c);
+                if left_pushable {
+                    left_preds.push(c);
+                } else {
+                    top_preds.push(c);
+                }
             } else if conjunct_bound_by(&c, &right_cols) && !conjunct_bound_by(&c, &left_cols) {
-                right_preds.push(c);
+                if right_pushable {
+                    right_preds.push(c);
+                } else {
+                    top_preds.push(c);
+                }
             } else if conjunct_bound_by(&c, &left_cols) && conjunct_bound_by(&c, &right_cols) {
                 // Column names collide across both sides (e.g. both have "id").
                 // If the conjunct has explicit table qualifier, use it to
@@ -1501,9 +1711,13 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
                             right_cols.iter().any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
                         }).unwrap_or(false)
                     });
-                    if left_only { left_preds.push(c); }
-                    else if right_only { right_preds.push(c); }
-                    else { top_preds.push(c); }
+                    if left_only && left_pushable {
+                        left_preds.push(c);
+                    } else if right_only && right_pushable {
+                        right_preds.push(c);
+                    } else {
+                        top_preds.push(c);
+                    }
                 } else {
                     top_preds.push(c);
                 }
@@ -1726,8 +1940,8 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
 /// the executor resolves them to column indices via `resolve_outer_key` below.
 fn extract_equi_join_keys_for_planner(
     cond: &Expr,
-    _left_plan: &Plan,
-    _right_plan: &Plan,
+    left_plan: &Plan,
+    right_plan: &Plan,
 ) -> Vec<(Option<String>, String, Option<String>, String)> {
     let mut out = Vec::new();
     let mut stack = vec![cond.clone()];
@@ -1742,7 +1956,43 @@ fn extract_equi_join_keys_for_planner(
                 if let (Expr::Column { table: lt, name: ln }, Expr::Column { table: rt, name: rn }) =
                     (left.as_ref(), right.as_ref())
                 {
-                    out.push((lt.clone(), ln.clone(), rt.clone(), rn.clone()));
+                    // SIDE-AWARE classification. The textual operand order
+                    // of the ON clause is irrelevant: `A JOIN B ON b.k =
+                    // a.k` must produce the same (left_col, right_col) pair
+                    // as `ON a.k = b.k`. Resolve each operand against BOTH
+                    // plan sides and canonicalize:
+                    //   - operand resolves only on the left → left key
+                    //   - operand resolves only on the right → right key
+                    //   - resolves on both (unqualified, name exists in
+                    //     both tables) → fall back to textual order (best
+                    //     effort; the executor's residual filter still
+                    //     guarantees correctness)
+                    //   - both operands on the SAME side → not an equi-join
+                    //     key at all (it's a pushed-down filter); skip.
+                    let a_on_left = resolve_outer_col_index(left_plan, lt.as_deref(), ln).is_some();
+                    let a_on_right = resolve_outer_col_index(right_plan, lt.as_deref(), ln).is_some();
+                    let b_on_left = resolve_outer_col_index(left_plan, rt.as_deref(), rn).is_some();
+                    let b_on_right = resolve_outer_col_index(right_plan, rt.as_deref(), rn).is_some();
+
+                    let pair = match (a_on_left, a_on_right, b_on_left, b_on_right) {
+                        // A = left key, B = right key (canonical order).
+                        (true, false, false, true) => {
+                            Some((lt.clone(), ln.clone(), rt.clone(), rn.clone()))
+                        }
+                        // A = right key, B = left key — SWAP to canonical.
+                        (false, true, true, false) => {
+                            Some((rt.clone(), rn.clone(), lt.clone(), ln.clone()))
+                        }
+                        // Ambiguous on one side: keep textual order.
+                        (true, true, _, _) | (_, _, true, true) => {
+                            Some((lt.clone(), ln.clone(), rt.clone(), rn.clone()))
+                        }
+                        // Same side only / unresolvable: not a join key.
+                        _ => None,
+                    };
+                    if let Some(p) = pair {
+                        out.push(p);
+                    }
                 }
             }
             _ => {}
@@ -1842,6 +2092,8 @@ fn plan_output_width(plan: &Plan) -> usize {
         }
         Plan::Scan { table, .. } => table.n_columns(),
         Plan::RowidLookup { table, .. } => table.n_columns(),
+        Plan::RowidIn { table, .. } => table.n_columns(),
+        Plan::IndexIn { table, .. } => table.n_columns(),
         Plan::IndexLookup { table, .. } => table.n_columns(),
         Plan::IndexRange { table, .. } => table.n_columns(),
         Plan::RowidRange { table, .. } => table.n_columns(),

@@ -86,9 +86,12 @@ pub mod profile {
     }
 }
 
-/// Page size: 16 KiB (larger than SQLite's 4 KiB default) to reduce splits.
-/// This trades some memory for fewer B+tree splits and better scan locality.
+// Page size: 16 KiB (larger than SQLite's 4 KiB default) to reduce splits.
+// This trades some memory for fewer B+tree splits and better scan locality.
 // const DEFAULT_PAGE_SIZE: u32 = 16384;
+
+/// A (object name, root page) pair used when syncing schema roots.
+type RootEntry = (String, u32);
 
 /// A database. Owns the pager and catalog.
 ///
@@ -397,7 +400,6 @@ impl FastPath {
 /// the selective decoder, which skips over un-projected columns without
 /// allocating Values for them.
 #[inline]
-
 /// Pre-encode the index key for an IndexPoint fast path when every bound
 /// key is a literal (constants in the SQL text). Returns None when any
 /// key is a parameter (re-encoded per call against the param values).
@@ -737,16 +739,15 @@ fn rename_column_in_create_table(
                 match c {
                     C::Check(e) | C::Default(e) => rename_column_in_expr(e, old, new, table_name),
                     C::GeneratedAs { expr, .. } => rename_column_in_expr(expr, old, new, table_name),
-                    C::References { table, columns, .. } => {
+                    C::References { table, columns, .. }
                         // Child-side columns of THIS table's FK.
-                        if table.eq_ignore_ascii_case(table_name) {
+                        if table.eq_ignore_ascii_case(table_name) => {
                             for cn in columns.iter_mut() {
                                 if cn.eq_ignore_ascii_case(old) {
                                     *cn = new.to_string();
                                 }
                             }
                         }
-                    }
                     _ => {}
                 }
             }
@@ -1038,8 +1039,8 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
                     let target = as_str(j).map(is_target_ref).unwrap_or(false);
                     j += 1;
                     // Optional column list: '(' ident[, ident]* ')'
-                    if target {
-                        if matches!(&toks.get(j).map(|t| &t.0), Some(Tk::Other(o)) if o == "(") {
+                    if target
+                        && matches!(&toks.get(j).map(|t| &t.0), Some(Tk::Other(o)) if o == "(") {
                             j += 1;
                             while j < n {
                                 if let Tk::Ident(s) = &toks[j].0 {
@@ -1054,7 +1055,6 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
                                 }
                             }
                         }
-                    }
                 }
                 i = j;
             }
@@ -1187,15 +1187,15 @@ fn rewrite_object_sql_column_refs(
                             tbl_name.eq_ignore_ascii_case(table)
                         } else {
                             catalog
-                                .get_view(&name)
+                                .get_view(name)
                                 .map(|v| view_is_single_table_over(&v.select, table))
                                 .unwrap_or(false)
                         };
-                        let new_sql = rename_column_in_object_sql(&sql, table, old, new, unq);
+                        let new_sql = rename_column_in_object_sql(sql, table, old, new, unq);
                         if new_sql != sql {
                             schema_updates.push((
                                 rowid,
-                                crate::schema::encode_schema_row(&kind, &name, &tbl_name, rootpage, &new_sql),
+                                crate::schema::encode_schema_row(kind, name, tbl_name, rootpage, &new_sql),
                             ));
                         }
                     }
@@ -1220,7 +1220,7 @@ fn rewrite_object_sql_column_refs(
     for (rowid, row) in &schema_updates {
         let _ = rowid;
         if let Some((_kind, _name, _tbl, _root, sql)) = crate::schema::decode_schema_row(row) {
-            if let Ok(stmt) = crate::sql::parser::parse(&sql) {
+            if let Ok(stmt) = crate::sql::parser::parse(sql) {
                 match stmt {
                     crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::View {
                         name, columns, select, ..
@@ -1331,11 +1331,11 @@ impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         crate::engine_init();
         let path = path.as_ref().to_path_buf();
-        let mut pager = Pager::open(&path, DEFAULT_CACHE_PAGES)?;
+        let pager = Pager::open(&path, DEFAULT_CACHE_PAGES)?;
         let mut catalog = Catalog::new();
         catalog.schema_cookie = pager.schema_cookie();
         // Load the schema from page 0 (the schema table root).
-        load_schema(&mut pager, &mut catalog)?;
+        load_schema(&pager, &mut catalog)?;
         // Seed the persisted-root map from the loaded schema so
         // sync_schema_roots only rewrites rows when a root actually moves.
         let mut schema_root_pages = HashMap::new();
@@ -1377,7 +1377,7 @@ impl Database {
     pub fn open_in_memory() -> Result<Self> {
         let path = PathBuf::from(":memory:");
         // Use a temp file under the hood — we don't support pure in-memory yet.
-        let tmp = tempfile::NamedTempFile::new().map_err(|e| Error::Io(e))?;
+        let tmp = tempfile::NamedTempFile::new().map_err(Error::Io)?;
         let mut db = Self::open(tmp.path())?;
         db.path = path;
         db.pager.set_skip_fsync(true);
@@ -1516,7 +1516,7 @@ impl Database {
             }
             let mut seen: Vec<usize> = Vec::with_capacity(fi.columns.len());
             for name in fi.columns.iter() {
-                match table.find_column(name) {
+                match resolve_insert_column(&table, name) {
                     Some(idx) => {
                         if seen.contains(&idx) {
                             // Duplicate column — general path errors nicely.
@@ -1722,7 +1722,8 @@ impl Database {
     /// last persisted (tracked in `schema_root_pages`), so the cost is one
     /// schema-row rewrite per actual split — O(1) amortized.
     fn sync_schema_roots(&self) -> Result<()> {
-        let (tables, indexes): (Vec<(String, u32)>, Vec<(String, u32)>) = {
+        // (object name, root page) pairs for tables and indexes.
+        let (tables, indexes): (Vec<RootEntry>, Vec<RootEntry>) = {
             let m = self.maps.read();
             (
                 m.roots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -1780,7 +1781,6 @@ impl Database {
             }
             true
         })?;
-        drop(bt);
         if let Some((old_rowid, mut row)) = found {
             if row.len() >= 4 {
                 row[3] = Value::Integer(new_root as i64);
@@ -2025,7 +2025,7 @@ impl Database {
         let cached = self.get_or_cache_stmt(sql)?;
         // Read-form PRAGMAs surface their value as a result row.
         if let Statement::Pragma(p) = cached.stmt.as_ref() {
-            if let Some(row) = read_pragma(p, &self.pager) {
+            if let Some(row) = read_pragma(p, self) {
                 return Ok(vec![row]);
             }
         }
@@ -2176,7 +2176,7 @@ impl Database {
         }
         let cached = self.get_or_cache_stmt(sql)?;
         if let Statement::Pragma(p) = cached.stmt.as_ref() {
-            if let Some(row) = read_pragma(p, &self.pager) {
+            if let Some(row) = read_pragma(p, self) {
                 return Ok((vec![p.name.clone()], vec![row]));
             }
         }
@@ -2399,7 +2399,7 @@ impl Database {
         &self,
         ctx: &mut ExecContext<'_>,
         select: &SelectStatement,
-        outer_ctes: &HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>,
+        outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
     ) -> Result<crate::executor::ExecResult> {
         // Materialize THIS select's own WITH clause (nested WITH), layered
         // on top of the outer map (inner names shadow outer names).
@@ -2432,10 +2432,10 @@ impl Database {
     fn materialize_ctes(
         &self,
         with: &WithClause,
-        outer_ctes: &HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>,
+        outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
         ctx: &mut ExecContext<'_>,
-    ) -> Result<HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>> {
-        let mut map: HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)> = outer_ctes.clone();
+    ) -> Result<HashMap<String, crate::types::CteMaterialization>> {
+        let mut map: HashMap<String, crate::types::CteMaterialization> = outer_ctes.clone();
         for cte in &with.ctes {
             let name_lc = cte.name.to_ascii_lowercase();
             let (rows, cols) = if with.recursive {
@@ -2486,7 +2486,7 @@ impl Database {
     fn materialize_recursive_cte(
         &self,
         cte: &Cte,
-        outer_ctes: &HashMap<String, (Arc<Vec<Row>>, Arc<[String]>)>,
+        outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
         ctx: &mut ExecContext<'_>,
     ) -> Result<(Vec<Row>, Arc<[String]>)> {
         let name_lc = cte.name.to_ascii_lowercase();
@@ -2596,7 +2596,7 @@ impl Database {
         fn resolve_projection(
             columns: &[crate::planner::plan::ProjectExpr],
             table: &Table,
-        ) -> Option<(Option<Vec<usize>>, Arc<[String]>)> {
+        ) -> Option<crate::types::ProjectionMapping> {
             // `SELECT *` / `SELECT t.*` plans as a single pseudo-column
             // named "*" — identity projection, decode the full row.
             if columns.len() == 1 {
@@ -2653,7 +2653,7 @@ impl Database {
                 crate::planner::plan::Plan::IndexLookup { table, index, key_exprs, .. } => {
                     let keys = key_exprs
                         .iter()
-                        .map(|e| bind_expr(e))
+                        .map(bind_expr)
                         .collect::<Option<Vec<_>>>()?;
                     let pre_encoded = pre_encode_literal_keys(&keys);
                     Some(FastPath::IndexCount {
@@ -2745,7 +2745,7 @@ impl Database {
                         return None;
                     }
                     if let Plan::IndexLookup { table, index, key_exprs, .. } = input.as_ref() {
-                        let keys = key_exprs.iter().map(|e| bind_expr(e)).collect::<Option<Vec<_>>>()?;
+                        let keys = key_exprs.iter().map(bind_expr).collect::<Option<Vec<_>>>()?;
                         let pre_encoded = pre_encode_literal_keys(&keys);
                         Some(FastPath::IndexCount {
                             table: table.clone(),
@@ -2875,7 +2875,7 @@ impl Database {
                 let rows = ROWID_SCRATCH.with(|scratch| {
                     let mut rowids = std::mem::take(&mut *scratch.borrow_mut());
                     let r = (|| -> Result<Vec<Row>> {
-                        ibt.lookup_index_into(&key_bytes, &mut rowids)?;
+                        ibt.lookup_index_into(key_bytes, &mut rowids)?;
                         if rowids.is_empty() {
                             return Ok(Vec::new());
                         }
@@ -2938,8 +2938,8 @@ impl Database {
         // Plan the source.
         let source_plan = match &ins.source {
             InsertSource::Values(rows) => {
-                let plan = crate::planner::plan::Plan::Values { rows: rows.clone() };
-                plan
+                
+                crate::planner::plan::Plan::Values { rows: rows.clone() }
             }
             InsertSource::Select(s) => {
                 let mut planner = Planner::new(catalog);
@@ -2952,7 +2952,7 @@ impl Database {
         let columns: Option<Vec<usize>> = if let Some(cols) = &ins.columns {
             let mut v = Vec::with_capacity(cols.len());
             for c in cols {
-                let idx = table.find_column(c).ok_or_else(|| Error::semantic(format!("column {} not in table {}", c, table.name)))?;
+                let idx = resolve_insert_column(&table, c).ok_or_else(|| Error::semantic(format!("column {} not in table {}", c, table.name)))?;
                 v.push(idx);
             }
             Some(v)
@@ -3108,7 +3108,8 @@ impl Database {
     fn execute_create(c: CreateStatement, ctx: &mut ExecContext, catalog: &mut Catalog, original_sql: &str) -> Result<()> {
         match c {
             CreateStatement::Table { name, columns, constraints, without_rowid, strict, if_not_exists } => {
-                if let Some(_) = catalog.get_table(&name.name) {
+                // Tables and views share one namespace (see the View arm).
+                if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some() {
                     if if_not_exists {
                         return Ok(());
                     }
@@ -3280,8 +3281,18 @@ impl Database {
                                 _ => return true,
                             }
                         }
+                        // NULLs are distinct: rows with ANY NULL among
+                        // the indexed columns are exempt from the UNIQUE
+                        // duplicate check (SQLite semantics — you can
+                        // CREATE UNIQUE INDEX over data holding many NULLs).
+                        let has_null_key = index.columns.iter().any(|c| {
+                            table.find_column(&c.name)
+                                .and_then(|p| row_buf.get(p))
+                                .map(|v| v.is_null())
+                                .unwrap_or(false)
+                        });
                         let key = crate::executor::encode_index_key(&index, &table, &row_buf);
-                        if is_unique {
+                        if is_unique && !has_null_key {
                             match index_bt.lookup_index(&key) {
                                 Ok(existing) if !existing.is_empty() => {
                                     backfill_err = Some(Error::semantic(format!(
@@ -3335,11 +3346,17 @@ impl Database {
                 Ok(())
             }
             CreateStatement::View { name, columns, select, if_not_exists } => {
-                if catalog.get_view(&name.name).is_some() {
+                // Tables and views share one namespace (SQLite: creating a
+                // view with an existing TABLE's name fails with "table X
+                // already exists", and vice versa). Without this check, a
+                // fuzzed `CREATE VIEW t AS ... FROM t` silently shadows a
+                // real table t — and a self-referencing shadow is exactly
+                // how infinite view-expansion recursion arises.
+                if catalog.get_view(&name.name).is_some() || catalog.get_table(&name.name).is_some() {
                     if if_not_exists {
                         return Ok(());
                     }
-                    return Err(Error::AlreadyExists(format!("view: {}", name.name)));
+                    return Err(Error::AlreadyExists(format!("table: {}", name.name)));
                 }
                 let view = crate::schema::View {
                     name: name.name.clone(),
@@ -3570,13 +3587,11 @@ impl Database {
                 let mut rebuilt = (*table).clone();
                 // Rebuild via build_table so affinity/constraints parse
                 // consistently (parse the new SQL and take its columns).
-                if let Ok(stmt) = crate::sql::parser::parse(&new_sql) {
-                    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                        columns, constraints, without_rowid, strict, ..
-                    }) = stmt
-                    {
-                        rebuilt = build_table(&table.name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
-                    }
+                if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                    columns, constraints, without_rowid, strict, ..
+                })) = crate::sql::parser::parse(&new_sql)
+                {
+                    rebuilt = build_table(&table.name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
                 }
                 let table_name = rebuilt.name.clone();
                 catalog.drop_table(&a.table);
@@ -3667,13 +3682,11 @@ impl Database {
 
                 // 2. Rebuild the catalog entry from the new SQL.
                 let mut rebuilt = (*table).clone();
-                if let Ok(stmt) = crate::sql::parser::parse(&new_sql) {
-                    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                        columns, constraints, without_rowid, strict, ..
-                    }) = stmt
-                    {
-                        rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
-                    }
+                if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                    columns, constraints, without_rowid, strict, ..
+                })) = crate::sql::parser::parse(&new_sql)
+                {
+                    rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
                 }
                 catalog.replace_table(&table_name, rebuilt);
 
@@ -3692,14 +3705,12 @@ impl Database {
                             rename_fk_refs_in_create_table(&other.create_sql, &table_name, &old_name, &new)
                         {
                             let mut rebuilt_other = (*other).clone();
-                            if let Ok(stmt) = crate::sql::parser::parse(&new_other_sql) {
-                                if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                                    columns, constraints, without_rowid, strict, ..
-                                }) = stmt
-                                {
-                                    if let Ok(t) = build_table(&other.name, &columns, &constraints, other.root_page, without_rowid, strict, &new_other_sql) {
-                                        rebuilt_other = t;
-                                    }
+                            if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                                columns, constraints, without_rowid, strict, ..
+                            })) = crate::sql::parser::parse(&new_other_sql)
+                            {
+                                if let Ok(t) = build_table(&other.name, &columns, &constraints, other.root_page, without_rowid, strict, &new_other_sql) {
+                                    rebuilt_other = t;
                                 }
                             }
                             let other_root = ctx.table_root(&other);
@@ -3894,13 +3905,11 @@ impl Database {
 
                 // 2. Rebuild the catalog entry.
                 let mut rebuilt = (*table).clone();
-                if let Ok(stmt) = crate::sql::parser::parse(&new_sql) {
-                    if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                        columns, constraints, without_rowid, strict, ..
-                    }) = stmt
-                    {
-                        rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
-                    }
+                if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                    columns, constraints, without_rowid, strict, ..
+                })) = crate::sql::parser::parse(&new_sql)
+                {
+                    rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
                 }
                 let new_n_cols = rebuilt.n_columns();
                 catalog.replace_table(&table_name, rebuilt);
@@ -3919,7 +3928,7 @@ impl Database {
                         let mut bt = Btree::new(ctx.pager, live_root, false);
                         bt.scan_table(|rowid, payload| {
                             if let Ok(mut row) = decode_row(payload, old_n_cols, rowid, old_alias) {
-                                if (col_idx as usize) < row.len() {
+                                if col_idx < row.len() {
                                     row.remove(col_idx);
                                 }
                                 // Rowid-alias marker may shift: the alias
@@ -3981,7 +3990,7 @@ impl Database {
                 &ctx.params,
                 &ctx.named_params,
             );
-            let v = crate::executor::evaluate(&value_as_expr(value), &eval_ctx)?;
+            let v = crate::executor::evaluate(value_as_expr(value), &eval_ctx)?;
             match name.as_str() {
                 "foreign_keys" | "recursive_triggers" => {
                     // Accept booleans, numbers, and ON/OFF bare words.
@@ -4069,11 +4078,36 @@ impl Database {
 /// Evaluate a read-form PRAGMA (`PRAGMA name` with no `= value`) into a
 /// result row. Returns None for unknown names (the caller then treats the
 /// statement as a no-op, matching the previous behavior).
-fn read_pragma(p: &PragmaStatement, pager: &Pager) -> Option<Vec<Value>> {
+fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
     let name = p.name.to_ascii_lowercase();
     if p.value.is_some() {
         return None; // write form
     }
+    // integrity_check / quick_check: full structural walk of every b-tree
+    // (see src/storage/integrity.rs). Runs against the flushed on-disk
+    // state so the reported file shape is real.
+    if name == "integrity_check" || name == "quick_check" {
+        // Flush pending dirty pages first: the check validates the file,
+        // and the session's live roots must match what's persisted.
+        if db.pager.has_dirty_pages() {
+            let _ = db.pager.flush();
+        }
+        let (roots, index_roots) = {
+            let maps = db.maps.read();
+            let roots = maps.roots.clone();
+            let index_roots = maps.index_roots.clone();
+            (roots, index_roots)
+        };
+        let rows = crate::storage::integrity::integrity_check(
+            &db.catalog,
+            &db.pager,
+            &roots,
+            &index_roots,
+            name == "quick_check",
+        );
+        return Some(rows);
+    }
+    let pager = &db.pager;
     let v = match name.as_str() {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
         "page_size" => Value::Integer(pager.page_size() as i64),
@@ -4261,10 +4295,10 @@ fn rewrite_trigger_tbl_names(pager: &Pager, old_table: &str, new_table: &str) ->
         if let Ok(row) = decode_row(payload, 5, 0, None) {
             if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
                 if kind == "trigger" && tbl_name.eq_ignore_ascii_case(old_table) {
-                    let new_sql = rewrite_on_table(&sql, old_table, new_table);
+                    let new_sql = rewrite_on_table(sql, old_table, new_table);
                     updates.push((
                         rowid,
-                        crate::schema::encode_schema_row("trigger", &name, new_table, rootpage, &new_sql),
+                        crate::schema::encode_schema_row("trigger", name, new_table, rootpage, &new_sql),
                     ));
                 }
             }
@@ -4314,10 +4348,10 @@ fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> R
         if let Ok(row) = decode_row(payload, 5, 0, None) {
             if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
                 if kind == "index" && tbl_name.eq_ignore_ascii_case(old_table) {
-                    let new_sql = rewrite_on_table(&sql, old_table, new_table);
+                    let new_sql = rewrite_on_table(sql, old_table, new_table);
                     updates.push((
                         rowid,
-                        crate::schema::encode_schema_row("index", &name, new_table, rootpage, &new_sql),
+                        crate::schema::encode_schema_row("index", name, new_table, rootpage, &new_sql),
                     ));
                 }
             }
@@ -4343,7 +4377,7 @@ fn insert_schema_row(pager: &Pager, row: &[Value]) -> Result<()> {
         }
         true
     })?;
-    let rowid = max_rowid + 1;
+    let rowid = crate::executor::next_auto_rowid(pager, 0, max_rowid)?;
     let row_vec: Vec<Value> = row.to_vec();
     let payload = encode_row(&row_vec);
     bt.insert_table(rowid, &payload)?;
@@ -4397,7 +4431,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
             }
         }
     }
-    let ordered = tables_first.into_iter().chain(others.into_iter());
+    let ordered = tables_first.into_iter().chain(others);
     for (kind, _name, tbl_name, rootpage, sql) in ordered {
         let kind = kind.as_str();
         let sql = sql.as_str();
@@ -4406,56 +4440,48 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         {
             match kind {
                 "table" => {
-                    if let Ok(stmt) = parse(sql) {
-                        if let Statement::Create(CreateStatement::Table { name: tn, columns, constraints, without_rowid, strict, .. }) = stmt {
-                            let table = build_table(&tn.name, &columns, &constraints, rootpage, without_rowid, strict, sql)?;
-                            catalog.add_table(table);
-                        }
+                    if let Ok(Statement::Create(CreateStatement::Table { name: tn, columns, constraints, without_rowid, strict, .. })) = parse(sql) {
+                        let table = build_table(&tn.name, &columns, &constraints, rootpage, without_rowid, strict, sql)?;
+                        catalog.add_table(table);
                     }
                 }
                 "index" => {
-                    if let Ok(stmt) = parse(sql) {
-                        if let Statement::Create(CreateStatement::Index { unique, name: idx_name, table, columns, where_clause, .. }) = stmt {
-                            let table_obj = catalog.get_table(&table).ok_or_else(|| Error::corruption(format!("index {} references missing table {}", idx_name, table)))?;
-                            let idx_columns = crate::schema::build_index_columns(&columns, &table_obj)?;
-                            catalog.add_index(crate::schema::Index {
-                                name: idx_name,
-                                table,
-                                columns: idx_columns,
-                                root_page: rootpage,
-                                unique,
-                                partial_expr: where_clause,
-                                create_sql: sql.to_string(),
-                            });
-                        }
+                    if let Ok(Statement::Create(CreateStatement::Index { unique, name: idx_name, table, columns, where_clause, .. })) = parse(sql) {
+                        let table_obj = catalog.get_table(&table).ok_or_else(|| Error::corruption(format!("index {} references missing table {}", idx_name, table)))?;
+                        let idx_columns = crate::schema::build_index_columns(&columns, &table_obj)?;
+                        catalog.add_index(crate::schema::Index {
+                            name: idx_name,
+                            table,
+                            columns: idx_columns,
+                            root_page: rootpage,
+                            unique,
+                            partial_expr: where_clause,
+                            create_sql: sql.to_string(),
+                        });
                     }
                 }
                 "view" => {
-                    if let Ok(stmt) = parse(sql) {
-                        if let Statement::Create(CreateStatement::View { name: vn, columns, select, .. }) = stmt {
-                            catalog.add_view(crate::schema::View {
-                                name: vn.name,
-                                columns,
-                                select: *select,
-                                create_sql: sql.to_string(),
-                            });
-                        }
+                    if let Ok(Statement::Create(CreateStatement::View { name: vn, columns, select, .. })) = parse(sql) {
+                        catalog.add_view(crate::schema::View {
+                            name: vn.name,
+                            columns,
+                            select: *select,
+                            create_sql: sql.to_string(),
+                        });
                     }
                 }
                 "trigger" => {
-                    if let Ok(stmt) = parse(sql) {
-                        if let Statement::Create(CreateStatement::Trigger(t)) = stmt {
-                            catalog.add_trigger(crate::schema::Trigger {
-                                name: t.name,
-                                table: t.table,
-                                when: t.when,
-                                events: t.events,
-                                for_each_row: t.for_each_row,
-                                when_clause: t.when_clause,
-                                body: t.body,
-                                create_sql: sql.to_string(),
-                            });
-                        }
+                    if let Ok(Statement::Create(CreateStatement::Trigger(t))) = parse(sql) {
+                        catalog.add_trigger(crate::schema::Trigger {
+                            name: t.name,
+                            table: t.table,
+                            when: t.when,
+                            events: t.events,
+                            for_each_row: t.for_each_row,
+                            when_clause: t.when_clause,
+                            body: t.body,
+                            create_sql: sql.to_string(),
+                        });
                     }
                 }
                 _ => {}
@@ -4466,11 +4492,10 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
-/// Heuristic: does this SQL string start a DDL statement (CREATE/DROP/ALTER)?
-/// Used to invalidate the statement cache after schema changes. We only need
-/// a cheap prefix check — the parser is the source of truth, and the cache
-/// will be re-populated on the next call.
-
+// Heuristic: does this SQL string start a DDL statement (CREATE/DROP/ALTER)?
+// Used to invalidate the statement cache after schema changes. We only need
+// a cheap prefix check — the parser is the source of truth, and the cache
+// will be re-populated on the next call.
 // ============================================================================
 // Fast INSERT path
 // ============================================================================
@@ -4779,7 +4804,7 @@ fn is_ddl_sql(sql: &str) -> bool {
         for j in 0..kw.len() {
             let mut c = p[j];
             // ASCII to_upper
-            if c >= b'a' && c <= b'z' {
+            if c.is_ascii_lowercase() {
                 c -= 32;
             }
             if c != kw[j] {
@@ -4827,6 +4852,28 @@ impl Params for Vec<Value> {
     fn as_slice(&self) -> Option<&[Value]> {
         Some(self)
     }
+}
+
+/// Resolve one name from an INSERT column list to a column index.
+/// `rowid` / `_rowid_` / `oid` are accepted as synonyms for the table's
+/// INTEGER PRIMARY KEY alias column (SQLite semantics); a real column of
+/// the same name always takes precedence.
+fn resolve_insert_column(table: &crate::schema::Table, name: &str) -> Option<usize> {
+    if let Some(idx) = table.find_column(name) {
+        return Some(idx);
+    }
+    let is_rowid_name = name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid");
+    if is_rowid_name {
+        if let Some(alias_idx) = table.rowid_alias {
+            return Some(alias_idx);
+        }
+        // No INTEGER PRIMARY KEY: `rowid` targets the rowid itself — the
+        // executor routes the value to the B+tree key (sentinel index).
+        return Some(crate::executor::ROWID_COLUMN_SENTINEL);
+    }
+    None
 }
 
 impl<const N: usize> Params for [Value; N] {

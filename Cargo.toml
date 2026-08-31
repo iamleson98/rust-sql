@@ -57,10 +57,32 @@ rand = "0.8"
 
 [features]
 default = ["mimalloc"]
+# SQLite's SQLITE_MEMDEBUG/memsys2 equivalent: replace the global allocator
+# with a counting allocator that can fail at allocation #N. Enables the
+# `oom_fault` test (see tests/oom_fault.rs) and disables mimalloc for that
+# build (only one global allocator may exist per binary).
+oom-injection = []
 # Fast global allocator (see the mimalloc dependency note above).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Disable to remove rustyline (smaller binary)
 no-cli-readline = []
+
+# Crash/power-loss simulation (SQLite testing.html §3.3): spawns itself as
+# a child that hard-aborts mid-transaction at advancing statement
+# boundaries, then verifies all-or-nothing + baseline survival.
+[[test]]
+name = "crash_recovery"
+path = "tests/crash_recovery.rs"
+harness = false
+
+# OOM fault injection (SQLite testing.html §3.1): a counting global
+# allocator that fails at allocation #N; the parent advances N through the
+# whole workload allocation range and verifies the baseline after each.
+[[test]]
+name = "oom_fault"
+path = "tests/oom_fault.rs"
+harness = false
+required-features = ["oom-injection"]
 
 [[bench]]
 name = "point_lookup"

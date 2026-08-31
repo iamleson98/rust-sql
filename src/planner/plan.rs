@@ -31,6 +31,20 @@ pub enum Plan {
     /// `rowid > ?`, `rowid < ?`, `rowid >= ?`, `rowid <= ?`, or any AND-chain
     /// of these on the rowid-alias column). Starts and ends are inclusive.
     /// If either bound is `None`, it means -∞ or +∞ respectively.
+    /// A batched rowid multi-lookup (used for `WHERE rowid IN (?, ?, ...)`
+    /// and `WHERE id IN (...)` on the INTEGER PRIMARY KEY alias). Evaluates
+    /// the list, sorts + dedups the rowids, and fetches each row with ONE
+    /// shared B+tree handle — N point seeks instead of a full table scan.
+    RowidIn {
+        table: Arc<Table>,
+        alias: Option<String>,
+        /// The IN-list member expressions (evaluated with the statement's
+        /// parameters, so `IN (?, ?, ?)` works).
+        values: Vec<Expr>,
+        /// Remaining predicates for a top-level Filter (e.g.
+        /// `id IN (1,2,3) AND name = 'x'`).
+        residual: Option<Expr>,
+    },
     RowidRange {
         table: Arc<Table>,
         alias: Option<String>,
@@ -39,6 +53,19 @@ pub enum Plan {
         /// Remaining predicates that can't be expressed as a range bound
         /// (e.g. `id > 5 AND id < 100 AND name = 'foo'` → start=Some(5),
         /// end=Some(100), residual=Some(name='foo')).
+        residual: Option<Expr>,
+    },
+    /// Batched secondary-index multi-lookup (`WHERE indexed_col IN (?, ?, ...)`
+    /// where indexed_col is the first column of an index). Each key seeks
+    /// the index, and the matching rows are fetched by rowid — no full
+    /// table scan.
+    IndexIn {
+        table: Arc<Table>,
+        alias: Option<String>,
+        index: Arc<Index>,
+        /// The IN-list member expressions (one per index seek).
+        key_exprs: Vec<Expr>,
+        /// Remaining predicates for a top-level Filter.
         residual: Option<Expr>,
     },
     /// A point lookup via a secondary index (used for `WHERE indexed_col = ?`).

@@ -9,6 +9,223 @@ use crate::sql::ast::*;
 use crate::types::{Affinity, Value};
 use std::collections::HashMap;
 
+/// Resolve a `substr(X, Y, Z)` range to 0-based `[begin, end)` bounds
+/// over a value of `n` units (characters for TEXT, bytes for BLOB),
+/// implementing SQLite's exact algorithm from `substrFunc` (func.c):
+///
+///   - `Y > 0` is a 1-based start; `Y < 0` counts from the end; `Y == 0`
+///     consumes one unit of the length budget and starts at 0.
+///   - `Z > 0` is a length; `Z < 0` selects `|Z|` units PRECEDING the
+///     start; omitted `Z` means "to the end".
+///   - A start left of the beginning also eats into the length budget.
+fn substr_range(n: i64, y: i64, z: i64) -> (i64, i64) {
+    let mut p1 = y;
+    let mut p2 = z;
+    if p1 < 0 {
+        p1 = p1.saturating_add(n);
+        if p1 < 0 {
+            p2 = p2.saturating_add(p1);
+            if p2 < 0 {
+                p2 = 0;
+            }
+            p1 = 0;
+        }
+    } else if p1 > 0 {
+        p1 -= 1;
+    } else if p2 > 0 {
+        // Position 0 does not exist: the missing first character still
+        // consumes one unit of length (substr('hello', 0, 2) = 'h').
+        p2 -= 1;
+    }
+    if p2 < 0 {
+        // |Z| units preceding the start position, clamped to the string.
+        let begin = (p1 + p2).max(0);
+        let end = p1.min(n);
+        if begin >= end {
+            (0, 0)
+        } else {
+            (begin, end)
+        }
+    } else {
+        let begin = p1.min(n).max(0);
+        let end = p1.saturating_add(p2).min(n).max(begin);
+        (begin, end)
+    }
+}
+
+/// CAST(value AS type) with SQLite's exact semantics — which differ from
+/// column-affinity coercion: CAST parses the longest numeric PREFIX of the
+/// text (`CAST('12abc' AS INTEGER)` is 12, `CAST('abc' AS INTEGER)` is 0),
+/// while affinity conversion only fires when the WHOLE string looks numeric.
+/// Overflow saturates to i64::MIN/MAX, `CAST('inf' AS REAL)` is 0.0, and
+/// NUMERIC keeps integral values as INTEGER (`CAST('12.0' AS NUMERIC)` is
+/// the integer 12).
+fn cast_value(v: Value, type_name: &str) -> Value {
+    let affinity = Affinity::from_declared_type(type_name);
+    match affinity {
+        Affinity::Integer => match v {
+            Value::Null => Value::Null,
+            Value::Integer(i) => Value::Integer(i),
+            // Rust's float→int `as` saturates exactly like SQLite clamps.
+            Value::Real(f) => Value::Integer(f as i64),
+            Value::Text(_) | Value::Blob(_) => {
+                Value::Integer(parse_int_prefix(&v.as_text()))
+            }
+        },
+        Affinity::Real => match v {
+            Value::Null => Value::Null,
+            Value::Integer(i) => Value::Real(i as f64),
+            Value::Real(f) => Value::Real(f),
+            Value::Text(_) | Value::Blob(_) => Value::Real(parse_real_prefix(&v.as_text())),
+        },
+        Affinity::Text => match v {
+            Value::Null => Value::Null,
+            other => Value::Text(other.as_text().into()),
+        },
+        Affinity::Blob => match v {
+            Value::Null => Value::Null,
+            Value::Blob(b) => Value::Blob(b),
+            other => Value::Blob(other.as_text().into_bytes()),
+        },
+        // No declared type (CAST(x AS) is a syntax error anyway): no-op.
+        Affinity::None => v,
+    }
+}
+
+/// SQLite `sqlite3Atoi64` prefix semantics for CAST(... AS INTEGER):
+/// optional whitespace and sign, then digits. No digits -> 0. No exponent
+/// (`CAST('1e3' AS INTEGER)` is 1). Overflow saturates to i64::MIN/MAX.
+fn parse_int_prefix(s: &str) -> i64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        neg = b[i] == b'-';
+        i += 1;
+    }
+    let mut v: i64 = 0;
+    let mut digits = 0usize;
+    let mut overflow = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        let d = (b[i] - b'0') as i64;
+        match v.checked_mul(10).and_then(|x| x.checked_add(d)) {
+            Some(nv) => v = nv,
+            None => overflow = true,
+        }
+        digits += 1;
+        i += 1;
+    }
+    if digits == 0 {
+        return 0;
+    }
+    if overflow {
+        return if neg { i64::MIN } else { i64::MAX };
+    }
+    if neg {
+        -v
+    } else {
+        v
+    }
+}
+
+/// SQLite `sqlite3AtoF` prefix semantics for CAST(... AS REAL):
+/// optional whitespace and sign, digits with optional fraction, and an
+/// optional exponent that only counts when at least one digit follows.
+/// `inf`/`nan` are NOT accepted by CAST (they yield 0.0).
+fn parse_real_prefix(s: &str) -> f64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let mut mantissa_digits = 0usize;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        mantissa_digits += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            mantissa_digits += 1;
+        }
+    }
+    if mantissa_digits == 0 {
+        return 0.0;
+    }
+    let mut end = i;
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let mut exp_digits = 0usize;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+            exp_digits += 1;
+        }
+        if exp_digits > 0 {
+            end = j;
+        }
+    }
+    s[start..end].parse::<f64>().unwrap_or(0.0)
+}
+
+/// SQLite's `round(X, N)`: round the EXACT binary value of X to N digits,
+/// ties away from zero. The naive `x * 10^N` scale-round-divide loses to
+/// representation error (2.675 * 100 rounds to exactly 267.5 in f64, so
+/// it would round to 2.68 — SQLite gives 2.67 because 2.675 is actually
+/// 2.67499999... in binary). The FMA error term recovers the direction of
+/// the true product when the scaled value lands exactly on a .5 boundary.
+fn sqlite_round(x: f64, n: i64) -> f64 {
+    if x.is_infinite() {
+        return x;
+    }
+    let n = n.clamp(0, 30);
+    // |x| >= 2^52 is already an exact integer; rounding to N >= 0 digits
+    // cannot change it (SQLite short-circuits the same range).
+    if x.abs() >= 4_503_599_627_370_496.0 {
+        return x;
+    }
+    if n == 0 {
+        // SQLite: (i64)(r + (r < 0 ? -0.5 : +0.5)) — half away from zero.
+        return (x + if x < 0.0 { -0.5 } else { 0.5 }).trunc();
+    }
+    let factor = 10f64.powi(n as i32);
+    let scaled = x * factor;
+    if !scaled.is_finite() {
+        return x;
+    }
+    // Exact rounding error of the multiplication (FMA is correctly
+    // rounded): true_product == scaled + err exactly.
+    let err = f64::mul_add(x, factor, -scaled);
+    let rounded = if scaled.fract().abs() == 0.5 && err != 0.0 {
+        // The scaled value sits exactly on a half boundary but the TRUE
+        // product is on one side of it: round toward the true side.
+        // err > 0 means the true product is greater than `scaled`.
+        let true_is_above = err > 0.0;
+        let scaled_is_positive = scaled > 0.0;
+        if true_is_above == scaled_is_positive {
+            // True value lies AWAY from zero relative to the boundary.
+            scaled.round()
+        } else {
+            scaled.trunc()
+        }
+    } else {
+        // Either not at a boundary (plain round is exact) or an exact
+        // mathematical tie (SQLite rounds half away from zero).
+        scaled.round()
+    };
+    rounded / factor
+}
+
 /// A row context: maps column references (table, name) to values.
 pub struct EvalContext<'a> {
     /// Per-table column values, indexed by table alias.
@@ -180,6 +397,15 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             } else {
                 None
             };
+            // Three-valued logic: any NULL operand makes the whole
+            // comparison NULL (unknown) — NOT LIKE included — so WHERE
+            // filters the row out either way (SQLite semantics).
+            if v.is_null()
+                || p.is_null()
+                || esc.as_ref().map(|e| e.is_null()).unwrap_or(false)
+            {
+                return Ok(Value::Null);
+            }
             let result = match op {
                 LikeOp::Like => like_match(&v, &p, esc.as_ref(), false),
                 LikeOp::Glob => glob_match(&v, &p),
@@ -227,12 +453,12 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 if let Some(op) = &op_val {
                     let c = evaluate(cond, ctx)?;
                     if op == &c {
-                        return Ok(evaluate(val, ctx)?);
+                        return evaluate(val, ctx);
                     }
                 } else {
                     let c = evaluate(cond, ctx)?;
                     if c.is_truthy() {
-                        return Ok(evaluate(val, ctx)?);
+                        return evaluate(val, ctx);
                     }
                 }
             }
@@ -254,8 +480,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         Expr::Exists(sel) => crate::executor::corr_exec_exists(sel, ctx),
         Expr::Cast { expr, type_name } => {
             let v = evaluate(expr, ctx)?;
-            let affinity = Affinity::from_declared_type(type_name);
-            Ok(affinity.coerce(v))
+            Ok(cast_value(v, type_name))
         }
         Expr::Collate { expr, .. } => evaluate(expr, ctx),
         Expr::Raise { action, .. } => Err(Error::runtime(format!("RAISE {:?}", action))),
@@ -341,19 +566,30 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
     // Scalar functions only here; aggregates are handled by the Aggregate operator.
     let argvals: Result<Vec<Value>> = args.iter().map(|e| evaluate(e, ctx)).collect();
     let argvals = argvals?;
-    Ok(call_scalar(&fname, &argvals))
+    call_scalar(&fname, &argvals)
 }
 
 /// Call a scalar SQL function.
-pub fn call_scalar(name: &str, args: &[Value]) -> Value {
+pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
     let fname = name.to_ascii_lowercase();
-    match fname.as_str() {
+    Ok(    match fname.as_str() {
         "abs" => match args.first() {
             Some(Value::Null) | None => Value::Null,
+            // SQLite: abs() of the most-negative integer raises
+            // "integer overflow" (the value has no positive i64).
+            Some(Value::Integer(i)) if *i == i64::MIN => {
+                return Err(Error::runtime("integer overflow"));
+            }
             Some(Value::Integer(i)) => Value::Integer(i.abs()),
             Some(Value::Real(f)) => Value::Real(f.abs()),
             // Numeric-looking text gets coerced; everything else: SQLite returns 0.
-            Some(other) => Value::Integer(other.as_integer().abs()),
+            Some(other) => {
+                let i = other.as_integer();
+                if i == i64::MIN {
+                    return Err(Error::runtime("integer overflow"));
+                }
+                Value::Integer(i.abs())
+            }
         },
         "length" => match args.first() {
             Some(Value::Null) | None => Value::Null,
@@ -384,7 +620,13 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
                 let s = args[0].as_text();
                 let from = args[1].as_text();
                 let to = args[2].as_text();
-                Value::Text(s.replace(&from, &to).into())
+                // Empty needle: SQLite returns the string unchanged
+                // (str::replace would insert `to` between every char).
+                if from.is_empty() {
+                    Value::Text(s.into())
+                } else {
+                    Value::Text(s.replace(&from, &to).into())
+                }
             } else {
                 Value::Null
             }
@@ -393,18 +635,32 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             if args.len() >= 2 && args.iter().take(2).all(|v| !v.is_null())
                 && (args.len() < 3 || !args[2].is_null())
             {
+                // Blob operands are byte-indexed and yield a blob
+                // (mirrors SQLite: substr(x'00ff', 2, 1) = x'ff').
+                if let Some(Value::Blob(b)) = args.first() {
+                    let (begin, end) = substr_range(
+                        b.len() as i64,
+                        args[1].as_integer(),
+                        if args.len() == 3 { args[2].as_integer() } else { i64::MAX / 4 },
+                    );
+                    return Ok(Value::Blob(b[begin as usize..end as usize].to_vec()));
+                }
                 let s = args[0].as_text();
-                let start = args[1].as_integer();
-                if start <= 0 {
-                    Value::Text(s[..((start.unsigned_abs() as usize).min(s.len()))].to_string().into())
+                let z = if args.len() == 3 { args[2].as_integer() } else { i64::MAX / 4 };
+                if s.is_ascii() {
+                    // Fast path: byte index == char index for ASCII.
+                    let (begin, end) = substr_range(s.len() as i64, args[1].as_integer(), z);
+                    Value::Text(s[begin as usize..end as usize].into())
                 } else {
-                    let start = (start - 1) as usize;
-                    if args.len() == 3 {
-                        let len = args[2].as_integer() as usize;
-                        Value::Text(s[start..(start + len).min(s.len())].to_string().into())
-                    } else {
-                        Value::Text(s[start..].to_string().into())
-                    }
+                    // Count UTF-8 characters, never slice mid-codepoint.
+                    let n = s.chars().count() as i64;
+                    let (begin, end) = substr_range(n, args[1].as_integer(), z);
+                    let out: String = s
+                        .chars()
+                        .skip(begin as usize)
+                        .take((end - begin) as usize)
+                        .collect();
+                    Value::Text(out.into())
                 }
             } else {
                 Value::Null
@@ -413,7 +669,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         "coalesce" | "ifnull" => {
             for v in args {
                 if !v.is_null() {
-                    return v.clone();
+                    return Ok(v.clone());
                 }
             }
             Value::Null
@@ -441,13 +697,16 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             }
         }
         "round" => {
-            if args.is_empty() {
+            if args.is_empty() || args[0].is_null() {
                 Value::Null
             } else {
                 let x = args[0].as_real();
+                if x.is_nan() {
+                    // SQLite: round(NaN) is NULL.
+                    return Ok(Value::Null);
+                }
                 let n = args.get(1).map(|v| v.as_integer()).unwrap_or(0);
-                let factor = 10f64.powi(n as i32);
-                Value::Real((x * factor).round() / factor)
+                Value::Real(sqlite_round(x, n))
             }
         }
         "random" => Value::Integer(rand_i64()),
@@ -460,8 +719,14 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
             )
         }
         "hex" => {
-            let s = args.first().map(|v| v.as_text()).unwrap_or_default();
-            Value::Text(s.bytes().map(|b| format!("{:02X}", b)).collect::<String>().into())
+            // BLOB input hexes the RAW bytes (as_text lossy-converts
+            // invalid UTF-8, which corrupted 0xff into U+FFFD).
+            let out = match args.first() {
+                Some(Value::Blob(b)) => b.iter().map(|x| format!("{:02X}", x)).collect::<String>(),
+                Some(v) => v.as_text().bytes().map(|b| format!("{:02X}", b)).collect::<String>(),
+                None => String::new(),
+            };
+            Value::Text(out.into())
         }
         "typeof" => Value::Text(
             match args.first() {
@@ -493,12 +758,12 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // or 0 if not found. NULL inputs return NULL.
         "instr" => {
             if args.len() != 2 || args[0].is_null() || args[1].is_null() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let s = args[0].as_text();
             let sub = args[1].as_text();
             if sub.is_empty() {
-                return Value::Integer(1);
+                return Ok(Value::Integer(1));
             }
             match s.find(&sub) {
                 Some(pos) => Value::Integer((pos + 1) as i64),
@@ -509,7 +774,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // %f, %x, %c, %% substitutions. NULL format returns NULL.
         "printf" => {
             if args.is_empty() || args[0].is_null() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let fmt = args[0].as_text();
             let mut out = String::with_capacity(fmt.len());
@@ -569,7 +834,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // NULL, the result is NULL (the comparison short-circuits).
         "min" if args.len() > 1 => {
             if args.iter().any(|v| v.is_null()) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let mut best: Option<Value> = None;
             for v in args {
@@ -583,7 +848,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // Same NULL semantics as MIN: any NULL arg → result is NULL.
         "max" if args.len() > 1 => {
             if args.iter().any(|v| v.is_null()) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let mut best: Option<Value> = None;
             for v in args {
@@ -656,15 +921,15 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // LOG(x) / LOG10(x) — base-10 log. With two args, LOG(b, x) is base-b.
         "log" | "log10" => {
             if args.is_empty() || args[0].is_null() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             if args.len() == 2 && !args[1].is_null() {
                 let b = args[0].as_real();
                 let x = args[1].as_real();
                 if b <= 0.0 || b == 1.0 || x <= 0.0 {
-                    return Value::Null;
+                    return Ok(Value::Null);
                 }
-                return Value::Real(x.log(b));
+                return Ok(Value::Real(x.log(b)));
             }
             let x = args[0].as_real();
             if x <= 0.0 { Value::Null } else { Value::Real(x.log10()) }
@@ -711,7 +976,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Value {
         // unknown functions evaluate to NULL rather than erroring).
         _ => crate::executor::json::call_json_function(&fname, args)
             .unwrap_or(Value::Null),
-    }
+    })
 }
 
 fn quote_value(v: &Value) -> String {
@@ -737,23 +1002,36 @@ fn rand_i64() -> i64 {
 }
 
 /// Apply a binary operator.
+/// SQL comparisons involving NaN yield NULL (SQLite semantics: NaN is
+/// equal to nothing, not even itself — only the `IS` operator treats
+/// NaN as identical to NaN).
+fn cmp_operand_missing(v: &Value) -> bool {
+    v.is_null() || matches!(v, Value::Real(f) if f.is_nan())
+}
+
 pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
     use BinaryOp::*;
     match op {
-        Add => arith(l, r, |a, b| a + b, |a, b| a + b),
-        Sub => arith(l, r, |a, b| a - b, |a, b| a - b),
-        Mul => arith(l, r, |a, b| a * b, |a, b| a * b),
+        // Integer overflow PROMOTES TO REAL (SQLite: 9223372036854775807 + 1
+        // is 9.223372036854776e18, never a wrapped i64).
+        Add => arith_checked(l, r, i64::checked_add, |a, b| a + b),
+        Sub => arith_checked(l, r, i64::checked_sub, |a, b| a - b),
+        Mul => arith_checked(l, r, i64::checked_mul, |a, b| a * b),
         Div => {
             if r.as_integer() == 0 || r.as_real() == 0.0 {
                 Value::Null
             } else {
-                arith(l, r, |a, b| a / b, |a, b| a / b)
+                // i64::MIN / -1 overflows; checked_div promotes to REAL.
+                arith_checked(l, r, i64::checked_div, |a, b| a / b)
             }
         }
         Mod => {
             let b = r.as_integer();
             if b == 0 {
                 Value::Null
+            } else if b == -1 {
+                // i64::MIN % -1 overflows in Rust; mathematically 0.
+                Value::Integer(0)
             } else {
                 Value::Integer(l.as_integer() % b)
             }
@@ -771,42 +1049,42 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
         // `WHERE col = NULL` to match every row where col was NULL.
         // This bug was caught by the SLT test suite.
         Eq => {
-            if l.is_null() || r.is_null() {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
                 Value::Integer(if l == r { 1 } else { 0 })
             }
         }
         NotEq => {
-            if l.is_null() || r.is_null() {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
                 Value::Integer(if l != r { 1 } else { 0 })
             }
         }
         Lt => {
-            if l.is_null() || r.is_null() {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
                 Value::Integer(if l < r { 1 } else { 0 })
             }
         }
         LtEq => {
-            if l.is_null() || r.is_null() {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
                 Value::Integer(if l <= r { 1 } else { 0 })
             }
         }
         Gt => {
-            if l.is_null() || r.is_null() {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
                 Value::Integer(if l > r { 1 } else { 0 })
             }
         }
         GtEq => {
-            if l.is_null() || r.is_null() {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
                 Value::Integer(if l >= r { 1 } else { 0 })
@@ -817,9 +1095,9 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
     }
 }
 
-fn arith<I, F>(l: &Value, r: &Value, fi: F, ff: I) -> Value
+fn arith_checked<F, I>(l: &Value, r: &Value, fi: F, ff: I) -> Value
 where
-    F: Fn(i64, i64) -> i64,
+    F: Fn(i64, i64) -> Option<i64>,
     I: Fn(f64, f64) -> f64,
 {
     if l.is_null() || r.is_null() {
@@ -828,7 +1106,14 @@ where
     if matches!(l, Value::Real(_)) || matches!(r, Value::Real(_)) {
         Value::Real(ff(l.as_real(), r.as_real()))
     } else {
-        Value::Integer(fi(l.as_integer(), r.as_integer()))
+        let (a, b) = (l.as_integer(), r.as_integer());
+        match fi(a, b) {
+            Some(v) => Value::Integer(v),
+            // Integer overflow: SQLite promotes the whole expression to
+            // REAL instead of wrapping (`9223372036854775807 + 1` is
+            // 9.223372036854776e18, never i64::MIN).
+            None => Value::Real(ff(a as f64, b as f64)),
+        }
     }
 }
 
@@ -840,7 +1125,12 @@ pub fn apply_unary(op: UnaryOp, v: &Value) -> Value {
             } else if matches!(v, Value::Real(_)) {
                 Value::Real(-v.as_real())
             } else {
-                Value::Integer(-v.as_integer())
+                let i = v.as_integer();
+                match i.checked_neg() {
+                    Some(n) => Value::Integer(n),
+                    // -i64::MIN overflows: promote to REAL (SQLite).
+                    None => Value::Real(-(i as f64)),
+                }
             }
         }
         UnaryOp::Pos => v.clone(),
