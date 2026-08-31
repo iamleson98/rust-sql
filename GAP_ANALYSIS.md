@@ -461,7 +461,35 @@ cloned every map under a read lock).
 ## 7. Working order (next sprint)
 
 All head-to-head criteria are now at parity or faster (see §1). The
-backlog below is hardening / depth work, ordered by user impact:
+2026-08-31 leaf-cache close-out (f80c620) additionally landed: a
+direct-mapped 64-slot table-leaf cache keyed by rowid (fixed-parameter
+OLTP + join inner loops hit ~10/10 instead of 1/10 and skip the whole
+root→interior→leaf descent), struct-local B+tree hints probed at ~2 ns
+before the thread-local map, `BtreeHandleState` export/import for
+cross-statement pinned roots, fused IndexLookup projection (selective
+decode under the page lock, one B+tree handle per rowid batch), an
+allocation-free `resolve_column_index`, and a like-for-like materializing
+join harness (both engines now build the result rows; stepping without
+reading values was comparing different work). Isolated steady-state:
+2-table join 2.87 µs vs SQLite 2.78–2.95 (parity); 3-table join
+20.3 µs vs 22.1 (**1.09× faster**).
+
+### Remaining known deltas (all ≤5% or environmental)
+
+- **GROUP BY 100 buckets** — 1.85 vs 1.84 ms (1.005×): sub-noise.
+- **Mixed 80/20** — 2.54 vs 2.42 ms (1.05×): interleaved writes bump the
+  write epoch and clear the leaf caches, forcing reads to re-descend.
+- **2-table join in-bench** — 3.4 vs 2.8 µs in the full bench run, but
+  isolated best-of-5 is 2.87 vs 2.78–2.95 µs (parity): the in-bench delta
+  is CPU-cache pollution from the preceding sections on this shared
+  2-core VM (we pay +30% because our advisory leaf-cache state is
+  cache-resident, SQLite pays +5%), not engine work.
+- **DB file size** — 1.03×: 8 KiB page rounding; `PRAGMA page_size=4096`
+  matches SQLite exactly.
+- **Binary size** — ~2.17 vs 2.03 MB: mimalloc adds ~140 KiB and buys the
+  1.5–2.1× write-throughput wins.
+
+The backlog below is hardening / depth work, ordered by user impact:
 
 1. ⏳ Savepoint semantics — SAVEPOINT/ROLLBACK TO/RELEASE are no-ops on a
    flat transaction; implement nested savepoint snapshots.
