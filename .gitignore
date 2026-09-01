@@ -6,3 +6,6 @@ plugins/zig/*.so
 plugins/zig/*.o
 plugins/zig/zig-cache/
 plugins/rust/target/
+
+# sqlx-interop build artifacts (separate workspace)
+sqlx-interop/target/

@@ -1,0 +1,27 @@
+[package]
+name = "sqlx-interop"
+version = "0.1.0"
+edition = "2021"
+
+# THE POINT OF THIS PROJECT: sqlx and sea-orm are UNMODIFIED crates.io
+# releases. The [patch] below redirects libsqlite3-sys to rustqlite's
+# drop-in replacement, so every sqlite3_* call lands in the rustqlite
+# engine.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite-unbundled",
+    "macros",
+    "migrate",
+] }
+sea-orm = { version = "2.0", features = ["sqlx-sqlite", "runtime-tokio"] }
+
+[patch.crates-io]
+libsqlite3-sys = { path = "../compat/libsqlite3-sys" }
+
+[workspace]
+
+[profile.release]
+debug = true
