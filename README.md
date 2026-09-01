@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust, modeled after SQLite but designed for cleaner code and competitive performance.
 
-> **Status**: This is an educational / proof-of-concept implementation. It implements a strong subset of SQLite's SQL surface, with a clean layered architecture. It is **not** production-ready — see [Limitations](#limitations).
+> **Status**: Educational / proof-of-concept core, now with a full SQLite-style **plugin system** (functions, aggregates, collations, virtual tables, page codecs) loadable from C, C++, Zig, and Rust — see [PLUGINS.md](PLUGINS.md). Still not production-ready — see [Limitations](#limitations).
 
 ## Quick Start
 
@@ -61,6 +61,18 @@ for row in &rows {
 - **CLI shell**: `rustqlite-cli` with table/JSON/CSV/line output modes, dot commands
 - **HTTP/JSON server**: `rustqlite-server` with `/query`, `/execute`, `/health` endpoints
 - **Benchmarks**: criterion-based benchmarks against rusqlite (SQLite) for point lookups, range scans, inserts, joins
+
+### Plugin system (SQLite-style extensions)
+
+- **User functions**: scalar (`create_function`) and aggregate (`create_aggregate`) functions in safe Rust — planner-visible, GROUP BY-integrated, arity-checked, built-ins protected from shadowing
+- **Collations**: `NOCASE` / `RTRIM` built-ins plus user-defined sequences (`create_collation`), honored by `ORDER BY … COLLATE` and comparison operators
+- **Virtual tables**: `CREATE VIRTUAL TABLE … USING module(...)` with SQLite's full callback protocol — `xCreate`/`xConnect`/`xBestIndex` constraint pushdown, cursors, and writable modules (`xUpdate`) — persisting across reopen like SQLite's runtime modules
+- **Page codecs**: pluggable page encode/decode (`PRAGMA codec`), the SEE/ZIPVFS-style hook — XOR codec included as a working example with file markers and safe-refuse-on-wrong-codec
+- **Dynamic extensions in any language**: compile against `include/rustqlite_ext.h`, export `rustqlite_extension_init`, load with `Database::load_extension` — working examples in **C, C++, Zig, and Rust** (`plugins/`)
+- **SQLite-shaped C ABI**: the `rustqlite_*` family (`open`/`exec`/`prepare_v2`/`step`/`bind`/`column`/`load_extension`, …) mirroring `sqlite3_*` argument order and semantics — the binding layer for future sqlx support
+- **Prepared statements** (`Database::prepare` + `Statement::bind/step/reset`): parsed and planned once, rebindable, and **streaming** — scans/ranges/filters/projections/limits (and vtab scans) deliver rows in batches without materializing the result set
+
+See [PLUGINS.md](PLUGINS.md) for the full guide.
 
 ## Architecture
 
@@ -216,6 +228,40 @@ let rows = db.query("SELECT x FROM t WHERE id = ?", vec![Value::Integer(1)])?;
 assert_eq!(rows[0][0], Value::Integer(10));
 ```
 
+### Plugins & streaming statements
+
+```rust
+use rustqlite::{Database, Value, StepResult};
+use rustqlite::plugin::{ScalarFunction, FnCtx};
+
+struct Doubler;
+impl ScalarFunction for Doubler {
+    fn name(&self) -> &str { "double" }
+    fn call(&self, _ctx: &FnCtx, args: &[Value]) -> rustqlite::Result<Value> {
+        Ok(Value::Integer(args[0].as_integer() * 2))
+    }
+}
+
+let mut db = Database::open_in_memory()?;
+db.create_function(Doubler)?;
+db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])?;
+db.execute("INSERT INTO t (id) VALUES (1), (2), (3)", [])?;
+
+// SQLite-style streaming prepared statement.
+let mut stmt = db.prepare("SELECT double(id) FROM t WHERE id > ?")?;
+stmt.bind(1, Value::Integer(1));
+while stmt.step()? == StepResult::Row {
+    println!("{}", stmt.column_int(0));   // 4, 6
+}
+```
+
+Load a compiled extension (C/C++/Zig/Rust):
+
+```rust
+db.load_extension("plugins/c/rot13.so", None)?;
+let rows = db.query("SELECT rot13('hello')", [])?;   // "uryyb"
+```
+
 ## Examples
 
 See [`examples/`](examples/):
@@ -264,7 +310,7 @@ This is a proof-of-concept. Known gaps:
   infrastructure-only.
 - **Numeric precision**: `AVG` rounds to 10 decimals; some edge cases in
   real formatting differ from SQLite.
-- **Collations**: Only `BINARY` is honored.
+- **Collations**: `BINARY`/`NOCASE`/`RTRIM` plus user-registered sequences work in ORDER BY and comparisons; index collations (COLLATE in CREATE INDEX / column definitions) are not yet used by the planner for index scans.
 - **Pragmas**: Only `foreign_keys` changes behavior; the rest are no-ops.
 - **WAL/MVCC**: the log and snapshot machinery exists (CRC32 frames, salt
   recovery) but readers do not yet serve queries from WAL frames.

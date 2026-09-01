@@ -48,6 +48,10 @@ mimalloc = { version = "0.1", optional = true }
 # Raw FFI for the mimalloc option API (purge-delay tuning); version-locked
 # to whatever `mimalloc` resolves to (same upstream).
 libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
+# Dynamic extension loading (dlopen for C/C++/Zig/Rust .so plugins).
+# Optional: disable with `default-features = false` for a hardened build
+# (mirrors SQLite's SQLITE_OMIT_LOAD_EXTENSION).
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -56,7 +60,7 @@ tempfile = "3"
 rand = "0.8"
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "extension"]
 # SQLite's SQLITE_MEMDEBUG/memsys2 equivalent: replace the global allocator
 # with a counting allocator that can fail at allocation #N. Enables the
 # `oom_fault` test (see tests/oom_fault.rs) and disables mimalloc for that
@@ -64,6 +68,7 @@ default = ["mimalloc"]
 oom-injection = []
 # Fast global allocator (see the mimalloc dependency note above).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+extension = ["dep:libloading"]
 # Disable to remove rustyline (smaller binary)
 no-cli-readline = []
 

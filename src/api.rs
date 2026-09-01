@@ -102,16 +102,16 @@ type RootEntry = (String, u32);
 /// `&mut Database`, which serializes them — but reads proceed without
 /// blocking on the outer lock.
 pub struct Database {
-    pager: Pager,
-    catalog: Catalog,
+    pub(crate) pager: Pager,
+    pub(crate) catalog: Catalog,
     path: PathBuf,
     /// Inside an explicit BEGIN..COMMIT/ROLLBACK transaction. Only mutated
     /// by the writer (which holds `&mut self` via the outer write lock),
     /// but wrapped for interior mutability so `&self` query paths can read it.
-    in_transaction: AtomicBool,
+    pub(crate) in_transaction: AtomicBool,
     /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager's
     /// state to the pre-transaction point.
-    txn_snapshot: Mutex<Option<crate::storage::pager::PagerSnapshot>>,
+    pub(crate) txn_snapshot: Mutex<Option<crate::storage::pager::PagerSnapshot>>,
     /// SAVEPOINT support: bookkeeping-map snapshots aligned with the
     /// pager's savepoint stack (index i corresponds to pager savepoint i).
     /// ROLLBACK TO restores the maps Arc wholesale — root overrides and
@@ -126,7 +126,7 @@ pub struct Database {
     /// `RwLock<Arc<HashMap>>` fields: 3 locks + 3 atomic bumps per query).
     /// Only writes (DML causing root splits / rowid-cache fills) take the
     /// write lock, and the writer (`&mut self`) detaches the Arc entirely.
-    maps: RwLock<std::sync::Arc<crate::executor::StmtMaps>>,
+    pub(crate) maps: RwLock<std::sync::Arc<crate::executor::StmtMaps>>,
     /// Root page currently persisted in the schema table per object
     /// ("table:name" / "index:name" -> rootpage in the schema row).
     /// `sync_schema_roots` rewrites a schema row only when the live root
@@ -170,6 +170,16 @@ pub struct Database {
     /// Maximum number of entries in the statement cache. Default 64.
     /// Immutable after open (only set via `set_stmt_cache_capacity`).
     stmt_cache_capacity: usize,
+    /// Plugin registry: user functions, aggregates, collations,
+    /// virtual-table modules, page codecs. One Arc snapshot per statement
+    /// (installed into the thread-local plugin scope alongside the
+    /// correlated-subquery bridge).
+    pub(crate) plugins: RwLock<std::sync::Arc<crate::plugin::PluginRegistry>>,
+    /// Fast path flag: true once anything is registered. Zero plugins
+    /// (the overwhelmingly common library configuration) skips the
+    /// plugin-scope guard entirely — one relaxed atomic load instead of
+    /// a RwLock read + Arc clone + thread-local install per statement.
+    has_plugins: std::sync::atomic::AtomicBool,
     /// Hashes of SQL statements seen at least once ("cache on second
     /// sight" filter). Populating the statement cache costs ~1 µs (two
     /// String allocations for the key + FIFO order entry, write-lock, Arc
@@ -197,7 +207,7 @@ pub struct Database {
     /// per statement. The cost is reduced durability — unflushed writes can
     /// be lost on application crash (but not on transaction abort, since
     /// rollback uses the in-memory snapshot, not the on-disk state).
-    deferred_flush: AtomicBool,
+    pub(crate) deferred_flush: AtomicBool,
     /// Threshold for forcing a flush when `deferred_flush` is enabled.
     /// Default: 1000 dirty pages (~4 MB at 4 KiB page size).
     /// Immutable after open.
@@ -280,7 +290,7 @@ fn quick_sql_hash(s: &str) -> u64 {
 
 /// A bound value for a fast-path lookup key, resolved at detection time.
 #[derive(Clone, Debug)]
-enum FastBound {
+pub(crate) enum FastBound {
     /// Positional parameter index (from a numeric `?N` name).
     Param(usize),
     /// A literal constant.
@@ -311,7 +321,7 @@ impl FastBound {
 /// `lookup_table` / `lookup_index` / `decode_row*` routines the general
 /// path uses.
 #[derive(Clone)]
-enum FastPath {
+pub(crate) enum FastPath {
     /// `SELECT cols FROM t WHERE rowid_alias = ?` / `WHERE rowid = literal`
     RowidPoint {
         table: Arc<Table>,
@@ -363,12 +373,12 @@ enum FastPath {
 /// computed once at plan time instead of re-walking the plan tree, which
 /// allocated a Vec of expr references, on every execution).
 #[derive(Clone)]
-struct CachedStmt {
-    stmt: Arc<Statement>,
-    plan: Option<Arc<crate::planner::plan::Plan>>,
-    has_subqueries: bool,
+pub(crate) struct CachedStmt {
+    pub(crate) stmt: Arc<Statement>,
+    pub(crate) plan: Option<Arc<crate::planner::plan::Plan>>,
+    pub(crate) has_subqueries: bool,
     /// Pre-compiled point-lookup fast path (see `FastPath`).
-    fast_path: Option<Arc<FastPath>>,
+    pub(crate) fast_path: Option<Arc<FastPath>>,
 }
 
 impl FastPath {
@@ -385,6 +395,10 @@ impl FastPath {
 
     /// Output column names.
     #[inline]
+    pub(crate) fn output_columns_public(&self) -> Arc<[String]> {
+        self.output_columns().clone()
+    }
+
     fn output_columns(&self) -> &Arc<[String]> {
         match self {
             FastPath::RowidPoint { columns, .. } => columns,
@@ -1328,10 +1342,30 @@ fn stmt_ref_pre(stmt: &Statement) -> StmtPre {
 
 impl Database {
     /// Open or create a database at the given path.
+    ///
+    /// A file written with an active page codec is refused here with a
+    /// clear error — use [`Self::open_with_codec`] (or register the codec
+    /// and run `PRAGMA codec = <name>` before any other statement).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    /// Shared constructor: `codec` is activated before the schema load.
+    fn open_inner<P: AsRef<Path>>(
+        path: P,
+        codec: Option<std::sync::Arc<dyn crate::plugin::PageCodec>>,
+    ) -> Result<Self> {
         crate::engine_init();
         let path = path.as_ref().to_path_buf();
         let pager = Pager::open(&path, DEFAULT_CACHE_PAGES)?;
+        if let Some(c) = &codec {
+            pager.set_codec(Some(c.clone()))?;
+        } else if let Some(required) = pager.required_codec() {
+            return Err(Error::semantic(format!(
+                "database is written with page codec '{}' — open it with Database::open_with_codec(path, codec)",
+                required
+            )));
+        }
         let mut catalog = Catalog::new();
         catalog.schema_cookie = pager.schema_cookie();
         // Load the schema from page 0 (the schema table root).
@@ -1363,7 +1397,26 @@ impl Database {
             seen_hashes_cap: 4096,
             deferred_flush: AtomicBool::new(false),
             deferred_flush_threshold: 1000,
+            plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
+            has_plugins: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Open a database written with a page codec (see
+    /// [`crate::plugin::PageCodec`]). Activates the codec BEFORE the
+    /// schema is loaded, so every page read decodes correctly. The
+    /// codec's name must match the file's marker.
+    pub fn open_with_codec<P: AsRef<Path>, C: crate::plugin::PageCodec + 'static>(
+        path: P,
+        codec: C,
+    ) -> Result<Self> {
+        let codec = std::sync::Arc::new(codec);
+        let codec2 = codec.clone();
+        let db = Self::open_inner(path, Some(codec))?;
+        // Write the marker (idempotent; also validated against any
+        // existing marker inside set_codec).
+        db.pager.set_codec(Some(codec2))?;
+        Ok(db)
     }
 
     /// Open an in-memory database (no file). The data is lost when the
@@ -1480,7 +1533,10 @@ impl Database {
             }
         };
         // Table-shape bails: fall through to the general path.
-        if table.without_rowid
+        // Virtual tables route through xUpdate — the byte scanner's
+        // btree fast path doesn't apply.
+        if table.vtab.is_some()
+            || table.without_rowid
             || table.strict
             || table.columns.iter().any(|c| c.generated.is_some())
         {
@@ -1575,7 +1631,7 @@ impl Database {
         }
         *self.maps.get_mut() = ctx.shared;
         if result.is_ok() && ctx.roots_changed {
-            self.sync_schema_roots()?;
+            self.sync_schema_roots_inner()?;
         }
         result?;
         // Auto-commit: flush outside explicit transactions (no-op in lazy
@@ -1602,7 +1658,11 @@ impl Database {
         }
     }
 
-    fn get_or_cache_stmt(&self, sql: &str) -> Result<Arc<CachedStmt>> {
+    pub(crate) fn get_or_cache_stmt(&self, sql: &str) -> Result<Arc<CachedStmt>> {
+        // Planning must see the plugin registry (user aggregates change
+        // how expressions are planned — see is_aggregate_call). One
+        // read-lock + refcount bump + thread-local install.
+        let _plugin_guard = self.plugin_scope();
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let t0 = profile::now();
@@ -1721,7 +1781,11 @@ impl Database {
     /// Rewrites only happen when the live root differs from the value we
     /// last persisted (tracked in `schema_root_pages`), so the cost is one
     /// schema-row rewrite per actual split — O(1) amortized.
-    fn sync_schema_roots(&self) -> Result<()> {
+    pub(crate) fn sync_schema_roots_public(&self) -> Result<()> {
+        self.sync_schema_roots_inner()
+    }
+
+    fn sync_schema_roots_inner(&self) -> Result<()> {
         // (object name, root page) pairs for tables and indexes.
         let (tables, indexes): (Vec<RootEntry>, Vec<RootEntry>) = {
             let m = self.maps.read();
@@ -1836,6 +1900,9 @@ impl Database {
         // query(); the result rows are simply discarded.
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
+                // vtab xConnect bridge (same rationale as the DDL path).
+                let _thread_db =
+                    crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot.get_mut().take();
                 let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -1848,7 +1915,8 @@ impl Database {
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
-                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new());
                 self.in_transaction.store(ctx.in_transaction, Ordering::Release);
                 *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
@@ -1913,6 +1981,7 @@ impl Database {
         // Correlated-subquery execution bridge: installs the statement's
         // ExecContext for evaluate-time subquery re-execution (DML SET /
         // CHECK / WHERE expressions). Cleared by Drop before ctx ends.
+        let _plugin_guard = self.plugin_scope();
         let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
         // Use the cached plan if available — execute_statement_static
         // otherwise re-parses + re-plans, which for a 1k-row INSERT batch
@@ -1920,6 +1989,11 @@ impl Database {
         // containing Plan::Values { Vec<Vec<Expr>> }, several heap
         // allocations). With the cached plan, we skip all of that.
         let t_exec = profile::now();
+        // C-ABI virtual-table bridge: xCreate/xConnect (reached through
+        // CREATE VIRTUAL TABLE and module registration) route declare_vtab
+        // and argv construction through this thread-local raw pointer.
+        // Valid for the duration of the statement (we hold &mut self).
+        let _thread_db = crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
         let result = if let Some(plan) = plan_opt {
             // Substitute uncorrelated subqueries (scalar / IN / EXISTS) with
             // their materialized results before execution — mirrors
@@ -1990,7 +2064,7 @@ impl Database {
         // rare; previously this ran (two read locks + two Vec<(String,u32)>
         // collects with String clones) after EVERY statement.
         if result.is_ok() && ctx.roots_changed {
-            self.sync_schema_roots()?;
+            self.sync_schema_roots_inner()?;
         }
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
         if result.is_ok() && is_ddl {
@@ -2057,7 +2131,8 @@ impl Database {
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
-                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
                 return Ok(res.rows);
             }
@@ -2104,7 +2179,8 @@ impl Database {
             // Correlated-subquery bridge (see execute): must span the
             // subquery rewrite AND execution — rewrite-time execution of
             // UNcorrelated subqueries may itself hit nested correlated ones.
-            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
             let plan_local;
@@ -2143,7 +2219,7 @@ impl Database {
                         bk.index_roots.extend(ctx.index_roots.drain());
                     }
                 }
-                self.sync_schema_roots()?;
+                self.sync_schema_roots_inner()?;
             } else if ctx.max_rowids_changed {
                 // Pure SELECTs can still populate the max-rowid scan cache
                 // (used by the index-range merge-scan heuristic) — merge it
@@ -2165,6 +2241,32 @@ impl Database {
     /// they're sharing a `&Database` reference across threads.
     pub fn query_shared<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
         self.query(sql, params)
+    }
+
+    /// Prepare a statement for repeated execution — the
+    /// `sqlite3_prepare_v2` + `sqlite3_step` model.
+    ///
+    /// The statement is parsed and planned ONCE; parameters are bound with
+    /// [`Statement::bind`] (1-based, like SQLite) and rows arrive one at a
+    /// time via [`Statement::step`]. See [`Statement`] for the streaming
+    /// plan shapes.
+    ///
+    /// Transaction-control and DDL statements are rejected here — use
+    /// [`Database::execute`] for those.
+    pub fn prepare(&self, sql: &str) -> Result<crate::statement::Statement<'_>> {
+        crate::statement::Statement::new(self, sql)
+    }
+
+    /// Running total of rows modified by all statements on this thread
+    /// (SQLite's `sqlite3_total_changes`).
+    pub fn total_changes(&self) -> i64 {
+        crate::executor::change_counters::total()
+    }
+
+    /// Rows modified by the most recent statement (SQLite's
+    /// `sqlite3_changes`).
+    pub fn changes(&self) -> i64 {
+        crate::executor::change_counters::last()
     }
 
     /// Execute a query and return (column_names, rows).
@@ -2205,7 +2307,8 @@ impl Database {
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
-                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
                 return Ok((res.columns.to_vec(), res.rows));
             }
@@ -2240,7 +2343,8 @@ impl Database {
             // Correlated-subquery bridge (see execute): must span the
             // subquery rewrite AND execution — rewrite-time execution of
             // UNcorrelated subqueries may itself hit nested correlated ones.
-            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
             let plan_local;
@@ -2273,7 +2377,7 @@ impl Database {
                         bk.index_roots.extend(ctx.index_roots.drain());
                     }
                 }
-                self.sync_schema_roots()?;
+                self.sync_schema_roots_inner()?;
             } else if ctx.max_rowids_changed {
                 // Pure SELECTs can still populate the max-rowid scan cache
                 // (used by the index-range merge-scan heuristic) — merge it
@@ -2331,6 +2435,211 @@ impl Database {
     /// Read-only pager access (diagnostics: cache stats, page count).
     pub fn pager(&self) -> &Pager {
         &self.pager
+    }
+
+    // ====================================================================
+    // Plugin / extension registration (static, in-process)
+    // ====================================================================
+
+    /// Register a user-defined scalar SQL function
+    /// (SQLite's `sqlite3_create_function` with xFunc only).
+    ///
+    /// ```no_run
+    /// # use rustqlite::{Database, Value, Result, plugin::{ScalarFunction, FnCtx}};
+    /// struct AddSuffix;
+    /// impl ScalarFunction for AddSuffix {
+    ///     fn name(&self) -> &str { "add_suffix" }
+    ///     fn call(&self, _ctx: &FnCtx, args: &[Value]) -> Result<Value> {
+    ///         Ok(Value::Text(format!("{}!", args[0].as_text()).into()))
+    ///     }
+    /// }
+    /// # fn main() -> Result<()> {
+    /// let mut db = Database::open_in_memory()?;
+    /// db.create_function(AddSuffix)?;
+    /// let rows = db.query("SELECT add_suffix('hi')", [])?;
+    /// assert_eq!(rows[0][0].as_text(), "hi!");
+    /// # Ok(()) }
+    /// ```
+    pub fn create_function<F: crate::plugin::ScalarFunction + 'static>(&mut self, f: F) -> Result<()> {
+        self.create_function_arc(std::sync::Arc::new(f))
+    }
+
+    /// `create_function` for an already-`Arc`ed function (used by the C ABI
+    /// trampolines, which hold raw pointers inside the Arc).
+    pub fn create_function_arc(&mut self, f: std::sync::Arc<dyn crate::plugin::ScalarFunction>) -> Result<()> {
+        let mut reg = self.plugins.read().clone();
+        if crate::plugin::lookup_scalar_is_builtin(f.name()) {
+            return Err(Error::semantic(format!(
+                "function {}() is a built-in and cannot be overridden",
+                f.name()
+            )));
+        }
+        Arc::make_mut(&mut reg).set_scalar(f);
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Register a user-defined aggregate SQL function
+    /// (SQLite's `sqlite3_create_function` with xStep + xFinal).
+    pub fn create_aggregate<F: crate::plugin::AggregateFunction + 'static>(&mut self, f: F) -> Result<()> {
+        let mut reg = self.plugins.read().clone();
+        Arc::make_mut(&mut reg).set_aggregate(std::sync::Arc::new(f));
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// `create_aggregate` for an already-`Arc`ed aggregate.
+    pub fn create_aggregate_arc(&mut self, f: std::sync::Arc<dyn crate::plugin::AggregateFunction>) -> Result<()> {
+        let mut reg = self.plugins.read().clone();
+        Arc::make_mut(&mut reg).set_aggregate(f);
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Register a user-defined collation sequence
+    /// (SQLite's `sqlite3_create_collation`). Built-in names NOCASE, RTRIM
+    /// and BINARY can be replaced.
+    pub fn create_collation<C: crate::plugin::Collation + 'static>(&mut self, c: C) -> Result<()> {
+        let mut reg = self.plugins.read().clone();
+        Arc::make_mut(&mut reg).set_collation(std::sync::Arc::new(c));
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// `create_collation` for an already-`Arc`ed collation.
+    pub fn create_collation_arc(&mut self, c: std::sync::Arc<dyn crate::plugin::Collation>) -> Result<()> {
+        let mut reg = self.plugins.read().clone();
+        Arc::make_mut(&mut reg).set_collation(c);
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Register a virtual-table module
+    /// (SQLite's `sqlite3_create_module`).
+    pub fn create_module<M: crate::plugin::VirtualTableModule + 'static>(&mut self, m: M) -> Result<()> {
+        self.create_module_arc(std::sync::Arc::new(m))
+    }
+
+    /// `create_module` for an already-`Arc`ed module.
+    ///
+    /// Registering a module also CONNECTS every pending virtual table that
+    /// was created by an earlier session with the same module name
+    /// (SQLite's xConnect-on-open, deferred to registration because
+    /// modules can't exist before the user registers them).
+    pub fn create_module_arc(&mut self, m: std::sync::Arc<dyn crate::plugin::VirtualTableModule>) -> Result<()> {
+        let module_name = m.name().to_ascii_lowercase();
+        let mut reg = self.plugins.read().clone();
+        Arc::make_mut(&mut reg).set_module(m.clone());
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+
+        // Connect pending vtabs for this module: rebuild the catalog
+        // Table with the module's declared columns, replace the entry,
+        // and invalidate the statement cache (plans hold Arc<Table>).
+        let pending: Vec<(String, std::sync::Arc<crate::plugin::vtab::VtabInstance>)> = self
+            .catalog
+            .all_tables()
+            .into_iter()
+            .filter(|(_, t)| {
+                t.vtab
+                    .as_ref()
+                    .map(|v| v.is_pending() && v.module_name == module_name)
+                    .unwrap_or(false)
+            })
+            .map(|(name, t)| (name, t.vtab.clone().unwrap()))
+            .collect();
+        let mut any_connected = false;
+        for (name, inst) in pending {
+            let instance = match m.connect(&inst.table_name, &inst.args) {
+                Ok(i) => i,
+                Err(e) => return Err(e),
+            };
+            let cols = instance.columns();
+            let mut table = crate::plugin::vtab::vtab_columns_to_schema(&inst.table_name, &cols);
+            table.create_sql = self
+                .catalog
+                .get_table(&name)
+                .map(|t| t.create_sql.clone())
+                .unwrap_or_default();
+            // Reuse the SAME VtabInstance (state now connected).
+            if let Err(e) = inst.set_connected(instance) {
+                return Err(e);
+            }
+            table.vtab = Some(inst);
+            self.catalog.add_table(table);
+            any_connected = true;
+        }
+        if any_connected {
+            self.invalidate_stmt_cache();
+        }
+        Ok(())
+    }
+
+    /// Register a page codec, activatable with `PRAGMA codec = <name>`.
+    pub fn create_codec<C: crate::plugin::PageCodec + 'static>(&mut self, c: C) -> Result<()> {
+        let mut reg = self.plugins.read().clone();
+        Arc::make_mut(&mut reg).set_codec(std::sync::Arc::new(c));
+        *self.plugins.write() = reg;
+        self.has_plugins.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Activate a registered page codec by name (equivalent to
+    /// `PRAGMA codec = name`). Pass "plain"/"none" to disable.
+    pub fn set_page_codec(&mut self, name: &str) -> Result<()> {
+        let lowered = crate::plugin::codec::validate_codec_name(name)?;
+        if lowered == "plain" || lowered == "none" {
+            let _ = self.pager.set_codec(None);
+            return Ok(());
+        }
+        let reg = self.plugins.read().clone();
+        let codec = reg
+            .codec(&lowered)
+            .ok_or_else(|| Error::semantic(format!("no such codec: {name}")))?;
+        // Re-set the marker in the header comment area.
+        self.pager.set_codec(Some(codec))?;
+        Ok(())
+    }
+
+    /// The name of the active page codec, if any.
+    pub fn page_codec(&self) -> Option<String> {
+        self.pager.codec_name()
+    }
+
+    /// Load a dynamic extension (`.so` / `.dylib` / `.dll`) built against
+    /// `include/rustqlite_ext.h` (any language: C, C++, Zig, Rust).
+    /// Mirrors SQLite's `sqlite3_load_extension`. The library must export
+    ///
+    /// ```c
+    /// int rustqlite_extension_init(const rql_api *api, rql_db *db, char **err);
+    /// ```
+    ///
+    /// `entry` overrides the entry-point name (default
+    /// `rustqlite_extension_init`).
+    #[cfg(feature = "extension")]
+    pub fn load_extension<P: AsRef<Path>>(&mut self, path: P, entry: Option<&str>) -> Result<()> {
+        crate::plugin::abi::load_extension(self, path.as_ref(), entry)
+    }
+
+    /// Snapshot of the plugin registry (introspection: registered function
+    /// names, collations, modules, codecs).
+    pub fn plugin_registry(&self) -> std::sync::Arc<crate::plugin::PluginRegistry> {
+        self.plugins.read().clone()
+    }
+
+    /// The plugin-scope guard when anything is registered; None otherwise.
+    /// Keeps the zero-plugin hot path at one relaxed atomic load.
+    #[inline]
+    pub(crate) fn plugin_scope(&self) -> Option<crate::plugin::PluginScopeGuard> {
+        if !self.has_plugins.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(crate::plugin::PluginScopeGuard::install(self.plugins.read().clone()))
     }
 
     // ====================================================================
@@ -2393,6 +2702,15 @@ impl Database {
             }
             None => Err(Error::semantic(format!("no such savepoint: {name}"))),
         }
+    }
+
+    /// CTE SELECT execution bridge for the statement layer (pub(crate)).
+    pub(crate) fn exec_select_with_ctes_stmt(
+        &self,
+        ctx: &mut ExecContext<'_>,
+        select: &SelectStatement,
+    ) -> Result<crate::executor::ExecResult> {
+        self.exec_select_with_ctes(ctx, select, &HashMap::new())
     }
 
     fn exec_select_with_ctes(
@@ -2571,7 +2889,7 @@ impl Database {
         Ok((rows, out_cols))
     }
 
-    fn plan_for_statement(catalog: &Catalog, stmt: &Statement) -> Result<Option<crate::planner::plan::Plan>> {
+    pub(crate) fn plan_for_statement(catalog: &Catalog, stmt: &Statement) -> Result<Option<crate::planner::plan::Plan>> {
         match stmt {
             Statement::Select(s) => {
                 let mut planner = Planner::new(catalog);
@@ -2768,6 +3086,10 @@ impl Database {
     /// selective decode, with NO ExecContext / EvalContext / Plan dispatch.
     /// Semantics identical to the general path (same `lookup_table` /
     /// `lookup_index` / `decode_row*` calls, same `.as_integer()` binding).
+    pub(crate) fn run_fast_path_public(&self, fp: &FastPath, params: &[Value]) -> Result<Vec<Row>> {
+        self.run_fast_path(fp, params)
+    }
+
     fn run_fast_path(&self, fp: &FastPath, params: &[Value]) -> Result<Vec<Row>> {
         // One combined snapshot read for root overrides (tables + indexes).
         // The maps are empty for the vast majority of OLTP databases (they
@@ -3376,6 +3698,47 @@ impl Database {
                 ctx.pager.flush()?;
                 Ok(())
             }
+            CreateStatement::VirtualTable { if_not_exists, name, module, args } => {
+                if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some() {
+                    if if_not_exists {
+                        return Ok(());
+                    }
+                    return Err(Error::AlreadyExists(format!("table: {}", name.name)));
+                }
+                // Module lookup through the thread-local plugin scope —
+                // the CREATE statement runs inside `execute()`'s
+                // PluginScopeGuard (see the `_plugin_guard` installs).
+                let module = crate::plugin::lookup_module(&module).ok_or_else(|| {
+                    Error::semantic(format!("no such module: {}", module))
+                })?;
+                // xCreate: the instance supplies the column schema.
+                let instance = module.create(&name.name, &args)?;
+                let cols = instance.columns();
+                let mut table = crate::plugin::vtab::vtab_columns_to_schema(&name.name, &cols);
+                table.create_sql = original_sql.to_string();
+                let vtab = crate::plugin::vtab::VtabInstance::connected(
+                    name.name.clone(),
+                    module.clone(),
+                    args,
+                    instance,
+                );
+                // on_create: module hook for external-state setup.
+                let _ = vtab.with_table(|vt| vt.on_create());
+                table.vtab = Some(std::sync::Arc::new(vtab));
+                // rootpage 0: no B+tree. The schema row's SQL round-trips
+                // through the parser on reopen (see load_schema).
+                let schema_row = crate::schema::encode_schema_row(
+                    "table",
+                    &table.name,
+                    &table.name,
+                    0,
+                    &table.create_sql,
+                );
+                insert_schema_row(ctx.pager, &schema_row)?;
+                catalog.add_table(table);
+                ctx.pager.flush()?;
+                Ok(())
+            }
             CreateStatement::Trigger(t) => {
                 let trig = crate::schema::Trigger {
                     name: t.name.clone(),
@@ -3408,6 +3771,16 @@ impl Database {
                 // Capture indexes BEFORE the catalog drop removes them.
                 let indexes_on_it = catalog.indexes_on_table(&d.name);
                 let table = catalog.drop_table(&d.name).ok_or_else(|| Error::NotFound(format!("table: {}", d.name)))?;
+                if let Some(vtab) = &table.vtab {
+                    // Virtual table: no pages to free; run xDestroy on the
+                    // module so it can drop external state.
+                    if let Ok((module, args)) = vtab.module_and_args() {
+                        let _ = module.destroy(&d.name, &args);
+                    }
+                    delete_schema_row(ctx.pager, "table", &d.name)?;
+                    ctx.pager.flush()?;
+                    return Ok(());
+                }
                 ctx.pager.free_page(table.root_page)?;
                 delete_schema_row(ctx.pager, "table", &d.name)?;
                 // Also free root pages and delete schema rows for every
@@ -4028,6 +4401,24 @@ impl Database {
                         _ => {}
                     }
                 }
+                "codec" => {
+                    // PRAGMA codec = <registered name> | none
+                    let cname = match (&v, value_as_expr(value)) {
+                        (Value::Text(t), _) => t.to_ascii_lowercase(),
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            name.to_ascii_lowercase()
+                        }
+                        _ => String::new(),
+                    };
+                    if cname.is_empty() || cname == "none" || cname == "plain" {
+                        ctx.pager.set_codec(None)?;
+                    } else {
+                        let codec = crate::plugin::lookup_codec(&cname).ok_or_else(|| {
+                            Error::semantic(format!("no such codec: {}", cname))
+                        })?;
+                        ctx.pager.set_codec(Some(codec))?;
+                    }
+                }
                 "synchronous" => {
                     let level = match (&v, value_as_expr(value)) {
                         (Value::Integer(i), _) => (*i).clamp(0, 3) as u8,
@@ -4078,6 +4469,11 @@ impl Database {
 /// Evaluate a read-form PRAGMA (`PRAGMA name` with no `= value`) into a
 /// result row. Returns None for unknown names (the caller then treats the
 /// statement as a no-op, matching the previous behavior).
+/// `read_pragma` exposed for the statement layer (pub(crate)).
+pub(crate) fn read_pragma_public(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
+    read_pragma(p, db)
+}
+
 fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
     let name = p.name.to_ascii_lowercase();
     if p.value.is_some() {
@@ -4115,6 +4511,13 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
         "cache_size" => Value::Integer(pager.cache_capacity() as i64),
         "schema_version" => Value::Integer(pager.schema_cookie() as i64),
         "journal_mode" => Value::Text(if pager.wal_enabled() { "wal".into() } else { "delete".into() }),
+        "codec" => Value::Text(
+            pager
+                .codec_name()
+                .or_else(|| pager.required_codec())
+                .map(|s| s.into())
+                .unwrap_or_else(|| "none".into()),
+        ),
         "synchronous" => Value::Integer(pager.synchronous() as i64),
         "temp_store" => Value::Integer(0),
         "locking_mode" => Value::Text("normal".into()),
@@ -4442,6 +4845,25 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                 "table" => {
                     if let Ok(Statement::Create(CreateStatement::Table { name: tn, columns, constraints, without_rowid, strict, .. })) = parse(sql) {
                         let table = build_table(&tn.name, &columns, &constraints, rootpage, without_rowid, strict, sql)?;
+                        catalog.add_table(table);
+                    } else if let Ok(Statement::Create(CreateStatement::VirtualTable { name: tn, module, args, .. })) = parse(sql) {
+                        // Virtual table: the module isn't registered at
+                        // open time — build a PENDING instance. The column
+                        // list stays empty until `create_module` connects
+                        // it (the planner rejects queries over pending
+                        // vtabs with "no such module").
+                        let mut table = crate::plugin::vtab::vtab_columns_to_schema(
+                            &tn.name,
+                            &[],
+                        );
+                        table.create_sql = sql.to_string();
+                        table.vtab = Some(std::sync::Arc::new(
+                            crate::plugin::vtab::VtabInstance::pending(
+                                tn.name.clone(),
+                                module.clone(),
+                                args.clone(),
+                            ),
+                        ));
                         catalog.add_table(table);
                     }
                 }

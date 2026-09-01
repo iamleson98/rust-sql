@@ -457,3 +457,64 @@ The highest-impact improvements, in rough priority order:
 10. **Cost-based optimization**: Track table statistics (row counts, cardinality) and choose join order / index selection based on cost.
 
 Each of these is a self-contained project that fits cleanly into the existing architecture.
+
+---
+
+## Plugin system (2026-09)
+
+The plugin system adds one horizontal layer touching all five:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  C ABI (ffi.rs)         rustqlite_* family + rql_api table │
+│  Extension ABI (plugin/abi.rs)  C/C++/Zig/Rust .so loading │
+├────────────────────────────────────────────────────────────┤
+│  Plugin registry (plugin/mod.rs)                           │
+│    scalars · aggregates · collations · vtab modules ·      │
+│    page codecs  — Arc COW maps, thread-local scope         │
+├──────────────┬──────────────────┬──────────────────────────┤
+│ SQL: CREATE  │ Planner: plugin  │ Executor:                │
+│ VIRTUAL      │ aggregates via   │ - call_scalar fallback   │
+│ TABLE parse  │ is_aggregate_call│ - exec_plugin_aggregate  │
+│              │                  │ - vtab_exec drivers      │
+├──────────────┴──────────────────┴──────────────────────────┤
+│ Storage: Table::vtab (catalog) + Pager codec hooks         │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Dispatch model.** The registry is a `RwLock<Arc<PluginRegistry>>` on
+`Database`. Every statement installs a snapshot into a thread-local
+scope (`PluginScopeGuard`, the same lifetime pattern as the correlated
+subquery bridge), so evaluator code deep in the tree resolves plugins
+without parameter threading. An `AtomicBool has_plugins` fast path keeps
+zero-plugin databases (the default library configuration) at one relaxed
+atomic load per statement — plugin-less throughput is unchanged.
+
+**Virtual tables** attach a `VtabInstance` to the catalog `Table`
+(`table.vtab`). Scans route through `executor::vtab_exec`: WHERE
+conjuncts of the shape `vtab_col <op> const/param` are extracted and
+offered to the module's `best_index`; marked-handled constraints become
+bound `xFilter` arguments, the rest stay engine-applied residuals.
+DML maps to `xUpdate` ops (SQLite argv protocol). `CREATE VIRTUAL
+TABLE` persists a schema row; on reopen the instance is *pending* and
+connects when the module is registered (`create_module`), matching
+SQLite's runtime-module linkage.
+
+**Page codecs** wrap the two pager I/O choke points (main-file read in
+`get_page`, write in the DELETE-mode flush). Page 0 keeps its first 100
+bytes plain; a `RQLCODEC:<name>` marker at bytes 72..100 makes reopen
+refuse plain opens and validate the codec name.
+
+**The C ABI** (`ffi.rs`) is a SQLite-shaped facade: connection wrapper
+(RwLock — read steps share the read lock), prepared-statement handles
+(lifetime-erased borrows of the Database), and the extension protocol
+(`plugin/abi.rs`): trampolines adapting C callbacks onto the safe Rust
+traits, a process-lifetime API table, and `libloading`-based
+`load_extension`. Statement caching is invalidated on registration
+(plans may hold vtab-affected `Arc<Table>`).
+
+**Streaming statements** (`statement.rs`) add resumable drivers over
+the OLTP plan shapes (Scan with rowid-resume, RowidRange, Filter,
+Project, Limit, vtab cursors): rows arrive in batches of 64 with early
+termination; everything else executes once and serves materialized
+rows (still single parse + plan per prepare).

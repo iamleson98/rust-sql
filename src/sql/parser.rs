@@ -171,8 +171,7 @@ impl Parser {
             return self.parse_create_trigger();
         }
         if self.peek().is_keyword("VIRTUAL") {
-            // CREATE VIRTUAL TABLE — not supported, parse and reject
-            return Err(Error::Unsupported("CREATE VIRTUAL TABLE"));
+            return self.parse_create_virtual_table();
         }
         let t = self.peek();
         Err(Error::parse(t.line, t.col, format!("expected TABLE/INDEX/VIEW/TRIGGER after CREATE, got {:?}", t.token)))
@@ -573,6 +572,89 @@ impl Parser {
             columns,
             where_clause,
         }))
+    }
+
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module(arg, ...)`.
+    ///
+    /// Module args are raw text tokens passed through to the module
+    /// (SQLite's argv protocol): a string literal contributes its unquoted
+    /// content, an identifier/number contributes its text, and `key=value`
+    /// contributes TWO argv entries ("key", "value"). The parentheses are
+    /// optional when there are no args.
+    fn parse_create_virtual_table(&mut self) -> Result<Statement> {
+        self.expect_keyword("VIRTUAL")?;
+        self.expect_keyword("TABLE")?;
+        let if_not_exists = if self.peek().is_keyword("IF") {
+            self.advance();
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_table_name()?;
+        self.expect_keyword("USING")?;
+        let module = self.parse_ident()?;
+        // Optional arg list. `USING module` with no parens is legal.
+        let mut args = Vec::new();
+        if self.peek().is_punct('(') {
+            self.advance();
+            if !self.peek().is_punct(')') {
+                loop {
+                    // One arg: ident | number | string | keyword, with an
+                    // optional `=value` suffix that becomes a second entry.
+                    let mut a = self.parse_vtab_arg_token()?;
+                    if self.peek().is_op("=") {
+                        self.advance();
+                        let v = self.parse_vtab_arg_token()?;
+                        args.push(std::mem::take(&mut a));
+                        args.push(v);
+                    } else {
+                        args.push(a);
+                    }
+                    if self.peek().is_punct(',') {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(')')?;
+        }
+        Ok(Statement::Create(CreateStatement::VirtualTable {
+            if_not_exists,
+            name,
+            module,
+            args,
+        }))
+    }
+
+    /// One module-arg token: identifier, keyword, number, or string literal.
+    fn parse_vtab_arg_token(&mut self) -> Result<String> {
+        let t = self.peek();
+        let out = match &t.token {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.clone(),
+            Token::String(s) => s.clone(),
+            Token::Integer(i) => i.to_string(),
+            Token::Float(f) => f.to_string(),
+            Token::Keyword(k) => {
+                let s: &'static str = k;
+                s.to_ascii_lowercase()
+            }
+            Token::Blob(b) => format!(
+                "x'{}'",
+                b.iter().map(|x| format!("{:02X}", x)).collect::<String>()
+            ),
+            _ => {
+                return Err(Error::parse(
+                    t.line,
+                    t.col,
+                    format!("expected module argument, got {:?}", t.token),
+                ))
+            }
+        };
+        self.advance();
+        Ok(out)
     }
 
     fn parse_create_view(&mut self) -> Result<Statement> {

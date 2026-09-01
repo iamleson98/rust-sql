@@ -351,6 +351,18 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         Expr::Binary { op, left, right } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
+            // COLLATE on either comparison operand applies a collation to
+            // text comparison (SQLite: `a < b COLLATE NOCASE`). Only
+            // ordering / equality operators honor it.
+            if let Some(coll_name) = comparison_collation(left).or_else(|| comparison_collation(right)) {
+                if let Some(coll) = crate::plugin::lookup_collation(&coll_name) {
+                    return Ok(apply_binary_collated(*op, &l, &r, coll.as_ref()));
+                }
+                return Err(crate::error::Error::semantic(format!(
+                    "no such collation sequence: {}",
+                    coll_name
+                )));
+            }
             Ok(apply_binary(*op, &l, &r))
         }
         Expr::Unary { op, expr } => {
@@ -482,6 +494,9 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             let v = evaluate(expr, ctx)?;
             Ok(cast_value(v, type_name))
         }
+        // COLLATE: transparent for evaluation (the collation is consumed
+        // by comparison operators and ORDER BY — see the Binary arm and
+        // exec_sort).
         Expr::Collate { expr, .. } => evaluate(expr, ctx),
         Expr::Raise { action, .. } => Err(Error::runtime(format!("RAISE {:?}", action))),
     }
@@ -974,9 +989,40 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         "false" => Value::Integer(0),
         // JSON1 — see json.rs. Unknown names return NULL (legacy behavior:
         // unknown functions evaluate to NULL rather than erroring).
-        _ => crate::executor::json::call_json_function(&fname, args)
-            .unwrap_or(Value::Null),
+        // USER FUNCTIONS take priority over JSON1 so extensions can shadow
+        // built-in JSON names (SQLite: user functions override core ones
+        // registered in the same "override" slot).
+        _ => {
+            if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
+                return r;
+            }
+            crate::executor::json::call_json_function(&fname, args)
+                .unwrap_or(Value::Null)
+        }
     })
+}
+
+/// Built-in scalar/aggregate/window function names (used to reject
+/// `create_function` overrides of engine internals, matching SQLite's
+/// SQLITE_BUSY error for overwriting a core function). Aggregates are
+/// included so user aggregates can't silently shadow them either.
+pub(crate) fn is_builtin_scalar(name: &str) -> bool {
+    const BUILTIN: &[&str] = &[
+        "abs", "avg", "ceil", "ceiling", "changes", "char", "coalesce", "count",
+        "currentdate", "currenttime", "currenttimestamp", "date", "datetime",
+        "dense_rank", "exp", "false", "floor", "group_concat", "hex", "ifnull", "iif",
+        "instr", "json", "json_array", "json_array_length", "json_extract",
+        "json_insert", "json_object", "json_patch", "json_quote", "json_remove",
+        "json_replace", "json_set", "json_valid", "julianday", "last_insert_rowid",
+        "length", "ln", "log", "log10", "log2", "lower", "ltrim", "max", "min",
+        "nullif", "pi", "power", "printf", "quote", "random", "randomblob", "rank",
+        "replace", "round", "row_number", "rtrim", "sign", "sqlite_version", "sqrt",
+        "strftime", "substr", "substring", "sum", "time", "timediff", "total",
+        "total_changes", "trim", "true", "trunc", "typeof", "unicode", "unixepoch",
+        "upper", "zeroblob",
+    ];
+    let lowered = name.to_ascii_lowercase();
+    BUILTIN.binary_search(&lowered.as_str()).is_ok()
 }
 
 fn quote_value(v: &Value) -> String {
@@ -999,6 +1045,43 @@ fn rand_i64() -> i64 {
         .unwrap_or(0);
     now.wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407)
+}
+
+/// Extract a COLLATE name from one side of a comparison (SQLite allows
+/// `a COLLATE X < b` and `a < b COLLATE X`; the RHS wins when both sides
+/// specify one).
+fn comparison_collation(e: &Expr) -> Option<String> {
+    if let Expr::Collate { collation, .. } = e {
+        return Some(collation.clone());
+    }
+    None
+}
+
+/// Comparison through a collation (text-text pairs only; other types keep
+/// the engine's total order). Result mirrors `apply_binary` for the six
+/// comparison operators.
+fn apply_binary_collated(op: BinaryOp, l: &Value, r: &Value, coll: &dyn crate::plugin::Collation) -> Value {
+    use BinaryOp::*;
+    use std::cmp::Ordering;
+    match op {
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            if cmp_operand_missing(l) || cmp_operand_missing(r) {
+                return Value::Null;
+            }
+            let ord = crate::plugin::compare_collated(l, r, coll);
+            let b = match (op, ord) {
+                (Eq, Ordering::Equal) => true,
+                (NotEq, Ordering::Less | Ordering::Greater) => true,
+                (Lt, Ordering::Less) => true,
+                (LtEq, Ordering::Less | Ordering::Equal) => true,
+                (Gt, Ordering::Greater) => true,
+                (GtEq, Ordering::Greater | Ordering::Equal) => true,
+                _ => false,
+            };
+            Value::Integer(if b { 1 } else { 0 })
+        }
+        _ => apply_binary(op, l, r),
+    }
 }
 
 /// Apply a binary operator.

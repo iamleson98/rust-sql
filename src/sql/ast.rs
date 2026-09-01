@@ -53,6 +53,15 @@ pub enum CreateStatement {
         select: Box<SelectStatement>,
     },
     Trigger(CreateTrigger),
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module(arg, ...)`.
+    /// Args are the raw comma-separated tokens (string literals unquoted);
+    /// `key=value` splits into two entries, matching SQLite's argv protocol.
+    VirtualTable {
+        if_not_exists: bool,
+        name: TableName,
+        module: String,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]

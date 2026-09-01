@@ -451,6 +451,20 @@ impl<'a> Planner<'a> {
                 let table = self.catalog.get_table(name).ok_or_else(|| {
                     Error::NotFound(format!("table: {}", name))
                 })?;
+                // Pending virtual table (module not registered yet): the
+                // column list is unknown until xConnect, so planning
+                // would produce a wrong schema. Modules must be
+                // registered with `Database::create_module` first (the
+                // registration connects pending vtabs) — same rule as
+                // SQLite's runtime module linkage.
+                if let Some(vt) = &table.vtab {
+                    if vt.is_pending() {
+                        return Err(Error::semantic(format!(
+                            "no such module: {} (register it with Database::create_module before use)",
+                            vt.module_name
+                        )));
+                    }
+                }
                 let index = if let Some(IndexedHint::Indexed(idx_name)) = indexed {
                     self.catalog.get_index(idx_name)
                 } else {
@@ -757,7 +771,7 @@ pub fn is_aggregate_fn(name: &str) -> bool {
     matches!(
         name,
         "count" | "sum" | "avg" | "min" | "max" | "total" | "group_concat"
-    )
+    ) || crate::plugin::lookup_aggregate(&name.to_ascii_lowercase()).is_some()
 }
 
 /// Returns true if the function name is an aggregate *when called with the
@@ -770,7 +784,7 @@ pub fn is_aggregate_call(name: &str, n_args: usize) -> bool {
     match lc.as_str() {
         "count" | "sum" | "avg" | "total" | "group_concat" => true,
         "min" | "max" => n_args <= 1,
-        _ => false,
+        _ => crate::plugin::lookup_aggregate(&lc).is_some(),
     }
 }
 

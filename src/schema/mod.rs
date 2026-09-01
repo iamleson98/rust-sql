@@ -80,9 +80,25 @@ pub struct Table {
     /// Cached `"table.column"`-qualified names, matching what `exec_scan`
     /// reports for an un-aliased scan. Built once in `build_table`.
     pub qualified_col_names: std::sync::Arc<[String]>,
+    /// Virtual-table instance when this is a `CREATE VIRTUAL TABLE` entry
+    /// (root_page is 0 — there is no B+tree; all access goes through the
+    /// module callbacks).
+    pub vtab: Option<std::sync::Arc<crate::plugin::vtab::VtabInstance>>,
 }
 
 impl Table {
+    /// Rebuild the `col_names` / `qualified_col_names` caches after a
+    /// structural change (used by the vtab schema bridge).
+    pub fn rebuild_name_caches(&mut self) {
+        self.col_names = self.columns.iter().map(|c| c.name.clone()).collect::<Vec<String>>().into();
+        self.qualified_col_names = self
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", self.name, c.name))
+            .collect::<Vec<String>>()
+            .into();
+    }
+
     /// Look up a column by name (case-insensitive). Returns its index.
     pub fn find_column(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
@@ -636,6 +652,7 @@ pub fn build_table(
         foreign_keys,
         col_names: plain.into(),
         qualified_col_names: qualified.into(),
+        vtab: None,
     })
 }
 

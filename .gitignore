@@ -1,1 +1,8 @@
 /target
+# Compiled example plugins (build with tests/build_plugins.sh)
+plugins/c/*.so
+plugins/cpp/*.so
+plugins/zig/*.so
+plugins/zig/*.o
+plugins/zig/zig-cache/
+plugins/rust/target/

@@ -387,6 +387,16 @@ pub struct Pager {
     /// load when no savepoint is active — the common case — instead of a
     /// Mutex lock).
     savepoint_depth: std::sync::atomic::AtomicUsize,
+    /// Active page codec (`PRAGMA codec = <name>`): every main-file page
+    /// write passes through `encode`, every read through `decode`. Page 0
+    /// keeps its first 100 bytes (the file header + marker area) plain.
+    /// Mutually exclusive with WAL mode (WAL frames would need the same
+    /// treatment — enforced in both directions).
+    codec: RwLock<crate::plugin::codec::CodecState>,
+    /// Codec name recorded in the file header marker (read at open): a
+    /// plain `open()` of a coded file fails with a pointer to
+    /// `Database::open_with_codec`.
+    required_codec: Mutex<Option<String>>,
 }
 
 /// One SAVEPOINT level: the metadata snapshot plus page pre-images.
@@ -619,6 +629,8 @@ impl Pager {
                 .unwrap_or(0),
             savepoints: Mutex::new(Vec::new()),
             savepoint_depth: std::sync::atomic::AtomicUsize::new(0),
+            codec: RwLock::new(crate::plugin::codec::CodecState::default()),
+            required_codec: Mutex::new(None),
         };
 
         let file_size = pager.file.metadata()?.len();
@@ -697,6 +709,12 @@ impl Pager {
             return Err(Error::corruption("invalid magic header"));
         }
         let page_size = FileHeader::page_size(&header)?;
+        // Page-codec marker (see set_codec): "RQLCODEC:<name>\0" at
+        // bytes 72..100. Present → the file was written with a codec;
+        // Database::open refuses, open_with_codec activates it.
+        if let Some(marker) = codec_marker_name(&header) {
+            *self.required_codec.lock() = Some(marker);
+        }
         // Validate before trusting it: a corrupted page-size field (bit
         // flip, torn write) otherwise poisons every later Page allocation
         // (a 0-byte page panics on first page_type(), a 4864-byte page
@@ -972,13 +990,31 @@ impl Pager {
                 }
             };
             if !served_from_wal {
-                let offset = id as u64 * psz as u64;
-                let n = self.read_file_at(offset, &mut page.data)?;
-                if n != psz as usize {
-                    return Err(Error::corruption(format!(
-                        "short read on page {}: {} of {} bytes",
-                        id, n, psz
-                    )));
+                let codec_active = self.codec.read().is_active();
+                if codec_active {
+                    let offset = id as u64 * psz as u64;
+                    let mut raw = vec![0u8; psz as usize];
+                    let n = self.read_file_at(offset, &mut raw)?;
+                    if n != psz as usize {
+                        return Err(Error::corruption(format!(
+                            "short read on page {}: {} of {} bytes",
+                            id, n, psz
+                        )));
+                    }
+                    let decoded = {
+                        let cs = self.codec.read();
+                        cs.decode_page(id == 0, &raw, psz as usize)?
+                    };
+                    page.data.copy_from_slice(&decoded);
+                } else {
+                    let offset = id as u64 * psz as u64;
+                    let n = self.read_file_at(offset, &mut page.data)?;
+                    if n != psz as usize {
+                        return Err(Error::corruption(format!(
+                            "short read on page {}: {} of {} bytes",
+                            id, n, psz
+                        )));
+                    }
                 }
             }
             let page_ref = Arc::new(Mutex::new(page));
@@ -1070,12 +1106,85 @@ impl Pager {
     /// Committed frames left over from a previous session become visible
     /// through the page map — this IS crash recovery: un-checkpointed
     /// committed data is served from the WAL.
+    /// Activate a page codec (`PRAGMA codec = <name>` /
+    /// `Database::open_with_codec`). Errors when WAL mode is active, or
+    /// when the file carries a DIFFERENT codec's marker. When activating
+    /// on a codec-less file, the marker is written into the in-cache page
+    /// 0 (flushed with the next commit) so reopen knows what to require.
+    pub fn set_codec(&self, codec: Option<std::sync::Arc<dyn crate::plugin::PageCodec>>) -> Result<()> {
+        if codec.is_some() && self.wal_enabled() {
+            return Err(crate::error::Error::semantic(
+                "page codecs require journal_mode=delete (WAL frames are not encoded)",
+            ));
+        }
+        if let Some(c) = &codec {
+            if let Some(required) = self.required_codec.lock().clone() {
+                if !required.eq_ignore_ascii_case(c.name()) {
+                    return Err(crate::error::Error::semantic(format!(
+                        "database was written with codec '{}', refusing codec '{}'",
+                        required,
+                        c.name()
+                    )));
+                }
+            }
+        }
+        {
+            let mut cs = self.codec.write();
+            cs.active = codec;
+        }
+        // Write / clear the marker on the in-cache page 0.
+        let page0 = self.get_page(0)?;
+        {
+            let mut b = page0.lock();
+            let name = self.codec.read().active_name().map(|n| n.to_string());
+            match name {
+                Some(n) => write_codec_marker(&mut b.data, &n),
+                None => clear_codec_marker(&mut b.data),
+            }
+            b.dirty = true;
+        }
+        self.note_dirty(0);
+        if self.lazy_writeback.load(Ordering::Acquire) {
+            // In-memory mode: force the marker out so reopen-by-path sees it.
+            let _ = self.flush();
+        } else {
+            let _ = self.flush();
+        }
+        Ok(())
+    }
+
+    /// Active codec name, if any.
+    pub fn codec_name(&self) -> Option<String> {
+        self.codec.read().active_name().map(|s| s.to_string())
+    }
+
+    /// Codec required by the file's marker (read at open).
+    pub fn required_codec(&self) -> Option<String> {
+        self.required_codec.lock().clone()
+    }
+
+    /// Write one page through the active codec (or raw when none).
+    fn codec_write_page(&self, id: PageId, data: &[u8]) -> Result<()> {
+        let psz = self.page_size();
+        let offset = id as u64 * psz as u64;
+        let out = {
+            let cs = self.codec.read();
+            cs.encode_page(id == 0, data)?
+        };
+        self.write_file_at(offset, &out)
+    }
+
     pub fn enable_wal(&self) -> Result<()> {
         {
             let guard = self.wal.read();
             if guard.is_some() {
                 return Ok(()); // already in WAL mode
             }
+        }
+        if self.codec.read().is_active() {
+            return Err(crate::error::Error::semantic(
+                "journal_mode=WAL is unavailable while a page codec is active",
+            ));
         }
         // Flush pending dirty pages in DELETE mode first.
         self.flush()?;
@@ -1344,11 +1453,21 @@ impl Pager {
         } else {
             // Page 0 not in cache — read, modify, write directly
             let mut header = vec![0u8; psz as usize];
-            self.read_file_at(0, &mut header)?;
+            if self.codec.read().is_active() {
+                let mut raw = vec![0u8; psz as usize];
+                self.read_file_at(0, &mut raw)?;
+                let decoded = {
+                    let cs = self.codec.read();
+                    cs.decode_page(true, &raw, psz as usize)?
+                };
+                header.copy_from_slice(&decoded);
+            } else {
+                self.read_file_at(0, &mut header)?;
+            }
             FileHeader::write(&mut header, psz, n_pages_val, schema_cookie_val);
             header[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
             header[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
-            self.write_file_at(0, &header)?;
+            self.codec_write_page(0, &header)?;
         }
 
         // Flush dirty pages — use the dirty_pages set so this is O(dirty_count),
@@ -1376,7 +1495,8 @@ impl Pager {
                 let mut borrowed = page_ref.lock();
                 if borrowed.dirty {
                     let offset = id as u64 * psz as u64;
-                    self.write_file_at(offset, &borrowed.data)?;
+                    self.codec_write_page(id, &borrowed.data)?;
+                    let _ = offset;
                     borrowed.dirty = false;
                 }
             }
@@ -1622,6 +1742,41 @@ impl Pager {
         file.write_all(buf)?;
         Ok(())
     }
+}
+
+/// Codec marker area: bytes 72..100 of the file header, laid out as
+/// `b"RQLCODEC:"` + name + NUL padding. Kept plain by the codec layer
+/// (see `CodecState`).
+const CODEC_MARKER_OFFSET: usize = 72;
+const CODEC_MARKER_LEN: usize = 28;
+
+fn write_codec_marker(header: &mut [u8], name: &str) {
+    let area = &mut header[CODEC_MARKER_OFFSET..CODEC_MARKER_OFFSET + CODEC_MARKER_LEN];
+    area.fill(0);
+    let prefix = b"RQLCODEC:";
+    area[..prefix.len()].copy_from_slice(prefix);
+    let max_name = CODEC_MARKER_LEN - prefix.len() - 1;
+    let n = name.len().min(max_name);
+    area[prefix.len()..prefix.len() + n].copy_from_slice(&name.as_bytes()[..n]);
+}
+
+fn clear_codec_marker(header: &mut [u8]) {
+    header[CODEC_MARKER_OFFSET..CODEC_MARKER_OFFSET + CODEC_MARKER_LEN].fill(0);
+}
+
+/// Read the codec name from a 100-byte header image (None when absent).
+fn codec_marker_name(header: &[u8; 100]) -> Option<String> {
+    let area = &header[CODEC_MARKER_OFFSET..CODEC_MARKER_OFFSET + CODEC_MARKER_LEN];
+    let prefix = b"RQLCODEC:";
+    if area.len() < prefix.len() || &area[..prefix.len()] != prefix {
+        return None;
+    }
+    let name_bytes = &area[prefix.len()..];
+    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&name_bytes[..end]).into_owned())
 }
 
 /// Trait helper to convert `AsRef<Path>` to `PathBuf` without naming the

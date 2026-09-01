@@ -1,0 +1,13 @@
+[package]
+name = "rustqlite-ext-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Example rustqlite dynamic extension written in Rust against the raw C ABI (no engine linkage)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rustext"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 2

@@ -88,6 +88,14 @@ pub mod error;
 /// OOM fault-injection allocator (`oom-injection` feature).
 #[cfg(feature = "oom-injection")]
 pub mod oom_alloc;
+/// Plugin system: user functions, aggregates, collations, virtual-table
+/// modules, page codecs (static Rust + dynamic C/C++/Zig/Rust extensions).
+pub mod plugin;
+/// SQLite-style C ABI (`rustqlite_open` / `rustqlite_prepare` /
+/// `rustqlite_step` / ...) plus the extension loading entry points.
+pub mod ffi;
+/// SQLite-style streaming statement handles (`prepare` / `bind` / `step`).
+pub mod statement;
 pub mod planner;
 pub mod schema;
 pub mod sql;
@@ -99,6 +107,7 @@ pub mod api;
 
 pub use api::{Database, Params};
 pub use error::{Error, Result};
+pub use statement::{Statement, StepResult};
 pub use types::{Affinity, Row, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

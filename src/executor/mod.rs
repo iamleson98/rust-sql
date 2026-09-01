@@ -17,6 +17,8 @@ pub mod json;
 pub(crate) mod triggers;
 pub(crate) mod explain;
 pub(crate) mod predicate;
+pub(crate) mod vtab_exec;
+
 
 pub use expr::{apply_binary, evaluate, EvalContext};
 
@@ -848,7 +850,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
 }
 
 // Helper: evaluate an expression against a single row.
-fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], named_params: &HashMap<String, Value>) -> Result<Value> {
+pub(crate) fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], named_params: &HashMap<String, Value>) -> Result<Value> {
     let ctx = EvalContext::new(row, col_names, params, named_params);
     evaluate(expr, &ctx)
 }
@@ -1234,6 +1236,17 @@ fn project_returning_row(
         }
     }
     Ok(out)
+}
+
+/// Extract the WHERE predicate from an UPDATE/DELETE source plan: the
+/// `Filter { predicate }` wrapper, the pushed-down `Scan { predicate }`, or
+/// None. Used by the virtual-table DML paths.
+fn extract_source_predicate(source: &Plan) -> Option<Expr> {
+    match source {
+        Plan::Filter { predicate, .. } => Some(predicate.clone()),
+        Plan::Scan { predicate: Some(p), .. } => Some(p.clone()),
+        _ => None,
+    }
 }
 
 /// Column names for a RETURNING result (used for `query_with_columns`).
@@ -2188,6 +2201,12 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
 // ============================================================================
 
 fn exec_scan(ctx: &mut ExecContext<'_>, table: Arc<Table>, alias: Option<String>) -> Result<ExecResult> {
+    // Virtual table: drive the module's cursor protocol instead of a
+    // B+tree scan. The pushed-down predicate (if any) is offered to the
+    // module through best_index.
+    if table.vtab.is_some() {
+        return vtab_exec::exec_scan_vtab(ctx, &table, alias.as_ref(), None);
+    }
     let mut rows = Vec::new();
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
@@ -2257,6 +2276,12 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     // skips materializing rows that fail it — non-matching rows cost a
     // payload decode and nothing else (no Vec<Value>, no clone, no move).
     if let Plan::Scan { table, alias, index: None, predicate: None } = input {
+        // Virtual table: pass the Filter's predicate into the vtab scan
+        // (best_index sees it; unhandled conjuncts become the residual).
+        if table.vtab.is_some() {
+            let res = vtab_exec::exec_scan_vtab(ctx, table, alias.as_ref(), Some(predicate))?;
+            return Ok(res);
+        }
         let prefix = alias.as_deref().unwrap_or(&table.name);
         if let Some(pred) = crate::executor::predicate::compile_predicate(predicate, table, prefix) {
             let n_cols = table.n_columns();
@@ -2620,7 +2645,15 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         for term in terms {
             let va = sort_key(&term.expr, a, &columns, params, named_params);
             let vb = sort_key(&term.expr, b, &columns, params, named_params);
-            let ord = va.cmp(&vb);
+            // ORDER BY ... COLLATE name: compare text through the named
+            // collation (SQL semantics: collations affect only text pairs).
+            let ord = if let Expr::Collate { collation, .. } = &term.expr {
+                crate::plugin::lookup_collation(collation)
+                    .map(|c| crate::plugin::compare_collated(&va, &vb, c.as_ref()))
+                    .unwrap_or_else(|| va.cmp(&vb))
+            } else {
+                va.cmp(&vb)
+            };
             let ord = if term.order == Order::Desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -3553,6 +3586,18 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
 }
 
 fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], aggregates: &[AggExpr]) -> Result<ExecResult> {
+    // USER AGGREGATES: when any aggregate function name resolves to a
+    // registered plugin aggregate, run the generic path. It materializes
+    // the input and steps plugin states with full error propagation
+    // (the tuned builtin fast paths can't surface plugin errors). The
+    // plugin call itself dominates per-row cost, so the missing fusion
+    // is not measurable.
+    if aggregates
+        .iter()
+        .any(|a| crate::plugin::lookup_aggregate(&a.func).is_some())
+    {
+        return exec_plugin_aggregate(ctx, input, group_by, aggregates);
+    }
     // Fast path #0: SELECT COUNT(*) FROM t  (no WHERE, no GROUP BY, single COUNT(*)).
     // Uses `Btree::count_rows` which skips decoding every cell payload —
     // just sums `n_cells` across all leaf pages. For a 10k-row table this is
@@ -3562,6 +3607,10 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         && matches!(input, Plan::Scan { predicate: None, .. })
     {
         if let Plan::Scan { table, .. } = input {
+            // Virtual tables have no B+tree to count cells in.
+            if table.vtab.is_some() {
+                // fall through to the general path (vtab scan + aggregate)
+            } else {
             let agg = &aggregates[0];
             // COUNT(*) — arg is None (the planner emits COUNT(*) with no arg).
             // COUNT(col) — arg is Some(Column). We can't use the fast path
@@ -3577,13 +3626,16 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                     rows: vec![row],
                 });
             }
+            }
         }
     }
     // Fast path #1: input is a bare Scan.
     // Handles: `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t`
     //          `SELECT col, COUNT(*) FROM t GROUP BY col`
     if let Plan::Scan { table, alias, index: None, predicate: None } = input {
-        return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), None, group_by, aggregates);
+        if table.vtab.is_none() {
+            return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), None, group_by, aggregates);
+        }
     }
     // Fast path #1b: COUNT(*) over a RowidRange — count leaf CELLS in the
     // rowid range with no payload decoding. `SELECT COUNT(*) FROM t WHERE
@@ -3626,7 +3678,9 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
     if let Plan::Filter { input: inner, predicate } = input {
         if let Plan::Scan { table, alias, index: None, predicate: None } = inner.as_ref() {
-            return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), Some(predicate), group_by, aggregates);
+            if table.vtab.is_none() {
+                return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), Some(predicate), group_by, aggregates);
+            }
         }
     }
     // Fast path #3: COUNT(*) over an IndexRange — COVERING INDEX count.
@@ -3808,6 +3862,192 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         // The alias (if any) is still used as the display name in the Project.
         let _ = agg.alias;
         let _ = i;
+        out_cols.push(format!("__agg_{}", i));
+    }
+
+    Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
+}
+
+// ============================================================================
+// User (plugin) aggregates
+// ============================================================================
+
+/// Generic aggregate execution for statements that use at least one
+/// registered plugin aggregate. Mirrors the general (non-fused) builtin
+/// path: materialize input rows, group with `HashGrouper`, step per row,
+/// finalize per group. Builtins in the same statement keep their normal
+/// `AggState` handling so mixed statements (`SELECT count(*), my_agg(x)
+/// ...`) work.
+fn exec_plugin_aggregate(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> Result<ExecResult> {
+    use crate::plugin::{AggCtx, AggregateFunction};
+
+    let inner = execute(input, ctx)?;
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
+
+    // Resolve group-by exprs and agg args positionally once.
+    let key_col_indices: Vec<Option<usize>> = group_by
+        .iter()
+        .map(|e| match e {
+            Expr::Column { table, name } => resolve_column_index(&inner.columns, table.as_deref(), name),
+            _ => None,
+        })
+        .collect();
+    let agg_col_indices: Vec<Option<usize>> = aggregates
+        .iter()
+        .map(|agg| match &agg.arg {
+            Some(Expr::Column { table, name }) => {
+                resolve_column_index(&inner.columns, table.as_deref(), name)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Per-aggregate execution slot: builtin state or plugin state.
+    enum Slot {
+        Builtin(AggState),
+        Plugin {
+            func: std::sync::Arc<dyn AggregateFunction>,
+            state: Option<Box<dyn crate::plugin::AggState>>,
+        },
+    }
+
+    // Grouper generic over the state type (HashGrouper is hard-wired to
+    // AggState). Same SQL-semantic hashing + linear probing.
+    struct Grouper {
+        buckets: HashMap<u64, Vec<usize>>,
+        groups: Vec<(Vec<Value>, Vec<Slot>)>,
+    }
+    impl Grouper {
+        fn intern(&mut self, key: &[Value]) -> usize {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for v in key {
+                hash_sql_value(v, &mut hasher);
+            }
+            let h = hasher.finish();
+            if let Some(bucket) = self.buckets.get(&h) {
+                for &gi in bucket {
+                    let (existing, _) = &self.groups[gi];
+                    if existing.len() == key.len()
+                        && existing
+                            .iter()
+                            .zip(key.iter())
+                            .all(|(a, b)| crate::types::values_sql_equal(a, b))
+                    {
+                        return gi;
+                    }
+                }
+            }
+            let gi = self.groups.len();
+            self.groups.push((key.to_vec(), Vec::new()));
+            self.buckets.entry(h).or_default().push(gi);
+            gi
+        }
+        fn len(&self) -> usize {
+            self.groups.len()
+        }
+        fn is_empty(&self) -> bool {
+            self.groups.is_empty()
+        }
+    }
+
+    let make_slot = |agg: &AggExpr| -> Result<Slot> {
+        if let Some(f) = crate::plugin::lookup_aggregate(&agg.func) {
+            // Eager init: an empty group finalizes the fresh state
+            // (SQLite calls xFinal even with no xStep).
+            Ok(Slot::Plugin { func: f.clone(), state: Some(f.init()) })
+        } else {
+            Ok(Slot::Builtin(AggState::default()))
+        }
+    };
+
+    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
+    let mut grouper = Grouper {
+        buckets: HashMap::new(),
+        groups: Vec::new(),
+    };
+    let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
+
+    for row in &inner.rows {
+        key_buf.clear();
+        for (ge, kidx) in group_by.iter().zip(key_col_indices.iter()) {
+            match kidx {
+                Some(idx) => key_buf.push(row[*idx].clone()),
+                None => key_buf.push(eval_row(ge, row, &inner.columns, params, named_params)?),
+            }
+        }
+        let gi = grouper.intern(&key_buf);
+        if grouper.groups[gi].1.is_empty() {
+            grouper.groups[gi].1 = (0..aggregates.len())
+                .map(|i| make_slot(&aggregates[i]))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        for (i, agg) in aggregates.iter().enumerate() {
+            let arg_val = match (&agg.arg, agg_col_indices[i]) {
+                (Some(_), Some(idx)) => row[idx].clone(),
+                (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
+                (None, _) => Value::Integer(1),
+            };
+            match &mut grouper.groups[gi].1[i] {
+                Slot::Builtin(st) => update_agg_state(st, agg_funcs[i], &arg_val, agg.distinct),
+                Slot::Plugin { func, state } => {
+                    if !func.arity().accepts(agg.arg.is_some() as usize) {
+                        return Err(Error::semantic(format!(
+                            "wrong number of arguments to function {}()",
+                            agg.func
+                        )));
+                    }
+                    let actx = AggCtx::new(agg.arg.is_some() as usize);
+                    if let Some(st) = state.as_mut() {
+                        st.step(&actx, &[arg_val])?;
+                    }
+                }
+            }
+        }
+    }
+
+    // No GROUP BY + empty input → one row of initial states (COUNT=0 etc.).
+    if group_by.is_empty() && grouper.is_empty() && !aggregates.is_empty() {
+        grouper
+            .groups
+            .push((Vec::new(), (0..aggregates.len()).map(|i| make_slot(&aggregates[i])).collect::<Result<Vec<_>>>()?));
+    }
+
+    let mut out_rows = Vec::with_capacity(grouper.len());
+    for (key, states) in grouper.groups {
+        let mut row = key;
+        for (i, slot) in states.into_iter().enumerate() {
+            row.push(match slot {
+                Slot::Builtin(st) => finalize_agg(&st, &aggregates[i].func),
+                Slot::Plugin { state, .. } => match state {
+                    Some(st) => st.value()?,
+                    // No rows reached this group's step (e.g. aggregate over
+                    // an empty table with GROUP BY): SQLite calls xFinal
+                    // with no xStep — the state exists from init().
+                    None => Value::Null,
+                },
+            });
+        }
+        out_rows.push(row);
+    }
+
+    // Column naming identical to the builtin general path so downstream
+    // Project/Sort/ORDER BY rewrite logic works unchanged.
+    let mut out_cols = Vec::new();
+    for (i, g) in group_by.iter().enumerate() {
+        let name = match g {
+            Expr::Column { table: None, name } => name.clone(),
+            Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+            _ => format!("col{}", i + 1),
+        };
+        out_cols.push(name);
+    }
+    for i in 0..aggregates.len() {
         out_cols.push(format!("__agg_{}", i));
     }
 
@@ -5736,6 +5976,31 @@ pub(crate) fn make_index_states(
 }
 
 fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, columns: Option<Vec<usize>>, on_conflict: ConflictResolution, upsert: Option<&crate::sql::ast::UpsertClause>, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+    // Virtual table: xUpdate with old_rowid = None. The source rows are
+    // evaluated normally, then handed to the module.
+    if table.vtab.is_some() {
+        if upsert.is_some() {
+            return Err(Error::Unsupported("ON CONFLICT on a virtual table"));
+        }
+        let source_res = execute(source, ctx)?;
+        // RETURNING needs the inserted rows AFTER xUpdate (clone only then).
+        let returning_snapshot = if returning.is_some() {
+            source_res.rows.clone()
+        } else {
+            Vec::new()
+        };
+        vtab_exec::exec_insert_vtab(ctx, &table, source_res.rows, columns.as_ref(), on_conflict)?;
+        if let Some(ret) = returning {
+            let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+            let mut rows = Vec::with_capacity(returning_snapshot.len());
+            for row in &returning_snapshot {
+                rows.push(project_returning_row(ret, row, &col_names, &ctx.params, &ctx.named_params)?);
+            }
+            let names = returning_column_names(ret, &col_names);
+            return Ok(ExecResult { columns: names.into(), rows });
+        }
+        return Ok(ExecResult { columns: Arc::from(Vec::new()), rows: Vec::new() });
+    }
     let target_indices: Vec<usize> = columns.unwrap_or_else(|| (0..table.n_columns()).collect());
     // Track the current root page — it may change if the B+tree splits.
     let mut current_root = ctx.table_root(&table);
@@ -6861,6 +7126,13 @@ fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
 // ============================================================================
 
 fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assignments: &[(usize, Expr)], returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+    // Virtual table: scan matching rows through the module, evaluate the
+    // SET expressions per row, batch xUpdate.
+    if table.vtab.is_some() {
+        let pred = extract_source_predicate(source);
+        vtab_exec::exec_update_vtab(ctx, &table, assignments, pred.as_ref())?;
+        return Ok(ExecResult { columns: Arc::from(Vec::new()), rows: Vec::new() });
+    }
     // Streaming UPDATE fast path: when the source is a bare `Scan`, a
     // `Filter { Scan, predicate }`, or a `RowidRange`, iterate the B+tree
     // directly with a reusable row buffer. This avoids the materialize-all
@@ -7942,6 +8214,13 @@ fn try_streaming_delete(
 }
 
 fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+    // Virtual table: collect matching rowids through the module, batch
+    // xUpdate (delete ops).
+    if table.vtab.is_some() {
+        let pred = extract_source_predicate(source);
+        vtab_exec::exec_delete_vtab(ctx, &table, pred.as_ref())?;
+        return Ok(ExecResult { columns: Arc::from(Vec::new()), rows: Vec::new() });
+    }
     // Streaming path first: handles Scan/Filter, RowidRange and IndexRange
     // sources without materializing matched rows, and — critically —
     // supports DELETE on tables without an INTEGER PRIMARY KEY (rowid
