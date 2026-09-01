@@ -74,6 +74,14 @@ for row in &rows {
 
 See [PLUGINS.md](PLUGINS.md) for the full guide.
 
+### sqlx & sea-orm compatibility (drop-in `libsqlite3`)
+
+- **`compat/`** exports the real `sqlite3_*` C ABI (124 symbols) on the engine and ships a drop-in `libsqlite3-sys` replacement, so **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line
+- SQLite-exact error messages + extended result codes (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_MISMATCH`, …) — what sqlx's `error_kind()` and sea-orm's `DbErr` classify on
+- Full UPDATE constraint semantics: sequential unique-index checking (ratchets pass, swaps conflict), `OR IGNORE`/`OR REPLACE`, rowid moves (`UPDATE t SET id = X`), collation-aware (NOCASE) unique probes, atomic statement aborts
+
+See [compat/README.md](compat/README.md) and [docs/SQLX_COMPAT.md](docs/SQLX_COMPAT.md).
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
@@ -296,24 +304,19 @@ cargo run --release --example bench_compare             # vs SQLite
 
 ## Limitations
 
-This is a proof-of-concept. Known gaps:
+Known gaps (shrinking — see `GAP_ANALYSIS.md` for the full ledger):
 
-- **Streaming**: The executor materializes all rows in memory (collect-all
-  model). A pull-based streaming executor would be needed for large result
-  sets.
 - **Correlated subqueries**: clean "unsupported" errors (uncorrelated
   scalar / IN / EXISTS subqueries work).
-- **ALTER TABLE RENAME COLUMN / DROP COLUMN**: parsed, rejected with a
-  clear error (RENAME TO and ADD COLUMN are implemented).
 - **Concurrent access**: page-level MRMW reads work (3.1x SQLite's
   concurrent-read throughput); full MVCC visibility wiring is still
   infrastructure-only.
 - **Numeric precision**: `AVG` rounds to 10 decimals; some edge cases in
   real formatting differ from SQLite.
-- **Collations**: `BINARY`/`NOCASE`/`RTRIM` plus user-registered sequences work in ORDER BY and comparisons; index collations (COLLATE in CREATE INDEX / column definitions) are not yet used by the planner for index scans.
-- **Pragmas**: Only `foreign_keys` changes behavior; the rest are no-ops.
-- **WAL/MVCC**: the log and snapshot machinery exists (CRC32 frames, salt
-  recovery) but readers do not yet serve queries from WAL frames.
+- **Compat surface**: `sqlite3_serialize`/`deserialize`, preupdate hooks,
+  and unlock-notify are stubs in `compat/`; `sqlite_master` DDL text and a
+  few `PRAGMA` result shapes continue to be tightened via differential
+  tests (`tests/pragma_introspect.rs`, `tests/update_from_collate.rs`).
 
 ## License
 

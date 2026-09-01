@@ -645,7 +645,7 @@ fn build_api_table() -> RqlApi {
 /// SAFETY (Send+Sync): `app` and the fn pointers are used only from the
 /// calling thread during a statement (the engine's statement scope);
 /// extensions register from one thread and SQLite has the same contract.
-pub(crate) struct CScalar {
+pub struct CScalar {
     pub name: String,
     pub n_arg: c_int,
     pub app: *mut c_void,
@@ -716,7 +716,7 @@ impl ScalarFunction for CScalar {
 }
 
 /// Aggregate state backed by xStep/xFinal + `aggregate_context` memory.
-pub(crate) struct CAggregate {
+pub struct CAggregate {
     pub name: String,
     pub n_arg: c_int,
     pub app: *mut c_void,
@@ -821,7 +821,7 @@ impl Drop for CAggState {
 }
 
 /// Collation backed by a C comparator.
-pub(crate) struct CCollation {
+pub struct CCollation {
     pub name: String,
     pub app: *mut c_void,
     pub x_compare: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
@@ -1386,4 +1386,73 @@ impl Drop for ThreadDbGuard {
 /// Borrow the thread-local database for module callbacks.
 pub(crate) fn current_db_thread() -> *mut crate::api::Database {
     THREAD_DB.with(|d| *d.borrow())
+}
+
+// ---------------------------------------------------------------------------
+// Public facade for the sqlite3 C ABI compatibility layer (compat crate)
+// ---------------------------------------------------------------------------
+
+/// `sqlite3_result_int` — writes into the call context.
+pub fn api_result_int(ctx: *mut RqlContext, v: c_int) {
+    let _ = with_ctx_ptr(ctx, |c| c.out = Some(Value::Integer(v as i64)));
+}
+
+/// `sqlite3_result_int64`.
+pub fn api_result_int64(ctx: *mut RqlContext, v: i64) {
+    let _ = with_ctx_ptr(ctx, |c| c.out = Some(Value::Integer(v)));
+}
+
+/// `sqlite3_result_double`.
+pub fn api_result_double(ctx: *mut RqlContext, v: f64) {
+    let _ = with_ctx_ptr(ctx, |c| c.out = Some(Value::Real(v)));
+}
+
+/// `sqlite3_result_null`.
+pub fn api_result_null(ctx: *mut RqlContext) {
+    let _ = with_ctx_ptr(ctx, |c| c.out = Some(Value::Null));
+}
+
+/// `sqlite3_result_text` (len < 0 = NUL-terminated).
+pub fn api_result_text(ctx: *mut RqlContext, s: *const c_char, len: c_int) {
+    #[allow(unused_unsafe)]
+    unsafe {
+    let bytes = cstr_or_len(s, len);
+    let _ = with_ctx_ptr(ctx, |c| {
+        c.out = Some(Value::Text(String::from_utf8_lossy(&bytes).into_owned().into()))
+    });
+    }
+}
+
+/// `sqlite3_result_blob`.
+pub fn api_result_blob(ctx: *mut RqlContext, data: *const c_void, len: c_int) {
+    #[allow(unused_unsafe)]
+    unsafe {
+    let bytes = if data.is_null() || len <= 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data as *const u8, len as usize).to_vec()
+    };
+    let _ = with_ctx_ptr(ctx, |c| c.out = Some(Value::Blob(bytes)));
+    }
+}
+
+/// `sqlite3_result_error`.
+pub fn api_result_error(ctx: *mut RqlContext, msg: *const c_char, len: c_int) {
+    #[allow(unused_unsafe)]
+    unsafe {
+    let bytes = cstr_or_len(msg, len);
+    let _ = with_ctx_ptr(ctx, |c| {
+        c.err = Some(String::from_utf8_lossy(&bytes).into_owned())
+    });
+    }
+}
+
+/// `sqlite3_user_data` — the p_app pointer registered with the function.
+pub fn api_user_data(ctx: *mut RqlContext) -> *mut c_void {
+    with_ctx_ptr(ctx, |c| c.app).unwrap_or(std::ptr::null_mut())
+}
+
+/// `sqlite3_aggregate_context` — plugin-managed scratch memory.
+pub fn api_aggregate_context(ctx: *mut RqlContext, n_bytes: c_int) -> *mut c_void {
+    unsafe { tramp_aggregate_context(ctx, n_bytes) }
 }

@@ -752,6 +752,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustqlite-compat"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "rustqlite",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

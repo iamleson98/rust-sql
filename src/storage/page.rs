@@ -35,11 +35,14 @@ pub const MIN_PAGE_SIZE: u32 = 512;
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// Magic header for the database file.
-/// On-disk format version. Bumped to `RSQLDB02` with the compact row
+/// On-disk format version. `RSQLDB03`: index order keys for TEXT/BLOB
+/// switched from (length-prefix, bytes) to true lexicographic
+/// (bytes + NUL terminator) — index range scans and ORDER BY on text of
+/// differing lengths were wrong. Bumped to `RSQLDB02` with the compact row
 /// codec (size-classed integers, varint lengths, rowid-alias elision) —
 /// files written by v1 are rejected with a clear "unsupported format"
 /// error instead of silently decoding garbage.
-pub const DB_MAGIC: [u8; 8] = *b"RSQLDB02";
+pub const DB_MAGIC: [u8; 8] = *b"RSQLDB03";
 
 /// Page 0 is special: it holds the database header (100 bytes) followed by
 /// the first B+tree page (typically the schema table's root).

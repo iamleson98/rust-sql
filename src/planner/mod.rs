@@ -220,6 +220,26 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_simple_select(&mut self, s: &SimpleSelect) -> Result<Plan> {
+        // SQLite's collation resolution: a comparison whose operand is a
+        // column with a DECLARED collation (e.g. `email TEXT COLLATE
+        // NOCASE`) uses that collation even without an explicit COLLATE in
+        // the query. Attach explicit COLLATE nodes once, at plan time, so
+        // every evaluation path (compiled predicate fallback, general
+        // evaluator, join conditions) sees them.
+        let coll_scope: Vec<(std::sync::Arc<crate::schema::Table>, String)> = s
+            .from
+            .as_ref()
+            .map(|from| collect_collation_scope(self.catalog, from))
+            .unwrap_or_default();
+        let where_rewritten = s
+            .where_clause
+            .as_ref()
+            .map(|p| rewrite_column_collations(self.catalog, p, &coll_scope));
+        let having_rewritten = s
+            .having
+            .as_ref()
+            .map(|p| rewrite_column_collations(self.catalog, p, &coll_scope));
+
         let mut plan = if let Some(from) = &s.from {
             self.plan_table_expression(from)?
         } else {
@@ -227,7 +247,7 @@ impl<'a> Planner<'a> {
         };
 
         // Apply WHERE — with predicate pushdown and index/rowid lookup optimization.
-        if let Some(pred) = &s.where_clause {
+        if let Some(pred) = &where_rewritten {
             plan = self.apply_where(plan, pred);
         }
 
@@ -272,7 +292,7 @@ impl<'a> Planner<'a> {
                 group_by: resolved_group_by.clone(),
                 aggregates: aggregates.clone(),
             };
-            if let Some(having) = &s.having {
+            if let Some(having) = &having_rewritten {
                 let rewritten_having = rewrite_aggregates_and_groups(having, &aggregates, &resolved_group_by, n_group);
                 plan = Plan::Filter { input: Box::new(plan), predicate: rewritten_having };
             }
@@ -366,6 +386,12 @@ impl<'a> Planner<'a> {
             return Some(v.clone());
         }
         self.outer_ctes.as_ref().and_then(|m| m.get(name).cloned())
+    }
+
+    /// Public wrapper for `UPDATE ... FROM` (SQLite 3.33+): plan an
+    /// arbitrary FROM-side table expression (table / subquery / join).
+    pub(crate) fn plan_table_expression_pub(&mut self, te: &TableExpression) -> Result<Plan> {
+        self.plan_table_expression(te)
     }
 
     fn plan_table_expression(&mut self, te: &TableExpression) -> Result<Plan> {
@@ -492,8 +518,13 @@ impl<'a> Planner<'a> {
             TableExpression::Join { left, right, join_type, constraint } => {
                 let l = self.plan_table_expression(left)?;
                 let r = self.plan_table_expression(right)?;
+                // Collation scope for the join condition spans BOTH sides.
+                let mut join_scope = collect_collation_scope(self.catalog, left);
+                join_scope.extend(collect_collation_scope(self.catalog, right));
                 let condition = match constraint {
-                    JoinConstraint::On(e) => Some(e.clone()),
+                    JoinConstraint::On(e) => {
+                        Some(rewrite_column_collations(self.catalog, e, &join_scope))
+                    }
                     JoinConstraint::Using(cols) => {
                         let mut combined = None;
                         for c in cols {
@@ -794,6 +825,30 @@ pub fn is_window_only_fn(name: &str) -> bool {
     matches!(name, "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" | "ntile" | "lag" | "lead" | "first_value" | "last_value" | "nth_value")
 }
 
+
+/// SQLite-style output name for an aggregate/window call: `COUNT(*)`,
+/// `SUM(x)`, `COUNT(DISTINCT y)`. (SQLite's short-column-name rule.)
+fn aggregate_display_name(name: &str, distinct: bool, args: &[crate::sql::ast::Expr]) -> String {
+    use crate::sql::ast::Expr;
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| match a {
+            Expr::Column { name, .. } if name == "*" => "*".to_string(),
+            Expr::Column { name, .. } => name.clone(),
+            Expr::Literal(v) => format!("{}", v),
+            other => crate::executor::expr_display_name(other),
+        })
+        .collect();
+    if rendered.is_empty() {
+        return format!("{}(*)", name);
+    }
+    if distinct {
+        format!("{}(DISTINCT {})", name, rendered.join(", "))
+    } else {
+        format!("{}({})", name, rendered.join(", "))
+    }
+}
+
 fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExpr>) {
     match e {
         Expr::Function { name, distinct, args, over, filter } => {
@@ -814,7 +869,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     arg,
                     distinct: *distinct,
                     alias: alias.clone(),
-                    display_name: name.to_string(),
+                    display_name: aggregate_display_name(name, *distinct, args),
                 });
                 return;
             }
@@ -902,7 +957,7 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
                     order_by,
                     frame,
                     alias: alias.clone(),
-                    display_name: name.to_string(),
+                    display_name: aggregate_display_name(name, *distinct, args),
                 });
                 return;
             }
@@ -2183,5 +2238,181 @@ pub fn insert_sort_below_top(plan: Plan, terms: Vec<OrderTerm>) -> Plan {
             }
         }
         other => Plan::Sort { input: Box::new(other), terms },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Column-declared collation attachment (SQLite collation resolution)
+// ---------------------------------------------------------------------------
+
+/// Collect the (table, effective-alias) pairs visible in a FROM scope for
+/// collation resolution. Subqueries / CTEs have no declared collations and
+/// are skipped.
+pub(crate) fn collect_collation_scope(
+    catalog: &Catalog,
+    te: &TableExpression,
+) -> Vec<(std::sync::Arc<crate::schema::Table>, String)> {
+    let mut out = Vec::new();
+    collect_scope_rec(catalog, te, &mut out);
+    out
+}
+
+fn collect_scope_rec(
+    catalog: &Catalog,
+    te: &TableExpression,
+    out: &mut Vec<(std::sync::Arc<crate::schema::Table>, String)>,
+) {
+    match te {
+        TableExpression::Table { name, alias, .. } => {
+            if let Some(t) = catalog.get_table(name) {
+                out.push((t, alias.clone().unwrap_or_else(|| name.clone())));
+            }
+        }
+        TableExpression::Subquery { .. } => {}
+        TableExpression::Join { left, right, .. } => {
+            collect_scope_rec(catalog, left, out);
+            collect_scope_rec(catalog, right, out);
+        }
+    }
+}
+
+/// The declared collation of a column reference, if it resolves in scope
+/// and is not BINARY.
+fn column_declared_collation(
+    catalog: &Catalog,
+    e: &Expr,
+    scope: &[(std::sync::Arc<crate::schema::Table>, String)],
+) -> Option<String> {
+    let (qualifier, name) = match e {
+        Expr::Column { table, name } => (table.as_deref(), name),
+        _ => return None,
+    };
+    for (t, alias) in scope {
+        let qualified_match = match qualifier {
+            Some(q) => q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(&t.name),
+            None => true,
+        };
+        if qualified_match {
+            if let Some(i) = t.find_column(name) {
+                let coll = t.columns[i].collation.clone();
+                if !coll.eq_ignore_ascii_case("BINARY") {
+                    return Some(coll);
+                }
+                return None;
+            }
+        }
+    }
+    let _ = catalog;
+    None
+}
+
+/// Does an expression (or a nested operand) carry an explicit COLLATE?
+fn has_explicit_collate(e: &Expr) -> bool {
+    match e {
+        Expr::Collate { .. } => true,
+        Expr::Unary { expr, .. } => has_explicit_collate(expr),
+        Expr::Binary { left, right, .. } => {
+            has_explicit_collate(left) || has_explicit_collate(right)
+        }
+        _ => false,
+    }
+}
+
+/// SQLite collation attachment: rewrite comparisons so that a column with
+/// a DECLARED collation compares through it. Explicit COLLATE anywhere in
+/// the comparison already wins (left operand first, per SQLite). The
+/// rewrite attaches `Expr::Collate` to the column operand, which every
+/// evaluation path (general evaluator, compiled-predicate fallback, join
+/// conditions) already honors.
+pub(crate) fn rewrite_column_collations(
+    catalog: &Catalog,
+    e: &Expr,
+    scope: &[(std::sync::Arc<crate::schema::Table>, String)],
+) -> Expr {
+    match e {
+        Expr::Binary { op, left, right } => match op {
+            BinaryOp::And => Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(rewrite_column_collations(catalog, left, scope)),
+                right: Box::new(rewrite_column_collations(catalog, right, scope)),
+            },
+            BinaryOp::Or => Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(rewrite_column_collations(catalog, left, scope)),
+                right: Box::new(rewrite_column_collations(catalog, right, scope)),
+            },
+            op if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) => {
+                // Explicit COLLATE on either operand wins — leave as-is.
+                if has_explicit_collate(left) || has_explicit_collate(right) {
+                    return e.clone();
+                }
+                // Left operand's declared collation, else the right's
+                // (SQLite's rule).
+                if let Some(coll) = column_declared_collation(catalog, left, scope) {
+                    return Expr::Binary {
+                        op: *op,
+                        left: Box::new(Expr::Collate {
+                            expr: left.clone(),
+                            collation: coll,
+                        }),
+                        right: right.clone(),
+                    };
+                }
+                if let Some(coll) = column_declared_collation(catalog, right, scope) {
+                    return Expr::Binary {
+                        op: *op,
+                        left: left.clone(),
+                        right: Box::new(Expr::Collate {
+                            expr: right.clone(),
+                            collation: coll,
+                        }),
+                    };
+                }
+                e.clone()
+            }
+            _ => e.clone(),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_column_collations(catalog, expr, scope)),
+        },
+        Expr::Between { expr, low, high, negated } => {
+            if let Some(coll) = column_declared_collation(catalog, expr, scope) {
+                Expr::Between {
+                    expr: Box::new(Expr::Collate {
+                        expr: expr.clone(),
+                        collation: coll,
+                    }),
+                    low: low.clone(),
+                    high: high.clone(),
+                    negated: *negated,
+                }
+            } else {
+                e.clone()
+            }
+        }
+        Expr::In { expr, source, negated } => {
+            if let Some(coll) = column_declared_collation(catalog, expr, scope) {
+                Expr::In {
+                    expr: Box::new(Expr::Collate {
+                        expr: expr.clone(),
+                        collation: coll,
+                    }),
+                    source: source.clone(),
+                    negated: *negated,
+                }
+            } else {
+                e.clone()
+            }
+        }
+        _ => e.clone(),
     }
 }

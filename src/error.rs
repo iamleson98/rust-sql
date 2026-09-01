@@ -26,6 +26,13 @@ pub enum Error {
     Parse { line: usize, col: usize, msg: String },
     /// SQL semantic error (unknown column, type mismatch, ambiguous name).
     Semantic(String),
+    /// Constraint violation with a SQLite-exact message. The Display is
+    /// deliberately prefix-free: SQLite's `sqlite3_errmsg` renders these
+    /// verbatim ("UNIQUE constraint failed: t.c", "NOT NULL constraint
+    /// failed: t.c", "CHECK constraint failed: t", "FOREIGN KEY
+    /// constraint failed") and ORMs (sqlx, sea-orm) pattern-match on the
+    /// exact bytes. Keep the message content byte-identical to SQLite.
+    Constraint(String),
     /// Query planner could not produce a valid plan.
     Planner(String),
     /// Runtime execution error (division by zero, type coercion failure).
@@ -53,6 +60,10 @@ impl Error {
     pub fn semantic(msg: impl Into<String>) -> Self {
         Error::Semantic(msg.into())
     }
+    /// SQLite-exact constraint violation (see [`Error::Constraint`]).
+    pub fn constraint(msg: impl Into<String>) -> Self {
+        Error::Constraint(msg.into())
+    }
     pub fn runtime(msg: impl Into<String>) -> Self {
         Error::Runtime(msg.into())
     }
@@ -69,6 +80,8 @@ impl fmt::Display for Error {
             Error::Lex { line, col, msg } => write!(f, "lex error at {}:{}: {}", line, col, msg),
             Error::Parse { line, col, msg } => write!(f, "parse error at {}:{}: {}", line, col, msg),
             Error::Semantic(m) => write!(f, "semantic error: {}", m),
+            // Prefix-free: byte-identical to SQLite's errmsg.
+            Error::Constraint(m) => write!(f, "{}", m),
             Error::Planner(m) => write!(f, "planner: {}", m),
             Error::Runtime(m) => write!(f, "runtime error: {}", m),
             Error::Unsupported(m) => write!(f, "unsupported: {}", m),

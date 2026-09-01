@@ -23,6 +23,14 @@ pub struct Column {
     pub default: Option<crate::sql::ast::Expr>,
     pub primary_key: bool,
     pub primary_key_order: Order,
+    /// 1-based position within the (possibly compound) PRIMARY KEY clause;
+    /// 0 = not part of the PK. `PRAGMA table_info` reports this as `pk`.
+    pub pk_seq: u8,
+    /// True only for an explicit `NOT NULL` constraint (NOT a PK-implied
+    /// one). `PRAGMA table_info.notnull` and
+    /// `sqlite3_table_column_metadata` report THIS, matching SQLite's
+    /// famous quirk: `id INTEGER PRIMARY KEY` reports notnull=0.
+    pub explicit_not_null: bool,
     pub autoincrement: bool,
     pub unique: bool,
     pub collation: String,
@@ -511,6 +519,7 @@ pub fn build_table(
         let mut default = None;
         let mut collation = "BINARY".to_string();
         let mut generated = None;
+        let mut explicit_not_null = false;
 
         for constraint in &col.constraints {
             match constraint {
@@ -524,7 +533,10 @@ pub fn build_table(
                         rowid_alias = Some(i);
                     }
                 }
-                ColumnConstraint::NotNull => nullable = false,
+                ColumnConstraint::NotNull => {
+                    nullable = false;
+                    explicit_not_null = true;
+                }
                 ColumnConstraint::Null => nullable = true,
                 ColumnConstraint::Unique => unique = true,
                 ColumnConstraint::Check(_) => {}
@@ -545,6 +557,8 @@ pub fn build_table(
             default,
             primary_key,
             primary_key_order,
+            pk_seq: u8::from(primary_key),
+            explicit_not_null,
             autoincrement,
             unique,
             collation,
@@ -554,11 +568,12 @@ pub fn build_table(
 
     // Handle table-level PRIMARY KEY: mark columns as PK.
     if !table_pk.is_empty() {
-        for ic in &table_pk {
+        for (seq, ic) in table_pk.iter().enumerate() {
             if let Some(idx) = table_columns.iter().position(|c| c.name.eq_ignore_ascii_case(&ic.name)) {
                 table_columns[idx].primary_key = true;
                 table_columns[idx].primary_key_order = ic.order;
                 table_columns[idx].nullable = false;
+                table_columns[idx].pk_seq = (seq + 1) as u8;
                 // If single INTEGER PRIMARY KEY at table level, it's also a rowid alias.
                 if table_pk.len() == 1 && table_columns[idx].affinity == Affinity::Integer {
                     rowid_alias = Some(idx);
@@ -671,10 +686,22 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
                 c.name, table.name
             )));
         }
+        // Collation precedence (SQLite): an explicit COLLATE in the index
+        // spec wins; otherwise the index INHERITS the table column's
+        // declared collation — `CREATE INDEX ON t(email)` on a
+        // `email TEXT COLLATE NOCASE` column is a NOCASE index.
+        let inherited = table
+            .find_column(&c.name)
+            .and_then(|i| table.columns.get(i))
+            .map(|col| col.collation.clone())
+            .unwrap_or_else(|| "BINARY".to_string());
         out.push(IndexColumn {
             name: c.name.clone(),
             order: c.order,
-            collation: c.collation.clone().unwrap_or_else(|| "BINARY".to_string()),
+            collation: c
+                .collation
+                .clone()
+                .unwrap_or_else(|| inherited),
         });
     }
     Ok(out)
@@ -690,6 +717,56 @@ pub fn encode_schema_row(kind: &str, name: &str, tbl_name: &str, rootpage: PageI
         Value::Integer(rootpage as i64),
         Value::Text(sql.to_string().into()),
     ]
+}
+
+
+/// The `sqlite_master` (aka `sqlite_schema`) table: a real, queryable view
+/// over the schema B+tree at page 0. Columns match SQLite exactly:
+/// (type, name, tbl_name, rootpage, sql).
+///
+/// This is what ORMs and tooling query for schema discovery:
+/// `SELECT name, sql FROM sqlite_master WHERE type='table'`.
+pub fn sqlite_master_table() -> Table {
+    let cols = ["type", "name", "tbl_name", "rootpage", "sql"];
+    let types = ["TEXT", "TEXT", "TEXT", "INTEGER", "TEXT"];
+    let mut columns = Vec::with_capacity(5);
+    for (c, t) in cols.iter().zip(types.iter()) {
+        columns.push(Column {
+            name: (*c).to_string(),
+            affinity: crate::types::Affinity::from_declared_type(t),
+            declared_type: (*t).to_string(),
+            nullable: true,
+            default: None,
+            primary_key: false,
+            primary_key_order: crate::sql::ast::Order::default(),
+            pk_seq: 0,
+            explicit_not_null: false,
+            autoincrement: false,
+            unique: false,
+            collation: "BINARY".to_string(),
+            generated: None,
+        });
+    }
+    Table {
+        name: "sqlite_master".to_string(),
+        columns,
+        root_page: 0,
+        without_rowid: false,
+        strict: false,
+        rowid_alias: None,
+        create_sql: "CREATE TABLE sqlite_master(type text, name text, tbl_name text, rootpage int, sql text)".to_string(),
+        check_exprs: Vec::new(),
+        foreign_keys: Vec::new(),
+        col_names: std::sync::Arc::from(
+            cols.iter().map(|c| c.to_string()).collect::<Vec<String>>(),
+        ),
+        qualified_col_names: std::sync::Arc::from(
+            cols.iter()
+                .map(|c| format!("sqlite_master.{}", c))
+                .collect::<Vec<String>>(),
+        ),
+        vtab: None,
+    }
 }
 
 /// Decode a schema row.

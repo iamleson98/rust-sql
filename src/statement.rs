@@ -367,11 +367,12 @@ impl<'a> Statement<'a> {
             let _ = self.db.pager.flush();
         }
 
-        // PRAGMA reads: single row.
+        // PRAGMA reads: single row for value pragmas, N rows for
+        // table-valued pragmas (table_info etc.).
         if let AstStatement::Pragma(p) = self.stmt.as_ref() {
-            if let Some(row) = crate::api::read_pragma_public(p, self.db) {
-                self.columns = Some(Arc::from(vec![p.name.to_ascii_lowercase()]));
-                self.stream = StreamState::Materialized(vec![row].into_iter());
+            if let Some(pr) = crate::api::read_pragma_public(p, self.db) {
+                self.columns = Some(Arc::from(pr.columns));
+                self.stream = StreamState::Materialized(pr.rows.into_iter());
                 return Ok(());
             }
             self.stream = StreamState::Exhausted;
@@ -487,7 +488,13 @@ impl<'a> Statement<'a> {
         }
         let _plugin_guard = db.plugin_scope();
         let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
-        let out = f(&mut ctx)?;
+        let out = f(&mut ctx);
+        // sqlite3_last_insert_rowid / sqlite3_changes bookkeeping: DML
+        // through the streaming-statement path must update the Database
+        // and the change counters the same way Database::execute does.
+        db.set_last_insert_rowid(ctx.last_insert_rowid);
+        crate::executor::change_counters::record(ctx.changes);
+        let out = out?;
         // Capture deltas (query()'s DML merge-back semantics).
         self.deltas = CtxDeltas {
             max_rowids: ctx.max_rowids.clone(),

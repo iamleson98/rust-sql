@@ -346,7 +346,36 @@ impl Parser {
             Ok(ColumnConstraint::Check(e))
         } else if t.is_keyword("DEFAULT") {
             self.advance();
-            let e = self.parse_primary_expr()?;
+            // Signed literals are legal defaults: `DEFAULT -3`,
+            // `DEFAULT +1.5` (a leading sign is not a unary expression
+            // here — parse_primary_expr rejects it).
+            let e = if self.peek().is_op("-") || self.peek().is_op("+") {
+                let neg = self.peek().is_op("-");
+                self.advance();
+                let (line, col, tok) = {
+                    let p = self.peek();
+                    (p.line, p.col, p.token.clone())
+                };
+                match tok {
+                    Token::Integer(n) => {
+                        self.advance();
+                        Expr::Literal(Value::Integer(if neg { -n } else { n }))
+                    }
+                    Token::Float(f) => {
+                        self.advance();
+                        Expr::Literal(Value::Real(if neg { -f } else { f }))
+                    }
+                    _ => {
+                        return Err(Error::parse(
+                            line,
+                            col,
+                            "expected numeric literal after sign in DEFAULT",
+                        ))
+                    }
+                }
+            } else {
+                self.parse_primary_expr()?
+            };
             Ok(ColumnConstraint::Default(e))
         } else if t.is_keyword("COLLATE") {
             self.advance();
@@ -1113,6 +1142,36 @@ impl Parser {
                     let txt = keyword_text(&t.token).unwrap();
                     self.advance();
                     Expr::Literal(Value::Text(txt.into()))
+                }
+                // Signed numeric values (`PRAGMA cache_size = -2000`): a
+                // leading `-`/`+` before a numeric literal is common in
+                // connection strings (sqlx sends cache_size = -2000).
+                t if t.is_op("-") || t.is_op("+") => {
+                    let neg = t.is_op("-");
+                    self.advance();
+                    // Clone the token info out of the borrow before
+                    // mutating the parser.
+                    let (line, col, tok) = {
+                        let p = self.peek();
+                        (p.line, p.col, p.token.clone())
+                    };
+                    match tok {
+                        Token::Integer(n) => {
+                            self.advance();
+                            Expr::Literal(Value::Integer(if neg { -n } else { n }))
+                        }
+                        Token::Float(f) => {
+                            self.advance();
+                            Expr::Literal(Value::Real(if neg { -f } else { f }))
+                        }
+                        _ => {
+                            return Err(Error::parse(
+                                line,
+                                col,
+                                "expected numeric pragma value after sign",
+                            ))
+                        }
+                    }
                 }
                 _ => self.parse_primary_expr()?,
             };

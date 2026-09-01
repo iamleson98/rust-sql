@@ -390,9 +390,12 @@ fn find_index_child(
     let mut lo: u16 = 0;
     let mut hi: u16 = n;
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        // usize arithmetic: a corrupt n_cells can push lo+hi past u16::MAX.
+        let mid = ((lo as usize + hi as usize) / 2) as u16;
         let ptr = cell_pointer(mid) as usize;
-        let Some(v) = decode_index_cell(&data[ptr..], true) else { break };
+        // Corrupt cell pointer: out-of-range offsets must yield a miss,
+        // never a slice panic (SQLite policy: corrupt -> SQLITE_CORRUPT).
+        let Some(v) = data.get(ptr..).and_then(|c| decode_index_cell(c, true)) else { break };
         // (v.key, v.rowid) < (key, rowid)  → go right
         let ord = v.key.cmp(key).then(v.rowid.cmp(&rowid));
         if ord == std::cmp::Ordering::Less {
@@ -405,7 +408,7 @@ fn find_index_child(
         (n as usize, right_most)
     } else {
         let ptr = cell_pointer(lo) as usize;
-        match decode_index_cell(&data[ptr..], true) {
+        match data.get(ptr..).and_then(|c| decode_index_cell(c, true)) {
             Some(v) => (lo as usize, v.left_child),
             None => (n as usize, right_most),
         }
@@ -3619,7 +3622,10 @@ impl<'a> Btree<'a> {
                         .ok_or_else(|| Error::corruption("truncated leaf payload len in scan_borrowed"))?;
                     let payload_start = n1 + n2;
                     let plen = plen as usize;
-                    if payload_start + plen > buf.len() {
+                    // Corrupt files can carry huge payload-length varints:
+                    // checked add, not `payload_start + plen` (which
+                    // overflows usize and panics in debug builds).
+                    if plen.checked_add(payload_start).map_or(true, |end| end > buf.len()) {
                         return Err(Error::corruption("truncated leaf payload in scan_borrowed"));
                     }
                     let payload = &buf[payload_start..payload_start + plen];

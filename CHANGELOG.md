@@ -1,6 +1,72 @@
 # Changelog
 
-## [Unreleased] — Plugin system, SQLite-style C API, streaming statements
+## [Unreleased] — sqlx/sea-orm drop-in compatibility, full UPDATE constraint semantics
+
+### Added
+
+- **`compat/` — drop-in SQLite C ABI replacement** (see `compat/README.md`):
+  - `rustqlite-compat`: 124 real `sqlite3_*` symbols on the engine
+    (open_v2 with URI flags, prepare_v2/v3 with pzTail, full step state
+    machine, binds, column/value objects, changes bookkeeping,
+    busy_timeout with cross-connection tx serialization, hooks,
+    create_function_v2/collations, load_extension). Builds
+    `libsqlite3.so`/`.a`.
+  - `libsqlite3-sys`: drop-in crates.io `libsqlite3-sys` 0.30.x
+    replacement (vendored bindings + link/rpath build script), consumed
+    from external workspaces via `[patch.crates-io]`.
+  - 30 raw-ABI conformance tests (`compat/rustqlite-compat/tests/compat_abi.rs`).
+  - `docs/SQLX_COMPAT.md`: end-to-end guide — **unmodified sqlx 0.9 and
+    sea-orm 2.0 run on the rustqlite engine** (verified externally:
+    pool, DDL, binds, last_insert_rowid, query_as, transactions,
+    UniqueViolation/NotNullViolation mapping on SQLite-exact messages,
+    raw_sql multi-statement, 8-connection pools, full sea-orm CRUD +
+    error propagation).
+
+- **`Error::Constraint`** — SQLite-exact, prefix-free constraint messages
+  (`UNIQUE constraint failed: t.c`, `NOT NULL constraint failed: t.c`,
+  `CHECK constraint failed: t`, `FOREIGN KEY constraint failed`,
+  `datatype mismatch`); FK runtime messages now match SQLite byte-for-byte.
+
+- **Full UPDATE constraint semantics** (all three execution paths —
+  general, streaming, `UPDATE ...FROM`):
+  - **UNIQUE-index enforcement with SQLite's sequential semantics**: a
+    write-set simulation walks rows in scan order, subtracting vacated
+    keys and adding claimed keys, so `UPDATE t SET v = v - 1` on
+    1,2,3 succeeds while swaps conflict — exactly like SQLite. Statement
+    aborts atomically (checks run before any B+tree modification).
+    Collation-aware: NOCASE/RTRIM fold into probe keys.
+  - **`UPDATE OR IGNORE` / `OR REPLACE`** plumbed end-to-end (planner →
+    executor): IGNORE skips conflicting rows (changes() counts only
+    applied rows; RETURNING output filtered), REPLACE deletes the
+    conflicting holder row (table + all index entries) first.
+  - **Rowid-alias moves**: `UPDATE t SET id = X` now moves the row (cell
+    key change, delete + reinsert with every index entry re-keyed) and
+    enforces rowid uniqueness (`UNIQUE constraint failed: t.id`); NULL
+    on the alias reports `datatype mismatch` / SQLITE_MISMATCH.
+  - **FK child-side checks + NULL-alias checks** added to the general and
+    `UPDATE ...FROM` paths (previously streaming-only).
+  - Index maintenance errors are now propagated (previously discarded).
+
+### Fixed
+
+- Corrupt-page robustness: out-of-range cell pointers in index-interior
+  binary search now yield SQLITE_CORRUPT-style misses instead of a slice
+  panic (found by `db_corrupt_fuzz`).
+- Compat layer: `sqlite3_changes` no longer clobbered to 0 by the final
+  `SQLITE_DONE` step of a RETURNING statement (per-run reporting flag).
+
+### Tests
+
+- `tests/pragma_introspect.rs` — 25 differential tests vs real SQLite for
+  `PRAGMA table_info`/`table_xinfo`/`index_list`/`index_xinfo`/
+  `foreign_key_list`, `journal_mode` result rows (type-tagged value
+  equality, NULLs included).
+- `tests/update_from_collate.rs` — 46 differential tests: UPDATE...FROM
+  (SQLite 3.33+ semantics), NOCASE/RTRIM collations, unique violations,
+  OR IGNORE / OR REPLACE, rowid moves, composite keys, ratchets, atomic
+  aborts, error message shapes.
+
+## [Plugins] — Plugin system, SQLite-style C API, streaming statements
 
 ### Added
 

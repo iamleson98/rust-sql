@@ -180,6 +180,14 @@ pub enum Plan {
         source: Box<Plan>,
         assignments: Vec<(usize, Expr)>,
         returning: Option<Vec<crate::sql::ast::ResultColumn>>,
+        /// `UPDATE [OR IGNORE|REPLACE|ABORT|FAIL|ROLLBACK]` — the
+        /// conflict algorithm applied when the write set violates a
+        /// UNIQUE index. Default ABORT.
+        or_conflict: crate::sql::ast::ConflictResolution,
+        /// `UPDATE ... FROM <table-expression>` (SQLite 3.33+): the
+        /// FROM-side plan plus the WHERE clause evaluated over
+        /// target++from combined rows. `None` for plain UPDATEs.
+        from: Option<Box<UpdateFrom>>,
     },
     Delete {
         table: Arc<Table>,
@@ -203,6 +211,19 @@ pub enum JoinAlgorithm {
 pub struct ProjectExpr {
     pub expr: Expr,
     pub alias: Option<String>,
+}
+
+/// The FROM side of `UPDATE ... FROM` (SQLite 3.33+).
+#[derive(Clone, Debug)]
+pub struct UpdateFrom {
+    /// The FROM-side plan (a table, subquery, or join — whatever
+    /// `plan_table_expression` produced). Its output columns are
+    /// qualified ("alias.col" / "table.col").
+    pub plan: Plan,
+    /// The statement's WHERE clause, evaluated over target++from combined
+    /// rows (it usually carries the join condition). `None` means every
+    /// target row matches every FROM row once (cross product, last wins).
+    pub where_clause: Option<Expr>,
 }
 
 /// An aggregate expression.

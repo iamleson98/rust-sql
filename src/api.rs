@@ -25,7 +25,7 @@ use crate::types::{Row, Value};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 /// The maximum number of pages cached in memory.
@@ -212,6 +212,11 @@ pub struct Database {
     /// Default: 1000 dirty pages (~4 MB at 4 KiB page size).
     /// Immutable after open.
     deferred_flush_threshold: usize,
+    /// Last rowid inserted on this connection (`sqlite3_last_insert_rowid`).
+    /// Written by every DML completion site from `ExecContext::last_insert_rowid`;
+    /// read by the C ABI layer (`sqlite3_last_insert_rowid`) so ORMs like
+    /// sea-orm / sqlx get real ids after INSERTs.
+    last_rowid: AtomicI64,
 }
 
 /// Default capacity of the statement cache.
@@ -1397,6 +1402,7 @@ impl Database {
             seen_hashes_cap: 4096,
             deferred_flush: AtomicBool::new(false),
             deferred_flush_threshold: 1000,
+            last_rowid: AtomicI64::new(0),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1608,6 +1614,7 @@ impl Database {
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+        self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         if let Ok(n) = result {
             crate::executor::change_counters::record(n);
@@ -1919,6 +1926,7 @@ impl Database {
         let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new());
                 self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+                self.set_last_insert_rowid(ctx.last_insert_rowid);
                 *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
                 if ctx.max_rowids_changed {
                     Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
@@ -2019,6 +2027,7 @@ impl Database {
         };
         profile::span(t_exec, &profile::EXEC_NS);
         self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+        self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         crate::executor::change_counters::record(ctx.changes);
         // Merge local overlay entries into the DETACHED maps (in place —
@@ -2097,10 +2106,11 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
-        // Read-form PRAGMAs surface their value as a result row.
+        // Read-form PRAGMAs surface their value as result rows (one for
+        // single-value pragmas, N for table-valued ones like table_info).
         if let Statement::Pragma(p) = cached.stmt.as_ref() {
-            if let Some(row) = read_pragma(p, self) {
-                return Ok(vec![row]);
+            if let Some(pr) = read_pragma(p, self) {
+                return Ok(pr.rows);
             }
         }
         // EXPLAIN [QUERY PLAN]: plan the inner statement and render rows;
@@ -2278,8 +2288,8 @@ impl Database {
         }
         let cached = self.get_or_cache_stmt(sql)?;
         if let Statement::Pragma(p) = cached.stmt.as_ref() {
-            if let Some(row) = read_pragma(p, self) {
-                return Ok((vec![p.name.clone()], vec![row]));
+            if let Some(pr) = read_pragma(p, self) {
+                return Ok((pr.columns, pr.rows));
             }
         }
         if let Statement::Explain(inner) = cached.stmt.as_ref() {
@@ -2395,11 +2405,29 @@ impl Database {
         }
     }
 
-    /// Get the last inserted rowid.
+    /// Get the last inserted rowid (`sqlite3_last_insert_rowid`).
     pub fn last_insert_rowid(&self) -> i64 {
-        // The ExecContext owns this; we'd need to expose it. For now, return 0.
-        // A real impl would track this on `Database`.
-        0
+        self.last_rowid.load(Ordering::Acquire)
+    }
+
+    /// Set the last inserted rowid (internal: called by the statement
+    /// layer's ExecContext write-back).
+    pub(crate) fn set_last_insert_rowid(&self, rowid: i64) {
+        if rowid != 0 {
+            self.last_rowid.store(rowid, Ordering::Release);
+        }
+    }
+
+    /// `sqlite3_table_column_metadata`: (declared type, NOT NULL, PRIMARY
+    /// KEY) for a table column, or None when table/column is unknown.
+    /// Used by the C ABI layer (sqlx describe / column_nullable).
+    pub fn table_column_metadata(&self, table: &str, column: &str) -> Option<(String, bool, bool)> {
+        let t = self.catalog.get_table(table)?;
+        let idx = t.find_column(column)?;
+        let col = &t.columns[idx];
+        let pk = col.primary_key;
+        let not_null = !col.nullable || pk;
+        Some((col.declared_type.clone(), not_null, pk))
     }
 
     /// Number of pages in the database file.
@@ -3304,11 +3332,24 @@ impl Database {
             index: None,
             predicate: None,
         };
+        // `UPDATE ... FROM` (SQLite 3.33+): the target table is joined
+        // with the FROM side; the WHERE clause references BOTH sides, so
+        // it is evaluated over combined rows by the executor instead of
+        // being pushed into the target scan.
+        let from = upd.from.as_ref().map(|te| {
+            let mut planner = crate::planner::Planner::new(catalog);
+            let plan = planner.plan_table_expression_pub(te)?;
+            Ok::<_, Error>(Box::new(crate::planner::plan::UpdateFrom {
+                plan,
+                where_clause: upd.where_clause.clone(),
+            }))
+        }).transpose()?;
         // Use apply_where_for_scan so that `UPDATE t SET ... WHERE id = ?`
         // picks RowidLookup instead of a full table scan. Previously this
         // built a Filter{Scan, predicate} which forced an O(n) scan per
         // UPDATE — a ~743x regression on the UPDATE-by-PK benchmark.
-        let source = if let Some(pred) = &upd.where_clause {
+        // (Skipped for UPDATE...FROM: the WHERE spans both sides.)
+        let source = if let (Some(pred), None) = (&upd.where_clause, &from) {
             crate::planner::apply_where_for_scan(catalog, scan, pred)
         } else {
             scan
@@ -3322,6 +3363,8 @@ impl Database {
             source: Box::new(source),
             assignments,
             returning: upd.returning.clone(),
+            or_conflict: upd.or.unwrap_or(ConflictResolution::Abort),
+            from,
         })
     }
 
@@ -3467,10 +3510,21 @@ impl Database {
                 let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
                 for col in &columns {
                     if col.constraints.iter().any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique)) {
+                        // Inherit the column's declared COLLATE (SQLite:
+                        // the implicit auto-index uses the column's
+                        // collation, so `email TEXT UNIQUE COLLATE NOCASE`
+                        // enforces case-insensitive uniqueness).
+                        let collate = col.constraints.iter().find_map(|c| {
+                            if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        });
                         implicit.push(vec![crate::sql::ast::IndexedColumn {
                             name: col.name.clone(),
                             order: crate::sql::ast::Order::Asc,
-                            collation: None,
+                            collation: collate,
                         }]);
                     }
                 }
@@ -3497,9 +3551,18 @@ impl Database {
                 }
                 for (n, cols) in implicit.iter().enumerate() {
                     let idx_name = format!("sqlite_autoindex_{}_{}", name.name, n + 1);
+                    // Synthesized SQL: emit each column's COLLATE so the
+                    // implicit index round-trips with its collation on
+                    // reopen (the catalog IndexColumn carries it too).
                     let col_list = cols
                         .iter()
-                        .map(|ic| format!("\"{}\"", ic.name))
+                        .map(|ic| {
+                            let coll = match &ic.collation {
+                                Some(c) => format!(" COLLATE \"{}\"", c),
+                                None => String::new(),
+                            };
+                            format!("\"{}\"{}", ic.name, coll)
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     let idx_sql = format!(
@@ -3617,7 +3680,7 @@ impl Database {
                         if is_unique && !has_null_key {
                             match index_bt.lookup_index(&key) {
                                 Ok(existing) if !existing.is_empty() => {
-                                    backfill_err = Some(Error::semantic(format!(
+                                    backfill_err = Some(Error::constraint(format!(
                                         "UNIQUE constraint failed: {}.{}",
                                         table_name,
                                         index.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -3768,6 +3831,16 @@ impl Database {
     fn execute_drop(d: DropStatement, ctx: &mut ExecContext, catalog: &mut Catalog) -> Result<()> {
         match d.kind {
             DropKind::Table => {
+                // SQLite: the schema tables are not droppable.
+                if d.name.eq_ignore_ascii_case("sqlite_master")
+                    || d.name.eq_ignore_ascii_case("sqlite_schema")
+                    || d.name.eq_ignore_ascii_case("sqlite_temp_master")
+                {
+                    return Err(Error::semantic(format!(
+                        "table {} may not be dropped",
+                        d.name
+                    )));
+                }
                 // Capture indexes BEFORE the catalog drop removes them.
                 let indexes_on_it = catalog.indexes_on_table(&d.name);
                 let table = catalog.drop_table(&d.name).ok_or_else(|| Error::NotFound(format!("table: {}", d.name)))?;
@@ -4466,18 +4539,328 @@ impl Database {
 
 
 
-/// Evaluate a read-form PRAGMA (`PRAGMA name` with no `= value`) into a
-/// result row. Returns None for unknown names (the caller then treats the
-/// statement as a no-op, matching the previous behavior).
 /// `read_pragma` exposed for the statement layer (pub(crate)).
-pub(crate) fn read_pragma_public(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
+pub(crate) fn read_pragma_public(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     read_pragma(p, db)
 }
 
-fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
+/// A PRAGMA result set. SQLite pragmas return zero, one, or MANY rows with
+/// a fixed column layout: `PRAGMA table_info(t)` is 6 columns × N rows,
+/// `PRAGMA foreign_key_list(t)` is 7 columns × (N × ncols) rows. The
+/// single-value pragmas (`PRAGMA page_size`) are one row named after the
+/// pragma itself.
+pub(crate) struct PragmaRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+impl PragmaRows {
+    fn single(name: &str, v: Value) -> Self {
+        PragmaRows { columns: vec![name.to_string()], rows: vec![vec![v]] }
+    }
+}
+
+/// Extract the argument of an argumented pragma (`PRAGMA table_info(t)`,
+/// `PRAGMA index_list('t')`) — a bare identifier or string literal.
+fn pragma_arg(v: Option<&crate::sql::ast::PragmaValue>) -> Option<String> {
+    let e = value_as_expr(v?);
+    match e {
+        crate::sql::ast::Expr::Column { name, .. } => Some(name.clone()),
+        crate::sql::ast::Expr::Literal(Value::Text(t)) => Some(t.to_string()),
+        _ => None,
+    }
+}
+
+/// `PRAGMA table_info(t)` / `PRAGMA table_xinfo(t)` result rows.
+/// Column layout matches SQLite exactly:
+/// (cid, name, type, notnull, dflt_value, pk[, hidden]).
+/// `table_info` EXCLUDES generated (hidden) columns; `table_xinfo`
+/// includes them with hidden=2 (VIRTUAL) / 3 (STORED).
+fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
+    let mut columns = vec![
+        "cid".to_string(),
+        "name".to_string(),
+        "type".to_string(),
+        "notnull".to_string(),
+        "dflt_value".to_string(),
+        "pk".to_string(),
+    ];
+    if xinfo {
+        columns.push("hidden".to_string());
+    }
+    let mut rows = Vec::with_capacity(t.columns.len());
+    for (cid, c) in t.columns.iter().enumerate() {
+        // table_info skips generated columns (SQLite behavior); xinfo
+        // includes them.
+        if c.generated.is_some() && !xinfo {
+            continue;
+        }
+        let mut row = vec![
+            Value::Integer(cid as i64),
+            Value::Text(c.name.clone().into()),
+            Value::Text(c.declared_type.clone().into()),
+            // SQLite quirk: plain `INTEGER PRIMARY KEY` reports notnull=0
+            // (the NULL is replaced by an auto rowid at INSERT time).
+            Value::Integer(i64::from(c.explicit_not_null)),
+            c.default.as_ref().map(|e| Value::Text(default_value_text(e).into())).unwrap_or(Value::Null),
+            Value::Integer(c.pk_seq as i64),
+        ];
+        if xinfo {
+            // hidden (SQLite): 0 = normal, 2 = VIRTUAL generated,
+            // 3 = STORED generated.
+            let hidden = match &c.generated {
+                Some((_, true)) => 3,
+                Some((_, false)) => 2,
+                None => 0,
+            };
+            row.push(Value::Integer(hidden));
+        }
+        rows.push(row);
+    }
+    PragmaRows { columns, rows }
+}
+
+/// Render a DEFAULT expression as SQL text (SQLite's `dflt_value` column).
+/// CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME render as bare
+/// keywords (SQLite parses them as keywords, not function calls).
+fn default_value_text(e: &Expr) -> String {
+    if let Expr::Function { name, args, .. } = e {
+        if args.is_empty() {
+            let up = name.to_ascii_uppercase();
+            if matches!(up.as_str(), "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME") {
+                return up;
+            }
+        }
+    }
+    expr_to_sql(e)
+}
+
+/// `PRAGMA index_list(t)` — (seq, name, unique, origin, partial).
+/// `origin`: 'c' = CREATE INDEX, 'u' = UNIQUE-constraint auto-index,
+/// 'pk' = PRIMARY KEY auto-index (compound / non-integer / WITHOUT
+/// ROWID). SQLite lists indexes in REVERSE creation order — root-page
+/// allocation order is the creation proxy, so sort descending.
+fn pragma_index_list(t: &Arc<crate::schema::Table>, catalog: &crate::schema::Catalog) -> PragmaRows {
+    let mut idxs = catalog.indexes_on_table(&t.name);
+    idxs.sort_by(|a, b| b.root_page.cmp(&a.root_page));
+    let rows = idxs
+        .iter()
+        .enumerate()
+        .map(|(seq, idx)| {
+            let origin = if idx.name.starts_with("sqlite_autoindex_") {
+                // The PK auto-index's column set equals the table's PK
+                // (non-rowid-alias) column set; WITHOUT ROWID tables' PK
+                // auto-index is always 'pk'.
+                let pk_cols: Vec<&str> = t
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, c)| c.primary_key && (t.without_rowid || t.rowid_alias != Some(*i)))
+                    .map(|(_, c)| c.name.as_str())
+                    .collect();
+                let idx_cols: Vec<&str> =
+                    idx.columns.iter().map(|c| c.name.as_str()).collect();
+                let same_set = pk_cols.len() == idx_cols.len()
+                    && pk_cols
+                        .iter()
+                        .all(|p| idx_cols.iter().any(|c| c.eq_ignore_ascii_case(p)));
+                if same_set {
+                    "pk"
+                } else {
+                    "u"
+                }
+            } else {
+                "c"
+            };
+            vec![
+                Value::Integer(seq as i64),
+                Value::Text(idx.name.clone().into()),
+                Value::Integer(i64::from(idx.unique)),
+                Value::Text(origin.into()),
+                Value::Integer(i64::from(idx.partial_expr.is_some())),
+            ]
+        })
+        .collect();
+    PragmaRows {
+        columns: vec![
+            "seq".into(),
+            "name".into(),
+            "unique".into(),
+            "origin".into(),
+            "partial".into(),
+        ],
+        rows,
+    }
+}
+
+/// `PRAGMA index_info(idx)` / `index_xinfo(idx)` —
+/// (seqno, cid, name[, desc, coll, key]). `index_xinfo` additionally
+/// appends the auxiliary rowid column (cid=-1, name NULL, key=0).
+fn pragma_index_info(idx: &Arc<crate::schema::Index>, t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
+    let mut columns = vec!["seqno".to_string(), "cid".to_string(), "name".to_string()];
+    if xinfo {
+        columns.push("desc".to_string());
+        columns.push("coll".to_string());
+        columns.push("key".to_string());
+    }
+    let mut rows = Vec::with_capacity(idx.columns.len());
+    for (seqno, ic) in idx.columns.iter().enumerate() {
+        let cid = t.find_column(&ic.name).map(|i| i as i64).unwrap_or(-1);
+        let mut row = vec![
+            Value::Integer(seqno as i64),
+            Value::Integer(cid),
+            Value::Text(ic.name.clone().into()),
+        ];
+        if xinfo {
+            row.push(Value::Integer(i64::from(ic.order == crate::sql::ast::Order::Desc)));
+            row.push(Value::Text(ic.collation.clone().into()));
+            row.push(Value::Integer(1)); // every indexed column is a key column
+        }
+        rows.push(row);
+    }
+    if xinfo {
+        // The trailing auxiliary rowid entry (SQLite appends it to every
+        // index_xinfo).
+        rows.push(vec![
+            Value::Integer(idx.columns.len() as i64),
+            Value::Integer(-1),
+            Value::Null,
+            Value::Integer(0),
+            Value::Text("BINARY".into()),
+            Value::Integer(0),
+        ]);
+    }
+    PragmaRows { columns, rows }
+}
+
+/// `PRAGMA foreign_key_list(t)` —
+/// (id, seq, table, from, to, on_update, on_delete, match).
+/// Action names match SQLite's spelling: NO ACTION, RESTRICT, SET NULL,
+/// SET DEFAULT, CASCADE. `match` is always "NONE" for us (SQLite's
+/// only non-default MATCH is deferrable-schema, which we don't support).
+fn pragma_foreign_key_list(
+    t: &Arc<crate::schema::Table>,
+    catalog: &crate::schema::Catalog,
+) -> PragmaRows {
+    fn action_name(a: crate::sql::ast::ForeignKeyAction) -> Value {
+        use crate::sql::ast::ForeignKeyAction as A;
+        Value::Text(
+            match a {
+                A::NoAction => "NO ACTION",
+                A::Restrict => "RESTRICT",
+                A::SetNull => "SET NULL",
+                A::SetDefault => "SET DEFAULT",
+                A::Cascade => "CASCADE",
+            }
+            .into(),
+        )
+    }
+    let mut rows = Vec::new();
+    // SQLite lists FK clauses in reverse declaration order (id = 0 is the
+    // LAST-declared constraint).
+    for (id, fk) in t.foreign_keys.iter().rev().enumerate() {
+        let _ = catalog; // parent lookup only needed for explicit ref_columns
+        for (seq, &col_idx) in fk.columns.iter().enumerate() {
+            let from = t.columns.get(col_idx).map(|c| c.name.as_str()).unwrap_or("");
+            let to = fk
+                .ref_columns
+                .get(seq)
+                .cloned()
+                .map(|c| Value::Text(c.into()))
+                // Implicit form: REFERENCES parent (no columns) — SQLite
+                // reports `to` as NULL.
+                .unwrap_or(Value::Null);
+            rows.push(vec![
+                Value::Integer(id as i64),
+                Value::Integer(seq as i64),
+                Value::Text(fk.ref_table.clone().into()),
+                Value::Text(from.to_string().into()),
+                to,
+                action_name(fk.on_update),
+                action_name(fk.on_delete),
+                Value::Text("NONE".into()),
+            ]);
+        }
+    }
+    PragmaRows {
+        columns: vec![
+            "id".into(),
+            "seq".into(),
+            "table".into(),
+            "from".into(),
+            "to".into(),
+            "on_update".into(),
+            "on_delete".into(),
+            "match".into(),
+        ],
+        rows,
+    }
+}
+
+fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let name = p.name.to_ascii_lowercase();
+    // `PRAGMA journal_mode = WAL` / `journal_mode(WAL)`: the write form
+    // RETURNS the resulting mode as a row (SQLite behavior — rusqlite and
+    // ORMs read it back). The mode word parses as a bare identifier
+    // (Column) or string literal.
+    if p.value.is_some() && name == "journal_mode" {
+        let mode = p.value.as_ref().and_then(|v| {
+            match value_as_expr(v) {
+                crate::sql::ast::Expr::Column { name, .. } => {
+                    Some(name.to_ascii_lowercase())
+                }
+                crate::sql::ast::Expr::Literal(Value::Text(t)) => {
+                    Some(t.to_ascii_lowercase())
+                }
+                crate::sql::ast::Expr::Literal(Value::Integer(i)) => {
+                    Some(if *i == 0 { "delete".to_string() } else { "wal".to_string() })
+                }
+                _ => None,
+            }
+        });
+        if let Some(mode) = mode {
+            apply_journal_mode(db, &mode).ok()?;
+            let pager = &db.pager;
+            return Some(PragmaRows::single(
+                "journal_mode",
+                Value::Text(
+                    if pager.wal_enabled() { "wal" } else { "delete" }.into(),
+                ),
+            ));
+        }
+        return None;
+    }
+    // Table-valued introspection pragmas: the argument arrives as the
+    // call form (`PRAGMA table_info(t)`) or a string literal.
+    let catalog = &db.catalog;
+    match name.as_str() {
+        "table_info" | "table_xinfo" => {
+            let arg = pragma_arg(p.value.as_ref())?;
+            let t = catalog.get_table(&arg)?;
+            return Some(pragma_table_info(&t, name == "table_xinfo"));
+        }
+        "index_list" => {
+            let arg = pragma_arg(p.value.as_ref())?;
+            let t = catalog.get_table(&arg)?;
+            return Some(pragma_index_list(&t, catalog));
+        }
+        "index_info" | "index_xinfo" => {
+            let arg = pragma_arg(p.value.as_ref())?;
+            let idx = catalog.get_index(&arg)?;
+            let t = catalog.get_table(&idx.table)?;
+            return Some(pragma_index_info(&idx, &t, name == "index_xinfo"));
+        }
+        "foreign_key_list" => {
+            let arg = pragma_arg(p.value.as_ref())?;
+            let t = catalog.get_table(&arg)?;
+            return Some(pragma_foreign_key_list(&t, catalog));
+        }
+        _ => {}
+    }
+    // Every other pragma WITH a value is a plain write form: no result
+    // rows (the write itself runs through the execute path).
     if p.value.is_some() {
-        return None; // write form
+        return None;
     }
     // integrity_check / quick_check: full structural walk of every b-tree
     // (see src/storage/integrity.rs). Runs against the flushed on-disk
@@ -4494,14 +4877,17 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
             let index_roots = maps.index_roots.clone();
             (roots, index_roots)
         };
-        let rows = crate::storage::integrity::integrity_check(
+        // integrity_check returns one value per problem line ("ok" when
+        // clean); SQLite surfaces each as its own single-column row.
+        let problems = crate::storage::integrity::integrity_check(
             &db.catalog,
             &db.pager,
             &roots,
             &index_roots,
             name == "quick_check",
         );
-        return Some(rows);
+        let rows: Vec<Vec<Value>> = problems.iter().cloned().map(|v| vec![v]).collect();
+        return Some(PragmaRows { columns: vec!["integrity_check".into()], rows });
     }
     let pager = &db.pager;
     let v = match name.as_str() {
@@ -4527,7 +4913,17 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<Vec<Value>> {
         "encoding" => Value::Text("UTF-8".into()),
         _ => return None,
     };
-    Some(vec![v])
+    Some(PragmaRows::single(&name, v))
+}
+
+/// Apply a `PRAGMA journal_mode = X` mode switch from the read/query path
+/// (the pager methods take `&self` — interior mutability).
+fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
+    match mode {
+        "wal" => db.pager.enable_wal(),
+        "delete" | "truncate" | "persist" | "memory" | "off" => db.pager.disable_wal(),
+        _ => Ok(()),
+    }
 }
 
 /// Extract the expression from a PRAGMA value (plain expr or parenthesized
@@ -4809,6 +5205,9 @@ fn delete_schema_row(pager: &Pager, kind: &str, name: &str) -> Result<()> {
 
 /// Load the schema from the schema table (page 0) into the catalog.
 fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
+    // sqlite_master / sqlite_schema: a queryable view over this very
+    // B+tree (page 0). Registered FIRST so nothing shadows it.
+    catalog.add_table(crate::schema::sqlite_master_table());
     let mut bt = Btree::new(pager, 0, false);
     let mut entries = Vec::new();
     bt.scan_table(|_rowid, payload| {

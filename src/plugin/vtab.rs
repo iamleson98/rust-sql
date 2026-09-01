@@ -411,6 +411,8 @@ pub(crate) fn vtab_columns_to_schema(
             default: None,
             primary_key: false,
             primary_key_order: crate::sql::ast::Order::Asc,
+            pk_seq: 0,
+            explicit_not_null: false,
             autoincrement: false,
             unique: false,
             collation: "BINARY".to_string(),

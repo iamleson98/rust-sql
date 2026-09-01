@@ -29,6 +29,7 @@ pub mod abi;
 pub mod codec;
 pub mod vtab;
 
+pub use abi::{CAggregate, CCollation, CScalar};
 pub use codec::PageCodec;
 pub use vtab::{
     IndexInfo, VtabConstraint, VtabUpdateArg, VirtualTable, VirtualTableCursor, VirtualTableModule,
@@ -188,6 +189,81 @@ pub fn compare_collated(a: &Value, b: &Value, coll: &dyn Collation) -> Ordering 
     match (a, b) {
         (Value::Text(x), Value::Text(y)) => coll.compare(x.as_str(), y.as_str()),
         _ => a.cmp(b),
+    }
+}
+
+/// Fold a value through a collation into its BYTE-ORDER INDEX-KEY form.
+///
+/// The engine's B+trees compare encoded keys bytewise with no comparator
+/// hook, so a collated index (e.g. `CREATE INDEX i ON t(v COLLATE NOCASE)`)
+/// must bake the collation into the key itself: NOCASE lowercases ASCII,
+/// RTRIM strips trailing spaces. Both folds are order-preserving for
+/// ASCII text, so range scans stay correct. Custom plugin collations have
+/// no byte-preserving fold — they fall back to BINARY keys (documented
+/// limitation; comparisons in WHERE still honor them).
+///
+/// Every index-key encode site (maintenance, point lookup, IN-list,
+/// range bounds, INLJ probes) MUST pass values through this so probe keys
+/// and stored keys agree.
+///
+/// Borrowing variant used on hot paths (no clone for BINARY keys).
+#[inline]
+pub fn collation_fold_key_ref<'a>(collation: &str, v: &'a Value) -> std::borrow::Cow<'a, Value> {
+    if collation.eq_ignore_ascii_case("BINARY") || !matches!(v, Value::Text(_)) {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    if collation.eq_ignore_ascii_case("NOCASE") {
+        if let Value::Text(t) = v {
+            // ASCII-only fold (SQLite's NOCASE is ASCII-only).
+            let folded: String = t.as_str().chars().map(|c| c.to_ascii_lowercase()).collect();
+            return std::borrow::Cow::Owned(Value::Text(folded.into()));
+        }
+    } else if collation.eq_ignore_ascii_case("RTRIM") {
+        if let Value::Text(t) = v {
+            let trimmed = t.as_str().trim_end_matches(' ');
+            return std::borrow::Cow::Owned(Value::Text(trimmed.to_string().into()));
+        }
+    }
+    // Unknown / custom collation: BINARY key form.
+    std::borrow::Cow::Borrowed(v)
+}
+
+#[inline]
+pub fn collation_fold_key(collation: &str, v: &Value) -> Value {
+    collation_fold_key_ref(collation, v).into_owned()
+}
+
+/// Fold a multi-column index key: values are paired with the index
+/// columns' collations (missing columns fold as-is / NULL).
+pub fn collation_fold_index_key(
+    columns: &[crate::schema::IndexColumn],
+    values: &[Value],
+) -> Vec<Value> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            columns
+                .get(i)
+                .map(|c| collation_fold_key(&c.collation, v))
+                .unwrap_or_else(|| v.clone())
+        })
+        .collect()
+}
+
+/// Encode a full multi-column index key with collation folding, straight
+/// into a byte buffer (probe keys and maintenance keys share this).
+pub fn encode_collated_index_key_into(
+    columns: &[crate::schema::IndexColumn],
+    values: &[Value],
+    out: &mut Vec<u8>,
+) {
+    for (i, v) in values.iter().enumerate() {
+        match columns.get(i) {
+            Some(c) => collation_fold_key_ref(&c.collation, v)
+                .encode_order_key_into(out),
+            None => v.encode_order_key_into(out),
+        }
     }
 }
 

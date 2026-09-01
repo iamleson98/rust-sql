@@ -1,0 +1,25 @@
+[package]
+name = "rustqlite-compat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["rustqlite contributors"]
+description = "SQLite C ABI compatibility layer for rustqlite: exports the real sqlite3_* symbols so unmodified sqlx / sea-orm / C programs link against the rustqlite engine"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/rustqlite"
+keywords = ["database", "sql", "sqlite", "ffi", "sqlx"]
+categories = ["database-implementations", "external-ffi-bindings"]
+
+[lib]
+# Produces `libsqlite3.so` (cdylib) and `libsqlite3.a` (staticlib) with the
+# REAL `sqlite3_*` symbol names, plus an rlib for in-workspace Rust tests.
+name = "sqlite3"
+crate-type = ["cdylib", "staticlib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+rustqlite = { path = "../.." }
+parking_lot = "0.12"
+
+[features]
+default = []

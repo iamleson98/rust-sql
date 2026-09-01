@@ -10,6 +10,13 @@ repository = "https://github.com/example/rustqlite"
 keywords = ["database", "sql", "sqlite", "embedded", "btree"]
 categories = ["database-implementations"]
 
+[workspace]
+members = ["compat/rustqlite-compat"]
+# `compat/libsqlite3-sys` is consumed via [patch.crates-io] from the
+# CONSUMER's workspace — building it here as a member would emit link flags
+# for every workspace command. It stays out of the default member set.
+exclude = ["compat/libsqlite3-sys"]
+
 [lib]
 name = "rustqlite"
 path = "src/lib.rs"

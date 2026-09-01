@@ -4,6 +4,11 @@
 //! and a function that maps column refs to values). Built for clarity over
 //! speed; a production engine would JIT-compile hot expressions.
 
+/// SQLite version we report for `SELECT sqlite_version()` / `sqlite3_libversion()`.
+/// Aligned with the C ABI compatibility layer (see compat/). ORMs key feature
+/// detection off this value (e.g. RETURNING requires >= 3.35).
+pub const SQLITE_COMPAT_VERSION: &str = "3.50.4";
+
 use crate::error::{Error, Result};
 use crate::sql::ast::*;
 use crate::types::{Affinity, Value};
@@ -387,7 +392,23 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             if v.is_null() || lo.is_null() || hi.is_null() {
                 return Ok(Value::Null);
             }
-            let in_range = v >= lo && v <= hi;
+            // A COLLATE on the value operand applies to both bound
+            // comparisons (SQLite).
+            let in_range = if let Some(name) = comparison_collation(expr) {
+                let coll = crate::plugin::lookup_collation(&name).ok_or_else(|| {
+                    crate::error::Error::semantic(format!(
+                        "no such collation sequence: {}",
+                        name
+                    ))
+                })?;
+                let ge = crate::plugin::compare_collated(&v, &lo, coll.as_ref())
+                    != std::cmp::Ordering::Less;
+                let le = crate::plugin::compare_collated(&v, &hi, coll.as_ref())
+                    != std::cmp::Ordering::Greater;
+                ge && le
+            } else {
+                v >= lo && v <= hi
+            };
             Ok(Value::Integer(if in_range ^ negated { 1 } else { 0 }))
         }
         Expr::In {
@@ -509,6 +530,22 @@ fn evaluate_in(
     ctx: &EvalContext<'_>,
 ) -> Result<Value> {
     let v = evaluate(expr, ctx)?;
+    // A COLLATE on the left operand applies to every membership
+    // comparison (SQLite: `v COLLATE NOCASE IN ('a', 'B')`).
+    let coll = comparison_collation(expr).and_then(|name| {
+        crate::plugin::lookup_collation(&name).or_else(|| {
+            // Unknown collation name: error later at the comparison below
+            // would abort the whole scan — mirror the binary comparison
+            // behavior and error here instead.
+            None
+        })
+    });
+    if let (Some(name), None) = (comparison_collation(expr), &coll) {
+        return Err(crate::error::Error::semantic(format!(
+            "no such collation sequence: {}",
+            name
+        )));
+    }
     // SQL three-valued logic for IN:
     //   - If v is NULL: result is NULL (regardless of list contents).
     //   - If v matches a non-NULL list element: result is TRUE (FALSE if negated).
@@ -522,6 +559,7 @@ fn evaluate_in(
     if v.is_null() {
         return Ok(Value::Null);
     }
+    let coll_ref = coll.as_deref();
     let (found, list_has_null) = match source {
         InSource::List(list) => {
             let mut found = false;
@@ -532,7 +570,14 @@ fn evaluate_in(
                     list_has_null = true;
                     continue;
                 }
-                if v == candidate {
+                let eq = match coll_ref {
+                    Some(c) => {
+                        crate::plugin::compare_collated(&v, &candidate, c)
+                            == std::cmp::Ordering::Equal
+                    }
+                    None => v == candidate,
+                };
+                if eq {
                     found = true;
                     // Keep iterating to detect NULLs (we need list_has_null
                     // accurate even after a match, for the negated case).
@@ -764,7 +809,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         "last_insert_rowid" => Value::Integer(0), // overridden by executor
         "changes" => Value::Integer(crate::executor::change_counters::last()),
         "total_changes" => Value::Integer(crate::executor::change_counters::total()),
-        "sqlite_version" => Value::Text("3.0.0".to_string().into()),
+        "sqlite_version" => Value::Text(SQLITE_COMPAT_VERSION.into()),
         "quote" => {
             let v = args.first().cloned().unwrap_or(Value::Null);
             Value::Text(quote_value(&v).into())

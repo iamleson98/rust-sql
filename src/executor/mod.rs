@@ -844,7 +844,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
         Plan::IndexRange { table, alias, index, start, end, residual } => exec_index_range(ctx, table.clone(), alias.clone(), index.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
         Plan::Insert { table, source, columns, on_conflict, upsert, returning } => exec_insert(ctx, table.clone(), source, columns.clone(), *on_conflict, upsert.as_ref(), returning.as_deref()),
-        Plan::Update { table, source, assignments, returning } => exec_update(ctx, table.clone(), source, assignments, returning.as_deref()),
+        Plan::Update { table, source, assignments, returning, or_conflict, from } => exec_update(ctx, table.clone(), source, assignments, returning.as_deref(), *or_conflict, from.as_deref()),
         Plan::Delete { table, source, returning } => exec_delete(ctx, table.clone(), source, returning.as_deref()),
     }
 }
@@ -882,7 +882,7 @@ fn enforce_row_constraints(
 ) -> Result<()> {
     for (i, col) in table.columns.iter().enumerate() {
         if !col.nullable && row.get(i).map(|v| v.is_null()).unwrap_or(true) {
-            return Err(Error::semantic(format!(
+            return Err(Error::constraint(format!(
                 "NOT NULL constraint failed: {}.{}",
                 table.name, col.name
             )));
@@ -891,7 +891,7 @@ fn enforce_row_constraints(
     for expr in &table.check_exprs {
         let v = eval_row(expr, row, col_names, params, named_params)?;
         if !v.is_truthy() {
-            return Err(Error::semantic(format!(
+            return Err(Error::constraint(format!(
                 "CHECK constraint failed: {}",
                 table.name
             )));
@@ -1016,13 +1016,9 @@ fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Res
             continue;
         }
         if !fk_parent_exists(ctx, fk, &key_values)? {
-            let cols: Vec<String> = fk.columns.iter().map(|&i| table.columns[i].name.clone()).collect();
-            return Err(Error::semantic(format!(
-                "FOREIGN KEY constraint failed: {}.{} -> {}",
-                table.name,
-                cols.join(", "),
-                fk.ref_table
-            )));
+            // SQLite's runtime FK message is exactly this — no table or
+            // column detail (see sqlite3.c fkMismatch / sqlite3FkCheck).
+            return Err(Error::constraint("FOREIGN KEY constraint failed"));
         }
     }
     Ok(())
@@ -1141,10 +1137,8 @@ fn enforce_parent_delete_fks(
             }
             match fk.on_delete {
                 ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                    return Err(Error::semantic(format!(
-                        "FOREIGN KEY constraint failed: {} rows reference {}",
-                        child.name, parent.name
-                    )));
+                    // SQLite-exact: no row-count detail.
+                    return Err(Error::constraint("FOREIGN KEY constraint failed"));
                 }
                 ForeignKeyAction::Cascade => {
                     // Recursively delete each child row (children may be
@@ -2583,7 +2577,10 @@ fn resolve_column_index(
 /// For aggregate references (rewritten to `__agg_N`) the original function
 /// name is not recoverable at this point — the Project's caller should
 /// supply an alias.
-fn expr_display_name(e: &Expr) -> String {
+/// SQLite-style output-column naming (alias or expression text), shared
+/// with the C ABI compatibility layer for `sqlite3_column_name` at
+/// PREPARE time (before the first step materializes the result).
+pub fn expr_display_name(e: &Expr) -> String {
     match e {
         Expr::Column { table: _, name } => {
             if name.starts_with("__agg_") {
@@ -2599,7 +2596,24 @@ fn expr_display_name(e: &Expr) -> String {
             }
         }
         Expr::Literal(v) => format!("{}", v),
-        Expr::Function { name, .. } => format!("{}(...)", name),
+        Expr::Function { name, distinct, args, .. } => {
+            let rendered: Vec<String> = args
+                .iter()
+                .map(|a| match a {
+                    Expr::Column { name, .. } if name == "*" => "*".to_string(),
+                    Expr::Column { name, .. } => name.clone(),
+                    Expr::Literal(v) => format!("{}", v),
+                    _ => "?".to_string(),
+                })
+                .collect();
+            if rendered.is_empty() {
+                format!("{}()", name)
+            } else if *distinct {
+                format!("{}(DISTINCT {})", name, rendered.join(", "))
+            } else {
+                format!("{}({})", name, rendered.join(", "))
+            }
+        }
         _ => "?".to_string(),
     }
 }
@@ -3723,16 +3737,25 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
             _ => None,
         };
         if let Some((_table, index, start, end)) = covering {
-            // Evaluate the bounds (same logic as exec_index_range).
+            // Evaluate the bounds (same logic as exec_index_range —
+            // collated index bounds fold through the first column's
+            // collation).
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let fold_bound = |e: &Expr| -> Result<Value> {
+                let v = evaluate(e, &eval_ctx)?;
+                Ok(match index.columns.first() {
+                    Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+                    None => v,
+                })
+            };
             let start_key: Option<(Vec<u8>, bool)> = match start {
-                Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+                Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
                 None => None,
             };
             let end_key: Option<(Vec<u8>, bool)> = match end {
-                Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+                Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
                 None => None,
             };
             let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
@@ -5043,10 +5066,15 @@ fn exec_index_nested_loop_join(
             None => continue, // NULL join key — no matches in INNER join.
         };
 
-        // Encode the key for index lookup (order-preserving form), reusing
-        // the buffer across rows.
+        // Encode the key for index lookup (order-preserving form, folded
+        // through the inner index's collation when it is a collated
+        // index), reusing the buffer across rows.
         key_buf.clear();
-        key_value.encode_order_key_into(&mut key_buf);
+        match inner_index.columns.first() {
+            Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, key_value)
+                .encode_order_key_into(&mut key_buf),
+            None => key_value.encode_order_key_into(&mut key_buf),
+        }
 
         // Look up matching rowids in the index B+tree (reused handle +
         // reused output buffer). A mid-join index split moves the root:
@@ -5362,7 +5390,9 @@ fn exec_index_in(
             continue;
         }
         key_buf.clear();
-        v.encode_order_key_into(&mut key_buf);
+        // Collated index: fold the probe key the same way stored keys
+        // were folded (NOCASE / RTRIM).
+        crate::plugin::encode_collated_index_key_into(&index.columns, std::slice::from_ref(&v), &mut key_buf);
         encoded_keys.push(key_buf.clone());
     }
     encoded_keys.sort();
@@ -5630,11 +5660,10 @@ fn exec_index_lookup_impl(
         .collect::<Result<_>>()?;
 
     // Encode the key: concatenate the order-preserving encoded form of each
-    // indexed column value (must match encode_index_key's encoding).
+    // indexed column value (must match encode_index_key's encoding —
+    // collated index columns fold their TEXT probe keys the same way).
     let mut key_bytes = Vec::new();
-    for v in &key_values {
-        v.encode_order_key_into(&mut key_bytes);
-    }
+    crate::plugin::encode_collated_index_key_into(&index.columns, &key_values, &mut key_bytes);
 
     // Look up matching rowids in the index (override-aware root), into a
     // reusable buffer (no fresh Vec malloc per query).
@@ -5741,12 +5770,21 @@ fn exec_index_range(
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    // Collated index: the bounds fold through the first index column's
+    // collation so the scan bounds match the folded stored keys.
+    let fold_bound = |e: &Expr| -> Result<Value> {
+        let v = evaluate(e, &eval_ctx)?;
+        Ok(match index.columns.first() {
+            Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+            None => v,
+        })
+    };
     let start_key: Option<(Vec<u8>, bool)> = match start {
-        Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+        Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
         None => None,
     };
     let end_key: Option<(Vec<u8>, bool)> = match end {
-        Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+        Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
         None => None,
     };
 
@@ -5917,12 +5955,19 @@ pub(crate) struct IndexMaintState {
 impl IndexMaintState {
     /// Encode `row`'s index key into `buf` (cleared first) using the
     /// pre-resolved column positions — zero allocations, no name lookups.
+    /// Collated index columns (NOCASE / RTRIM) fold their TEXT values so
+    /// the stored key matches probe keys.
     #[inline]
     pub fn encode_key(&mut self, row: &[Value]) -> &[u8] {
         self.key_buf.clear();
-        for &pos in &self.cols {
+        for (i, &pos) in self.cols.iter().enumerate() {
             if let Some(v) = row.get(pos) {
-                v.encode_order_key_into(&mut self.key_buf);
+                if let Some(ic) = self.idx.columns.get(i) {
+                    crate::plugin::collation_fold_key(&ic.collation, v)
+                        .encode_order_key_into(&mut self.key_buf);
+                } else {
+                    v.encode_order_key_into(&mut self.key_buf);
+                }
             }
         }
         &self.key_buf
@@ -6658,6 +6703,7 @@ fn exec_insert_one_row(
     // the conflicting row first, ABORT/FAIL/ROLLBACK → error,
     // UPSERT → DO NOTHING / DO UPDATE).
     let mut conflict_rowid: Option<i64> = None;
+    let mut conflict_cols: Vec<String> = Vec::new();
     let mut conflict_on_target = false;
     for (i, st) in index_states.iter_mut().enumerate() {
         if !st.idx.unique {
@@ -6684,6 +6730,12 @@ fn exec_insert_one_row(
         let matches = ibt.lookup_index(&key_bytes)?;
         if !matches.is_empty() {
             conflict_rowid = Some(matches[0]);
+            conflict_cols = st
+                .idx
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", table.name, c.name))
+                .collect();
             conflict_on_target = matches!(
                 upsert_target,
                 UpsertTarget::Any | UpsertTarget::Index(_)
@@ -6728,10 +6780,19 @@ fn exec_insert_one_row(
                     }
                 }
             }
-            _ => return Err(Error::semantic(format!(
-                "UNIQUE constraint failed: {}",
-                table.name
-            ))),
+            _ => {
+                // SQLite's message shape: "UNIQUE constraint failed: t.col"
+                // (comma-joined for composite keys).
+                let cols = if conflict_cols.is_empty() {
+                    table.name.clone()
+                } else {
+                    conflict_cols.join(", ")
+                };
+                return Err(Error::constraint(format!(
+                    "UNIQUE constraint failed: {}",
+                    cols
+                )));
+            }
         }
     }
 
@@ -6803,7 +6864,16 @@ fn exec_insert_one_row(
                             bt.insert_table(rowid, payload)?;
                         }
                         ConflictResolution::Ignore => return Ok(InsertOutcome::Skipped),
-                        _ => return Err(Error::semantic(format!("UNIQUE constraint failed: rowid={}", rowid))),
+                        _ => {
+                        let pk = table
+                            .rowid_alias
+                            .and_then(|i| table.columns.get(i).map(|c| c.name.clone()))
+                            .unwrap_or_else(|| "rowid".to_string());
+                        return Err(Error::constraint(format!(
+                            "UNIQUE constraint failed: {}.{}",
+                            table.name, pk
+                        )));
+                    }
                     }
                 }
                 LookupResult::NotFound => {
@@ -6985,12 +7055,292 @@ pub(crate) fn encode_index_key(index: &crate::schema::Index, table: &Table, row:
     for col in &index.columns {
         if let Some(pos) = table.find_column(&col.name) {
             if let Some(v) = row.get(pos) {
-                v.encode_order_key_into(&mut key_bytes);
+                // Collated index: fold TEXT keys through the column's
+                // collation so probe keys and stored keys agree.
+                crate::plugin::collation_fold_key(&col.collation, v)
+                    .encode_order_key_into(&mut key_bytes);
             }
         }
     }
     key_bytes
 }
+
+// ---------------------------------------------------------------------------
+// UPDATE write-set unique-index simulation (SQLite sequential semantics)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the UPDATE unique-index write-set simulation.
+#[derive(Default)]
+pub(crate) struct UpdateConflictPlan {
+    /// Write-set indices (positions) to SKIP: rows that would violate a
+    /// unique index under OR IGNORE, or rows deleted by OR REPLACE.
+    pub skip: std::collections::HashSet<usize>,
+    /// Rowids to DELETE before applying the write set (OR REPLACE
+    /// conflicting holders — baseline rows or write-set rows).
+    pub delete_rowids: Vec<i64>,
+}
+
+/// True when any indexed column of `row` is NULL (UNIQUE-exempt).
+fn index_key_has_null(index: &crate::schema::Index, table: &Table, row: &[Value]) -> bool {
+    index
+        .columns
+        .iter()
+        .any(|c| table.find_column(&c.name).map(|p| row.get(p).map(|v| v.is_null()).unwrap_or(false)).unwrap_or(false))
+}
+
+/// Simulate SQLite's per-row sequential unique-index checking for an
+/// UPDATE write set, BEFORE any row is applied, so the statement aborts
+/// atomically (SQLite's ABORT rolls back the whole statement).
+///
+/// SQLite applies UPDATE rows one at a time (in scan order), deleting
+/// each row's old index entries and inserting the new ones, checking
+/// uniqueness at insert time. Row K's new key therefore conflicts iff it
+/// is held at that moment by:
+///   (a) a row outside the write set (never touched),
+///   (b) a LATER write-set row's old key (not yet vacated), or
+///   (c) an EARLIER write-set row's new key (already claimed).
+/// Because nothing has been applied yet, the pristine index B+tree shows
+/// every write-set row's OLD key; the simulation subtracts vacated keys
+/// and adds claimed keys as it walks the write set in order.
+///
+/// Handles the UPDATE conflict algorithms:
+///  - ABORT / FAIL / ROLLBACK (default): `Err` with the SQLite-exact
+///    "UNIQUE constraint failed: t.c" message.
+///  - OR IGNORE: the conflicting row's update is skipped (row keeps its
+///    old values; changes() does not count it).
+///  - OR REPLACE: the conflicting HOLDER row is deleted (table + all
+///    its index entries) before the write set applies.
+///
+/// `write_set` entries are `(rowid, old_row, new_row)` in scan order.
+/// Returns `Ok(plan)` with no conflicts when `unique_indexes` is empty.
+pub(crate) fn simulate_update_unique(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    unique_indexes: &[Arc<crate::schema::Index>],
+    write_set: &[(i64, &[Value], &[Value])],
+    or_conflict: ConflictResolution,
+) -> Result<UpdateConflictPlan> {
+    let mut plan = UpdateConflictPlan::default();
+    if unique_indexes.is_empty() || write_set.is_empty() {
+        return Ok(plan);
+    }
+    // rowid -> write-set position (classifies probe matches).
+    let pos_of: std::collections::HashMap<i64, usize> =
+        write_set.iter().enumerate().map(|(i, r)| (r.0, i)).collect();
+    // Rows already condemned by OR REPLACE in this statement — their
+    // entries are (virtually) gone for every index.
+    let mut deleted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for idx in unique_indexes {
+        // Per-row (old_key, new_key) pairs, encoded once. NULL rows carry
+        // keys too (they have index entries) but are exempt from CHECKING.
+        let mut keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(write_set.len());
+        for (_, old_row, new_row) in write_set {
+            keys.push((encode_index_key(idx, table, old_row), encode_index_key(idx, table, new_row)));
+        }
+        let root = ctx.index_root(idx);
+        let mut ibt = Btree::new(ctx.pager, root, true);
+        // New keys claimed by PROCESSED write-set rows (their old entries
+        // are already vacated; their new entries are live).
+        let mut pending_new: std::collections::HashMap<Vec<u8>, i64> =
+            std::collections::HashMap::with_capacity(write_set.len());
+        let mut probe: Vec<i64> = Vec::new();
+        for pos in 0..write_set.len() {
+            let rowid = write_set[pos].0;
+            let (ref old_key, ref new_key) = keys[pos];
+            if old_key == new_key {
+                // Index entry unchanged — the entry stays; claim it so
+                // LATER rows probing this key see it as taken.
+                pending_new.insert(new_key.clone(), rowid);
+                continue;
+            }
+            let null_new = index_key_has_null(idx, table, write_set[pos].2);
+            let mut conflict: Option<i64> = None;
+            if !null_new {
+                ibt.lookup_index_into(new_key, &mut probe)?;
+                for &m in probe.iter() {
+                    if m == rowid || deleted.contains(&m) {
+                        continue; // own entry, or virtually deleted holder
+                    }
+                    match pos_of.get(&m) {
+                        Some(&lpos) if lpos < pos => {
+                            // Earlier write-set row: its old entry was
+                            // vacated at its application time — UNLESS its
+                            // key never changed or the row was skipped
+                            // (OR IGNORE), in which case the entry persists.
+                            let skipped = plan.skip.contains(&lpos);
+                            let unchanged = keys[lpos].0 == keys[lpos].1;
+                            if skipped || unchanged {
+                                conflict = Some(m);
+                                break;
+                            }
+                        }
+                        _ => {
+                            // Later write-set row's old entry, or an
+                            // untouched baseline row — present now.
+                            conflict = Some(m);
+                            break;
+                        }
+                    }
+                }
+                if conflict.is_none() {
+                    if let Some(&holder) = pending_new.get(new_key) {
+                        if holder != rowid {
+                            conflict = Some(holder);
+                        }
+                    }
+                }
+            }
+            if let Some(holder) = conflict {
+                match or_conflict {
+                    ConflictResolution::Ignore => {
+                        plan.skip.insert(pos);
+                        continue; // row keeps old values; no key claimed
+                    }
+                    ConflictResolution::Replace => {
+                        // Delete the conflicting holder row; the current
+                        // row's update then proceeds cleanly.
+                        plan.delete_rowids.push(holder);
+                        deleted.insert(holder);
+                        if let Some(&hpos) = pos_of.get(&holder) {
+                            plan.skip.insert(hpos); // its pending update is discarded
+                        }
+                    }
+                    _ => {
+                        let cols = idx
+                            .columns
+                            .iter()
+                            .map(|c| format!("{}.{}", table.name, c.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(Error::constraint(format!("UNIQUE constraint failed: {}", cols)));
+                    }
+                }
+            }
+            pending_new.insert(new_key.clone(), rowid);
+        }
+    }
+    Ok(plan)
+}
+
+/// Delete rows by rowid (table cell + every index entry) — the OR REPLACE
+/// holder-deletion step. Mirrors the DELETE rowid fast path: fetch the
+/// payload, delete the table cell, remove all index entries, and keep the
+/// cached max-rowid consistent. FK parent checks run first when
+/// `PRAGMA foreign_keys = ON` (SQLite's REPLACE-triggered deletes enforce
+/// FKs too).
+pub(crate) fn delete_rows_by_rowid(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowids: &[i64],
+) -> Result<()> {
+    let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let table_name_lc = table.name.to_ascii_lowercase();
+    let n_cols = table.n_columns();
+    for &rowid in rowids {
+        let root = ctx.table_root(table);
+        if ctx.pager.foreign_keys_enabled() {
+            let mut bt = Btree::new(ctx.pager, root, false);
+            if let LookupResult::Found(payload) = bt.lookup_table(rowid)? {
+                if let Ok(old_row) = decode_row(&payload, n_cols, rowid, table.rowid_alias) {
+                    enforce_parent_delete_fks(ctx, table, &old_row, rowid, 0)?;
+                }
+            }
+        }
+        let root = ctx.table_root(table);
+        let (new_root, old_payload) = {
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let payload = bt.delete_table_get_payload(rowid)?;
+            (bt.root, payload)
+        };
+        ctx.set_table_root_lc(&table_name_lc, new_root);
+        if let Some(payload) = old_payload {
+            if !indexes.is_empty() {
+                if let Ok(row) = decode_row(&payload, n_cols, rowid, table.rowid_alias) {
+                    for idx in &indexes {
+                        delete_index_entry(ctx, idx, table, &row, rowid)?;
+                    }
+                }
+            }
+            ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid);
+        }
+    }
+    Ok(())
+}
+
+/// Apply a rowid-alias move for one UPDATE'd row: `UPDATE t SET id = X`
+/// where `id` is the INTEGER PRIMARY KEY. SQLite moves the row — its
+/// B+tree cell key changes — and enforces rowid uniqueness ("UNIQUE
+/// constraint failed: t.id"). NULL auto-assigns a fresh rowid.
+///
+/// Returns `Ok(true)` when the row was moved, `Ok(false)` when the
+/// conflict resolution was OR IGNORE (row keeps its old position — the
+/// caller skips it). The payload must be encoded WITHOUT the alias
+/// column (`encode_row_aliased`) — the rowid is the cell key.
+fn apply_rowid_alias_move(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowid: i64,
+    new_alias: &Value,
+    payload: &[u8],
+    new_row: &[Value],
+    or_conflict: ConflictResolution,
+) -> Result<bool> {
+    let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let alias_col = table
+        .rowid_alias
+        .and_then(|i| table.columns.get(i))
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "rowid".to_string());
+    let target = match new_alias {
+        Value::Integer(i) => *i,
+        Value::Null => {
+            // NULL on the rowid alias auto-assigns (INSERT semantics).
+            let root = ctx.table_root(table);
+            let max_rowid = ctx.get_or_scan_max_rowid(table)?;
+            next_auto_rowid(ctx.pager, root, max_rowid)?
+        }
+        _ => return Err(Error::constraint("datatype mismatch")),
+    };
+    if target == rowid {
+        // Same rowid — a plain in-place payload update; not a move.
+        return Ok(false);
+    }
+    // Rowid uniqueness for the target.
+    {
+        let root = ctx.table_root(table);
+        let mut bt = Btree::new(ctx.pager, root, false);
+        if let LookupResult::Found(_) = bt.lookup_table(target)? {
+            match or_conflict {
+                ConflictResolution::Ignore => return Ok(false),
+                ConflictResolution::Replace => {
+                    delete_rows_by_rowid(ctx, table, &[target])?;
+                }
+                _ => {
+                    return Err(Error::constraint(format!(
+                        "UNIQUE constraint failed: {}.{}",
+                        table.name, alias_col
+                    )));
+                }
+            }
+        }
+    }
+    // Move = delete the old cell (+ index entries, FK parent checks)
+    // then insert at the new rowid (+ index entries).
+    delete_rows_by_rowid(ctx, table, &[rowid])?;
+    {
+        let root = ctx.table_root(table);
+        let mut bt = Btree::new(ctx.pager, root, false);
+        bt.insert_table(target, payload)?;
+        if bt.root != root {
+            ctx.set_table_root(&table.name, bt.root);
+        }
+    }
+    for idx in &indexes {
+        insert_index_entry(ctx, idx, table, new_row, target)?;
+    }
+    Ok(true)
+}
+
 
 /// Insert an entry into an index for a given row.
 fn insert_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
@@ -7125,7 +7475,26 @@ fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
 // UPDATE
 // ============================================================================
 
-fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assignments: &[(usize, Expr)], returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+fn exec_update(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    source: &Plan,
+    assignments: &[(usize, Expr)],
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+    or_conflict: ConflictResolution,
+    from: Option<&crate::planner::plan::UpdateFrom>,
+) -> Result<ExecResult> {
+    // `UPDATE ... FROM` (SQLite 3.33+): the target table is joined with
+    // the FROM side and the WHERE clause spans both. Per SQLite
+    // semantics: a target row matching multiple FROM rows is updated
+    // ONCE (the last match supplies the SET expression values).
+    if let Some(uf) = from {
+        let result = exec_update_from(ctx, &table, source, assignments, returning, or_conflict, uf)?;
+        if !ctx.in_transaction && !ctx.deferred_flush {
+            ctx.pager.flush()?;
+        }
+        return Ok(result);
+    }
     // Virtual table: scan matching rows through the module, evaluate the
     // SET expressions per row, batch xUpdate.
     if table.vtab.is_some() {
@@ -7146,7 +7515,7 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     // across rows) and ONE Vec<u8> allocation for the encoded payload
     // (also reused). Cuts ~80% of the allocations on a 10k-row UPDATE,
     // closing the 23× UPDATE-range gap vs SQLite.
-    if let Some(result) = try_streaming_update(ctx, &table, source, assignments, returning)? {
+    if let Some(result) = try_streaming_update(ctx, &table, source, assignments, returning, or_conflict)? {
         // Autocommit flush (transactional execution defers this to COMMIT;
         // deferred_flush leaves it to the threshold/requery logic). The
         // flush used to live at the end of the general path — the fast
@@ -7165,6 +7534,11 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
+    // ---- Pass 1: compute every new row (assignments + constraints),
+    // without applying anything. This keeps the statement atomic: any
+    // constraint error (NOT NULL, CHECK, UNIQUE) aborts BEFORE the first
+    // B+tree modification, exactly like SQLite's statement-level ABORT.
+    let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::with_capacity(source_res.rows.len());
     for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
@@ -7178,8 +7552,62 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
             let aff = table.columns[*col_idx].affinity;
             new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
         }
+        // NULL assigned to the rowid alias: SQLite rejects with
+        // "datatype mismatch" (INSERT auto-assigns, UPDATE does not) —
+        // checked BEFORE NOT NULL, which would otherwise mislabel it.
+        if let Some(alias_idx) = table.rowid_alias {
+            if matches!(new_row.get(alias_idx), Some(Value::Null)) {
+                return Err(Error::constraint("datatype mismatch"));
+            }
+        }
         // NOT NULL + CHECK constraints on the updated row.
         enforce_row_constraints(&table, &new_row, &col_names, &ctx.params, &ctx.named_params)?;
+        // Child-side FK: the new values must reference existing parents.
+        enforce_child_fks(ctx, &table, &new_row)?;
+        write_set.push((rowid, row.clone(), new_row));
+    }
+
+    // ---- Unique-index write-set simulation (SQLite sequential
+    // semantics, collation-aware): errors atomically for ABORT-family,
+    // produces the OR IGNORE skip / OR REPLACE delete plan otherwise.
+    let unique_indexes: Vec<Arc<crate::schema::Index>> =
+        indexes.iter().filter(|i| i.unique).cloned().collect();
+    let ws_refs: Vec<(i64, &[Value], &[Value])> =
+        write_set.iter().map(|(r, o, n)| (*r, o.as_slice(), n.as_slice())).collect();
+    let plan = simulate_update_unique(ctx, &table, &unique_indexes, &ws_refs, or_conflict)?;
+
+    // OR REPLACE: delete the conflicting holder rows (table + all index
+    // entries) before applying the write set.
+    if !plan.delete_rowids.is_empty() {
+        delete_rows_by_rowid(ctx, &table, &plan.delete_rowids)?;
+    }
+
+    // ---- Pass 2: apply.
+    for (pos, (rowid, row, new_row)) in write_set.into_iter().enumerate() {
+        if plan.skip.contains(&pos) {
+            continue; // OR IGNORE: row keeps its old values
+        }
+        // Rowid-alias move (`UPDATE t SET id = X`): the B+tree cell key
+        // changes — delete + reinsert at the new rowid with uniqueness.
+        if let Some(alias_idx) = table.rowid_alias {
+            if let Some(new_alias) = new_row.get(alias_idx) {
+                if !matches!(new_alias, Value::Integer(i) if *i == rowid) {
+                    let payload = encode_row_aliased(&new_row, table.rowid_alias);
+                    if apply_rowid_alias_move(ctx, &table, rowid, new_alias, &payload, &new_row, or_conflict)? {
+                        ctx.changes += 1;
+                        updated += 1;
+                        if let Some(ret) = returning {
+                            returning_rows.push(project_returning_row(ret, &new_row, &col_names, &ctx.params, &ctx.named_params)?);
+                        }
+                        continue;
+                    }
+                    // OR IGNORE kept the old position — skip the row.
+                    if !matches!(new_alias, Value::Integer(_)) {
+                        continue;
+                    }
+                }
+            }
+        }
         let payload = encode_row_aliased(&new_row, table.rowid_alias);
         let root = ctx.table_root(&table);
         let new_root;
@@ -7211,14 +7639,14 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
         // and the UPDATE doesn't touch `val`).
         for idx in &indexes {
             // Compute the old and new index keys.
-            let old_key = encode_index_key(idx, &table, row);
+            let old_key = encode_index_key(idx, &table, &row);
             let new_key = encode_index_key(idx, &table, &new_row);
             if old_key == new_key {
                 // No change to this index's key — skip maintenance.
                 continue;
             }
-            let _ = delete_index_entry(ctx, idx, &table, row, rowid);
-            let _ = insert_index_entry(ctx, idx, &table, &new_row, rowid);
+            delete_index_entry(ctx, idx, &table, &row, rowid)?;
+            insert_index_entry(ctx, idx, &table, &new_row, rowid)?;
         }
         ctx.changes += 1;
         updated += 1;
@@ -7232,6 +7660,202 @@ fn exec_update(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, assi
     if let Some(ret) = returning {
         return Ok(ExecResult {
             columns: returning_column_names(ret, &col_names).into(),
+            rows: returning_rows,
+        });
+    }
+    Ok(ExecResult {
+        columns: Arc::from(vec!["updated".to_string()]),
+        rows: vec![vec![Value::Integer(updated)]],
+    })
+}
+
+/// `UPDATE t SET ... FROM <expr> [WHERE ...]` (SQLite 3.33+).
+///
+/// Semantics (SQLite docs): the target table is joined with the FROM
+/// side; the WHERE clause supplies the join condition and/or residual
+/// filter, evaluated over target++from combined rows. If a target row
+/// matches MULTIPLE FROM rows, it is updated ONCE — the LAST match
+/// supplies the values for the SET expressions ("one arbitrary matching
+/// row" in the docs; the last in practice). Target rows with no match
+/// are left untouched (this is an inner-match update, not a LEFT JOIN
+/// against the target — the target is always the driving side).
+///
+/// Column resolution: combined names are `target-qualified ++ from-
+/// qualified` ("t.v", "src.v"). Unqualified references resolve
+/// target-first (SQLite raises "ambiguous column name"; we prefer the
+/// target side, which is what `SET v = v + 1` means in practice).
+fn exec_update_from(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    target: &Plan,
+    assignments: &[(usize, Expr)],
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+    or_conflict: ConflictResolution,
+    uf: &crate::planner::plan::UpdateFrom,
+) -> Result<ExecResult> {
+    // Materialize both sides. The FROM side may itself be a join /
+    // subquery / CTE — `execute` handles all plan shapes.
+    let target_res = execute(target, ctx)?;
+    let from_res = execute(&uf.plan, ctx)?;
+    // Combined namespace for SET / WHERE evaluation.
+    let mut combined_cols: Vec<String> = Vec::with_capacity(
+        target_res.columns.len() + from_res.columns.len(),
+    );
+    combined_cols.extend(target_res.columns.iter().cloned());
+    combined_cols.extend(from_res.columns.iter().cloned());
+    let n_target = target_res.columns.len();
+    // Plain (unqualified) target names for constraint checks and
+    // RETURNING projection (SQLite: RETURNING references the target row).
+    let plain_cols: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+
+    let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let has_update_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        table,
+        &crate::sql::ast::TriggerEvent::Update(vec![]),
+    );
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    let mut updated: i64 = 0;
+
+    // ---- Pass 1: compute the write set (nothing applied yet — atomic
+    // statement abort on any constraint violation).
+    let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::new();
+    for row in &target_res.rows {
+        let rowid = if let Some(idx) = table.rowid_alias {
+            row[idx].as_integer()
+        } else {
+            return Err(Error::Unsupported("UPDATE on a table without INTEGER PRIMARY KEY"));
+        };
+        // Find the LAST FROM row (if any) whose combination with this
+        // target row satisfies the WHERE clause.
+        let mut last_match: Option<Vec<Value>> = None;
+        for frow in &from_res.rows {
+            let mut combined: Vec<Value> = Vec::with_capacity(n_target + frow.len());
+            combined.extend(row.iter().cloned());
+            combined.extend(frow.iter().cloned());
+            if let Some(w) = &uf.where_clause {
+                let keep = eval_row(w, &combined, &combined_cols, &ctx.params, &ctx.named_params)?;
+                if !keep.is_truthy() {
+                    continue;
+                }
+            }
+            last_match = Some(combined);
+        }
+        let Some(combined) = last_match else { continue };
+
+        let mut new_row = row.clone();
+        for (col_idx, expr) in assignments {
+            new_row[*col_idx] =
+                eval_row(expr, &combined, &combined_cols, &ctx.params, &ctx.named_params)?;
+            let aff = table.columns[*col_idx].affinity;
+            new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
+        }
+        // NULL assigned to the rowid alias: SQLite rejects with
+        // "datatype mismatch" (before NOT NULL relabels it).
+        if let Some(alias_idx) = table.rowid_alias {
+            if matches!(new_row.get(alias_idx), Some(Value::Null)) {
+                return Err(Error::constraint("datatype mismatch"));
+            }
+        }
+        enforce_row_constraints(table, &new_row, &plain_cols, &ctx.params, &ctx.named_params)?;
+        // Child-side FK: the new values must reference existing parents.
+        enforce_child_fks(ctx, table, &new_row)?;
+        write_set.push((rowid, row.clone(), new_row));
+    }
+
+    // ---- Unique-index write-set simulation (collation-aware).
+    let unique_indexes: Vec<Arc<crate::schema::Index>> =
+        indexes.iter().filter(|i| i.unique).cloned().collect();
+    let ws_refs: Vec<(i64, &[Value], &[Value])> =
+        write_set.iter().map(|(r, o, n)| (*r, o.as_slice(), n.as_slice())).collect();
+    let plan = simulate_update_unique(ctx, table, &unique_indexes, &ws_refs, or_conflict)?;
+    if !plan.delete_rowids.is_empty() {
+        delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
+    }
+
+    // ---- Pass 2: apply.
+    for (pos, (rowid, row, new_row)) in write_set.into_iter().enumerate() {
+        if plan.skip.contains(&pos) {
+            continue; // OR IGNORE: row keeps its old values
+        }
+        // Rowid-alias move (`UPDATE t SET id = X`).
+        if let Some(alias_idx) = table.rowid_alias {
+            if let Some(new_alias) = new_row.get(alias_idx) {
+                if !matches!(new_alias, Value::Integer(i) if *i == rowid) {
+                    let payload = encode_row_aliased(&new_row, table.rowid_alias);
+                    if apply_rowid_alias_move(ctx, table, rowid, new_alias, &payload, &new_row, or_conflict)? {
+                        ctx.changes += 1;
+                        updated += 1;
+                        if let Some(ret) = returning {
+                            returning_rows.push(project_returning_row(
+                                ret,
+                                &new_row,
+                                &plain_cols,
+                                &ctx.params,
+                                &ctx.named_params,
+                            )?);
+                        }
+                        continue;
+                    }
+                    if !matches!(new_alias, Value::Integer(_)) {
+                        continue;
+                    }
+                }
+            }
+        }
+        let payload = encode_row_aliased(&new_row, table.rowid_alias);
+        let root = ctx.table_root(table);
+        let new_root;
+        {
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let did_in_place = bt.update_table(rowid, &payload).unwrap_or(false);
+            if !did_in_place {
+                bt.delete_table(rowid)?;
+                bt.insert_table(rowid, &payload)?;
+            }
+            new_root = bt.root;
+        }
+        ctx.set_table_root(&table.name, new_root);
+        for idx in &indexes {
+            let old_key = encode_index_key(idx, table, &row);
+            let new_key = encode_index_key(idx, table, &new_row);
+            if old_key == new_key {
+                continue;
+            }
+            delete_index_entry(ctx, idx, table, &row, rowid)?;
+            insert_index_entry(ctx, idx, table, &new_row, rowid)?;
+        }
+        // AFTER UPDATE triggers (NEW = post-change, OLD = pre-change).
+        if has_update_triggers {
+            let changed_cols: Vec<String> = assignments
+                .iter()
+                .map(|(idx, _)| table.columns[*idx].name.clone())
+                .collect();
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                crate::sql::ast::TriggerWhen::After,
+                Some(&new_row),
+                Some(&row),
+                &table.col_names,
+            )?;
+        }
+        ctx.changes += 1;
+        updated += 1;
+        if let Some(ret) = returning {
+            returning_rows.push(project_returning_row(
+                ret,
+                &new_row,
+                &plain_cols,
+                &ctx.params,
+                &ctx.named_params,
+            )?);
+        }
+    }
+    if let Some(ret) = returning {
+        return Ok(ExecResult {
+            columns: returning_column_names(ret, &plain_cols).into(),
             rows: returning_rows,
         });
     }
@@ -7269,6 +7893,7 @@ fn try_streaming_update(
     source: &Plan,
     assignments: &[(usize, Expr)],
     returning: Option<&[crate::sql::ast::ResultColumn]>,
+    or_conflict: ConflictResolution,
 ) -> Result<Option<ExecResult>> {
     // Detect the source shape and extract (table, filter_predicate, range, rowid).
     enum StreamingSource<'a> {
@@ -7317,6 +7942,16 @@ fn try_streaming_update(
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
         return Ok(None);
+    }
+
+    // Rowid-alias reassignment (`UPDATE t SET id = X`) moves the row —
+    // its B+tree cell key changes. The streaming path patches payloads
+    // in place at the OLD rowid, so it can't express a move; the general
+    // path handles moves (delete + reinsert with uniqueness).
+    if let Some(alias_idx) = table.rowid_alias {
+        if assignments.iter().any(|(a_idx, _)| *a_idx == alias_idx) {
+            return Ok(None);
+        }
     }
 
     let params = ctx.params.clone();
@@ -7542,12 +8177,20 @@ fn try_streaming_update(
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
+        // Collated index: fold bounds through the first column's collation.
+        let fold_bound = |e: &Expr| -> Result<Value> {
+            let v = evaluate(e, &eval_ctx)?;
+            Ok(match index.columns.first() {
+                Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+                None => v,
+            })
+        };
         let start_key: Option<(Vec<u8>, bool)> = match start {
-            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
         let end_key: Option<(Vec<u8>, bool)> = match end {
-            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
         let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
@@ -7707,6 +8350,57 @@ fn try_streaming_update(
         return Err(e);
     }
 
+    // ---- Unique-index write-set simulation (SQLite sequential
+    // semantics, collation-aware — NOCASE / RTRIM / custom collations
+    // all fold into the encoded keys). Runs BEFORE phase 2 touches
+    // anything, so ABORT-family conflicts abort the statement atomically
+    // with the SQLite-exact message; OR IGNORE produces the skip set;
+    // OR REPLACE produces holder rowids to delete.
+    let unique_touched: Vec<Arc<crate::schema::Index>> = touched_indexes
+        .iter()
+        .filter(|i| i.unique)
+        .map(|i| (**i).clone())
+        .collect();
+    let plan = if !unique_touched.is_empty() {
+        let mut ws_old: Vec<Value> = Vec::with_capacity(n_cols);
+        let mut ws_new: Vec<Value> = Vec::with_capacity(n_cols);
+        let mut ws: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::with_capacity(updates.len());
+        for (rowid, range, old_stash) in updates.iter() {
+            let Some(old_payload) = old_stash.as_deref() else { continue };
+            ws_old.clear();
+            if decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut ws_old).is_err() {
+                continue;
+            }
+            let new_payload = &update_arena[range.clone()];
+            ws_new.clear();
+            if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut ws_new).is_err() {
+                continue;
+            }
+            ws.push((*rowid, ws_old.clone(), ws_new.clone()));
+        }
+        let ws_refs: Vec<(i64, &[Value], &[Value])> =
+            ws.iter().map(|(r, o, n)| (*r, o.as_slice(), n.as_slice())).collect();
+        simulate_update_unique(ctx, table, &unique_touched, &ws_refs, or_conflict)?
+    } else {
+        UpdateConflictPlan::default()
+    };
+    // OR REPLACE: delete the conflicting holder rows (table + all index
+    // entries) before the write set applies.
+    if !plan.delete_rowids.is_empty() {
+        delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
+    }
+    // OR IGNORE: drop the skipped rows' RETURNING output. Phase 1 pushed
+    // RETURNING rows in lockstep with `updates` (one per pushed update),
+    // so position k in returning_rows == position k in updates.
+    if !plan.skip.is_empty() && returning.is_some() {
+        returning_rows = returning_rows
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !plan.skip.contains(k))
+            .map(|(_, r)| r.clone())
+            .collect();
+    }
+
     // Phase 2: apply the updates. For each (rowid, new_payload, old_payload):
     //   1. The old payload was pre-stashed during the scan when an indexed
     //      column is being SET — no per-row re-fetch descent needed.
@@ -7729,6 +8423,11 @@ fn try_streaming_update(
     // are in index order). Phase 2's per-row work is order-independent.
     let mut order: Vec<usize> = (0..updates.len()).collect();
     order.sort_unstable_by_key(|&i| updates[i].0);
+    // OR IGNORE / OR REPLACE: drop the skipped rows entirely (their
+    // RETURNING rows were already filtered above).
+    if !plan.skip.is_empty() {
+        order.retain(|&i| !plan.skip.contains(&i));
+    }
     let mut deferred: Vec<usize> = Vec::new();
     let mut root = root;
     // Triggers force the per-row path: bulk-applied rows skip AFTER UPDATE
@@ -8026,16 +8725,24 @@ fn try_streaming_delete(
     let mut bt = Btree::new(ctx.pager, root, false);
     if let Some((index, start, end)) = index_range {
         // IndexRange source: scan the index between the encoded bounds,
-        // collecting rowids (bounds logic mirrors try_streaming_update).
+        // collecting rowids (bounds logic mirrors try_streaming_update —
+        // collated index bounds fold through the first column's collation).
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
+        let fold_bound = |e: &Expr| -> Result<Value> {
+            let v = evaluate(e, &eval_ctx)?;
+            Ok(match index.columns.first() {
+                Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+                None => v,
+            })
+        };
         let start_key: Option<(Vec<u8>, bool)> = match start {
-            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
         let end_key: Option<(Vec<u8>, bool)> = match end {
-            Some((e, inc)) => Some((evaluate(e, &eval_ctx)?.encode_order_key(), *inc)),
+            Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
         let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();

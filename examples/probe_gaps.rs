@@ -1,116 +1,119 @@
-//! Micro-profiler for the remaining perf gaps: decomposes each workload into
-//! pipeline layers (btree-only / fast-path / full query) to find fixed costs.
-use std::time::Instant;
-use rustqlite::types::Value;
 use rustqlite::Database;
-
-fn ms(d: std::time::Duration) -> f64 {
-    d.as_secs() as f64 * 1e3 + d.as_nanos() as f64 / 1e6
-}
-fn us(d: std::time::Duration) -> f64 {
-    d.as_secs() as f64 * 1e6 + d.as_nanos() as f64 / 1e3
-}
-
 fn main() {
-    // ---------- 1. Range scan 10 rows ----------
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
-    db.execute("BEGIN", []).unwrap();
-    for i in 1..=10000i64 {
-        db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+    // 1. UPDATE ... FROM
+    println!("--- UPDATE FROM ---");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("INSERT INTO t VALUES (1,'old'),(2,'keep')", []).unwrap();
+    db.execute("INSERT INTO src VALUES (1,'new')", []).unwrap();
+    match db.execute("UPDATE t SET v = src.v FROM src WHERE t.id = src.id", []) {
+        Ok(_) => println!("UPDATE FROM: OK, v={:?}", db.query("SELECT v FROM t ORDER BY id", []).unwrap()),
+        Err(e) => println!("UPDATE FROM: FAIL {}", e),
     }
-    db.execute("COMMIT", []).unwrap();
-
-    let sql = "SELECT name, val, score FROM t WHERE id BETWEEN ? AND ?";
-    // warm
-    for _ in 0..50 {
-        let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    // 2. NOCASE in index + comparison
+    println!("--- NOCASE ---");
+    match db.execute("CREATE INDEX idx_nc ON t(v COLLATE NOCASE)", []) {
+        Ok(_) => println!("NOCASE index: OK"),
+        Err(e) => println!("NOCASE index: FAIL {}", e),
     }
-    let n = 2000;
-    let start = Instant::now();
-    for _ in 0..n {
-        let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    match db.query("SELECT id FROM t WHERE v = 'OLD' COLLATE NOCASE", []) {
+        Ok(r) => println!("NOCASE compare: {:?}", r),
+        Err(e) => println!("NOCASE compare: FAIL {}", e),
     }
-    let full = us(start.elapsed()) / n as f64;
-    println!("range10 full query():      {:>8.1} ns/op", full * 1000.0);
-
-    // empty range (touches tree but emits 0 rows): measures descent cost
-    let start = Instant::now();
-    for _ in 0..n {
-        let _ = db.query(sql, [Value::Integer(100000), Value::Integer(100009)]).unwrap();
+    match db.query("SELECT id FROM t WHERE v = 'OLD'", []) {
+        Ok(r) => println!("plain compare: {:?}", r),
+        Err(e) => println!("plain compare: FAIL {}", e),
     }
-    let empty = us(start.elapsed()) / n as f64;
-    println!("range10 EMPTY range:       {:>8.1} ns/op  (descent-only cost)", empty * 1000.0);
-
-    // Same via raw plan inspection: get the plan and time execute() alone
-    // (parse+cache amortized away, like a prepared statement would).
-
-    // ---------- 2. Point lookup indexed ----------
-    db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
-    let sql2 = "SELECT id, name, score FROM t WHERE val = ?";
-    for _ in 0..50 {
-        let _ = db.query(sql2, [Value::Integer(2000)]).unwrap();
+    // 3. NOCASE in ORDER BY
+    match db.query("SELECT v FROM t ORDER BY v COLLATE NOCASE", []) {
+        Ok(_) => println!("NOCASE order: OK"),
+        Err(e) => println!("NOCASE order: FAIL {}", e),
     }
-    let n2 = 2000;
-    let start = Instant::now();
-    for i in 0..n2 {
-        let target = ((i % 1000) + 1) * 2;
-        let _ = db.query(sql2, [Value::Integer(target)]).unwrap();
+    // 4. UNIQUE + NOCASE conflict
+    println!("--- UNIQUE NOCASE ---");
+    db.execute("CREATE TABLE u (name TEXT UNIQUE COLLATE NOCASE)", []).unwrap();
+    db.execute("INSERT INTO u VALUES ('Alice')", []).unwrap();
+    match db.execute("INSERT INTO u VALUES ('ALICE')", []) {
+        Ok(_) => println!("UNIQUE NOCASE: ACCEPTED (BUG - should conflict)"),
+        Err(e) => println!("UNIQUE NOCASE: conflict raised ({:?})", e.to_string().chars().take(80).collect::<String>()),
     }
-    println!("idx-point full query():    {:>8.1} ns/op", us(start.elapsed()) / n2 as f64 * 1000.0);
-
-    // missing key (index descent + no row fetch)
-    let start = Instant::now();
-    for _ in 0..n2 {
-        let _ = db.query(sql2, [Value::Integer(-999999)]).unwrap();
+    // 5. sqlite_master via SQL
+    println!("--- sqlite_master ---");
+    match db.query("SELECT name, type FROM sqlite_master ORDER BY name", []) {
+        Ok(r) => println!("sqlite_master: {:?}", r.iter().map(|row| format!("{:?}", row)).collect::<Vec<_>>()),
+        Err(e) => println!("sqlite_master: FAIL {}", e),
     }
-    println!("idx-point MISSING key:     {:>8.1} ns/op  (index descent only)", us(start.elapsed()) / n2 as f64 * 1000.0);
-
-    // ---------- 3. rowid point lookup (control) ----------
-    let sql3 = "SELECT name, val, score FROM t WHERE id = ?";
-    for _ in 0..50 {
-        let _ = db.query(sql3, [Value::Integer(500)]).unwrap();
+    match db.query("SELECT type FROM sqlite_temp_master", []) {
+        Ok(_) => println!("sqlite_temp_master: OK"),
+        Err(e) => println!("sqlite_temp_master: FAIL {}", e),
     }
-    let start = Instant::now();
-    for i in 0..n2 {
-        let target = (i % 1000) + 1;
-        let _ = db.query(sql3, [Value::Integer(target)]).unwrap();
+    // 6. PRAGMA table_info
+    println!("--- PRAGMA ---");
+    match db.query("PRAGMA table_info(t)", []) {
+        Ok(r) => println!("table_info: {} rows", r.len()),
+        Err(e) => println!("table_info: FAIL {}", e),
     }
-    println!("rowid-point full query():  {:>8.1} ns/op", us(start.elapsed()) / n2 as f64 * 1000.0);
-
-    // ---------- 4. 3-table join ----------
-    let mut dbj = Database::open_in_memory().unwrap();
-    dbj.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)", []).unwrap();
-    dbj.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)", []).unwrap();
-    dbj.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)", []).unwrap();
-    dbj.execute("BEGIN", []).unwrap();
-    for i in 1..=1000i64 {
-        dbj.execute("INSERT INTO users VALUES (?, ?, ?)",
-            [Value::Integer(i), Value::Text(format!("u{}", i).into()), Value::Text(format!("d{}", i % 10).into())]).unwrap();
+    match db.query("PRAGMA index_list(t)", []) {
+        Ok(_) => println!("index_list: OK"),
+        Err(e) => println!("index_list: FAIL {}", e),
     }
-    for i in 1..=10000i64 {
-        dbj.execute("INSERT INTO orders VALUES (?, ?, ?)",
-            [Value::Integer(i), Value::Integer((i % 1000) + 1), Value::Real(i as f64)]).unwrap();
+    match db.query("PRAGMA foreign_key_list(u)", []) {
+        Ok(_) => println!("foreign_key_list: OK"),
+        Err(e) => println!("foreign_key_list: FAIL {}", e),
     }
-    for i in 1..=50000i64 {
-        dbj.execute("INSERT INTO items VALUES (?, ?, ?, ?)",
-            [Value::Integer(i), Value::Integer((i % 10000) + 1), Value::Text(format!("item{}", i).into()), Value::Real(i as f64 * 0.5)]).unwrap();
+    // 7. DELETE RETURNING
+    println!("--- RETURNING ---");
+    match db.execute("DELETE FROM t WHERE id = 2 RETURNING v", []) {
+        Ok(_) => println!("DELETE RETURNING: OK"),
+        Err(e) => println!("DELETE RETURNING: FAIL {}", e),
     }
-    dbj.execute("COMMIT", []).unwrap();
-    dbj.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
-    dbj.execute("CREATE INDEX idx_items_order ON items(order_id)", []).unwrap();
-
-    let sql4 = "SELECT u.name, o.total, i.name, i.price FROM users u JOIN orders o ON u.id = o.user_id JOIN items i ON o.id = i.order_id WHERE u.id = ?";
-    for _ in 0..20 {
-        let _ = dbj.query(sql4, [Value::Integer(1)]).unwrap();
+    // 8. Subquery in FROM (derived table)
+    println!("--- derived table ---");
+    match db.query("SELECT x FROM (SELECT 1 AS x UNION SELECT 2)", []) {
+        Ok(r) => println!("derived: {:?}", r),
+        Err(e) => println!("derived: FAIL {}", e),
     }
-    let n4 = 500;
-    let start = Instant::now();
-    for _ in 0..n4 {
-        let _ = dbj.query(sql4, [Value::Integer(500)]).unwrap();
+    // 9. CTE
+    match db.query("WITH c AS (SELECT 1 AS x) SELECT x FROM c", []) {
+        Ok(r) => println!("CTE: {:?}", r),
+        Err(e) => println!("CTE: FAIL {}", e),
     }
-    println!("3-table join full:         {:>8.1} us/op", us(start.elapsed()) / n4 as f64);
-
-    let _ = ms;
+    // 10. recursive CTE
+    match db.query("WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT x FROM cnt", []) {
+        Ok(r) => println!("recursive CTE: {:?}", r),
+        Err(e) => println!("recursive CTE: FAIL {}", e),
+    }
+    // 11. window functions
+    println!("--- window ---");
+    match db.query("SELECT v, ROW_NUMBER() OVER (ORDER BY v) FROM t", []) {
+        Ok(_) => println!("ROW_NUMBER OVER: OK"),
+        Err(e) => println!("ROW_NUMBER OVER: FAIL {}", e),
+    }
+    // 12. PRAGMA journal_mode returns row
+    match db.query("PRAGMA journal_mode=WAL", []) {
+        Ok(r) => println!("journal_mode set: {:?}", r),
+        Err(e) => println!("journal_mode set: FAIL {}", e),
+    }
+    // 13. last_insert_rowid
+    let _ = db.execute("CREATE TABLE lr (id INTEGER PRIMARY KEY, x INT)", []);
+    let _ = db.execute("INSERT INTO lr VALUES (NULL, 5)", []);
+    println!("last_rowid: {:?}", db.last_insert_rowid());
+    // 14. view support
+    println!("--- views ---");
+    match db.execute("CREATE VIEW vv AS SELECT id FROM t", []) {
+        Ok(_) => {
+            match db.query("SELECT * FROM vv", []) {
+                Ok(_) => println!("CREATE VIEW + query: OK"),
+                Err(e) => println!("view query: FAIL {}", e),
+            }
+        },
+        Err(e) => println!("CREATE VIEW: FAIL {}", e),
+    }
+    // 15. trigger support
+    println!("--- triggers ---");
+    match db.execute("CREATE TRIGGER tg AFTER INSERT ON t BEGIN UPDATE u SET name = name; END", []) {
+        Ok(_) => println!("CREATE TRIGGER: OK"),
+        Err(e) => println!("CREATE TRIGGER: FAIL {}", e),
+    }
 }

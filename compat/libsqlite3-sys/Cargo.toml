@@ -1,0 +1,46 @@
+[package]
+name = "libsqlite3-sys"
+# Version-compatible with sqlx-sqlite's requirement (">=0.30.1, <0.38.0").
+version = "0.30.1"
+edition = "2015"
+authors = ["rustqlite contributors"]
+description = "Drop-in libsqlite3-sys replacement that links the rustqlite engine's SQLite C ABI compatibility library (for unmodified sqlx / sea-orm support)"
+license = "MIT"
+links = "sqlite3"
+build = "build.rs"
+keywords = ["sqlite", "sqlx", "rustqlite", "database"]
+categories = ["database-implementations", "external-ffi-bindings"]
+
+# NOTE: this crate is consumed from ANOTHER workspace via
+# [patch.crates-io]; the rust-sql workspace excludes it (its build script
+# emits link flags referencing the rustqlite compat artifact).
+
+[features]
+default = []
+# Upstream feature names, kept as no-ops / redirects:
+#   bundled      -> upstream compiles SQLite's amalgamation; here it simply
+#                   links our compat library (already "bundled" with the
+#                   app through libsqlite3.so / the engine rlib).
+bundled = []
+bundled-windows = []
+#   buildtime_bindgen -> upstream runs bindgen (needs libclang); our
+#                   bindings are vendored, so this is a no-op.
+buildtime_bindgen = []
+bundled_bindings = []
+loadable_extension = []
+pkg-config = []
+vcpkg = []
+unlock_notify = []
+preupdate_hook = []
+sqlcipher = []
+bundled-sqlcipher = []
+bundled-sqlcipher-vendored-openssl = []
+wasm32-wasi-vfs = []
+
+[dependencies]
+
+[build-dependencies]
+# No pkg-config / bindgen dependencies: the compat library location is
+# resolved from RUSTQLITE_LIB_DIR or the repo-relative default.
+
+[dev-dependencies]

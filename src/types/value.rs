@@ -352,14 +352,25 @@ impl Value {
                 out.extend_from_slice(&double_order_key(*f).to_be_bytes());
             }
             Value::Text(s) => {
+                // TRUE lexicographic order (SQL text comparison: memcmp,
+                // then shorter-prefix-first). Raw bytes + a 0x00 terminator
+                // — the terminator makes 'a' < 'a\0' < 'ab' and never
+                // reorders non-equal strings, matching memcmp semantics
+                // for embedded NULs. (The previous form — 4-byte length
+                // prefix before the bytes — ordered by LENGTH first, so
+                // `WHERE tag > 'beta'` via an index returned 'alpha'
+                // (len 5) as greater: index ranges and ORDER BY on text
+                // of differing lengths were wrong.)
                 out.push(0x02);
-                out.extend_from_slice(&(s.len() as u32).to_be_bytes());
                 out.extend_from_slice(s.as_bytes());
+                out.push(0x00);
             }
             Value::Blob(b) => {
+                // Same terminator scheme (SQL blob order is memcmp,
+                // shorter-prefix-first).
                 out.push(0x03);
-                out.extend_from_slice(&(b.len() as u32).to_be_bytes());
                 out.extend_from_slice(b);
+                out.push(0x00);
             }
         }
     }
@@ -410,13 +421,13 @@ impl Value {
             }
             Value::Text(s) => {
                 o[0] = 0x02;
-                o[1..5].copy_from_slice(&(s.len() as u32).to_be_bytes());
-                o[5..].copy_from_slice(s.as_bytes());
+                o[1..1 + s.len()].copy_from_slice(s.as_bytes());
+                o[1 + s.len()] = 0x00;
             }
             Value::Blob(b) => {
                 o[0] = 0x03;
-                o[1..5].copy_from_slice(&(b.len() as u32).to_be_bytes());
-                o[5..].copy_from_slice(b);
+                o[1..1 + b.len()].copy_from_slice(b);
+                o[1 + b.len()] = 0x00;
             }
         }
         Some(need)
@@ -435,8 +446,9 @@ impl Value {
                 }
             }
             Value::Real(_) => 9,
-            Value::Text(s) => 5 + s.len(),
-            Value::Blob(b) => 5 + b.len(),
+            // 1 type tag + bytes + 1 terminator.
+            Value::Text(s) => 2 + s.len(),
+            Value::Blob(b) => 2 + b.len(),
         }
     }
 
