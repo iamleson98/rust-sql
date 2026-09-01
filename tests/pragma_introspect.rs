@@ -16,7 +16,16 @@ fn diff_query(setup: &[&str], query: &str) {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     for s in setup {
         db.execute(s, []).unwrap();
-        conn.execute(s, []).unwrap();
+        // Row-returning setup statements (e.g. PRAGMA locking_mode = X)
+        // are rejected by rusqlite's execute (AFTER running) — drain the
+        // rows via prepare/query; other errors propagate.
+        match conn.execute(s, []) {
+            Err(rusqlite::Error::ExecuteReturnedResults) => {
+                let mut stmt = conn.prepare(s).unwrap();
+                let _ = stmt.query([]).unwrap();
+            }
+            other => { other.unwrap(); }
+        }
     }
     let ours = db
         .query_with_columns(query, [])
@@ -348,4 +357,102 @@ fn pragma_table_info_through_prepared_statement() {
         names,
         vec!["cid", "name", "type", "notnull", "dflt_value", "pk"]
     );
+}
+
+
+/// Run identical SQL programs on both engines (each statement via
+/// execute), then compare a final query — used for transaction-mode and
+/// write-pragma round-trip programs.
+fn diff_program(setup: &[&str], program: &[&str], check: &str) {
+    let mut db = Database::open_in_memory().unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for group in [setup, program] {
+        for s in group {
+            let ours = db.execute(s, []).map(|_| ());
+            // rusqlite's execute rejects row-returning pragmas; re-run
+            // those through the query path (result rows discarded here —
+            // diff_query compares them elsewhere).
+            let theirs = match conn.execute(s, []) {
+                Ok(_) => Ok(()),
+                Err(rusqlite::Error::ExecuteReturnedResults) => {
+                    let mut stmt = conn.prepare(s).unwrap();
+                    let _ = stmt.query([]).unwrap();
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            match (ours, theirs) {
+                (Ok(()), Ok(())) => {}
+                (Err(e), Err(te)) => {
+                    let (o, t) = (e.to_string(), te.to_string());
+                    assert!(
+                        o.starts_with(&t[..t.len().min(30)]) || t.starts_with(&o[..o.len().min(30)]),
+                        "error mismatch on {s}\n  rustqlite: {o}\n  sqlite:   {t}"
+                    );
+                }
+                (Err(e), Ok(())) => panic!("rustqlite failed where SQLite succeeded on {s}: {e}"),
+                (Ok(()), Err(te)) => panic!("SQLite failed where rustqlite succeeded on {s}: {te}"),
+            }
+        }
+    }
+    diff_query(&[], check);
+}
+
+// ===========================================================================
+// PRAGMA locking_mode round-trip (SQLite: write returns the new mode and
+// subsequent reads repeat it — connection setups and migrators rely on it)
+// ===========================================================================
+
+#[test]
+fn locking_mode_write_returns_new_mode() {
+    diff_query(&[], "PRAGMA locking_mode = EXCLUSIVE");
+}
+
+#[test]
+fn locking_mode_round_trip() {
+    // Write -> read back -> reset -> read back.
+    diff_query(
+        &["PRAGMA locking_mode = EXCLUSIVE"],
+        "PRAGMA locking_mode",
+    );
+    diff_query(
+        &["PRAGMA locking_mode = EXCLUSIVE", "PRAGMA locking_mode = NORMAL"],
+        "PRAGMA locking_mode",
+    );
+}
+
+#[test]
+fn locking_mode_call_form() {
+    diff_query(&[], "PRAGMA locking_mode(EXCLUSIVE)");
+}
+
+// ===========================================================================
+// Transaction modes (pool managers and migrators issue these)
+// ===========================================================================
+
+#[test]
+fn begin_modes_parse_and_commit() {
+    diff_program(
+        &[],
+        &[
+            "BEGIN",
+            "COMMIT",
+            "BEGIN DEFERRED",
+            "COMMIT",
+            "BEGIN IMMEDIATE",
+            "COMMIT",
+            "BEGIN EXCLUSIVE",
+            "COMMIT",
+            "BEGIN",
+            "END",
+        ],
+        "SELECT 1",
+    );
+}
+
+#[test]
+fn synchronous_pragma_round_trip() {
+    diff_query(&[], "PRAGMA synchronous = OFF");
+    diff_query(&["PRAGMA synchronous = OFF"], "PRAGMA synchronous");
+    diff_query(&["PRAGMA synchronous = 1"], "PRAGMA synchronous");
 }

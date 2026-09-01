@@ -1178,7 +1178,15 @@ impl Parser {
             Some(PragmaValue::Expr(v))
         } else if self.peek().is_punct('(') {
             self.advance();
-            let e = self.parse_expr()?;
+            // Bare keyword values apply to the call form too
+            // (`PRAGMA journal_mode(WAL)`, `PRAGMA locking_mode(EXCLUSIVE)`).
+            let e = if keyword_text(&self.peek().token).is_some() {
+                let txt = keyword_text(&self.peek().token).unwrap();
+                self.advance();
+                Expr::Literal(Value::Text(txt.into()))
+            } else {
+                self.parse_expr()?
+            };
             self.expect_punct(')')?;
             Some(PragmaValue::Call(e))
         } else {
@@ -2631,7 +2639,10 @@ fn keyword_text(t: &crate::sql::lexer::Token) -> Option<String> {
         match *k {
             "DELETE" | "WAL" | "MEMORY" | "TRUNCATE" | "PERSIST" | "NORMAL"
             | "FULL" | "EXTRA" | "ROW" | "STATEMENT" | "QUERY" | "INCREMENTAL"
-            | "RESTART" | "PASSIVE" | "FORCE" | "OPTIMIZE" => Some(k.to_string()),
+            | "RESTART" | "PASSIVE" | "FORCE" | "OPTIMIZE" | "EXCLUSIVE"
+            | "OFF" | "ON" | "FIRST" | "LAST" | "SMALLEST" | "LARGEST" => {
+                Some(k.to_string())
+            }
             _ => None,
         }
     } else {

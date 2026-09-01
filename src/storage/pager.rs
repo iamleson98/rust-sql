@@ -303,6 +303,11 @@ pub struct Pager {
     /// Lives on the pager so both Database (api.rs) and the executor's
     /// static statement dispatcher can reach it through a shared &Pager.
     foreign_keys_enabled: AtomicBool,
+    /// Advisory PRAGMA locking_mode ("exclusive" vs "normal"). The
+    /// engine's actual cross-connection locking is the transaction slot;
+    /// this flag makes the pragma round-trip observable (SQLite: the write
+    /// form returns the new mode and later reads repeat it).
+    locking_mode_exclusive: AtomicBool,
     /// Whether triggers may fire recursively (PRAGMA recursive_triggers).
     /// SQLite's DEFAULT IS OFF: a trigger does not re-fire for statements
     /// executed from inside another trigger. Our engine previously always
@@ -614,6 +619,7 @@ impl Pager {
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
+            locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
             last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1677,6 +1683,15 @@ impl Pager {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.foreign_keys_enabled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Advisory PRAGMA locking_mode toggle — see the field docs.
+    pub fn set_locking_mode_exclusive(&self, exclusive: bool) {
+        self.locking_mode_exclusive.store(exclusive, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn locking_mode_exclusive(&self) -> bool {
+        self.locking_mode_exclusive.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// PRAGMA synchronous level: 0=OFF, 1=NORMAL, 2=FULL (default).

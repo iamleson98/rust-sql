@@ -3584,12 +3584,16 @@ impl Database {
                         partial_expr: None,
                         create_sql: idx_sql.clone(),
                     };
-                    let schema_row = crate::schema::encode_schema_row(
+                    // SQLite stores NULL sql for auto-indexes; the catalog
+                    // keeps the synthesized DDL for reopen (load_schema
+                    // rebuilds implicit indexes from the TABLE's DDL and
+                    // matches them to these rows by name + rootpage).
+                    let schema_row = crate::schema::encode_schema_row_opt(
                         "index",
                         &index.name,
                         &index.table,
                         idx_root,
-                        &index.create_sql,
+                        None,
                     );
                     insert_schema_row(ctx.pager, &schema_row)?;
                     catalog.add_index(index);
@@ -4513,6 +4517,17 @@ impl Database {
                     };
                     ctx.pager.set_synchronous(level);
                 }
+                "locking_mode" => {
+                    // Advisory round-trip (see Pager::locking_mode_exclusive).
+                    let mode = match (&v, value_as_expr(value)) {
+                        (Value::Text(t), _) => t.to_ascii_lowercase(),
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            name.to_ascii_lowercase()
+                        }
+                        _ => String::new(),
+                    };
+                    ctx.pager.set_locking_mode_exclusive(mode == "exclusive");
+                }
                 "wal_checkpoint" => {
                     ctx.pager.checkpoint_wal()?;
                 }
@@ -4830,6 +4845,32 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         }
         return None;
     }
+    // `PRAGMA locking_mode = EXCLUSIVE`: the write form RETURNS the new
+    // mode as a row (SQLite behavior — connection setups read it back).
+    // Semantics: advisory in this engine (single-process locking is
+    // handled by the transaction slot), but the round-trip must match.
+    if p.value.is_some() && name == "locking_mode" {
+        let mode = p.value.as_ref().and_then(|v| {
+            match value_as_expr(v) {
+                crate::sql::ast::Expr::Column { name, .. } => {
+                    Some(name.to_ascii_lowercase())
+                }
+                crate::sql::ast::Expr::Literal(Value::Text(t)) => {
+                    Some(t.to_ascii_lowercase())
+                }
+                _ => None,
+            }
+        });
+        if let Some(mode) = mode {
+            db.pager
+                .set_locking_mode_exclusive(mode == "exclusive");
+            return Some(PragmaRows::single(
+                "locking_mode",
+                Value::Text(if mode == "exclusive" { "exclusive" } else { "normal" }.into()),
+            ));
+        }
+        return None;
+    }
     // Table-valued introspection pragmas: the argument arrives as the
     // call form (`PRAGMA table_info(t)`) or a string literal.
     let catalog = &db.catalog;
@@ -4906,7 +4947,13 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         ),
         "synchronous" => Value::Integer(pager.synchronous() as i64),
         "temp_store" => Value::Integer(0),
-        "locking_mode" => Value::Text("normal".into()),
+        "locking_mode" => Value::Text(
+            if pager.locking_mode_exclusive() {
+                "exclusive".into()
+            } else {
+                "normal".into()
+            },
+        ),
         "user_version" => Value::Integer(0),
         "application_id" => Value::Integer(0),
         "auto_vacuum" => Value::Integer(0),
@@ -5223,8 +5270,17 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     // Decode into owned tuples so the row Vecs can drop.
     let mut tables_first: Vec<(String, String, String, u32, String)> = Vec::new();
     let mut others: Vec<(String, String, String, u32, String)> = Vec::new();
+    // Index rows keyed by name — used by the table branch to recover the
+    // rootpages of implicit auto-index rows (which carry NULL sql, like
+    // SQLite — they are rebuilt from the TABLE's DDL, not parsed).
+    let mut index_row_by_name: std::collections::HashMap<String, (u32, String)> =
+        std::collections::HashMap::new();
     for row in entries {
         if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+            if kind == "index" {
+                index_row_by_name
+                    .insert(_name.to_string(), (rootpage, sql.to_string()));
+            }
             let owned = (kind.to_string(), _name.to_string(), tbl_name.to_string(), rootpage, sql.to_string());
             if kind == "table" {
                 tables_first.push(owned);
@@ -5244,7 +5300,16 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                 "table" => {
                     if let Ok(Statement::Create(CreateStatement::Table { name: tn, columns, constraints, without_rowid, strict, .. })) = parse(sql) {
                         let table = build_table(&tn.name, &columns, &constraints, rootpage, without_rowid, strict, sql)?;
-                        catalog.add_table(table);
+                        catalog.add_table(table.clone());
+                        // Implicit auto-indexes (sqlite_autoindex_*): their
+                        // schema rows have NULL sql (SQLite-faithful), so
+                        // reconstruct them from THIS DDL — column-level
+                        // UNIQUE, then table-level UNIQUE, then non-alias
+                        // PRIMARY KEY — matching CREATE-time order, and
+                        // pair with the rows by name to recover rootpages.
+                        // (Rows WITH sql text are handled by the "index"
+                        // branch below — legacy files.)
+                        rebuild_implicit_indexes(&table, &columns, &constraints, &index_row_by_name, catalog);
                     } else if let Ok(Statement::Create(CreateStatement::VirtualTable { name: tn, module, args, .. })) = parse(sql) {
                         // Virtual table: the module isn't registered at
                         // open time — build a PENDING instance. The column
@@ -5311,6 +5376,94 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Rebuild the implicit `sqlite_autoindex_<table>_<n>` indexes for one
+/// table during `load_schema`. Their schema rows carry NULL sql (SQLite
+/// stores NULL for auto-indexes), so the TABLE's DDL is the source of
+/// truth: column-level UNIQUE (in column order), then table-level
+/// UNIQUE, then non-rowid-alias PRIMARY KEY — the exact collection order
+/// `execute_create` uses, so the numbering matches. Rows carrying DDL
+/// text (legacy files) are skipped here — the "index" branch parses them.
+fn rebuild_implicit_indexes(
+    table: &crate::schema::Table,
+    columns: &[crate::sql::ast::ColumnDef],
+    constraints: &[crate::sql::ast::TableConstraint],
+    index_rows: &std::collections::HashMap<String, (u32, String)>,
+    catalog: &mut Catalog,
+) {
+    let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
+    for col in columns {
+        if col.constraints.iter().any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique)) {
+            let collate = col.constraints.iter().find_map(|c| {
+                if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            });
+            implicit.push(vec![crate::sql::ast::IndexedColumn {
+                name: col.name.clone(),
+                order: crate::sql::ast::Order::Asc,
+                collation: collate,
+            }]);
+        }
+    }
+    for c in constraints {
+        match c {
+            crate::sql::ast::TableConstraint::Unique(cols) => {
+                implicit.push(cols.clone());
+            }
+            crate::sql::ast::TableConstraint::PrimaryKey { columns: cols } => {
+                let is_rowid_alias = cols.len() == 1
+                    && table.rowid_alias.is_some()
+                    && columns
+                        .iter()
+                        .position(|cc| cc.name.eq_ignore_ascii_case(&cols[0].name))
+                        .map(|ci| table.rowid_alias == Some(ci))
+                        .unwrap_or(false);
+                if !is_rowid_alias {
+                    implicit.push(cols.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for (n, cols) in implicit.iter().enumerate() {
+        let idx_name = format!("sqlite_autoindex_{}_{}", table.name, n + 1);
+        let Some((root, sql_text)) = index_rows.get(&idx_name) else { continue };
+        if !sql_text.is_empty() {
+            continue; // legacy row with DDL text — parsed by the index branch
+        }
+        let idx_columns = match crate::schema::build_index_columns(cols, table) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let col_list = cols
+            .iter()
+            .map(|ic| {
+                let coll = match &ic.collation {
+                    Some(c) => format!(" COLLATE \"{}\"", c),
+                    None => String::new(),
+                };
+                format!("\"{}\"{}", ic.name, coll)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let idx_sql = format!(
+            "CREATE UNIQUE INDEX \"{}\" ON \"{}\"({})",
+            idx_name, table.name, col_list
+        );
+        catalog.add_index(crate::schema::Index {
+            name: idx_name,
+            table: table.name.clone(),
+            columns: idx_columns,
+            root_page: *root,
+            unique: true,
+            partial_expr: None,
+            create_sql: idx_sql,
+        });
+    }
 }
 
 // Heuristic: does this SQL string start a DDL statement (CREATE/DROP/ALTER)?

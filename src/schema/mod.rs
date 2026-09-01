@@ -710,12 +710,24 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
 /// Encode a catalog entry as a row in the schema table (`sqlite_master`).
 /// Columns: (type, name, tbl_name, rootpage, sql).
 pub fn encode_schema_row(kind: &str, name: &str, tbl_name: &str, rootpage: PageId, sql: &str) -> Vec<Value> {
+    encode_schema_row_opt(kind, name, tbl_name, rootpage, Some(sql))
+}
+
+/// [`encode_schema_row`] with a NULL `sql` column. SQLite stores NULL sql
+/// for auto-indexes (`sqlite_autoindex_*`) — tools that dump
+/// `SELECT sql FROM sqlite_master` and re-apply it must not see (and
+/// re-create) the implicit indexes. The reopen path rebuilds them from
+/// the TABLE's DDL instead (see `load_schema`).
+pub fn encode_schema_row_opt(kind: &str, name: &str, tbl_name: &str, rootpage: PageId, sql: Option<&str>) -> Vec<Value> {
     vec![
         Value::Text(kind.to_string().into()),
         Value::Text(name.to_string().into()),
         Value::Text(tbl_name.to_string().into()),
         Value::Integer(rootpage as i64),
-        Value::Text(sql.to_string().into()),
+        match sql {
+            Some(s) => Value::Text(s.to_string().into()),
+            None => Value::Null,
+        },
     ]
 }
 
