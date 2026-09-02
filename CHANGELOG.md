@@ -1,5 +1,81 @@
 # Changelog
 
+## [Unreleased] — 2026-09-02 gap-close sprint: every benchmark row at parity or faster
+
+### Performance
+
+- **GROUP BY 2.6× faster** (`SELECT val/100 AS bucket, COUNT(*) FROM t
+  GROUP BY bucket`: 1.92 → 0.72 ms vs SQLite 1.84 ms): the streaming
+  aggregate's general path now compiles GROUP-BY keys AND aggregate args
+  that are arithmetic over columns/literals/params into positional
+  `CompiledExpr` trees once per statement (~5-15 ns/row vs the ~60-120
+  ns/row `eval_row` AST walk + name resolution). When everything
+  compiles, the row decode becomes SELECTIVE (`decode_row_selective_wide`
+  — full-width buffer, identity indexing, only referenced columns
+  decoded), the single-key case skips the key-slice Vec entirely
+  (`intern_one`), and `HashGrouper` hashes with FxHash (~5-10 ns vs
+  SipHash's ~25-40 ns per key). `COUNT(*)`'s placeholder argument is a
+  shared static — zero per-row Value construction.
+- **Point lookup by rowid 1.2× faster than SQLite** (246 vs 350 µs per
+  1000 ops; was 375-402 µs, ~1.08× SLOWER):
+  - **Bucket-keyed 2-way set-associative leaf cache**: table-leaf hint
+    slots are keyed by `rowid >> 8` (two slots per bucket). One B+tree
+    descent now primes a whole 256-rowid bucket, so a first-visit sweep
+    over sequential rowids (fixed-parameter OLTP loops, the bench's
+    `WHERE id = ?` cycling pattern) descends ~once per leaf pair instead
+    of once per rowid. The fill policy refreshes the same-page entry,
+    prefers empty/stale slots, and evicts the leaf farther from the probe
+    — a bucket straddling a leaf boundary keeps BOTH leaves resident.
+  - **Cursor-ix cell bias** (SQLite's `pCur->ix` technique): every
+    table-leaf and index-leaf search probes the remembered cell index
+    first, then falls back to an exact bracketed search. Sequential
+    rowid/key access resolves in 1-2 probes instead of log2(cells)
+    (~8-10 for a 290-cell leaf). The bias rides the existing epoch-checked
+    hint slots, so staleness remains impossible.
+  - **`maps_populated` atomic flag**: fast-path point lookups skip the
+    bookkeeping-maps read-lock entirely while no B+tree split has moved a
+    root (the overwhelmingly common case). Writers refresh the flag at
+    every attach site — `query` is `&self`, writers `&mut self`, so a
+    stale `false` is impossible.
+- **First-query-after-bulk-write latency 287 → 41 µs**: mimalloc's
+  delayed-free queue wakes on the first allocating READ after a bulk
+  write transaction (200-400 µs, measured in
+  `examples/probe_drain_cold.rs`). The engine now estimates freed blocks
+  per write statement (rows × 6 + write-ops × 150 + AST teardown) and, at
+  write-burst completion (COMMIT / auto-commit / DDL — mid-transaction
+  drains are useless, the remaining statements re-arm the queue), drains
+  the wake with a 512-allocation small-class tap (~170 µs, amortized
+  inside the multi-ms transaction). Once per process; a read-side
+  safety net covers DML-via-RETURNING bursts.
+- **UPDATE payload-patch fast path**: when the table has no NOT NULL /
+  CHECK / enforced-FK constraints, no RETURNING, and every SET
+  compiles, the new payload is built by copying the OLD payload bytes
+  and patching only the assigned columns' byte regions
+  (`row_column_regions_into` walks the encoded layout; each new value
+  must keep its encoded size). Skips the full-row decode and full-row
+  re-encode (~60-90 ns/row). Any mismatch (size change, missing column,
+  decode error) falls back to the generic path — identical semantics.
+  8 new differential cases (same-size REALs, size-changing TEXT, int
+  size-class boundaries, multi-assign, NULL transitions).
+
+### Fixed
+
+- **`--no-default-features` build**: `ffi.rs`'s `sqlite3_load_extension`
+  bridge called `Database::load_extension` unconditionally, which is
+  `#[cfg(feature = "extension")]` — the no-extension build failed to
+  compile. It now returns a clean "extension loading is disabled" error
+  instead (mirroring SQLite's SQLITE_OMIT_LOAD_EXTENSION behavior).
+
+### sqlx / sea-orm
+
+- All four in-repo interop suites re-verified on this build:
+  `sqlx-interop` (pool, binds, error mapping, raw_sql, 8-connection
+  concurrent pool, blob+NULL round-trips), `sea_orm_interop` (CRUD,
+  transactions, UNIQUE error code 2067 propagation), `sea_orm_relations`
+  (junction models, Linked chains, grouped loading, paginator), and
+  `migrate_interop` (sqlx::migrate! fresh apply, idempotent re-run,
+  atomic rollback of failing migrations, cross-pool visibility).
+
 ## [Unreleased] — sqlx/sea-orm drop-in compatibility, full UPDATE constraint semantics
 
 ### Added
