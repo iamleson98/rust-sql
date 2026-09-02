@@ -37,9 +37,13 @@ fn main() {
         let _ = db.query("SELECT * FROM b", []).unwrap();
     }
 
-    let n = 200;
+    let n = if std::env::var("LONG").is_ok() {
+        20_000
+    } else {
+        200
+    };
 
-    // 1. Full join
+    // 1. Full join — criterion-exact shape (black_box, no assert).
     let t = std::time::Instant::now();
     for _ in 0..n {
         let rows = db
@@ -48,7 +52,7 @@ fn main() {
                 [],
             )
             .unwrap();
-        assert_eq!(rows.len(), 1000);
+        std::hint::black_box(rows);
     }
     let d = t.elapsed() / n;
     println!(

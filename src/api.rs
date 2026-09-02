@@ -285,6 +285,11 @@ pub struct Database {
     /// mutable (`Mutex`) because the read paths (`query`) must be able to
     /// break (flush) a hot chain from `&self`.
     insert_chain: Mutex<Option<InsertChain>>,
+    /// Advisory fast-path flag for [`Database::break_insert_chain`]: true
+    /// while a chain might be hot. Cold (the overwhelmingly common state
+    /// for read-heavy workloads) the break costs ONE relaxed atomic load
+    /// instead of a mutex round-trip (~10 ns) on every query.
+    insert_chain_hot: AtomicBool,
 }
 
 /// Default capacity of the statement cache.
@@ -1719,6 +1724,7 @@ impl Database {
             deferred_flush_threshold: 1000,
             last_rowid: AtomicI64::new(0),
             insert_chain: Mutex::new(None),
+            insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1831,26 +1837,6 @@ impl Database {
         self.pager.flush()
     }
 
-    /// Look up the statement cache; on miss, parse + plan, store, and return.
-    /// Returns a `CachedStmt` clone (three refcount bumps) so the caller can:
-    /// - For SELECT (query path): use just the Plan (cheap Arc clone).
-    /// - For DML/DDL (execute path): use the Arc<Statement> (cheap Arc clone).
-    /// - The `has_subqueries` flag avoids re-walking the plan tree per query.
-    ///
-    /// The cached Plan is `Option<Plan>` and is cloned — cheap because
-    /// `Plan` is `Clone` with only `Arc` references internally (no deep
-    /// copies of large structures).
-    ///
-    /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
-    /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
-    /// don't conflict.
-    /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
-    ///
-    /// Returns `Ok(true)` when executed, `Ok(false)` when the fast path
-    /// turns out not to apply (caller falls through to the general path),
-    /// `Err` for a real failure. Not-applicable cases: WITHOUT ROWID /
-    /// STRICT tables, generated columns, missing DEFAULT evaluation,
-    /// duplicate column names (the general path produces nicer errors).
     // ------------------------------------------------------------------
     // INSERT CHAIN (see `InsertChain` docs for the design).
     // ------------------------------------------------------------------
@@ -1875,6 +1861,7 @@ impl Database {
             // the bookkeeping maps, then drop it. The cold path below (or
             // a later statement) rebuilds a chain for the new shape.
             let flushed = guard.take();
+            self.insert_chain_hot.store(false, Ordering::Relaxed);
             drop(guard);
             if let Some(ch) = flushed {
                 self.flush_insert_chain(&ch)?;
@@ -1891,6 +1878,7 @@ impl Database {
             }
             Ok(false) => {
                 let flushed = guard.take();
+                self.insert_chain_hot.store(false, Ordering::Relaxed);
                 drop(guard);
                 if let Some(ch) = flushed {
                     self.flush_insert_chain(&ch)?;
@@ -1903,6 +1891,7 @@ impl Database {
                 // already bumped the epoch, so the chain can never validate
                 // again — flush and drop it for a clean slate.
                 let flushed = guard.take();
+                self.insert_chain_hot.store(false, Ordering::Relaxed);
                 drop(guard);
                 if let Some(ch) = flushed {
                     let _ = self.flush_insert_chain(&ch);
@@ -1933,8 +1922,7 @@ impl Database {
             if ch.full_row[c].is_null() {
                 return Err(Error::constraint(format!(
                     "NOT NULL constraint failed: {}.{}",
-                    ch.table.name,
-                    ch.table.columns[c].name
+                    ch.table.name, ch.table.columns[c].name
                 )));
             }
         }
@@ -2030,7 +2018,15 @@ impl Database {
     /// this first: while a chain is hot, the shared maps' root / max-rowid
     /// entries for the chained table are stale by design.
     pub(crate) fn break_insert_chain(&self) {
+        // Advisory flag: one relaxed load when cold (~1 ns) — a mutex
+        // round-trip here on EVERY query measurably regressed point
+        // lookups. False can never skip a needed flush: the flag is only
+        // cleared while holding the chain mutex with the chain taken.
+        if !self.insert_chain_hot.load(Ordering::Relaxed) {
+            return;
+        }
         let flushed = self.insert_chain.lock().take();
+        self.insert_chain_hot.store(false, Ordering::Relaxed);
         if let Some(ch) = flushed {
             // Flush state. Read paths tolerate flush errors the same way
             // they tolerate deferred-flush failures: log nothing, keep
@@ -2096,10 +2092,8 @@ impl Database {
                 col_indices.to_vec(),
             )
         };
-        let affinities: Vec<crate::types::Affinity> = col_idx
-            .iter()
-            .map(|&i| table.columns[i].affinity)
-            .collect();
+        let affinities: Vec<crate::types::Affinity> =
+            col_idx.iter().map(|&i| table.columns[i].affinity).collect();
         let not_null: Vec<usize> = table
             .columns
             .iter()
@@ -2124,8 +2118,16 @@ impl Database {
             payload_buf: Vec::with_capacity(n_cols * 8),
         };
         *self.insert_chain.lock() = Some(chain);
+        self.insert_chain_hot.store(true, Ordering::Relaxed);
     }
 
+    /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
+    ///
+    /// Returns `Ok(true)` when executed, `Ok(false)` when the fast path
+    /// turns out not to apply (caller falls through to the general path),
+    /// `Err` for a real failure. Not-applicable cases: WITHOUT ROWID /
+    /// STRICT tables, generated columns, missing DEFAULT evaluation,
+    /// duplicate column names (the general path produces nicer errors).
     fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
         let table = match self.catalog.get_table_fast(fi.table) {
             Some(t) => t,
@@ -2293,6 +2295,19 @@ impl Database {
         }
     }
 
+    /// Look up the statement cache; on miss, parse + plan, store, and return.
+    /// Returns a `CachedStmt` clone (three refcount bumps) so the caller can:
+    /// - For SELECT (query path): use just the Plan (cheap Arc clone).
+    /// - For DML/DDL (execute path): use the Arc<Statement> (cheap Arc clone).
+    /// - The `has_subqueries` flag avoids re-walking the plan tree per query.
+    ///
+    /// The cached Plan is `Option<Plan>` and is cloned — cheap because
+    /// `Plan` is `Clone` with only `Arc` references internally (no deep
+    /// copies of large structures).
+    ///
+    /// On any cache lookup we DO NOT consult `self.catalog` mutably, so the
+    /// borrow of `self.stmt_cache` and the immutable borrow of `self.catalog`
+    /// don't conflict.
     pub(crate) fn get_or_cache_stmt(&self, sql: &str) -> Result<Arc<CachedStmt>> {
         // Planning must see the plugin registry (user aggregates change
         // how expressions are planned — see is_aggregate_call). One

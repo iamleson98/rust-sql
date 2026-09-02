@@ -312,6 +312,73 @@ fn value_encoded_len(buf: &[u8]) -> Result<usize> {
     })
 }
 
+/// Selective decode for callers that GUARANTEE a sorted, deduplicated
+/// `col_indices` (the fused hash join constructs its wanted lists that
+/// way). Semantically identical to [`decode_row_selective`] — same
+/// NULL-filling for short rows, same rowid-alias handling — but skips
+/// the general decoder's per-call ascending probe, permutation
+/// machinery, and duplicate-run handling: the per-row walk is the fused
+/// join's dominant decode cost, so every branch matters.
+///
+/// # Panics / errors
+/// Returns a corruption error on truncated or malformed payloads (the
+/// caller decides whether to skip the row or fail the query).
+pub fn decode_row_selective_sorted(
+    buf: &[u8],
+    n_cols_total: usize,
+    col_indices: &[usize],
+    rowid: i64,
+    alias: Option<usize>,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    debug_assert!(col_indices.windows(2).all(|w| w[0] < w[1]));
+    out.clear();
+    out.resize(col_indices.len(), Value::Null);
+    if col_indices.is_empty() {
+        return Ok(());
+    }
+    let mut pos = 0usize;
+    let mut wi = 0usize; // index into col_indices of the next wanted column
+    for col in 0..n_cols_total {
+        if wi >= col_indices.len() {
+            break;
+        }
+        // Short row (fewer encoded columns than declared — ALTER ADD
+        // COLUMN territory): remaining wanted columns stay NULL.
+        if pos >= buf.len() {
+            break;
+        }
+        let target = col_indices[wi];
+        if col < target {
+            // Unwanted column: length probe only.
+            if alias == Some(col) {
+                pos += 1; // rowid-alias marker byte
+            } else {
+                pos += value_encoded_len(&buf[pos..])?;
+            }
+            continue;
+        }
+        // col == target (col increments by one, so it cannot jump past a
+        // target it was below; sorted+dedup guarantees no repeats).
+        if alias == Some(col) {
+            if buf[pos] != ROWID_MARKER {
+                return Err(crate::error::Error::corruption(
+                    "rowid-alias column must hold the rowid marker",
+                ));
+            }
+            out[wi] = Value::Integer(rowid);
+            pos += 1;
+        } else {
+            let (v, n) = Value::decode(&buf[pos..])
+                .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
+            out[wi] = v;
+            pos += n;
+        }
+        wi += 1;
+    }
+    Ok(())
+}
+
 /// Decode only the wanted columns into a FULL-WIDTH row buffer
 /// (`out.len() == n_cols_total`), leaving every non-wanted column as
 /// `Value::Null`. This is the companion of `decode_row_selective` for

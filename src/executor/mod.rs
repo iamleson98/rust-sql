@@ -5421,50 +5421,11 @@ fn exec_join(
     })
 }
 
-/// Hash join: build a hash table on the smaller side, then probe with the
-/// other side. Works for equi-joins where the condition is `left.col =
-/// right.col` (or an AND chain of such equalities).
-///
-/// Performance-critical design notes (this node runs for every join in
-/// every query):
-///
-/// 1. **Pure-equi fast path.** When the join condition consists ONLY of the
-///    extracted equi-key predicates (no residual terms like `b.y > 5`),
-///    matching hash keys PROVES the condition holds — the per-candidate
-///    `eval_row` call is skipped entirely. That call walks the AST and
-///    resolves column names by string comparison per row (~300-500 ns
-///    each); skipping it is the single biggest win, ~0.4 ms on a 1k x 1k
-///    join.
-///
-/// 2. **Order-key encoding for join keys.** Keys are built with
-///    `encode_order_key_into`, which interleaves INTEGER and REAL values
-///    numerically. This is both alloc-free (into a reusable buffer on the
-///    probe side) and *semantically required*: SQL equality says 5 = 5.0,
-///    but the old `Value::encode()` tagged encoding hashed them apart,
-///    silently dropping cross-type join matches.
-///
-/// 3. **NULL keys never match.** `NULL = x` is NULL in SQL. NULL-keyed
-///    build rows are excluded from the hash table and NULL-keyed probe
-///    rows skip probing — they fall through to the unmatched-emission path
-///    (which is what LEFT/RIGHT/FULL joins need; INNER just drops them).
-///
-/// 4. **Bucket-chain hash table.** `heads: HashMap<Vec<u8>, u32>` plus a
-///    flat `chain: Vec<u32>` linked list. One allocation per build row
-///    (the owned key), zero per probe. The previous layout stored
-///    `Vec<u8> -> Vec<usize>` — an extra heap Vec per distinct key.
-///
-/// 5. **Single-allocation combined rows.** `Vec::with_capacity(n_l+n_r)` +
-///    two `extend_from_slice`s, instead of cloning one side wholesale into
-///    a temporary Vec that was immediately consumed by `extend`.
-
 /// Static column list a bare `Plan::Scan` would report — without executing
 /// it. Must match `exec_scan` exactly (alias-qualified names when the
 /// effective prefix differs from the table name, the cached qualified
 /// names otherwise).
-fn scan_columns_static(
-    table: &Arc<Table>,
-    alias: &Option<String>,
-) -> std::sync::Arc<[String]> {
+fn scan_columns_static(table: &Arc<Table>, alias: &Option<String>) -> std::sync::Arc<[String]> {
     let prefix = alias.as_deref().unwrap_or(&table.name);
     if prefix == table.name {
         table.qualified_col_names.clone()
@@ -5678,14 +5639,13 @@ fn try_fused_scan_hash_join(
     // bits of key * PHI spreads monotone keys uniformly (~5 ns/op, faster
     // than std's SipHash at ~15 ns/op).
     let n_build = build.count;
-    let mut build_vals: Vec<Value> =
-        Vec::with_capacity(n_build.saturating_mul(stride).max(1));
+    let mut build_vals: Vec<Value> = Vec::with_capacity(n_build.saturating_mul(stride).max(1));
     let mut chain: Vec<u32> = vec![u32::MAX; n_build];
     // Capacity: next power of two >= 2 * n_build (load factor <= 0.5 —
     // probe chains stay ~1.3 slots on average, and an empty slot always
     // exists so the linear probe terminates).
     let table_cap = (n_build.max(1)).next_power_of_two() << 1;
-    let table_mask = table_cap.wrapping_sub(1) as usize;
+    let table_mask = table_cap.wrapping_sub(1);
     // Top-bits shift for multiplicative hashing (see the comment above).
     let hash_shift = 64 - table_cap.trailing_zeros();
     #[inline]
@@ -5715,7 +5675,7 @@ fn try_fused_scan_hash_join(
     {
         let mut bt = Btree::new(pager, build.root, false);
         bt.scan_table_borrowed(|rowid, payload| {
-            if crate::storage::row_codec::decode_row_selective(
+            if crate::storage::row_codec::decode_row_selective_sorted(
                 payload,
                 build.n_cols,
                 &build_wanted,
@@ -5790,7 +5750,7 @@ fn try_fused_scan_hash_join(
     {
         let mut bt = Btree::new(pager, probe.root, false);
         bt.scan_table_borrowed(|rowid, payload| {
-            if crate::storage::row_codec::decode_row_selective(
+            if crate::storage::row_codec::decode_row_selective_sorted(
                 payload,
                 probe.n_cols,
                 &probe_wanted,
@@ -5855,6 +5815,41 @@ fn try_fused_scan_hash_join(
     }))
 }
 
+/// Hash join: build a hash table on the smaller side, then probe with the
+/// other side. Works for equi-joins where the condition is `left.col =
+/// right.col` (or an AND chain of such equalities).
+///
+/// Performance-critical design notes (this node runs for every join in
+/// every query):
+///
+/// 1. **Pure-equi fast path.** When the join condition consists ONLY of the
+///    extracted equi-key predicates (no residual terms like `b.y > 5`),
+///    matching hash keys PROVES the condition holds — the per-candidate
+///    `eval_row` call is skipped entirely. That call walks the AST and
+///    resolves column names by string comparison per row (~300-500 ns
+///    each); skipping it is the single biggest win, ~0.4 ms on a 1k x 1k
+///    join.
+///
+/// 2. **Order-key encoding for join keys.** Keys are built with
+///    `encode_order_key_into`, which interleaves INTEGER and REAL values
+///    numerically. This is both alloc-free (into a reusable buffer on the
+///    probe side) and *semantically required*: SQL equality says 5 = 5.0,
+///    but the old `Value::encode()` tagged encoding hashed them apart,
+///    silently dropping cross-type join matches.
+///
+/// 3. **NULL keys never match.** `NULL = x` is NULL in SQL. NULL-keyed
+///    build rows are excluded from the hash table and NULL-keyed probe
+///    rows skip probing — they fall through to the unmatched-emission path
+///    (which is what LEFT/RIGHT/FULL joins need; INNER just drops them).
+///
+/// 4. **Bucket-chain hash table.** `heads: HashMap<Vec<u8>, u32>` plus a
+///    flat `chain: Vec<u32>` linked list. One allocation per build row
+///    (the owned key), zero per probe. The previous layout stored
+///    `Vec<u8> -> Vec<usize>` — an extra heap Vec per distinct key.
+///
+/// 5. **Single-allocation combined rows.** `Vec::with_capacity(n_l+n_r)` +
+///    two `extend_from_slice`s, instead of cloning one side wholesale into
+///    a temporary Vec that was immediately consumed by `extend`.
 fn exec_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -5874,7 +5869,11 @@ fn exec_hash_join(
     // shape or value the fast path doesn't cover; the materialized path
     // below is then 100% in charge (same semantics, different cost
     // profile).
-    if projection.is_some() && matches!(join_type, crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross)
+    if projection.is_some()
+        && matches!(
+            join_type,
+            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+        )
     {
         if let Some(res) = try_fused_scan_hash_join(ctx, left, right, condition, projection)? {
             return Ok(res);

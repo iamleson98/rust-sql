@@ -18,8 +18,11 @@ fn main() {
         )
         .unwrap();
         for i in 1..=6000i64 {
-            db.execute(&format!("INSERT INTO t (name, val) VALUES ('name{i}', {i})"), [])
-                .unwrap();
+            db.execute(
+                &format!("INSERT INTO t (name, val) VALUES ('name{i}', {i})"),
+                [],
+            )
+            .unwrap();
         }
         let n = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].clone();
         assert_eq!(n, Value::Integer(6000));
@@ -48,8 +51,11 @@ fn main() {
         .unwrap();
         db.execute("BEGIN", []).unwrap();
         for i in 1..=6000i64 {
-            db.execute(&format!("INSERT INTO t (name, val) VALUES ('name{i}', {i})"), [])
-                .unwrap();
+            db.execute(
+                &format!("INSERT INTO t (name, val) VALUES ('name{i}', {i})"),
+                [],
+            )
+            .unwrap();
         }
         db.execute("COMMIT", []).unwrap();
         let n = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].clone();
@@ -70,8 +76,11 @@ fn main() {
         let mut db = Database::open(&path2).unwrap();
         db.execute("BEGIN", []).unwrap();
         for i in 10_000..=10_500i64 {
-            db.execute(&format!("INSERT INTO t (name, val) VALUES ('x{i}', {i})"), [])
-                .unwrap();
+            db.execute(
+                &format!("INSERT INTO t (name, val) VALUES ('x{i}', {i})"),
+                [],
+            )
+            .unwrap();
         }
         db.execute("ROLLBACK", []).unwrap();
         let n = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].clone();

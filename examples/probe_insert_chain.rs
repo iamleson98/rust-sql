@@ -7,13 +7,19 @@ use rustqlite::{Database, Value};
 fn main() {
     // ---------------- Correctness: chain + breakers ----------------
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
 
     // Three chained inserts.
     for i in 1..=3i64 {
-        db.execute(&format!("INSERT INTO t (name, val) VALUES ('n{i}', {i})"), [])
-            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t (name, val) VALUES ('n{i}', {i})"),
+            [],
+        )
+        .unwrap();
     }
     // A SELECT breaks the chain and must observe all rows.
     let rows = db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
@@ -22,8 +28,11 @@ fn main() {
 
     // Chained inserts continue after the read (chain rebuild).
     for i in 4..=5i64 {
-        db.execute(&format!("INSERT INTO t (name, val) VALUES ('n{i}', {i})"), [])
-            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t (name, val) VALUES ('n{i}', {i})"),
+            [],
+        )
+        .unwrap();
     }
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(5));
@@ -32,18 +41,25 @@ fn main() {
     // max_rowid (max rowid was 5, deleted; SQLite semantics: next is the
     // scan-derived max + 1, i.e. 4 -> then chain continues 5, 6...).
     db.execute("DELETE FROM t WHERE id = 5", []).unwrap();
-    db.execute("INSERT INTO t (name, val) VALUES ('again', 99)", []).unwrap();
+    db.execute("INSERT INTO t (name, val) VALUES ('again', 99)", [])
+        .unwrap();
     let rows = db
         .query("SELECT id, name, val FROM t WHERE name = 'again'", [])
         .unwrap();
     assert_eq!(rows.len(), 1);
-    println!("after delete+insert: id={} (expect 4..6, no collision)", rows[0][0]);
+    println!(
+        "after delete+insert: id={} (expect 4..6, no collision)",
+        rows[0][0]
+    );
 
     // ROLLBACK mid-chain.
     db.execute("BEGIN", []).unwrap();
     for i in 100..=150i64 {
-        db.execute(&format!("INSERT INTO t (name, val) VALUES ('r{i}', {i})"), [])
-            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t (name, val) VALUES ('r{i}', {i})"),
+            [],
+        )
+        .unwrap();
     }
     let n_before = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].clone();
     db.execute("ROLLBACK", []).unwrap();
@@ -54,8 +70,11 @@ fn main() {
     // COMMIT persistence of chained inserts (in-memory, just visibility).
     db.execute("BEGIN", []).unwrap();
     for i in 200..=250i64 {
-        db.execute(&format!("INSERT INTO t (name, val) VALUES ('c{i}', {i})"), [])
-            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t (name, val) VALUES ('c{i}', {i})"),
+            [],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     let n = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].clone();
@@ -71,41 +90,49 @@ fn main() {
     )
     .unwrap();
     for i in 0..3 {
-        db.execute(&format!("INSERT INTO t2 (x) VALUES ({i})"), []).unwrap();
+        db.execute(&format!("INSERT INTO t2 (x) VALUES ({i})"), [])
+            .unwrap();
     }
     let fired = db.query("SELECT COUNT(*) FROM log", []).unwrap()[0][0].clone();
-    assert_eq!(fired, Value::Integer(3), "trigger must fire 3x via cold path");
+    assert_eq!(
+        fired,
+        Value::Integer(3),
+        "trigger must fire 3x via cold path"
+    );
     let x_sum = db.query("SELECT SUM(x) FROM t2", []).unwrap()[0][0].clone();
     assert_eq!(x_sum, Value::Integer(3));
 
     // NOT NULL violation mid-chain: error surfaces, state stays correct.
-    db.execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY, a TEXT NOT NULL)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t3 (id INTEGER PRIMARY KEY, a TEXT NOT NULL)",
+        [],
+    )
+    .unwrap();
     db.execute("INSERT INTO t3 (a) VALUES ('ok1')", []).unwrap();
-    let err = db
-        .execute("INSERT INTO t3 (a) VALUES (NULL)", [])
-        .err()
-        .expect("NOT NULL must reject");
+    let err = match db.execute("INSERT INTO t3 (a) VALUES (NULL)", []) {
+        Err(e) => e,
+        Ok(()) => panic!("NOT NULL must reject"),
+    };
     println!("NOT NULL error: {err}");
     db.execute("INSERT INTO t3 (a) VALUES ('ok2')", []).unwrap();
     let n = db.query("SELECT COUNT(*) FROM t3", []).unwrap()[0][0].clone();
     assert_eq!(n, Value::Integer(2));
 
     // Escaped quotes in chained literals.
-    db.execute("CREATE TABLE t4 (id INTEGER PRIMARY KEY, s TEXT)", []).unwrap();
-    db.execute("INSERT INTO t4 (s) VALUES ('it''s')", []).unwrap();
-    db.execute("INSERT INTO t4 (s) VALUES ('plain')", []).unwrap();
+    db.execute("CREATE TABLE t4 (id INTEGER PRIMARY KEY, s TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t4 (s) VALUES ('it''s')", [])
+        .unwrap();
+    db.execute("INSERT INTO t4 (s) VALUES ('plain')", [])
+        .unwrap();
     let s = db.query("SELECT s FROM t4 WHERE id = 1", []).unwrap()[0][0].clone();
     assert_eq!(s, Value::Text("it's".into()));
     let s2 = db.query("SELECT s FROM t4 WHERE id = 2", []).unwrap()[0][0].clone();
     assert_eq!(s2, Value::Text("plain".into()));
 
     // Multi-row VALUES after a single-row chain (shape fallback).
-    db.execute(
-        "INSERT INTO t4 (s) VALUES ('m1'), ('m2'), ('m3')",
-        [],
-    )
-    .unwrap();
+    db.execute("INSERT INTO t4 (s) VALUES ('m1'), ('m2'), ('m3')", [])
+        .unwrap();
     let n = db.query("SELECT COUNT(*) FROM t4", []).unwrap()[0][0].clone();
     assert_eq!(n, Value::Integer(5));
 
@@ -127,12 +154,18 @@ fn main() {
 
     // ---------------- Throughput ----------------
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     // Warm the chain.
     for i in 0..100 {
-        db.execute(&format!("INSERT INTO t (name, val) VALUES ('w{i}', {i})"), [])
-            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t (name, val) VALUES ('w{i}', {i})"),
+            [],
+        )
+        .unwrap();
     }
     let n = 5000i64;
     let sqls: Vec<String> = (1..=n)
@@ -154,12 +187,18 @@ fn main() {
     );
 
     let mut db2 = Database::open_in_memory().unwrap();
-    db2.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", [])
-        .unwrap();
+    db2.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     let t0 = std::time::Instant::now();
     for i in 1..=n {
-        db2.execute(&format!("INSERT INTO t (name, val) VALUES ('name{i}', {i})"), [])
-            .unwrap();
+        db2.execute(
+            &format!("INSERT INTO t (name, val) VALUES ('name{i}', {i})"),
+            [],
+        )
+        .unwrap();
     }
     let ac = t0.elapsed();
     println!(
