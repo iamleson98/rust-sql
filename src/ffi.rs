@@ -18,11 +18,15 @@
 //! like SQLITE_BUSY from sqlite3_close).
 
 use crate::api::Database;
-use crate::error::{Error, Result};
+use crate::error::Error;
+#[cfg(feature = "extension")]
+use crate::error::Result;
 use crate::plugin::abi::*;
 
 // Status / value-type codes for C consumers (SQLite-compatible values).
-pub use crate::plugin::abi::{RQL_BLOB, RQL_ERROR, RQL_FLOAT, RQL_INTEGER, RQL_MISUSE, RQL_NOMEM, RQL_NULL, RQL_OK, RQL_TEXT};
+pub use crate::plugin::abi::{
+    RQL_BLOB, RQL_ERROR, RQL_FLOAT, RQL_INTEGER, RQL_MISUSE, RQL_NOMEM, RQL_NULL, RQL_OK, RQL_TEXT,
+};
 use crate::types::Value;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::os::raw::c_uchar;
@@ -70,6 +74,11 @@ type StatementErased = crate::statement::Statement<'static>;
 
 /// Open (or create) a database. `path` is UTF-8; `":memory:"` selects the
 /// in-memory engine. Returns RQL_OK / RQL_ERROR.
+///
+/// # Safety
+///
+/// - `path` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
+/// - `ppdb` must point to a valid, writable `*mut RqlConn` slot that the engine stores the new connection handle into on success.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_open(path: *const c_char, ppdb: *mut *mut RqlConn) -> c_int {
     if path.is_null() || ppdb.is_null() {
@@ -99,6 +108,10 @@ pub unsafe extern "C" fn rustqlite_open(path: *const c_char, ppdb: *mut *mut Rql
 }
 
 /// Open an in-memory database.
+///
+/// # Safety
+///
+/// - `ppdb` must point to a valid, writable `*mut RqlConn` slot that the engine stores the new connection handle into on success.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_open_in_memory(ppdb: *mut *mut RqlConn) -> c_int {
     rustqlite_open(c":memory:".as_ptr(), ppdb)
@@ -107,6 +120,10 @@ pub unsafe extern "C" fn rustqlite_open_in_memory(ppdb: *mut *mut RqlConn) -> c_
 /// Close the connection. Returns RQL_MISUSE when prepared statements are
 /// still alive (SQLite's sqlite3_close returns SQLITE_BUSY for the same
 /// reason).
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_close(db: *mut RqlConn) -> c_int {
     if db.is_null() {
@@ -126,6 +143,11 @@ pub unsafe extern "C" fn rustqlite_close(db: *mut RqlConn) -> c_int {
 
 /// Execute zero-or-more statements (no result rows). Multi-statement SQL
 /// runs sequentially until the first error.
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
+/// - `sql` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_exec(db: *mut RqlConn, sql: *const c_char) -> c_int {
     let Some(conn) = (unsafe { db.as_ref() }) else {
@@ -164,6 +186,13 @@ pub unsafe extern "C" fn rustqlite_exec(db: *mut RqlConn, sql: *const c_char) ->
 /// Prepare one statement. `sql` is NUL-terminated UTF-8 (a negative `len`
 /// means strlen); `pzTail` (optional) receives the byte offset of the
 /// first character past the statement's end (multi-statement stepping).
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
+/// - `sql` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
+/// - `ppstmt` must be a valid pointer per this API's contract.
+/// - `pz_tail` must be a valid pointer per this API's contract.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_prepare_v2(
     db: *mut RqlConn,
@@ -220,6 +249,10 @@ pub unsafe extern "C" fn rustqlite_prepare_v2(
 }
 
 /// Finalize a statement (drop it).
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_finalize(stmt: *mut RqlStmt) -> c_int {
     if stmt.is_null() {
@@ -234,6 +267,10 @@ pub unsafe extern "C" fn rustqlite_finalize(stmt: *mut RqlStmt) -> c_int {
 }
 
 /// Reset a statement for re-execution (bindings are kept).
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_reset(stmt: *mut RqlStmt) -> c_int {
     let Some(handle) = (unsafe { stmt.as_mut() }) else {
@@ -248,6 +285,10 @@ pub unsafe extern "C" fn rustqlite_reset(stmt: *mut RqlStmt) -> c_int {
 }
 
 /// Clear all bindings (parameters become NULL).
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_clear_bindings(stmt: *mut RqlStmt) -> c_int {
     let Some(handle) = (unsafe { stmt.as_mut() }) else {
@@ -260,6 +301,10 @@ pub unsafe extern "C" fn rustqlite_clear_bindings(stmt: *mut RqlStmt) -> c_int {
 }
 
 /// Step a statement. Returns 100 (ROW), 101 (DONE), or an error code.
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_step(stmt: *mut RqlStmt) -> c_int {
     let Some(handle) = (unsafe { stmt.as_mut() }) else {
@@ -292,21 +337,37 @@ pub unsafe extern "C" fn rustqlite_step(stmt: *mut RqlStmt) -> c_int {
 // Parameter binding (1-based, like sqlite3_bind_*)
 // ---------------------------------------------------------------------------
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_int64(stmt: *mut RqlStmt, idx: c_int, v: i64) -> c_int {
     bind_value(stmt, idx, Value::Integer(v))
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_int(stmt: *mut RqlStmt, idx: c_int, v: c_int) -> c_int {
     bind_value(stmt, idx, Value::Integer(v as i64))
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_double(stmt: *mut RqlStmt, idx: c_int, v: f64) -> c_int {
     bind_value(stmt, idx, Value::Real(v))
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_null(stmt: *mut RqlStmt, idx: c_int) -> c_int {
     bind_value(stmt, idx, Value::Null)
@@ -315,6 +376,12 @@ pub unsafe extern "C" fn rustqlite_bind_null(stmt: *mut RqlStmt, idx: c_int) -> 
 /// Bind text. `len < 0` uses strlen. `destructor`: 0 = static (the buffer
 /// outlives the call), -1 (SQLITE_TRANSIENT) = copy, otherwise called
 /// with the pointer after the copy.
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
+/// - `s` must be a valid readable buffer for the passed length (or NULL when the API allows it).
+/// - `destructor` must be a valid C callback matching this API's expected signature (or NULL when optional).
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_text(
     stmt: *mut RqlStmt,
@@ -344,6 +411,12 @@ pub unsafe extern "C" fn rustqlite_bind_text(
     rc
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
+/// - `data` must be a valid readable buffer for the passed length (or NULL when the API allows it).
+/// - `destructor` must be a valid C callback matching this API's expected signature (or NULL when optional).
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_blob(
     stmt: *mut RqlStmt,
@@ -380,15 +453,28 @@ fn bind_value(stmt: *mut RqlStmt, idx: c_int, v: Value) -> c_int {
 }
 
 /// Number of positional parameters.
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_parameter_count(stmt: *mut RqlStmt) -> c_int {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
         return 0;
     };
-    handle.stmt.as_ref().map(|s| s.parameter_count()).unwrap_or(0) as c_int
+    handle
+        .stmt
+        .as_ref()
+        .map(|s| s.parameter_count())
+        .unwrap_or(0) as c_int
 }
 
 /// Index of a named parameter (SQL: `:name`), 0 when unknown.
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
+/// - `name` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_bind_parameter_index(
     stmt: *mut RqlStmt,
@@ -406,7 +492,11 @@ pub unsafe extern "C" fn rustqlite_bind_parameter_index(
     let found = handle
         .stmt
         .as_ref()
-        .map(|s| s.parameter_names().iter().any(|p| p.eq_ignore_ascii_case(n.trim_start_matches([':', '@', '$']))))
+        .map(|s| {
+            s.parameter_names()
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(n.trim_start_matches([':', '@', '$'])))
+        })
         .unwrap_or(false);
     if found {
         1
@@ -419,6 +509,10 @@ pub unsafe extern "C" fn rustqlite_bind_parameter_index(
 // Column access (0-based, like sqlite3_column_*)
 // ---------------------------------------------------------------------------
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_count(stmt: *mut RqlStmt) -> c_int {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
@@ -427,6 +521,10 @@ pub unsafe extern "C" fn rustqlite_column_count(stmt: *mut RqlStmt) -> c_int {
     handle.stmt.as_ref().map(|s| s.column_count()).unwrap_or(0) as c_int
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_name(stmt: *mut RqlStmt, i: c_int) -> *const c_char {
     let Some(handle) = (unsafe { stmt.as_mut() }) else {
@@ -438,21 +536,35 @@ pub unsafe extern "C" fn rustqlite_column_name(stmt: *mut RqlStmt, i: c_int) -> 
             let cs = CString::new(n).unwrap_or_default();
             let p = cs.as_ptr();
             std::mem::forget(cs);
-            handle.text_bufs.push(unsafe { CString::from_raw(p as *mut c_char) });
+            handle
+                .text_bufs
+                .push(unsafe { CString::from_raw(p as *mut c_char) });
             p
         }
         None => std::ptr::null(),
     }
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_int64(stmt: *mut RqlStmt, i: c_int) -> i64 {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
         return 0;
     };
-    handle.stmt.as_ref().map(|s| s.column_int(i as usize)).unwrap_or(0)
+    handle
+        .stmt
+        .as_ref()
+        .map(|s| s.column_int(i as usize))
+        .unwrap_or(0)
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_double(stmt: *mut RqlStmt, i: c_int) -> f64 {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
@@ -466,27 +578,34 @@ pub unsafe extern "C" fn rustqlite_column_double(stmt: *mut RqlStmt, i: c_int) -
 }
 
 /// NUL-terminated column text, valid until the next step/reset/finalize.
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_text(stmt: *mut RqlStmt, i: c_int) -> *const c_uchar {
     let Some(handle) = (unsafe { stmt.as_mut() }) else {
         return std::ptr::null();
     };
-    let text = handle
-        .stmt
-        .as_ref()
-        .and_then(|s| s.column_text(i as usize));
+    let text = handle.stmt.as_ref().and_then(|s| s.column_text(i as usize));
     match text {
         Some(t) => {
             let cs = CString::new(t).unwrap_or_default();
             let p = cs.as_ptr() as *const c_uchar;
             std::mem::forget(cs);
-            handle.text_bufs.push(unsafe { CString::from_raw(p as *mut c_char) });
+            handle
+                .text_bufs
+                .push(unsafe { CString::from_raw(p as *mut c_char) });
             p
         }
         None => std::ptr::null(),
     }
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_blob(stmt: *mut RqlStmt, i: c_int) -> *const c_void {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
@@ -505,6 +624,10 @@ pub unsafe extern "C" fn rustqlite_column_blob(stmt: *mut RqlStmt, i: c_int) -> 
     }
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_bytes(stmt: *mut RqlStmt, i: c_int) -> c_int {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
@@ -516,11 +639,15 @@ pub unsafe extern "C" fn rustqlite_column_bytes(stmt: *mut RqlStmt, i: c_int) ->
         .and_then(|s| s.column_value(i as usize))
     {
         Some(Value::Blob(b)) => b.len() as c_int,
-        Some(Value::Text(t)) => t.as_str().as_bytes().len() as c_int,
+        Some(Value::Text(t)) => t.as_str().len() as c_int,
         _ => 0,
     }
 }
 
+///
+/// # Safety
+///
+/// - `stmt` must point to a statement produced by `rustqlite_prepare_v2` on a live connection and not yet finalized.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_column_type(stmt: *mut RqlStmt, i: c_int) -> c_int {
     let Some(handle) = (unsafe { stmt.as_ref() }) else {
@@ -543,15 +670,27 @@ pub unsafe extern "C" fn rustqlite_column_type(stmt: *mut RqlStmt, i: c_int) -> 
 // Diagnostics + misc
 // ---------------------------------------------------------------------------
 
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_errcode(db: *mut RqlConn) -> c_int {
     let Some(conn) = (unsafe { db.as_ref() }) else {
         return RQL_MISUSE;
     };
-    conn.last_error.lock().as_bytes().is_empty().then(|| RQL_OK).unwrap_or(RQL_ERROR)
+    if conn.last_error.lock().as_bytes().is_empty() {
+        RQL_OK
+    } else {
+        RQL_ERROR
+    }
 }
 
 /// Last error message (valid until the next call on this connection).
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_errmsg(db: *mut RqlConn) -> *const c_char {
     let Some(conn) = (unsafe { db.as_ref() }) else {
@@ -560,6 +699,10 @@ pub unsafe extern "C" fn rustqlite_errmsg(db: *mut RqlConn) -> *const c_char {
     conn.last_error.lock().as_ptr()
 }
 
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_changes(db: *mut RqlConn) -> i64 {
     let Some(conn) = (unsafe { db.as_ref() }) else {
@@ -569,6 +712,10 @@ pub unsafe extern "C" fn rustqlite_changes(db: *mut RqlConn) -> i64 {
     rd.changes()
 }
 
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_total_changes(db: *mut RqlConn) -> i64 {
     let Some(conn) = (unsafe { db.as_ref() }) else {
@@ -578,6 +725,10 @@ pub unsafe extern "C" fn rustqlite_total_changes(db: *mut RqlConn) -> i64 {
     rd.total_changes()
 }
 
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_last_insert_rowid(db: *mut RqlConn) -> i64 {
     let Some(conn) = (unsafe { db.as_ref() }) else {
@@ -586,19 +737,21 @@ pub unsafe extern "C" fn rustqlite_last_insert_rowid(db: *mut RqlConn) -> i64 {
     conn.db.read().last_insert_rowid()
 }
 
+/// Return the library version string (static, NUL-terminated).
 #[no_mangle]
-pub unsafe extern "C" fn rustqlite_libversion() -> *const c_char {
+pub extern "C" fn rustqlite_libversion() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
+/// Whether the library is compiled thread-safe (always 1).
 #[no_mangle]
-pub unsafe extern "C" fn rustqlite_threadsafe() -> c_int {
+pub extern "C" fn rustqlite_threadsafe() -> c_int {
     1
 }
 
-/// Get the engine version as a Rust &str.
+/// Get the engine source id string (static, NUL-terminated).
 #[no_mangle]
-pub unsafe extern "C" fn rustqlite_source_id() -> *const c_char {
+pub extern "C" fn rustqlite_source_id() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), " rustqlite C ABI\0").as_ptr() as *const c_char
 }
 
@@ -608,6 +761,14 @@ pub unsafe extern "C" fn rustqlite_source_id() -> *const c_char {
 
 /// `sqlite3_create_function` equivalent: scalar (xFunc) or aggregate
 /// (xStep + xFinal). `n_arg < 0` = variadic.
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
+/// - `name` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
+/// - `p_app` must be a valid pointer per this API's contract.
+/// - `x_func` must be a valid C callback matching this API's expected signature (or NULL when optional).
+/// - `*mut *mut RqlValue` must be a valid pointer per this API's contract.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_create_function(
     db: *mut RqlConn,
@@ -642,7 +803,9 @@ pub unsafe extern "C" fn rustqlite_create_function(
             x_final: xfin,
         }))
     } else {
-        Err(Error::semantic("create_function requires xFunc or xStep+xFinal"))
+        Err(Error::semantic(
+            "create_function requires xFunc or xStep+xFinal",
+        ))
     };
     drop(w);
     match res {
@@ -652,6 +815,15 @@ pub unsafe extern "C" fn rustqlite_create_function(
 }
 
 /// `sqlite3_create_collation` equivalent.
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
+/// - `name` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
+/// - `p_app` must be a valid pointer per this API's contract.
+/// - `x_compare` must be a valid C callback matching this API's expected signature (or NULL when optional).
+/// - `*const c_void` must be a valid pointer per this API's contract.
+/// - `*const c_void` must be a valid pointer per this API's contract.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_create_collation(
     db: *mut RqlConn,
@@ -685,6 +857,13 @@ pub unsafe extern "C" fn rustqlite_create_collation(
 }
 
 /// `sqlite3_create_module` equivalent: registers a C vtab module.
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
+/// - `name` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
+/// - `module` must be a valid pointer per this API's contract.
+/// - `p_aux` must be a valid pointer per this API's contract.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_create_module(
     db: *mut RqlConn,
@@ -702,11 +881,7 @@ pub unsafe extern "C" fn rustqlite_create_module(
         return RQL_MISUSE;
     }
     let mut w = conn.db.write();
-    let res = w.create_module_arc(std::sync::Arc::new(CVtabModule::new(
-        name,
-        module,
-        p_aux,
-    )));
+    let res = w.create_module_arc(std::sync::Arc::new(CVtabModule::new(name, module, p_aux)));
     drop(w);
     match res {
         Ok(()) => RQL_OK,
@@ -715,6 +890,12 @@ pub unsafe extern "C" fn rustqlite_create_module(
 }
 
 /// `sqlite3_load_extension` equivalent (feature "extension").
+///
+/// # Safety
+///
+/// - `db` must point to a live connection produced by `rustqlite_open` / `rustqlite_open_in_memory` and not yet closed.
+/// - `path` must be a valid NUL-terminated UTF-8 C string (or NULL when the API allows it).
+/// - `entry` must be a valid pointer per this API's contract.
 #[no_mangle]
 pub unsafe extern "C" fn rustqlite_load_extension(
     db: *mut RqlConn,
@@ -727,11 +908,7 @@ pub unsafe extern "C" fn rustqlite_load_extension(
     let Some(p) = cstr(path) else {
         return RQL_MISUSE;
     };
-    let entry = if entry.is_null() {
-        None
-    } else {
-        cstr(entry)
-    };
+    let entry = if entry.is_null() { None } else { cstr(entry) };
     let mut w = conn.db.write();
     #[cfg(feature = "extension")]
     let res = w.load_extension(std::path::Path::new(p), entry);
@@ -760,6 +937,7 @@ pub(crate) fn make_extension_handle(db: &mut Database) -> *mut RqlDb {
 
 /// Recover a `&mut Database` from an extension handle (valid only during
 /// the extension-init borrow).
+#[cfg(feature = "extension")]
 pub(crate) fn db_from_handle(db: *mut RqlDb) -> Option<&'static mut Database> {
     if db.is_null() {
         return None;
@@ -768,6 +946,7 @@ pub(crate) fn db_from_handle(db: *mut RqlDb) -> Option<&'static mut Database> {
 }
 
 /// Execute SQL on a raw extension handle.
+#[cfg(feature = "extension")]
 pub(crate) fn exec_on_handle(db: *mut RqlDb, sql: &str) -> Result<()> {
     let Some(d) = db_from_handle(db) else {
         return Err(Error::runtime("null handle"));
@@ -784,11 +963,13 @@ thread_local! {
     );
 }
 
+#[cfg(feature = "extension")]
 pub(crate) fn errmsg_ptr(_db: *mut RqlDb) -> *const c_char {
     EXT_ERR.with(|e| e.borrow().as_ptr())
 }
 
 /// Register a C scalar function onto a Database (trampoline target).
+#[cfg(feature = "extension")]
 pub(crate) fn register_c_scalar(
     db: &mut Database,
     name: &str,
@@ -804,6 +985,7 @@ pub(crate) fn register_c_scalar(
     }))
 }
 
+#[cfg(feature = "extension")]
 pub(crate) fn register_c_aggregate(
     db: &mut Database,
     name: &str,
@@ -821,11 +1003,18 @@ pub(crate) fn register_c_aggregate(
     }))
 }
 
+#[cfg(feature = "extension")]
 pub(crate) fn register_c_collation(
     db: &mut Database,
     name: &str,
     app: *mut c_void,
-    x_compare: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+    x_compare: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *const c_void,
+        c_int,
+        *const c_void,
+    ) -> c_int,
 ) -> Result<()> {
     db.create_collation_arc(std::sync::Arc::new(CCollation {
         name: name.to_string(),
@@ -834,6 +1023,7 @@ pub(crate) fn register_c_collation(
     }))
 }
 
+#[cfg(feature = "extension")]
 pub(crate) fn register_c_module(
     db: &mut Database,
     name: &str,

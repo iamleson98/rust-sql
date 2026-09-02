@@ -20,13 +20,18 @@ const N_ROWS: i64 = 10_000;
 
 fn setup_rusqlite(n: i64) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     conn.execute("BEGIN", []).unwrap();
     for i in 1..=n {
         conn.execute(
             "INSERT INTO t (name, val) VALUES (?1, ?2)",
             params![format!("name{}", i), i * 2],
-        ).unwrap();
+        )
+        .unwrap();
     }
     conn.execute("COMMIT", []).unwrap();
     conn
@@ -34,15 +39,23 @@ fn setup_rusqlite(n: i64) -> rusqlite::Connection {
 
 fn setup_rustqlite(n: i64) -> Database {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     // Use parameterized query so the statement cache hit makes it a fair
     // comparison with rusqlite's prepared-statement path.
     for i in 1..=n {
         db.execute(
             "INSERT INTO t (name, val) VALUES (?, ?)",
-            [Value::Text(format!("name{}", i).into()), Value::Integer(i * 2)],
-        ).unwrap();
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db
@@ -99,31 +112,49 @@ fn measure<F: Fn()>(_name: &str, f: F, total_ops: usize) -> (f64, f64) {
 
 fn bench_insert_autocommit() -> Result {
     let n = 1000;
-    let (rq_ops, _) = measure("rust-sql autocommit insert", || {
-        let mut db = Database::open_in_memory().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
-        // Use parameterized query so the statement cache hit makes it a fair
-        // comparison with rusqlite's prepared-statement path. Without this,
-        // we'd be re-parsing the SQL string every iteration (since `format!`
-        // produces a different string each time).
-        for i in 1..=n {
+    let (rq_ops, _) = measure(
+        "rust-sql autocommit insert",
+        || {
+            let mut db = Database::open_in_memory().unwrap();
             db.execute(
-                "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
-            ).unwrap();
-        }
-    }, n as usize);
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                [],
+            )
+            .unwrap();
+            // Use parameterized query so the statement cache hit makes it a fair
+            // comparison with rusqlite's prepared-statement path. Without this,
+            // we'd be re-parsing the SQL string every iteration (since `format!`
+            // produces a different string each time).
+            for i in 1..=n {
+                db.execute(
+                    "INSERT INTO t (name, val) VALUES (?, ?)",
+                    [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
+                )
+                .unwrap();
+            }
+        },
+        n as usize,
+    );
 
-    let (rs_ops, _) = measure("rusqlite autocommit insert", || {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
-        for i in 1..=n {
+    let (rs_ops, _) = measure(
+        "rusqlite autocommit insert",
+        || {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
             conn.execute(
-                "INSERT INTO t (name, val) VALUES (?1, ?2)",
-                params![format!("name{}", i), i],
-            ).unwrap();
-        }
-    }, n as usize);
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                [],
+            )
+            .unwrap();
+            for i in 1..=n {
+                conn.execute(
+                    "INSERT INTO t (name, val) VALUES (?1, ?2)",
+                    params![format!("name{}", i), i],
+                )
+                .unwrap();
+            }
+        },
+        n as usize,
+    );
 
     Result {
         name: "INSERT (auto-commit, 1k rows)".into(),
@@ -134,33 +165,51 @@ fn bench_insert_autocommit() -> Result {
 
 fn bench_insert_transaction() -> Result {
     let n = 1000;
-    let (rq_ops, _) = measure("rust-sql transaction insert", || {
-        let mut db = Database::open_in_memory().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
-        db.execute("BEGIN", []).unwrap();
-        // Use parameterized query so the statement cache hit makes it a fair
-        // comparison with rusqlite's prepared-statement path.
-        for i in 1..=n {
+    let (rq_ops, _) = measure(
+        "rust-sql transaction insert",
+        || {
+            let mut db = Database::open_in_memory().unwrap();
             db.execute(
-                "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
-            ).unwrap();
-        }
-        db.execute("COMMIT", []).unwrap();
-    }, n as usize);
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                [],
+            )
+            .unwrap();
+            db.execute("BEGIN", []).unwrap();
+            // Use parameterized query so the statement cache hit makes it a fair
+            // comparison with rusqlite's prepared-statement path.
+            for i in 1..=n {
+                db.execute(
+                    "INSERT INTO t (name, val) VALUES (?, ?)",
+                    [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
+                )
+                .unwrap();
+            }
+            db.execute("COMMIT", []).unwrap();
+        },
+        n as usize,
+    );
 
-    let (rs_ops, _) = measure("rusqlite transaction insert", || {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
-        conn.execute("BEGIN", []).unwrap();
-        for i in 1..=n {
+    let (rs_ops, _) = measure(
+        "rusqlite transaction insert",
+        || {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
             conn.execute(
-                "INSERT INTO t (name, val) VALUES (?1, ?2)",
-                params![format!("name{}", i), i],
-            ).unwrap();
-        }
-        conn.execute("COMMIT", []).unwrap();
-    }, n as usize);
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                [],
+            )
+            .unwrap();
+            conn.execute("BEGIN", []).unwrap();
+            for i in 1..=n {
+                conn.execute(
+                    "INSERT INTO t (name, val) VALUES (?1, ?2)",
+                    params![format!("name{}", i), i],
+                )
+                .unwrap();
+            }
+            conn.execute("COMMIT", []).unwrap();
+        },
+        n as usize,
+    );
 
     Result {
         name: "INSERT (transaction, 1k rows)".into(),
@@ -174,22 +223,31 @@ fn bench_point_lookup() -> Result {
     let conn = setup_rusqlite(N_ROWS);
     let n = 1000;
 
-    let (rq_ops, _) = measure("rust-sql point lookup", || {
-        for i in 1..=n {
-            let _ = db.query(
-                "SELECT name, val FROM t WHERE id = ?",
-                [Value::Integer(i)],
-            ).unwrap();
-        }
-    }, n as usize);
+    let (rq_ops, _) = measure(
+        "rust-sql point lookup",
+        || {
+            for i in 1..=n {
+                let _ = db
+                    .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(i)])
+                    .unwrap();
+            }
+        },
+        n as usize,
+    );
 
-    let (rs_ops, _) = measure("rusqlite point lookup", || {
-        for i in 1..=n {
-            let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
-            let mut rows = stmt.query(params![i]).unwrap();
-            while rows.next().unwrap().is_some() {}
-        }
-    }, n as usize);
+    let (rs_ops, _) = measure(
+        "rusqlite point lookup",
+        || {
+            for i in 1..=n {
+                let mut stmt = conn
+                    .prepare("SELECT name, val FROM t WHERE id = ?1")
+                    .unwrap();
+                let mut rows = stmt.query(params![i]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            }
+        },
+        n as usize,
+    );
 
     Result {
         name: "Point lookup (SELECT by id, 1k queries)".into(),
@@ -203,19 +261,31 @@ fn bench_range_scan() -> Result {
     let conn = setup_rusqlite(N_ROWS);
     let n = 500;
 
-    let (rq_ops, _) = measure("rust-sql range scan", || {
-        for _ in 0..n {
-            let _ = db.query("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100", []).unwrap();
-        }
-    }, n as usize);
+    let (rq_ops, _) = measure(
+        "rust-sql range scan",
+        || {
+            for _ in 0..n {
+                let _ = db
+                    .query("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100", [])
+                    .unwrap();
+            }
+        },
+        n as usize,
+    );
 
-    let (rs_ops, _) = measure("rusqlite range scan", || {
-        for _ in 0..n {
-            let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100").unwrap();
-            let mut rows = stmt.query([]).unwrap();
-            while rows.next().unwrap().is_some() {}
-        }
-    }, n as usize);
+    let (rs_ops, _) = measure(
+        "rusqlite range scan",
+        || {
+            for _ in 0..n {
+                let mut stmt = conn
+                    .prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100")
+                    .unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            }
+        },
+        n as usize,
+    );
 
     Result {
         name: "Range scan (100 rows, 500 queries)".into(),
@@ -229,19 +299,34 @@ fn bench_aggregate() -> Result {
     let conn = setup_rusqlite(N_ROWS);
     let n = 500;
 
-    let (rq_ops, _) = measure("rust-sql aggregate", || {
-        for _ in 0..n {
-            let _ = db.query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t", []).unwrap();
-        }
-    }, n as usize);
+    let (rq_ops, _) = measure(
+        "rust-sql aggregate",
+        || {
+            for _ in 0..n {
+                let _ = db
+                    .query(
+                        "SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t",
+                        [],
+                    )
+                    .unwrap();
+            }
+        },
+        n as usize,
+    );
 
-    let (rs_ops, _) = measure("rusqlite aggregate", || {
-        for _ in 0..n {
-            let mut stmt = conn.prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t").unwrap();
-            let mut rows = stmt.query([]).unwrap();
-            while rows.next().unwrap().is_some() {}
-        }
-    }, n as usize);
+    let (rs_ops, _) = measure(
+        "rusqlite aggregate",
+        || {
+            for _ in 0..n {
+                let mut stmt = conn
+                    .prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t")
+                    .unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            }
+        },
+        n as usize,
+    );
 
     Result {
         name: "Aggregate (COUNT/SUM/MIN/MAX/AVG over 10k rows)".into(),
@@ -255,19 +340,27 @@ fn bench_count_star() -> Result {
     let conn = setup_rusqlite(N_ROWS);
     let n = 500;
 
-    let (rq_ops, _) = measure("rust-sql COUNT(*)", || {
-        for _ in 0..n {
-            let _ = db.query("SELECT COUNT(*) FROM t", []).unwrap();
-        }
-    }, n as usize);
+    let (rq_ops, _) = measure(
+        "rust-sql COUNT(*)",
+        || {
+            for _ in 0..n {
+                let _ = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+            }
+        },
+        n as usize,
+    );
 
-    let (rs_ops, _) = measure("rusqlite COUNT(*)", || {
-        for _ in 0..n {
-            let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
-            let mut rows = stmt.query([]).unwrap();
-            while rows.next().unwrap().is_some() {}
-        }
-    }, n as usize);
+    let (rs_ops, _) = measure(
+        "rusqlite COUNT(*)",
+        || {
+            for _ in 0..n {
+                let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            }
+        },
+        n as usize,
+    );
 
     Result {
         name: "COUNT(*) only (no row decode)".into(),
@@ -282,40 +375,52 @@ fn bench_concurrent_8_readers() -> Result {
     let n_per_thread = 500;
     let total_ops = 8 * n_per_thread;
 
-    let (rq_ops, _) = measure("rust-sql 8 readers", || {
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let db = Arc::clone(&db);
-            handles.push(thread::spawn(move || {
-                for i in 0..n_per_thread {
-                    let id = (i % N_ROWS as usize) as i64 + 1;
-                    let guard = db.read();
-                    let _ = guard.query(
-                        "SELECT name, val FROM t WHERE id = ?",
-                        [Value::Integer(id)],
-                    );
-                }
-            }));
-        }
-        for h in handles { h.join().unwrap(); }
-    }, total_ops);
+    let (rq_ops, _) = measure(
+        "rust-sql 8 readers",
+        || {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let db = Arc::clone(&db);
+                handles.push(thread::spawn(move || {
+                    for i in 0..n_per_thread {
+                        let id = (i % N_ROWS as usize) as i64 + 1;
+                        let guard = db.read();
+                        let _ = guard
+                            .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(id)]);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+        total_ops,
+    );
 
-    let (rs_ops, _) = measure("rusqlite 8 readers mutex", || {
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let conn = Arc::clone(&conn);
-            handles.push(thread::spawn(move || {
-                for i in 0..n_per_thread {
-                    let id = (i % N_ROWS as usize) as i64 + 1;
-                    let guard = conn.lock().unwrap();
-                    let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
-                    let mut rows = stmt.query(params![id]).unwrap();
-                    while rows.next().unwrap().is_some() {}
-                }
-            }));
-        }
-        for h in handles { h.join().unwrap(); }
-    }, total_ops);
+    let (rs_ops, _) = measure(
+        "rusqlite 8 readers mutex",
+        || {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let conn = Arc::clone(&conn);
+                handles.push(thread::spawn(move || {
+                    for i in 0..n_per_thread {
+                        let id = (i % N_ROWS as usize) as i64 + 1;
+                        let guard = conn.lock().unwrap();
+                        let mut stmt = guard
+                            .prepare("SELECT name, val FROM t WHERE id = ?1")
+                            .unwrap();
+                        let mut rows = stmt.query(params![id]).unwrap();
+                        while rows.next().unwrap().is_some() {}
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+        total_ops,
+    );
 
     Result {
         name: "Concurrent reads (8 threads × 500 queries)".into(),
@@ -331,70 +436,86 @@ fn bench_mixed_rw_4r_1w() -> Result {
     let n_writes = 200;
     let total_ops = (4 * n_reads) + n_writes;
 
-    let (rq_ops, _) = measure("rust-sql 4r 1w", || {
-        let mut handles = Vec::new();
-        // writer
-        {
-            let db = Arc::clone(&db);
-            handles.push(thread::spawn(move || {
-                for i in 0..n_writes {
-                    let id = N_ROWS + 1 + i as i64;
-                    let mut guard = db.write();
-                    let _ = guard.execute(
-                        "INSERT INTO t (id, name, val) VALUES (?, ?, ?)",
-                        [Value::Integer(id), Value::Text(format!("new{i}").into()), Value::Integer(i as i64)],
-                    );
-                }
-            }));
-        }
-        // 4 readers
-        for _ in 0..4 {
-            let db = Arc::clone(&db);
-            handles.push(thread::spawn(move || {
-                for i in 0..n_reads {
-                    let id = (i % N_ROWS as usize) as i64 + 1;
-                    let guard = db.read();
-                    let _ = guard.query(
-                        "SELECT name, val FROM t WHERE id = ?",
-                        [Value::Integer(id)],
-                    );
-                }
-            }));
-        }
-        for h in handles { h.join().unwrap(); }
-    }, total_ops);
+    let (rq_ops, _) = measure(
+        "rust-sql 4r 1w",
+        || {
+            let mut handles = Vec::new();
+            // writer
+            {
+                let db = Arc::clone(&db);
+                handles.push(thread::spawn(move || {
+                    for i in 0..n_writes {
+                        let id = N_ROWS + 1 + i as i64;
+                        let mut guard = db.write();
+                        let _ = guard.execute(
+                            "INSERT INTO t (id, name, val) VALUES (?, ?, ?)",
+                            [
+                                Value::Integer(id),
+                                Value::Text(format!("new{i}").into()),
+                                Value::Integer(i as i64),
+                            ],
+                        );
+                    }
+                }));
+            }
+            // 4 readers
+            for _ in 0..4 {
+                let db = Arc::clone(&db);
+                handles.push(thread::spawn(move || {
+                    for i in 0..n_reads {
+                        let id = (i % N_ROWS as usize) as i64 + 1;
+                        let guard = db.read();
+                        let _ = guard
+                            .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(id)]);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+        total_ops,
+    );
 
-    let (rs_ops, _) = measure("rusqlite 4r 1w mutex", || {
-        let mut handles = Vec::new();
-        // writer
-        {
-            let conn = Arc::clone(&conn);
-            handles.push(thread::spawn(move || {
-                for i in 0..n_writes {
-                    let id = N_ROWS + 1 + i as i64;
-                    let guard = conn.lock().unwrap();
-                    let _ = guard.execute(
-                        "INSERT INTO t (id, name, val) VALUES (?1, ?2, ?3)",
-                        params![id, format!("new{i}"), i],
-                    );
-                }
-            }));
-        }
-        // 4 readers
-        for _ in 0..4 {
-            let conn = Arc::clone(&conn);
-            handles.push(thread::spawn(move || {
-                for i in 0..n_reads {
-                    let id = (i % N_ROWS as usize) as i64 + 1;
-                    let guard = conn.lock().unwrap();
-                    let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
-                    let mut rows = stmt.query(params![id]).unwrap();
-                    while rows.next().unwrap().is_some() {}
-                }
-            }));
-        }
-        for h in handles { h.join().unwrap(); }
-    }, total_ops);
+    let (rs_ops, _) = measure(
+        "rusqlite 4r 1w mutex",
+        || {
+            let mut handles = Vec::new();
+            // writer
+            {
+                let conn = Arc::clone(&conn);
+                handles.push(thread::spawn(move || {
+                    for i in 0..n_writes {
+                        let id = N_ROWS + 1 + i as i64;
+                        let guard = conn.lock().unwrap();
+                        let _ = guard.execute(
+                            "INSERT INTO t (id, name, val) VALUES (?1, ?2, ?3)",
+                            params![id, format!("new{i}"), i],
+                        );
+                    }
+                }));
+            }
+            // 4 readers
+            for _ in 0..4 {
+                let conn = Arc::clone(&conn);
+                handles.push(thread::spawn(move || {
+                    for i in 0..n_reads {
+                        let id = (i % N_ROWS as usize) as i64 + 1;
+                        let guard = conn.lock().unwrap();
+                        let mut stmt = guard
+                            .prepare("SELECT name, val FROM t WHERE id = ?1")
+                            .unwrap();
+                        let mut rows = stmt.query(params![id]).unwrap();
+                        while rows.next().unwrap().is_some() {}
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+        total_ops,
+    );
 
     Result {
         name: "Mixed R/W (4 readers + 1 writer)".into(),
@@ -431,8 +552,14 @@ fn main() {
     println!();
     println!("============================================================");
     println!("Summary:");
-    println!("  rust-sql wins: {}", tests.iter().filter(|t| t.winner() == "rust-sql").count());
-    println!("  SQLite wins:   {}", tests.iter().filter(|t| t.winner() == "SQLite").count());
+    println!(
+        "  rust-sql wins: {}",
+        tests.iter().filter(|t| t.winner() == "rust-sql").count()
+    );
+    println!(
+        "  SQLite wins:   {}",
+        tests.iter().filter(|t| t.winner() == "SQLite").count()
+    );
     println!();
 
     // Print concurrent test results in detail since that's the headline.
@@ -440,14 +567,20 @@ fn main() {
         println!(">>> HEADLINE: {}", t.name);
         println!("    rust-sql: {:.0} ops/sec", t.rustqlite_ops_per_sec);
         println!("    SQLite:   {:.0} ops/sec", t.rusqlite_ops_per_sec);
-        println!("    rust-sql is {:.2}x faster than SQLite for concurrent reads", t.ratio());
+        println!(
+            "    rust-sql is {:.2}x faster than SQLite for concurrent reads",
+            t.ratio()
+        );
     }
 
     if let Some(t) = tests.iter().find(|t| t.name.contains("Mixed R/W")) {
         println!(">>> HEADLINE: {}", t.name);
         println!("    rust-sql: {:.0} ops/sec", t.rustqlite_ops_per_sec);
         println!("    SQLite:   {:.0} ops/sec", t.rusqlite_ops_per_sec);
-        println!("    rust-sql is {:.2}x faster than SQLite for mixed R/W workload", t.ratio());
+        println!(
+            "    rust-sql is {:.2}x faster than SQLite for mixed R/W workload",
+            t.ratio()
+        );
     }
     println!();
 }

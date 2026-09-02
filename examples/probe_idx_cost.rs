@@ -10,15 +10,23 @@ fn ns(d: std::time::Duration) -> f64 {
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     let ins = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
     for i in 1..=10000i64 {
-        db.execute(ins, [
-            Value::Text(format!("name{}", i).into()),
-            Value::Integer(i * 2),
-            Value::Real(i as f64 * 1.5),
-        ]).unwrap();
+        db.execute(
+            ins,
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
@@ -34,8 +42,12 @@ fn main() {
 
     let warm = 2000;
     for i in 0..warm {
-        let _ = db.query(sql_idx, [Value::Integer((i % 10000 + 1) as i64 * 2)]).unwrap();
-        let _ = db.query(sql_rid, [Value::Integer((i % 10000 + 1) as i64)]).unwrap();
+        let _ = db
+            .query(sql_idx, [Value::Integer((i % 10000 + 1) as i64 * 2)])
+            .unwrap();
+        let _ = db
+            .query(sql_rid, [Value::Integer((i % 10000 + 1) as i64)])
+            .unwrap();
         let _ = db.query(sql_miss, [Value::Integer(-1)]).unwrap();
     }
 
@@ -61,13 +73,18 @@ fn main() {
     // (C) miss: same pipeline, no row decode/fetch.
     let t = std::time::Instant::now();
     for i in 0..n {
-        let _ = db.query(sql_miss, [Value::Integer(-1 - (i % 100) as i64)]).unwrap();
+        let _ = db
+            .query(sql_miss, [Value::Integer(-1 - (i % 100) as i64)])
+            .unwrap();
     }
     let c = ns(t.elapsed()) / n as f64;
     println!("indexed miss (C):           {:>7.1} ns/op", c);
 
     println!();
     println!("index descent + seek:       {:>7.1} ns (C - fixed)", c);
-    println!("rowid descent+decode+row:   {:>7.1} ns (B - fixed est.)", b - c);
+    println!(
+        "rowid descent+decode+row:   {:>7.1} ns (B - fixed est.)",
+        b - c
+    );
     println!("table fetch on hit:         {:>7.1} ns (A - C)", a - c);
 }

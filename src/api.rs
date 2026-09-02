@@ -165,6 +165,21 @@ pub struct Database {
     /// (exclusive with all readers at the type level), so a stale `false`
     /// is impossible: the flag is refreshed at every maps attach site.
     pub(crate) maps_populated: AtomicBool,
+    /// Monotonic write epoch: bumped by every statement that executes via
+    /// `Database::execute` (all DML/DDL/transaction control) and by DML
+    /// executed through prepared statements (see `statement.rs`). Readers
+    /// (`&self`) can never bump it, so a value observed at the START of a
+    /// read is stable for the read's duration. Keyes the
+    /// `table_count_cache` below (SQLite's OP_Count walks the whole tree
+    /// every time; we memoize per table and invalidate on any write).
+    pub(crate) write_epoch: AtomicU64,
+    /// Memoized `SELECT COUNT(*) FROM t` answers, keyed by lowercased table
+    /// name → (write_epoch, row count). A hit requires the epoch to match
+    /// the current one; ANY write statement invalidates every entry
+    /// (conservative — cross-table writes just cost a re-walk). Writers
+    /// are `&mut self`, so a walk performed under one epoch value cannot
+    /// interleave with a write; the stored pair is always self-consistent.
+    table_count_cache: RwLock<HashMap<String, (u64, i64)>>,
     /// Estimated allocator blocks freed by write statements since the last
     /// read-side settle (see `settle_allocator`). Bulk-write transactions
     /// free hundreds of thousands of small blocks (statement ASTs, encode
@@ -274,7 +289,8 @@ const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
 /// attach path in `execute` and on the ROLLBACK reset.
 fn empty_maps() -> Arc<crate::executor::StmtMaps> {
     static E: std::sync::OnceLock<Arc<crate::executor::StmtMaps>> = std::sync::OnceLock::new();
-    E.get_or_init(|| Arc::new(crate::executor::StmtMaps::empty())).clone()
+    E.get_or_init(|| Arc::new(crate::executor::StmtMaps::empty()))
+        .clone()
 }
 
 /// Generic FxHash-style string hasher for statement-cache keys.
@@ -419,6 +435,14 @@ pub(crate) enum FastPath {
         project: Option<Vec<usize>>,
         columns: Arc<[String]>,
     },
+    /// `SELECT COUNT(*) FROM t` (bare: no WHERE / GROUP BY / DISTINCT).
+    /// Direct `Btree::count_rows` — sums `n_cells` across leaf pages with
+    /// zero payload decoding and no ExecContext / executor dispatch.
+    /// `COUNT(col)` (NULL-skipping) and DISTINCT keep the general path.
+    CountStar {
+        table: Arc<Table>,
+        columns: Arc<[String]>,
+    },
 }
 
 /// precomputed `has_subqueries` flag (mirrors SQLite's OP_Once check —
@@ -442,6 +466,7 @@ impl FastPath {
             FastPath::IndexPoint { table, .. } => &table.name,
             FastPath::IndexCount { table, .. } => &table.name,
             FastPath::RowidRange { table, .. } => &table.name,
+            FastPath::CountStar { table, .. } => &table.name,
         }
     }
 
@@ -457,6 +482,7 @@ impl FastPath {
             FastPath::IndexPoint { columns, .. } => columns,
             FastPath::IndexCount { columns, .. } => columns,
             FastPath::RowidRange { columns, .. } => columns,
+            FastPath::CountStar { columns, .. } => columns,
         }
     }
 }
@@ -482,11 +508,23 @@ fn pre_encode_literal_keys(keys: &[FastBound]) -> Option<Arc<[u8]>> {
     Some(buf.into())
 }
 
-fn decode_projected(payload: &[u8], table: &Table, rowid: i64, project: Option<&[usize]>) -> Result<Row> {
+fn decode_projected(
+    payload: &[u8],
+    table: &Table,
+    rowid: i64,
+    project: Option<&[usize]>,
+) -> Result<Row> {
     match project {
         Some(idxs) => {
             let mut out = Vec::with_capacity(idxs.len());
-            decode_row_selective(payload, table.n_columns(), idxs, rowid, table.rowid_alias, &mut out)?;
+            decode_row_selective(
+                payload,
+                table.n_columns(),
+                idxs,
+                rowid,
+                table.rowid_alias,
+                &mut out,
+            )?;
             Ok(out)
         }
         None => decode_row(payload, table.n_columns(), rowid, table.rowid_alias),
@@ -498,11 +536,7 @@ fn decode_projected(payload: &[u8], table: &Table, rowid: i64, project: Option<&
 /// non-UNION top-level operator is rejected (SQLite requires the same shape).
 fn split_compound_cte(
     sel: &SelectStatement,
-) -> Result<(
-    SelectStatement,
-    crate::sql::ast::SetOp,
-    SelectStatement,
-)> {
+) -> Result<(SelectStatement, crate::sql::ast::SetOp, SelectStatement)> {
     use crate::sql::ast::{SelectBody, SelectStatement as Sel};
     // Rebuild a plain SelectStatement from a SelectBody by cloning the
     // statement shell with the body swapped.
@@ -544,7 +578,10 @@ fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
     for c in &cd.constraints {
         s.push(' ');
         match c {
-            C::PrimaryKey { autoincrement, order } => {
+            C::PrimaryKey {
+                autoincrement,
+                order,
+            } => {
                 s.push_str("PRIMARY KEY");
                 if *order == crate::sql::ast::Order::Desc {
                     s.push_str(" DESC");
@@ -559,7 +596,12 @@ fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
             C::Check(e) => s.push_str(&format!("CHECK ({})", expr_to_sql(e))),
             C::Default(e) => s.push_str(&format!("DEFAULT {}", expr_to_sql(e))),
             C::Collate(c) => s.push_str(&format!("COLLATE {}", c)),
-            C::References { table, columns, on_delete, on_update } => {
+            C::References {
+                table,
+                columns,
+                on_delete,
+                on_update,
+            } => {
                 s.push_str(&format!("REFERENCES {}", table));
                 if !columns.is_empty() {
                     s.push_str(&format!("({})", columns.join(", ")));
@@ -619,11 +661,23 @@ fn create_table_to_sql(
     let mut parts: Vec<String> = columns.iter().map(column_def_to_sql).collect();
     for tc in constraints {
         let s = match tc {
-            T::PrimaryKey { columns } => format!("PRIMARY KEY ({})", indexed_columns_to_sql(columns)),
+            T::PrimaryKey { columns } => {
+                format!("PRIMARY KEY ({})", indexed_columns_to_sql(columns))
+            }
             T::Unique(cols) => format!("UNIQUE ({})", indexed_columns_to_sql(cols)),
             T::Check(e) => format!("CHECK ({})", expr_to_sql(e)),
-            T::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update } => {
-                let mut s = format!("FOREIGN KEY ({}) REFERENCES {}", columns.join(", "), ref_table);
+            T::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                on_delete,
+                on_update,
+            } => {
+                let mut s = format!(
+                    "FOREIGN KEY ({}) REFERENCES {}",
+                    columns.join(", "),
+                    ref_table
+                );
                 if !ref_columns.is_empty() {
                     s.push_str(&format!("({})", ref_columns.join(", ")));
                 }
@@ -662,7 +716,10 @@ fn create_table_to_sql(
 fn rename_column_in_expr(e: &mut Expr, old: &str, new: &str, qualifier: &str) {
     match e {
         Expr::Column { table, name } => {
-            let matches_qual = table.as_deref().map(|t| t.eq_ignore_ascii_case(qualifier)).unwrap_or(true);
+            let matches_qual = table
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case(qualifier))
+                .unwrap_or(true);
             if matches_qual && name.eq_ignore_ascii_case(old) {
                 *name = new.to_string();
                 if table.is_some() {
@@ -685,7 +742,11 @@ fn rename_column_in_expr(e: &mut Expr, old: &str, new: &str, qualifier: &str) {
                 rename_column_in_expr(it, old, new, qualifier);
             }
         }
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             if let Some(op) = operand {
                 rename_column_in_expr(op, old, new, qualifier);
             }
@@ -705,14 +766,21 @@ fn rename_column_in_expr(e: &mut Expr, old: &str, new: &str, qualifier: &str) {
                 }
             }
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             rename_column_in_expr(expr, old, new, qualifier);
             rename_column_in_expr(low, old, new, qualifier);
             rename_column_in_expr(high, old, new, qualifier);
         }
         Expr::Cast { expr, .. } => rename_column_in_expr(expr, old, new, qualifier),
         Expr::Collate { expr, .. } => rename_column_in_expr(expr, old, new, qualifier),
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             rename_column_in_expr(expr, old, new, qualifier);
             rename_column_in_expr(pattern, old, new, qualifier);
             if let Some(e) = escape {
@@ -733,39 +801,71 @@ fn rename_column_in_expr(e: &mut Expr, old: &str, new: &str, qualifier: &str) {
 fn expr_references_column(e: &Expr, old: &str, qualifier: &str) -> bool {
     match e {
         Expr::Column { table, name } => {
-            let matches_qual = table.as_deref().map(|t| t.eq_ignore_ascii_case(qualifier)).unwrap_or(true);
+            let matches_qual = table
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case(qualifier))
+                .unwrap_or(true);
             matches_qual && name.eq_ignore_ascii_case(old)
         }
         Expr::Binary { left, right, .. } => {
-            expr_references_column(left, old, qualifier) || expr_references_column(right, old, qualifier)
+            expr_references_column(left, old, qualifier)
+                || expr_references_column(right, old, qualifier)
         }
         Expr::Unary { expr, .. } => expr_references_column(expr, old, qualifier),
         Expr::Function { args, filter, .. } => {
-            args.iter().any(|a| expr_references_column(a, old, qualifier))
-                || filter.as_ref().map(|f| expr_references_column(f, old, qualifier)).unwrap_or(false)
+            args.iter()
+                .any(|a| expr_references_column(a, old, qualifier))
+                || filter
+                    .as_ref()
+                    .map(|f| expr_references_column(f, old, qualifier))
+                    .unwrap_or(false)
         }
-        Expr::Row(items) => items.iter().any(|it| expr_references_column(it, old, qualifier)),
-        Expr::Case { operand, whens, else_ } => {
-            operand.as_ref().map(|o| expr_references_column(o, old, qualifier)).unwrap_or(false)
+        Expr::Row(items) => items
+            .iter()
+            .any(|it| expr_references_column(it, old, qualifier)),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand
+                .as_ref()
+                .map(|o| expr_references_column(o, old, qualifier))
+                .unwrap_or(false)
                 || whens.iter().any(|(w, t)| {
-                    expr_references_column(w, old, qualifier) || expr_references_column(t, old, qualifier)
+                    expr_references_column(w, old, qualifier)
+                        || expr_references_column(t, old, qualifier)
                 })
-                || else_.as_ref().map(|el| expr_references_column(el, old, qualifier)).unwrap_or(false)
+                || else_
+                    .as_ref()
+                    .map(|el| expr_references_column(el, old, qualifier))
+                    .unwrap_or(false)
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             expr_references_column(expr, old, qualifier)
                 || expr_references_column(pattern, old, qualifier)
-                || escape.as_ref().map(|e| expr_references_column(e, old, qualifier)).unwrap_or(false)
+                || escape
+                    .as_ref()
+                    .map(|e| expr_references_column(e, old, qualifier))
+                    .unwrap_or(false)
         }
         Expr::IsNull { expr, .. } => expr_references_column(expr, old, qualifier),
         Expr::Is { left, right, .. } => {
-            expr_references_column(left, old, qualifier) || expr_references_column(right, old, qualifier)
+            expr_references_column(left, old, qualifier)
+                || expr_references_column(right, old, qualifier)
         }
         Expr::In { expr, source, .. } => {
             expr_references_column(expr, old, qualifier)
                 || matches!(source, crate::sql::ast::InSource::List(items) if items.iter().any(|it| expr_references_column(it, old, qualifier)))
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             expr_references_column(expr, old, qualifier)
                 || expr_references_column(low, old, qualifier)
                 || expr_references_column(high, old, qualifier)
@@ -792,7 +892,12 @@ fn rename_column_in_create_table(
     use crate::sql::ast::TableConstraint as T;
     let stmt = crate::sql::parser::parse(sql)?;
     if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-        name, columns, constraints, without_rowid, strict, ..
+        name,
+        columns,
+        constraints,
+        without_rowid,
+        strict,
+        ..
     }) = stmt
     {
         let mut columns = columns;
@@ -828,7 +933,12 @@ fn rename_column_in_create_table(
                     }
                 }
                 T::Check(e) => rename_column_in_expr(e, old, new, table_name),
-                T::ForeignKey { columns, ref_table, ref_columns, .. } => {
+                T::ForeignKey {
+                    columns,
+                    ref_table,
+                    ref_columns,
+                    ..
+                } => {
                     for cn in columns.iter_mut() {
                         if cn.eq_ignore_ascii_case(old) {
                             *cn = new.to_string();
@@ -844,21 +954,39 @@ fn rename_column_in_create_table(
                 }
             }
         }
-        Ok(create_table_to_sql(&name.name, &columns, &constraints, without_rowid, strict))
+        Ok(create_table_to_sql(
+            &name.name,
+            &columns,
+            &constraints,
+            without_rowid,
+            strict,
+        ))
     } else {
-        Err(Error::corruption("schema row is not a CREATE TABLE statement"))
+        Err(Error::corruption(
+            "schema row is not a CREATE TABLE statement",
+        ))
     }
 }
 
 /// Rewrite a CREATE TABLE statement, renaming `old` -> `new` ONLY in
 /// REFERENCES <target_table> (...) parent-column lists (used when another
 /// table's column is renamed and this table points at it).
-fn rename_fk_refs_in_create_table(sql: &str, target_table: &str, old: &str, new: &str) -> Result<String> {
+fn rename_fk_refs_in_create_table(
+    sql: &str,
+    target_table: &str,
+    old: &str,
+    new: &str,
+) -> Result<String> {
     use crate::sql::ast::ColumnConstraint as C;
     use crate::sql::ast::TableConstraint as T;
     let stmt = crate::sql::parser::parse(sql)?;
     if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-        name, columns, constraints, without_rowid, strict, ..
+        name,
+        columns,
+        constraints,
+        without_rowid,
+        strict,
+        ..
     }) = stmt
     {
         let mut columns = columns;
@@ -880,15 +1008,28 @@ fn rename_fk_refs_in_create_table(sql: &str, target_table: &str, old: &str, new:
             }
         }
         for tc in constraints.iter_mut() {
-            if let T::ForeignKey { ref_table, ref_columns, .. } = tc {
+            if let T::ForeignKey {
+                ref_table,
+                ref_columns,
+                ..
+            } = tc
+            {
                 if ref_table.eq_ignore_ascii_case(target_table) {
                     rename_refs(ref_columns);
                 }
             }
         }
-        Ok(create_table_to_sql(&name.name, &columns, &constraints, without_rowid, strict))
+        Ok(create_table_to_sql(
+            &name.name,
+            &columns,
+            &constraints,
+            without_rowid,
+            strict,
+        ))
     } else {
-        Err(Error::corruption("schema row is not a CREATE TABLE statement"))
+        Err(Error::corruption(
+            "schema row is not a CREATE TABLE statement",
+        ))
     }
 }
 
@@ -896,7 +1037,12 @@ fn rename_fk_refs_in_create_table(sql: &str, target_table: &str, old: &str, new:
 fn rename_column_in_create_index(sql: &str, old: &str, new: &str) -> Result<String> {
     let stmt = crate::sql::parser::parse(sql)?;
     if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Index {
-        unique, name, table, columns, where_clause, ..
+        unique,
+        name,
+        table,
+        columns,
+        where_clause,
+        ..
     }) = stmt
     {
         let mut columns = columns;
@@ -917,7 +1063,9 @@ fn rename_column_in_create_index(sql: &str, old: &str, new: &str) -> Result<Stri
         }
         Ok(sql)
     } else {
-        Err(Error::corruption("schema row is not a CREATE INDEX statement"))
+        Err(Error::corruption(
+            "schema row is not a CREATE INDEX statement",
+        ))
     }
 }
 
@@ -939,7 +1087,13 @@ fn rename_column_in_create_index(sql: &str, old: &str, new: &str) -> Result<Stri
 /// triggers ON the target (their unqualified names resolve to the trigger
 /// table per SQLite's lookup order). When false, only the disambiguated
 /// positions above are rewritten.
-fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unqualified: bool) -> String {
+fn rename_column_in_object_sql(
+    sql: &str,
+    table: &str,
+    old: &str,
+    new: &str,
+    unqualified: bool,
+) -> String {
     #[derive(Clone, Debug, PartialEq)]
     enum Tk {
         Ident(String),
@@ -982,15 +1136,26 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
                 }
                 out.push((Tk::Str(sql[start..i].to_string()), start, i));
             } else if c == b'"' || c == b'`' || c == b'[' {
-                let close = if c == b'"' { b'"' } else if c == b'`' { b'`' } else { b']' };
+                let close = if c == b'"' {
+                    b'"'
+                } else if c == b'`' {
+                    b'`'
+                } else {
+                    b']'
+                };
                 i += 1;
                 while i < b.len() && b[i] != close {
                     i += 1;
                 }
                 i = (i + 1).min(b.len());
-                out.push((Tk::Ident(sql[start + 1..i.saturating_sub(1)].to_string()), start, i));
+                out.push((
+                    Tk::Ident(sql[start + 1..i.saturating_sub(1)].to_string()),
+                    start,
+                    i,
+                ));
             } else if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80)
+                {
                     i += 1;
                 }
                 out.push((Tk::Ident(sql[start..i].to_string()), start, i));
@@ -1018,15 +1183,76 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
     let is_kw = |s: &str| -> bool {
         matches!(
             s.to_ascii_uppercase().as_str(),
-            "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "NOT" | "VALUES" | "INSERT" | "UPDATE"
-                | "DELETE" | "SET" | "INTO" | "OF" | "JOIN" | "ON" | "AS" | "WHEN" | "THEN"
-                | "ELSE" | "CASE" | "END" | "IS" | "NULL" | "IN" | "BETWEEN" | "LIKE" | "GLOB"
-                | "REGEXP" | "MATCH" | "ESCAPE" | "CAST" | "COLLATE" | "ASC" | "DESC" | "IF"
-                | "EXISTS" | "BEGIN" | "BEFORE" | "AFTER" | "INSTEAD" | "FOR" | "EACH" | "ROW"
-                | "TRIGGER" | "VIEW" | "TABLE" | "INDEX" | "CREATE" | "REPLACE" | "CONFLICT"
-                | "DO" | "NOTHING" | "RETURNING" | "LIMIT" | "ORDER" | "BY" | "GROUP" | "HAVING"
-                | "DISTINCT" | "ALL" | "UNION" | "EXCEPT" | "INTERSECT" | "PRIMARY" | "KEY"
-                | "REFERENCES" | "DEFAULT" | "CHECK" | "UNIQUE" | "AUTOINCREMENT"
+            "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "AND"
+                | "OR"
+                | "NOT"
+                | "VALUES"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "SET"
+                | "INTO"
+                | "OF"
+                | "JOIN"
+                | "ON"
+                | "AS"
+                | "WHEN"
+                | "THEN"
+                | "ELSE"
+                | "CASE"
+                | "END"
+                | "IS"
+                | "NULL"
+                | "IN"
+                | "BETWEEN"
+                | "LIKE"
+                | "GLOB"
+                | "REGEXP"
+                | "MATCH"
+                | "ESCAPE"
+                | "CAST"
+                | "COLLATE"
+                | "ASC"
+                | "DESC"
+                | "IF"
+                | "EXISTS"
+                | "BEGIN"
+                | "BEFORE"
+                | "AFTER"
+                | "INSTEAD"
+                | "FOR"
+                | "EACH"
+                | "ROW"
+                | "TRIGGER"
+                | "VIEW"
+                | "TABLE"
+                | "INDEX"
+                | "CREATE"
+                | "REPLACE"
+                | "CONFLICT"
+                | "DO"
+                | "NOTHING"
+                | "RETURNING"
+                | "LIMIT"
+                | "ORDER"
+                | "BY"
+                | "GROUP"
+                | "HAVING"
+                | "DISTINCT"
+                | "ALL"
+                | "UNION"
+                | "EXCEPT"
+                | "INTERSECT"
+                | "PRIMARY"
+                | "KEY"
+                | "REFERENCES"
+                | "DEFAULT"
+                | "CHECK"
+                | "UNIQUE"
+                | "AUTOINCREMENT"
         )
     };
 
@@ -1068,7 +1294,8 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
                     // written the other way (t.old already covered), or it
                     // sits right after a '.' (someone's column already).
                     let prev_is_dot = i >= 1 && matches!(&toks[i - 1].0, Tk::Other(o) if o == ".");
-                    let next_is_dot = i + 1 < n && matches!(&toks[i + 1].0, Tk::Other(o) if o == ".");
+                    let next_is_dot =
+                        i + 1 < n && matches!(&toks[i + 1].0, Tk::Other(o) if o == ".");
                     if !prev_is_dot && !next_is_dot {
                         replace[i] = true;
                     }
@@ -1097,40 +1324,53 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
             Some("INSERT") => {
                 // INSERT [OR <conflict>] INTO <table> [ ( collist ) ]
                 let mut j = i + 1;
-                if as_str(j).map(|s| s.eq_ignore_ascii_case("OR")).unwrap_or(false) {
+                if as_str(j)
+                    .map(|s| s.eq_ignore_ascii_case("OR"))
+                    .unwrap_or(false)
+                {
                     j += 2; // skip OR + conflict action
                 }
-                if as_str(j).map(|s| s.eq_ignore_ascii_case("INTO")).unwrap_or(false) {
+                if as_str(j)
+                    .map(|s| s.eq_ignore_ascii_case("INTO"))
+                    .unwrap_or(false)
+                {
                     j += 1;
                     let target = as_str(j).map(is_target_ref).unwrap_or(false);
                     j += 1;
                     // Optional column list: '(' ident[, ident]* ')'
                     if target
-                        && matches!(&toks.get(j).map(|t| &t.0), Some(Tk::Other(o)) if o == "(") {
-                            j += 1;
-                            while j < n {
-                                if let Tk::Ident(s) = &toks[j].0 {
-                                    if s.eq_ignore_ascii_case(old) {
-                                        replace[j] = true;
-                                    }
-                                    j += 1;
-                                } else if matches!(&toks[j].0, Tk::Other(o) if o == ",") {
-                                    j += 1;
-                                } else {
-                                    break;
+                        && matches!(&toks.get(j).map(|t| &t.0), Some(Tk::Other(o)) if o == "(")
+                    {
+                        j += 1;
+                        while j < n {
+                            if let Tk::Ident(s) = &toks[j].0 {
+                                if s.eq_ignore_ascii_case(old) {
+                                    replace[j] = true;
                                 }
+                                j += 1;
+                            } else if matches!(&toks[j].0, Tk::Other(o) if o == ",") {
+                                j += 1;
+                            } else {
+                                break;
                             }
                         }
+                    }
                 }
                 i = j;
             }
             Some("UPDATE") => {
                 // UPDATE [OR <conflict>] <table|OF> ...
                 let mut j = i + 1;
-                if as_str(j).map(|s| s.eq_ignore_ascii_case("OR")).unwrap_or(false) {
+                if as_str(j)
+                    .map(|s| s.eq_ignore_ascii_case("OR"))
+                    .unwrap_or(false)
+                {
                     j += 2;
                 }
-                if as_str(j).map(|s| s.eq_ignore_ascii_case("OF")).unwrap_or(false) {
+                if as_str(j)
+                    .map(|s| s.eq_ignore_ascii_case("OF"))
+                    .unwrap_or(false)
+                {
                     // Trigger UPDATE OF <col-list>: refers to the trigger's
                     // table, which IS the target.
                     j += 1;
@@ -1172,7 +1412,12 @@ fn rename_column_in_object_sql(sql: &str, table: &str, old: &str, new: &str, unq
                                 if u == "SET" {
                                     in_set = true;
                                     j += 1;
-                                } else if in_set && (u == "WHERE" || u == "RETURNING" || u == "ORDER" || u == "LIMIT") {
+                                } else if in_set
+                                    && (u == "WHERE"
+                                        || u == "RETURNING"
+                                        || u == "ORDER"
+                                        || u == "LIMIT")
+                                {
                                     break;
                                 } else if in_set && s.eq_ignore_ascii_case(old) {
                                     // LHS of an assignment? next token '='
@@ -1222,7 +1467,9 @@ fn view_is_single_table_over(select: &crate::sql::ast::SelectStatement, table: &
                 Some(TableExpression::Table { name, .. }) => name.eq_ignore_ascii_case(table),
                 _ => false,
             },
-            SelectBody::Binary { left, right, .. } => body_single(left, table) && body_single(right, table),
+            SelectBody::Binary { left, right, .. } => {
+                body_single(left, table) && body_single(right, table)
+            }
         }
     }
     body_single(&select.body, table)
@@ -1243,7 +1490,9 @@ fn rewrite_object_sql_column_refs(
         let mut bt = Btree::new(pager, 0, false);
         bt.scan_table(|rowid, payload| {
             if let Ok(row) = decode_row(payload, 5, 0, None) {
-                if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+                if let Some((kind, name, tbl_name, rootpage, sql)) =
+                    crate::schema::decode_schema_row(&row)
+                {
                     if (kind == "view" || kind == "trigger") && !sql.is_empty() {
                         // Views: rename bare references only when the view
                         // reads exactly this table (unqualified names then
@@ -1261,7 +1510,9 @@ fn rewrite_object_sql_column_refs(
                         if new_sql != sql {
                             schema_updates.push((
                                 rowid,
-                                crate::schema::encode_schema_row(kind, name, tbl_name, rootpage, &new_sql),
+                                crate::schema::encode_schema_row(
+                                    kind, name, tbl_name, rootpage, &new_sql,
+                                ),
                             ));
                         }
                     }
@@ -1288,9 +1539,14 @@ fn rewrite_object_sql_column_refs(
         if let Some((_kind, _name, _tbl, _root, sql)) = crate::schema::decode_schema_row(row) {
             if let Ok(stmt) = crate::sql::parser::parse(sql) {
                 match stmt {
-                    crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::View {
-                        name, columns, select, ..
-                    }) => {
+                    crate::sql::ast::Statement::Create(
+                        crate::sql::ast::CreateStatement::View {
+                            name,
+                            columns,
+                            select,
+                            ..
+                        },
+                    ) => {
                         let vname = name.name.clone();
                         catalog.replace_view(
                             &vname,
@@ -1302,7 +1558,9 @@ fn rewrite_object_sql_column_refs(
                             },
                         );
                     }
-                    crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Trigger(ct)) => {
+                    crate::sql::ast::Statement::Create(
+                        crate::sql::ast::CreateStatement::Trigger(ct),
+                    ) => {
                         let tname2 = ct.name.clone();
                         catalog.replace_trigger(
                             &tname2,
@@ -1365,11 +1623,11 @@ fn drop_column_from_create_table(sql: &str, name: &str) -> Result<Option<String>
             strict,
         )))
     } else {
-        Err(Error::corruption("schema row is not a CREATE TABLE statement"))
+        Err(Error::corruption(
+            "schema row is not a CREATE TABLE statement",
+        ))
     }
 }
-
-
 
 /// Pre-classification of savepoint-adjacent statements for execute()'s
 /// interception (the static dispatcher has no &self for map snapshots).
@@ -1441,6 +1699,8 @@ impl Database {
             savepoint_txn: AtomicBool::new(false),
             maps: RwLock::new(empty_maps()),
             maps_populated: AtomicBool::new(false),
+            write_epoch: AtomicU64::new(0),
+            table_count_cache: RwLock::new(HashMap::new()),
             alloc_burst: AtomicU64::new(0),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
@@ -1599,8 +1859,7 @@ impl Database {
         }
         // If any column has a DEFAULT and the row doesn't supply every
         // column, defaults must be evaluated — general path.
-        let supplies_all = fi.columns.is_empty()
-            || (fi.columns.len() == table.n_columns());
+        let supplies_all = fi.columns.is_empty() || (fi.columns.len() == table.n_columns());
         if !supplies_all && table.columns.iter().any(|c| c.default.is_some()) {
             return Ok(false);
         }
@@ -1658,11 +1917,13 @@ impl Database {
         // DETACH the combined maps (zero-copy): `execute`-family callers
         // hold `&mut self`, so no reader can hold a snapshot concurrently.
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
-        let result = crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values);
+        let result =
+            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values);
 
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
-        self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+        self.in_transaction
+            .store(ctx.in_transaction, Ordering::Release);
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         if let Ok(n) = result {
@@ -1674,7 +1935,9 @@ impl Database {
         // dropping the root override would lose data. ROLLBACK is the only
         // path that legitimately discards them.
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.shared).roots.extend(ctx.root_overrides.drain());
+            Arc::make_mut(&mut ctx.shared)
+                .roots
+                .extend(ctx.root_overrides.drain());
         }
         if ctx.max_rowids_changed {
             let shared = Arc::make_mut(&mut ctx.shared);
@@ -1684,7 +1947,9 @@ impl Database {
             }
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
+            Arc::make_mut(&mut ctx.shared)
+                .index_roots
+                .extend(ctx.index_roots.drain());
         }
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
@@ -1736,8 +2001,16 @@ impl Database {
                 .as_ref()
                 .map(|p| crate::executor::plan_has_subqueries(p))
                 .unwrap_or(false);
-            let fast_path = plan_arc.as_ref().and_then(|p| Self::detect_fast_path(p)).map(Arc::new);
-            return Ok(Arc::new(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path }));
+            let fast_path = plan_arc
+                .as_ref()
+                .and_then(|p| Self::detect_fast_path(p))
+                .map(Arc::new);
+            return Ok(Arc::new(CachedStmt {
+                stmt: Arc::new(stmt),
+                plan: plan_arc,
+                has_subqueries: has_subq,
+                fast_path,
+            }));
         }
         // Fast path 1: last-statement memo — consecutive calls with the
         // same SQL text (the dominant pattern) skip hashing + probing.
@@ -1788,8 +2061,16 @@ impl Database {
             .as_ref()
             .map(|p| crate::executor::plan_has_subqueries(p))
             .unwrap_or(false);
-        let fast_path = plan_arc.as_ref().and_then(|p| Self::detect_fast_path(p)).map(Arc::new);
-        let entry = Arc::new(CachedStmt { stmt: Arc::new(stmt), plan: plan_arc, has_subqueries: has_subq, fast_path });
+        let fast_path = plan_arc
+            .as_ref()
+            .and_then(|p| Self::detect_fast_path(p))
+            .map(Arc::new);
+        let entry = Arc::new(CachedStmt {
+            stmt: Arc::new(stmt),
+            plan: plan_arc,
+            has_subqueries: has_subq,
+            fast_path,
+        });
         let t2 = profile::now();
         // "Cache on second sight": only populate the cache for SQL text we
         // have seen before. A first sighting returns the freshly-parsed
@@ -1857,9 +2138,9 @@ impl Database {
         self.maps_populated.store(nonempty, Ordering::Release);
     }
 
-    /// Account allocator blocks freed by a write statement: an AST + token
-    /// + plan teardown baseline per statement, plus per-row encode buffers,
-    /// plus newly-dirtied pages (index backfills, page splits). Feeds the
+    /// Account allocator blocks freed by a write statement: per-statement
+    /// baseline (AST, tokens, plan teardown), per-row encode buffers, and
+    /// newly-dirtied pages (index backfills, page splits). Feeds the
     /// `drain_mimalloc_wake` threshold (checked at transaction end — see
     /// `maybe_drain_after_burst`).
     fn note_alloc_burst(&self, changes: u64, dirty_delta: u64) {
@@ -1993,6 +2274,15 @@ impl Database {
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         profile::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Write-epoch bump: `execute` is the gateway for every mutating
+        // statement (DML, DDL, transaction control, fast-path inserts),
+        // so ONE bump here invalidates the memoized COUNT(*) answers for
+        // all tables. Bumping unconditionally (SELECTs through execute
+        // are rare CTE shapes) trades a pointless invalidation for the
+        // guarantee that no write path can forget it. Readers are `&self`
+        // and can never observe a torn epoch.
+        self.write_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         // ---- FAST INSERT PATH ----
         // Single-row literal VALUES inserts are the hottest statement shape
         // in OLTP. A dedicated byte scanner recognizes them without the
@@ -2001,7 +2291,10 @@ impl Database {
         // deviation (UPSERT, RETURNING, non-literals, multi-row) falls
         // through to the general path below.
         {
-            let first = sql.as_bytes().iter().find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+            let first = sql
+                .as_bytes()
+                .iter()
+                .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
             if first == Some(&b'I') || first == Some(&b'i') {
                 if let Some(fi) = try_fast_insert_parse(sql) {
                     if self.exec_fast_insert(fi)? {
@@ -2020,8 +2313,9 @@ impl Database {
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
                 // vtab xConnect bridge (same rationale as the DDL path).
-                let _thread_db =
-                    crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
+                let _thread_db = crate::plugin::abi::ThreadDbGuard::install(
+                    self as *const Database as *mut Database,
+                );
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot.get_mut().take();
                 let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -2035,13 +2329,16 @@ impl Database {
                     ctx.bind_positional(v);
                 }
                 let _plugin_guard = self.plugin_scope();
-        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new());
-                self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+                self.in_transaction
+                    .store(ctx.in_transaction, Ordering::Release);
                 self.set_last_insert_rowid(ctx.last_insert_rowid);
                 *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
                 if ctx.max_rowids_changed {
-                    Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
+                    Arc::make_mut(&mut ctx.shared)
+                        .max_rowids
+                        .extend(ctx.max_rowids.drain());
                 }
                 *self.maps.get_mut() = ctx.shared;
                 self.refresh_maps_flag();
@@ -2114,7 +2411,8 @@ impl Database {
         // CREATE VIRTUAL TABLE and module registration) route declare_vtab
         // and argv construction through this thread-local raw pointer.
         // Valid for the duration of the statement (we hold &mut self).
-        let _thread_db = crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
+        let _thread_db =
+            crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
         let result = if let Some(plan) = plan_opt {
             // Substitute uncorrelated subqueries (scalar / IN / EXISTS) with
             // their materialized results before execution — mirrors
@@ -2139,7 +2437,8 @@ impl Database {
             Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql)
         };
         profile::span(t_exec, &profile::EXEC_NS);
-        self.in_transaction.store(ctx.in_transaction, Ordering::Release);
+        self.in_transaction
+            .store(ctx.in_transaction, Ordering::Release);
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         crate::executor::change_counters::record(ctx.changes);
@@ -2160,7 +2459,9 @@ impl Database {
         // are not undone by error propagation); ROLLBACK is the only path
         // that legitimately discards them.
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.shared).roots.extend(ctx.root_overrides.drain());
+            Arc::make_mut(&mut ctx.shared)
+                .roots
+                .extend(ctx.root_overrides.drain());
         }
         if ctx.max_rowids_changed {
             let shared = Arc::make_mut(&mut ctx.shared);
@@ -2170,7 +2471,9 @@ impl Database {
             }
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
+            Arc::make_mut(&mut ctx.shared)
+                .index_roots
+                .extend(ctx.index_roots.drain());
         }
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
@@ -2275,7 +2578,7 @@ impl Database {
                     ctx.bind_positional(v);
                 }
                 let _plugin_guard = self.plugin_scope();
-        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
                 return Ok(res.rows);
             }
@@ -2323,7 +2626,7 @@ impl Database {
             // subquery rewrite AND execution — rewrite-time execution of
             // UNcorrelated subqueries may itself hit nested correlated ones.
             let _plugin_guard = self.plugin_scope();
-        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
             let plan_local;
@@ -2417,7 +2720,11 @@ impl Database {
     /// Execute a query and return (column_names, rows).
     ///
     /// Takes `&self` — concurrent readers can call this simultaneously.
-    pub fn query_with_columns<P: Params>(&self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)> {
+    pub fn query_with_columns<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
         self.maybe_settle_allocator();
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
@@ -2434,7 +2741,15 @@ impl Database {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),
                 None => Vec::new(),
             };
-            return Ok((vec!["id".into(), "parent".into(), "notused".into(), "detail".into()], rows));
+            return Ok((
+                vec![
+                    "id".into(),
+                    "parent".into(),
+                    "notused".into(),
+                    "detail".into(),
+                ],
+                rows,
+            ));
         }
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
@@ -2454,7 +2769,7 @@ impl Database {
                     ctx.bind_positional(v);
                 }
                 let _plugin_guard = self.plugin_scope();
-        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
                 return Ok((res.columns.to_vec(), res.rows));
             }
@@ -2465,7 +2780,10 @@ impl Database {
                 let owned;
                 let slice: &[Value] = match params.as_slice() {
                     Some(s) => s,
-                    None => { owned = params.into_iter().collect::<Vec<Value>>(); &owned }
+                    None => {
+                        owned = params.into_iter().collect::<Vec<Value>>();
+                        &owned
+                    }
                 };
                 let rows = self.run_fast_path(fp, slice)?;
                 return Ok((fp.output_columns().to_vec(), rows));
@@ -2490,7 +2808,7 @@ impl Database {
             // subquery rewrite AND execution — rewrite-time execution of
             // UNcorrelated subqueries may itself hit nested correlated ones.
             let _plugin_guard = self.plugin_scope();
-        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
             let plan_local;
@@ -2626,13 +2944,19 @@ impl Database {
     /// assert_eq!(rows[0][0].as_text(), "hi!");
     /// # Ok(()) }
     /// ```
-    pub fn create_function<F: crate::plugin::ScalarFunction + 'static>(&mut self, f: F) -> Result<()> {
+    pub fn create_function<F: crate::plugin::ScalarFunction + 'static>(
+        &mut self,
+        f: F,
+    ) -> Result<()> {
         self.create_function_arc(std::sync::Arc::new(f))
     }
 
     /// `create_function` for an already-`Arc`ed function (used by the C ABI
     /// trampolines, which hold raw pointers inside the Arc).
-    pub fn create_function_arc(&mut self, f: std::sync::Arc<dyn crate::plugin::ScalarFunction>) -> Result<()> {
+    pub fn create_function_arc(
+        &mut self,
+        f: std::sync::Arc<dyn crate::plugin::ScalarFunction>,
+    ) -> Result<()> {
         let mut reg = self.plugins.read().clone();
         if crate::plugin::lookup_scalar_is_builtin(f.name()) {
             return Err(Error::semantic(format!(
@@ -2648,7 +2972,10 @@ impl Database {
 
     /// Register a user-defined aggregate SQL function
     /// (SQLite's `sqlite3_create_function` with xStep + xFinal).
-    pub fn create_aggregate<F: crate::plugin::AggregateFunction + 'static>(&mut self, f: F) -> Result<()> {
+    pub fn create_aggregate<F: crate::plugin::AggregateFunction + 'static>(
+        &mut self,
+        f: F,
+    ) -> Result<()> {
         let mut reg = self.plugins.read().clone();
         Arc::make_mut(&mut reg).set_aggregate(std::sync::Arc::new(f));
         *self.plugins.write() = reg;
@@ -2657,7 +2984,10 @@ impl Database {
     }
 
     /// `create_aggregate` for an already-`Arc`ed aggregate.
-    pub fn create_aggregate_arc(&mut self, f: std::sync::Arc<dyn crate::plugin::AggregateFunction>) -> Result<()> {
+    pub fn create_aggregate_arc(
+        &mut self,
+        f: std::sync::Arc<dyn crate::plugin::AggregateFunction>,
+    ) -> Result<()> {
         let mut reg = self.plugins.read().clone();
         Arc::make_mut(&mut reg).set_aggregate(f);
         *self.plugins.write() = reg;
@@ -2677,7 +3007,10 @@ impl Database {
     }
 
     /// `create_collation` for an already-`Arc`ed collation.
-    pub fn create_collation_arc(&mut self, c: std::sync::Arc<dyn crate::plugin::Collation>) -> Result<()> {
+    pub fn create_collation_arc(
+        &mut self,
+        c: std::sync::Arc<dyn crate::plugin::Collation>,
+    ) -> Result<()> {
         let mut reg = self.plugins.read().clone();
         Arc::make_mut(&mut reg).set_collation(c);
         *self.plugins.write() = reg;
@@ -2687,7 +3020,10 @@ impl Database {
 
     /// Register a virtual-table module
     /// (SQLite's `sqlite3_create_module`).
-    pub fn create_module<M: crate::plugin::VirtualTableModule + 'static>(&mut self, m: M) -> Result<()> {
+    pub fn create_module<M: crate::plugin::VirtualTableModule + 'static>(
+        &mut self,
+        m: M,
+    ) -> Result<()> {
         self.create_module_arc(std::sync::Arc::new(m))
     }
 
@@ -2697,7 +3033,10 @@ impl Database {
     /// was created by an earlier session with the same module name
     /// (SQLite's xConnect-on-open, deferred to registration because
     /// modules can't exist before the user registers them).
-    pub fn create_module_arc(&mut self, m: std::sync::Arc<dyn crate::plugin::VirtualTableModule>) -> Result<()> {
+    pub fn create_module_arc(
+        &mut self,
+        m: std::sync::Arc<dyn crate::plugin::VirtualTableModule>,
+    ) -> Result<()> {
         let module_name = m.name().to_ascii_lowercase();
         let mut reg = self.plugins.read().clone();
         Arc::make_mut(&mut reg).set_module(m.clone());
@@ -2721,10 +3060,7 @@ impl Database {
             .collect();
         let mut any_connected = false;
         for (name, inst) in pending {
-            let instance = match m.connect(&inst.table_name, &inst.args) {
-                Ok(i) => i,
-                Err(e) => return Err(e),
-            };
+            let instance = m.connect(&inst.table_name, &inst.args)?;
             let cols = instance.columns();
             let mut table = crate::plugin::vtab::vtab_columns_to_schema(&inst.table_name, &cols);
             table.create_sql = self
@@ -2733,9 +3069,7 @@ impl Database {
                 .map(|t| t.create_sql.clone())
                 .unwrap_or_default();
             // Reuse the SAME VtabInstance (state now connected).
-            if let Err(e) = inst.set_connected(instance) {
-                return Err(e);
-            }
+            inst.set_connected(instance)?;
             table.vtab = Some(inst);
             self.catalog.add_table(table);
             any_connected = true;
@@ -2805,7 +3139,9 @@ impl Database {
         if !self.has_plugins.load(Ordering::Relaxed) {
             return None;
         }
-        Some(crate::plugin::PluginScopeGuard::install(self.plugins.read().clone()))
+        Some(crate::plugin::PluginScopeGuard::install(
+            self.plugins.read().clone(),
+        ))
     }
 
     // ====================================================================
@@ -2985,7 +3321,10 @@ impl Database {
         let mut scope = outer_ctes.clone();
         scope.insert(
             name_lc.clone(),
-            (Arc::new(Vec::new()), Arc::from(vec![format!("{}.", cte.name)])),
+            (
+                Arc::new(Vec::new()),
+                Arc::from(vec![format!("{}.", cte.name)]),
+            ),
         );
         let base_res = self.exec_select_with_ctes(ctx, &base, &scope)?;
         let mut rows: Vec<Row> = base_res.rows;
@@ -3015,10 +3354,8 @@ impl Database {
                 .into(),
         };
         // Dedup set for UNION semantics.
-        let mut seen: std::collections::HashSet<String> = rows
-            .iter()
-            .map(|r| format!("{:?}", r))
-            .collect();
+        let mut seen: std::collections::HashSet<String> =
+            rows.iter().map(|r| format!("{:?}", r)).collect();
         // Iterate the recursive arm with QUEUE semantics (SQLite's model):
         // each iteration's arm sees ONLY the rows produced by the PREVIOUS
         // iteration (the frontier), not the full accumulation — otherwise
@@ -3056,7 +3393,10 @@ impl Database {
         Ok((rows, out_cols))
     }
 
-    pub(crate) fn plan_for_statement(catalog: &Catalog, stmt: &Statement) -> Result<Option<crate::planner::plan::Plan>> {
+    pub(crate) fn plan_for_statement(
+        catalog: &Catalog,
+        stmt: &Statement,
+    ) -> Result<Option<crate::planner::plan::Plan>> {
         match stmt {
             Statement::Select(s) => {
                 let mut planner = Planner::new(catalog);
@@ -3098,7 +3438,11 @@ impl Database {
                     Expr::Column { name, .. } => {
                         let idx = table.find_column(name)?;
                         idxs.push(idx);
-                        names.push(pe.alias.clone().unwrap_or_else(|| table.columns[idx].name.clone()));
+                        names.push(
+                            pe.alias
+                                .clone()
+                                .unwrap_or_else(|| table.columns[idx].name.clone()),
+                        );
                     }
                     _ => return None,
                 }
@@ -3135,7 +3479,12 @@ impl Database {
                 return None;
             }
             match input {
-                crate::planner::plan::Plan::IndexLookup { table, index, key_exprs, .. } => {
+                crate::planner::plan::Plan::IndexLookup {
+                    table,
+                    index,
+                    key_exprs,
+                    ..
+                } => {
                     let keys = key_exprs
                         .iter()
                         .map(bind_expr)
@@ -3152,8 +3501,49 @@ impl Database {
                 _ => None,
             }
         }
-        if let Plan::Aggregate { input, group_by, aggregates } = plan {
+        /// `SELECT COUNT(*) FROM t` — the BARE table-count shape (no WHERE,
+        /// no GROUP BY): direct cell counting, zero decode, no executor.
+        /// Shared by the Project-wrapped and bare-Aggregate plan shapes.
+        fn bare_count_star_fp(
+            input: &crate::planner::plan::Plan,
+            group_by: &[Expr],
+            aggregates: &[crate::planner::plan::AggExpr],
+        ) -> Option<FastPath> {
+            if !group_by.is_empty() || aggregates.len() != 1 {
+                return None;
+            }
+            let agg = &aggregates[0];
+            if !agg.func.eq_ignore_ascii_case("count") || agg.arg.is_some() || agg.distinct {
+                return None;
+            }
+            // Only a plain table scan (no predicate; vtabs fall back —
+            // their cursor protocol must run).
+            let Plan::Scan {
+                table,
+                predicate: None,
+                ..
+            } = input
+            else {
+                return None;
+            };
+            if table.vtab.is_some() {
+                return None;
+            }
+            Some(FastPath::CountStar {
+                table: table.clone(),
+                columns: std::sync::Arc::from(vec![agg.display_name.clone()]),
+            })
+        }
+        if let Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } = plan
+        {
             if let Some(fp) = covering_count_fp(input, group_by, aggregates) {
+                return Some(fp);
+            }
+            if let Some(fp) = bare_count_star_fp(input, group_by, aggregates) {
                 return Some(fp);
             }
         }
@@ -3169,7 +3559,13 @@ impl Database {
                 })
             }
             // Bare `SELECT * FROM t WHERE id BETWEEN ? AND ?`.
-            Plan::RowidRange { table, start: Some(s), end: Some(e), residual: None, .. } => {
+            Plan::RowidRange {
+                table,
+                start: Some(s),
+                end: Some(e),
+                residual: None,
+                ..
+            } => {
                 let start = bind_expr(s)?;
                 let end = bind_expr(e)?;
                 Some(FastPath::RowidRange {
@@ -3191,8 +3587,16 @@ impl Database {
                         columns: cols,
                     })
                 }
-                Plan::IndexLookup { table, index, key_exprs, .. } => {
-                    let keys = key_exprs.iter().map(bind_expr).collect::<Option<Vec<_>>>()?;
+                Plan::IndexLookup {
+                    table,
+                    index,
+                    key_exprs,
+                    ..
+                } => {
+                    let keys = key_exprs
+                        .iter()
+                        .map(bind_expr)
+                        .collect::<Option<Vec<_>>>()?;
                     let (project, cols) = resolve_projection(columns, table)?;
                     let pre_encoded = pre_encode_literal_keys(&keys);
                     Some(FastPath::IndexPoint {
@@ -3204,7 +3608,13 @@ impl Database {
                         columns: cols,
                     })
                 }
-                Plan::RowidRange { table, start: Some(s), end: Some(e), residual: None, .. } => {
+                Plan::RowidRange {
+                    table,
+                    start: Some(s),
+                    end: Some(e),
+                    residual: None,
+                    ..
+                } => {
                     let start = bind_expr(s)?;
                     let end = bind_expr(e)?;
                     let (project, cols) = resolve_projection(columns, table)?;
@@ -3218,9 +3628,13 @@ impl Database {
                 }
                 // Project { Aggregate { IndexLookup } } — the planner's
                 // wrapped form of the covering-index COUNT (see above).
-                Plan::Aggregate { input, group_by, aggregates }
-                    if group_by.is_empty() && aggregates.len() == 1 =>
-                {
+                // Project { Aggregate { Scan } } — the wrapped form of the
+                // bare `SELECT COUNT(*) FROM t` (see bare_count_star_fp).
+                Plan::Aggregate {
+                    input,
+                    group_by,
+                    aggregates,
+                } if group_by.is_empty() && aggregates.len() == 1 => {
                     // Only when the projection is the trivial single-column
                     // pass-through of the aggregate output.
                     let trivial = columns.len() == 1
@@ -3229,8 +3643,17 @@ impl Database {
                     if !trivial {
                         return None;
                     }
-                    if let Plan::IndexLookup { table, index, key_exprs, .. } = input.as_ref() {
-                        let keys = key_exprs.iter().map(bind_expr).collect::<Option<Vec<_>>>()?;
+                    if let Plan::IndexLookup {
+                        table,
+                        index,
+                        key_exprs,
+                        ..
+                    } = input.as_ref()
+                    {
+                        let keys = key_exprs
+                            .iter()
+                            .map(bind_expr)
+                            .collect::<Option<Vec<_>>>()?;
                         let pre_encoded = pre_encode_literal_keys(&keys);
                         Some(FastPath::IndexCount {
                             table: table.clone(),
@@ -3240,7 +3663,7 @@ impl Database {
                             columns: std::sync::Arc::from(vec![aggregates[0].display_name.clone()]),
                         })
                     } else {
-                        None
+                        bare_count_star_fp(input, group_by, aggregates)
                     }
                 }
                 _ => None,
@@ -3267,10 +3690,16 @@ impl Database {
         let (table_root, index_root) = if self.maps_populated.load(Ordering::Acquire) {
             let m = self.maps.read();
             let name = fp.table_name();
-            let t = m.roots.get(name).copied()
+            let t = m
+                .roots
+                .get(name)
+                .copied()
                 .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
             let i = match fp {
-                FastPath::IndexPoint { index, .. } => m.index_roots.get(&index.name).copied()
+                FastPath::IndexPoint { index, .. } => m
+                    .index_roots
+                    .get(&index.name)
+                    .copied()
                     .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
                 _ => None,
             };
@@ -3279,7 +3708,12 @@ impl Database {
             (None, None)
         };
         match fp {
-            FastPath::RowidPoint { table, rowid, project, columns: _ } => {
+            FastPath::RowidPoint {
+                table,
+                rowid,
+                project,
+                columns: _,
+            } => {
                 let rid = rowid.resolve(params).as_integer();
                 let root = table_root.unwrap_or(table.root_page);
                 let mut bt = Btree::new(&self.pager, root, false);
@@ -3292,7 +3726,12 @@ impl Database {
                     None => Ok(Vec::new()),
                 }
             }
-            FastPath::IndexCount { index, keys, pre_encoded, .. } => {
+            FastPath::IndexCount {
+                index,
+                keys,
+                pre_encoded,
+                ..
+            } => {
                 let mut key_scratch: Vec<u8>;
                 let key_bytes: &[u8] = match pre_encoded {
                     Some(pre) => &pre[..],
@@ -3309,7 +3748,34 @@ impl Database {
                 let rowids = ibt.lookup_index(key_bytes)?;
                 Ok(vec![vec![Value::Integer(rowids.len() as i64)]])
             }
-            FastPath::IndexPoint { table, index, keys, pre_encoded, project, columns: _ } => {
+            FastPath::CountStar { table, .. } => {
+                // Epoch-keyed memoization: the walk sums n_cells over every
+                // leaf (~1-2 us for 10k rows); SQLite's OP_Count pays that
+                // every call. A write bumps write_epoch BEFORE mutating, and
+                // writers are `&mut self` (exclusive with this `&self`
+                // read), so a cached (epoch, count) pair can never outlive
+                // the state it describes. Vtabs never reach this arm.
+                let epoch = self.write_epoch.load(Ordering::Acquire);
+                let key = table.name.to_ascii_lowercase();
+                if let Some(&(e, n)) = self.table_count_cache.read().get(&key) {
+                    if e == epoch {
+                        return Ok(vec![vec![Value::Integer(n)]]);
+                    }
+                }
+                let root = table_root.unwrap_or(table.root_page);
+                let mut bt = Btree::new(&self.pager, root, false);
+                let n = bt.count_rows()? as i64;
+                self.table_count_cache.write().insert(key, (epoch, n));
+                Ok(vec![vec![Value::Integer(n)]])
+            }
+            FastPath::IndexPoint {
+                table,
+                index,
+                keys,
+                pre_encoded,
+                project,
+                columns: _,
+            } => {
                 // Encode the key (same order-preserving encoding as the
                 // general path's exec_index_lookup). All-literal keys were
                 // pre-encoded at cache time — borrow, don't re-encode.
@@ -3327,9 +3793,10 @@ impl Database {
                         let mut spilled = false;
                         'outer: {
                             for k in keys {
-                                match k.resolve(params).encode_order_key_into_slice(
-                                    &mut key_stack[key_stack_len..],
-                                ) {
+                                match k
+                                    .resolve(params)
+                                    .encode_order_key_into_slice(&mut key_stack[key_stack_len..])
+                                {
                                     Some(n) => key_stack_len += n,
                                     None => {
                                         spilled = true;
@@ -3386,7 +3853,13 @@ impl Database {
                 })?;
                 Ok(rows)
             }
-            FastPath::RowidRange { table, start, end, project, columns: _ } => {
+            FastPath::RowidRange {
+                table,
+                start,
+                end,
+                project,
+                columns: _,
+            } => {
                 let lo = start.resolve(params).as_integer();
                 let hi = end.resolve(params).as_integer();
                 let root = table_root.unwrap_or(table.root_page);
@@ -3416,18 +3889,20 @@ impl Database {
         }
     }
 
-    pub(crate) fn plan_insert(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
+    pub(crate) fn plan_insert(
+        catalog: &Catalog,
+        stmt: &Statement,
+    ) -> Result<crate::planner::plan::Plan> {
         let ins = match stmt {
             Statement::Insert(i) => i,
             _ => unreachable!(),
         };
-        let table = catalog.get_table(&ins.table).ok_or_else(|| Error::NotFound(format!("table: {}", ins.table)))?;
+        let table = catalog
+            .get_table(&ins.table)
+            .ok_or_else(|| Error::NotFound(format!("table: {}", ins.table)))?;
         // Plan the source.
         let source_plan = match &ins.source {
-            InsertSource::Values(rows) => {
-                
-                crate::planner::plan::Plan::Values { rows: rows.clone() }
-            }
+            InsertSource::Values(rows) => crate::planner::plan::Plan::Values { rows: rows.clone() },
             InsertSource::Select(s) => {
                 let mut planner = Planner::new(catalog);
                 planner.plan_select(s)?
@@ -3439,7 +3914,9 @@ impl Database {
         let columns: Option<Vec<usize>> = if let Some(cols) = &ins.columns {
             let mut v = Vec::with_capacity(cols.len());
             for c in cols {
-                let idx = resolve_insert_column(&table, c).ok_or_else(|| Error::semantic(format!("column {} not in table {}", c, table.name)))?;
+                let idx = resolve_insert_column(&table, c).ok_or_else(|| {
+                    Error::semantic(format!("column {} not in table {}", c, table.name))
+                })?;
                 v.push(idx);
             }
             Some(v)
@@ -3457,12 +3934,17 @@ impl Database {
         })
     }
 
-    pub(crate) fn plan_update(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
+    pub(crate) fn plan_update(
+        catalog: &Catalog,
+        stmt: &Statement,
+    ) -> Result<crate::planner::plan::Plan> {
         let upd = match stmt {
             Statement::Update(u) => u,
             _ => unreachable!(),
         };
-        let table = catalog.get_table(&upd.table).ok_or_else(|| Error::NotFound(format!("table: {}", upd.table)))?;
+        let table = catalog
+            .get_table(&upd.table)
+            .ok_or_else(|| Error::NotFound(format!("table: {}", upd.table)))?;
         let scan = crate::planner::plan::Plan::Scan {
             table: table.clone(),
             alias: upd.alias.clone(),
@@ -3473,14 +3955,18 @@ impl Database {
         // with the FROM side; the WHERE clause references BOTH sides, so
         // it is evaluated over combined rows by the executor instead of
         // being pushed into the target scan.
-        let from = upd.from.as_ref().map(|te| {
-            let mut planner = crate::planner::Planner::new(catalog);
-            let plan = planner.plan_table_expression_pub(te)?;
-            Ok::<_, Error>(Box::new(crate::planner::plan::UpdateFrom {
-                plan,
-                where_clause: upd.where_clause.clone(),
-            }))
-        }).transpose()?;
+        let from = upd
+            .from
+            .as_ref()
+            .map(|te| {
+                let mut planner = crate::planner::Planner::new(catalog);
+                let plan = planner.plan_table_expression_pub(te)?;
+                Ok::<_, Error>(Box::new(crate::planner::plan::UpdateFrom {
+                    plan,
+                    where_clause: upd.where_clause.clone(),
+                }))
+            })
+            .transpose()?;
         // Use apply_where_for_scan so that `UPDATE t SET ... WHERE id = ?`
         // picks RowidLookup instead of a full table scan. Previously this
         // built a Filter{Scan, predicate} which forced an O(n) scan per
@@ -3491,10 +3977,14 @@ impl Database {
         } else {
             scan
         };
-        let assignments: Vec<(usize, Expr)> = upd.set.iter().map(|(col, expr)| {
-            let idx = table.find_column(col).unwrap_or(0);
-            (idx, expr.clone())
-        }).collect();
+        let assignments: Vec<(usize, Expr)> = upd
+            .set
+            .iter()
+            .map(|(col, expr)| {
+                let idx = table.find_column(col).unwrap_or(0);
+                (idx, expr.clone())
+            })
+            .collect();
         Ok(crate::planner::plan::Plan::Update {
             table,
             source: Box::new(source),
@@ -3505,12 +3995,17 @@ impl Database {
         })
     }
 
-    pub(crate) fn plan_delete(catalog: &Catalog, stmt: &Statement) -> Result<crate::planner::plan::Plan> {
+    pub(crate) fn plan_delete(
+        catalog: &Catalog,
+        stmt: &Statement,
+    ) -> Result<crate::planner::plan::Plan> {
         let del = match stmt {
             Statement::Delete(d) => d,
             _ => unreachable!(),
         };
-        let table = catalog.get_table(&del.from).ok_or_else(|| Error::NotFound(format!("table: {}", del.from)))?;
+        let table = catalog
+            .get_table(&del.from)
+            .ok_or_else(|| Error::NotFound(format!("table: {}", del.from)))?;
         let scan = crate::planner::plan::Plan::Scan {
             table: table.clone(),
             alias: del.alias.clone(),
@@ -3531,7 +4026,12 @@ impl Database {
         })
     }
 
-    fn execute_statement_static(stmt: &Statement, ctx: &mut ExecContext, catalog: &mut Catalog, original_sql: &str) -> Result<()> {
+    fn execute_statement_static(
+        stmt: &Statement,
+        ctx: &mut ExecContext,
+        catalog: &mut Catalog,
+        original_sql: &str,
+    ) -> Result<()> {
         match stmt {
             Statement::Create(c) => Self::execute_create(c.clone(), ctx, catalog, original_sql),
             Statement::Drop(d) => Self::execute_drop(d.clone(), ctx, catalog),
@@ -3587,7 +4087,10 @@ impl Database {
             // means they were executed through a path without map access —
             // treat as no-ops to stay total.
             Statement::Savepoint(_) | Statement::Release(_) => Ok(()),
-            Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_) => {
                 // These produce rows; for `execute`, we just discard them.
                 let plan_opt = match stmt {
                     Statement::Select(s) => {
@@ -3607,11 +4110,24 @@ impl Database {
         }
     }
 
-    fn execute_create(c: CreateStatement, ctx: &mut ExecContext, catalog: &mut Catalog, original_sql: &str) -> Result<()> {
+    fn execute_create(
+        c: CreateStatement,
+        ctx: &mut ExecContext,
+        catalog: &mut Catalog,
+        original_sql: &str,
+    ) -> Result<()> {
         match c {
-            CreateStatement::Table { name, columns, constraints, without_rowid, strict, if_not_exists } => {
+            CreateStatement::Table {
+                name,
+                columns,
+                constraints,
+                without_rowid,
+                strict,
+                if_not_exists,
+            } => {
                 // Tables and views share one namespace (see the View arm).
-                if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some() {
+                if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some()
+                {
                     if if_not_exists {
                         return Ok(());
                     }
@@ -3622,7 +4138,15 @@ impl Database {
                     let page = ctx.pager.get_page(root_page)?;
                     page.lock().init_leaf_table();
                 }
-                let table = build_table(&name.name, &columns, &constraints, root_page, without_rowid, strict, original_sql)?;
+                let table = build_table(
+                    &name.name,
+                    &columns,
+                    &constraints,
+                    root_page,
+                    without_rowid,
+                    strict,
+                    original_sql,
+                )?;
                 let schema_row = crate::schema::encode_schema_row(
                     "table",
                     &table.name,
@@ -3646,7 +4170,11 @@ impl Database {
                 // as the schema SQL so the index round-trips on reopen.
                 let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
                 for col in &columns {
-                    if col.constraints.iter().any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique)) {
+                    if col
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique))
+                    {
                         // Inherit the column's declared COLLATE (SQLite:
                         // the implicit auto-index uses the column's
                         // collation, so `email TEXT UNIQUE COLLATE NOCASE`
@@ -3738,14 +4266,23 @@ impl Database {
                 ctx.pager.flush()?;
                 Ok(())
             }
-            CreateStatement::Index { unique, if_not_exists, name, table: table_name, columns, where_clause } => {
+            CreateStatement::Index {
+                unique,
+                if_not_exists,
+                name,
+                table: table_name,
+                columns,
+                where_clause,
+            } => {
                 if catalog.get_index(&name).is_some() {
                     if if_not_exists {
                         return Ok(());
                     }
                     return Err(Error::AlreadyExists(format!("index: {}", name)));
                 }
-                let table = catalog.get_table(&table_name).ok_or_else(|| Error::NotFound(format!("table: {}", table_name)))?;
+                let table = catalog
+                    .get_table(&table_name)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", table_name)))?;
                 let root_page = ctx.pager.allocate_page()?;
                 {
                     let page = ctx.pager.get_page(root_page)?;
@@ -3781,14 +4318,20 @@ impl Database {
                     let col_names: Vec<String> =
                         table.columns.iter().map(|c| c.name.clone()).collect();
                     let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
-                    let mut index_bt = crate::storage::btree::Btree::new(ctx.pager, root_page, true);
+                    let mut index_bt =
+                        crate::storage::btree::Btree::new(ctx.pager, root_page, true);
                     let partial = index.partial_expr.clone();
                     let is_unique = index.unique;
                     let mut backfill_err: Option<crate::error::Error> = None;
-                    let mut table_bt = crate::storage::btree::Btree::new(ctx.pager, table_root, false);
+                    let mut table_bt =
+                        crate::storage::btree::Btree::new(ctx.pager, table_root, false);
                     table_bt.scan_table_borrowed(|rowid, payload| {
                         if crate::storage::row_codec::decode_row_into(
-                            payload, n_cols, rowid, alias, &mut row_buf,
+                            payload,
+                            n_cols,
+                            rowid,
+                            alias,
+                            &mut row_buf,
                         )
                         .is_err()
                         {
@@ -3812,7 +4355,8 @@ impl Database {
                         // duplicate check (SQLite semantics — you can
                         // CREATE UNIQUE INDEX over data holding many NULLs).
                         let has_null_key = index.columns.iter().any(|c| {
-                            table.find_column(&c.name)
+                            table
+                                .find_column(&c.name)
                                 .and_then(|p| row_buf.get(p))
                                 .map(|v| v.is_null())
                                 .unwrap_or(false)
@@ -3824,7 +4368,12 @@ impl Database {
                                     backfill_err = Some(Error::constraint(format!(
                                         "UNIQUE constraint failed: {}.{}",
                                         table_name,
-                                        index.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                                        index
+                                            .columns
+                                            .iter()
+                                            .map(|c| c.name.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
                                     )));
                                     return false; // stop the scan
                                 }
@@ -3865,20 +4414,27 @@ impl Database {
                 // first user query after the build doesn't pay the
                 // read-path wake-up (see Btree::warm_read_path).
                 if std::env::var_os("RUSTQLITE_NO_WARM_TAP").is_none() {
-                    let mut warm_bt = crate::storage::btree::Btree::new(ctx.pager, final_root, true);
+                    let mut warm_bt =
+                        crate::storage::btree::Btree::new(ctx.pager, final_root, true);
                     let _ = warm_bt.warm_read_path();
                 }
                 ctx.pager.flush()?;
                 Ok(())
             }
-            CreateStatement::View { name, columns, select, if_not_exists } => {
+            CreateStatement::View {
+                name,
+                columns,
+                select,
+                if_not_exists,
+            } => {
                 // Tables and views share one namespace (SQLite: creating a
                 // view with an existing TABLE's name fails with "table X
                 // already exists", and vice versa). Without this check, a
                 // fuzzed `CREATE VIEW t AS ... FROM t` silently shadows a
                 // real table t — and a self-referencing shadow is exactly
                 // how infinite view-expansion recursion arises.
-                if catalog.get_view(&name.name).is_some() || catalog.get_table(&name.name).is_some() {
+                if catalog.get_view(&name.name).is_some() || catalog.get_table(&name.name).is_some()
+                {
                     if if_not_exists {
                         return Ok(());
                     }
@@ -3902,8 +4458,14 @@ impl Database {
                 ctx.pager.flush()?;
                 Ok(())
             }
-            CreateStatement::VirtualTable { if_not_exists, name, module, args } => {
-                if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some() {
+            CreateStatement::VirtualTable {
+                if_not_exists,
+                name,
+                module,
+                args,
+            } => {
+                if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some()
+                {
                     if if_not_exists {
                         return Ok(());
                     }
@@ -3912,9 +4474,8 @@ impl Database {
                 // Module lookup through the thread-local plugin scope —
                 // the CREATE statement runs inside `execute()`'s
                 // PluginScopeGuard (see the `_plugin_guard` installs).
-                let module = crate::plugin::lookup_module(&module).ok_or_else(|| {
-                    Error::semantic(format!("no such module: {}", module))
-                })?;
+                let module = crate::plugin::lookup_module(&module)
+                    .ok_or_else(|| Error::semantic(format!("no such module: {}", module)))?;
                 // xCreate: the instance supplies the column schema.
                 let instance = module.create(&name.name, &args)?;
                 let cols = instance.columns();
@@ -3984,7 +4545,9 @@ impl Database {
                 }
                 // Capture indexes BEFORE the catalog drop removes them.
                 let indexes_on_it = catalog.indexes_on_table(&d.name);
-                let table = catalog.drop_table(&d.name).ok_or_else(|| Error::NotFound(format!("table: {}", d.name)))?;
+                let table = catalog
+                    .drop_table(&d.name)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", d.name)))?;
                 if let Some(vtab) = &table.vtab {
                     // Virtual table: no pages to free; run xDestroy on the
                     // module so it can drop external state.
@@ -4008,7 +4571,9 @@ impl Database {
                 let mut to_delete = Vec::new();
                 bt.scan_table(|rowid, payload| {
                     if let Ok(row) = decode_row(payload, 5, 0, None) {
-                        if let Some((kind, _n, tbl_name, _rootpage, _sql)) = crate::schema::decode_schema_row(&row) {
+                        if let Some((kind, _n, tbl_name, _rootpage, _sql)) =
+                            crate::schema::decode_schema_row(&row)
+                        {
                             if kind == "index" && tbl_name.eq_ignore_ascii_case(&d.name) {
                                 to_delete.push(rowid);
                             }
@@ -4023,7 +4588,9 @@ impl Database {
                 Ok(())
             }
             DropKind::Index => {
-                let idx = catalog.drop_index(&d.name).ok_or_else(|| Error::NotFound(format!("index: {}", d.name)))?;
+                let idx = catalog
+                    .drop_index(&d.name)
+                    .ok_or_else(|| Error::NotFound(format!("index: {}", d.name)))?;
                 ctx.pager.free_page(idx.root_page)?;
                 delete_schema_row(ctx.pager, "index", &d.name)?;
                 ctx.pager.flush()?;
@@ -4043,9 +4610,6 @@ impl Database {
             }
         }
     }
-
-
-
 
     /// ALTER TABLE — RENAME TO (catalog + schema row rewrite, index
     /// tbl_name fixups) and ADD COLUMN (catalog + schema rewrite +
@@ -4086,9 +4650,9 @@ impl Database {
                     .into();
 
                 // Move the catalog entry (indexes + triggers follow).
-                catalog.rename_table(&old_name, &new_name).ok_or_else(|| {
-                    Error::AlreadyExists(format!("table: {}", new_name))
-                })?;
+                catalog
+                    .rename_table(&old_name, &new_name)
+                    .ok_or_else(|| Error::AlreadyExists(format!("table: {}", new_name)))?;
                 // Replace the moved entry's Arc with the rebuilt table.
                 catalog.replace_table(&new_name, rebuilt);
 
@@ -4099,9 +4663,8 @@ impl Database {
                 // Schema row: delete old, insert new (kind=table,
                 // name/tbl_name=new, same root, new SQL).
                 delete_schema_row(ctx.pager, "table", &old_name)?;
-                let schema_row = crate::schema::encode_schema_row(
-                    "table", &new_name, &new_name, root, &new_sql,
-                );
+                let schema_row =
+                    crate::schema::encode_schema_row("table", &new_name, &new_name, root, &new_sql);
                 insert_schema_row(ctx.pager, &schema_row)?;
 
                 // Index schema rows keep name and SQL but tbl_name follows.
@@ -4156,8 +4719,7 @@ impl Database {
                             _ => None,
                         })
                         .unwrap();
-                    let names: Vec<String> =
-                        table.columns.iter().map(|c| c.name.clone()).collect();
+                    let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
                     crate::executor::eval_row_public(
                         &expr,
                         &[],
@@ -4174,11 +4736,25 @@ impl Database {
                 let mut rebuilt = (*table).clone();
                 // Rebuild via build_table so affinity/constraints parse
                 // consistently (parse the new SQL and take its columns).
-                if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                    columns, constraints, without_rowid, strict, ..
-                })) = crate::sql::parser::parse(&new_sql)
+                if let Ok(crate::sql::ast::Statement::Create(
+                    crate::sql::ast::CreateStatement::Table {
+                        columns,
+                        constraints,
+                        without_rowid,
+                        strict,
+                        ..
+                    },
+                )) = crate::sql::parser::parse(&new_sql)
                 {
-                    rebuilt = build_table(&table.name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
+                    rebuilt = build_table(
+                        &table.name,
+                        &columns,
+                        &constraints,
+                        root,
+                        without_rowid,
+                        strict,
+                        &new_sql,
+                    )?;
                 }
                 let table_name = rebuilt.name.clone();
                 catalog.drop_table(&a.table);
@@ -4186,8 +4762,13 @@ impl Database {
 
                 // Schema row rewrite.
                 delete_schema_row(ctx.pager, "table", &table.name)?;
-                let schema_row =
-                    crate::schema::encode_schema_row("table", &table_name, &table_name, root, &new_sql);
+                let schema_row = crate::schema::encode_schema_row(
+                    "table",
+                    &table_name,
+                    &table_name,
+                    root,
+                    &new_sql,
+                );
                 insert_schema_row(ctx.pager, &schema_row)?;
 
                 // Physical back-fill: append the default to every existing
@@ -4254,8 +4835,14 @@ impl Database {
                     return Err(Error::AlreadyExists(format!("column: {}", new)));
                 }
                 if new.is_empty()
-                    || new.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    || new.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+                    || new
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    || new
+                        .chars()
+                        .any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
                 {
                     return Err(Error::semantic(format!("invalid column name: {}", new)));
                 }
@@ -4265,15 +4852,30 @@ impl Database {
                 // 1. Rewrite this table's CREATE statement (column def,
                 //    CHECK/DEFAULT/GENERATED exprs, PK/UNIQUE lists, child
                 //    FK columns, self-referencing FK parent columns).
-                let new_sql = rename_column_in_create_table(&table.create_sql, &table_name, &old_name, &new)?;
+                let new_sql =
+                    rename_column_in_create_table(&table.create_sql, &table_name, &old_name, &new)?;
 
                 // 2. Rebuild the catalog entry from the new SQL.
                 let mut rebuilt = (*table).clone();
-                if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                    columns, constraints, without_rowid, strict, ..
-                })) = crate::sql::parser::parse(&new_sql)
+                if let Ok(crate::sql::ast::Statement::Create(
+                    crate::sql::ast::CreateStatement::Table {
+                        columns,
+                        constraints,
+                        without_rowid,
+                        strict,
+                        ..
+                    },
+                )) = crate::sql::parser::parse(&new_sql)
                 {
-                    rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
+                    rebuilt = build_table(
+                        &table_name,
+                        &columns,
+                        &constraints,
+                        root,
+                        without_rowid,
+                        strict,
+                        &new_sql,
+                    )?;
                 }
                 catalog.replace_table(&table_name, rebuilt);
 
@@ -4285,18 +4887,38 @@ impl Database {
                     }
                     let references_us = other.foreign_keys.iter().any(|fk| {
                         fk.ref_table.eq_ignore_ascii_case(&table_name)
-                            && fk.ref_columns.iter().any(|rc| rc.eq_ignore_ascii_case(&old_name))
+                            && fk
+                                .ref_columns
+                                .iter()
+                                .any(|rc| rc.eq_ignore_ascii_case(&old_name))
                     });
                     if references_us {
-                        if let Ok(new_other_sql) =
-                            rename_fk_refs_in_create_table(&other.create_sql, &table_name, &old_name, &new)
-                        {
+                        if let Ok(new_other_sql) = rename_fk_refs_in_create_table(
+                            &other.create_sql,
+                            &table_name,
+                            &old_name,
+                            &new,
+                        ) {
                             let mut rebuilt_other = (*other).clone();
-                            if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                                columns, constraints, without_rowid, strict, ..
-                            })) = crate::sql::parser::parse(&new_other_sql)
+                            if let Ok(crate::sql::ast::Statement::Create(
+                                crate::sql::ast::CreateStatement::Table {
+                                    columns,
+                                    constraints,
+                                    without_rowid,
+                                    strict,
+                                    ..
+                                },
+                            )) = crate::sql::parser::parse(&new_other_sql)
                             {
-                                if let Ok(t) = build_table(&other.name, &columns, &constraints, other.root_page, without_rowid, strict, &new_other_sql) {
+                                if let Ok(t) = build_table(
+                                    &other.name,
+                                    &columns,
+                                    &constraints,
+                                    other.root_page,
+                                    without_rowid,
+                                    strict,
+                                    &new_other_sql,
+                                ) {
                                     rebuilt_other = t;
                                 }
                             }
@@ -4305,7 +4927,11 @@ impl Database {
                             catalog.replace_table(&other_name, rebuilt_other);
                             delete_schema_row(ctx.pager, "table", &other_display)?;
                             let schema_row = crate::schema::encode_schema_row(
-                                "table", &other_display, &other_display, other_root, &new_other_sql,
+                                "table",
+                                &other_display,
+                                &other_display,
+                                other_root,
+                                &new_other_sql,
                             );
                             insert_schema_row(ctx.pager, &schema_row)?;
                         }
@@ -4316,9 +4942,14 @@ impl Database {
                 //    their CREATE statements (and the catalog's Index columns).
                 for (idx_name, idx) in catalog.all_indexes() {
                     if idx.table.eq_ignore_ascii_case(&table_name)
-                        && idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&old_name))
+                        && idx
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&old_name))
                     {
-                        if let Ok(new_idx_sql) = rename_column_in_create_index(&idx.create_sql, &old_name, &new) {
+                        if let Ok(new_idx_sql) =
+                            rename_column_in_create_index(&idx.create_sql, &old_name, &new)
+                        {
                             let mut rebuilt_idx = (*idx).clone();
                             for ic in rebuilt_idx.columns.iter_mut() {
                                 if ic.name.eq_ignore_ascii_case(&old_name) {
@@ -4331,7 +4962,11 @@ impl Database {
                             catalog.replace_index(&idx_name, rebuilt_idx);
                             delete_schema_row(ctx.pager, "index", &display_name)?;
                             let schema_row = crate::schema::encode_schema_row(
-                                "index", &display_name, &table_name, idx_root, &new_idx_sql,
+                                "index",
+                                &display_name,
+                                &table_name,
+                                idx_root,
+                                &new_idx_sql,
                             );
                             insert_schema_row(ctx.pager, &schema_row)?;
                         }
@@ -4346,7 +4981,11 @@ impl Database {
                 // 6. Rewrite this table's schema row.
                 delete_schema_row(ctx.pager, "table", &table_name)?;
                 let schema_row = crate::schema::encode_schema_row(
-                    "table", &table_name, &table_name, root, &new_sql,
+                    "table",
+                    &table_name,
+                    &table_name,
+                    root,
+                    &new_sql,
                 );
                 insert_schema_row(ctx.pager, &schema_row)?;
                 ctx.pager.flush()?;
@@ -4364,7 +5003,9 @@ impl Database {
                     .ok_or_else(|| Error::NotFound(format!("column: {}", name)))?;
                 // Rowid alias (INTEGER PRIMARY KEY) can't be dropped.
                 if table.rowid_alias == Some(col_idx) {
-                    return Err(Error::semantic("cannot drop the INTEGER PRIMARY KEY column"));
+                    return Err(Error::semantic(
+                        "cannot drop the INTEGER PRIMARY KEY column",
+                    ));
                 }
                 if table.columns.len() <= 1 {
                     return Err(Error::semantic(format!(
@@ -4389,7 +5030,11 @@ impl Database {
                 // Indexed columns (explicit indexes, incl. partial-index
                 // WHERE clauses) can't be dropped.
                 for idx in catalog.indexes_on_table(&table.name) {
-                    if idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                    if idx
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&name))
+                    {
                         return Err(Error::semantic(format!(
                             "cannot drop indexed column: \"{}\" (index \"{}\" uses it)",
                             name, idx.name
@@ -4427,7 +5072,11 @@ impl Database {
                 // FOREIGN KEYs (child or parent side) referencing it.
                 for fk in &table.foreign_keys {
                     if fk.columns.iter().any(|&ci| {
-                        table.columns.get(ci).map(|c| c.name.eq_ignore_ascii_case(&name)).unwrap_or(false)
+                        table
+                            .columns
+                            .get(ci)
+                            .map(|c| c.name.eq_ignore_ascii_case(&name))
+                            .unwrap_or(false)
                     }) {
                         return Err(Error::semantic(format!(
                             "cannot drop column \"{}\": used in a FOREIGN KEY constraint",
@@ -4441,7 +5090,10 @@ impl Database {
                     }
                     let refs_us = other.foreign_keys.iter().any(|fk| {
                         fk.ref_table.eq_ignore_ascii_case(&table.name)
-                            && fk.ref_columns.iter().any(|rc| rc.eq_ignore_ascii_case(&name))
+                            && fk
+                                .ref_columns
+                                .iter()
+                                .any(|rc| rc.eq_ignore_ascii_case(&name))
                     });
                     if refs_us {
                         return Err(Error::semantic(format!(
@@ -4456,9 +5108,18 @@ impl Database {
                 // references count for triggers on this table.
                 for (vname, view) in catalog.all_views() {
                     let single_table_view = view_is_single_table_over(&view.select, &table.name);
-                    if object_sql_references_column(&view.create_sql, &table.name, &name, single_table_view)
-                        || (single_table_view
-                            && object_sql_references_column(&view.create_sql, &table.name, &name, false))
+                    if object_sql_references_column(
+                        &view.create_sql,
+                        &table.name,
+                        &name,
+                        single_table_view,
+                    ) || (single_table_view
+                        && object_sql_references_column(
+                            &view.create_sql,
+                            &table.name,
+                            &name,
+                            false,
+                        ))
                     {
                         return Err(Error::semantic(format!(
                             "cannot drop column \"{}\": referenced by view \"{}\"",
@@ -4481,10 +5142,8 @@ impl Database {
                 let table_name = table.name.clone();
                 let old_n_cols = table.n_columns();
                 let old_alias = table.rowid_alias;
-                let dropped_is_before_alias = table
-                    .rowid_alias
-                    .map(|a| col_idx < a)
-                    .unwrap_or(false);
+                let dropped_is_before_alias =
+                    table.rowid_alias.map(|a| col_idx < a).unwrap_or(false);
 
                 // 1. Rewrite the CREATE statement without the column.
                 let new_sql = drop_column_from_create_table(&table.create_sql, &name)?
@@ -4492,11 +5151,25 @@ impl Database {
 
                 // 2. Rebuild the catalog entry.
                 let mut rebuilt = (*table).clone();
-                if let Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                    columns, constraints, without_rowid, strict, ..
-                })) = crate::sql::parser::parse(&new_sql)
+                if let Ok(crate::sql::ast::Statement::Create(
+                    crate::sql::ast::CreateStatement::Table {
+                        columns,
+                        constraints,
+                        without_rowid,
+                        strict,
+                        ..
+                    },
+                )) = crate::sql::parser::parse(&new_sql)
                 {
-                    rebuilt = build_table(&table_name, &columns, &constraints, root, without_rowid, strict, &new_sql)?;
+                    rebuilt = build_table(
+                        &table_name,
+                        &columns,
+                        &constraints,
+                        root,
+                        without_rowid,
+                        strict,
+                        &new_sql,
+                    )?;
                 }
                 let new_n_cols = rebuilt.n_columns();
                 catalog.replace_table(&table_name, rebuilt);
@@ -4549,7 +5222,11 @@ impl Database {
                 // 4. Rewrite the schema row.
                 delete_schema_row(ctx.pager, "table", &table_name)?;
                 let schema_row = crate::schema::encode_schema_row(
-                    "table", &table_name, &table_name, root, &new_sql,
+                    "table",
+                    &table_name,
+                    &table_name,
+                    root,
+                    &new_sql,
                 );
                 insert_schema_row(ctx.pager, &schema_row)?;
                 ctx.pager.flush()?;
@@ -4603,7 +5280,11 @@ impl Database {
                             name.to_ascii_lowercase()
                         }
                         (Value::Integer(i), _) => {
-                            if *i == 0 { "delete".to_string() } else { "wal".to_string() }
+                            if *i == 0 {
+                                "delete".to_string()
+                            } else {
+                                "wal".to_string()
+                            }
                         }
                         _ => String::new(),
                     };
@@ -4627,9 +5308,8 @@ impl Database {
                     if cname.is_empty() || cname == "none" || cname == "plain" {
                         ctx.pager.set_codec(None)?;
                     } else {
-                        let codec = crate::plugin::lookup_codec(&cname).ok_or_else(|| {
-                            Error::semantic(format!("no such codec: {}", cname))
-                        })?;
+                        let codec = crate::plugin::lookup_codec(&cname)
+                            .ok_or_else(|| Error::semantic(format!("no such codec: {}", cname)))?;
                         ctx.pager.set_codec(Some(codec))?;
                     }
                 }
@@ -4689,8 +5369,6 @@ impl Database {
     }
 }
 
-
-
 /// `read_pragma` exposed for the statement layer (pub(crate)).
 pub(crate) fn read_pragma_public(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     read_pragma(p, db)
@@ -4708,7 +5386,10 @@ pub(crate) struct PragmaRows {
 
 impl PragmaRows {
     fn single(name: &str, v: Value) -> Self {
-        PragmaRows { columns: vec![name.to_string()], rows: vec![vec![v]] }
+        PragmaRows {
+            columns: vec![name.to_string()],
+            rows: vec![vec![v]],
+        }
     }
 }
 
@@ -4754,7 +5435,10 @@ fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
             // SQLite quirk: plain `INTEGER PRIMARY KEY` reports notnull=0
             // (the NULL is replaced by an auto rowid at INSERT time).
             Value::Integer(i64::from(c.explicit_not_null)),
-            c.default.as_ref().map(|e| Value::Text(default_value_text(e).into())).unwrap_or(Value::Null),
+            c.default
+                .as_ref()
+                .map(|e| Value::Text(default_value_text(e).into()))
+                .unwrap_or(Value::Null),
             Value::Integer(c.pk_seq as i64),
         ];
         if xinfo {
@@ -4779,7 +5463,10 @@ fn default_value_text(e: &Expr) -> String {
     if let Expr::Function { name, args, .. } = e {
         if args.is_empty() {
             let up = name.to_ascii_uppercase();
-            if matches!(up.as_str(), "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME") {
+            if matches!(
+                up.as_str(),
+                "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
+            ) {
                 return up;
             }
         }
@@ -4792,9 +5479,12 @@ fn default_value_text(e: &Expr) -> String {
 /// 'pk' = PRIMARY KEY auto-index (compound / non-integer / WITHOUT
 /// ROWID). SQLite lists indexes in REVERSE creation order — root-page
 /// allocation order is the creation proxy, so sort descending.
-fn pragma_index_list(t: &Arc<crate::schema::Table>, catalog: &crate::schema::Catalog) -> PragmaRows {
+fn pragma_index_list(
+    t: &Arc<crate::schema::Table>,
+    catalog: &crate::schema::Catalog,
+) -> PragmaRows {
     let mut idxs = catalog.indexes_on_table(&t.name);
-    idxs.sort_by(|a, b| b.root_page.cmp(&a.root_page));
+    idxs.sort_by_key(|i| std::cmp::Reverse(i.root_page));
     let rows = idxs
         .iter()
         .enumerate()
@@ -4807,11 +5497,12 @@ fn pragma_index_list(t: &Arc<crate::schema::Table>, catalog: &crate::schema::Cat
                     .columns
                     .iter()
                     .enumerate()
-                    .filter(|(i, c)| c.primary_key && (t.without_rowid || t.rowid_alias != Some(*i)))
+                    .filter(|(i, c)| {
+                        c.primary_key && (t.without_rowid || t.rowid_alias != Some(*i))
+                    })
                     .map(|(_, c)| c.name.as_str())
                     .collect();
-                let idx_cols: Vec<&str> =
-                    idx.columns.iter().map(|c| c.name.as_str()).collect();
+                let idx_cols: Vec<&str> = idx.columns.iter().map(|c| c.name.as_str()).collect();
                 let same_set = pk_cols.len() == idx_cols.len()
                     && pk_cols
                         .iter()
@@ -4848,7 +5539,11 @@ fn pragma_index_list(t: &Arc<crate::schema::Table>, catalog: &crate::schema::Cat
 /// `PRAGMA index_info(idx)` / `index_xinfo(idx)` —
 /// (seqno, cid, name[, desc, coll, key]). `index_xinfo` additionally
 /// appends the auxiliary rowid column (cid=-1, name NULL, key=0).
-fn pragma_index_info(idx: &Arc<crate::schema::Index>, t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
+fn pragma_index_info(
+    idx: &Arc<crate::schema::Index>,
+    t: &Arc<crate::schema::Table>,
+    xinfo: bool,
+) -> PragmaRows {
     let mut columns = vec!["seqno".to_string(), "cid".to_string(), "name".to_string()];
     if xinfo {
         columns.push("desc".to_string());
@@ -4864,7 +5559,9 @@ fn pragma_index_info(idx: &Arc<crate::schema::Index>, t: &Arc<crate::schema::Tab
             Value::Text(ic.name.clone().into()),
         ];
         if xinfo {
-            row.push(Value::Integer(i64::from(ic.order == crate::sql::ast::Order::Desc)));
+            row.push(Value::Integer(i64::from(
+                ic.order == crate::sql::ast::Order::Desc,
+            )));
             row.push(Value::Text(ic.collation.clone().into()));
             row.push(Value::Integer(1)); // every indexed column is a key column
         }
@@ -4913,7 +5610,11 @@ fn pragma_foreign_key_list(
     for (id, fk) in t.foreign_keys.iter().rev().enumerate() {
         let _ = catalog; // parent lookup only needed for explicit ref_columns
         for (seq, &col_idx) in fk.columns.iter().enumerate() {
-            let from = t.columns.get(col_idx).map(|c| c.name.as_str()).unwrap_or("");
+            let from = t
+                .columns
+                .get(col_idx)
+                .map(|c| c.name.as_str())
+                .unwrap_or("");
             let to = fk
                 .ref_columns
                 .get(seq)
@@ -4956,28 +5657,22 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     // ORMs read it back). The mode word parses as a bare identifier
     // (Column) or string literal.
     if p.value.is_some() && name == "journal_mode" {
-        let mode = p.value.as_ref().and_then(|v| {
-            match value_as_expr(v) {
-                crate::sql::ast::Expr::Column { name, .. } => {
-                    Some(name.to_ascii_lowercase())
-                }
-                crate::sql::ast::Expr::Literal(Value::Text(t)) => {
-                    Some(t.to_ascii_lowercase())
-                }
-                crate::sql::ast::Expr::Literal(Value::Integer(i)) => {
-                    Some(if *i == 0 { "delete".to_string() } else { "wal".to_string() })
-                }
-                _ => None,
-            }
+        let mode = p.value.as_ref().and_then(|v| match value_as_expr(v) {
+            crate::sql::ast::Expr::Column { name, .. } => Some(name.to_ascii_lowercase()),
+            crate::sql::ast::Expr::Literal(Value::Text(t)) => Some(t.to_ascii_lowercase()),
+            crate::sql::ast::Expr::Literal(Value::Integer(i)) => Some(if *i == 0 {
+                "delete".to_string()
+            } else {
+                "wal".to_string()
+            }),
+            _ => None,
         });
         if let Some(mode) = mode {
             apply_journal_mode(db, &mode).ok()?;
             let pager = &db.pager;
             return Some(PragmaRows::single(
                 "journal_mode",
-                Value::Text(
-                    if pager.wal_enabled() { "wal" } else { "delete" }.into(),
-                ),
+                Value::Text(if pager.wal_enabled() { "wal" } else { "delete" }.into()),
             ));
         }
         return None;
@@ -4987,23 +5682,23 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     // Semantics: advisory in this engine (single-process locking is
     // handled by the transaction slot), but the round-trip must match.
     if p.value.is_some() && name == "locking_mode" {
-        let mode = p.value.as_ref().and_then(|v| {
-            match value_as_expr(v) {
-                crate::sql::ast::Expr::Column { name, .. } => {
-                    Some(name.to_ascii_lowercase())
-                }
-                crate::sql::ast::Expr::Literal(Value::Text(t)) => {
-                    Some(t.to_ascii_lowercase())
-                }
-                _ => None,
-            }
+        let mode = p.value.as_ref().and_then(|v| match value_as_expr(v) {
+            crate::sql::ast::Expr::Column { name, .. } => Some(name.to_ascii_lowercase()),
+            crate::sql::ast::Expr::Literal(Value::Text(t)) => Some(t.to_ascii_lowercase()),
+            _ => None,
         });
         if let Some(mode) = mode {
-            db.pager
-                .set_locking_mode_exclusive(mode == "exclusive");
+            db.pager.set_locking_mode_exclusive(mode == "exclusive");
             return Some(PragmaRows::single(
                 "locking_mode",
-                Value::Text(if mode == "exclusive" { "exclusive" } else { "normal" }.into()),
+                Value::Text(
+                    if mode == "exclusive" {
+                        "exclusive"
+                    } else {
+                        "normal"
+                    }
+                    .into(),
+                ),
             ));
         }
         return None;
@@ -5065,7 +5760,10 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             name == "quick_check",
         );
         let rows: Vec<Vec<Value>> = problems.iter().cloned().map(|v| vec![v]).collect();
-        return Some(PragmaRows { columns: vec!["integrity_check".into()], rows });
+        return Some(PragmaRows {
+            columns: vec!["integrity_check".into()],
+            rows,
+        });
     }
     let pager = &db.pager;
     let v = match name.as_str() {
@@ -5074,7 +5772,11 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "page_count" => Value::Integer(pager.n_pages() as i64),
         "cache_size" => Value::Integer(pager.cache_capacity() as i64),
         "schema_version" => Value::Integer(pager.schema_cookie() as i64),
-        "journal_mode" => Value::Text(if pager.wal_enabled() { "wal".into() } else { "delete".into() }),
+        "journal_mode" => Value::Text(if pager.wal_enabled() {
+            "wal".into()
+        } else {
+            "delete".into()
+        }),
         "codec" => Value::Text(
             pager
                 .codec_name()
@@ -5084,13 +5786,11 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         ),
         "synchronous" => Value::Integer(pager.synchronous() as i64),
         "temp_store" => Value::Integer(0),
-        "locking_mode" => Value::Text(
-            if pager.locking_mode_exclusive() {
-                "exclusive".into()
-            } else {
-                "normal".into()
-            },
-        ),
+        "locking_mode" => Value::Text(if pager.locking_mode_exclusive() {
+            "exclusive".into()
+        } else {
+            "normal".into()
+        }),
         "user_version" => Value::Integer(0),
         "application_id" => Value::Integer(0),
         "auto_vacuum" => Value::Integer(0),
@@ -5119,8 +5819,6 @@ fn value_as_expr(v: &crate::sql::ast::PragmaValue) -> &crate::sql::ast::Expr {
     }
 }
 
-
-
 /// Minimal Expr → SQL text renderer (enough for DEFAULT / CHECK clauses
 /// replayed through ALTER TABLE ADD COLUMN's schema rewrite).
 fn expr_to_sql(e: &Expr) -> String {
@@ -5137,23 +5835,42 @@ fn expr_to_sql(e: &Expr) -> String {
             }
         },
         E::Column { table: None, name } => name.clone(),
-        E::Column { table: Some(t), name } => format!("{}.{}", t, name),
+        E::Column {
+            table: Some(t),
+            name,
+        } => format!("{}.{}", t, name),
         E::Binary { op, left, right } => {
             use crate::sql::ast::BinaryOp::*;
             let sym = match op {
-                Add => "+", Sub => "-", Mul => "*", Div => "/", Mod => "%",
-                Concat => "||", BitAnd => "&", BitOr => "|", BitXor => "^",
-                ShiftLeft => "<<", ShiftRight => ">>",
-                Eq => "=", NotEq => "!=", Lt => "<", LtEq => "<=", Gt => ">",
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                Div => "/",
+                Mod => "%",
+                Concat => "||",
+                BitAnd => "&",
+                BitOr => "|",
+                BitXor => "^",
+                ShiftLeft => "<<",
+                ShiftRight => ">>",
+                Eq => "=",
+                NotEq => "!=",
+                Lt => "<",
+                LtEq => "<=",
+                Gt => ">",
                 GtEq => ">=",
-                And => "AND", Or => "OR",
+                And => "AND",
+                Or => "OR",
             };
             format!("{} {} {}", expr_to_sql(left), sym, expr_to_sql(right))
         }
         E::Unary { op, expr } => {
             use crate::sql::ast::UnaryOp::*;
             let sym = match op {
-                Neg => "-", Pos => "+", Not => "NOT ", BitNot => "~",
+                Neg => "-",
+                Pos => "+",
+                Not => "NOT ",
+                BitNot => "~",
             };
             format!("{}{}", sym, expr_to_sql(expr))
         }
@@ -5192,20 +5909,27 @@ fn rewrite_create_table_name(sql: &str, new_name: &str) -> String {
             .find(|c: char| c.is_whitespace() || c == '(')
             .unwrap_or(t2.len());
         let name_start = after_ws + kw_len + ws2;
-        return format!("{}{}{}", &sql[..name_start], new_name, &sql[name_start + name_len..]);
+        return format!(
+            "{}{}{}",
+            &sql[..name_start],
+            new_name,
+            &sql[name_start + name_len..]
+        );
     }
     let name_len = trimmed
         .find(|c: char| c.is_whitespace() || c == '(')
         .unwrap_or(trimmed.len());
-    format!("{}{}{}", &sql[..after_ws], new_name, &sql[after_ws + name_len..])
+    format!(
+        "{}{}{}",
+        &sql[..after_ws],
+        new_name,
+        &sql[after_ws + name_len..]
+    )
 }
 
 /// Append `, <column-def>` to a CREATE TABLE statement's column list (just
 /// before the closing paren).
-fn rewrite_create_table_add_column(
-    sql: &str,
-    column: &crate::sql::ast::ColumnDef,
-) -> String {
+fn rewrite_create_table_add_column(sql: &str, column: &crate::sql::ast::ColumnDef) -> String {
     // Render the column definition back to SQL text.
     let mut col_sql = column.name.clone();
     if !column.type_name.is_empty() {
@@ -5228,7 +5952,12 @@ fn rewrite_create_table_add_column(
             Check(e) => col_sql.push_str(&format!("CHECK ({})", expr_to_sql(e))),
             Default(e) => col_sql.push_str(&format!("DEFAULT {}", expr_to_sql(e))),
             Collate(c) => col_sql.push_str(&format!("COLLATE {}", c)),
-            References { table, columns, on_delete, on_update } => {
+            References {
+                table,
+                columns,
+                on_delete,
+                on_update,
+            } => {
                 col_sql.push_str(&format!("REFERENCES {}", table));
                 if !columns.is_empty() {
                     col_sql.push_str(&format!("({})", columns.join(", ")));
@@ -5276,12 +6005,16 @@ fn rewrite_trigger_tbl_names(pager: &Pager, old_table: &str, new_table: &str) ->
     let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
     bt.scan_table(|rowid, payload| {
         if let Ok(row) = decode_row(payload, 5, 0, None) {
-            if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+            if let Some((kind, name, tbl_name, rootpage, sql)) =
+                crate::schema::decode_schema_row(&row)
+            {
                 if kind == "trigger" && tbl_name.eq_ignore_ascii_case(old_table) {
                     let new_sql = rewrite_on_table(sql, old_table, new_table);
                     updates.push((
                         rowid,
-                        crate::schema::encode_schema_row("trigger", name, new_table, rootpage, &new_sql),
+                        crate::schema::encode_schema_row(
+                            "trigger", name, new_table, rootpage, &new_sql,
+                        ),
                     ));
                 }
             }
@@ -5295,7 +6028,6 @@ fn rewrite_trigger_tbl_names(pager: &Pager, old_table: &str, new_table: &str) ->
     }
     Ok(())
 }
-
 
 /// Rewrite `... ON <old> ...` → `... ON <new> ...` in a CREATE INDEX /
 /// CREATE TRIGGER statement (case-insensitive table name, word boundaries).
@@ -5329,12 +6061,16 @@ fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> R
     let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
     bt.scan_table(|rowid, payload| {
         if let Ok(row) = decode_row(payload, 5, 0, None) {
-            if let Some((kind, name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+            if let Some((kind, name, tbl_name, rootpage, sql)) =
+                crate::schema::decode_schema_row(&row)
+            {
                 if kind == "index" && tbl_name.eq_ignore_ascii_case(old_table) {
                     let new_sql = rewrite_on_table(sql, old_table, new_table);
                     updates.push((
                         rowid,
-                        crate::schema::encode_schema_row("index", name, new_table, rootpage, &new_sql),
+                        crate::schema::encode_schema_row(
+                            "index", name, new_table, rootpage, &new_sql,
+                        ),
                     ));
                 }
             }
@@ -5413,12 +6149,18 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     let mut index_row_by_name: std::collections::HashMap<String, (u32, String)> =
         std::collections::HashMap::new();
     for row in entries {
-        if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row) {
+        if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row)
+        {
             if kind == "index" {
-                index_row_by_name
-                    .insert(_name.to_string(), (rootpage, sql.to_string()));
+                index_row_by_name.insert(_name.to_string(), (rootpage, sql.to_string()));
             }
-            let owned = (kind.to_string(), _name.to_string(), tbl_name.to_string(), rootpage, sql.to_string());
+            let owned = (
+                kind.to_string(),
+                _name.to_string(),
+                tbl_name.to_string(),
+                rootpage,
+                sql.to_string(),
+            );
             if kind == "table" {
                 tables_first.push(owned);
             } else {
@@ -5435,8 +6177,24 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         {
             match kind {
                 "table" => {
-                    if let Ok(Statement::Create(CreateStatement::Table { name: tn, columns, constraints, without_rowid, strict, .. })) = parse(sql) {
-                        let table = build_table(&tn.name, &columns, &constraints, rootpage, without_rowid, strict, sql)?;
+                    if let Ok(Statement::Create(CreateStatement::Table {
+                        name: tn,
+                        columns,
+                        constraints,
+                        without_rowid,
+                        strict,
+                        ..
+                    })) = parse(sql)
+                    {
+                        let table = build_table(
+                            &tn.name,
+                            &columns,
+                            &constraints,
+                            rootpage,
+                            without_rowid,
+                            strict,
+                            sql,
+                        )?;
                         catalog.add_table(table.clone());
                         // Implicit auto-indexes (sqlite_autoindex_*): their
                         // schema rows have NULL sql (SQLite-faithful), so
@@ -5446,17 +6204,26 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                         // pair with the rows by name to recover rootpages.
                         // (Rows WITH sql text are handled by the "index"
                         // branch below — legacy files.)
-                        rebuild_implicit_indexes(&table, &columns, &constraints, &index_row_by_name, catalog);
-                    } else if let Ok(Statement::Create(CreateStatement::VirtualTable { name: tn, module, args, .. })) = parse(sql) {
+                        rebuild_implicit_indexes(
+                            &table,
+                            &columns,
+                            &constraints,
+                            &index_row_by_name,
+                            catalog,
+                        );
+                    } else if let Ok(Statement::Create(CreateStatement::VirtualTable {
+                        name: tn,
+                        module,
+                        args,
+                        ..
+                    })) = parse(sql)
+                    {
                         // Virtual table: the module isn't registered at
                         // open time — build a PENDING instance. The column
                         // list stays empty until `create_module` connects
                         // it (the planner rejects queries over pending
                         // vtabs with "no such module").
-                        let mut table = crate::plugin::vtab::vtab_columns_to_schema(
-                            &tn.name,
-                            &[],
-                        );
+                        let mut table = crate::plugin::vtab::vtab_columns_to_schema(&tn.name, &[]);
                         table.create_sql = sql.to_string();
                         table.vtab = Some(std::sync::Arc::new(
                             crate::plugin::vtab::VtabInstance::pending(
@@ -5469,8 +6236,21 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                     }
                 }
                 "index" => {
-                    if let Ok(Statement::Create(CreateStatement::Index { unique, name: idx_name, table, columns, where_clause, .. })) = parse(sql) {
-                        let table_obj = catalog.get_table(&table).ok_or_else(|| Error::corruption(format!("index {} references missing table {}", idx_name, table)))?;
+                    if let Ok(Statement::Create(CreateStatement::Index {
+                        unique,
+                        name: idx_name,
+                        table,
+                        columns,
+                        where_clause,
+                        ..
+                    })) = parse(sql)
+                    {
+                        let table_obj = catalog.get_table(&table).ok_or_else(|| {
+                            Error::corruption(format!(
+                                "index {} references missing table {}",
+                                idx_name, table
+                            ))
+                        })?;
                         let idx_columns = crate::schema::build_index_columns(&columns, &table_obj)?;
                         catalog.add_index(crate::schema::Index {
                             name: idx_name,
@@ -5484,7 +6264,13 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                     }
                 }
                 "view" => {
-                    if let Ok(Statement::Create(CreateStatement::View { name: vn, columns, select, .. })) = parse(sql) {
+                    if let Ok(Statement::Create(CreateStatement::View {
+                        name: vn,
+                        columns,
+                        select,
+                        ..
+                    })) = parse(sql)
+                    {
                         catalog.add_view(crate::schema::View {
                             name: vn.name,
                             columns,
@@ -5531,7 +6317,11 @@ fn rebuild_implicit_indexes(
 ) {
     let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
     for col in columns {
-        if col.constraints.iter().any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique)) {
+        if col
+            .constraints
+            .iter()
+            .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique))
+        {
             let collate = col.constraints.iter().find_map(|c| {
                 if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
                     Some(name.clone())
@@ -5568,7 +6358,9 @@ fn rebuild_implicit_indexes(
     }
     for (n, cols) in implicit.iter().enumerate() {
         let idx_name = format!("sqlite_autoindex_{}_{}", table.name, n + 1);
-        let Some((root, sql_text)) = index_rows.get(&idx_name) else { continue };
+        let Some((root, sql_text)) = index_rows.get(&idx_name) else {
+            continue;
+        };
         if !sql_text.is_empty() {
             continue; // legacy row with DDL text — parsed by the index branch
         }
@@ -5737,7 +6529,9 @@ fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
         return Some((Value::Integer(if neg { -v } else { v }), he));
     }
     // Decimal / float
-    if j < b.len() && (b[j].is_ascii_digit() || (b[j] == b'.' && j + 1 < b.len() && b[j + 1].is_ascii_digit())) {
+    if j < b.len()
+        && (b[j].is_ascii_digit() || (b[j] == b'.' && j + 1 < b.len() && b[j + 1].is_ascii_digit()))
+    {
         let ns = j;
         let mut ne = j;
         while ne < b.len() && b[ne].is_ascii_digit() {
@@ -5886,7 +6680,11 @@ fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
     if values.is_empty() {
         return None;
     }
-    Some(FastInsert { table, columns, values })
+    Some(FastInsert {
+        table,
+        columns,
+        values,
+    })
 }
 
 fn is_ddl_sql(sql: &str) -> bool {
@@ -6026,17 +6824,25 @@ mod tests {
         let was_settled_before = ALLOC_SETTLED.load(Ordering::Relaxed);
         let mut db = Database::open_in_memory().unwrap();
         db.set_deferred_flush(true);
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+            [],
+        )
+        .unwrap();
         let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
         db.execute("BEGIN", []).unwrap();
         // 5000 single-row statements ≈ 1.02M accounted blocks — past the
         // 400k ALLOC_WAKE_THRESHOLD, so the COMMIT-path drain must fire.
         for i in 1..=5000i64 {
-            db.execute(sql, [
-                Value::Text(format!("name{}", i).into()),
-                Value::Integer(i * 2),
-                Value::Real(i as f64 * 1.5),
-            ]).unwrap();
+            db.execute(
+                sql,
+                [
+                    Value::Text(format!("name{}", i).into()),
+                    Value::Integer(i * 2),
+                    Value::Real(i as f64 * 1.5),
+                ],
+            )
+            .unwrap();
         }
         db.execute("COMMIT", []).unwrap();
         if !was_settled_before {
@@ -6068,9 +6874,12 @@ mod tests {
     #[test]
     fn create_insert_select() {
         let mut db = memdb();
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-        db.execute("INSERT INTO users (name) VALUES ('Alice')", []).unwrap();
-        db.execute("INSERT INTO users (name) VALUES ('Bob')", []).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        db.execute("INSERT INTO users (name) VALUES ('Alice')", [])
+            .unwrap();
+        db.execute("INSERT INTO users (name) VALUES ('Bob')", [])
+            .unwrap();
         let rows = db.query("SELECT id, name FROM users", []).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1], Value::Text("Alice".into()));
@@ -6080,15 +6889,20 @@ mod tests {
     #[test]
     fn update_and_delete() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", [])
+            .unwrap();
         db.execute("UPDATE t SET x = x + 1", []).unwrap();
         let rows = db.query("SELECT x FROM t ORDER BY id", []).unwrap();
-        assert_eq!(rows, vec![
-            vec![Value::Integer(11)],
-            vec![Value::Integer(21)],
-            vec![Value::Integer(31)],
-        ]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(11)],
+                vec![Value::Integer(21)],
+                vec![Value::Integer(31)],
+            ]
+        );
         db.execute("DELETE FROM t WHERE x = 21", []).unwrap();
         let rows = db.query("SELECT x FROM t ORDER BY id", []).unwrap();
         assert_eq!(rows.len(), 2);
@@ -6098,8 +6912,11 @@ mod tests {
     fn aggregate() {
         let mut db = memdb();
         db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)", []).unwrap();
-        let rows = db.query("SELECT SUM(x), COUNT(*), MIN(x), MAX(x), AVG(x) FROM t", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)", [])
+            .unwrap();
+        let rows = db
+            .query("SELECT SUM(x), COUNT(*), MIN(x), MAX(x), AVG(x) FROM t", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(15));
         assert_eq!(rows[0][1], Value::Integer(5));
         assert_eq!(rows[0][2], Value::Integer(1));
@@ -6109,19 +6926,42 @@ mod tests {
     #[test]
     fn join() {
         let mut db = memdb();
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)", []).unwrap();
-        db.execute("INSERT INTO users (name) VALUES ('Alice'), ('Bob')", []).unwrap();
-        db.execute("INSERT INTO orders (user_id, total) VALUES (1, 100), (1, 200), (2, 50)", []).unwrap();
-        let rows = db.query("SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id", []).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        db.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO users (name) VALUES ('Alice'), ('Bob')", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders (user_id, total) VALUES (1, 100), (1, 200), (2, 50)",
+            [],
+        )
+        .unwrap();
+        let rows = db
+            .query(
+                "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id",
+                [],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
     }
 
     #[test]
     fn group_by() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (k, v) VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO t (k, v) VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)",
+            [],
+        )
+        .unwrap();
         let rows = db.query("SELECT k, SUM(v) FROM t GROUP BY k", []).unwrap();
         assert_eq!(rows.len(), 2);
     }
@@ -6131,8 +6971,10 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let mut db = Database::open(tmp.path()).unwrap();
-            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-            db.execute("INSERT INTO t (name) VALUES ('Alice')", []).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", [])
+                .unwrap();
+            db.execute("INSERT INTO t (name) VALUES ('Alice')", [])
+                .unwrap();
         }
         let db = Database::open(tmp.path()).unwrap();
         let rows = db.query("SELECT name FROM t", []).unwrap();
@@ -6146,12 +6988,17 @@ mod tests {
     #[test]
     fn upsert_do_nothing() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)",
+            [],
+        )
+        .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'a')", []).unwrap();
         db.execute(
             "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO NOTHING",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let rows = db.query("SELECT id, val FROM t", []).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1], Value::Text("a".into()));
@@ -6160,12 +7007,17 @@ mod tests {
     #[test]
     fn upsert_do_update() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, n INTEGER)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, n INTEGER)",
+            [],
+        )
+        .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'a', 10)", []).unwrap();
         db.execute(
             "INSERT INTO t VALUES (1, 'b', 5) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let rows = db.query("SELECT id, val, n FROM t", []).unwrap();
         assert_eq!(rows.len(), 1);
         // SET doesn't touch val → old value 'a'; n = 10 + 5 = 15.
@@ -6185,8 +7037,13 @@ mod tests {
     #[test]
     fn upsert_unique_index_target() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)", []).unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'a@x.com', 'Alice')", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a@x.com', 'Alice')", [])
+            .unwrap();
         // Conflict on the UNIQUE(email) index — targeted upsert.
         db.execute(
             "INSERT INTO t VALUES (2, 'a@x.com', 'Bob') ON CONFLICT (email) DO UPDATE SET name = excluded.name",
@@ -6201,7 +7058,8 @@ mod tests {
     #[test]
     fn upsert_where_guard() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", [])
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)", []).unwrap();
         db.execute(
             "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n < 50",
@@ -6221,7 +7079,11 @@ mod tests {
     #[test]
     fn upsert_bad_target_errors() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            [],
+        )
+        .unwrap();
         let err = db.execute(
             "INSERT INTO t VALUES (1, 1, 1) ON CONFLICT (a, b) DO NOTHING",
             [],
@@ -6232,11 +7094,11 @@ mod tests {
     #[test]
     fn insert_returning() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        let rows = db.query(
-            "INSERT INTO t (x) VALUES (10), (20) RETURNING id, x",
-            [],
-        ).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        let rows = db
+            .query("INSERT INTO t (x) VALUES (10), (20) RETURNING id, x", [])
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Integer(1));
         assert_eq!(rows[0][1], Value::Integer(10));
@@ -6247,11 +7109,11 @@ mod tests {
     #[test]
     fn insert_returning_star() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        let rows = db.query(
-            "INSERT INTO t (x) VALUES (7) RETURNING *",
-            [],
-        ).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        let rows = db
+            .query("INSERT INTO t (x) VALUES (7) RETURNING *", [])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(7)]);
     }
@@ -6259,12 +7121,13 @@ mod tests {
     #[test]
     fn update_returning() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
-        let rows = db.query(
-            "UPDATE t SET x = x * 2 WHERE x > 15 RETURNING id, x",
-            [],
-        ).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", [])
+            .unwrap();
+        let rows = db
+            .query("UPDATE t SET x = x * 2 WHERE x > 15 RETURNING id, x", [])
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Integer(2));
         assert_eq!(rows[0][1], Value::Integer(40));
@@ -6274,12 +7137,13 @@ mod tests {
     #[test]
     fn delete_returning() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
-        let rows = db.query(
-            "DELETE FROM t WHERE x <= 20 RETURNING x",
-            [],
-        ).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", [])
+            .unwrap();
+        let rows = db
+            .query("DELETE FROM t WHERE x <= 20 RETURNING x", [])
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Integer(10));
         assert_eq!(rows[1][0], Value::Integer(20));
@@ -6290,11 +7154,18 @@ mod tests {
     #[test]
     fn check_constraint_enforced() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0))", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0))",
+            [],
+        )
+        .unwrap();
         db.execute("INSERT INTO t (age) VALUES (25)", []).unwrap();
         let err = db.execute("INSERT INTO t (age) VALUES (-1)", []);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("CHECK constraint failed"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("CHECK constraint failed"));
         // UPDATE violating the CHECK fails too.
         let err = db.execute("UPDATE t SET age = -5 WHERE age = 25", []);
         assert!(err.is_err());
@@ -6306,10 +7177,8 @@ mod tests {
     #[test]
     fn table_level_check_constraint() {
         let mut db = memdb();
-        db.execute(
-            "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a < b))",
-            [],
-        ).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a < b))", [])
+            .unwrap();
         let ok = db.execute("INSERT INTO t VALUES (1, 2)", []);
         assert!(ok.is_ok());
         let err = db.execute("INSERT INTO t VALUES (2, 1)", []);
@@ -6319,10 +7188,17 @@ mod tests {
     #[test]
     fn not_null_constraint_enforced() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
         let err = db.execute("INSERT INTO t (name) VALUES (NULL)", []);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("NOT NULL constraint failed"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("NOT NULL constraint failed"));
         // UPDATE to NULL also fails.
         db.execute("INSERT INTO t (name) VALUES ('a')", []).unwrap();
         let err = db.execute("UPDATE t SET name = NULL", []);
@@ -6332,12 +7208,22 @@ mod tests {
     #[test]
     fn datetime_functions_end_to_end() {
         let db = memdb();
-        let rows = db.query("SELECT date('2023-07-14'), datetime('2023-07-14 13:45:28'), time('23:59:59')", []).unwrap();
+        let rows = db
+            .query(
+                "SELECT date('2023-07-14'), datetime('2023-07-14 13:45:28'), time('23:59:59')",
+                [],
+            )
+            .unwrap();
         assert_eq!(rows[0][0], Value::Text("2023-07-14".into()));
         assert_eq!(rows[0][1], Value::Text("2023-07-14 13:45:28".into()));
         assert_eq!(rows[0][2], Value::Text("23:59:59".into()));
 
-        let rows = db.query("SELECT julianday('1970-01-01'), unixepoch('2023-01-01 00:00:00')", []).unwrap();
+        let rows = db
+            .query(
+                "SELECT julianday('1970-01-01'), unixepoch('2023-01-01 00:00:00')",
+                [],
+            )
+            .unwrap();
         match &rows[0][0] {
             Value::Real(f) => assert!((f - 2440587.5).abs() < 1e-6),
             v => panic!("expected real, got {:?}", v),
@@ -6362,12 +7248,19 @@ mod tests {
     #[test]
     fn datetime_where_filter() {
         let mut db = memdb();
-        db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, day TEXT)", []).unwrap();
-        db.execute("INSERT INTO events (day) VALUES ('2023-01-01'), ('2023-06-15'), ('2024-03-20')", []).unwrap();
-        let rows = db.query(
-            "SELECT day FROM events WHERE day > date('2023-01-01', '+90 days') ORDER BY day",
+        db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, day TEXT)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO events (day) VALUES ('2023-01-01'), ('2023-06-15'), ('2024-03-20')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
+        let rows = db
+            .query(
+                "SELECT day FROM events WHERE day > date('2023-01-01', '+90 days') ORDER BY day",
+                [],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Text("2023-06-15".into()));
     }
@@ -6379,12 +7272,16 @@ mod tests {
     #[test]
     fn scalar_subquery_in_select() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", [])
+            .unwrap();
         let rows = db.query("SELECT (SELECT MAX(x) FROM t) AS m", []).unwrap();
         assert_eq!(rows[0][0], Value::Integer(30));
         // Scalar subquery in WHERE.
-        let rows = db.query("SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t)", []).unwrap();
+        let rows = db
+            .query("SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t)", [])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Integer(30));
     }
@@ -6392,24 +7289,41 @@ mod tests {
     #[test]
     fn scalar_subquery_empty_returns_null() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        let rows = db.query("SELECT (SELECT x FROM t WHERE id = 99)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        let rows = db
+            .query("SELECT (SELECT x FROM t WHERE id = 99)", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Null);
     }
 
     #[test]
     fn in_subquery() {
         let mut db = memdb();
-        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
-        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
-        db.execute("INSERT INTO a (v) VALUES (1), (2), (3), (4)", []).unwrap();
-        db.execute("INSERT INTO b (v) VALUES (2), (4), (6)", []).unwrap();
-        let rows = db.query("SELECT v FROM a WHERE v IN (SELECT v FROM b) ORDER BY v", []).unwrap();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO a (v) VALUES (1), (2), (3), (4)", [])
+            .unwrap();
+        db.execute("INSERT INTO b (v) VALUES (2), (4), (6)", [])
+            .unwrap();
+        let rows = db
+            .query(
+                "SELECT v FROM a WHERE v IN (SELECT v FROM b) ORDER BY v",
+                [],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Integer(2));
         assert_eq!(rows[1][0], Value::Integer(4));
         // NOT IN
-        let rows = db.query("SELECT v FROM a WHERE v NOT IN (SELECT v FROM b) ORDER BY v", []).unwrap();
+        let rows = db
+            .query(
+                "SELECT v FROM a WHERE v NOT IN (SELECT v FROM b) ORDER BY v",
+                [],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Integer(1));
         assert_eq!(rows[1][0], Value::Integer(3));
@@ -6418,8 +7332,10 @@ mod tests {
     #[test]
     fn exists_subquery() {
         let mut db = memdb();
-        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
-        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            .unwrap();
         db.execute("INSERT INTO a (v) VALUES (1), (2)", []).unwrap();
         // Empty b → EXISTS false, NOT EXISTS true.
         let rows = db.query("SELECT EXISTS (SELECT 1 FROM b)", []).unwrap();
@@ -6430,15 +7346,19 @@ mod tests {
         let rows = db.query("SELECT EXISTS (SELECT 1 FROM b)", []).unwrap();
         assert_eq!(rows[0][0], Value::Integer(1));
         // EXISTS in WHERE.
-        let rows = db.query("SELECT v FROM a WHERE EXISTS (SELECT 1 FROM b)", []).unwrap();
+        let rows = db
+            .query("SELECT v FROM a WHERE EXISTS (SELECT 1 FROM b)", [])
+            .unwrap();
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn nested_subqueries() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (5), (15), (25)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (x) VALUES (5), (15), (25)", [])
+            .unwrap();
         // Subquery within a subquery: inner MIN=5, middle MIN(x WHERE x>5)=15.
         let rows = db.query(
             "SELECT x FROM t WHERE x > (SELECT MIN(x) FROM t WHERE x > (SELECT MIN(x) FROM t)) ORDER BY x",
@@ -6451,12 +7371,16 @@ mod tests {
     #[test]
     fn subquery_with_parameters() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
-        let rows = db.query(
-            "SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t WHERE x < ?)",
-            vec![Value::Integer(30)],
-        ).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", [])
+            .unwrap();
+        let rows = db
+            .query(
+                "SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t WHERE x < ?)",
+                vec![Value::Integer(30)],
+            )
+            .unwrap();
         // Subquery: AVG over rows where x < 30 → 15. Rows where x > 15: 20, 30.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Integer(20));
@@ -6466,19 +7390,32 @@ mod tests {
     #[test]
     fn correlated_subquery_executes_correctly() {
         let mut db = memdb();
-        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
-        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            .unwrap();
         db.execute("INSERT INTO a (v) VALUES (1), (2)", []).unwrap();
-        db.execute("INSERT INTO b (v) VALUES (1), (1), (7)", []).unwrap();
+        db.execute("INSERT INTO b (v) VALUES (1), (1), (7)", [])
+            .unwrap();
         // Correlated (a.v referenced inside subquery): for a.v=1, MAX(b.v)
         // over b.v=1 rows is 1 → matches. For a.v=2, no b rows → NULL → no
         // match. (Previously this shape errored 'unsupported'.)
-        let result = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = a.v)", []).unwrap();
+        let result = db
+            .query(
+                "SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = a.v)",
+                [],
+            )
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0][0], Value::Integer(1));
         // Empty outer match: b has no v=2 rows, so the scalar subquery is
         // NULL and the equality filters the row out (NULL = NULL is not true).
-        let result2 = db.query("SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = 99)", []).unwrap();
+        let result2 = db
+            .query(
+                "SELECT v FROM a WHERE v = (SELECT MAX(v) FROM b WHERE b.v = 99)",
+                [],
+            )
+            .unwrap();
         assert_eq!(result2.len(), 0);
     }
 
@@ -6489,9 +7426,14 @@ mod tests {
     #[test]
     fn index_range_scan_select() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+            .unwrap();
         db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
-        db.execute("INSERT INTO t (val) VALUES (3), (1), (4), (1), (5), (9), (2), (6)", []).unwrap();
+        db.execute(
+            "INSERT INTO t (val) VALUES (3), (1), (4), (1), (5), (9), (2), (6)",
+            [],
+        )
+        .unwrap();
         // val > 3 → 4, 5, 6, 9 in index order.
         let rows = db.query("SELECT val FROM t WHERE val > 3", []).unwrap();
         let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
@@ -6507,11 +7449,15 @@ mod tests {
         let rows = db.query("SELECT val FROM t WHERE val <= 2", []).unwrap();
         assert_eq!(rows.len(), 3);
         // BETWEEN.
-        let rows = db.query("SELECT val FROM t WHERE val BETWEEN 2 AND 5", []).unwrap();
+        let rows = db
+            .query("SELECT val FROM t WHERE val BETWEEN 2 AND 5", [])
+            .unwrap();
         let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
         assert_eq!(vals, vec![2, 3, 4, 5]);
         // Both bounds.
-        let rows = db.query("SELECT val FROM t WHERE val > 1 AND val < 5", []).unwrap();
+        let rows = db
+            .query("SELECT val FROM t WHERE val > 1 AND val < 5", [])
+            .unwrap();
         let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
         assert_eq!(vals, vec![2, 3, 4]);
     }
@@ -6519,11 +7465,21 @@ mod tests {
     #[test]
     fn index_range_with_residual() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, cat TEXT)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, cat TEXT)",
+            [],
+        )
+        .unwrap();
         db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
-        db.execute("INSERT INTO t (val, cat) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a')", []).unwrap();
+        db.execute(
+            "INSERT INTO t (val, cat) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a')",
+            [],
+        )
+        .unwrap();
         // Range on val + residual on cat.
-        let rows = db.query("SELECT val FROM t WHERE val > 1 AND cat = 'a'", []).unwrap();
+        let rows = db
+            .query("SELECT val FROM t WHERE val > 1 AND cat = 'a'", [])
+            .unwrap();
         let vals: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
         assert_eq!(vals, vec![3, 5]);
     }
@@ -6531,7 +7487,11 @@ mod tests {
     #[test]
     fn index_range_update() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, score REAL)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, score REAL)",
+            [],
+        )
+        .unwrap();
         db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
         let mut sql = String::from("INSERT INTO t (val, score) VALUES ");
         for i in 0..100 {
@@ -6542,11 +7502,16 @@ mod tests {
         }
         db.execute(&sql, []).unwrap();
         // UPDATE with a range predicate on the indexed column.
-        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 90", []).unwrap();
-        let rows = db.query("SELECT COUNT(*) FROM t WHERE score > 0.5", []).unwrap();
+        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 90", [])
+            .unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM t WHERE score > 0.5", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(10));
         // Also verify all rows with val <= 90 still have score 0.
-        let rows = db.query("SELECT COUNT(*) FROM t WHERE score = 0.0", []).unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM t WHERE score = 0.0", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(90));
         // DELETE with a range predicate.
         db.execute("DELETE FROM t WHERE val >= 95", []).unwrap();
@@ -6557,9 +7522,14 @@ mod tests {
     #[test]
     fn index_range_negative_and_real_values() {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x REAL)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x REAL)", [])
+            .unwrap();
         db.execute("CREATE INDEX idx_x ON t(x)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES (-5.5), (-2.0), (0.0), (1.5), (3.25), (7.0)", []).unwrap();
+        db.execute(
+            "INSERT INTO t (x) VALUES (-5.5), (-2.0), (0.0), (1.5), (3.25), (7.0)",
+            [],
+        )
+        .unwrap();
         let rows = db.query("SELECT x FROM t WHERE x > -2.5", []).unwrap();
         let vals: Vec<String> = rows.iter().map(|r| r[0].to_string()).collect();
         assert_eq!(vals, vec!["-2.0", "0.0", "1.5", "3.25", "7.0"]);
@@ -6587,10 +7557,12 @@ mod persist_tests {
         let path = tmp.path();
         {
             let mut db = Database::open(path).unwrap();
-            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+                .unwrap();
             db.execute("BEGIN", []).unwrap();
             for i in 1..=10_000i64 {
-                db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)]).unwrap();
+                db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)])
+                    .unwrap();
             }
             db.execute("COMMIT", []).unwrap();
             db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
@@ -6599,7 +7571,11 @@ mod persist_tests {
         }
         let db2 = Database::open(path).unwrap();
         let c = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
-        assert_eq!(c[0][0], Value::Integer(10_000), "row count lost across reopen");
+        assert_eq!(
+            c[0][0],
+            Value::Integer(10_000),
+            "row count lost across reopen"
+        );
         let r = db2.query("SELECT val FROM t WHERE id = 5000", []).unwrap();
         assert_eq!(r[0][0], Value::Integer(5000), "row 5000 lost across reopen");
         // Index still works after reopen.
@@ -6613,21 +7589,27 @@ mod persist_tests {
         // forgotten by statement N+1 (no override tracking) — entries past
         // the first split were silently unreachable.
         let mut db = Database::open_in_memory().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+            .unwrap();
         db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
         for i in 1..=3_000i64 {
-            db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i * 7)]).unwrap();
+            db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i * 7)])
+                .unwrap();
         }
         let mut missing = 0;
         for i in 1..=3_000i64 {
-            let r = db.query("SELECT id FROM t WHERE val = ?", [Value::Integer(i * 7)]).unwrap();
+            let r = db
+                .query("SELECT id FROM t WHERE val = ?", [Value::Integer(i * 7)])
+                .unwrap();
             if r.len() != 1 {
                 missing += 1;
             }
         }
         assert_eq!(missing, 0, "{} indexed rows unreachable", missing);
         // Range scans too.
-        let r = db.query("SELECT COUNT(*) FROM t WHERE val > 14000", []).unwrap();
+        let r = db
+            .query("SELECT COUNT(*) FROM t WHERE val > 14000", [])
+            .unwrap();
         assert_eq!(r[0][0], Value::Integer(1_000)); // i*7 > 14000 → i in 2001..3000
     }
 
@@ -6639,11 +7621,13 @@ mod persist_tests {
         let path = tmp.path();
         {
             let mut db = Database::open(path).unwrap();
-            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+                .unwrap();
             db.execute("INSERT INTO t (val) VALUES (1)", []).unwrap();
             db.execute("BEGIN", []).unwrap();
             for i in 2..=5_000i64 {
-                db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)]).unwrap();
+                db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)])
+                    .unwrap();
             }
             db.execute("ROLLBACK", []).unwrap();
             let c = db.query("SELECT COUNT(*) FROM t", []).unwrap();
@@ -6651,7 +7635,11 @@ mod persist_tests {
         }
         let db2 = Database::open(path).unwrap();
         let c = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
-        assert_eq!(c[0][0], Value::Integer(1), "rollback leaked rows across reopen");
+        assert_eq!(
+            c[0][0],
+            Value::Integer(1),
+            "rollback leaked rows across reopen"
+        );
     }
 
     // ---- RowidRange fast path -------------------------------------------
@@ -6662,14 +7650,20 @@ mod persist_tests {
 
     fn range_db(n: i64) -> Database {
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", [])
-            .unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
         // 10k rows → a multi-level tree so the interior-node binary
         // search and early-stop logic are exercised, not just one leaf.
         for i in 1..=n {
             db.execute(
                 "INSERT INTO t (name, val) VALUES (?, ?)",
-                [Value::Text(format!("row-{i}").into()), Value::Integer(i * 7)],
+                [
+                    Value::Text(format!("row-{i}").into()),
+                    Value::Integer(i * 7),
+                ],
             )
             .unwrap();
         }
@@ -6680,13 +7674,17 @@ mod persist_tests {
     fn rowid_range_fast_path_bare_star() {
         let db = range_db(10_000);
         // BETWEEN on the INTEGER PRIMARY KEY alias.
-        let rows = db.query("SELECT * FROM t WHERE id BETWEEN 1000 AND 1009", []).unwrap();
+        let rows = db
+            .query("SELECT * FROM t WHERE id BETWEEN 1000 AND 1009", [])
+            .unwrap();
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0][0], Value::Integer(1000));
         assert_eq!(rows[9][0], Value::Integer(1009));
         assert_eq!(rows[0][1], Value::Text("row-1000".into()));
         // Projection form: only requested columns, in order.
-        let rows = db.query("SELECT val, name FROM t WHERE id BETWEEN 1000 AND 1004", []).unwrap();
+        let rows = db
+            .query("SELECT val, name FROM t WHERE id BETWEEN 1000 AND 1004", [])
+            .unwrap();
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0][0], Value::Integer(7000));
         assert_eq!(rows[0][1], Value::Text("row-1000".into()));
@@ -6696,14 +7694,18 @@ mod persist_tests {
     fn rowid_range_fast_path_conjunct_bounds() {
         let db = range_db(10_000);
         // >= / <= conjunct pair is the same plan shape as BETWEEN.
-        let rows = db.query("SELECT id FROM t WHERE id >= 5000 AND id <= 5004", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id >= 5000 AND id <= 5004", [])
+            .unwrap();
         assert_eq!(rows.len(), 5);
         for (i, r) in rows.iter().enumerate() {
             assert_eq!(r[0], Value::Integer(5000 + i as i64));
         }
         // > / < (exclusive) still routes through the general range plan —
         // verify row count and edges are right there too.
-        let rows = db.query("SELECT id FROM t WHERE id > 9990 AND id < 9999", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id > 9990 AND id < 9999", [])
+            .unwrap();
         assert_eq!(rows.len(), 8);
         assert_eq!(rows[0][0], Value::Integer(9991));
         assert_eq!(rows[7][0], Value::Integer(9998));
@@ -6728,25 +7730,37 @@ mod persist_tests {
     fn rowid_range_degenerate_and_edge_bounds() {
         let db = range_db(10_000);
         // Empty range: start > end → no rows, no panic, no infinite loop.
-        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 500 AND 400", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id BETWEEN 500 AND 400", [])
+            .unwrap();
         assert!(rows.is_empty());
         // Single-row range.
-        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 1 AND 1", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id BETWEEN 1 AND 1", [])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Integer(1));
         // Full-table range via rowid bounds.
-        let rows = db.query("SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 20000", []).unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 20000", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(10_000));
         // Bounds beyond both ends clamp correctly.
-        let rows = db.query("SELECT COUNT(*) FROM t WHERE id BETWEEN -5 AND 50000", []).unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM t WHERE id BETWEEN -5 AND 50000", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(10_000));
         // Range entirely past the right edge: the early-stop must kick in
         // at the first leaf without walking every remaining leaf.
-        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 10001 AND 20000", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id BETWEEN 10001 AND 20000", [])
+            .unwrap();
         assert!(rows.is_empty());
         // Range entirely before the left edge: the interior binary search
         // must skip to the first child, not panic.
-        let rows = db.query("SELECT id FROM t WHERE id BETWEEN -100 AND -1", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id BETWEEN -100 AND -1", [])
+            .unwrap();
         assert!(rows.is_empty());
     }
 
@@ -6774,16 +7788,21 @@ mod persist_tests {
         // rowid >= start even when earlier cells were deleted.
         let mut db = range_db(2_000);
         for i in (100..200).step_by(2) {
-            db.execute("DELETE FROM t WHERE id = ?", [Value::Integer(i)]).unwrap();
+            db.execute("DELETE FROM t WHERE id = ?", [Value::Integer(i)])
+                .unwrap();
         }
-        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 99 AND 201", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id BETWEEN 99 AND 201", [])
+            .unwrap();
         // Survivors: 99, 101, 103, ..., 199, 200, 201
         let expect: Vec<Vec<Value>> = (99..=201)
             .filter(|i| *i == 99 || *i >= 200 || i % 2 == 1)
             .map(|i| vec![Value::Integer(i)])
             .collect();
         assert_eq!(rows, expect);
-        let rows = db.query("SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 2000", []).unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 2000", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(1_950)); // 2000 - 50 deleted
     }
 
@@ -6793,14 +7812,19 @@ mod persist_tests {
         // verifies the early-stop `Ok(false)` propagation never cuts the
         // walk short while rows remain inside the range.
         let db = range_db(10_000);
-        let rows = db.query("SELECT id FROM t WHERE id BETWEEN 137 AND 9973", []).unwrap();
+        let rows = db
+            .query("SELECT id FROM t WHERE id BETWEEN 137 AND 9973", [])
+            .unwrap();
         assert_eq!(rows.len() as i64, 9973 - 137 + 1);
         assert_eq!(rows[0][0], Value::Integer(137));
         let last = rows.last().unwrap();
         assert_eq!(last[0], Value::Integer(9973));
         // Descending ranges are not the fast path, but must agree.
         let rows2 = db
-            .query("SELECT id FROM t WHERE id BETWEEN 137 AND 9973 ORDER BY id DESC", [])
+            .query(
+                "SELECT id FROM t WHERE id BETWEEN 137 AND 9973 ORDER BY id DESC",
+                [],
+            )
             .unwrap();
         assert_eq!(rows2.len(), rows.len());
         assert_eq!(rows2[0][0], Value::Integer(9973));
@@ -6816,43 +7840,68 @@ mod persist_tests {
         let mut db = range_db(30);
         db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
         // Rowid point lookup, reordered projection.
-        let rows = db.query("SELECT val, name, id FROM t WHERE id = 5", []).unwrap();
-        assert_eq!(rows, vec![vec![
-            Value::Integer(35),
-            Value::Text("row-5".into()),
-            Value::Integer(5),
-        ]]);
+        let rows = db
+            .query("SELECT val, name, id FROM t WHERE id = 5", [])
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Integer(35),
+                Value::Text("row-5".into()),
+                Value::Integer(5),
+            ]]
+        );
         // Rowid range, reordered projection.
-        let rows = db.query("SELECT val, name FROM t WHERE id BETWEEN 5 AND 6", []).unwrap();
-        assert_eq!(rows, vec![
-            vec![Value::Integer(35), Value::Text("row-5".into())],
-            vec![Value::Integer(42), Value::Text("row-6".into())],
-        ]);
+        let rows = db
+            .query("SELECT val, name FROM t WHERE id BETWEEN 5 AND 6", [])
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(35), Value::Text("row-5".into())],
+                vec![Value::Integer(42), Value::Text("row-6".into())],
+            ]
+        );
         // Index point lookup, reordered projection.
-        let rows = db.query("SELECT val, name, id FROM t WHERE val = 35", []).unwrap();
-        assert_eq!(rows, vec![vec![
-            Value::Integer(35),
-            Value::Text("row-5".into()),
-            Value::Integer(5),
-        ]]);
+        let rows = db
+            .query("SELECT val, name, id FROM t WHERE val = 35", [])
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Integer(35),
+                Value::Text("row-5".into()),
+                Value::Integer(5),
+            ]]
+        );
         // Duplicate projections on both point shapes.
         let rows = db.query("SELECT val, val FROM t WHERE id = 5", []).unwrap();
         assert_eq!(rows, vec![vec![Value::Integer(35), Value::Integer(35)]]);
-        let rows = db.query("SELECT name, name FROM t WHERE val = 35", []).unwrap();
-        assert_eq!(rows, vec![vec![
-            Value::Text("row-5".into()),
-            Value::Text("row-5".into()),
-        ]]);
+        let rows = db
+            .query("SELECT name, name FROM t WHERE val = 35", [])
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("row-5".into()),
+                Value::Text("row-5".into()),
+            ]]
+        );
         // Single-column reorder: projection picks the LAST column only.
         let rows = db.query("SELECT val FROM t WHERE id = 7", []).unwrap();
         assert_eq!(rows, vec![vec![Value::Integer(49)]]);
         // Mid-table reorder mixing alias, text and integer.
-        let rows = db.query("SELECT name, id, val FROM t WHERE id BETWEEN 9 AND 9", []).unwrap();
-        assert_eq!(rows, vec![vec![
-            Value::Text("row-9".into()),
-            Value::Integer(9),
-            Value::Integer(63),
-        ]]);
+        let rows = db
+            .query("SELECT name, id, val FROM t WHERE id BETWEEN 9 AND 9", [])
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("row-9".into()),
+                Value::Integer(9),
+                Value::Integer(63),
+            ]]
+        );
     }
 
     #[test]
@@ -6862,17 +7911,22 @@ mod persist_tests {
         // INSERT skip rowids — `DELETE row 2` then INSERT returned 3, not
         // SQLite's max(existing)+1 = 2.
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         db.execute("INSERT INTO t (v) VALUES ('a')", []).unwrap();
         db.execute("INSERT INTO t (v) VALUES ('b')", []).unwrap();
         // Filtered delete of the max rowid (streaming path).
         db.execute("DELETE FROM t WHERE v = 'b'", []).unwrap();
         db.execute("INSERT INTO t (v) VALUES ('c')", []).unwrap();
         let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
-        assert_eq!(rows, vec![
-            vec![Value::Integer(1), Value::Text("a".into())],
-            vec![Value::Integer(2), Value::Text("c".into())],
-        ], "INSERT must reuse max(existing)+1 = 2");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(1), Value::Text("a".into())],
+                vec![Value::Integer(2), Value::Text("c".into())],
+            ],
+            "INSERT must reuse max(existing)+1 = 2"
+        );
         // Delete-all (Scan path) then insert: rowids restart at 1.
         db.execute("DELETE FROM t", []).unwrap();
         db.execute("INSERT INTO t (v) VALUES ('d')", []).unwrap();
@@ -6892,10 +7946,20 @@ mod persist_tests {
         // Exercise literal keys, param keys, misses, aliases, and the
         // shapes that must NOT take it (COUNT(col), GROUP BY).
         let mut db = memdb();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
         db.execute("BEGIN", []).unwrap();
         for i in 1..=1000i64 {
-            let cat = if i % 3 == 0 { "a" } else if i % 3 == 1 { "b" } else { "c" };
+            let cat = if i % 3 == 0 {
+                "a"
+            } else if i % 3 == 1 {
+                "b"
+            } else {
+                "c"
+            };
             db.execute(
                 "INSERT INTO t (cat, val) VALUES (?, ?)",
                 [Value::Text(cat.into()), Value::Integer(i)],
@@ -6905,18 +7969,27 @@ mod persist_tests {
         db.execute("COMMIT", []).unwrap();
         db.execute("CREATE INDEX idx_cat ON t(cat)", []).unwrap();
         // Literal key.
-        let r = db.query("SELECT COUNT(*) FROM t WHERE cat = 'a'", []).unwrap();
+        let r = db
+            .query("SELECT COUNT(*) FROM t WHERE cat = 'a'", [])
+            .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(333)]]);
         // Parameter key (re-encoded per call).
         let r = db
-            .query("SELECT COUNT(*) FROM t WHERE cat = ?", [Value::Text("b".into())])
+            .query(
+                "SELECT COUNT(*) FROM t WHERE cat = ?",
+                [Value::Text("b".into())],
+            )
             .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(334)]]);
         // Miss.
-        let r = db.query("SELECT COUNT(*) FROM t WHERE cat = 'zzz'", []).unwrap();
+        let r = db
+            .query("SELECT COUNT(*) FROM t WHERE cat = 'zzz'", [])
+            .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(0)]]);
         // Aliased.
-        let r = db.query("SELECT COUNT(*) AS n FROM t WHERE cat = 'a'", []).unwrap();
+        let r = db
+            .query("SELECT COUNT(*) AS n FROM t WHERE cat = 'a'", [])
+            .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(333)]]);
         // Column names through query_with_columns.
         let (cols, rows) = db
@@ -6925,20 +7998,27 @@ mod persist_tests {
         assert_eq!(rows, vec![vec![Value::Integer(333)]]);
         assert_eq!(cols.len(), 1);
         // COUNT(col) is NOT the fast path but must stay correct.
-        let r = db.query("SELECT COUNT(val) FROM t WHERE cat = 'c'", []).unwrap();
+        let r = db
+            .query("SELECT COUNT(val) FROM t WHERE cat = 'c'", [])
+            .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(333)]]);
         // GROUP BY multi-bucket stays correct.
         let r = db
             .query("SELECT cat, COUNT(*) FROM t GROUP BY cat ORDER BY cat", [])
             .unwrap();
-        assert_eq!(r, vec![
-            vec![Value::Text("a".into()), Value::Integer(333)],
-            vec![Value::Text("b".into()), Value::Integer(334)],
-            vec![Value::Text("c".into()), Value::Integer(333)],
-        ]);
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Text("a".into()), Value::Integer(333)],
+                vec![Value::Text("b".into()), Value::Integer(334)],
+                vec![Value::Text("c".into()), Value::Integer(333)],
+            ]
+        );
         // Indexed point lookups still correct alongside (pre-encoded
         // literal keys path).
-        let r = db.query("SELECT id FROM t WHERE cat = 'a' AND val = 999", []).unwrap();
+        let r = db
+            .query("SELECT id FROM t WHERE cat = 'a' AND val = 999", [])
+            .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(999)]]);
     }
 }

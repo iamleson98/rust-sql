@@ -28,7 +28,7 @@ impl ScalarFunction for Rot13 {
         true
     }
     fn call(&self, _ctx: &FnCtx, args: &[Value]) -> rustqlite::Result<Value> {
-        let s = args.get(0).map(|v| v.as_text()).unwrap_or_default();
+        let s = args.first().map(|v| v.as_text()).unwrap_or_default();
         let out: String = s
             .chars()
             .map(|c| match c {

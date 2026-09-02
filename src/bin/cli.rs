@@ -53,7 +53,16 @@ fn main() {
     let mut mode = OutputMode::Table;
 
     loop {
-        write!(stdout, "{}> ", if buffer.is_empty() { "rustqlite" } else { "  ..." }).unwrap();
+        write!(
+            stdout,
+            "{}> ",
+            if buffer.is_empty() {
+                "rustqlite"
+            } else {
+                "  ..."
+            }
+        )
+        .unwrap();
         stdout.flush().unwrap();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
@@ -101,7 +110,11 @@ fn handle_dot_command(
             writeln!(out, "  .tables          List all tables.").unwrap();
             writeln!(out, "  .schema [name]   Show schema for a table.").unwrap();
             writeln!(out, "  .mode json       Output rows as JSON.").unwrap();
-            writeln!(out, "  .mode table      Output rows as ASCII table (default).").unwrap();
+            writeln!(
+                out,
+                "  .mode table      Output rows as ASCII table (default)."
+            )
+            .unwrap();
             writeln!(out, "  .quit / .exit    Exit the shell.").unwrap();
         }
         ".tables" => {
@@ -142,7 +155,12 @@ fn handle_dot_command(
     Ok(())
 }
 
-fn execute_sql(db: &mut Database, sql: &str, mode: &OutputMode, out: &mut impl Write) -> Result<(), rustqlite::Error> {
+fn execute_sql(
+    db: &mut Database,
+    sql: &str,
+    mode: &OutputMode,
+    out: &mut impl Write,
+) -> Result<(), rustqlite::Error> {
     // Determine if this is a query or a DML/DDL statement. We do this by
     // looking at the leading keyword.
     let trimmed = sql.trim_start();
@@ -195,17 +213,25 @@ fn print_table(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
         }
     }
     // Header
-    let header: Vec<String> = cols.iter().enumerate().map(|(i, c)| format!("{:width$}", c, width = widths[i])).collect();
+    let header: Vec<String> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
+        .collect();
     writeln!(out, "| {} |", header.join(" | ")).unwrap();
     // Separator
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
     writeln!(out, "|-{}-|", sep.join("-|-")).unwrap();
     // Rows
     for row in rows {
-        let cells: Vec<String> = row.iter().enumerate().map(|(i, v)| {
-            let s = format_value(v);
-            format!("{:width$}", s, width = widths.get(i).copied().unwrap_or(0))
-        }).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let s = format_value(v);
+                format!("{:width$}", s, width = widths.get(i).copied().unwrap_or(0))
+            })
+            .collect();
         writeln!(out, "| {} |", cells.join(" | ")).unwrap();
     }
     writeln!(out, "({} rows)", rows.len()).unwrap();
@@ -244,7 +270,14 @@ fn print_line(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
     for row in rows {
         for (i, v) in row.iter().enumerate() {
             let name = cols.get(i).map(|s| s.as_str()).unwrap_or("?");
-            writeln!(out, "{:>width$} = {}", name, format_value(v), width = max_col_len).unwrap();
+            writeln!(
+                out,
+                "{:>width$} = {}",
+                name,
+                format_value(v),
+                width = max_col_len
+            )
+            .unwrap();
         }
         writeln!(out).unwrap();
     }

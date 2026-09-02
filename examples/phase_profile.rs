@@ -6,7 +6,11 @@ fn main() {
     rustqlite::api::profile::ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
     let n = 3000;
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
 
     // Warm up
     for i in 0..500 {
@@ -24,12 +28,20 @@ fn main() {
     }
     let full = t0.elapsed();
     db.execute("COMMIT", []).unwrap();
-    println!("full path (txn)  : {:>9.2?}  ({:.3} us/insert)", full, full.as_nanos() as f64 / n as f64 / 1000.0);
+    println!(
+        "full path (txn)  : {:>9.2?}  ({:.3} us/insert)",
+        full,
+        full.as_nanos() as f64 / n as f64 / 1000.0
+    );
     rustqlite::api::profile::dump();
 
     // Same with cache DISABLED to isolate cache overhead
     db.set_stmt_cache_capacity(0);
-    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     let t1 = std::time::Instant::now();
     for i in 1..=n {
@@ -38,5 +50,9 @@ fn main() {
     }
     let full2 = t1.elapsed();
     db.execute("COMMIT", []).unwrap();
-    println!("no-cache (txn)   : {:>9.2?}  ({:.3} us/insert)", full2, full2.as_nanos() as f64 / n as f64 / 1000.0);
+    println!(
+        "no-cache (txn)   : {:>9.2?}  ({:.3} us/insert)",
+        full2,
+        full2.as_nanos() as f64 / n as f64 / 1000.0
+    );
 }

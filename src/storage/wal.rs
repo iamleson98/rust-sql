@@ -321,7 +321,9 @@ impl Wal {
     pub fn read_frame_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
         if buf.len() != self.page_size as usize {
-            return Err(Error::InvalidArgument("read_frame_at: wrong buffer size".to_string()));
+            return Err(Error::InvalidArgument(
+                "read_frame_at: wrong buffer size".to_string(),
+            ));
         }
         let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
         self.file.read_exact_at(&mut fh_buf, offset)?;
@@ -329,7 +331,8 @@ impl Wal {
         if fh.salt1 != self.header.salt1 || fh.salt2 != self.header.salt2 {
             return Err(Error::corruption("WAL frame salt mismatch"));
         }
-        self.file.read_exact_at(buf, offset + FRAME_HEADER_SIZE as u64)?;
+        self.file
+            .read_exact_at(buf, offset + FRAME_HEADER_SIZE as u64)?;
         Ok(())
     }
 
@@ -349,7 +352,8 @@ impl Wal {
                 self.page_size
             )));
         }
-        let offset = WAL_HEADER_SIZE as u64 + self.n_frames as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;
+        let offset = WAL_HEADER_SIZE as u64
+            + self.n_frames as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;
         self.file.seek(SeekFrom::Start(offset))?;
 
         // Compute checksum: include page_id + commit (8 bytes) + page data.
@@ -440,7 +444,8 @@ mod tests {
         let mut pages = Vec::new();
         wal.for_each_frame(|id, data, commit| {
             pages.push((id, data.to_vec(), commit));
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].0, 1);
         assert_eq!(pages[1].0, 2);

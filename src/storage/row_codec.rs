@@ -289,11 +289,11 @@ fn value_encoded_len(buf: &[u8]) -> Result<usize> {
     }
     let tag = buf[0];
     Ok(match tag {
-        0x00 | 0x01 | 0x09 => 1,                     // Null / zero / rowid marker
-        0x02 => 2,                                   // i8
-        0x03 => 3,                                   // i16
-        0x04 => 5,                                   // i32
-        0x05 | 0x06 => 9,                            // i64 / f64
+        0x00 | 0x01 | 0x09 => 1, // Null / zero / rowid marker
+        0x02 => 2,               // i8
+        0x03 => 3,               // i16
+        0x04 => 5,               // i32
+        0x05 | 0x06 => 9,        // i64 / f64
         0x0A => {
             // Integral REAL as zigzag varint: tag + varint.
             let rest = &buf[1..];
@@ -458,7 +458,11 @@ mod tests {
     #[test]
     fn rowid_alias_elision_roundtrip() {
         // (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)
-        let row = vec![Value::Integer(1234), Value::Text("abc".into()), Value::Integer(-7)];
+        let row = vec![
+            Value::Integer(1234),
+            Value::Text("abc".into()),
+            Value::Integer(-7),
+        ];
         let mut buf = Vec::new();
         encode_row_aliased_into(&row, Some(0), &mut buf);
         // marker(1) + text(1+1+3) + int(2) = 8 bytes
@@ -503,7 +507,11 @@ mod tests {
     #[test]
     fn selective_decode_with_alias() {
         // Row: [id (alias), name, val] — decode only id and val.
-        let row = vec![Value::Integer(77), Value::Text("xy".into()), Value::Integer(9)];
+        let row = vec![
+            Value::Integer(77),
+            Value::Text("xy".into()),
+            Value::Integer(9),
+        ];
         let mut buf = Vec::new();
         encode_row_aliased_into(&row, Some(0), &mut buf);
         let mut out = Vec::new();
@@ -515,7 +523,11 @@ mod tests {
     fn selective_decode_skips_alias() {
         // Wanted columns exclude the alias: skipping must still advance
         // past the 1-byte marker.
-        let row = vec![Value::Integer(5), Value::Text("name5".into()), Value::Integer(10)];
+        let row = vec![
+            Value::Integer(5),
+            Value::Text("name5".into()),
+            Value::Integer(10),
+        ];
         let mut buf = Vec::new();
         encode_row_aliased_into(&row, Some(0), &mut buf);
         let mut out = Vec::new();

@@ -21,8 +21,8 @@
 
 use crate::error::{Error, Result};
 use crate::types::Value;
-use std::collections::HashMap;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod abi;
@@ -32,7 +32,7 @@ pub mod vtab;
 pub use abi::{CAggregate, CCollation, CScalar};
 pub use codec::PageCodec;
 pub use vtab::{
-    IndexInfo, VtabConstraint, VtabUpdateArg, VirtualTable, VirtualTableCursor, VirtualTableModule,
+    IndexInfo, VirtualTable, VirtualTableCursor, VirtualTableModule, VtabConstraint, VtabUpdateArg,
 };
 
 /// Argument-count policy for a user function, mirroring SQLite's `nArg`
@@ -69,7 +69,10 @@ pub struct FnCtx {
 
 impl FnCtx {
     pub fn new(argc: usize) -> Self {
-        Self { argc, app: std::ptr::null_mut() }
+        Self {
+            argc,
+            app: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -112,7 +115,10 @@ pub struct AggCtx {
 
 impl AggCtx {
     pub fn new(argc: usize) -> Self {
-        Self { argc, app: std::ptr::null_mut() }
+        Self {
+            argc,
+            app: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -260,8 +266,7 @@ pub fn encode_collated_index_key_into(
 ) {
     for (i, v) in values.iter().enumerate() {
         match columns.get(i) {
-            Some(c) => collation_fold_key_ref(&c.collation, v)
-                .encode_order_key_into(out),
+            Some(c) => collation_fold_key_ref(&c.collation, v).encode_order_key_into(out),
             None => v.encode_order_key_into(out),
         }
     }

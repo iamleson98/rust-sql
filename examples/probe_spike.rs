@@ -10,11 +10,22 @@ fn us(d: std::time::Duration) -> f64 {
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=10000i64 {
-        db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("user{}", i).into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 
@@ -23,7 +34,9 @@ fn main() {
 
     // warm both statements
     for _ in 0..5 {
-        let _ = db.query(sql_rng, [Value::Integer(1), Value::Integer(2)]).unwrap();
+        let _ = db
+            .query(sql_rng, [Value::Integer(1), Value::Integer(2)])
+            .unwrap();
         let _ = db.query(sql_pt, [Value::Integer(5)]).unwrap();
     }
 
@@ -35,7 +48,9 @@ fn main() {
     println!("--- after 1000 point lookups, individual range queries:");
     for k in 1..=5 {
         let start = Instant::now();
-        let _ = db.query(sql_rng, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+        let _ = db
+            .query(sql_rng, [Value::Integer(1000), Value::Integer(1009)])
+            .unwrap();
         println!("  range query #{}: {:>8.2} us", k, us(start.elapsed()));
     }
 
@@ -48,7 +63,9 @@ fn main() {
     println!("--- after storm + 50ms sleep (mimalloc timer purge window):");
     for k in 1..=3 {
         let start = Instant::now();
-        let _ = db.query(sql_rng, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+        let _ = db
+            .query(sql_rng, [Value::Integer(1000), Value::Integer(1009)])
+            .unwrap();
         println!("  range query #{}: {:>8.2} us", k, us(start.elapsed()));
     }
 
@@ -56,7 +73,9 @@ fn main() {
     println!("--- tight loop of 1000 range queries (steady state):");
     let start = Instant::now();
     for _ in 0..1000 {
-        let _ = db.query(sql_rng, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+        let _ = db
+            .query(sql_rng, [Value::Integer(1000), Value::Integer(1009)])
+            .unwrap();
     }
     println!("  avg: {:>8.2} us", us(start.elapsed()) / 1000.0);
 
@@ -70,7 +89,12 @@ fn main() {
         }
         drop(v);
         let start = Instant::now();
-        let _ = db.query(sql_rng, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
-        println!("  range query after Vec storm: {:>8.2} us", us(start.elapsed()));
+        let _ = db
+            .query(sql_rng, [Value::Integer(1000), Value::Integer(1009)])
+            .unwrap();
+        println!(
+            "  range query after Vec storm: {:>8.2} us",
+            us(start.elapsed())
+        );
     }
 }

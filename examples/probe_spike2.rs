@@ -9,31 +9,50 @@ fn us(d: std::time::Duration) -> f64 {
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=10000i64 {
-        db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("user{}", i).into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 
     let sql = "SELECT name, val, score FROM t WHERE id BETWEEN ? AND ?";
     for _ in 0..1000 {
-        let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+        let _ = db
+            .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+            .unwrap();
     }
 
     // Case A: sleep with NO prior free storm (steady loop then sleep).
     let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    let _ = db
+        .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+        .unwrap();
     println!("steady (no sleep):        {:>7.2} us", us(start.elapsed()));
     std::thread::sleep(std::time::Duration::from_millis(50));
     let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    let _ = db
+        .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+        .unwrap();
     println!("after 50ms sleep:         {:>7.2} us", us(start.elapsed()));
 
     // Case B: re-warm, then free storm (drop big Vecs), then sleep.
     for _ in 0..1000 {
-        let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+        let _ = db
+            .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+            .unwrap();
     }
     {
         let mut v: Vec<Vec<u8>> = Vec::new();
@@ -44,7 +63,9 @@ fn main() {
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
     let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    let _ = db
+        .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+        .unwrap();
     println!("storm + 50ms sleep:       {:>7.2} us", us(start.elapsed()));
 
     // Case C: does a pure computational lambda also spike after sleep?
@@ -63,7 +84,11 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     let start = Instant::now();
     acc ^= f(acc);
-    println!("pure compute after sleep: {:>7.2} us  (CPU wake cost)  acc={}", us(start.elapsed()), acc & 1);
+    println!(
+        "pure compute after sleep: {:>7.2} us  (CPU wake cost)  acc={}",
+        us(start.elapsed()),
+        acc & 1
+    );
 
     // Case D: bench pattern — 1000 point lookups (free storm via results),
     // no sleep, immediate range query.
@@ -72,9 +97,13 @@ fn main() {
         let _ = db.query(sql_pt, [Value::Integer(500)]).unwrap();
     }
     let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    let _ = db
+        .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+        .unwrap();
     println!("storm, no sleep:          {:>7.2} us", us(start.elapsed()));
     let start = Instant::now();
-    let _ = db.query(sql, [Value::Integer(1000), Value::Integer(1009)]).unwrap();
+    let _ = db
+        .query(sql, [Value::Integer(1000), Value::Integer(1009)])
+        .unwrap();
     println!("second query:             {:>7.2} us", us(start.elapsed()));
 }

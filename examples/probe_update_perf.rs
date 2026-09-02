@@ -6,7 +6,11 @@ use std::time::Instant;
 
 fn bench_rustqlite(n: i64) {
     let mut db = rustqlite::Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT, s INT, u TEXT UNIQUE, idx INT)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT, s INT, u TEXT UNIQUE, idx INT)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=n {
         let row: Vec<rustqlite::Value> = vec![
@@ -15,7 +19,8 @@ fn bench_rustqlite(n: i64) {
             rustqlite::Value::Text(format!("u{i}").into()),
             rustqlite::Value::Integer(i),
         ];
-        db.execute("INSERT INTO t (v, s, u, idx) VALUES (?, ?, ?, ?)", row).unwrap();
+        db.execute("INSERT INTO t (v, s, u, idx) VALUES (?, ?, ?, ?)", row)
+            .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db.execute("CREATE INDEX si ON t(s)", []).unwrap();
@@ -30,12 +35,17 @@ fn bench_rustqlite(n: i64) {
 
     let t0 = Instant::now();
     for i in 1..=n {
-        db.execute("UPDATE t SET v = v + 1 WHERE id = ?", vec![rustqlite::Value::Integer(i)]).unwrap();
+        db.execute(
+            "UPDATE t SET v = v + 1 WHERE id = ?",
+            vec![rustqlite::Value::Integer(i)],
+        )
+        .unwrap();
     }
     let point = t0.elapsed();
 
     let t0 = Instant::now();
-    db.execute("UPDATE t SET v = v + 1 WHERE u = 'u5000'", []).unwrap();
+    db.execute("UPDATE t SET v = v + 1 WHERE u = 'u5000'", [])
+        .unwrap();
     let via_unique = t0.elapsed();
 
     println!(
@@ -46,13 +56,18 @@ fn bench_rustqlite(n: i64) {
 
 fn bench_rusqlite(n: i64) {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT, s INT, u TEXT UNIQUE, idx INT)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT, s INT, u TEXT UNIQUE, idx INT)",
+        [],
+    )
+    .unwrap();
     conn.execute("BEGIN", []).unwrap();
     for i in 1..=n {
         conn.execute(
             "INSERT INTO t (v, s, u, idx) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![i, i, format!("u{i}"), i],
-        ).unwrap();
+        )
+        .unwrap();
     }
     conn.execute("COMMIT", []).unwrap();
     conn.execute("CREATE INDEX si ON t(s)", []).unwrap();
@@ -67,12 +82,14 @@ fn bench_rusqlite(n: i64) {
 
     let t0 = Instant::now();
     for i in 1..=n {
-        conn.execute("UPDATE t SET v = v + 1 WHERE id = ?1", rusqlite::params![i]).unwrap();
+        conn.execute("UPDATE t SET v = v + 1 WHERE id = ?1", rusqlite::params![i])
+            .unwrap();
     }
     let point = t0.elapsed();
 
     let t0 = Instant::now();
-    conn.execute("UPDATE t SET v = v + 1 WHERE u = 'u5000'", []).unwrap();
+    conn.execute("UPDATE t SET v = v + 1 WHERE u = 'u5000'", [])
+        .unwrap();
     let via_unique = t0.elapsed();
 
     println!(

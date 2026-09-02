@@ -43,13 +43,23 @@ fn savepoint_basic_rollback_to() {
         db.execute(s, []).unwrap();
         conn.execute(s, []).unwrap();
     }
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), count_s(&conn, "SELECT COUNT(*) FROM t"));
-    let ours: Vec<String> = db.query("SELECT id FROM t ORDER BY id", []).unwrap()
-        .iter().map(|r| format!("{}", r[0].as_integer())).collect();
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM t"),
+        count_s(&conn, "SELECT COUNT(*) FROM t")
+    );
+    let ours: Vec<String> = db
+        .query("SELECT id FROM t ORDER BY id", [])
+        .unwrap()
+        .iter()
+        .map(|r| format!("{}", r[0].as_integer()))
+        .collect();
     let theirs: Vec<String> = {
         let mut stmt = conn.prepare("SELECT id FROM t ORDER BY id").unwrap();
-        let rows: Vec<i64> = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap()
-            .map(|r| r.unwrap()).collect();
+        let rows: Vec<i64> = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         rows.iter().map(|i| i.to_string()).collect()
     };
     assert_eq!(ours, theirs);
@@ -73,7 +83,10 @@ fn savepoint_release_keeps_changes() {
         conn.execute(s, []).unwrap();
     }
     assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), 5);
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), count_s(&conn, "SELECT COUNT(*) FROM t"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM t"),
+        count_s(&conn, "SELECT COUNT(*) FROM t")
+    );
 }
 
 #[test]
@@ -86,9 +99,9 @@ fn savepoint_nested_rollback_inner_and_outer() {
         "INSERT INTO t (v) VALUES ('n2')",
         "SAVEPOINT s2",
         "INSERT INTO t (v) VALUES ('n3')",
-        "ROLLBACK TO SAVEPOINT s2",   // drops n3
+        "ROLLBACK TO SAVEPOINT s2", // drops n3
         "INSERT INTO t (v) VALUES ('n4')",
-        "ROLLBACK TO SAVEPOINT s1",   // drops n2, n4 — keeps n1
+        "ROLLBACK TO SAVEPOINT s1", // drops n2, n4 — keeps n1
         "COMMIT",
     ];
     for s in script {
@@ -96,7 +109,10 @@ fn savepoint_nested_rollback_inner_and_outer() {
         conn.execute(s, []).unwrap();
     }
     assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), 4); // a,b,c,n1
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), count_s(&conn, "SELECT COUNT(*) FROM t"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM t"),
+        count_s(&conn, "SELECT COUNT(*) FROM t")
+    );
 }
 
 #[test]
@@ -113,7 +129,10 @@ fn savepoint_outside_transaction_commits_on_release() {
         conn.execute(s, []).unwrap();
     }
     assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), 5);
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), count_s(&conn, "SELECT COUNT(*) FROM t"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM t"),
+        count_s(&conn, "SELECT COUNT(*) FROM t")
+    );
     // The transaction is committed — a later plain ROLLBACK must NOT undo it.
     db.execute("BEGIN", []).unwrap();
     db.execute("INSERT INTO t (v) VALUES ('o3')", []).unwrap();
@@ -122,7 +141,10 @@ fn savepoint_outside_transaction_commits_on_release() {
     conn.execute("INSERT INTO t (v) VALUES ('o3')", []).unwrap();
     conn.execute("ROLLBACK", []).unwrap();
     assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), 5);
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), count_s(&conn, "SELECT COUNT(*) FROM t"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM t"),
+        count_s(&conn, "SELECT COUNT(*) FROM t")
+    );
 }
 
 #[test]
@@ -143,10 +165,16 @@ fn savepoint_update_delete_rollback() {
     }
     // UPDATE and DELETE rolled back; INSERT (pre-savepoint) survives.
     assert_eq!(count(&mut db, "SELECT COUNT(*) FROM u"), 3);
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM u"), count_s(&conn, "SELECT COUNT(*) FROM u"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM u"),
+        count_s(&conn, "SELECT COUNT(*) FROM u")
+    );
     let zz = count(&mut db, "SELECT COUNT(*) FROM t WHERE v = 'zz'");
     assert_eq!(zz, 0);
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM t"), count_s(&conn, "SELECT COUNT(*) FROM t"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM t"),
+        count_s(&conn, "SELECT COUNT(*) FROM t")
+    );
 }
 
 #[test]
@@ -169,7 +197,7 @@ fn savepoint_multi_page_churn() {
     let (mut db, conn) = setup();
     let script = [
         "BEGIN",
-        "INSERT INTO u (w) SELECT id FROM t",      // 3 rows
+        "INSERT INTO u (w) SELECT id FROM t", // 3 rows
         "SAVEPOINT bulk",
     ];
     for s in script {
@@ -191,14 +219,23 @@ fn savepoint_multi_page_churn() {
     db.execute("COMMIT", []).unwrap();
     conn.execute("COMMIT", []).unwrap();
     assert_eq!(count(&mut db, "SELECT COUNT(*) FROM u"), 53);
-    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM u"), count_s(&conn, "SELECT COUNT(*) FROM u"));
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM u"),
+        count_s(&conn, "SELECT COUNT(*) FROM u")
+    );
     // Content equality on the surviving rows.
-    let ours: Vec<String> = db.query("SELECT w FROM u ORDER BY w", []).unwrap()
-        .iter().map(|r| format!("{}", r[0].as_integer())).collect();
+    let ours: Vec<String> = db
+        .query("SELECT w FROM u ORDER BY w", [])
+        .unwrap()
+        .iter()
+        .map(|r| format!("{}", r[0].as_integer()))
+        .collect();
     let theirs: Vec<String> = {
         let mut stmt = conn.prepare("SELECT w FROM u ORDER BY w").unwrap();
-        stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap()
-            .map(|r| r.unwrap().to_string()).collect()
+        stmt.query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap().to_string())
+            .collect()
     };
     assert_eq!(ours, theirs);
 }

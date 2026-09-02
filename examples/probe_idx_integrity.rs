@@ -16,7 +16,11 @@ fn main() {
 
     // Full scan: count entries.
     let mut n = 0usize;
-    ibt.scan_index(|_rowid, _key| { n += 1; true }).unwrap();
+    ibt.scan_index(|_rowid, _key| {
+        n += 1;
+        true
+    })
+    .unwrap();
     println!("full scan entries: {} (expect 10000)", n);
 
     // Point lookups for every key.
@@ -41,7 +45,9 @@ fn main() {
     // pseudo-shuffle
     let mut seed = 42u64;
     for i in (1..vals.len()).rev() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (seed % (i as u64 + 1)) as usize;
         vals.swap(i, j);
     }
@@ -50,7 +56,11 @@ fn main() {
         ibt2.insert_index(&key, (n_ + 1) as i64).unwrap();
     }
     let mut n2 = 0usize;
-    ibt2.scan_index(|_rowid, _key| { n2 += 1; true }).unwrap();
+    ibt2.scan_index(|_rowid, _key| {
+        n2 += 1;
+        true
+    })
+    .unwrap();
     println!("random-order full scan: {} (expect 10000)", n2);
     let mut missing2 = 0usize;
     for v in (1..=10_000).map(|i| i * 2) {

@@ -54,7 +54,10 @@ struct JsonParser<'a> {
 
 impl<'a> JsonParser<'a> {
     fn new(s: &'a str) -> Self {
-        Self { b: s.as_bytes(), pos: 0 }
+        Self {
+            b: s.as_bytes(),
+            pos: 0,
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -153,7 +156,8 @@ impl<'a> JsonParser<'a> {
                         b'u' => {
                             // \uXXXX (surrogate pairs handled)
                             let hex = self.b.get(self.pos + 1..self.pos + 5)?;
-                            let cp = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                            let cp =
+                                u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
                             self.pos += 4;
                             if (0xD800..0xDC00).contains(&cp) {
                                 // expect low surrogate
@@ -481,7 +485,13 @@ pub fn sql_to_json(v: &Value) -> Json {
 
 /// Set the value at `path` inside `root` (creating intermediate objects for
 /// json_set/json_insert with `create` = true). Returns the new document.
-fn json_set_at(root: Json, path: &JsonPath, new_val: Json, create: bool, insert_only: bool) -> Json {
+fn json_set_at(
+    root: Json,
+    path: &JsonPath,
+    new_val: Json,
+    create: bool,
+    insert_only: bool,
+) -> Json {
     fn walk(node: Json, segs: &[PathSeg], new_val: &Json, create: bool, insert_only: bool) -> Json {
         if segs.is_empty() {
             if insert_only {
@@ -498,7 +508,10 @@ fn json_set_at(root: Json, path: &JsonPath, new_val: Json, create: bool, insert_
                     Json::Object(members)
                 } else if create {
                     let child = Json::Object(Vec::new());
-                    members.push((k.clone(), walk(child, &segs[1..], new_val, create, insert_only)));
+                    members.push((
+                        k.clone(),
+                        walk(child, &segs[1..], new_val, create, insert_only),
+                    ));
                     Json::Object(members)
                 } else {
                     Json::Object(members)
@@ -618,10 +631,8 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
             Some(Value::Null) | None => Value::Null,
             Some(v) => match parse_json(&v.as_text()) {
                 Some(j) => Value::Text(json_to_string(&j).into()),
-                None => {
-                    Value::Text(format!("malformed JSON: {}", trunc(&v.as_text())).into())
-                }
-            }
+                None => Value::Text(format!("malformed JSON: {}", trunc(&v.as_text())).into()),
+            },
         }),
         "json_type" => {
             let (doc, path) = doc_and_path(args)?;
@@ -648,7 +659,11 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
             // json_object(k1, v1, k2, v2, ...) — odd arg count is an error
             // in SQLite; we mirror by returning a malformed marker text.
             if args.len() % 2 != 0 {
-                return Some(Value::Text("json_object() requires an even number of arguments".to_string().into()));
+                return Some(Value::Text(
+                    "json_object() requires an even number of arguments"
+                        .to_string()
+                        .into(),
+                ));
             }
             let mut members = Vec::with_capacity(args.len() / 2);
             let mut i = 0;
@@ -693,10 +708,17 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
                 }
             }
             if args.len() == 2 {
-                Some(if any { results.pop().unwrap() } else { Value::Null })
+                Some(if any {
+                    results.pop().unwrap()
+                } else {
+                    Value::Null
+                })
             } else {
                 Some(Value::Text(
-                    json_to_string(&Json::Array(results.into_iter().map(|v| sql_to_json(&v)).collect())).into(),
+                    json_to_string(&Json::Array(
+                        results.into_iter().map(|v| sql_to_json(&v)).collect(),
+                    ))
+                    .into(),
                 ))
             }
         }
@@ -747,7 +769,9 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
             }
             let target = parse_json(&args[0].as_text())?;
             let patch = parse_json(&args[1].as_text())?;
-            Some(Value::Text(json_to_string(&json_patch_target(&target, &patch)).into()))
+            Some(Value::Text(
+                json_to_string(&json_patch_target(&target, &patch)).into(),
+            ))
         }
         _ => None,
     }

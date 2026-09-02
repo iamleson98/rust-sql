@@ -2,9 +2,9 @@
 //! SELECT 1 (no table) / rowid lookup / indexed lookup / COUNT.
 //! If SELECT 1 pays the penalty too, it's API/catalog-level; if only
 //! table-touching queries pay, it's btree/page-cache level.
-use std::time::Instant;
 use rustqlite::types::Value;
 use rustqlite::Database;
+use std::time::Instant;
 
 fn us(d: std::time::Duration) -> f64 {
     d.as_secs() as f64 * 1e6 + d.as_nanos() as f64 * 1e-3
@@ -13,19 +13,37 @@ fn us(d: std::time::Duration) -> f64 {
 fn storm(db: &mut Database, base: i64, n: i64) {
     db.execute("BEGIN", []).unwrap();
     for i in base..base + n {
-        db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("user{}", i).into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 }
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
     for i in 1..=1000i64 {
-        db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("user{}", i).into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
 
     // Warm ALL the statements we'll measure.
@@ -55,14 +73,17 @@ fn main() {
         let a = Instant::now();
         let _ = db.query(qs[3], []).unwrap();
         let d3 = us(a.elapsed());
-        println!("round {}: SELECT1={:.1}us  rowid={:.1}us  idx={:.1}us  count={:.1}us",
-                 round, d0, d1, d2, d3);
+        println!(
+            "round {}: SELECT1={:.1}us  rowid={:.1}us  idx={:.1}us  count={:.1}us",
+            round, d0, d1, d2, d3
+        );
     }
 
     // Now: does a WRITE (not read) right after commit also pay? e.g. an
     // INSERT outside a txn (autocommit write).
     let a = Instant::now();
-    db.execute("INSERT INTO t (name, val, score) VALUES ('x', 1, 1.0)", []).unwrap();
+    db.execute("INSERT INTO t (name, val, score) VALUES ('x', 1, 1.0)", [])
+        .unwrap();
     println!("autocommit INSERT after storm: {:.1} us", us(a.elapsed()));
     let a = Instant::now();
     let _ = db.query(qs[2], [Value::Integer(500)]).unwrap();
@@ -87,5 +108,8 @@ fn main() {
     let _ = db.query(qs[2], [Value::Integer(500)]).unwrap();
     let d_q = us(a.elapsed());
     db.execute("COMMIT", []).unwrap();
-    println!("after storm: BEGIN={:.1}us  first query in txn={:.1}us", d_begin, d_q);
+    println!(
+        "after storm: BEGIN={:.1}us  first query in txn={:.1}us",
+        d_begin, d_q
+    );
 }

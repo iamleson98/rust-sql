@@ -10,25 +10,61 @@ fn us(d: std::time::Duration) -> f64 {
 
 fn setup() -> Database {
     let mut dbj = Database::open_in_memory().unwrap();
-    dbj.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)", []).unwrap();
-    dbj.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)", []).unwrap();
-    dbj.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)", []).unwrap();
+    dbj.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)",
+        [],
+    )
+    .unwrap();
+    dbj.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)",
+        [],
+    )
+    .unwrap();
+    dbj.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)",
+        [],
+    )
+    .unwrap();
     dbj.execute("BEGIN", []).unwrap();
     for i in 1..=1000i64 {
-        dbj.execute("INSERT INTO users VALUES (?, ?, ?)",
-            [Value::Integer(i), Value::Text(format!("u{}", i).into()), Value::Text(format!("d{}", i % 10).into())]).unwrap();
+        dbj.execute(
+            "INSERT INTO users VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Text(format!("u{}", i).into()),
+                Value::Text(format!("d{}", i % 10).into()),
+            ],
+        )
+        .unwrap();
     }
     for i in 1..=10000i64 {
-        dbj.execute("INSERT INTO orders VALUES (?, ?, ?)",
-            [Value::Integer(i), Value::Integer((i % 1000) + 1), Value::Real(i as f64)]).unwrap();
+        dbj.execute(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer((i % 1000) + 1),
+                Value::Real(i as f64),
+            ],
+        )
+        .unwrap();
     }
     for i in 1..=50000i64 {
-        dbj.execute("INSERT INTO items VALUES (?, ?, ?, ?)",
-            [Value::Integer(i), Value::Integer((i % 10000) + 1), Value::Text(format!("item{}", i).into()), Value::Real(i as f64 * 0.5)]).unwrap();
+        dbj.execute(
+            "INSERT INTO items VALUES (?, ?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer((i % 10000) + 1),
+                Value::Text(format!("item{}", i).into()),
+                Value::Real(i as f64 * 0.5),
+            ],
+        )
+        .unwrap();
     }
     dbj.execute("COMMIT", []).unwrap();
-    dbj.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
-    dbj.execute("CREATE INDEX idx_items_order ON items(order_id)", []).unwrap();
+    dbj.execute("CREATE INDEX idx_orders_user ON orders(user_id)", [])
+        .unwrap();
+    dbj.execute("CREATE INDEX idx_items_order ON items(order_id)", [])
+        .unwrap();
     dbj
 }
 
@@ -52,7 +88,10 @@ fn main() {
         let _ = db.query(sql, [Value::Integer(1)]).unwrap();
         let start = Instant::now();
         let _ = db.query(sql, [Value::Integer(500)]).unwrap();
-        println!("bench pattern (warm=1, time=500):  {:>8.1} us", us(start.elapsed()));
+        println!(
+            "bench pattern (warm=1, time=500):  {:>8.1} us",
+            us(start.elapsed())
+        );
     }
     // Case 2: warmup with SAME param, then time.
     {
@@ -61,7 +100,11 @@ fn main() {
         let m0 = db.pager().cache_misses();
         let start = Instant::now();
         let _ = db.query(sql, [Value::Integer(500)]).unwrap();
-        println!("same-param warm + timed:           {:>8.1} us (misses +{})", us(start.elapsed()), db.pager().cache_misses() - m0);
+        println!(
+            "same-param warm + timed:           {:>8.1} us (misses +{})",
+            us(start.elapsed()),
+            db.pager().cache_misses() - m0
+        );
     }
     // Case 1b: how many misses does the new-param query pay?
     {
@@ -70,7 +113,11 @@ fn main() {
         let m0 = db.pager().cache_misses();
         let start = Instant::now();
         let _ = db.query(sql, [Value::Integer(500)]).unwrap();
-        println!("bench pattern:                     {:>8.1} us (misses +{})", us(start.elapsed()), db.pager().cache_misses() - m0);
+        println!(
+            "bench pattern:                     {:>8.1} us (misses +{})",
+            us(start.elapsed()),
+            db.pager().cache_misses() - m0
+        );
     }
     // Case 3: steady state (500 iterations of param 500).
     {
@@ -82,7 +129,10 @@ fn main() {
         for _ in 0..500 {
             let _ = db.query(sql, [Value::Integer(500)]).unwrap();
         }
-        println!("steady state avg:                 {:>8.1} us", us(start.elapsed()) / 500.0);
+        println!(
+            "steady state avg:                 {:>8.1} us",
+            us(start.elapsed()) / 500.0
+        );
     }
     // Case 4: interleaved single shots, params cycling 100..600 — simulates
     // the bench's single-shot measurement across different users.

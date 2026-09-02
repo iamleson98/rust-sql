@@ -45,7 +45,13 @@ const MAX_VIEW_DEPTH: usize = 64;
 
 impl<'a> Planner<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
-        Self { catalog, scopes: vec![HashMap::new()], ctes: HashMap::new(), outer_ctes: None, view_depth: 0 }
+        Self {
+            catalog,
+            scopes: vec![HashMap::new()],
+            ctes: HashMap::new(),
+            outer_ctes: None,
+            view_depth: 0,
+        }
     }
 
     /// Plan a SELECT statement.
@@ -73,8 +79,14 @@ impl<'a> Planner<'a> {
         let plan = if stmt.limit.is_some() || stmt.offset.is_some() {
             Plan::Limit {
                 input: Box::new(plan),
-                count: stmt.limit.clone().unwrap_or(Expr::Literal(Value::Integer(-1))),
-                offset: stmt.offset.clone().unwrap_or(Expr::Literal(Value::Integer(0))),
+                count: stmt
+                    .limit
+                    .clone()
+                    .unwrap_or(Expr::Literal(Value::Integer(-1))),
+                offset: stmt
+                    .offset
+                    .clone()
+                    .unwrap_or(Expr::Literal(Value::Integer(0))),
             }
         } else {
             plan
@@ -158,7 +170,11 @@ impl<'a> Planner<'a> {
                 // 1. Alias resolution.
                 if let Expr::Column { table: None, name } = &expr {
                     for c in &s.columns {
-                        if let ResultColumn::Expr { expr: ce, alias: Some(a) } = c {
+                        if let ResultColumn::Expr {
+                            expr: ce,
+                            alias: Some(a),
+                        } = c
+                        {
                             if a.eq_ignore_ascii_case(name) {
                                 expr = ce.clone();
                                 break;
@@ -180,7 +196,11 @@ impl<'a> Planner<'a> {
                         .map(|g| {
                             if let Expr::Column { table: None, name } = g {
                                 for c in &s.columns {
-                                    if let ResultColumn::Expr { expr, alias: Some(a) } = c {
+                                    if let ResultColumn::Expr {
+                                        expr,
+                                        alias: Some(a),
+                                    } = c
+                                    {
                                         if a.eq_ignore_ascii_case(name) {
                                             return expr.clone();
                                         }
@@ -197,7 +217,11 @@ impl<'a> Planner<'a> {
                         resolved_group_by.len(),
                     );
                 }
-                OrderTerm { expr, order: t.order, nulls: t.nulls }
+                OrderTerm {
+                    expr,
+                    order: t.order,
+                    nulls: t.nulls,
+                }
             })
             .collect();
         Ok(resolved)
@@ -210,10 +234,24 @@ impl<'a> Planner<'a> {
                 let l = self.plan_select_body(left)?;
                 let r = self.plan_select_body(right)?;
                 match op {
-                    SetOp::Union => Ok(Plan::Union { left: Box::new(l), right: Box::new(r), all: false }),
-                    SetOp::UnionAll => Ok(Plan::Union { left: Box::new(l), right: Box::new(r), all: true }),
-                    SetOp::Intersect => Ok(Plan::Intersect { left: Box::new(l), right: Box::new(r) }),
-                    SetOp::Except => Ok(Plan::Except { left: Box::new(l), right: Box::new(r) }),
+                    SetOp::Union => Ok(Plan::Union {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        all: false,
+                    }),
+                    SetOp::UnionAll => Ok(Plan::Union {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        all: true,
+                    }),
+                    SetOp::Intersect => Ok(Plan::Intersect {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                    SetOp::Except => Ok(Plan::Except {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
                 }
             }
         }
@@ -269,18 +307,26 @@ impl<'a> Planner<'a> {
         // reference that matches a projection alias, replace it with the
         // projection's expression. This lets `GROUP BY bucket` work where
         // `bucket` is an alias for a CASE expression in the SELECT list.
-        let resolved_group_by: Vec<Expr> = s.group_by.iter().map(|g| {
-            if let Expr::Column { table: None, name } = g {
-                for c in &s.columns {
-                    if let ResultColumn::Expr { expr, alias: Some(a) } = c {
-                        if a.eq_ignore_ascii_case(name) {
-                            return expr.clone();
+        let resolved_group_by: Vec<Expr> = s
+            .group_by
+            .iter()
+            .map(|g| {
+                if let Expr::Column { table: None, name } = g {
+                    for c in &s.columns {
+                        if let ResultColumn::Expr {
+                            expr,
+                            alias: Some(a),
+                        } = c
+                        {
+                            if a.eq_ignore_ascii_case(name) {
+                                return expr.clone();
+                            }
                         }
                     }
                 }
-            }
-            g.clone()
-        }).collect();
+                g.clone()
+            })
+            .collect();
         if has_aggregates {
             // The Aggregate operator outputs: [group_by_cols..., aggregate_results...].
             // We need to rewrite the Project's columns so that aggregate expressions
@@ -293,26 +339,44 @@ impl<'a> Planner<'a> {
                 aggregates: aggregates.clone(),
             };
             if let Some(having) = &having_rewritten {
-                let rewritten_having = rewrite_aggregates_and_groups(having, &aggregates, &resolved_group_by, n_group);
-                plan = Plan::Filter { input: Box::new(plan), predicate: rewritten_having };
+                let rewritten_having =
+                    rewrite_aggregates_and_groups(having, &aggregates, &resolved_group_by, n_group);
+                plan = Plan::Filter {
+                    input: Box::new(plan),
+                    predicate: rewritten_having,
+                };
             }
 
-            let rewritten_columns: Vec<ProjectExpr> = s.columns.iter().map(|c| {
-                match c {
+            let rewritten_columns: Vec<ProjectExpr> = s
+                .columns
+                .iter()
+                .map(|c| match c {
                     ResultColumn::Star => ProjectExpr {
-                        expr: Expr::Column { table: None, name: "*".into() },
+                        expr: Expr::Column {
+                            table: None,
+                            name: "*".into(),
+                        },
                         alias: None,
                     },
                     ResultColumn::TableStar(t) => ProjectExpr {
-                        expr: Expr::Column { table: Some(t.clone()), name: "*".into() },
+                        expr: Expr::Column {
+                            table: Some(t.clone()),
+                            name: "*".into(),
+                        },
                         alias: None,
                     },
                     ResultColumn::Expr { expr, alias } => {
-                        let rewritten = rewrite_aggregates_and_groups(expr, &aggregates, &resolved_group_by, n_group);
+                        let rewritten = rewrite_aggregates_and_groups(
+                            expr,
+                            &aggregates,
+                            &resolved_group_by,
+                            n_group,
+                        );
                         let alias = alias.clone().or_else(|| {
                             if let Expr::Column { name, .. } = &rewritten {
                                 if name.starts_with("__agg_") {
-                                    let idx: usize = name.trim_start_matches("__agg_").parse().ok()?;
+                                    let idx: usize =
+                                        name.trim_start_matches("__agg_").parse().ok()?;
                                     Some(aggregates[idx].display_name.clone())
                                 } else {
                                     None
@@ -321,10 +385,13 @@ impl<'a> Planner<'a> {
                                 None
                             }
                         });
-                        ProjectExpr { expr: rewritten, alias }
+                        ProjectExpr {
+                            expr: rewritten,
+                            alias,
+                        }
                     }
-                }
-            }).collect();
+                })
+                .collect();
             plan = Plan::Project {
                 input: Box::new(plan),
                 columns: rewritten_columns,
@@ -335,7 +402,10 @@ impl<'a> Planner<'a> {
         let has_windows = self.expr_list_has_windows(&s.columns);
         if has_windows {
             let windows = self.collect_windows(&s.columns, &s.window)?;
-            plan = Plan::Window { input: Box::new(plan), windows };
+            plan = Plan::Window {
+                input: Box::new(plan),
+                windows,
+            };
         }
 
         // Project FIRST, then DISTINCT. SQLite semantics: DISTINCT applies
@@ -344,11 +414,17 @@ impl<'a> Planner<'a> {
         // would be the dedup key, and every row would be unique.
         plan = Plan::Project {
             input: Box::new(plan),
-            columns: s.columns.iter().map(|c| self.result_column_to_project(c)).collect::<Result<_>>()?,
+            columns: s
+                .columns
+                .iter()
+                .map(|c| self.result_column_to_project(c))
+                .collect::<Result<_>>()?,
         };
 
         if s.distinct {
-            plan = Plan::Distinct { input: Box::new(plan) };
+            plan = Plan::Distinct {
+                input: Box::new(plan),
+            };
         }
 
         Ok(plan)
@@ -373,10 +449,7 @@ impl<'a> Planner<'a> {
     }
 
     /// Provide the materialized CTE map for this statement (api.rs).
-    pub fn set_ctes(
-        &mut self,
-        ctes: HashMap<String, crate::types::CteMaterialization>,
-    ) {
+    pub fn set_ctes(&mut self, ctes: HashMap<String, crate::types::CteMaterialization>) {
         self.ctes = ctes;
     }
 
@@ -396,7 +469,12 @@ impl<'a> Planner<'a> {
 
     fn plan_table_expression(&mut self, te: &TableExpression) -> Result<Plan> {
         match te {
-            TableExpression::Table { name, alias, indexed, .. } => {
+            TableExpression::Table {
+                name,
+                alias,
+                indexed,
+                ..
+            } => {
                 // CTE reference? (WITH ... name AS (...)). CTEs shadow real
                 // tables of the same name.
                 if indexed.is_none() {
@@ -416,7 +494,10 @@ impl<'a> Planner<'a> {
                                 .collect::<Vec<String>>()
                                 .into()
                         };
-                        return Ok(Plan::CteRows { rows: rows.clone(), columns: ql });
+                        return Ok(Plan::CteRows {
+                            rows: rows.clone(),
+                            columns: ql,
+                        });
                     }
                 }
                 // VIEW reference: expand to the view's SELECT (recursively —
@@ -453,12 +534,17 @@ impl<'a> Planner<'a> {
                                     .iter()
                                     .zip(inner_names.iter())
                                     .map(|(new, old)| crate::planner::plan::ProjectExpr {
-                                        expr: Expr::Column { table: None, name: old.clone() },
+                                        expr: Expr::Column {
+                                            table: None,
+                                            name: old.clone(),
+                                        },
                                         alias: Some(format!("{}.{}", prefix, new)),
                                     })
                                     .collect();
                                 Plan::Project {
-                                    input: Box::new(Plan::Subquery { plan: Box::new(inner) }),
+                                    input: Box::new(Plan::Subquery {
+                                        plan: Box::new(inner),
+                                    }),
                                     columns: cols,
                                 }
                             }
@@ -469,14 +555,17 @@ impl<'a> Planner<'a> {
                                     renames.len()
                                 )));
                             }
-                            _ => Plan::Subquery { plan: Box::new(inner) },
+                            _ => Plan::Subquery {
+                                plan: Box::new(inner),
+                            },
                         };
                         return Ok(plan);
                     }
                 }
-                let table = self.catalog.get_table(name).ok_or_else(|| {
-                    Error::NotFound(format!("table: {}", name))
-                })?;
+                let table = self
+                    .catalog
+                    .get_table(name)
+                    .ok_or_else(|| Error::NotFound(format!("table: {}", name)))?;
                 // Pending virtual table (module not registered yet): the
                 // column list is unknown until xConnect, so planning
                 // would produce a wrong schema. Modules must be
@@ -513,9 +602,16 @@ impl<'a> Planner<'a> {
                 if let Some(a) = alias {
                     let _ = a;
                 }
-                Ok(Plan::Subquery { plan: Box::new(inner) })
+                Ok(Plan::Subquery {
+                    plan: Box::new(inner),
+                })
             }
-            TableExpression::Join { left, right, join_type, constraint } => {
+            TableExpression::Join {
+                left,
+                right,
+                join_type,
+                constraint,
+            } => {
                 let l = self.plan_table_expression(left)?;
                 let r = self.plan_table_expression(right)?;
                 // Collation scope for the join condition spans BOTH sides.
@@ -530,8 +626,14 @@ impl<'a> Planner<'a> {
                         for c in cols {
                             let e = Expr::Binary {
                                 op: BinaryOp::Eq,
-                                left: Box::new(Expr::Column { table: None, name: c.clone() }),
-                                right: Box::new(Expr::Column { table: None, name: c.clone() }),
+                                left: Box::new(Expr::Column {
+                                    table: None,
+                                    name: c.clone(),
+                                }),
+                                right: Box::new(Expr::Column {
+                                    table: None,
+                                    name: c.clone(),
+                                }),
                             };
                             combined = Some(match combined {
                                 Some(prev) => Expr::Binary {
@@ -549,9 +651,15 @@ impl<'a> Planner<'a> {
                 };
                 // JoinType is shared with the AST — no conversion needed.
                 let jt = *join_type;
-                let algo = if matches!(constraint, JoinConstraint::Natural | JoinConstraint::Using(_)) {
+                let algo = if matches!(
+                    constraint,
+                    JoinConstraint::Natural | JoinConstraint::Using(_)
+                ) {
                     JoinAlgorithm::Hash
-                } else if let Some(Expr::Binary { op: BinaryOp::Eq, .. }) = &condition {
+                } else if let Some(Expr::Binary {
+                    op: BinaryOp::Eq, ..
+                }) = &condition
+                {
                     JoinAlgorithm::Hash
                 } else {
                     JoinAlgorithm::NestedLoop
@@ -569,21 +677,42 @@ impl<'a> Planner<'a> {
 
     fn result_column_to_project(&self, c: &ResultColumn) -> Result<ProjectExpr> {
         match c {
-            ResultColumn::Star => Ok(ProjectExpr { expr: Expr::Column { table: None, name: "*".into() }, alias: None }),
-            ResultColumn::TableStar(t) => Ok(ProjectExpr { expr: Expr::Column { table: Some(t.clone()), name: "*".into() }, alias: None }),
-            ResultColumn::Expr { expr, alias } => Ok(ProjectExpr { expr: expr.clone(), alias: alias.clone() }),
+            ResultColumn::Star => Ok(ProjectExpr {
+                expr: Expr::Column {
+                    table: None,
+                    name: "*".into(),
+                },
+                alias: None,
+            }),
+            ResultColumn::TableStar(t) => Ok(ProjectExpr {
+                expr: Expr::Column {
+                    table: Some(t.clone()),
+                    name: "*".into(),
+                },
+                alias: None,
+            }),
+            ResultColumn::Expr { expr, alias } => Ok(ProjectExpr {
+                expr: expr.clone(),
+                alias: alias.clone(),
+            }),
         }
     }
 
     fn expr_list_has_aggregates(&self, cols: &[ResultColumn]) -> bool {
-        cols.iter().any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)))
+        cols.iter()
+            .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)))
     }
 
     fn expr_list_has_windows(&self, cols: &[ResultColumn]) -> bool {
-        cols.iter().any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_window(expr)))
+        cols.iter()
+            .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_window(expr)))
     }
 
-    fn collect_aggregates(&self, cols: &[ResultColumn], having: Option<&Expr>) -> Result<Vec<AggExpr>> {
+    fn collect_aggregates(
+        &self,
+        cols: &[ResultColumn],
+        having: Option<&Expr>,
+    ) -> Result<Vec<AggExpr>> {
         let mut out = Vec::new();
         for c in cols {
             if let ResultColumn::Expr { expr, alias } = c {
@@ -596,7 +725,11 @@ impl<'a> Planner<'a> {
         Ok(out)
     }
 
-    fn collect_windows(&self, cols: &[ResultColumn], defs: &[WindowDef]) -> Result<Vec<WindowExpr>> {
+    fn collect_windows(
+        &self,
+        cols: &[ResultColumn],
+        defs: &[WindowDef],
+    ) -> Result<Vec<WindowExpr>> {
         let _ = defs;
         let mut out = Vec::new();
         for c in cols {
@@ -634,7 +767,10 @@ pub fn rewrite_aggregates_and_groups(
             // would emit NULLs for what should be the group key.
             let name = match g {
                 Expr::Column { table: None, name } => name.clone(),
-                Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+                Expr::Column {
+                    table: Some(t),
+                    name,
+                } => format!("{}.{}", t, name),
                 _ => format!("col{}", i + 1),
             };
             return Expr::Column { table: None, name };
@@ -642,7 +778,13 @@ pub fn rewrite_aggregates_and_groups(
     }
     // Otherwise, rewrite aggregates and recurse.
     match e {
-        Expr::Function { name, distinct, args, over, filter } => {
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            over,
+            filter,
+        } => {
             // Use is_aggregate_call so the polymorphic scalar forms
             // (MIN(a,b), MAX(a,b,c)) are NOT rewritten to aggregate
             // columns when a real same-name aggregate exists elsewhere in
@@ -651,7 +793,10 @@ pub fn rewrite_aggregates_and_groups(
                 // The aggregate's INPUT expression: `None` for star / no-arg
                 // calls (COUNT(*)), otherwise the first argument.
                 let call_arg: Option<&Expr> = if args.is_empty()
-                    || args.first().map(|a| matches!(a, Expr::Column { name, .. } if name == "*")).unwrap_or(false)
+                    || args
+                        .first()
+                        .map(|a| matches!(a, Expr::Column { name, .. } if name == "*"))
+                        .unwrap_or(false)
                 {
                     None
                 } else {
@@ -677,12 +822,18 @@ pub fn rewrite_aggregates_and_groups(
                     };
                     if args_match {
                         let col_name = format!("__agg_{}", i);
-                        return Expr::Column { table: None, name: col_name };
+                        return Expr::Column {
+                            table: None,
+                            name: col_name,
+                        };
                     }
                 }
                 e.clone()
             } else {
-                let new_args: Vec<Expr> = args.iter().map(|a| rewrite_aggregates_and_groups(a, aggregates, group_by, n_group)).collect();
+                let new_args: Vec<Expr> = args
+                    .iter()
+                    .map(|a| rewrite_aggregates_and_groups(a, aggregates, group_by, n_group))
+                    .collect();
                 Expr::Function {
                     name: name.clone(),
                     distinct: *distinct,
@@ -694,45 +845,93 @@ pub fn rewrite_aggregates_and_groups(
         }
         Expr::Binary { op, left, right } => Expr::Binary {
             op: *op,
-            left: Box::new(rewrite_aggregates_and_groups(left, aggregates, group_by, n_group)),
-            right: Box::new(rewrite_aggregates_and_groups(right, aggregates, group_by, n_group)),
+            left: Box::new(rewrite_aggregates_and_groups(
+                left, aggregates, group_by, n_group,
+            )),
+            right: Box::new(rewrite_aggregates_and_groups(
+                right, aggregates, group_by, n_group,
+            )),
         },
         Expr::Unary { op, expr } => Expr::Unary {
             op: *op,
-            expr: Box::new(rewrite_aggregates_and_groups(expr, aggregates, group_by, n_group)),
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
         },
-        Expr::Between { expr, low, high, negated } => Expr::Between {
-            expr: Box::new(rewrite_aggregates_and_groups(expr, aggregates, group_by, n_group)),
-            low: Box::new(rewrite_aggregates_and_groups(low, aggregates, group_by, n_group)),
-            high: Box::new(rewrite_aggregates_and_groups(high, aggregates, group_by, n_group)),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
+            low: Box::new(rewrite_aggregates_and_groups(
+                low, aggregates, group_by, n_group,
+            )),
+            high: Box::new(rewrite_aggregates_and_groups(
+                high, aggregates, group_by, n_group,
+            )),
             negated: *negated,
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
-            expr: Box::new(rewrite_aggregates_and_groups(expr, aggregates, group_by, n_group)),
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
             negated: *negated,
         },
-        Expr::Is { left, right, negated } => Expr::Is {
-            left: Box::new(rewrite_aggregates_and_groups(left, aggregates, group_by, n_group)),
-            right: Box::new(rewrite_aggregates_and_groups(right, aggregates, group_by, n_group)),
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } => Expr::Is {
+            left: Box::new(rewrite_aggregates_and_groups(
+                left, aggregates, group_by, n_group,
+            )),
+            right: Box::new(rewrite_aggregates_and_groups(
+                right, aggregates, group_by, n_group,
+            )),
             negated: *negated,
         },
-        Expr::Case { operand, whens, else_ } => {
-            let new_whens: Vec<(Expr, Expr)> = whens.iter().map(|(c, v)| {
-                (rewrite_aggregates_and_groups(c, aggregates, group_by, n_group),
-                 rewrite_aggregates_and_groups(v, aggregates, group_by, n_group))
-            }).collect();
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            let new_whens: Vec<(Expr, Expr)> = whens
+                .iter()
+                .map(|(c, v)| {
+                    (
+                        rewrite_aggregates_and_groups(c, aggregates, group_by, n_group),
+                        rewrite_aggregates_and_groups(v, aggregates, group_by, n_group),
+                    )
+                })
+                .collect();
             Expr::Case {
-                operand: operand.as_ref().map(|o| Box::new(rewrite_aggregates_and_groups(o, aggregates, group_by, n_group))),
+                operand: operand.as_ref().map(|o| {
+                    Box::new(rewrite_aggregates_and_groups(
+                        o, aggregates, group_by, n_group,
+                    ))
+                }),
                 whens: new_whens,
-                else_: else_.as_ref().map(|e| Box::new(rewrite_aggregates_and_groups(e, aggregates, group_by, n_group))),
+                else_: else_.as_ref().map(|e| {
+                    Box::new(rewrite_aggregates_and_groups(
+                        e, aggregates, group_by, n_group,
+                    ))
+                }),
             }
         }
         Expr::Cast { expr, type_name } => Expr::Cast {
-            expr: Box::new(rewrite_aggregates_and_groups(expr, aggregates, group_by, n_group)),
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
             type_name: type_name.clone(),
         },
         Expr::Collate { expr, collation } => Expr::Collate {
-            expr: Box::new(rewrite_aggregates_and_groups(expr, aggregates, group_by, n_group)),
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
             collation: collation.clone(),
         },
         _ => e.clone(),
@@ -747,7 +946,13 @@ pub fn rewrite_aggregates(e: &Expr, aggregates: &[AggExpr], n_group: usize) -> E
 /// Check if an expression contains an aggregate function call.
 pub fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::Function { name, over, args, filter, .. } => {
+        Expr::Function {
+            name,
+            over,
+            args,
+            filter,
+            ..
+        } => {
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
                 return true;
             }
@@ -757,28 +962,51 @@ pub fn expr_has_aggregate(e: &Expr) -> bool {
             // (it previously did, so those shapes silently lost their
             // Aggregate plan and evaluated per-row instead of per-group).
             args.iter().any(expr_has_aggregate)
-                || filter.as_ref().map(|e| expr_has_aggregate(e)).unwrap_or(false)
+                || filter
+                    .as_ref()
+                    .map(|e| expr_has_aggregate(e))
+                    .unwrap_or(false)
         }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::Unary { expr, .. } => expr_has_aggregate(expr),
-        Expr::Between { expr, low, high, .. } => {
-            expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high)
-        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
         Expr::In { expr, source, .. } => {
             expr_has_aggregate(expr)
                 || matches!(source, InSource::List(l) if l.iter().any(expr_has_aggregate))
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             expr_has_aggregate(expr)
                 || expr_has_aggregate(pattern)
-                || escape.as_ref().map(|e| expr_has_aggregate(e)).unwrap_or(false)
+                || escape
+                    .as_ref()
+                    .map(|e| expr_has_aggregate(e))
+                    .unwrap_or(false)
         }
         Expr::IsNull { expr, .. } => expr_has_aggregate(expr),
         Expr::Is { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
-        Expr::Case { operand, whens, else_ } => {
-            operand.as_ref().map(|e| expr_has_aggregate(e)).unwrap_or(false)
-                || whens.iter().any(|(c, v)| expr_has_aggregate(c) || expr_has_aggregate(v))
-                || else_.as_ref().map(|e| expr_has_aggregate(e)).unwrap_or(false)
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand
+                .as_ref()
+                .map(|e| expr_has_aggregate(e))
+                .unwrap_or(false)
+                || whens
+                    .iter()
+                    .any(|(c, v)| expr_has_aggregate(c) || expr_has_aggregate(v))
+                || else_
+                    .as_ref()
+                    .map(|e| expr_has_aggregate(e))
+                    .unwrap_or(false)
         }
         Expr::Row(es) => es.iter().any(expr_has_aggregate),
         Expr::Cast { expr, .. } => expr_has_aggregate(expr),
@@ -793,17 +1021,27 @@ pub fn expr_has_window(e: &Expr) -> bool {
         Expr::Function { over: Some(_), .. } => true,
         Expr::Binary { left, right, .. } => expr_has_window(left) || expr_has_window(right),
         Expr::Unary { expr, .. } => expr_has_window(expr),
-        Expr::Between { expr, low, high, .. } => {
-            expr_has_window(expr) || expr_has_window(low) || expr_has_window(high)
-        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_window(expr) || expr_has_window(low) || expr_has_window(high),
         Expr::In { expr, source, .. } => {
-            expr_has_window(expr) || matches!(source, InSource::List(l) if l.iter().any(expr_has_window))
+            expr_has_window(expr)
+                || matches!(source, InSource::List(l) if l.iter().any(expr_has_window))
         }
         Expr::IsNull { expr, .. } => expr_has_window(expr),
         Expr::Is { left, right, .. } => expr_has_window(left) || expr_has_window(right),
-        Expr::Case { operand, whens, else_ } => {
-            operand.as_ref().map(|e| expr_has_window(e)).unwrap_or(false)
-                || whens.iter().any(|(c, v)| expr_has_window(c) || expr_has_window(v))
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand
+                .as_ref()
+                .map(|e| expr_has_window(e))
+                .unwrap_or(false)
+                || whens
+                    .iter()
+                    .any(|(c, v)| expr_has_window(c) || expr_has_window(v))
                 || else_.as_ref().map(|e| expr_has_window(e)).unwrap_or(false)
         }
         Expr::Cast { expr, .. } => expr_has_window(expr),
@@ -843,9 +1081,21 @@ pub fn is_aggregate_call(name: &str, n_args: usize) -> bool {
 /// Returns true if the function name is a window-only function.
 #[allow(dead_code)]
 pub fn is_window_only_fn(name: &str) -> bool {
-    matches!(name, "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" | "ntile" | "lag" | "lead" | "first_value" | "last_value" | "nth_value")
+    matches!(
+        name,
+        "row_number"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+            | "ntile"
+            | "lag"
+            | "lead"
+            | "first_value"
+            | "last_value"
+            | "nth_value"
+    )
 }
-
 
 /// SQLite-style output name for an aggregate/window call: `COUNT(*)`,
 /// `SUM(x)`, `COUNT(DISTINCT y)`. (SQLite's short-column-name rule.)
@@ -872,12 +1122,21 @@ fn aggregate_display_name(name: &str, distinct: bool, args: &[crate::sql::ast::E
 
 fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExpr>) {
     match e {
-        Expr::Function { name, distinct, args, over, filter } => {
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            over,
+            filter,
+        } => {
             // Use is_aggregate_call (not is_aggregate_fn) so that the
             // polymorphic min/max distinction is respected: MAX(col) is
             // an aggregate (1 arg), MAX(1, 5, 3) is a scalar call (3 args).
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
-                let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column { name, .. } if name == "*")) {
+                let arg = if args.is_empty()
+                    || (args.len() == 1
+                        && matches!(&args[0], Expr::Column { name, .. } if name == "*"))
+                {
                     None
                 } else {
                     // MAX(x) / MIN(x) / SUM(x): the single argument is the
@@ -906,7 +1165,9 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
             collect_aggregates_rec(right, &None, out);
         }
         Expr::Unary { expr, .. } => collect_aggregates_rec(expr, &None, out),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_aggregates_rec(expr, &None, out);
             collect_aggregates_rec(low, &None, out);
             collect_aggregates_rec(high, &None, out);
@@ -919,7 +1180,12 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                 }
             }
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             collect_aggregates_rec(expr, &None, out);
             collect_aggregates_rec(pattern, &None, out);
             if let Some(e) = escape {
@@ -931,7 +1197,11 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
             collect_aggregates_rec(left, &None, out);
             collect_aggregates_rec(right, &None, out);
         }
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             if let Some(o) = operand {
                 collect_aggregates_rec(o, &None, out);
             }
@@ -956,13 +1226,26 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
 
 fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExpr>) {
     match e {
-        Expr::Function { name, distinct, args, over, .. } => {
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            over,
+            ..
+        } => {
             if let Some(spec) = over {
                 let (partition_by, order_by, frame) = match spec.as_ref() {
                     WindowSpec::Named(_) => (Vec::new(), Vec::new(), None),
-                    WindowSpec::Inline(def) => (def.partition_by.clone(), def.order_by.clone(), def.frame.as_ref().map(|f| (**f).clone())),
+                    WindowSpec::Inline(def) => (
+                        def.partition_by.clone(),
+                        def.order_by.clone(),
+                        def.frame.as_ref().map(|f| (**f).clone()),
+                    ),
                 };
-                let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column { name, .. } if name == "*")) {
+                let arg = if args.is_empty()
+                    || (args.len() == 1
+                        && matches!(&args[0], Expr::Column { name, .. } if name == "*"))
+                {
                     None
                 } else {
                     // MAX(x) / MIN(x) / SUM(x): the single argument is the
@@ -1026,7 +1309,12 @@ pub fn find_index_for_column(
 /// equality. This is a conservative simplification; a real planner would split
 /// AND chains and try each conjunct.
 pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
-    if let Expr::Binary { op: BinaryOp::Eq, left, right } = predicate {
+    if let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = predicate
+    {
         // Try left = literal
         if let Expr::Column { table: _, name } = left.as_ref() {
             // Right side must not be a column ref (we want literal/param/value).
@@ -1091,9 +1379,7 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
         // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
         // multi-seek instead of a full scan + per-row IN evaluation (which
         // previously cost a 10k-row table scan for 10 literal rowids).
-        if let Some((in_plan, residual_conjuncts)) =
-            try_rowid_in(&conjuncts, table, alias)
-        {
+        if let Some((in_plan, residual_conjuncts)) = try_rowid_in(&conjuncts, table, alias) {
             if residual_conjuncts.is_empty() {
                 return in_plan;
             }
@@ -1104,8 +1390,7 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
         }
         // Indexed-column IN-list: `WHERE indexed_col IN (v1, v2, ...)` —
         // one index seek per member instead of a full table scan.
-        if let Some((in_plan, residual_conjuncts)) =
-            try_index_in(catalog, &conjuncts, table, alias)
+        if let Some((in_plan, residual_conjuncts)) = try_index_in(catalog, &conjuncts, table, alias)
         {
             if residual_conjuncts.is_empty() {
                 return in_plan;
@@ -1123,7 +1408,8 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                     if table.columns[idx].name.eq_ignore_ascii_case(&col_name) {
                         // For `id = ? AND other = ?`, use RowidLookup for `id = ?`
                         // and put the remaining conjuncts in a top-level Filter.
-                        let other_conjuncts: Vec<Expr> = conjuncts.iter()
+                        let other_conjuncts: Vec<Expr> = conjuncts
+                            .iter()
                             .filter(|c| !exprs_equal_conjunct(c, conjunct))
                             .cloned()
                             .collect();
@@ -1146,7 +1432,8 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                     || col_name.eq_ignore_ascii_case("_rowid_")
                     || col_name.eq_ignore_ascii_case("oid")
                 {
-                    let other_conjuncts: Vec<Expr> = conjuncts.iter()
+                    let other_conjuncts: Vec<Expr> = conjuncts
+                        .iter()
                         .filter(|c| !exprs_equal_conjunct(c, conjunct))
                         .cloned()
                         .collect();
@@ -1167,7 +1454,8 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 for index in catalog.indexes_on_table(&table.name) {
                     if let Some(first_col) = index.columns.first() {
                         if first_col.name.eq_ignore_ascii_case(&col_name) {
-                            let other_conjuncts: Vec<Expr> = conjuncts.iter()
+                            let other_conjuncts: Vec<Expr> = conjuncts
+                                .iter()
                                 .filter(|c| !exprs_equal_conjunct(c, conjunct))
                                 .cloned()
                                 .collect();
@@ -1197,7 +1485,10 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
         }
     }
     // Default: wrap in a Filter.
-    Plan::Filter { input: Box::new(plan), predicate: predicate.clone() }
+    Plan::Filter {
+        input: Box::new(plan),
+        predicate: predicate.clone(),
+    }
 }
 
 /// Compare two expressions for structural equality (used to filter out the
@@ -1218,13 +1509,17 @@ fn try_index_in(
     alias: &Option<String>,
 ) -> Option<(Plan, Vec<Expr>)> {
     for (i, conjunct) in conjuncts.iter().enumerate() {
-        if let Expr::In { expr, source: InSource::List(list), negated: false } = conjunct {
+        if let Expr::In {
+            expr,
+            source: InSource::List(list),
+            negated: false,
+        } = conjunct
+        {
             if let Expr::Column { table: None, name } = expr.as_ref() {
                 for index in catalog.indexes_on_table(&table.name) {
                     // Single-column index whose (only) column matches: each
                     // list member becomes one equality seek.
-                    if index.columns.len() == 1
-                        && index.columns[0].name.eq_ignore_ascii_case(name)
+                    if index.columns.len() == 1 && index.columns[0].name.eq_ignore_ascii_case(name)
                     {
                         let others: Vec<Expr> = conjuncts
                             .iter()
@@ -1260,7 +1555,12 @@ fn try_rowid_in(
     alias: &Option<String>,
 ) -> Option<(Plan, Vec<Expr>)> {
     for (i, conjunct) in conjuncts.iter().enumerate() {
-        if let Expr::In { expr, source: InSource::List(list), negated: false } = conjunct {
+        if let Expr::In {
+            expr,
+            source: InSource::List(list),
+            negated: false,
+        } = conjunct
+        {
             if let Expr::Column { table: None, name } = expr.as_ref() {
                 let is_rowid_alias = table
                     .rowid_alias
@@ -1309,8 +1609,12 @@ fn try_rowid_in(
 /// For an equality `col = ?` we DO take it as setting both start and end to
 /// the same value (so RowidRange degenerates to a point). The caller checks
 /// for this case and prefers RowidLookup.
-fn try_rowid_range(conjuncts: &[Expr], table: &Table) -> Option<(Option<Expr>, Option<Expr>, Option<Expr>)> {
-    let rowid_col_name = table.rowid_alias
+fn try_rowid_range(
+    conjuncts: &[Expr],
+    table: &Table,
+) -> Option<(Option<Expr>, Option<Expr>, Option<Expr>)> {
+    let rowid_col_name = table
+        .rowid_alias
         .and_then(|idx| table.columns.get(idx))
         .map(|c| c.name.clone());
     let mut start: Option<Expr> = None;
@@ -1434,9 +1738,8 @@ fn try_index_range(
         let mut matched = false;
 
         for conjunct in conjuncts {
-            let bare_col = |s: &str| -> String {
-                s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase()
-            };
+            let bare_col =
+                |s: &str| -> String { s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase() };
             // BETWEEN.
             if let Some((col, lo, hi)) = extract_between(conjunct) {
                 if bare_col(&col) == first_name {
@@ -1486,7 +1789,10 @@ fn try_index_range(
 /// Extract `col BETWEEN lo AND hi` from an expression.
 /// Returns (col_name, lo, hi) on match.
 fn extract_between(expr: &Expr) -> Option<(String, Expr, Expr)> {
-    if let Expr::Between { expr, low, high, .. } = expr {
+    if let Expr::Between {
+        expr, low, high, ..
+    } = expr
+    {
         if let Expr::Column { name, .. } = expr.as_ref() {
             return Some((name.clone(), *low.clone(), *high.clone()));
         }
@@ -1542,7 +1848,12 @@ pub fn split_and_chain(predicate: &Expr) -> Vec<Expr> {
 }
 
 fn split_and_chain_rec(expr: &Expr, out: &mut Vec<Expr>) {
-    if let Expr::Binary { op: BinaryOp::And, left, right } = expr {
+    if let Expr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = expr
+    {
         split_and_chain_rec(left, out);
         split_and_chain_rec(right, out);
     } else {
@@ -1591,7 +1902,9 @@ fn collect_column_refs_rec(expr: &Expr, out: &mut Vec<(Option<String>, String)>)
             collect_column_refs_rec(right, out);
         }
         Expr::Unary { expr, .. } => collect_column_refs_rec(expr, out),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_column_refs_rec(expr, out);
             collect_column_refs_rec(low, out);
             collect_column_refs_rec(high, out);
@@ -1599,14 +1912,23 @@ fn collect_column_refs_rec(expr: &Expr, out: &mut Vec<(Option<String>, String)>)
         Expr::In { expr, source, .. } => {
             collect_column_refs_rec(expr, out);
             if let crate::sql::ast::InSource::List(es) = source {
-                for e in es { collect_column_refs_rec(e, out); }
+                for e in es {
+                    collect_column_refs_rec(e, out);
+                }
             }
             // Subquery sources don't reference outer columns by name in our AST.
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             collect_column_refs_rec(expr, out);
             collect_column_refs_rec(pattern, out);
-            if let Some(e) = escape { collect_column_refs_rec(e, out); }
+            if let Some(e) = escape {
+                collect_column_refs_rec(e, out);
+            }
         }
         Expr::IsNull { expr, .. } => collect_column_refs_rec(expr, out),
         Expr::Is { left, right, .. } => {
@@ -1614,27 +1936,42 @@ fn collect_column_refs_rec(expr: &Expr, out: &mut Vec<(Option<String>, String)>)
             collect_column_refs_rec(right, out);
         }
         Expr::Function { args, filter, .. } => {
-            for a in args { collect_column_refs_rec(a, out); }
-            if let Some(f) = filter { collect_column_refs_rec(f, out); }
+            for a in args {
+                collect_column_refs_rec(a, out);
+            }
+            if let Some(f) = filter {
+                collect_column_refs_rec(f, out);
+            }
         }
-        Expr::Case { operand, whens, else_ } => {
-            if let Some(o) = operand { collect_column_refs_rec(o, out); }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_column_refs_rec(o, out);
+            }
             for (w, t) in whens {
                 collect_column_refs_rec(w, out);
                 collect_column_refs_rec(t, out);
             }
-            if let Some(e) = else_ { collect_column_refs_rec(e, out); }
+            if let Some(e) = else_ {
+                collect_column_refs_rec(e, out);
+            }
         }
-        Expr::Row(es) => for e in es { collect_column_refs_rec(e, out); },
+        Expr::Row(es) => {
+            for e in es {
+                collect_column_refs_rec(e, out);
+            }
+        }
         Expr::Cast { expr, .. } => collect_column_refs_rec(expr, out),
         Expr::Collate { expr, .. } => collect_column_refs_rec(expr, out),
         Expr::Raise { message, .. } => {
-            if let Some(m) = message { collect_column_refs_rec(m, out); }
+            if let Some(m) = message {
+                collect_column_refs_rec(m, out);
+            }
         }
-        Expr::Literal(_)
-        | Expr::Parameter(_)
-        | Expr::Subquery(_)
-        | Expr::Exists(_) => {}
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) | Expr::Exists(_) => {}
     }
 }
 
@@ -1651,7 +1988,9 @@ pub fn plan_column_refs(plan: &Plan) -> Vec<(Option<String>, String)> {
     match plan {
         Plan::Scan { table, alias, .. } => {
             let prefix = alias.clone().unwrap_or_else(|| table.name.clone());
-            table.columns.iter()
+            table
+                .columns
+                .iter()
                 .map(|c| (Some(prefix.clone()), c.name.clone()))
                 .collect()
         }
@@ -1684,11 +2023,11 @@ fn conjunct_bound_by(conjunct: &Expr, cols: &[(Option<String>, String)]) -> bool
         // No column references — it's a constant; safe to push down (or keep up).
         return true;
     }
-    refs.iter().all(|(t, n)| {
-        match t {
-            Some(prefix) => cols.iter().any(|(p, c)| p.as_deref() == Some(prefix.as_str()) && c == n),
-            None => cols.iter().any(|(_, c)| c == n),
-        }
+    refs.iter().all(|(t, n)| match t {
+        Some(prefix) => cols
+            .iter()
+            .any(|(p, c)| p.as_deref() == Some(prefix.as_str()) && c == n),
+        None => cols.iter().any(|(_, c)| c == n),
     })
 }
 
@@ -1746,7 +2085,14 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
 
     // If the plan is a Join, try to split conjuncts into left-only / right-only
     // / both-sides, and push down accordingly.
-    if let Plan::Join { left, right, join_type, condition, algorithm } = &plan {
+    if let Plan::Join {
+        left,
+        right,
+        join_type,
+        condition,
+        algorithm,
+    } = &plan
+    {
         let left_cols = plan_column_refs(left);
         let right_cols = plan_column_refs(right);
 
@@ -1764,8 +2110,14 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
         // (SQLite additionally converts a LEFT JOIN to INNER when the WHERE
         // predicate is null-rejecting — an optimization we can add later;
         // keeping the predicate on top is always correct.)
-        let left_pushable = matches!(join_type, JoinType::Inner | JoinType::Cross | JoinType::Left);
-        let right_pushable = matches!(join_type, JoinType::Inner | JoinType::Cross | JoinType::Right);
+        let left_pushable = matches!(
+            join_type,
+            JoinType::Inner | JoinType::Cross | JoinType::Left
+        );
+        let right_pushable = matches!(
+            join_type,
+            JoinType::Inner | JoinType::Cross | JoinType::Right
+        );
 
         let mut left_preds: Vec<Expr> = Vec::new();
         let mut right_preds: Vec<Expr> = Vec::new();
@@ -1792,14 +2144,22 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
                 let all_qualified = refs.iter().all(|(t, _)| t.is_some());
                 if all_qualified {
                     let left_only = refs.iter().all(|(t, _)| {
-                        t.as_ref().map(|prefix| {
-                            left_cols.iter().any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
-                        }).unwrap_or(false)
+                        t.as_ref()
+                            .map(|prefix| {
+                                left_cols
+                                    .iter()
+                                    .any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
+                            })
+                            .unwrap_or(false)
                     });
                     let right_only = refs.iter().all(|(t, _)| {
-                        t.as_ref().map(|prefix| {
-                            right_cols.iter().any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
-                        }).unwrap_or(false)
+                        t.as_ref()
+                            .map(|prefix| {
+                                right_cols
+                                    .iter()
+                                    .any(|(p, _)| p.as_deref() == Some(prefix.as_str()))
+                            })
+                            .unwrap_or(false)
                     });
                     if left_only && left_pushable {
                         left_preds.push(c);
@@ -1850,7 +2210,6 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
     }
 }
 
-
 /// Heuristic: is the outer plan's output expected to be SMALL relative to the
 /// underlying table? If yes, INLJ is profitable (one index lookup per outer
 /// row). If no, Hash join is faster (single full scan + hash build).
@@ -1881,9 +2240,10 @@ fn outer_is_selective(plan: &Plan) -> bool {
         // selective — important for 3-table joins where the inner join
         // produces a small filtered set that's then joined to a third table.
         Plan::IndexNestedLoopJoin { .. } => true,
-        Plan::Project { input, .. } | Plan::Sort { input, .. } | Plan::Limit { input, .. } | Plan::Distinct { input } => {
-            outer_is_selective(input)
-        }
+        Plan::Project { input, .. }
+        | Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Distinct { input } => outer_is_selective(input),
         _ => false,
     }
 }
@@ -1912,7 +2272,13 @@ fn outer_is_selective(plan: &Plan) -> bool {
 /// `idx_orders_user` can fetch the ~10 matching rows directly.
 pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
     match plan {
-        Plan::Join { left, right, join_type, condition, algorithm } => {
+        Plan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            algorithm,
+        } => {
             // Recurse into children first.
             let left = Box::new(optimize_index_nested_loop_join(catalog, *left));
             let right = Box::new(optimize_index_nested_loop_join(catalog, *right));
@@ -1924,16 +2290,36 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             let is_inner = matches!(join_type, JoinType::Inner | JoinType::Cross);
             let is_hash = matches!(algorithm, plan::JoinAlgorithm::Hash);
             if !is_inner || !is_hash {
-                return Plan::Join { left, right, join_type, condition, algorithm };
+                return Plan::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    algorithm,
+                };
             }
 
             // Extract equi-join key pairs from the ON condition.
             let eq_pairs = match condition.as_ref() {
                 Some(c) => extract_equi_join_keys_for_planner(c, &left, &right),
-                None => return Plan::Join { left, right, join_type, condition, algorithm },
+                None => {
+                    return Plan::Join {
+                        left,
+                        right,
+                        join_type,
+                        condition,
+                        algorithm,
+                    }
+                }
             };
             if eq_pairs.is_empty() {
-                return Plan::Join { left, right, join_type, condition, algorithm };
+                return Plan::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    algorithm,
+                };
             }
 
             // Try the right side as inner (the common case: scan right table
@@ -1949,10 +2335,17 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             // what makes `SELECT u.dept, COUNT(*), SUM(o.total) FROM users
             // u JOIN orders o ON u.id = o.user_id GROUP BY u.dept` (no WHERE)
             // ~3× faster than the INLJ path.
-            if let Plan::Scan { table: r_table, alias: r_alias, .. } = right.as_ref() {
+            if let Plan::Scan {
+                table: r_table,
+                alias: r_alias,
+                ..
+            } = right.as_ref()
+            {
                 if outer_is_selective(&left) {
                     for (l_qual, l_col, _r_qual, r_col) in &eq_pairs {
-                        if let Some(outer_key_col) = resolve_outer_col_index(&left, l_qual.as_deref(), l_col) {
+                        if let Some(outer_key_col) =
+                            resolve_outer_col_index(&left, l_qual.as_deref(), l_col)
+                        {
                             if let Some(idx) = find_index_for_column(catalog, r_table, r_col) {
                                 return Plan::IndexNestedLoopJoin {
                                     outer: left.clone(),
@@ -1969,10 +2362,17 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
 
             // Symmetric: try the left side as inner. The outer (right) plan
             // is kept verbatim.
-            if let Plan::Scan { table: l_table, alias: l_alias, .. } = left.as_ref() {
+            if let Plan::Scan {
+                table: l_table,
+                alias: l_alias,
+                ..
+            } = left.as_ref()
+            {
                 if outer_is_selective(&right) {
                     for (_l_qual, l_col, r_qual, r_col) in &eq_pairs {
-                        if let Some(outer_key_col) = resolve_outer_col_index(&right, r_qual.as_deref(), r_col) {
+                        if let Some(outer_key_col) =
+                            resolve_outer_col_index(&right, r_qual.as_deref(), r_col)
+                        {
                             if let Some(idx) = find_index_for_column(catalog, l_table, l_col) {
                                 return Plan::IndexNestedLoopJoin {
                                     outer: right.clone(),
@@ -1987,7 +2387,13 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
                 }
             }
 
-            Plan::Join { left, right, join_type, condition, algorithm }
+            Plan::Join {
+                left,
+                right,
+                join_type,
+                condition,
+                algorithm,
+            }
         }
 
         // Recurse into wrapper nodes.
@@ -2003,12 +2409,20 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
             terms,
         },
-        Plan::Limit { input, count, offset } => Plan::Limit {
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => Plan::Limit {
             input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
             count,
             offset,
         },
-        Plan::Aggregate { input, group_by, aggregates } => Plan::Aggregate {
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Aggregate {
             input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
             group_by,
             aggregates,
@@ -2037,14 +2451,30 @@ fn extract_equi_join_keys_for_planner(
     let mut stack = vec![cond.clone()];
     while let Some(e) = stack.pop() {
         match e {
-            Expr::Binary { op: BinaryOp::And, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
                 stack.push(*left);
                 stack.push(*right);
             }
-            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
                 // Both sides must be column refs.
-                if let (Expr::Column { table: lt, name: ln }, Expr::Column { table: rt, name: rn }) =
-                    (left.as_ref(), right.as_ref())
+                if let (
+                    Expr::Column {
+                        table: lt,
+                        name: ln,
+                    },
+                    Expr::Column {
+                        table: rt,
+                        name: rn,
+                    },
+                ) = (left.as_ref(), right.as_ref())
                 {
                     // SIDE-AWARE classification. The textual operand order
                     // of the ON clause is irrelevant: `A JOIN B ON b.k =
@@ -2060,9 +2490,11 @@ fn extract_equi_join_keys_for_planner(
                     //   - both operands on the SAME side → not an equi-join
                     //     key at all (it's a pushed-down filter); skip.
                     let a_on_left = resolve_outer_col_index(left_plan, lt.as_deref(), ln).is_some();
-                    let a_on_right = resolve_outer_col_index(right_plan, lt.as_deref(), ln).is_some();
+                    let a_on_right =
+                        resolve_outer_col_index(right_plan, lt.as_deref(), ln).is_some();
                     let b_on_left = resolve_outer_col_index(left_plan, rt.as_deref(), rn).is_some();
-                    let b_on_right = resolve_outer_col_index(right_plan, rt.as_deref(), rn).is_some();
+                    let b_on_right =
+                        resolve_outer_col_index(right_plan, rt.as_deref(), rn).is_some();
 
                     let pair = match (a_on_left, a_on_right, b_on_left, b_on_right) {
                         // A = left key, B = right key (canonical order).
@@ -2112,26 +2544,50 @@ fn extract_equi_join_keys_for_planner(
 /// - `Join { left, right, .. }` → try left first (recurse); if no match,
 ///   try right with a column offset of `left.n_cols`.
 /// - Other plan shapes → None (we don't optimize joins on top of them).
-fn resolve_outer_col_index(plan: &Plan, table_qualifier: Option<&str>, col_name: &str) -> Option<usize> {
+fn resolve_outer_col_index(
+    plan: &Plan,
+    table_qualifier: Option<&str>,
+    col_name: &str,
+) -> Option<usize> {
     match plan {
-        Plan::Scan { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
+        Plan::Scan { table, alias, .. } => {
+            resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
+        }
 
-        Plan::RowidLookup { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
+        Plan::RowidLookup { table, alias, .. } => {
+            resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
+        }
 
-        Plan::IndexLookup { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
+        Plan::IndexLookup { table, alias, .. } => {
+            resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
+        }
 
-        Plan::IndexRange { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
+        Plan::IndexRange { table, alias, .. } => {
+            resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
+        }
 
-        Plan::RowidRange { table, alias, .. } => resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name),
+        Plan::RowidRange { table, alias, .. } => {
+            resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
+        }
 
         Plan::Filter { input, .. } => {
             // Filter is transparent — its output columns are the input's.
             resolve_outer_col_index(input, table_qualifier, col_name)
         }
 
-        Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, .. } => {
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            ..
+        } => {
             // Try inner table first; if not matched, recurse into outer.
-            if let Some(idx) = resolve_table_col_index(inner_table, inner_alias.as_deref(), table_qualifier, col_name) {
+            if let Some(idx) = resolve_table_col_index(
+                inner_table,
+                inner_alias.as_deref(),
+                table_qualifier,
+                col_name,
+            ) {
                 // Inner table columns come AFTER outer columns in the output.
                 let outer_n = plan_output_width(outer);
                 return Some(outer_n + idx);
@@ -2168,7 +2624,10 @@ fn resolve_table_col_index(
             return None;
         }
     }
-    table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+    table
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(col_name))
 }
 
 /// Helper: compute the output column width of a plan.
@@ -2194,9 +2653,10 @@ fn plan_output_width(plan: &Plan) -> usize {
             // compute that without expanding stars, so we use a heuristic:
             // count non-star columns + 1 per star (which is wrong in general
             // but only used when no better signal is available).
-            let star_count = columns.iter().filter(|c| {
-                matches!(&c.expr, Expr::Column { name, .. } if name == "*")
-            }).count();
+            let star_count = columns
+                .iter()
+                .filter(|c| matches!(&c.expr, Expr::Column { name, .. } if name == "*"))
+                .count();
             if star_count == 0 {
                 columns.len()
             } else {
@@ -2207,14 +2667,16 @@ fn plan_output_width(plan: &Plan) -> usize {
         }
         Plan::Sort { input, .. } => plan_output_width(input),
         Plan::Limit { input, .. } => plan_output_width(input),
-        Plan::Aggregate { input, group_by, aggregates } => {
-            plan_output_width(input) + group_by.len() + aggregates.len()
-        }
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => plan_output_width(input) + group_by.len() + aggregates.len(),
         Plan::Window { input, windows } => plan_output_width(input) + windows.len(),
         Plan::Join { left, right, .. } => plan_output_width(left) + plan_output_width(right),
-        Plan::IndexNestedLoopJoin { outer, inner_table, .. } => {
-            plan_output_width(outer) + inner_table.n_columns()
-        }
+        Plan::IndexNestedLoopJoin {
+            outer, inner_table, ..
+        } => plan_output_width(outer) + inner_table.n_columns(),
         Plan::Subquery { plan } => plan_output_width(plan),
         Plan::Distinct { input } => plan_output_width(input),
         Plan::Union { left, .. } => plan_output_width(left),
@@ -2223,7 +2685,6 @@ fn plan_output_width(plan: &Plan) -> usize {
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => 0,
     }
 }
-
 
 /// Insert a Sort node below the topmost Project / Distinct node in the plan,
 /// so the Sort can see all input columns (not just the projected ones).
@@ -2241,24 +2702,46 @@ pub fn insert_sort_below_top(plan: Plan, terms: Vec<OrderTerm>) -> Plan {
     match plan {
         Plan::Project { input, columns } => {
             let sorted = Plan::Sort { input, terms };
-            Plan::Project { input: Box::new(sorted), columns }
+            Plan::Project {
+                input: Box::new(sorted),
+                columns,
+            }
         }
         Plan::Distinct { input } => {
             // Distinct wraps a Project. Push Sort inside the Project.
             match *input {
-                Plan::Project { input: proj_input, columns } => {
-                    let sorted = Plan::Sort { input: proj_input, terms };
-                    let new_proj = Plan::Project { input: Box::new(sorted), columns };
-                    Plan::Distinct { input: Box::new(new_proj) }
+                Plan::Project {
+                    input: proj_input,
+                    columns,
+                } => {
+                    let sorted = Plan::Sort {
+                        input: proj_input,
+                        terms,
+                    };
+                    let new_proj = Plan::Project {
+                        input: Box::new(sorted),
+                        columns,
+                    };
+                    Plan::Distinct {
+                        input: Box::new(new_proj),
+                    }
                 }
                 // Distinct over something else — wrap in Sort above Distinct.
                 other_inner => {
-                    let distinct = Plan::Distinct { input: Box::new(other_inner) };
-                    Plan::Sort { input: Box::new(distinct), terms }
+                    let distinct = Plan::Distinct {
+                        input: Box::new(other_inner),
+                    };
+                    Plan::Sort {
+                        input: Box::new(distinct),
+                        terms,
+                    }
                 }
             }
         }
-        other => Plan::Sort { input: Box::new(other), terms },
+        other => Plan::Sort {
+            input: Box::new(other),
+            terms,
+        },
     }
 }
 
@@ -2370,7 +2853,8 @@ pub(crate) fn rewrite_column_collations(
                     | BinaryOp::LtEq
                     | BinaryOp::Gt
                     | BinaryOp::GtEq
-            ) => {
+            ) =>
+            {
                 // Explicit COLLATE on either operand wins — leave as-is.
                 if has_explicit_collate(left) || has_explicit_collate(right) {
                     return e.clone();
@@ -2405,7 +2889,12 @@ pub(crate) fn rewrite_column_collations(
             op: *op,
             expr: Box::new(rewrite_column_collations(catalog, expr, scope)),
         },
-        Expr::Between { expr, low, high, negated } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             if let Some(coll) = column_declared_collation(catalog, expr, scope) {
                 Expr::Between {
                     expr: Box::new(Expr::Collate {
@@ -2420,7 +2909,11 @@ pub(crate) fn rewrite_column_collations(
                 e.clone()
             }
         }
-        Expr::In { expr, source, negated } => {
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => {
             if let Some(coll) = column_declared_collation(catalog, expr, scope) {
                 Expr::In {
                     expr: Box::new(Expr::Collate {
@@ -2457,8 +2950,16 @@ mod plan_dump_tests {
             if let Some(p) = plan {
                 fn walk(p: &crate::planner::plan::Plan, s: &mut String, depth: usize) {
                     let name = match p {
-                        crate::planner::plan::Plan::Scan { predicate, index, .. } => {
-                            if index.is_some() { "Scan(idx)" } else if predicate.is_some() { "Scan(pred)" } else { "Scan" }
+                        crate::planner::plan::Plan::Scan {
+                            predicate, index, ..
+                        } => {
+                            if index.is_some() {
+                                "Scan(idx)"
+                            } else if predicate.is_some() {
+                                "Scan(pred)"
+                            } else {
+                                "Scan"
+                            }
                         }
                         crate::planner::plan::Plan::Project { .. } => "Project",
                         crate::planner::plan::Plan::Filter { .. } => "Filter",
@@ -2480,7 +2981,9 @@ mod plan_dump_tests {
                         | crate::planner::plan::Plan::Window { input, .. } => vec![input.as_ref()],
                         _ => vec![],
                     };
-                    for k in kids { walk(k, s, depth + 1); }
+                    for k in kids {
+                        walk(k, s, depth + 1);
+                    }
                 }
                 walk(&p, &mut s, 0);
             }

@@ -14,6 +14,9 @@ pub mod wal;
 
 pub use btree::{Btree, LookupResult};
 pub use page::{Page, PageId, PageType, DEFAULT_PAGE_SIZE};
-pub use pager::{Pager, PageRef};
-pub use row_codec::{apply_affinities, decode_row, decode_row_into, decode_row_selective, encode_row, encode_row_into};
+pub use pager::{PageRef, Pager};
+pub use row_codec::{
+    apply_affinities, decode_row, decode_row_into, decode_row_selective, encode_row,
+    encode_row_into,
+};
 pub use wal::Wal;

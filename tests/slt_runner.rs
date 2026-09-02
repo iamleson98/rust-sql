@@ -81,8 +81,16 @@ enum SortMode {
 
 #[derive(Debug, Clone)]
 enum Record {
-    Statement { expect_error: bool, sql: String },
-    Query { types: Vec<char>, sort: SortMode, sql: String, expected: Vec<Vec<String>> },
+    Statement {
+        expect_error: bool,
+        sql: String,
+    },
+    Query {
+        types: Vec<char>,
+        sort: SortMode,
+        sql: String,
+        expected: Vec<Vec<String>>,
+    },
     HashThreshold(usize),
     Halt,
 }
@@ -303,8 +311,16 @@ fn format_value(v: &Value) -> String {
         Value::Null => "NULL".to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Real(f) => {
-            if f.is_nan() { return "NULL".to_string(); }
-            if f.is_infinite() { return if *f > 0.0 { "inf".to_string() } else { "-inf".to_string() }; }
+            if f.is_nan() {
+                return "NULL".to_string();
+            }
+            if f.is_infinite() {
+                return if *f > 0.0 {
+                    "inf".to_string()
+                } else {
+                    "-inf".to_string()
+                };
+            }
             // SQLite SLT canonical form for reals: print with at least one
             // decimal place. Use the shortest round-trippable representation.
             let s = format!("{}", f);
@@ -332,19 +348,31 @@ fn run_record(db: &mut Database, rec: &Record, hash_threshold: usize) -> Result<
             let result = db.execute(sql, []);
             match (result, expect_error) {
                 (Ok(()), false) => Ok(()),
-                (Ok(()), true) => Err(format!("statement ok: expected error, got success: {}", sql)),
+                (Ok(()), true) => Err(format!(
+                    "statement ok: expected error, got success: {}",
+                    sql
+                )),
                 (Err(_), true) => Ok(()),
-                (Err(e), false) => Err(format!("statement ok: expected success, got error: {}: {}", e, sql)),
+                (Err(e), false) => Err(format!(
+                    "statement ok: expected success, got error: {}: {}",
+                    e, sql
+                )),
             }
         }
-        Record::Query { types, sort, sql, expected } => {
+        Record::Query {
+            types,
+            sort,
+            sql,
+            expected,
+        } => {
             let result = db.query_with_columns(sql, []);
             let (cols, rows) = match result {
                 Ok(r) => r,
                 Err(e) => return Err(format!("query failed: {}: {}", e, sql)),
             };
             // Format actual rows as strings.
-            let actual: Vec<Vec<String>> = rows.iter()
+            let actual: Vec<Vec<String>> = rows
+                .iter()
                 .map(|r| r.iter().map(format_value).collect())
                 .collect();
             // Coerce expected value types.
@@ -369,7 +397,9 @@ fn run_record(db: &mut Database, rec: &Record, hash_threshold: usize) -> Result<
                 if actual.len() != expected.len() {
                     let mut diag = format!(
                         "row count mismatch: expected {}, got {} | SQL: {}\n",
-                        expected.len(), actual.len(), sql
+                        expected.len(),
+                        actual.len(),
+                        sql
                     );
                     let limit = expected.len().max(actual.len()).min(10);
                     for i in 0..limit {
@@ -392,7 +422,9 @@ fn run_record(db: &mut Database, rec: &Record, hash_threshold: usize) -> Result<
                         a.sort();
                         let mut e: Vec<String> = expected_sorted.into_iter().flatten().collect();
                         e.sort();
-                        if a == e { return Ok(()); }
+                        if a == e {
+                            return Ok(());
+                        }
                         return Err(format!(
                             "valuesort mismatch: expected {} values, got {} values | SQL: {}\nfirst diff: exp={:?} act={:?}",
                             e.len(), a.len(), sql,
@@ -410,7 +442,10 @@ fn run_record(db: &mut Database, rec: &Record, hash_threshold: usize) -> Result<
                     if a != e {
                         return Err(format!(
                             "row {} mismatch: expected [{}], got [{}] | SQL: {}",
-                            i, e.join(" "), a.join(" "), sql
+                            i,
+                            e.join(" "),
+                            a.join(" "),
+                            sql
                         ));
                     }
                 }
@@ -439,7 +474,8 @@ pub fn run_dir(dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
     let mut passed = 0;
     let mut failed = 0;
     let mut errors: Vec<String> = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {}", dir.display(), e))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {}", dir.display(), e))?;
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -461,10 +497,18 @@ pub fn run_dir(dir: &Path) -> Result<(usize, usize, Vec<String>), String> {
         let mut halted = false;
         let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         for rec in &records {
-            if halted { break; }
+            if halted {
+                break;
+            }
             match rec {
-                Record::HashThreshold(n) => { hash_threshold = *n; continue; }
-                Record::Halt => { halted = true; continue; }
+                Record::HashThreshold(n) => {
+                    hash_threshold = *n;
+                    continue;
+                }
+                Record::Halt => {
+                    halted = true;
+                    continue;
+                }
                 _ => {}
             }
             match run_record(&mut db, rec, hash_threshold) {

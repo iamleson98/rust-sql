@@ -78,7 +78,9 @@ extern "C" {
     fn sqlite3_exec(
         db: *mut compat::sqlite3,
         sql: *const c_char,
-        cb: Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>,
+        cb: Option<
+            unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
+        >,
         arg: *mut c_void,
         errmsg: *mut *mut c_char,
     ) -> c_int;
@@ -143,16 +145,7 @@ fn prepare(db: &Db, sql: &str) -> (St, usize) {
     let csql = CString::new(sql).unwrap();
     let mut stmt: *mut compat::sqlite3_stmt = ptr::null_mut();
     let mut tail: *const c_char = ptr::null();
-    let rc = unsafe {
-        sqlite3_prepare_v3(
-            db.0,
-            csql.as_ptr(),
-            -1,
-            0,
-            &mut stmt,
-            &mut tail,
-        )
-    };
+    let rc = unsafe { sqlite3_prepare_v3(db.0, csql.as_ptr(), -1, 0, &mut stmt, &mut tail) };
     assert_eq!(rc, SQLITE_OK, "prepare failed for {:?}: {}", sql, unsafe {
         cstr(sqlite3_errmsg(db.0))
     });
@@ -166,9 +159,7 @@ fn prepare(db: &Db, sql: &str) -> (St, usize) {
 
 fn exec(db: &Db, sql: &str) {
     let csql = CString::new(sql).unwrap();
-    let rc = unsafe {
-        sqlite3_exec(db.0, csql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
-    };
+    let rc = unsafe { sqlite3_exec(db.0, csql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()) };
     assert_eq!(rc, SQLITE_OK, "exec({:?}) failed: {}", sql, unsafe {
         cstr(sqlite3_errmsg(db.0))
     });
@@ -256,7 +247,10 @@ fn abi_dml_without_returning_has_zero_columns() {
 fn abi_dml_with_returning_reports_columns_at_prepare() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
-    let (stmt, _) = prepare(&db, "INSERT INTO t (v) VALUES (5) RETURNING id, v * 2 AS dbl");
+    let (stmt, _) = prepare(
+        &db,
+        "INSERT INTO t (v) VALUES (5) RETURNING id, v * 2 AS dbl",
+    );
     let n = unsafe { sqlite3_column_count(stmt.0) };
     assert_eq!(n, 2);
     let c0 = cstr(unsafe { sqlite3_column_name(stmt.0, 0) });
@@ -321,9 +315,7 @@ fn abi_multi_statement_tail() {
         let csql = CString::new(remaining.clone()).unwrap();
         let mut stmt: *mut compat::sqlite3_stmt = ptr::null_mut();
         let mut tail: *const c_char = ptr::null();
-        let rc = unsafe {
-            sqlite3_prepare_v3(db.0, csql.as_ptr(), -1, 0, &mut stmt, &mut tail)
-        };
+        let rc = unsafe { sqlite3_prepare_v3(db.0, csql.as_ptr(), -1, 0, &mut stmt, &mut tail) };
         assert_eq!(rc, SQLITE_OK);
         let consumed = if tail.is_null() {
             remaining.len()
@@ -404,19 +396,29 @@ fn abi_transaction_autocommit_states() {
 
     let (mut commit, _) = prepare(&db, "COMMIT");
     unsafe { sqlite3_step(commit.0) };
-    assert_eq!(unsafe { sqlite3_get_autocommit(db.0) }, 1, "back to autocommit");
+    assert_eq!(
+        unsafe { sqlite3_get_autocommit(db.0) },
+        1,
+        "back to autocommit"
+    );
 }
 
 #[test]
 fn abi_constraint_extended_error_codes() {
     let db = open_memory();
-    exec(&db, "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE)",
+    );
     exec(&db, "INSERT INTO u (email) VALUES ('a@b')");
 
     // UNIQUE violation -> 2067, message shape matches SQLite.
     let (mut stmt, _) = prepare(&db, "INSERT INTO u (email) VALUES ('a@b')");
     let rc = unsafe { sqlite3_step(stmt.0) };
-    assert_eq!(rc, SQLITE_CONSTRAINT_UNIQUE, "SQLITE_CONSTRAINT_UNIQUE (2067)");
+    assert_eq!(
+        rc, SQLITE_CONSTRAINT_UNIQUE,
+        "SQLITE_CONSTRAINT_UNIQUE (2067)"
+    );
     let msg = unsafe { cstr(sqlite3_errmsg(db.0)) };
     assert_eq!(msg, "UNIQUE constraint failed: u.email");
     assert_eq!(unsafe { sqlite3_errcode(db.0) }, SQLITE_CONSTRAINT_UNIQUE);
@@ -424,7 +426,10 @@ fn abi_constraint_extended_error_codes() {
     // NOT NULL violation -> 527.
     let (mut stmt, _) = prepare(&db, "INSERT INTO u (id, email) VALUES (2, NULL)");
     let rc = unsafe { sqlite3_step(stmt.0) };
-    assert_eq!(rc, SQLITE_CONSTRAINT_NOTNULL, "SQLITE_CONSTRAINT_NOTNULL (527)");
+    assert_eq!(
+        rc, SQLITE_CONSTRAINT_NOTNULL,
+        "SQLITE_CONSTRAINT_NOTNULL (527)"
+    );
     let msg = unsafe { cstr(sqlite3_errmsg(db.0)) };
     assert_eq!(msg, "NOT NULL constraint failed: u.email");
     let _ = SQLITE_CONSTRAINT; // base code imported for reference
@@ -435,7 +440,11 @@ fn abi_stmt_readonly_and_sql() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (x INTEGER)");
     let (sel, _) = prepare(&db, "SELECT x FROM t");
-    assert_eq!(unsafe { sqlite3_stmt_readonly(sel.0) }, 1, "SELECT is readonly");
+    assert_eq!(
+        unsafe { sqlite3_stmt_readonly(sel.0) },
+        1,
+        "SELECT is readonly"
+    );
     let (ins, _) = prepare(&db, "INSERT INTO t VALUES (1)");
     assert_eq!(unsafe { sqlite3_stmt_readonly(ins.0) }, 0, "INSERT is not");
     let sql = cstr(unsafe { sqlite3_sql(ins.0) });
@@ -463,7 +472,11 @@ fn abi_column_value_objects() {
     assert!(!d0.is_null());
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(rc, SQLITE_DONE);
-    assert_eq!(unsafe { sqlite3_value_int64(d0) }, 42, "dup outlives the row");
+    assert_eq!(
+        unsafe { sqlite3_value_int64(d0) },
+        42,
+        "dup outlives the row"
+    );
     unsafe { sqlite3_value_free(d0) };
 }
 
@@ -522,8 +535,14 @@ fn abi_cross_connection_shared_file() {
     let mut b: *mut compat::sqlite3 = ptr::null_mut();
     let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
     unsafe {
-        assert_eq!(sqlite3_open_v2(cpath.as_ptr(), &mut a, flags, ptr::null()), SQLITE_OK);
-        assert_eq!(sqlite3_open_v2(cpath.as_ptr(), &mut b, flags, ptr::null()), SQLITE_OK);
+        assert_eq!(
+            sqlite3_open_v2(cpath.as_ptr(), &mut a, flags, ptr::null()),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_open_v2(cpath.as_ptr(), &mut b, flags, ptr::null()),
+            SQLITE_OK
+        );
     }
     let (a, b) = (Db(a), Db(b));
 
@@ -548,8 +567,14 @@ fn abi_transaction_conflict_yields_busy_then_succeeds() {
     let mut a: *mut compat::sqlite3 = ptr::null_mut();
     let mut b: *mut compat::sqlite3 = ptr::null_mut();
     unsafe {
-        assert_eq!(sqlite3_open_v2(cpath.as_ptr(), &mut a, flags, ptr::null()), SQLITE_OK);
-        assert_eq!(sqlite3_open_v2(cpath.as_ptr(), &mut b, flags, ptr::null()), SQLITE_OK);
+        assert_eq!(
+            sqlite3_open_v2(cpath.as_ptr(), &mut a, flags, ptr::null()),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_open_v2(cpath.as_ptr(), &mut b, flags, ptr::null()),
+            SQLITE_OK
+        );
         // Short timeout on B so the test is fast; A holds a tx.
         sqlite3_busy_timeout(b, 150);
     }
@@ -604,13 +629,22 @@ fn abi_uri_mode_memory_private() {
     let mut b: *mut compat::sqlite3 = ptr::null_mut();
     let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | 0x40; // URI
     unsafe {
-        assert_eq!(sqlite3_open_v2(uri.as_ptr(), &mut a, flags, ptr::null()), SQLITE_OK);
-        assert_eq!(sqlite3_open_v2(uri.as_ptr(), &mut b, flags, ptr::null()), SQLITE_OK);
+        assert_eq!(
+            sqlite3_open_v2(uri.as_ptr(), &mut a, flags, ptr::null()),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_open_v2(uri.as_ptr(), &mut b, flags, ptr::null()),
+            SQLITE_OK
+        );
     }
     let (a, b) = (Db(a), Db(b));
     exec(&a, "CREATE TABLE t (x INTEGER)");
     exec(&a, "INSERT INTO t VALUES (1)");
-    let (mut q, _) = prepare(&b, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t'");
+    let (mut q, _) = prepare(
+        &b,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t'",
+    );
     // B should NOT see A's private memory table... but note: our engine
     // treats plain mode=memory as per-open private engines.
     let rows = step_all_text(&mut q);
@@ -650,7 +684,10 @@ const SQLITE_CONSTRAINT_FOREIGNKEY: c_int = 787;
 #[test]
 fn abi_update_unique_violation_code_and_errmsg() {
     let db = open_memory();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
 
     unsafe { sqlite3_extended_result_codes(db.0, 1) };
@@ -659,7 +696,9 @@ fn abi_update_unique_violation_code_and_errmsg() {
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_CONSTRAINT_UNIQUE, "extended UNIQUE code");
     // errmsg must be byte-exact (no engine prefix) — sqlx pattern-matches it.
-    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }.to_string_lossy().into_owned();
+    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(msg, "UNIQUE constraint failed: t.v");
     // errcode persists until reset (SQLite semantics).
     assert_eq!(unsafe { sqlite3_errcode(db.0) }, SQLITE_CONSTRAINT_UNIQUE);
@@ -670,7 +709,10 @@ fn abi_update_unique_violation_code_and_errmsg() {
 #[test]
 fn abi_update_atomic_abort_keeps_table_unchanged() {
     let db = open_memory();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
 
     // Multi-row UPDATE where row 3 violates: SQLite aborts the whole
@@ -683,7 +725,10 @@ fn abi_update_atomic_abort_keeps_table_unchanged() {
     assert_eq!(rc, SQLITE_DONE, "x1/x2/x3 are distinct");
     let (mut st2, _) = prepare(&db, "UPDATE t SET v = 'same'");
     let rc2 = unsafe { sqlite3_step(st2.0) };
-    assert_eq!(rc2, SQLITE_CONSTRAINT_UNIQUE, "all rows collapse onto 'same'");
+    assert_eq!(
+        rc2, SQLITE_CONSTRAINT_UNIQUE,
+        "all rows collapse onto 'same'"
+    );
     // Table unchanged after the abort.
     let (mut st3, _) = prepare(&db, "SELECT COUNT(*) FROM t WHERE v IN ('x1','x2','x3')");
     assert_eq!(unsafe { sqlite3_step(st3.0) }, SQLITE_ROW);
@@ -694,7 +739,10 @@ fn abi_update_atomic_abort_keeps_table_unchanged() {
 #[test]
 fn abi_update_or_ignore_via_step_and_changes() {
     let db = open_memory();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
 
     let (mut st, _) = prepare(&db, "UPDATE OR IGNORE t SET v = 'a'");
@@ -723,13 +771,21 @@ fn abi_update_rowid_move_via_step() {
 
     let (mut st2, _) = prepare(&db, "SELECT id, v FROM t ORDER BY id");
     let rows = step_all_text(&mut st2);
-    assert_eq!(rows, vec![vec!["2".to_string(), "b".to_string()], vec!["10".to_string(), "a".to_string()]]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["2".to_string(), "b".to_string()],
+            vec!["10".to_string(), "a".to_string()]
+        ]
+    );
 
     // Moving to a taken rowid: SQLITE_CONSTRAINT with t.id in the message.
     let (mut st3, _) = prepare(&db, "UPDATE t SET id = 2 WHERE id = 10");
     let rc = unsafe { sqlite3_step(st3.0) };
     assert_eq!(rc, SQLITE_CONSTRAINT_UNIQUE);
-    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }.to_string_lossy().into_owned();
+    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(msg, "UNIQUE constraint failed: t.id");
 }
 
@@ -743,7 +799,9 @@ fn abi_update_null_to_rowid_alias_is_mismatch() {
     let (mut st, _) = prepare(&db, "UPDATE t SET id = NULL WHERE id = 1");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_MISMATCH, "SQLite reports SQLITE_MISMATCH");
-    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }.to_string_lossy().into_owned();
+    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(msg, "datatype mismatch");
 }
 
@@ -752,7 +810,10 @@ fn abi_update_fk_violation_extended_code() {
     let db = open_memory();
     exec(&db, "PRAGMA foreign_keys = ON");
     exec(&db, "CREATE TABLE p (id INTEGER PRIMARY KEY)");
-    exec(&db, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT REFERENCES p(id))");
+    exec(
+        &db,
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT REFERENCES p(id))",
+    );
     exec(&db, "INSERT INTO p VALUES (1)");
     exec(&db, "INSERT INTO c VALUES (1, 1)");
 
@@ -760,21 +821,31 @@ fn abi_update_fk_violation_extended_code() {
     let (mut st, _) = prepare(&db, "UPDATE c SET pid = 99 WHERE id = 1");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_CONSTRAINT_FOREIGNKEY, "extended FK code");
-    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }.to_string_lossy().into_owned();
+    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(msg, "FOREIGN KEY constraint failed");
 }
 
 #[test]
 fn abi_update_collated_unique_nocase() {
     let db = open_memory();
-    exec(&db, "CREATE TABLE s (id INTEGER PRIMARY KEY, tag TEXT COLLATE NOCASE UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, tag TEXT COLLATE NOCASE UNIQUE)",
+    );
     exec(&db, "INSERT INTO s VALUES (1, 'Alpha'), (2, 'beta')");
 
     unsafe { sqlite3_extended_result_codes(db.0, 1) };
     let (mut st, _) = prepare(&db, "UPDATE s SET tag = 'ALPHA' WHERE id = 2");
     let rc = unsafe { sqlite3_step(st.0) };
-    assert_eq!(rc, SQLITE_CONSTRAINT_UNIQUE, "NOCASE folds 'ALPHA' onto 'Alpha'");
-    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }.to_string_lossy().into_owned();
+    assert_eq!(
+        rc, SQLITE_CONSTRAINT_UNIQUE,
+        "NOCASE folds 'ALPHA' onto 'Alpha'"
+    );
+    let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(msg, "UNIQUE constraint failed: s.tag");
 }
 
@@ -786,10 +857,20 @@ fn abi_update_returning_rows_and_changes() {
 
     let (mut st, _) = prepare(&db, "UPDATE t SET v = v || '!' RETURNING id, v");
     // Column names available at prepare time (SQLite reports them then).
-    let name0 = unsafe { CStr::from_ptr(sqlite3_column_name(st.0, 0)) }.to_string_lossy().into_owned();
-    let name1 = unsafe { CStr::from_ptr(sqlite3_column_name(st.0, 1)) }.to_string_lossy().into_owned();
+    let name0 = unsafe { CStr::from_ptr(sqlite3_column_name(st.0, 0)) }
+        .to_string_lossy()
+        .into_owned();
+    let name1 = unsafe { CStr::from_ptr(sqlite3_column_name(st.0, 1)) }
+        .to_string_lossy()
+        .into_owned();
     assert_eq!((name0.as_str(), name1.as_str()), ("id", "v"));
     let rows = step_all_text(&mut st);
-    assert_eq!(rows, vec![vec!["1".to_string(), "a!".to_string()], vec!["2".to_string(), "b!".to_string()]]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "a!".to_string()],
+            vec!["2".to_string(), "b!".to_string()]
+        ]
+    );
     assert_eq!(unsafe { sqlite3_changes(db.0) }, 2);
 }

@@ -5,10 +5,28 @@ use std::ptr;
 extern crate sqlite3 as compat;
 
 extern "C" {
-    fn sqlite3_open_v2(filename: *const c_char, ppdb: *mut *mut compat::sqlite3, flags: c_int, z: *const c_char) -> c_int;
+    fn sqlite3_open_v2(
+        filename: *const c_char,
+        ppdb: *mut *mut compat::sqlite3,
+        flags: c_int,
+        z: *const c_char,
+    ) -> c_int;
     fn sqlite3_close(db: *mut compat::sqlite3) -> c_int;
-    fn sqlite3_exec(db: *mut compat::sqlite3, sql: *const c_char, cb: *const u8, a: *const u8, e: *const u8) -> c_int;
-    fn sqlite3_prepare_v3(db: *mut compat::sqlite3, s: *const c_char, n: c_int, f: c_int, pp: *mut *mut compat::sqlite3_stmt, t: *mut *const c_char) -> c_int;
+    fn sqlite3_exec(
+        db: *mut compat::sqlite3,
+        sql: *const c_char,
+        cb: *const u8,
+        a: *const u8,
+        e: *const u8,
+    ) -> c_int;
+    fn sqlite3_prepare_v3(
+        db: *mut compat::sqlite3,
+        s: *const c_char,
+        n: c_int,
+        f: c_int,
+        pp: *mut *mut compat::sqlite3_stmt,
+        t: *mut *const c_char,
+    ) -> c_int;
     fn sqlite3_finalize(s: *mut compat::sqlite3_stmt) -> c_int;
     fn sqlite3_bind_int64(s: *mut compat::sqlite3_stmt, i: c_int, v: i64) -> c_int;
     fn sqlite3_step(s: *mut compat::sqlite3_stmt) -> c_int;

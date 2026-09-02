@@ -36,7 +36,12 @@ fn main() {
     ];
     for sql in shapes {
         match db.query(sql, []) {
-            Ok(rows) => println!("{:.70} => {} rows {:?}", sql, rows.len(), rows.iter().take(3).collect::<Vec<_>>()),
+            Ok(rows) => println!(
+                "{:.70} => {} rows {:?}",
+                sql,
+                rows.len(),
+                rows.iter().take(3).collect::<Vec<_>>()
+            ),
             Err(e) => println!("{:.70} => ERR {}", sql, e),
         }
     }

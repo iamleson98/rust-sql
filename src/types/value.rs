@@ -156,7 +156,10 @@ impl Value {
             Value::Integer(i) => *i as f64,
             Value::Real(f) => *f,
             Value::Text(s) => s.trim().parse().unwrap_or(0.0),
-            Value::Blob(b) => std::str::from_utf8(b).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0),
+            Value::Blob(b) => std::str::from_utf8(b)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0.0),
         }
     }
 
@@ -511,8 +514,7 @@ impl Value {
                 // Small-string optimization: short payloads (the dominant
                 // OLTP case) decode INLINE — no heap allocation. Longer
                 // payloads spill to a heap String exactly as before.
-                let t = Text::from_utf8(&rest[n..n + len])
-                    .map_err(|_| "invalid utf8 in text")?;
+                let t = Text::from_utf8(&rest[n..n + len]).map_err(|_| "invalid utf8 in text")?;
                 Ok((Value::Text(t), 1 + n + len))
             }
             0x08 => {
@@ -621,7 +623,7 @@ impl Affinity {
                 } else {
                     Value::Text(s)
                 }
-            },
+            }
             (Affinity::Integer, Value::Blob(b)) => {
                 let s = std::str::from_utf8(&b).unwrap_or("");
                 let trimmed = s.trim();
@@ -632,7 +634,7 @@ impl Affinity {
                 } else {
                     Value::Blob(b)
                 }
-            },
+            }
             (Affinity::Integer, Value::Null) => Value::Null,
 
             (Affinity::Real, Value::Integer(i)) => Value::Real(i as f64),
@@ -655,7 +657,7 @@ impl Affinity {
                 } else {
                     Value::Blob(b)
                 }
-            },
+            }
             (Affinity::Real, Value::Null) => Value::Null,
 
             (Affinity::Text, Value::Integer(i)) => Value::Text(i.to_string().into()),
@@ -758,7 +760,11 @@ pub fn format_real(f: f64) -> String {
         return "".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Inf".to_string() } else { "-Inf".to_string() };
+        return if f > 0.0 {
+            "Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        };
     }
     if f == 0.0 {
         // SQLite prints "0.0" for both +0.0 and -0.0.
@@ -896,10 +902,7 @@ mod tests {
             Affinity::Integer.coerce(Value::Text("42".into())),
             Value::Integer(42)
         );
-        assert_eq!(
-            Affinity::Real.coerce(Value::Integer(7)),
-            Value::Real(7.0)
-        );
+        assert_eq!(Affinity::Real.coerce(Value::Integer(7)), Value::Real(7.0));
         assert_eq!(
             Affinity::Text.coerce(Value::Integer(7)),
             Value::Text("7".into())

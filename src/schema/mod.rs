@@ -5,8 +5,8 @@
 
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    ColumnConstraint, ColumnDef, ConflictResolution, ForeignKeyAction, IndexedColumn,
-    Order, TableConstraint,
+    ColumnConstraint, ColumnDef, ConflictResolution, ForeignKeyAction, IndexedColumn, Order,
+    TableConstraint,
 };
 use crate::storage::page::PageId;
 use crate::types::{Affinity, Value};
@@ -98,7 +98,12 @@ impl Table {
     /// Rebuild the `col_names` / `qualified_col_names` caches after a
     /// structural change (used by the vtab schema bridge).
     pub fn rebuild_name_caches(&mut self) {
-        self.col_names = self.columns.iter().map(|c| c.name.clone()).collect::<Vec<String>>().into();
+        self.col_names = self
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<String>>()
+            .into();
         self.qualified_col_names = self
             .columns
             .iter()
@@ -109,7 +114,9 @@ impl Table {
 
     /// Look up a column by name (case-insensitive). Returns its index.
     pub fn find_column(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Returns true if the column at `idx` is the rowid alias.
@@ -217,22 +224,34 @@ impl Catalog {
     /// All tables (name, table) — used by api.rs to seed the persisted-root
     /// map after loading the schema.
     pub fn all_tables(&self) -> Vec<(String, Arc<Table>)> {
-        self.tables.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.tables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// All indexes (name, index).
     pub fn all_indexes(&self) -> Vec<(String, Arc<Index>)> {
-        self.indexes.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.indexes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// All views (name, view).
     pub fn all_views(&self) -> Vec<(String, Arc<View>)> {
-        self.views.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.views
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// All triggers (name, trigger).
     pub fn all_triggers(&self) -> Vec<(String, Arc<Trigger>)> {
-        self.triggers.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.triggers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Replace an index entry in place (ALTER TABLE column rewrites).
@@ -320,7 +339,10 @@ impl Catalog {
         let key = index.name.to_ascii_lowercase();
         let table_key = index.table.to_ascii_lowercase();
         let idx_arc = Arc::new(index);
-        self.indexes_by_table.entry(table_key).or_default().push(idx_arc.clone());
+        self.indexes_by_table
+            .entry(table_key)
+            .or_default()
+            .push(idx_arc.clone());
         self.indexes.insert(key, idx_arc);
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
     }
@@ -335,7 +357,10 @@ impl Catalog {
         let key = trigger.name.to_ascii_lowercase();
         let table_key = trigger.table.to_ascii_lowercase();
         let trig_arc = Arc::new(trigger);
-        self.triggers_by_table.entry(table_key).or_default().push(trig_arc.clone());
+        self.triggers_by_table
+            .entry(table_key)
+            .or_default()
+            .push(trig_arc.clone());
         self.triggers.insert(key, trig_arc);
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
     }
@@ -395,7 +420,8 @@ impl Catalog {
                 let mut i2 = (**idx).clone();
                 i2.table = new_name.to_string();
                 let i2 = Arc::new(i2);
-                self.indexes.insert(i2.name.to_ascii_lowercase(), i2.clone());
+                self.indexes
+                    .insert(i2.name.to_ascii_lowercase(), i2.clone());
                 self.indexes_by_table
                     .entry(new_key.clone())
                     .or_default()
@@ -409,7 +435,8 @@ impl Catalog {
                 let mut t2 = (**trig).clone();
                 t2.table = new_name.to_string();
                 let t2 = Arc::new(t2);
-                self.triggers.insert(t2.name.to_ascii_lowercase(), t2.clone());
+                self.triggers
+                    .insert(t2.name.to_ascii_lowercase(), t2.clone());
                 self.triggers_by_table
                     .entry(new_key.clone())
                     .or_default()
@@ -455,7 +482,10 @@ impl Catalog {
     pub fn drop_index(&mut self, name: &str) -> Option<Arc<Index>> {
         let key = name.to_ascii_lowercase();
         let idx = self.indexes.remove(&key)?;
-        if let Some(list) = self.indexes_by_table.get_mut(&idx.table.to_ascii_lowercase()) {
+        if let Some(list) = self
+            .indexes_by_table
+            .get_mut(&idx.table.to_ascii_lowercase())
+        {
             list.retain(|i| i.name.to_ascii_lowercase() != key);
         }
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
@@ -472,7 +502,10 @@ impl Catalog {
     pub fn drop_trigger(&mut self, name: &str) -> Option<Arc<Trigger>> {
         let key = name.to_ascii_lowercase();
         let t = self.triggers.remove(&key)?;
-        if let Some(list) = self.triggers_by_table.get_mut(&t.table.to_ascii_lowercase()) {
+        if let Some(list) = self
+            .triggers_by_table
+            .get_mut(&t.table.to_ascii_lowercase())
+        {
             list.retain(|tr| tr.name.to_ascii_lowercase() != key);
         }
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
@@ -523,7 +556,10 @@ pub fn build_table(
 
         for constraint in &col.constraints {
             match constraint {
-                ColumnConstraint::PrimaryKey { autoincrement: ai, order } => {
+                ColumnConstraint::PrimaryKey {
+                    autoincrement: ai,
+                    order,
+                } => {
                     primary_key = true;
                     autoincrement = *ai;
                     primary_key_order = *order;
@@ -569,7 +605,10 @@ pub fn build_table(
     // Handle table-level PRIMARY KEY: mark columns as PK.
     if !table_pk.is_empty() {
         for (seq, ic) in table_pk.iter().enumerate() {
-            if let Some(idx) = table_columns.iter().position(|c| c.name.eq_ignore_ascii_case(&ic.name)) {
+            if let Some(idx) = table_columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&ic.name))
+            {
                 table_columns[idx].primary_key = true;
                 table_columns[idx].primary_key_order = ic.order;
                 table_columns[idx].nullable = false;
@@ -586,7 +625,10 @@ pub fn build_table(
     for c in constraints {
         if let TableConstraint::Unique(cols) = c {
             for ic in cols {
-                if let Some(idx) = table_columns.iter().position(|c| c.name.eq_ignore_ascii_case(&ic.name)) {
+                if let Some(idx) = table_columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&ic.name))
+                {
                     table_columns[idx].unique = true;
                 }
             }
@@ -614,7 +656,13 @@ pub fn build_table(
     let mut foreign_keys = Vec::new();
     for (i, col) in columns.iter().enumerate() {
         for constraint in &col.constraints {
-            if let ColumnConstraint::References { table: rt, columns: rc, on_delete, on_update } = constraint {
+            if let ColumnConstraint::References {
+                table: rt,
+                columns: rc,
+                on_delete,
+                on_update,
+            } = constraint
+            {
                 foreign_keys.push(ForeignKeyClause {
                     columns: vec![i],
                     ref_table: rt.clone(),
@@ -626,10 +674,20 @@ pub fn build_table(
         }
     }
     for c in constraints {
-        if let TableConstraint::ForeignKey { columns: cols, ref_table, ref_columns, on_delete, on_update } = c {
+        if let TableConstraint::ForeignKey {
+            columns: cols,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+        } = c
+        {
             let mut child_idx = Vec::with_capacity(cols.len());
             for cn in cols {
-                match table_columns.iter().position(|tc| tc.name.eq_ignore_ascii_case(cn)) {
+                match table_columns
+                    .iter()
+                    .position(|tc| tc.name.eq_ignore_ascii_case(cn))
+                {
                     Some(idx) => child_idx.push(idx),
                     None => {
                         return Err(Error::semantic(format!(
@@ -698,10 +756,7 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
         out.push(IndexColumn {
             name: c.name.clone(),
             order: c.order,
-            collation: c
-                .collation
-                .clone()
-                .unwrap_or_else(|| inherited),
+            collation: c.collation.clone().unwrap_or(inherited),
         });
     }
     Ok(out)
@@ -709,7 +764,13 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
 
 /// Encode a catalog entry as a row in the schema table (`sqlite_master`).
 /// Columns: (type, name, tbl_name, rootpage, sql).
-pub fn encode_schema_row(kind: &str, name: &str, tbl_name: &str, rootpage: PageId, sql: &str) -> Vec<Value> {
+pub fn encode_schema_row(
+    kind: &str,
+    name: &str,
+    tbl_name: &str,
+    rootpage: PageId,
+    sql: &str,
+) -> Vec<Value> {
     encode_schema_row_opt(kind, name, tbl_name, rootpage, Some(sql))
 }
 
@@ -718,7 +779,13 @@ pub fn encode_schema_row(kind: &str, name: &str, tbl_name: &str, rootpage: PageI
 /// `SELECT sql FROM sqlite_master` and re-apply it must not see (and
 /// re-create) the implicit indexes. The reopen path rebuilds them from
 /// the TABLE's DDL instead (see `load_schema`).
-pub fn encode_schema_row_opt(kind: &str, name: &str, tbl_name: &str, rootpage: PageId, sql: Option<&str>) -> Vec<Value> {
+pub fn encode_schema_row_opt(
+    kind: &str,
+    name: &str,
+    tbl_name: &str,
+    rootpage: PageId,
+    sql: Option<&str>,
+) -> Vec<Value> {
     vec![
         Value::Text(kind.to_string().into()),
         Value::Text(name.to_string().into()),
@@ -730,7 +797,6 @@ pub fn encode_schema_row_opt(kind: &str, name: &str, tbl_name: &str, rootpage: P
         },
     ]
 }
-
 
 /// The `sqlite_master` (aka `sqlite_schema`) table: a real, queryable view
 /// over the schema B+tree at page 0. Columns match SQLite exactly:
@@ -834,13 +900,17 @@ pub fn int_to_fk_action(i: i64) -> ForeignKeyAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn parse_table(sql: &str) -> (String, Vec<ColumnDef>, Vec<TableConstraint>, bool, bool) {
         let stmt = crate::sql::parse(sql).unwrap();
         match stmt {
             crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
-                name, columns, constraints, without_rowid, strict, ..
+                name,
+                columns,
+                constraints,
+                without_rowid,
+                strict,
+                ..
             }) => (name.name, columns, constraints, without_rowid, strict),
             _ => panic!("not a CREATE TABLE"),
         }
@@ -851,7 +921,8 @@ mod tests {
         let (name, cols, cons, wo, st) = parse_table(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)",
         );
-        let table = build_table(&name, &cols, &cons, 1, wo, st, "CREATE TABLE users (...)").unwrap();
+        let table =
+            build_table(&name, &cols, &cons, 1, wo, st, "CREATE TABLE users (...)").unwrap();
         assert_eq!(table.name, "users");
         assert_eq!(table.columns.len(), 3);
         assert_eq!(table.columns[0].name, "id");
@@ -863,9 +934,8 @@ mod tests {
 
     #[test]
     fn build_table_with_composite_pk() {
-        let (name, cols, cons, wo, st) = parse_table(
-            "CREATE TABLE t (a INTEGER, b INTEGER, PRIMARY KEY(a, b))",
-        );
+        let (name, cols, cons, wo, st) =
+            parse_table("CREATE TABLE t (a INTEGER, b INTEGER, PRIMARY KEY(a, b))");
         let table = build_table(&name, &cols, &cons, 1, wo, st, "").unwrap();
         assert!(table.columns[0].primary_key);
         assert!(table.columns[1].primary_key);

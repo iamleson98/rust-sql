@@ -78,7 +78,10 @@ impl PageType {
             0x04 => Ok(PageType::Overflow),
             0x02 => Ok(PageType::InteriorIndex),
             0x0A => Ok(PageType::LeafIndex),
-            _ => Err(Error::corruption(format!("invalid page type byte: {:#x}", b))),
+            _ => Err(Error::corruption(format!(
+                "invalid page type byte: {:#x}",
+                b
+            ))),
         }
     }
 
@@ -210,7 +213,11 @@ impl Page {
     }
 
     pub fn set_cell_content_start(&mut self, offset: u32) {
-        let v = if offset >= self.page_size() { 0u16 } else { offset as u16 };
+        let v = if offset >= self.page_size() {
+            0u16
+        } else {
+            offset as u16
+        };
         let off = self.header_offset() as usize + 6;
         self.data[off..off + 2].copy_from_slice(&v.to_be_bytes());
         self.dirty = true;
@@ -378,7 +385,7 @@ impl FileHeader {
         buf[36..40].copy_from_slice(&(2048u32).to_le_bytes()); // cache hint
         buf[40..48].copy_from_slice(&0u64.to_le_bytes()); // largest root page
         buf[48..52].copy_from_slice(&1u32.to_le_bytes()); // encoding=UTF8
-        // remainder is zeros (already zeroed in fresh page)
+                                                          // remainder is zeros (already zeroed in fresh page)
     }
 
     pub fn magic(buf: &[u8]) -> Option<&[u8; 8]> {
@@ -431,7 +438,11 @@ mod tests {
         p.set_cell_content_start(2048);
         p.set_right_most_pointer(42);
 
-        let p2 = Page { id: 1, data: p.data.clone(), dirty: false };
+        let p2 = Page {
+            id: 1,
+            data: p.data.clone(),
+            dirty: false,
+        };
         assert_eq!(p2.page_type().unwrap(), PageType::InteriorTable);
         assert_eq!(p2.n_cells(), 3);
         assert_eq!(p2.cell_content_start(), 2048);

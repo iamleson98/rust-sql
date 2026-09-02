@@ -150,21 +150,31 @@ impl CompiledPredicate {
                 let r = rhs.eval(row, positions, params);
                 apply_binary(*op, l, r).is_truthy()
             }
-            CompiledPredicate::And(a, b) => a.eval(row, positions, params) && b.eval(row, positions, params),
-            CompiledPredicate::Or(a, b) => a.eval(row, positions, params) || b.eval(row, positions, params),
+            CompiledPredicate::And(a, b) => {
+                a.eval(row, positions, params) && b.eval(row, positions, params)
+            }
+            CompiledPredicate::Or(a, b) => {
+                a.eval(row, positions, params) || b.eval(row, positions, params)
+            }
             CompiledPredicate::Not(a) => !a.eval(row, positions, params),
             CompiledPredicate::IsNull { col, negated } => {
                 let is_null = matches!(row.get(positions[*col]), None | Some(Value::Null));
                 is_null != *negated
             }
-            CompiledPredicate::Between { col, lo, hi, negated } => {
+            CompiledPredicate::Between {
+                col,
+                lo,
+                hi,
+                negated,
+            } => {
                 // SQL three-valued logic, mirroring the general path
                 // exactly: any NULL operand → result NULL → WHERE filters
                 // the row out (true for BETWEEN *and* NOT BETWEEN).
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let l = lo.eval(row, positions, params);
                 let h = hi.eval(row, positions, params);
-                if matches!(v, Value::Null) || matches!(l, Value::Null) || matches!(h, Value::Null) {
+                if matches!(v, Value::Null) || matches!(l, Value::Null) || matches!(h, Value::Null)
+                {
                     return false;
                 }
                 let in_range = apply_binary(BinaryOp::GtEq, v, l).is_truthy()
@@ -198,7 +208,12 @@ impl CompiledPredicate {
                     found
                 }
             }
-            CompiledPredicate::Like { col, pattern, negated, glob } => {
+            CompiledPredicate::Like {
+                col,
+                pattern,
+                negated,
+                glob,
+            } => {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let p = pattern.eval(row, positions, params);
                 // NULL operand -> NULL result -> row filtered out.
@@ -250,7 +265,12 @@ fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<Pre
 fn is_cmp_op(op: BinaryOp) -> bool {
     matches!(
         op,
-        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
     )
 }
 
@@ -284,7 +304,9 @@ pub(crate) fn compile_predicate(
         Expr::Unary { op, expr } => {
             // NOT expr
             if matches!(op, crate::sql::ast::UnaryOp::Not) {
-                Some(CompiledPredicate::Not(Box::new(compile_predicate(expr, table, prefix)?)))
+                Some(CompiledPredicate::Not(Box::new(compile_predicate(
+                    expr, table, prefix,
+                )?)))
             } else {
                 None
             }
@@ -294,54 +316,71 @@ pub(crate) fn compile_predicate(
                 let matches = ref_t
                     .as_ref()
                     .map(|t| {
-                    // SQL scoping: an alias REPLACES the table name —
-                    // `t.col` must NOT bind to a `FROM t t2` instance
-                    // (otherwise a correlated reference to an outer
-                    // un-aliased `t` is silently captured by the inner
-                    // alias and compared against itself).
-                    if prefix == table.name {
-                        t == &table.name || t == prefix
-                    } else {
-                        t == prefix
-                    }
-                })
+                        // SQL scoping: an alias REPLACES the table name —
+                        // `t.col` must NOT bind to a `FROM t t2` instance
+                        // (otherwise a correlated reference to an outer
+                        // un-aliased `t` is silently captured by the inner
+                        // alias and compared against itself).
+                        if prefix == table.name {
+                            t == &table.name || t == prefix
+                        } else {
+                            t == prefix
+                        }
+                    })
                     .unwrap_or(true);
                 if matches {
                     if let Some(col) = table.find_column(name) {
-                        return Some(CompiledPredicate::IsNull { col, negated: *negated });
+                        return Some(CompiledPredicate::IsNull {
+                            col,
+                            negated: *negated,
+                        });
                     }
                 }
             }
             None
         }
-        Expr::Between { expr, low, high, negated } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             if let Expr::Column { table: ref_t, name } = expr.as_ref() {
                 let matches = ref_t
                     .as_ref()
                     .map(|t| {
-                    // SQL scoping: an alias REPLACES the table name —
-                    // `t.col` must NOT bind to a `FROM t t2` instance
-                    // (otherwise a correlated reference to an outer
-                    // un-aliased `t` is silently captured by the inner
-                    // alias and compared against itself).
-                    if prefix == table.name {
-                        t == &table.name || t == prefix
-                    } else {
-                        t == prefix
-                    }
-                })
+                        // SQL scoping: an alias REPLACES the table name —
+                        // `t.col` must NOT bind to a `FROM t t2` instance
+                        // (otherwise a correlated reference to an outer
+                        // un-aliased `t` is silently captured by the inner
+                        // alias and compared against itself).
+                        if prefix == table.name {
+                            t == &table.name || t == prefix
+                        } else {
+                            t == prefix
+                        }
+                    })
                     .unwrap_or(true);
                 if matches {
                     if let Some(col) = table.find_column(name) {
                         let lo = bind_leaf(low, table, prefix)?;
                         let hi = bind_leaf(high, table, prefix)?;
-                        return Some(CompiledPredicate::Between { col, lo, hi, negated: *negated });
+                        return Some(CompiledPredicate::Between {
+                            col,
+                            lo,
+                            hi,
+                            negated: *negated,
+                        });
                     }
                 }
             }
             None
         }
-        Expr::In { expr, source, negated } => {
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => {
             let crate::sql::ast::InSource::List(vals) = source else {
                 return None;
             };
@@ -374,9 +413,19 @@ pub(crate) fn compile_predicate(
             for v in vals {
                 bound.push(bind_leaf(v, table, prefix)?);
             }
-            Some(CompiledPredicate::InList { col, vals: bound, negated: *negated })
+            Some(CompiledPredicate::InList {
+                col,
+                vals: bound,
+                negated: *negated,
+            })
         }
-        Expr::Like { op, expr, pattern, escape, negated } => {
+        Expr::Like {
+            op,
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => {
             // LIKE/GLOB only when the pattern is a compile-time literal or
             // a positional parameter and there's no ESCAPE clause.
             if escape.is_some() {
@@ -415,7 +464,12 @@ pub(crate) fn compile_predicate(
             if matches!(pat, PredValue::Col(_)) {
                 return None; // column-vs-column LIKE: general path
             }
-            Some(CompiledPredicate::Like { col, pattern: pat, negated: *negated, glob })
+            Some(CompiledPredicate::Like {
+                col,
+                pattern: pat,
+                negated: *negated,
+                glob,
+            })
         }
         _ => None,
     }
@@ -466,7 +520,10 @@ fn normalize_scope(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Opti
                     t == prefix
                 };
                 if matches && table.find_column(name).is_some() {
-                    Some(Expr::Column { table: None, name: name.clone() })
+                    Some(Expr::Column {
+                        table: None,
+                        name: name.clone(),
+                    })
                 } else {
                     None
                 }
@@ -502,8 +559,22 @@ mod tests {
         // Build via the public schema API to keep column metadata real.
         let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)";
         let stmt = crate::sql::parse(sql).unwrap();
-        if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table { columns, constraints, .. }) = stmt {
-            crate::schema::build_table("t", &columns, &constraints, 1, false, false, "CREATE TABLE t").unwrap()
+        if let crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+            columns,
+            constraints,
+            ..
+        }) = stmt
+        {
+            crate::schema::build_table(
+                "t",
+                &columns,
+                &constraints,
+                1,
+                false,
+                false,
+                "CREATE TABLE t",
+            )
+            .unwrap()
         } else {
             panic!("not a create table")
         }
@@ -514,7 +585,10 @@ mod tests {
         let t = table();
         let e = Expr::Binary {
             op: BinaryOp::Gt,
-            left: Box::new(Expr::Column { table: None, name: "val".into() }),
+            left: Box::new(Expr::Column {
+                table: None,
+                name: "val".into(),
+            }),
             right: Box::new(Expr::Literal(Value::Integer(5000))),
         };
         let p = compile_predicate(&e, &t, "t").unwrap();
@@ -537,12 +611,18 @@ mod tests {
             op: BinaryOp::And,
             left: Box::new(Expr::Binary {
                 op: BinaryOp::Gt,
-                left: Box::new(Expr::Column { table: None, name: "val".into() }),
+                left: Box::new(Expr::Column {
+                    table: None,
+                    name: "val".into(),
+                }),
                 right: Box::new(Expr::Parameter("0".into())),
             }),
             right: Box::new(Expr::Binary {
                 op: BinaryOp::Lt,
-                left: Box::new(Expr::Column { table: None, name: "score".into() }),
+                left: Box::new(Expr::Column {
+                    table: None,
+                    name: "score".into(),
+                }),
                 right: Box::new(Expr::Parameter("1".into())),
             }),
         };
@@ -562,7 +642,10 @@ mod tests {
     fn compile_between_in_null() {
         let t = table();
         let e = Expr::Between {
-            expr: Box::new(Expr::Column { table: None, name: "val".into() }),
+            expr: Box::new(Expr::Column {
+                table: None,
+                name: "val".into(),
+            }),
             low: Box::new(Expr::Literal(Value::Integer(1))),
             high: Box::new(Expr::Literal(Value::Integer(10))),
             negated: false,
@@ -576,7 +659,13 @@ mod tests {
         assert!(p.eval(&[Value::Integer(5)], &positions, &[]));
         assert!(!p.eval(&[Value::Integer(50)], &positions, &[]));
 
-        let n = Expr::IsNull { expr: Box::new(Expr::Column { table: None, name: "name".into() }), negated: false };
+        let n = Expr::IsNull {
+            expr: Box::new(Expr::Column {
+                table: None,
+                name: "name".into(),
+            }),
+            negated: false,
+        };
         let p2 = compile_predicate(&n, &t, "t").unwrap();
         let pos2 = {
             let mut pos = vec![usize::MAX; 4];

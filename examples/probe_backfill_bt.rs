@@ -24,21 +24,30 @@ fn main() {
     let mut inserted = 0usize;
     let mut err: Option<String> = None;
     let mut scan_bt = Btree::new(&pager, tbt.root, false);
-    scan_bt.scan_table_borrowed(|rowid, _payload| {
-        scanned += 1;
-        let key = [(rowid * 2) as u8; 9];
-        match ibt.insert_index(&key, rowid) {
-            Ok(()) => inserted += 1,
-            Err(e) => {
-                err = Some(format!("{:?}", e));
-                return false;
+    scan_bt
+        .scan_table_borrowed(|rowid, _payload| {
+            scanned += 1;
+            let key = [(rowid * 2) as u8; 9];
+            match ibt.insert_index(&key, rowid) {
+                Ok(()) => inserted += 1,
+                Err(e) => {
+                    err = Some(format!("{:?}", e));
+                    return false;
+                }
             }
-        }
-        true
-    }).unwrap();
-    println!("scanned: {}, inserted: {}, err: {:?}", scanned, inserted, err);
+            true
+        })
+        .unwrap();
+    println!(
+        "scanned: {}, inserted: {}, err: {:?}",
+        scanned, inserted, err
+    );
     println!("index pages: {}, index root: {}", pager.n_pages(), ibt.root);
     let mut n = 0usize;
-    ibt.scan_index(|_r, _k| { n += 1; true }).unwrap();
+    ibt.scan_index(|_r, _k| {
+        n += 1;
+        true
+    })
+    .unwrap();
     println!("index entries: {} (expect 10000)", n);
 }

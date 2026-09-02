@@ -6,12 +6,18 @@ use rustqlite::{Database, StepResult};
 
 fn setup() -> Database {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y TEXT)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y TEXT)",
+        [],
+    )
+    .unwrap();
     for i in 0..100 {
         db.execute(
             "INSERT INTO t (x, y) VALUES (?, ?)",
-            vec![Value::Integer(i * 10), Value::Text(format!("row-{}", i).into())],
+            vec![
+                Value::Integer(i * 10),
+                Value::Text(format!("row-{}", i).into()),
+            ],
         )
         .unwrap();
     }
@@ -96,10 +102,7 @@ fn prepare_projection_and_column_names() {
         .unwrap();
     let mut rows = Vec::new();
     while stmt.step().unwrap() == StepResult::Row {
-        rows.push((
-            stmt.column_text(0).unwrap(),
-            stmt.column_int(1),
-        ));
+        rows.push((stmt.column_text(0).unwrap(), stmt.column_int(1)));
     }
     assert_eq!(rows.len(), 2); // ids 1, 2 (id < 3)
     assert_eq!(rows[0].0, "row-0");
@@ -111,10 +114,9 @@ fn prepare_projection_and_column_names() {
 #[test]
 fn prepare_named_parameters() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (a INTEGER, b TEXT)", []).unwrap();
-    let mut stmt = db
-        .prepare("INSERT INTO t (a, b) VALUES (:a, :b)")
+    db.execute("CREATE TABLE t (a INTEGER, b TEXT)", [])
         .unwrap();
+    let mut stmt = db.prepare("INSERT INTO t (a, b) VALUES (:a, :b)").unwrap();
     assert_eq!(stmt.parameter_count(), 0); // named, not positional
     assert!(stmt.parameter_names().iter().any(|n| n.ends_with('a')));
     assert!(stmt.parameter_names().iter().any(|n| n.ends_with('b')));
@@ -141,13 +143,12 @@ fn prepare_insert_update_delete() {
     let db = setup();
     // INSERT via statement + rebind loop (the OLTP pattern).
     {
-        let mut stmt = db
-            .prepare("INSERT INTO t (x, y) VALUES (?, ?)")
-            .unwrap();
+        let mut stmt = db.prepare("INSERT INTO t (x, y) VALUES (?, ?)").unwrap();
         for i in 100..200 {
             stmt.reset();
             stmt.bind(1, Value::Integer(i)).unwrap();
-            stmt.bind(2, Value::Text(format!("new-{}", i).into())).unwrap();
+            stmt.bind(2, Value::Text(format!("new-{}", i).into()))
+                .unwrap();
             stmt.raw_execute().unwrap();
         }
     }
@@ -155,15 +156,13 @@ fn prepare_insert_update_delete() {
     assert_eq!(rows[0][0].as_integer(), 200);
     // UPDATE via statement.
     {
-        let mut stmt = db
-            .prepare("UPDATE t SET x = x + 1 WHERE id > ?")
-            .unwrap();
+        let mut stmt = db.prepare("UPDATE t SET x = x + 1 WHERE id > ?").unwrap();
         stmt.bind(1, Value::Integer(190)).unwrap();
         stmt.raw_execute().unwrap();
     }
     let rows = db.query("SELECT x FROM t WHERE id = 200", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 200); // x=199 (i=199) + 1
-    // DELETE via statement.
+                                              // DELETE via statement.
     {
         let mut stmt = db.prepare("DELETE FROM t WHERE id > ?").unwrap();
         stmt.bind(1, Value::Integer(150)).unwrap();
@@ -177,12 +176,7 @@ fn prepare_insert_update_delete() {
 fn prepare_rejects_ddl_and_txn() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE t (x)", []).unwrap();
-    for sql in [
-        "BEGIN",
-        "COMMIT",
-        "CREATE TABLE u (y)",
-        "DROP TABLE t",
-    ] {
+    for sql in ["BEGIN", "COMMIT", "CREATE TABLE u (y)", "DROP TABLE t"] {
         let err = match db.prepare(sql) {
             Err(e) => e,
             Ok(_) => panic!("{} should be rejected by prepare()", sql),
@@ -199,7 +193,9 @@ fn prepare_rejects_ddl_and_txn() {
 #[test]
 fn prepare_aggregate_materializes() {
     let db = setup();
-    let mut stmt = db.prepare("SELECT count(*), sum(x), max(y) FROM t").unwrap();
+    let mut stmt = db
+        .prepare("SELECT count(*), sum(x), max(y) FROM t")
+        .unwrap();
     assert_eq!(stmt.step().unwrap(), StepResult::Row);
     assert_eq!(stmt.column_int(0), 100);
     assert_eq!(stmt.column_int(1), 49500); // sum(i*10, i=0..99) = 10*4950
@@ -209,7 +205,9 @@ fn prepare_aggregate_materializes() {
 #[test]
 fn prepare_query_all_and_finalize() {
     let db = setup();
-    let mut stmt = db.prepare("SELECT id FROM t WHERE id < 10 ORDER BY id DESC").unwrap();
+    let mut stmt = db
+        .prepare("SELECT id FROM t WHERE id < 10 ORDER BY id DESC")
+        .unwrap();
     let rows = stmt.query_all().unwrap();
     assert_eq!(rows.len(), 9);
     // query_all exhausted the statement.
@@ -222,11 +220,8 @@ fn prepare_case_and_types() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE t (i INTEGER, r REAL, s TEXT, b BLOB, n)", [])
         .unwrap();
-    db.execute(
-        "INSERT INTO t VALUES (1, 2.5, 'txt', x'00ff', NULL)",
-        [],
-    )
-    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2.5, 'txt', x'00ff', NULL)", [])
+        .unwrap();
     let mut stmt = db.prepare("SELECT i, r, s, b, n FROM t").unwrap();
     assert_eq!(stmt.step().unwrap(), StepResult::Row);
     assert_eq!(stmt.column_int(0), 1);

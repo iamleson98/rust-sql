@@ -23,8 +23,10 @@ fn wal_basic_commit_and_read() {
         db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(),
         "wal"
     );
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
-    db.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c')", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c')", [])
+        .unwrap();
 
     // Reads see WAL-committed data through the page map.
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
@@ -35,7 +37,10 @@ fn wal_basic_commit_and_read() {
 
     // Clean close checkpointed the WAL; reopen sees everything, no -wal.
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(), "delete");
+    assert_eq!(
+        db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(),
+        "delete"
+    );
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 3);
     cleanup(&path);
@@ -45,10 +50,12 @@ fn wal_basic_commit_and_read() {
 fn wal_crash_recovery_unclean_shutdown() {
     let (mut db, path) = tmpdb("wal_crash");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=500i64 {
-        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)]).unwrap();
+        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)])
+            .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 
@@ -57,18 +64,29 @@ fn wal_crash_recovery_unclean_shutdown() {
     let rows_before = db.query("SELECT COUNT(*), SUM(v) FROM t", []).unwrap();
     std::mem::forget(db);
 
-    assert!(std::path::PathBuf::from(format!("{}-wal", path.to_str().unwrap())).exists(),
-        "WAL file must survive the simulated crash");
+    assert!(
+        std::path::PathBuf::from(format!("{}-wal", path.to_str().unwrap())).exists(),
+        "WAL file must survive the simulated crash"
+    );
 
     // Recovery: committed frames are served from the WAL on reopen.
     let mut db2 = Database::open(&path).unwrap();
     let rows_after = db2.query("SELECT COUNT(*), SUM(v) FROM t", []).unwrap();
-    assert_eq!(rows_before[0][0].as_integer(), rows_after[0][0].as_integer());
-    assert_eq!(rows_before[0][1].as_integer(), rows_after[0][1].as_integer());
+    assert_eq!(
+        rows_before[0][0].as_integer(),
+        rows_after[0][0].as_integer()
+    );
+    assert_eq!(
+        rows_before[0][1].as_integer(),
+        rows_after[0][1].as_integer()
+    );
     assert_eq!(rows_after[0][0].as_integer(), 500);
 
     // The recovered pager is in WAL mode (journal state persisted).
-    assert_eq!(db2.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(), "wal");
+    assert_eq!(
+        db2.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(),
+        "wal"
+    );
 
     // And it accepts new writes on top of the recovered state.
     db2.execute("INSERT INTO t (v) VALUES (999)", []).unwrap();
@@ -83,7 +101,8 @@ fn wal_served_reads_after_reopen_without_checkpoint() {
     // Even without auto-checkpoint, reads resolve through the WAL map.
     let (mut db, path) = tmpdb("wal_served");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES ('x')", []).unwrap();
     let sum_before = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     std::mem::forget(db);
@@ -105,10 +124,12 @@ fn wal_served_reads_after_reopen_without_checkpoint() {
 fn wal_checkpoint_persists_to_main_file() {
     let (mut db, path) = tmpdb("wal_ckpt");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=200i64 {
-        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i * 3)]).unwrap();
+        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i * 3)])
+            .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db.execute("PRAGMA wal_checkpoint", []).unwrap();
@@ -128,14 +149,17 @@ fn wal_checkpoint_persists_to_main_file() {
 fn wal_rollback_discards_uncommitted() {
     let (mut db, path) = tmpdb("wal_rollback");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (1)", []).unwrap();
 
     db.execute("BEGIN", []).unwrap();
     for i in 2..=100i64 {
-        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)]).unwrap();
+        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)])
+            .unwrap();
     }
-    db.execute("UPDATE t SET v = v * 100 WHERE id = 1", []).unwrap();
+    db.execute("UPDATE t SET v = v * 100 WHERE id = 1", [])
+        .unwrap();
     db.execute("ROLLBACK", []).unwrap();
 
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
@@ -160,7 +184,8 @@ fn wal_auto_checkpoint_under_churn() {
     // the WAL resets and everything stays readable.
     let (mut db, path) = tmpdb("wal_autockpt");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     for batch in 0..80 {
         db.execute("BEGIN", []).unwrap();
         for i in 1..=40i64 {
@@ -188,13 +213,21 @@ fn wal_auto_checkpoint_under_churn() {
 fn wal_synchronous_normal_and_level_reads() {
     let (mut db, path) = tmpdb("wal_sync");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    assert_eq!(db.query("PRAGMA synchronous", []).unwrap()[0][0].as_integer(), 2);
+    assert_eq!(
+        db.query("PRAGMA synchronous", []).unwrap()[0][0].as_integer(),
+        2
+    );
     db.execute("PRAGMA synchronous = NORMAL", []).unwrap();
-    assert_eq!(db.query("PRAGMA synchronous", []).unwrap()[0][0].as_integer(), 1);
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+    assert_eq!(
+        db.query("PRAGMA synchronous", []).unwrap()[0][0].as_integer(),
+        1
+    );
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=50i64 {
-        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)]).unwrap();
+        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)])
+            .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
@@ -210,12 +243,16 @@ fn wal_synchronous_normal_and_level_reads() {
 fn wal_switch_back_to_delete() {
     let (mut db, path) = tmpdb("wal_switch");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (7)", []).unwrap();
 
     // Switching back checkpoints + removes the WAL.
     db.execute("PRAGMA journal_mode = DELETE", []).unwrap();
-    assert_eq!(db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(), "delete");
+    assert_eq!(
+        db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(),
+        "delete"
+    );
     let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 7);
     drop(db);
@@ -235,12 +272,19 @@ fn wal_indexes_and_dml_roundtrip() {
     // Secondary indexes, UPDATE and DELETE all maintain the WAL view.
     let (mut db, path) = tmpdb("wal_dml");
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+        [],
+    )
+    .unwrap();
     db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=300i64 {
-        db.execute("INSERT INTO t (k, v) VALUES (?, ?)",
-            [Value::Integer(i % 10), Value::Text(format!("v{i}").into())]).unwrap();
+        db.execute(
+            "INSERT INTO t (k, v) VALUES (?, ?)",
+            [Value::Integer(i % 10), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
 
@@ -248,8 +292,11 @@ fn wal_indexes_and_dml_roundtrip() {
     let rows = db.query("SELECT COUNT(*) FROM t WHERE k = 3", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 30);
 
-    db.execute("UPDATE t SET v = 'upd' WHERE k = 3", []).unwrap();
-    let rows = db.query("SELECT COUNT(*) FROM t WHERE v = 'upd'", []).unwrap();
+    db.execute("UPDATE t SET v = 'upd' WHERE k = 3", [])
+        .unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM t WHERE v = 'upd'", [])
+        .unwrap();
     assert_eq!(rows[0][0].as_integer(), 30);
 
     db.execute("DELETE FROM t WHERE k = 3", []).unwrap();

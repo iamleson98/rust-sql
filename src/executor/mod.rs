@@ -12,13 +12,12 @@
 //! have working code in the first place.
 
 pub mod datetime;
+pub(crate) mod explain;
 pub mod expr;
 pub mod json;
-pub(crate) mod triggers;
-pub(crate) mod explain;
 pub(crate) mod predicate;
+pub(crate) mod triggers;
 pub(crate) mod vtab_exec;
-
 
 pub use expr::{apply_binary, evaluate, EvalContext};
 
@@ -172,7 +171,8 @@ mod corr {
             }
             if let Some(t) = table {
                 // Pass 1: exact "qual.name" in each frame, innermost first.
-                let qual_lower = format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
+                let qual_lower =
+                    format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
                 for frame in c.outer.iter().rev() {
                     let names = frame.names();
                     for (i, n) in names.iter().enumerate() {
@@ -286,7 +286,10 @@ mod corr {
 
     /// SAFETY: caller must guarantee `ctx` is alive and not mutably
     /// aliased outside this call.
-    unsafe fn exec_select(sel: &SelectStatement, ctx: *mut ExecContext<'static>) -> Result<ExecResult> {
+    unsafe fn exec_select(
+        sel: &SelectStatement,
+        ctx: *mut ExecContext<'static>,
+    ) -> Result<ExecResult> {
         let ctx = unsafe { &mut *ctx };
         super::exec_select_statement(sel, ctx)
     }
@@ -296,19 +299,21 @@ pub(crate) use corr::Guard as CorrGuard;
 
 /// Evaluator-facing wrapper: execute a correlated scalar subquery with the
 /// given EvalContext as the outer scope.
-pub(crate) fn corr_exec_scalar(
-    sel: &SelectStatement,
-    eval_ctx: &EvalContext<'_>,
-) -> Result<Value> {
-    corr::exec_scalar(sel, eval_ctx.row as *const [Value], eval_ctx.column_names as *const [String])
+pub(crate) fn corr_exec_scalar(sel: &SelectStatement, eval_ctx: &EvalContext<'_>) -> Result<Value> {
+    corr::exec_scalar(
+        sel,
+        eval_ctx.row as *const [Value],
+        eval_ctx.column_names as *const [String],
+    )
 }
 
 /// Evaluator-facing wrapper: correlated EXISTS.
-pub(crate) fn corr_exec_exists(
-    sel: &SelectStatement,
-    eval_ctx: &EvalContext<'_>,
-) -> Result<Value> {
-    corr::exec_exists(sel, eval_ctx.row as *const [Value], eval_ctx.column_names as *const [String])
+pub(crate) fn corr_exec_exists(sel: &SelectStatement, eval_ctx: &EvalContext<'_>) -> Result<Value> {
+    corr::exec_exists(
+        sel,
+        eval_ctx.row as *const [Value],
+        eval_ctx.column_names as *const [String],
+    )
 }
 
 /// Evaluator-facing wrapper: correlated IN-subquery list.
@@ -316,7 +321,11 @@ pub(crate) fn corr_exec_in_list(
     sel: &SelectStatement,
     eval_ctx: &EvalContext<'_>,
 ) -> Result<Vec<Value>> {
-    corr::exec_in_list(sel, eval_ctx.row as *const [Value], eval_ctx.column_names as *const [String])
+    corr::exec_in_list(
+        sel,
+        eval_ctx.row as *const [Value],
+        eval_ctx.column_names as *const [String],
+    )
 }
 
 /// Outer-scope lookup for a qualified column ref (unqualified refs go
@@ -330,7 +339,6 @@ pub(crate) fn corr_outer_lookup(table: Option<&str>, name: &str) -> Option<Value
     corr::lookup_outer(table, name)
 }
 
-
 use crate::error::{Error, Result};
 use crate::planner::plan::*;
 use crate::schema::Table;
@@ -338,7 +346,10 @@ use crate::sql::ast::*;
 use crate::storage::btree::{Btree, LookupResult};
 use crate::storage::page::PageId;
 use crate::storage::pager::Pager;
-use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, decode_row_selective_wide, encode_row_aliased, encode_row_aliased_into};
+use crate::storage::row_codec::{
+    decode_row, decode_row_into, decode_row_selective, decode_row_selective_wide,
+    encode_row_aliased, encode_row_aliased_into,
+};
 use crate::types::{Row, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -533,7 +544,11 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.root_overrides.get(&lc) {
             return r;
         }
-        self.shared.roots.get(&lc).copied().unwrap_or(table.root_page)
+        self.shared
+            .roots
+            .get(&lc)
+            .copied()
+            .unwrap_or(table.root_page)
     }
 
     /// Update the root page override for a table.
@@ -554,7 +569,11 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.index_roots.get(&lc) {
             return r;
         }
-        self.shared.index_roots.get(&lc).copied().unwrap_or(index.root_page)
+        self.shared
+            .index_roots
+            .get(&lc)
+            .copied()
+            .unwrap_or(index.root_page)
     }
 
     /// Update the index root override (called after an index B+tree split).
@@ -731,7 +750,10 @@ pub struct ExecResult {
 
 impl ExecResult {
     pub fn empty() -> Self {
-        Self { columns: Arc::from(Vec::new()), rows: Vec::new() }
+        Self {
+            columns: Arc::from(Vec::new()),
+            rows: Vec::new(),
+        }
     }
 }
 
@@ -774,7 +796,14 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             // second pass of value cloning. Falls back internally to
             // normal join + apply_projection when fusion isn't applicable
             // (non-column projections, residual predicates, ...).
-            if let Plan::Join { left, right, join_type, condition, algorithm } = &**input {
+            if let Plan::Join {
+                left,
+                right,
+                join_type,
+                condition,
+                algorithm,
+            } = &**input
+            {
                 if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
                     return exec_hash_join(ctx, left, right, *join_type, condition, Some(columns));
                 }
@@ -783,47 +812,120 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             // bare-column projections — decode ONLY the projected columns
             // per row (skipping e.g. the rowid marker and un-referenced
             // wide text columns), with no second cloning pass.
-            if let Plan::RowidRange { table, alias: _, start, end, residual: None } = &**input {
+            if let Plan::RowidRange {
+                table,
+                alias: _,
+                start,
+                end,
+                residual: None,
+            } = &**input
+            {
                 if let Some((project, out_cols)) = bare_column_projection(columns, table) {
-                    return exec_rowid_range_projected(ctx, table.clone(), start.as_ref(), end.as_ref(), project.as_deref(), out_cols);
+                    return exec_rowid_range_projected(
+                        ctx,
+                        table.clone(),
+                        start.as_ref(),
+                        end.as_ref(),
+                        project.as_deref(),
+                        out_cols,
+                    );
                 }
             }
             if let Plan::RowidLookup { table, rowid, .. } = &**input {
                 if let Some((project, out_cols)) = bare_column_projection(columns, table) {
-                    return exec_rowid_lookup_projected(ctx, table.clone(), rowid, project.as_deref(), out_cols);
+                    return exec_rowid_lookup_projected(
+                        ctx,
+                        table.clone(),
+                        rowid,
+                        project.as_deref(),
+                        out_cols,
+                    );
                 }
             }
             // FUSED PATH: Project over an IndexLookup (WHERE indexed_col = ?)
             // — decode only the projected columns, reuse one B+tree handle
             // across the rowid batch (pinned root survives). Non-bare
             // projections fall through to the generic Project.
-            if let Plan::IndexLookup { table, alias: _, index, key_exprs } = &**input {
+            if let Plan::IndexLookup {
+                table,
+                alias: _,
+                index,
+                key_exprs,
+            } = &**input
+            {
                 if bare_column_projection(columns, table).is_some() {
-                    return exec_index_lookup_projected(ctx, table.clone(), index.clone(), key_exprs, Some(columns));
+                    return exec_index_lookup_projected(
+                        ctx,
+                        table.clone(),
+                        index.clone(),
+                        key_exprs,
+                        Some(columns),
+                    );
                 }
             }
             // FUSED PATH: Project over an Index Nested-Loop Join — the join
             // emits only the projected columns (no full-width combined row,
             // no second cloning pass). Mirrors the Hash Join fusion.
-            if let Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, inner_index, outer_key_col } = &**input {
-                return exec_index_nested_loop_join(ctx, outer, inner_table.clone(), inner_alias.clone(), inner_index.clone(), *outer_key_col, Some(columns));
+            if let Plan::IndexNestedLoopJoin {
+                outer,
+                inner_table,
+                inner_alias,
+                inner_index,
+                outer_key_col,
+            } = &**input
+            {
+                return exec_index_nested_loop_join(
+                    ctx,
+                    outer,
+                    inner_table.clone(),
+                    inner_alias.clone(),
+                    inner_index.clone(),
+                    *outer_key_col,
+                    Some(columns),
+                );
             }
             exec_project(ctx, input, columns)
         }
         Plan::Sort { input, terms } => exec_sort(ctx, input, terms),
-        Plan::Limit { input, count, offset } => exec_limit(ctx, input, count, offset),
-        Plan::Aggregate { input, group_by, aggregates } => exec_aggregate(ctx, input, group_by, aggregates),
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => exec_limit(ctx, input, count, offset),
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => exec_aggregate(ctx, input, group_by, aggregates),
         Plan::Window { input, windows } => exec_window(ctx, input, windows),
-        Plan::Join { left, right, join_type, condition, algorithm } => {
+        Plan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            algorithm,
+        } => {
             if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
                 exec_hash_join(ctx, left, right, *join_type, condition, None)
             } else {
                 exec_join(ctx, left, right, *join_type, condition)
             }
         }
-        Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, inner_index, outer_key_col } => {
-            exec_index_nested_loop_join(ctx, outer, inner_table.clone(), inner_alias.clone(), inner_index.clone(), *outer_key_col, None)
-        }
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            inner_index,
+            outer_key_col,
+        } => exec_index_nested_loop_join(
+            ctx,
+            outer,
+            inner_table.clone(),
+            inner_alias.clone(),
+            inner_index.clone(),
+            *outer_key_col,
+            None,
+        ),
         Plan::Distinct { input } => exec_distinct(ctx, input),
         Plan::Union { left, right, all } => exec_union(ctx, left, right, *all),
         Plan::Intersect { left, right } => exec_intersect(ctx, left, right),
@@ -834,23 +936,108 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             rows: rows.as_ref().clone(),
         }),
         Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
-        Plan::RowidIn { table, alias: _, values, residual } => {
-            exec_rowid_in(ctx, table.clone(), values, residual.as_ref())
-        }
-        Plan::IndexIn { table, alias: _, index, key_exprs, residual } => {
-            exec_index_in(ctx, table.clone(), index.clone(), key_exprs, residual.as_ref())
-        }
-        Plan::RowidRange { table, alias: _, start, end, residual } => exec_rowid_range(ctx, table.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
-        Plan::IndexLookup { table, alias: _, index, key_exprs } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
-        Plan::IndexRange { table, alias, index, start, end, residual } => exec_index_range(ctx, table.clone(), alias.clone(), index.clone(), start.as_ref(), end.as_ref(), residual.as_ref()),
-        Plan::Insert { table, source, columns, on_conflict, upsert, returning } => exec_insert(ctx, table.clone(), source, columns.clone(), *on_conflict, upsert.as_ref(), returning.as_deref()),
-        Plan::Update { table, source, assignments, returning, or_conflict, from } => exec_update(ctx, table.clone(), source, assignments, returning.as_deref(), *or_conflict, from.as_deref()),
-        Plan::Delete { table, source, returning } => exec_delete(ctx, table.clone(), source, returning.as_deref()),
+        Plan::RowidIn {
+            table,
+            alias: _,
+            values,
+            residual,
+        } => exec_rowid_in(ctx, table.clone(), values, residual.as_ref()),
+        Plan::IndexIn {
+            table,
+            alias: _,
+            index,
+            key_exprs,
+            residual,
+        } => exec_index_in(
+            ctx,
+            table.clone(),
+            index.clone(),
+            key_exprs,
+            residual.as_ref(),
+        ),
+        Plan::RowidRange {
+            table,
+            alias: _,
+            start,
+            end,
+            residual,
+        } => exec_rowid_range(
+            ctx,
+            table.clone(),
+            start.as_ref(),
+            end.as_ref(),
+            residual.as_ref(),
+        ),
+        Plan::IndexLookup {
+            table,
+            alias: _,
+            index,
+            key_exprs,
+        } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
+        Plan::IndexRange {
+            table,
+            alias,
+            index,
+            start,
+            end,
+            residual,
+        } => exec_index_range(
+            ctx,
+            table.clone(),
+            alias.clone(),
+            index.clone(),
+            start.as_ref(),
+            end.as_ref(),
+            residual.as_ref(),
+        ),
+        Plan::Insert {
+            table,
+            source,
+            columns,
+            on_conflict,
+            upsert,
+            returning,
+        } => exec_insert(
+            ctx,
+            table.clone(),
+            source,
+            columns.clone(),
+            *on_conflict,
+            upsert.as_ref(),
+            returning.as_deref(),
+        ),
+        Plan::Update {
+            table,
+            source,
+            assignments,
+            returning,
+            or_conflict,
+            from,
+        } => exec_update(
+            ctx,
+            table.clone(),
+            source,
+            assignments,
+            returning.as_deref(),
+            *or_conflict,
+            from.as_deref(),
+        ),
+        Plan::Delete {
+            table,
+            source,
+            returning,
+        } => exec_delete(ctx, table.clone(), source, returning.as_deref()),
     }
 }
 
 // Helper: evaluate an expression against a single row.
-pub(crate) fn eval_row(expr: &Expr, row: &[Value], col_names: &[String], params: &[Value], named_params: &HashMap<String, Value>) -> Result<Value> {
+pub(crate) fn eval_row(
+    expr: &Expr,
+    row: &[Value],
+    col_names: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<Value> {
     let ctx = EvalContext::new(row, col_names, params, named_params);
     evaluate(expr, &ctx)
 }
@@ -1009,8 +1196,11 @@ fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Res
         return Ok(());
     }
     for fk in &table.foreign_keys {
-        let key_values: Vec<Value> =
-            fk.columns.iter().map(|&i| row.get(i).cloned().unwrap_or(Value::Null)).collect();
+        let key_values: Vec<Value> = fk
+            .columns
+            .iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
         // MATCH SIMPLE: any NULL in the key → constraint satisfied.
         if key_values.iter().any(|v| v.is_null()) {
             continue;
@@ -1093,7 +1283,9 @@ fn enforce_parent_delete_fks(
         .into_iter()
         .filter(|(_, t)| !t.name.eq_ignore_ascii_case(&parent.name) && !t.foreign_keys.is_empty())
         .filter(|(_, t)| {
-            t.foreign_keys.iter().any(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+            t.foreign_keys
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
         })
         .map(|(_, t)| {
             let fks: Vec<crate::schema::ForeignKeyClause> = t
@@ -1129,9 +1321,8 @@ fn enforce_parent_delete_fks(
             // deleted? When the FK targets specific columns, only enforce
             // when those columns are part of the parent key set — otherwise
             // (FK on a non-key column) it's still a reference we must check.
-            let children = fk_find_child_rows(
-                ctx, &child, fk, &parent_cols, old_row, parent_rowid,
-            )?;
+            let children =
+                fk_find_child_rows(ctx, &child, fk, &parent_cols, old_row, parent_rowid)?;
             if children.is_empty() {
                 continue;
             }
@@ -1238,7 +1429,9 @@ fn project_returning_row(
 fn extract_source_predicate(source: &Plan) -> Option<Expr> {
     match source {
         Plan::Filter { predicate, .. } => Some(predicate.clone()),
-        Plan::Scan { predicate: Some(p), .. } => Some(p.clone()),
+        Plan::Scan {
+            predicate: Some(p), ..
+        } => Some(p.clone()),
         _ => None,
     }
 }
@@ -1273,7 +1466,10 @@ fn returning_column_names(
 pub fn expr_has_subquery(e: &Expr) -> bool {
     match e {
         Expr::Subquery(_) | Expr::Exists(_) => true,
-        Expr::In { source: InSource::Subquery(_), .. } => true,
+        Expr::In {
+            source: InSource::Subquery(_),
+            ..
+        } => true,
         _ => {
             let mut found = false;
             map_expr_children(e, &mut |child| {
@@ -1299,20 +1495,35 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
     Ok(match e {
         Expr::Literal(v) => Expr::Literal(v.clone()),
         Expr::Parameter(p) => Expr::Parameter(p.clone()),
-        Expr::Column { table, name } => Expr::Column { table: table.clone(), name: name.clone() },
+        Expr::Column { table, name } => Expr::Column {
+            table: table.clone(),
+            name: name.clone(),
+        },
         Expr::Binary { op, left, right } => Expr::Binary {
             op: *op,
             left: Box::new(r!(left)),
             right: Box::new(r!(right)),
         },
-        Expr::Unary { op, expr } => Expr::Unary { op: *op, expr: Box::new(r!(expr)) },
-        Expr::Between { expr, low, high, negated } => Expr::Between {
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(r!(expr)),
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
             expr: Box::new(r!(expr)),
             low: Box::new(r!(low)),
             high: Box::new(r!(high)),
             negated: *negated,
         },
-        Expr::In { expr, source, negated } => {
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => {
             let new_source = match source {
                 InSource::List(list) => {
                     let mut new_list = Vec::with_capacity(list.len());
@@ -1323,9 +1534,19 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
                 }
                 other => other.clone(),
             };
-            Expr::In { expr: Box::new(r!(expr)), source: new_source, negated: *negated }
+            Expr::In {
+                expr: Box::new(r!(expr)),
+                source: new_source,
+                negated: *negated,
+            }
         }
-        Expr::Like { op, expr, pattern, escape, negated } => {
+        Expr::Like {
+            op,
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => {
             let new_escape = match escape.as_ref() {
                 Some(es) => Some(Box::new(r!(es.as_ref()))),
                 None => None,
@@ -1338,13 +1559,26 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
                 negated: *negated,
             }
         }
-        Expr::IsNull { expr, negated } => Expr::IsNull { expr: Box::new(r!(expr)), negated: *negated },
-        Expr::Is { left, right, negated } => Expr::Is {
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(r!(expr)),
+            negated: *negated,
+        },
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } => Expr::Is {
             left: Box::new(r!(left)),
             right: Box::new(r!(right)),
             negated: *negated,
         },
-        Expr::Function { name, distinct, args, filter, over } => {
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            filter,
+            over,
+        } => {
             let mut new_args = Vec::with_capacity(args.len());
             for a in args {
                 new_args.push(r!(a));
@@ -1361,7 +1595,11 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
                 over: over.clone(),
             }
         }
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             let new_operand = match operand.as_ref() {
                 Some(o) => Some(Box::new(r!(o.as_ref()))),
                 None => None,
@@ -1374,7 +1612,11 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
                 Some(el) => Some(Box::new(r!(el.as_ref()))),
                 None => None,
             };
-            Expr::Case { operand: new_operand, whens: new_whens, else_: new_else }
+            Expr::Case {
+                operand: new_operand,
+                whens: new_whens,
+                else_: new_else,
+            }
         }
         Expr::Row(items) => {
             let mut new_items = Vec::with_capacity(items.len());
@@ -1385,8 +1627,14 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
         }
         Expr::Subquery(sel) => Expr::Subquery(sel.clone()),
         Expr::Exists(sel) => Expr::Exists(sel.clone()),
-        Expr::Cast { expr, type_name } => Expr::Cast { expr: Box::new(r!(expr)), type_name: type_name.clone() },
-        Expr::Collate { expr, collation } => Expr::Collate { expr: Box::new(r!(expr)), collation: collation.clone() },
+        Expr::Cast { expr, type_name } => Expr::Cast {
+            expr: Box::new(r!(expr)),
+            type_name: type_name.clone(),
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(r!(expr)),
+            collation: collation.clone(),
+        },
         Expr::Raise { action, message } => {
             let new_message = match message.as_ref() {
                 Some(m) => Some(Box::new(r!(m.as_ref()))),
@@ -1420,7 +1668,9 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                 }
             }
             Plan::RowidLookup { rowid, .. } => out.push(rowid),
-            Plan::RowidIn { values, residual, .. } => {
+            Plan::RowidIn {
+                values, residual, ..
+            } => {
                 for v in values.iter() {
                     out.push(v);
                 }
@@ -1428,7 +1678,11 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                     out.push(r);
                 }
             }
-            Plan::IndexIn { key_exprs, residual, .. } => {
+            Plan::IndexIn {
+                key_exprs,
+                residual,
+                ..
+            } => {
                 for k in key_exprs.iter() {
                     out.push(k);
                 }
@@ -1436,7 +1690,12 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                     out.push(r);
                 }
             }
-            Plan::RowidRange { start, end, residual, .. } => {
+            Plan::RowidRange {
+                start,
+                end,
+                residual,
+                ..
+            } => {
                 if let Some(s) = start.as_ref() {
                     out.push(s);
                 }
@@ -1452,7 +1711,12 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                     out.push(k);
                 }
             }
-            Plan::IndexRange { start, end, residual, .. } => {
+            Plan::IndexRange {
+                start,
+                end,
+                residual,
+                ..
+            } => {
                 if let Some((s, _)) = start.as_ref() {
                     out.push(s);
                 }
@@ -1486,12 +1750,20 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                 }
                 exprs_in_plan(input, out);
             }
-            Plan::Limit { input, count, offset } => {
+            Plan::Limit {
+                input,
+                count,
+                offset,
+            } => {
                 out.push(count);
                 out.push(offset);
                 exprs_in_plan(input, out);
             }
-            Plan::Aggregate { input, group_by, aggregates } => {
+            Plan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
                 for g in group_by {
                     out.push(g);
                 }
@@ -1516,7 +1788,12 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                 }
                 exprs_in_plan(input, out);
             }
-            Plan::Join { left, right, condition, .. } => {
+            Plan::Join {
+                left,
+                right,
+                condition,
+                ..
+            } => {
                 if let Some(c) = condition.as_ref() {
                     out.push(c);
                 }
@@ -1539,7 +1816,11 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                 exprs_in_plan(right, out);
             }
             Plan::Insert { source, .. } => exprs_in_plan(source, out),
-            Plan::Update { source, assignments, .. } => {
+            Plan::Update {
+                source,
+                assignments,
+                ..
+            } => {
                 for (_i, e) in assignments {
                     out.push(e);
                 }
@@ -1564,7 +1845,9 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::RowidLookup { rowid, .. } => {
             rewrite_expr_in_place(rowid, ctx)?;
         }
-        Plan::RowidIn { values, residual, .. } => {
+        Plan::RowidIn {
+            values, residual, ..
+        } => {
             for v in values.iter_mut() {
                 rewrite_expr_in_place(v, ctx)?;
             }
@@ -1572,7 +1855,11 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
                 rewrite_expr_in_place(r, ctx)?;
             }
         }
-        Plan::IndexIn { key_exprs, residual, .. } => {
+        Plan::IndexIn {
+            key_exprs,
+            residual,
+            ..
+        } => {
             for k in key_exprs.iter_mut() {
                 rewrite_expr_in_place(k, ctx)?;
             }
@@ -1580,7 +1867,12 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
                 rewrite_expr_in_place(r, ctx)?;
             }
         }
-        Plan::RowidRange { start, end, residual, .. } => {
+        Plan::RowidRange {
+            start,
+            end,
+            residual,
+            ..
+        } => {
             if let Some(s) = start.as_mut() {
                 rewrite_expr_in_place(s, ctx)?;
             }
@@ -1596,7 +1888,12 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
                 rewrite_expr_in_place(k, ctx)?;
             }
         }
-        Plan::IndexRange { start, end, residual, .. } => {
+        Plan::IndexRange {
+            start,
+            end,
+            residual,
+            ..
+        } => {
             if let Some((s, _)) = start.as_mut() {
                 rewrite_expr_in_place(s, ctx)?;
             }
@@ -1630,12 +1927,20 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
                 rewrite_expr_in_place(&mut t.expr, ctx)?;
             }
         }
-        Plan::Limit { input, count, offset } => {
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => {
             rewrite_plan_subqueries_in_place(input, ctx)?;
             rewrite_expr_in_place(count, ctx)?;
             rewrite_expr_in_place(offset, ctx)?;
         }
-        Plan::Aggregate { input, group_by, aggregates } => {
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             rewrite_plan_subqueries_in_place(input, ctx)?;
             for g in group_by.iter_mut() {
                 rewrite_expr_in_place(g, ctx)?;
@@ -1660,7 +1965,12 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
                 }
             }
         }
-        Plan::Join { left, right, condition, .. } => {
+        Plan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
             rewrite_plan_subqueries_in_place(left, ctx)?;
             rewrite_plan_subqueries_in_place(right, ctx)?;
             if let Some(c) = condition.as_mut() {
@@ -1691,7 +2001,11 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::Insert { source, .. } => {
             rewrite_plan_subqueries_in_place(source, ctx)?;
         }
-        Plan::Update { source, assignments, .. } => {
+        Plan::Update {
+            source,
+            assignments,
+            ..
+        } => {
             rewrite_plan_subqueries_in_place(source, ctx)?;
             for (_idx, e) in assignments.iter_mut() {
                 rewrite_expr_in_place(e, ctx)?;
@@ -1745,10 +2059,18 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                 Ok(Expr::Exists(Box::new(sel)))
             } else {
                 let res = exec_select_statement(&sel, ctx)?;
-                Ok(Expr::Literal(Value::Integer(if res.rows.is_empty() { 0 } else { 1 })))
+                Ok(Expr::Literal(Value::Integer(if res.rows.is_empty() {
+                    0
+                } else {
+                    1
+                })))
             }
         }
-        Expr::In { expr, source, negated } => {
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => {
             let inner = match source {
                 InSource::Subquery(sel) => {
                     let mut sel = *sel;
@@ -1768,7 +2090,11 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                 }
                 other => other,
             };
-            Ok(Expr::In { expr, source: inner, negated })
+            Ok(Expr::In {
+                expr,
+                source: inner,
+                negated,
+            })
         }
         other => Ok(other),
     }
@@ -1820,13 +2146,21 @@ fn rewrite_body_subqueries(body: &mut SelectBody, ctx: &mut ExecContext<'_>) -> 
     Ok(())
 }
 
-fn rewrite_table_expression_subqueries(te: &mut TableExpression, ctx: &mut ExecContext<'_>) -> Result<()> {
+fn rewrite_table_expression_subqueries(
+    te: &mut TableExpression,
+    ctx: &mut ExecContext<'_>,
+) -> Result<()> {
     match te {
         TableExpression::Table { .. } => {}
         TableExpression::Subquery { select, .. } => {
             rewrite_select_subqueries(select, ctx)?;
         }
-        TableExpression::Join { left, right, constraint, .. } => {
+        TableExpression::Join {
+            left,
+            right,
+            constraint,
+            ..
+        } => {
             rewrite_table_expression_subqueries(left, ctx)?;
             rewrite_table_expression_subqueries(right, ctx)?;
             if let JoinConstraint::On(e) = constraint {
@@ -1896,7 +2230,10 @@ fn subquery_is_correlated(
 /// CTE scope info extracted from an ExecContext for correlation analysis.
 fn cte_scope_of(
     ctx: &ExecContext<'_>,
-) -> (std::collections::HashSet<String>, HashMap<String, std::sync::Arc<[String]>>) {
+) -> (
+    std::collections::HashSet<String>,
+    HashMap<String, std::sync::Arc<[String]>>,
+) {
     let mut names = std::collections::HashSet::new();
     let mut cols = HashMap::new();
     if let Some(ctes) = &ctx.ctes {
@@ -2036,7 +2373,12 @@ fn collect_table_expression_refs(te: &TableExpression, out: &mut Vec<(Option<Str
                 collect_expr_refs(l, out);
             }
         }
-        TableExpression::Join { left, right, constraint, .. } => {
+        TableExpression::Join {
+            left,
+            right,
+            constraint,
+            ..
+        } => {
             collect_table_expression_refs(left, out);
             collect_table_expression_refs(right, out);
             if let JoinConstraint::On(e) = constraint {
@@ -2056,7 +2398,9 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_expr_refs(right, out);
         }
         Expr::Unary { expr, .. } => collect_expr_refs(expr, out),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_expr_refs(expr, out);
             collect_expr_refs(low, out);
             collect_expr_refs(high, out);
@@ -2075,7 +2419,12 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
                 InSource::Table(_) => {}
             }
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             collect_expr_refs(expr, out);
             collect_expr_refs(pattern, out);
             if let Some(es) = escape {
@@ -2095,7 +2444,11 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
                 collect_expr_refs(f, out);
             }
         }
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             if let Some(o) = operand {
                 collect_expr_refs(o, out);
             }
@@ -2120,7 +2473,9 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         }
         Expr::Cast { expr, .. } => collect_expr_refs(expr, out),
         Expr::Collate { expr, .. } => collect_expr_refs(expr, out),
-        Expr::Raise { message: Some(m), .. } => collect_expr_refs(m, out),
+        Expr::Raise {
+            message: Some(m), ..
+        } => collect_expr_refs(m, out),
         _ => {}
     }
 }
@@ -2160,7 +2515,10 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
             out.push(sel);
             collect_nested_selects(sel, out);
         }
-        Expr::In { source: InSource::Subquery(sel), .. } => {
+        Expr::In {
+            source: InSource::Subquery(sel),
+            ..
+        } => {
             out.push(sel);
             collect_nested_selects(sel, out);
         }
@@ -2174,7 +2532,11 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
                 collect_expr_selects(a, out);
             }
         }
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             if let Some(o) = operand {
                 collect_expr_selects(o, out);
             }
@@ -2194,7 +2556,11 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
 // Scan
 // ============================================================================
 
-fn exec_scan(ctx: &mut ExecContext<'_>, table: Arc<Table>, alias: Option<String>) -> Result<ExecResult> {
+fn exec_scan(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    alias: Option<String>,
+) -> Result<ExecResult> {
     // Virtual table: drive the module's cursor protocol instead of a
     // B+tree scan. The pushed-down predicate (if any) is offered to the
     // module through best_index.
@@ -2231,10 +2597,7 @@ fn exec_scan(ctx: &mut ExecContext<'_>, table: Arc<Table>, alias: Option<String>
             .collect::<Vec<String>>()
             .into()
     };
-    Ok(ExecResult {
-        columns,
-        rows,
-    })
+    Ok(ExecResult { columns, rows })
 }
 
 // ============================================================================
@@ -2253,7 +2616,10 @@ fn exec_values(ctx: &mut ExecContext<'_>, rows: &[Vec<Expr>]) -> Result<ExecResu
     for exprs in rows {
         let mut row = Vec::with_capacity(exprs.len());
         for e in exprs {
-            row.push(evaluate(e, &EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params))?);
+            row.push(evaluate(
+                e,
+                &EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params),
+            )?);
         }
         out.push(row);
     }
@@ -2281,7 +2647,8 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     // name lookups of eval_row when the predicate shape is supported.
     if let Plan::Scan { table, alias, .. } = input {
         let prefix = alias.as_deref().unwrap_or(&table.name);
-        if let Some(pred) = crate::executor::predicate::compile_predicate(predicate, table, prefix) {
+        if let Some(pred) = crate::executor::predicate::compile_predicate(predicate, table, prefix)
+        {
             let n_cols = table.n_columns();
             let positions: Vec<usize> = (0..n_cols).collect();
             let params: &[Value] = &ctx.params;
@@ -2291,17 +2658,29 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
                     rows.push(row);
                 }
             }
-            return Ok(ExecResult { columns: inner.columns, rows });
+            return Ok(ExecResult {
+                columns: inner.columns,
+                rows,
+            });
         }
     }
     let mut rows = Vec::new();
     for row in inner.rows {
-        let v = eval_row(predicate, &row, &inner.columns, &ctx.params, &ctx.named_params)?;
+        let v = eval_row(
+            predicate,
+            &row,
+            &inner.columns,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
         if v.is_truthy() {
             rows.push(row);
         }
     }
-    Ok(ExecResult { columns: inner.columns, rows })
+    Ok(ExecResult {
+        columns: inner.columns,
+        rows,
+    })
 }
 
 /// FUSED Scan+Filter(+Limit) path: scan the table with a compiled
@@ -2324,7 +2703,13 @@ fn scan_filter_limit(
     predicate: Option<&Expr>,
     stop_after: Option<usize>,
 ) -> Result<Option<ExecResult>> {
-    let Plan::Scan { table, alias, index: None, predicate: scan_pred } = input else {
+    let Plan::Scan {
+        table,
+        alias,
+        index: None,
+        predicate: scan_pred,
+    } = input
+    else {
         return Ok(None);
     };
     // Effective predicate: the caller's (Filter's) predicate, the Scan's own
@@ -2369,7 +2754,12 @@ fn scan_filter_limit(
     let columns: Arc<[String]> = if prefix == table.name {
         table.qualified_col_names.clone()
     } else {
-        table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect::<Vec<String>>().into()
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect::<Vec<String>>()
+            .into()
     };
     let mut rows: Vec<Vec<Value>> = Vec::new();
     match (&pred, !wanted.is_empty()) {
@@ -2384,7 +2774,12 @@ fn scan_filter_limit(
             let stop = stop_after;
             bt.scan_table_borrowed(|rowid, payload| {
                 if crate::storage::row_codec::decode_row_selective(
-                    payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf,
+                    payload,
+                    n_cols,
+                    &wanted,
+                    rowid,
+                    rowid_alias,
+                    &mut sel_buf,
                 )
                 .is_err()
                 {
@@ -2447,7 +2842,11 @@ fn scan_filter_limit(
 // Project
 // ============================================================================
 
-fn exec_project(ctx: &mut ExecContext<'_>, input: &Plan, columns: &[ProjectExpr]) -> Result<ExecResult> {
+fn exec_project(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    columns: &[ProjectExpr],
+) -> Result<ExecResult> {
     let inner = execute(input, ctx)?;
     apply_projection(inner, columns, ctx)
 }
@@ -2455,7 +2854,11 @@ fn exec_project(ctx: &mut ExecContext<'_>, input: &Plan, columns: &[ProjectExpr]
 /// Apply a projection to an ALREADY-EXECUTED input. Split out of
 /// `exec_project` so the fused hash-join path can fall back to normal
 /// projection semantics when its fusion preconditions don't hold.
-fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContext<'_>) -> Result<ExecResult> {
+fn apply_projection(
+    inner: ExecResult,
+    columns: &[ProjectExpr],
+    ctx: &ExecContext<'_>,
+) -> Result<ExecResult> {
     // Compute output columns, expanding `*` and `table.*` to the underlying
     // input column names.
     let mut out_columns: Vec<String> = Vec::new();
@@ -2464,13 +2867,17 @@ fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContex
         if let Expr::Column { name, .. } = &c.expr {
             if name == "*" {
                 // Expand to all input columns.
-                let expanded: Vec<String> = inner.columns.iter().map(|c| {
-                    if let Some(pos) = c.rfind('.') {
-                        c[pos + 1..].to_string()
-                    } else {
-                        c.clone()
-                    }
-                }).collect();
+                let expanded: Vec<String> = inner
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        if let Some(pos) = c.rfind('.') {
+                            c[pos + 1..].to_string()
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .collect();
                 out_columns.extend(expanded.clone());
                 star_expansions.push(expanded);
                 continue;
@@ -2507,7 +2914,9 @@ fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContex
         })
         .collect();
     let all_resolved = resolved.iter().all(|r| r.is_some())
-        && columns.iter().all(|c| !matches!(&c.expr, Expr::Column { name, .. } if name == "*"));
+        && columns
+            .iter()
+            .all(|c| !matches!(&c.expr, Expr::Column { name, .. } if name == "*"));
 
     // ---- IDENTITY FAST PATH ----
     // `SELECT *`, `SELECT t.*`-style star projections, or any projection
@@ -2516,14 +2925,17 @@ fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContex
     // Vecs — for a 1000-row scan that's 1000 allocations + 2000+ Value
     // clones eliminated. Only the column NAMES can differ (aliases / star
     // unqualification); the values are byte-identical.
-    let single_star = columns.len() == 1
-        && matches!(&columns[0].expr, Expr::Column { name, .. } if name == "*");
+    let single_star =
+        columns.len() == 1 && matches!(&columns[0].expr, Expr::Column { name, .. } if name == "*");
     let identity_projection = single_star
         || (all_resolved
             && resolved.len() == inner.columns.len()
             && resolved.iter().enumerate().all(|(i, r)| r == &Some(i)));
     if identity_projection {
-        return Ok(ExecResult { columns: out_columns.into(), rows: inner.rows });
+        return Ok(ExecResult {
+            columns: out_columns.into(),
+            rows: inner.rows,
+        });
     }
 
     let mut out_rows = Vec::with_capacity(inner.rows.len());
@@ -2550,12 +2962,21 @@ fn apply_projection(inner: ExecResult, columns: &[ProjectExpr], ctx: &ExecContex
                         continue;
                     }
                 }
-                out.push(eval_row(&c.expr, row, &inner.columns, &ctx.params, &ctx.named_params)?);
+                out.push(eval_row(
+                    &c.expr,
+                    row,
+                    &inner.columns,
+                    &ctx.params,
+                    &ctx.named_params,
+                )?);
             }
             out_rows.push(out);
         }
     }
-    Ok(ExecResult { columns: out_columns.into(), rows: out_rows })
+    Ok(ExecResult {
+        columns: out_columns.into(),
+        rows: out_rows,
+    })
 }
 
 /// Resolve a column reference to an index in `col_names`, mirroring
@@ -2599,7 +3020,8 @@ fn resolve_column_index_two_sides(
         // Inner virtual entries: "prefix.col".
         for (j, c) in inner_cols.iter().enumerate() {
             let cname = c.name.as_str();
-            if inner_prefix.len() == t.len() && cname.len() == name.len()
+            if inner_prefix.len() == t.len()
+                && cname.len() == name.len()
                 && inner_prefix.eq_ignore_ascii_case(t)
                 && cname.eq_ignore_ascii_case(name)
             {
@@ -2642,11 +3064,7 @@ fn resolve_column_index_two_sides(
     None
 }
 
-fn resolve_column_index(
-    col_names: &[String],
-    table: Option<&str>,
-    name: &str,
-) -> Option<usize> {
+fn resolve_column_index(col_names: &[String], table: Option<&str>, name: &str) -> Option<usize> {
     // Allocation-free: the old version built `to_ascii_lowercase()` copies
     // of the qualifier, the name, AND every candidate column name — 3+
     // heap Strings per resolution, paid per projected column per query in
@@ -2705,7 +3123,12 @@ pub fn expr_display_name(e: &Expr) -> String {
             }
         }
         Expr::Literal(v) => format!("{}", v),
-        Expr::Function { name, distinct, args, .. } => {
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            ..
+        } => {
             let rendered: Vec<String> = args
                 .iter()
                 .map(|a| match a {
@@ -2777,7 +3200,11 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
             } else {
                 va.cmp(&vb)
             };
-            let ord = if term.order == Order::Desc { ord.reverse() } else { ord };
+            let ord = if term.order == Order::Desc {
+                ord.reverse()
+            } else {
+                ord
+            };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -2814,7 +3241,12 @@ fn sort_key(
 // Limit
 // ============================================================================
 
-fn exec_limit(ctx: &mut ExecContext<'_>, input: &Plan, count: &Expr, offset: &Expr) -> Result<ExecResult> {
+fn exec_limit(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    count: &Expr,
+    offset: &Expr,
+) -> Result<ExecResult> {
     // LIMIT PUSHDOWN: for `Limit(Filter(Scan))` and `Limit(Scan)`, stop the
     // scan as soon as `offset + count` rows have passed the filter instead
     // of materializing the whole table and truncating — the classic
@@ -2839,18 +3271,23 @@ fn exec_limit(ctx: &mut ExecContext<'_>, input: &Plan, count: &Expr, offset: &Ex
                         // Limit(Project(Scan)) — the projection is 1:1, so
                         // limiting before projecting yields identical rows.
                         let pushed: Option<ExecResult> = match input {
-                            Plan::Filter { input: inner, predicate } => {
-                                scan_filter_limit(ctx, inner, Some(predicate), Some(stop))?
-                            }
+                            Plan::Filter {
+                                input: inner,
+                                predicate,
+                            } => scan_filter_limit(ctx, inner, Some(predicate), Some(stop))?,
                             Plan::Scan { index: None, .. } => {
                                 scan_filter_limit(ctx, input, None, Some(stop))?
                             }
-                            Plan::Project { input: inner, columns } => match inner.as_ref() {
-                                Plan::Filter { input: scan, predicate } => {
-                                    scan_filter_limit(ctx, scan, Some(predicate), Some(stop))?
-                                        .map(|res| apply_projection(res, columns, ctx))
-                                        .transpose()?
-                                }
+                            Plan::Project {
+                                input: inner,
+                                columns,
+                            } => match inner.as_ref() {
+                                Plan::Filter {
+                                    input: scan,
+                                    predicate,
+                                } => scan_filter_limit(ctx, scan, Some(predicate), Some(stop))?
+                                    .map(|res| apply_projection(res, columns, ctx))
+                                    .transpose()?,
                                 Plan::Scan { index: None, .. } => {
                                     scan_filter_limit(ctx, inner, None, Some(stop))?
                                         .map(|res| apply_projection(res, columns, ctx))
@@ -3013,7 +3450,6 @@ struct HashGrouper {
     groups: Vec<(Vec<Value>, Vec<AggState>)>,
 }
 
-
 impl HashGrouper {
     /// Find or create the group for `key`, returning its index.
     /// `key` is typically a reusable scratch buffer — its contents are
@@ -3086,7 +3522,7 @@ impl Default for AggState {
         Self {
             count: 0,
             sum: 0.0,
-            sum_is_int: true,  // Optimistic: assume int until we see a Real.
+            sum_is_int: true, // Optimistic: assume int until we see a Real.
             int_sum: 0,
             min: None,
             max: None,
@@ -3144,7 +3580,11 @@ fn exec_aggregate_streaming_scan(
     // Qualified column names ("t.col") — needed for eval_row calls on the
     // slow path (filter predicates / non-column group keys / non-column
     // aggregate args). The fast path avoids them entirely.
-    let columns: Vec<String> = table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect();
+    let columns: Vec<String> = table
+        .columns
+        .iter()
+        .map(|c| format!("{}.{}", prefix, c.name))
+        .collect();
 
     // ---- Vectorized setup: resolve everything ONCE before the scan ----
     //
@@ -3159,18 +3599,21 @@ fn exec_aggregate_streaming_scan(
         .iter()
         .map(|e| match e {
             Expr::Column { table: ref_t, name } => {
-                let matches = ref_t.as_ref().map(|t| {
-                    // SQL scoping: an alias REPLACES the table name —
-                    // `t.col` must NOT bind to a `FROM t t2` instance
-                    // (otherwise a correlated reference to an outer
-                    // un-aliased `t` is silently captured by the inner
-                    // alias and compared against itself).
-                    if prefix == table.name {
-                        t == &table.name || t == prefix
-                    } else {
-                        t == prefix
-                    }
-                }).unwrap_or(true);
+                let matches = ref_t
+                    .as_ref()
+                    .map(|t| {
+                        // SQL scoping: an alias REPLACES the table name —
+                        // `t.col` must NOT bind to a `FROM t t2` instance
+                        // (otherwise a correlated reference to an outer
+                        // un-aliased `t` is silently captured by the inner
+                        // alias and compared against itself).
+                        if prefix == table.name {
+                            t == &table.name || t == prefix
+                        } else {
+                            t == prefix
+                        }
+                    })
+                    .unwrap_or(true);
                 if matches {
                     table.find_column(name)
                 } else {
@@ -3184,18 +3627,21 @@ fn exec_aggregate_streaming_scan(
         .iter()
         .map(|agg| match &agg.arg {
             Some(Expr::Column { table: ref_t, name }) => {
-                let matches = ref_t.as_ref().map(|t| {
-                    // SQL scoping: an alias REPLACES the table name —
-                    // `t.col` must NOT bind to a `FROM t t2` instance
-                    // (otherwise a correlated reference to an outer
-                    // un-aliased `t` is silently captured by the inner
-                    // alias and compared against itself).
-                    if prefix == table.name {
-                        t == &table.name || t == prefix
-                    } else {
-                        t == prefix
-                    }
-                }).unwrap_or(true);
+                let matches = ref_t
+                    .as_ref()
+                    .map(|t| {
+                        // SQL scoping: an alias REPLACES the table name —
+                        // `t.col` must NOT bind to a `FROM t t2` instance
+                        // (otherwise a correlated reference to an outer
+                        // un-aliased `t` is silently captured by the inner
+                        // alias and compared against itself).
+                        if prefix == table.name {
+                            t == &table.name || t == prefix
+                        } else {
+                            t == prefix
+                        }
+                    })
+                    .unwrap_or(true);
                 if matches {
                     table.find_column(name)
                 } else {
@@ -3205,10 +3651,13 @@ fn exec_aggregate_streaming_scan(
             _ => None, // COUNT(*) or a non-column arg
         })
         .collect();
-    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
 
-    let all_resolved = key_col_indices.iter().all(|x| x.is_some())
-        && agg_col_indices.iter().all(|x| x.is_some());
+    let all_resolved =
+        key_col_indices.iter().all(|x| x.is_some()) && agg_col_indices.iter().all(|x| x.is_some());
     let selective_eligible = all_resolved && filter_predicate.is_none();
 
     // Sorted, deduped list of column indices to decode on the selective path.
@@ -3237,7 +3686,9 @@ fn exec_aggregate_streaming_scan(
         // ==== Fully vectorized path: selective decode + direct indexing ====
         let rowid_alias = table.rowid_alias;
         bt.scan_table_borrowed(|rowid, payload| {
-            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf).is_err() {
+            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
+                .is_err()
+            {
                 return true; // skip corrupt rows
             }
             // Build the group key from the decoded slice. Map each group-by
@@ -3268,7 +3719,12 @@ fn exec_aggregate_streaming_scan(
                     }
                     None => Value::Integer(1), // COUNT(*)
                 };
-                update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+                update_agg_state(
+                    &mut grouper.groups[gi].1[i],
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                );
             }
             true
         })?;
@@ -3311,12 +3767,11 @@ fn exec_aggregate_streaming_scan(
                 None => None, // COUNT(*): no argument to evaluate
             })
             .collect();
-        let keys_all_compile = compiled_keys.iter().all(|k| k.is_some())
-            && compiled_keys.len() == group_by.len();
-        let args_all_compile = aggregates
-            .iter()
-            .enumerate()
-            .all(|(i, agg)| agg.arg.is_none() || agg_col_indices[i].is_some() || compiled_args[i].is_some());
+        let keys_all_compile =
+            compiled_keys.iter().all(|k| k.is_some()) && compiled_keys.len() == group_by.len();
+        let args_all_compile = aggregates.iter().enumerate().all(|(i, agg)| {
+            agg.arg.is_none() || agg_col_indices[i].is_some() || compiled_args[i].is_some()
+        });
 
         let single_key = group_by.len() == 1;
         let rowid_alias = table.rowid_alias;
@@ -3342,7 +3797,12 @@ fn exec_aggregate_streaming_scan(
             let mut owned_key: Value = Value::Null;
             bt.scan_table_borrowed(|rowid, payload| {
                 if decode_row_selective_wide(
-                    payload, n_cols, &wanted, rowid, rowid_alias, &mut wide,
+                    payload,
+                    n_cols,
+                    &wanted,
+                    rowid,
+                    rowid_alias,
+                    &mut wide,
                 )
                 .is_err()
                 {
@@ -3386,7 +3846,12 @@ fn exec_aggregate_streaming_scan(
                 for (i, agg) in aggregates.iter().enumerate() {
                     if agg.arg.is_none() {
                         // COUNT(*): constant placeholder, no evaluation.
-                        update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &COUNT_STAR_ARG, false);
+                        update_agg_state(
+                            &mut grouper.groups[gi].1[i],
+                            agg_funcs[i],
+                            &COUNT_STAR_ARG,
+                            false,
+                        );
                         continue;
                     }
                     let arg_val = match (agg_col_indices[i], &compiled_args[i]) {
@@ -3394,7 +3859,12 @@ fn exec_aggregate_streaming_scan(
                         (None, Some(c)) => c.eval(&wide, params),
                         (None, None) => Value::Null,
                     };
-                    update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+                    update_agg_state(
+                        &mut grouper.groups[gi].1[i],
+                        agg_funcs[i],
+                        &arg_val,
+                        agg.distinct,
+                    );
                 }
                 true
             })?;
@@ -3447,13 +3917,20 @@ fn exec_aggregate_streaming_scan(
             for (i, agg) in aggregates.iter().enumerate() {
                 let arg_val = match (&agg.arg, agg_col_indices[i]) {
                     (Some(_), Some(idx)) => row_buf[idx].clone(),
-                    (Some(arg), None) => match eval_row(arg, &row_buf, &columns, params, named_params) {
-                        Ok(v) => v,
-                        Err(_) => Value::Null,
-                    },
+                    (Some(arg), None) => {
+                        match eval_row(arg, &row_buf, &columns, params, named_params) {
+                            Ok(v) => v,
+                            Err(_) => Value::Null,
+                        }
+                    }
                     (None, _) => Value::Integer(1), // COUNT(*)
                 };
-                update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+                update_agg_state(
+                    &mut grouper.groups[gi].1[i],
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                );
             }
             true
         })?;
@@ -3483,7 +3960,10 @@ fn finish_group_result(
     for (i, g) in group_by.iter().enumerate() {
         let name = match g {
             Expr::Column { table: None, name } => name.clone(),
-            Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+            Expr::Column {
+                table: Some(t),
+                name,
+            } => format!("{}.{}", t, name),
             _ => format!("col{}", i + 1),
         };
         out_cols.push(name);
@@ -3492,7 +3972,10 @@ fn finish_group_result(
         out_cols.push(format!("__agg_{}", i));
     }
 
-    Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
+    Ok(ExecResult {
+        columns: out_cols.into(),
+        rows: out_rows,
+    })
 }
 
 /// COUNT(*) placeholder argument: update_agg_state's non-NULL integer,
@@ -3540,18 +4023,21 @@ fn exec_aggregate_no_group_by(
         if let Some(arg) = &agg.arg {
             if let Expr::Column { table: ref_t, name } = arg {
                 // Verify the table matches (or is None).
-                let matches = ref_t.as_ref().map(|t| {
-                    // SQL scoping: an alias REPLACES the table name —
-                    // `t.col` must NOT bind to a `FROM t t2` instance
-                    // (otherwise a correlated reference to an outer
-                    // un-aliased `t` is silently captured by the inner
-                    // alias and compared against itself).
-                    if prefix == table.name {
-                        t == &table.name || t == prefix
-                    } else {
-                        t == prefix
-                    }
-                }).unwrap_or(true);
+                let matches = ref_t
+                    .as_ref()
+                    .map(|t| {
+                        // SQL scoping: an alias REPLACES the table name —
+                        // `t.col` must NOT bind to a `FROM t t2` instance
+                        // (otherwise a correlated reference to an outer
+                        // un-aliased `t` is silently captured by the inner
+                        // alias and compared against itself).
+                        if prefix == table.name {
+                            t == &table.name || t == prefix
+                        } else {
+                            t == prefix
+                        }
+                    })
+                    .unwrap_or(true);
                 if matches {
                     if let Some(idx) = table.find_column(name) {
                         agg_col_indices.push(Some(idx));
@@ -3577,11 +4063,20 @@ fn exec_aggregate_no_group_by(
     let columns: Option<Vec<String>> = if all_columns {
         None
     } else {
-        Some(table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect())
+        Some(
+            table
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", prefix, c.name))
+                .collect(),
+        )
     };
     let columns_ref = columns.as_ref();
 
-    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
     let mut states: Vec<AggState> = (0..aggregates.len()).map(|_| AggState::default()).collect();
     let mut saw_any_row = false;
 
@@ -3626,7 +4121,9 @@ fn exec_aggregate_no_group_by(
             let mut bt = Btree::new(ctx.pager, root, false);
             let rowid_alias = table.rowid_alias;
             bt.scan_table_borrowed(|rowid, payload| {
-                if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf).is_err() {
+                if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
+                    .is_err()
+                {
                     return true;
                 }
                 if !pred.eval(&sel_buf, &positions, params) {
@@ -3641,7 +4138,12 @@ fn exec_aggregate_no_group_by(
                     } else {
                         Value::Null
                     };
-                    update_agg_state(&mut states[i], agg_funcs[i], &arg_val, aggregates[i].distinct);
+                    update_agg_state(
+                        &mut states[i],
+                        agg_funcs[i],
+                        &arg_val,
+                        aggregates[i].distinct,
+                    );
                 }
                 true
             })?;
@@ -3679,7 +4181,13 @@ fn exec_aggregate_no_group_by(
         let wanted_names: Option<Vec<String>> = if filter_predicate.is_some() {
             // The filter eval path needs `col_names` to match row indices.
             // Build the full col_names vec since eval_row expects all cols.
-            Some(table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect())
+            Some(
+                table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", prefix, c.name))
+                    .collect(),
+            )
         } else {
             None
         };
@@ -3695,7 +4203,9 @@ fn exec_aggregate_no_group_by(
         let rowid_alias = table.rowid_alias;
         bt.scan_table_borrowed(|rowid, payload| {
             // Decode only the wanted columns.
-            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf).is_err() {
+            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
+                .is_err()
+            {
                 return true;
             }
             // Apply the filter predicate, if any. We need a full row buffer
@@ -3705,7 +4215,9 @@ fn exec_aggregate_no_group_by(
             // cheaper than decode_row_into because we skip the heavy Text/Blob
             // allocations on un-wanted cols (only Integer/Real decoded).
             if let Some(pred) = filter_predicate {
-                let cols = wanted_names.as_ref().expect("col_names built when filter is present");
+                let cols = wanted_names
+                    .as_ref()
+                    .expect("col_names built when filter is present");
                 // Expand into full_row_buf at the correct positions.
                 full_row_buf.clear();
                 full_row_buf.resize(n_cols, Value::Null);
@@ -3731,7 +4243,9 @@ fn exec_aggregate_no_group_by(
                 {
                     sel_buf[wanted_pos].clone()
                 } else if let Some(arg) = &agg.arg {
-                    let cols = wanted_names.as_ref().expect("col_names built when not all are Column");
+                    let cols = wanted_names
+                        .as_ref()
+                        .expect("col_names built when not all are Column");
                     // Fall back to eval_row for non-Column args.
                     let mut full_row = vec![Value::Null; n_cols];
                     for (j, &col_idx) in wanted.iter().enumerate() {
@@ -3799,13 +4313,24 @@ fn exec_aggregate_no_group_by(
 
 /// Finalize a no-GROUP-BY aggregate into its single output row.
 /// SQLite semantics: an empty input emits one row of NULLs (COUNT → 0).
-fn finish_no_group_by(aggregates: &[AggExpr], states: Vec<AggState>, _saw_any_row: bool) -> Result<ExecResult> {
+fn finish_no_group_by(
+    aggregates: &[AggExpr],
+    states: Vec<AggState>,
+    _saw_any_row: bool,
+) -> Result<ExecResult> {
     let mut out_row: Vec<Value> = Vec::with_capacity(aggregates.len());
     for (i, agg) in aggregates.iter().enumerate() {
         out_row.push(finalize_agg(&states[i], &agg.func));
     }
-    let out_cols: Vec<String> = aggregates.iter().enumerate().map(|(i, _)| format!("__agg_{}", i)).collect();
-    Ok(ExecResult { columns: out_cols.into(), rows: vec![out_row] })
+    let out_cols: Vec<String> = aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("__agg_{}", i))
+        .collect();
+    Ok(ExecResult {
+        columns: out_cols.into(),
+        rows: vec![out_row],
+    })
 }
 
 /// True iff `expr` only references `Column` references that resolve
@@ -3821,7 +4346,9 @@ fn expr_only_columns(expr: &Expr, table: &Table, prefix: &str) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) => true,
         Expr::Column { table: ref_t, name } => {
-            let matches_t = ref_t.as_ref().map(|t| {
+            let matches_t = ref_t
+                .as_ref()
+                .map(|t| {
                     // SQL scoping: an alias REPLACES the table name —
                     // `t.col` must NOT bind to a `FROM t t2` instance
                     // (otherwise a correlated reference to an outer
@@ -3832,14 +4359,17 @@ fn expr_only_columns(expr: &Expr, table: &Table, prefix: &str) -> bool {
                     } else {
                         t == prefix
                     }
-                }).unwrap_or(true);
+                })
+                .unwrap_or(true);
             matches_t && table.find_column(name).is_some()
         }
         Expr::Binary { left, right, .. } => {
             expr_only_columns(left, table, prefix) && expr_only_columns(right, table, prefix)
         }
         Expr::Unary { expr, .. } => expr_only_columns(expr, table, prefix),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             expr_only_columns(expr, table, prefix)
                 && expr_only_columns(low, table, prefix)
                 && expr_only_columns(high, table, prefix)
@@ -3848,16 +4378,36 @@ fn expr_only_columns(expr: &Expr, table: &Table, prefix: &str) -> bool {
         Expr::Is { left, right, .. } => {
             expr_only_columns(left, table, prefix) && expr_only_columns(right, table, prefix)
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             expr_only_columns(expr, table, prefix)
                 && expr_only_columns(pattern, table, prefix)
-                && escape.as_ref().map(|e| expr_only_columns(e, table, prefix)).unwrap_or(true)
+                && escape
+                    .as_ref()
+                    .map(|e| expr_only_columns(e, table, prefix))
+                    .unwrap_or(true)
         }
         Expr::Function { args, .. } => args.iter().all(|a| expr_only_columns(a, table, prefix)),
-        Expr::Case { operand, whens, else_ } => {
-            operand.as_ref().map(|o| expr_only_columns(o, table, prefix)).unwrap_or(true)
-                && whens.iter().all(|(w, t)| expr_only_columns(w, table, prefix) && expr_only_columns(t, table, prefix))
-                && else_.as_ref().map(|e| expr_only_columns(e, table, prefix)).unwrap_or(true)
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand
+                .as_ref()
+                .map(|o| expr_only_columns(o, table, prefix))
+                .unwrap_or(true)
+                && whens.iter().all(|(w, t)| {
+                    expr_only_columns(w, table, prefix) && expr_only_columns(t, table, prefix)
+                })
+                && else_
+                    .as_ref()
+                    .map(|e| expr_only_columns(e, table, prefix))
+                    .unwrap_or(true)
         }
         Expr::Row(exprs) => exprs.iter().all(|e| expr_only_columns(e, table, prefix)),
         // Conservatively, anything else (subqueries with complex sources,
@@ -3873,7 +4423,9 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) => {}
         Expr::Column { table: ref_t, name } => {
-            let matches_t = ref_t.as_ref().map(|t| {
+            let matches_t = ref_t
+                .as_ref()
+                .map(|t| {
                     // SQL scoping: an alias REPLACES the table name —
                     // `t.col` must NOT bind to a `FROM t t2` instance
                     // (otherwise a correlated reference to an outer
@@ -3884,7 +4436,8 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
                     } else {
                         t == prefix
                     }
-                }).unwrap_or(true);
+                })
+                .unwrap_or(true);
             if matches_t {
                 if let Some(idx) = table.find_column(name) {
                     out.push(idx);
@@ -3896,7 +4449,9 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
             collect_column_indices(right, table, prefix, out);
         }
         Expr::Unary { expr, .. } => collect_column_indices(expr, table, prefix, out),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_column_indices(expr, table, prefix, out);
             collect_column_indices(low, table, prefix, out);
             collect_column_indices(high, table, prefix, out);
@@ -3906,7 +4461,12 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
             collect_column_indices(left, table, prefix, out);
             collect_column_indices(right, table, prefix, out);
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             collect_column_indices(expr, table, prefix, out);
             collect_column_indices(pattern, table, prefix, out);
             if let Some(e) = escape {
@@ -3918,22 +4478,37 @@ fn collect_column_indices(expr: &Expr, table: &Table, prefix: &str, out: &mut Ve
                 collect_column_indices(a, table, prefix, out);
             }
         }
-        Expr::Case { operand, whens, else_ } => {
-            if let Some(o) = operand { collect_column_indices(o, table, prefix, out); }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_column_indices(o, table, prefix, out);
+            }
             for (w, t) in whens {
                 collect_column_indices(w, table, prefix, out);
                 collect_column_indices(t, table, prefix, out);
             }
-            if let Some(e) = else_ { collect_column_indices(e, table, prefix, out); }
+            if let Some(e) = else_ {
+                collect_column_indices(e, table, prefix, out);
+            }
         }
         Expr::Row(exprs) => {
-            for e in exprs { collect_column_indices(e, table, prefix, out); }
+            for e in exprs {
+                collect_column_indices(e, table, prefix, out);
+            }
         }
         _ => {}
     }
 }
 
-fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], aggregates: &[AggExpr]) -> Result<ExecResult> {
+fn exec_aggregate(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> Result<ExecResult> {
     // USER AGGREGATES: when any aggregate function name resolves to a
     // registered plugin aggregate, run the generic path. It materializes
     // the input and steps plugin states with full error propagation
@@ -3952,37 +4527,56 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     // ~10x faster than the streaming scan + decode path.
     if group_by.is_empty()
         && aggregates.len() == 1
-        && matches!(input, Plan::Scan { predicate: None, .. })
+        && matches!(
+            input,
+            Plan::Scan {
+                predicate: None,
+                ..
+            }
+        )
     {
         if let Plan::Scan { table, .. } = input {
             // Virtual tables have no B+tree to count cells in.
             if table.vtab.is_some() {
                 // fall through to the general path (vtab scan + aggregate)
             } else {
-            let agg = &aggregates[0];
-            // COUNT(*) — arg is None (the planner emits COUNT(*) with no arg).
-            // COUNT(col) — arg is Some(Column). We can't use the fast path
-            // for COUNT(col) because we need to skip NULLs, which requires
-            // decoding.
-            if agg.func == "count" && agg.arg.is_none() && !agg.distinct {
-                let root = ctx.table_root(table);
-                let mut bt = Btree::new(ctx.pager, root, false);
-                let n = bt.count_rows()?;
-                let row: Vec<Value> = vec![Value::Integer(n as i64)];
-                return Ok(ExecResult {
-                    columns: Arc::from(vec!["__agg_0".to_string()]),
-                    rows: vec![row],
-                });
-            }
+                let agg = &aggregates[0];
+                // COUNT(*) — arg is None (the planner emits COUNT(*) with no arg).
+                // COUNT(col) — arg is Some(Column). We can't use the fast path
+                // for COUNT(col) because we need to skip NULLs, which requires
+                // decoding.
+                if agg.func == "count" && agg.arg.is_none() && !agg.distinct {
+                    let root = ctx.table_root(table);
+                    let mut bt = Btree::new(ctx.pager, root, false);
+                    let n = bt.count_rows()?;
+                    let row: Vec<Value> = vec![Value::Integer(n as i64)];
+                    return Ok(ExecResult {
+                        columns: Arc::from(vec!["__agg_0".to_string()]),
+                        rows: vec![row],
+                    });
+                }
             }
         }
     }
     // Fast path #1: input is a bare Scan.
     // Handles: `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t`
     //          `SELECT col, COUNT(*) FROM t GROUP BY col`
-    if let Plan::Scan { table, alias, index: None, predicate: None } = input {
+    if let Plan::Scan {
+        table,
+        alias,
+        index: None,
+        predicate: None,
+    } = input
+    {
         if table.vtab.is_none() {
-            return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), None, group_by, aggregates);
+            return exec_aggregate_streaming_scan(
+                ctx,
+                table.clone(),
+                alias.clone(),
+                None,
+                group_by,
+                aggregates,
+            );
         }
     }
     // Fast path #1b: COUNT(*) over a RowidRange — count leaf CELLS in the
@@ -3999,10 +4593,18 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         && aggregates[0].arg.is_none()
         && !aggregates[0].distinct
     {
-        if let Plan::RowidRange { table, start, end, residual: None, .. } = input {
+        if let Plan::RowidRange {
+            table,
+            start,
+            end,
+            residual: None,
+            ..
+        } = input
+        {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let start_v = match start {
                 Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
                 None => i64::MIN,
@@ -4024,10 +4626,27 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     // Fast path #2: input is Filter(Scan, predicate).
     // Handles: `SELECT COUNT(*) FROM t WHERE val > 5000`
     //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
-    if let Plan::Filter { input: inner, predicate } = input {
-        if let Plan::Scan { table, alias, index: None, predicate: None } = inner.as_ref() {
+    if let Plan::Filter {
+        input: inner,
+        predicate,
+    } = input
+    {
+        if let Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } = inner.as_ref()
+        {
             if table.vtab.is_none() {
-                return exec_aggregate_streaming_scan(ctx, table.clone(), alias.clone(), Some(predicate), group_by, aggregates);
+                return exec_aggregate_streaming_scan(
+                    ctx,
+                    table.clone(),
+                    alias.clone(),
+                    Some(predicate),
+                    group_by,
+                    aggregates,
+                );
             }
         }
     }
@@ -4042,7 +4661,14 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         && !aggregates[0].distinct
     {
         let covering = match input {
-            Plan::IndexRange { table, index, start, end, residual, .. } => {
+            Plan::IndexRange {
+                table,
+                index,
+                start,
+                end,
+                residual,
+                ..
+            } => {
                 if residual.is_none() {
                     Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
                 } else {
@@ -4053,7 +4679,15 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                 // The planner sometimes wraps IndexRange in a Filter with
                 // the range predicate as residual; only cover when the
                 // filter is exactly the index range (residual == predicate).
-                if let Plan::IndexRange { table, index, start, end, residual, .. } = inner.as_ref() {
+                if let Plan::IndexRange {
+                    table,
+                    index,
+                    start,
+                    end,
+                    residual,
+                    ..
+                } = inner.as_ref()
+                {
                     // Only cover when there is NO residual predicate —
                     // any residual condition needs row data, so the index
                     // alone can't answer the count. (Conservative: even a
@@ -4076,11 +4710,14 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
             // collation).
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let fold_bound = |e: &Expr| -> Result<Value> {
                 let v = evaluate(e, &eval_ctx)?;
                 Ok(match index.columns.first() {
-                    Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+                    Some(ic) => {
+                        crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned()
+                    }
                     None => v,
                 })
             };
@@ -4092,7 +4729,10 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                 Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
                 None => None,
             };
-            let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+            let scan_start: Vec<u8> = start_key
+                .as_ref()
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
             let mut n: i64 = 0;
             let index_root = ctx.index_root(&index);
             let mut index_bt = Btree::new(ctx.pager, index_root, true);
@@ -4123,13 +4763,18 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     // Borrow params directly (inner is an owned local — no conflict).
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
-    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
     // Resolve group-by exprs and agg args against the input's column names
     // once, so per-row work is an index read whenever possible.
     let key_col_indices: Vec<Option<usize>> = group_by
         .iter()
         .map(|e| match e {
-            Expr::Column { table, name } => resolve_column_index(&inner.columns, table.as_deref(), name),
+            Expr::Column { table, name } => {
+                resolve_column_index(&inner.columns, table.as_deref(), name)
+            }
             _ => None,
         })
         .collect();
@@ -4176,7 +4821,12 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
                 (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
                 (None, _) => Value::Integer(1),
             };
-            update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+            update_agg_state(
+                &mut grouper.groups[gi].1[i],
+                agg_funcs[i],
+                &arg_val,
+                agg.distinct,
+            );
         }
     }
 
@@ -4185,7 +4835,10 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
     // COUNT=0, SUM=NULL, AVG=NULL, MIN=NULL, MAX=NULL). This handles the
     // common `SELECT COUNT(*) FROM empty_table` case.
     if group_by.is_empty() && grouper.is_empty() && !aggregates.is_empty() {
-        grouper.groups.push((Vec::new(), (0..n_aggs).map(|_| AggState::default()).collect()));
+        grouper.groups.push((
+            Vec::new(),
+            (0..n_aggs).map(|_| AggState::default()).collect(),
+        ));
     }
 
     let mut out_rows = Vec::with_capacity(grouper.len());
@@ -4209,7 +4862,10 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         // "GROUP BY with NULL keys puts NULL group in the wrong order".
         let name = match g {
             Expr::Column { table: None, name } => name.clone(),
-            Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+            Expr::Column {
+                table: Some(t),
+                name,
+            } => format!("{}.{}", t, name),
             _ => format!("col{}", i + 1),
         };
         out_cols.push(name);
@@ -4222,7 +4878,10 @@ fn exec_aggregate(ctx: &mut ExecContext<'_>, input: &Plan, group_by: &[Expr], ag
         out_cols.push(format!("__agg_{}", i));
     }
 
-    Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
+    Ok(ExecResult {
+        columns: out_cols.into(),
+        rows: out_rows,
+    })
 }
 
 // ============================================================================
@@ -4251,7 +4910,9 @@ fn exec_plugin_aggregate(
     let key_col_indices: Vec<Option<usize>> = group_by
         .iter()
         .map(|e| match e {
-            Expr::Column { table, name } => resolve_column_index(&inner.columns, table.as_deref(), name),
+            Expr::Column { table, name } => {
+                resolve_column_index(&inner.columns, table.as_deref(), name)
+            }
             _ => None,
         })
         .collect();
@@ -4317,13 +4978,19 @@ fn exec_plugin_aggregate(
         if let Some(f) = crate::plugin::lookup_aggregate(&agg.func) {
             // Eager init: an empty group finalizes the fresh state
             // (SQLite calls xFinal even with no xStep).
-            Ok(Slot::Plugin { func: f.clone(), state: Some(f.init()) })
+            Ok(Slot::Plugin {
+                func: f.clone(),
+                state: Some(f.init()),
+            })
         } else {
             Ok(Slot::Builtin(AggState::default()))
         }
     };
 
-    let agg_funcs: Vec<AggFunc> = aggregates.iter().map(|a| AggFunc::from_name(&a.func)).collect();
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
     let mut grouper = Grouper {
         buckets: HashMap::new(),
         groups: Vec::new(),
@@ -4370,9 +5037,12 @@ fn exec_plugin_aggregate(
 
     // No GROUP BY + empty input → one row of initial states (COUNT=0 etc.).
     if group_by.is_empty() && grouper.is_empty() && !aggregates.is_empty() {
-        grouper
-            .groups
-            .push((Vec::new(), (0..aggregates.len()).map(|i| make_slot(&aggregates[i])).collect::<Result<Vec<_>>>()?));
+        grouper.groups.push((
+            Vec::new(),
+            (0..aggregates.len())
+                .map(|i| make_slot(&aggregates[i]))
+                .collect::<Result<Vec<_>>>()?,
+        ));
     }
 
     let mut out_rows = Vec::with_capacity(grouper.len());
@@ -4399,7 +5069,10 @@ fn exec_plugin_aggregate(
     for (i, g) in group_by.iter().enumerate() {
         let name = match g {
             Expr::Column { table: None, name } => name.clone(),
-            Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+            Expr::Column {
+                table: Some(t),
+                name,
+            } => format!("{}.{}", t, name),
             _ => format!("col{}", i + 1),
         };
         out_cols.push(name);
@@ -4408,7 +5081,10 @@ fn exec_plugin_aggregate(
         out_cols.push(format!("__agg_{}", i));
     }
 
-    Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
+    Ok(ExecResult {
+        columns: out_cols.into(),
+        rows: out_rows,
+    })
 }
 
 fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bool) {
@@ -4417,10 +5093,9 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
     // entirely. The key is a `SqlValueKey` (a Value clone — free for
     // Integer/Real) instead of the old `format!("{:?}")` String, saving
     // a heap allocation per row for DISTINCT aggregates.
-    if distinct
-        && !state.distinct.insert(SqlValueKey(v.clone())) {
-            return;
-        }
+    if distinct && !state.distinct.insert(SqlValueKey(v.clone())) {
+        return;
+    }
     // Only mark "seen_value" for non-NULL inputs. This makes SUM of all
     // NULLs return NULL (matching SQLite), rather than the previous
     // behavior of returning Integer(0) because seen_value was set
@@ -4463,24 +5138,21 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
             }
         }
         AggFunc::Min => {
-            if !v.is_null()
-                && (state.min.is_none() || v < state.min.as_ref().unwrap()) {
-                    state.min = Some(v.clone());
-                }
+            if !v.is_null() && (state.min.is_none() || v < state.min.as_ref().unwrap()) {
+                state.min = Some(v.clone());
+            }
         }
         AggFunc::Max => {
-            if !v.is_null()
-                && (state.max.is_none() || v > state.max.as_ref().unwrap()) {
-                    state.max = Some(v.clone());
-                }
-        }
-        AggFunc::GroupConcat
-            if !v.is_null() => {
-                if !state.concat.is_empty() {
-                    state.concat.push(',');
-                }
-                state.concat.push_str(&v.as_text());
+            if !v.is_null() && (state.max.is_none() || v > state.max.as_ref().unwrap()) {
+                state.max = Some(v.clone());
             }
+        }
+        AggFunc::GroupConcat if !v.is_null() => {
+            if !state.concat.is_empty() {
+                state.concat.push(',');
+            }
+            state.concat.push_str(&v.as_text());
+        }
         _ => {}
     }
 }
@@ -4517,7 +5189,11 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
 // Window functions
 // ============================================================================
 
-fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) -> Result<ExecResult> {
+fn exec_window(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    windows: &[WindowExpr],
+) -> Result<ExecResult> {
     let mut inner = execute(input, ctx)?;
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
@@ -4531,8 +5207,16 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
         let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
         let mut partition_map: HashMap<String, usize> = HashMap::new();
         for (i, row) in inner.rows.iter().enumerate() {
-            let key: Vec<Value> = w.partition_by.iter().map(|e| eval_row(e, row, &inner.columns, params, named_params)).collect::<Result<_>>()?;
-            let key_str = key.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join("|");
+            let key: Vec<Value> = w
+                .partition_by
+                .iter()
+                .map(|e| eval_row(e, row, &inner.columns, params, named_params))
+                .collect::<Result<_>>()?;
+            let key_str = key
+                .iter()
+                .map(|v| format!("{:?}", v))
+                .collect::<Vec<_>>()
+                .join("|");
             if let Some(&idx) = partition_map.get(&key_str) {
                 partitions[idx].1.push(i);
             } else {
@@ -4545,10 +5229,28 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
             let mut sorted_indices = indices.clone();
             if !w.order_by.is_empty() {
                 sorted_indices.sort_by(|a, b| {
-                    let va = eval_row(&w.order_by[0].expr, &inner.rows[*a], &inner.columns, params, named_params).unwrap_or(Value::Null);
-                    let vb = eval_row(&w.order_by[0].expr, &inner.rows[*b], &inner.columns, params, named_params).unwrap_or(Value::Null);
+                    let va = eval_row(
+                        &w.order_by[0].expr,
+                        &inner.rows[*a],
+                        &inner.columns,
+                        params,
+                        named_params,
+                    )
+                    .unwrap_or(Value::Null);
+                    let vb = eval_row(
+                        &w.order_by[0].expr,
+                        &inner.rows[*b],
+                        &inner.columns,
+                        params,
+                        named_params,
+                    )
+                    .unwrap_or(Value::Null);
                     let ord = va.cmp(&vb);
-                    if w.order_by[0].order == Order::Desc { ord.reverse() } else { ord }
+                    if w.order_by[0].order == Order::Desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
                 });
             }
 
@@ -4560,7 +5262,11 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
             for (pos_in_partition, &row_idx) in sorted_indices.iter().enumerate() {
                 row_num = (pos_in_partition + 1) as i64;
                 let row = &inner.rows[row_idx];
-                let key: Vec<Value> = w.order_by.iter().map(|t| eval_row(&t.expr, row, &inner.columns, params, named_params)).collect::<Result<_>>()?;
+                let key: Vec<Value> = w
+                    .order_by
+                    .iter()
+                    .map(|t| eval_row(&t.expr, row, &inner.columns, params, named_params))
+                    .collect::<Result<_>>()?;
                 if prev_key.as_ref() != Some(&key) {
                     rank += count_in_rank + 1;
                     count_in_rank = 0;
@@ -4569,7 +5275,16 @@ fn exec_window(ctx: &mut ExecContext<'_>, input: &Plan, windows: &[WindowExpr]) 
                 count_in_rank += 1;
                 prev_key = Some(key);
 
-                let val = compute_window_value(w, row_num, rank, dense_rank, row, &inner.columns, params, named_params)?;
+                let val = compute_window_value(
+                    w,
+                    row_num,
+                    rank,
+                    dense_rank,
+                    row,
+                    &inner.columns,
+                    params,
+                    named_params,
+                )?;
                 if extra_cols[row_idx].is_empty() {
                     extra_cols[row_idx] = vec![Value::Null; windows.len()];
                 }
@@ -4627,7 +5342,13 @@ fn compute_window_value(
 // Join (nested-loop)
 // ============================================================================
 
-fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: crate::sql::ast::JoinType, condition: &Option<Expr>) -> Result<ExecResult> {
+fn exec_join(
+    ctx: &mut ExecContext<'_>,
+    left: &Plan,
+    right: &Plan,
+    join_type: crate::sql::ast::JoinType,
+    condition: &Option<Expr>,
+) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
     let mut combined_cols: Vec<String> = left_res.columns.to_vec();
@@ -4657,7 +5378,12 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
                 right_matched[ri] = true;
             }
         }
-        if !matched && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
+        if !matched
+            && matches!(
+                join_type,
+                crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+            )
+        {
             let mut combined = left_row.clone();
             combined.extend(vec![Value::Null; n_right]);
             out_rows.push(combined);
@@ -4665,7 +5391,10 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
     }
 
     // RIGHT and FULL: emit unmatched right rows with NULL left.
-    if matches!(join_type, crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full) {
+    if matches!(
+        join_type,
+        crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+    ) {
         for (ri, right_row) in right_res.rows.iter().enumerate() {
             if !right_matched[ri] {
                 let mut combined = vec![Value::Null; n_left];
@@ -4675,7 +5404,10 @@ fn exec_join(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, join_type: cr
         }
     }
 
-    Ok(ExecResult { columns: combined_cols.into(), rows: out_rows })
+    Ok(ExecResult {
+        columns: combined_cols.into(),
+        rows: out_rows,
+    })
 }
 
 /// Hash join: build a hash table on the smaller side, then probe with the
@@ -4760,9 +5492,9 @@ fn exec_hash_join(
     let mut proj: Option<(Vec<usize>, Vec<String>)> = None;
     if let (Some(columns), true) = (projection, pure_equi) {
         if !columns.is_empty()
-            && columns.iter().all(|c| {
-                matches!(&c.expr, Expr::Column { name, .. } if name != "*")
-            })
+            && columns
+                .iter()
+                .all(|c| matches!(&c.expr, Expr::Column { name, .. } if name != "*"))
         {
             let mut indices = Vec::with_capacity(columns.len());
             let mut names = Vec::with_capacity(columns.len());
@@ -4798,7 +5530,10 @@ fn exec_hash_join(
     // joins we must preserve the side that's preserved by the join type, so
     // we fall back to the (correct-but-slower) right-side-build path. This
     // is the common case (real OLTP joins are overwhelmingly inner).
-    let is_inner = matches!(join_type, crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross);
+    let is_inner = matches!(
+        join_type,
+        crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+    );
     let left_is_smaller = left_res.rows.len() <= right_res.rows.len();
     let build_left = is_inner && left_is_smaller;
 
@@ -4881,13 +5616,14 @@ fn exec_hash_join(
     }
 
     // ---- PROBE phase ----
-    let (probe_rows, probe_key_indices, probe_is_left): (&Vec<Row>, Vec<usize>, bool) = if build_left {
-        let idxs: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
-        (&right_res.rows, idxs, false)
-    } else {
-        let idxs: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
-        (&left_res.rows, idxs, true)
-    };
+    let (probe_rows, probe_key_indices, probe_is_left): (&Vec<Row>, Vec<usize>, bool) =
+        if build_left {
+            let idxs: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
+            (&right_res.rows, idxs, false)
+        } else {
+            let idxs: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
+            (&left_res.rows, idxs, true)
+        };
 
     // Projection bookkeeping: output width and per-output-source mapping.
     // proj_indices[i] = combined-row index of output column i.
@@ -4965,9 +5701,7 @@ fn exec_hash_join(
                 Some(Value::Integer(iv)) => {
                     u64_probe_key = crate::types::value::double_order_key(*iv as f64)
                 }
-                Some(Value::Real(fv)) => {
-                    u64_probe_key = crate::types::value::double_order_key(*fv)
-                }
+                Some(Value::Real(fv)) => u64_probe_key = crate::types::value::double_order_key(*fv),
                 Some(_) => probe_null = true,
             }
         } else {
@@ -5007,12 +5741,28 @@ fn exec_hash_join(
                     }
                     let v = eval_row(res, &combined, &combined_cols, &params, &named_params)?;
                     if v.is_truthy() {
-                        emit_row(&mut out_rows, proj_indices, probe_row, build_row, probe_is_left, n_left, out_width);
+                        emit_row(
+                            &mut out_rows,
+                            proj_indices,
+                            probe_row,
+                            build_row,
+                            probe_is_left,
+                            n_left,
+                            out_width,
+                        );
                         matched = true;
                         build_matched[bi] = true;
                     }
                 } else {
-                    emit_row(&mut out_rows, proj_indices, probe_row, build_row, probe_is_left, n_left, out_width);
+                    emit_row(
+                        &mut out_rows,
+                        proj_indices,
+                        probe_row,
+                        build_row,
+                        probe_is_left,
+                        n_left,
+                        out_width,
+                    );
                     matched = true;
                     build_matched[bi] = true;
                 }
@@ -5027,7 +5777,12 @@ fn exec_hash_join(
         // If probe is left and the join preserves left (LEFT/FULL), emit [probe, NULLs].
         // If probe is right and the join preserves right (RIGHT/FULL), emit [NULLs, probe].
         if !matched {
-            if probe_is_left && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
+            if probe_is_left
+                && matches!(
+                    join_type,
+                    crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+                )
+            {
                 match proj_indices {
                     Some(idxs) => {
                         let mut out = Vec::with_capacity(idxs.len());
@@ -5049,7 +5804,12 @@ fn exec_hash_join(
                         out_rows.push(c);
                     }
                 }
-            } else if !probe_is_left && matches!(join_type, crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full) {
+            } else if !probe_is_left
+                && matches!(
+                    join_type,
+                    crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+                )
+            {
                 match proj_indices {
                     Some(idxs) => {
                         let mut out = Vec::with_capacity(idxs.len());
@@ -5079,7 +5839,12 @@ fn exec_hash_join(
     // Emit unmatched build-side rows for the outer-join case where the build
     // side is the preserved side (LEFT preserved by LEFT/FULL if build was left;
     // RIGHT preserved by RIGHT/FULL if build was right).
-    if build_left && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
+    if build_left
+        && matches!(
+            join_type,
+            crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+        )
+    {
         for (bi, build_row) in build_rows.iter().enumerate() {
             if !build_matched[bi] {
                 match proj_indices {
@@ -5105,7 +5870,12 @@ fn exec_hash_join(
                 }
             }
         }
-    } else if !build_left && matches!(join_type, crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full) {
+    } else if !build_left
+        && matches!(
+            join_type,
+            crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+        )
+    {
         for (bi, build_row) in build_rows.iter().enumerate() {
             if !build_matched[bi] {
                 match proj_indices {
@@ -5134,8 +5904,14 @@ fn exec_hash_join(
     }
 
     let result = match &proj {
-        Some((_, names)) => ExecResult { columns: names.clone().into(), rows: out_rows },
-        None => ExecResult { columns: combined_cols.into(), rows: out_rows },
+        Some((_, names)) => ExecResult {
+            columns: names.clone().into(),
+            rows: out_rows,
+        },
+        None => ExecResult {
+            columns: combined_cols.into(),
+            rows: out_rows,
+        },
     };
     // When a projection was requested but fusion couldn't fire (residual
     // predicates, non-column projections, unresolvable names), apply the
@@ -5152,26 +5928,42 @@ fn exec_hash_join(
 /// candidate row). Conservative: any leaf that does not unambiguously
 /// resolve to one column on each side disqualifies purity — the join then
 /// keeps per-row residual evaluation (correct, slightly slower).
-fn count_eq_leaves_and_purity(condition: &Option<Expr>, left_cols: &[String], right_cols: &[String]) -> Option<usize> {
+fn count_eq_leaves_and_purity(
+    condition: &Option<Expr>,
+    left_cols: &[String],
+    right_cols: &[String],
+) -> Option<usize> {
     fn walk(e: &Expr, lc: &[String], rc: &[String]) -> Option<usize> {
         match e {
-            Expr::Binary { op: BinaryOp::And, left, right } => {
-                Some(walk(left, lc, rc)? + walk(right, lc, rc)?)
-            }
-            Expr::Binary { op: BinaryOp::Eq, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => Some(walk(left, lc, rc)? + walk(right, lc, rc)?),
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
                 let l_in_left = col_index(left, lc).is_some();
                 let l_in_right = col_index(left, rc).is_some();
                 let r_in_left = col_index(right, lc).is_some();
                 let r_in_right = col_index(right, rc).is_some();
-                let unambiguous_one_each =
-                    ((l_in_left && !l_in_right) && (r_in_right && !r_in_left))
-                        || ((l_in_right && !l_in_left) && (r_in_left && !r_in_right));
-                if unambiguous_one_each { Some(1) } else { None }
+                let unambiguous_one_each = ((l_in_left && !l_in_right)
+                    && (r_in_right && !r_in_left))
+                    || ((l_in_right && !l_in_left) && (r_in_left && !r_in_right));
+                if unambiguous_one_each {
+                    Some(1)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
     }
-    condition.as_ref().and_then(|c| walk(c, left_cols, right_cols))
+    condition
+        .as_ref()
+        .and_then(|c| walk(c, left_cols, right_cols))
 }
 
 /// Extract equi-join key column pairs from a join condition.
@@ -5196,24 +5988,30 @@ fn collect_eq_pairs(
     pairs: &mut Vec<(usize, usize)>,
 ) {
     match expr {
-        Expr::Binary { op: BinaryOp::And, left, right } => {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
             collect_eq_pairs(left, left_cols, right_cols, pairs);
             collect_eq_pairs(right, left_cols, right_cols, pairs);
         }
-        Expr::Binary { op: BinaryOp::Eq, left, right } => {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
             // Try left.col = right.col
-            if let (Some(l_idx), Some(r_idx)) = (
-                col_index(left, left_cols),
-                col_index(right, right_cols),
-            ) {
+            if let (Some(l_idx), Some(r_idx)) =
+                (col_index(left, left_cols), col_index(right, right_cols))
+            {
                 pairs.push((l_idx, r_idx));
                 return;
             }
             // Try right.col = left.col
-            if let (Some(r_idx), Some(l_idx)) = (
-                col_index(left, right_cols),
-                col_index(right, left_cols),
-            ) {
+            if let (Some(r_idx), Some(l_idx)) =
+                (col_index(left, right_cols), col_index(right, left_cols))
+            {
                 pairs.push((l_idx, r_idx));
             }
         }
@@ -5238,9 +6036,7 @@ fn col_index(expr: &Expr, cols: &[String]) -> Option<usize> {
                     // c is typically "table.column" — split off the prefix.
                     if let Some(pos) = c.rfind('.') {
                         let (prefix, col_name) = (&c[..pos], &c[pos + 1..]);
-                        if prefix.eq_ignore_ascii_case(t)
-                            && col_name.eq_ignore_ascii_case(name)
-                        {
+                        if prefix.eq_ignore_ascii_case(t) && col_name.eq_ignore_ascii_case(name) {
                             return Some(i);
                         }
                     }
@@ -5314,9 +6110,9 @@ fn exec_index_nested_loop_join(
     let mut fused: Option<(Vec<usize>, Arc<[String]>)> = None;
     if let Some(columns) = projection {
         if !columns.is_empty()
-            && columns.iter().all(|c| {
-                matches!(&c.expr, Expr::Column { name, .. } if name != "*")
-            })
+            && columns
+                .iter()
+                .all(|c| matches!(&c.expr, Expr::Column { name, .. } if name != "*"))
         {
             let mut indices = Vec::with_capacity(columns.len());
             let mut names = Vec::with_capacity(columns.len());
@@ -5467,10 +6263,7 @@ fn exec_index_nested_loop_join(
                                 match wanted.binary_search(&inner_col) {
                                     Ok(slot) => {
                                         // Move out of the decoded row.
-                                        out.push(std::mem::replace(
-                                            &mut sel[slot],
-                                            Value::Null,
-                                        ));
+                                        out.push(std::mem::replace(&mut sel[slot], Value::Null));
                                     }
                                     Err(_) => out.push(Value::Null),
                                 }
@@ -5520,12 +6313,18 @@ fn exec_index_nested_loop_join(
             // fused path never pays this).
             let mut combined: Vec<String> = outer_res.columns.to_vec();
             combined.extend(
-                inner_table.columns.iter().map(|c| format!("{}.{}", inner_prefix, c.name)),
+                inner_table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", inner_prefix, c.name)),
             );
             combined.into()
         }
     };
-    Ok(ExecResult { columns: out_columns, rows: out_rows })
+    Ok(ExecResult {
+        columns: out_columns,
+        rows: out_rows,
+    })
 }
 
 // ============================================================================
@@ -5550,7 +6349,12 @@ fn exec_distinct(ctx: &mut ExecContext<'_>, input: &Plan) -> Result<ExecResult> 
 // Set operations
 // ============================================================================
 
-fn exec_union(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan, all: bool) -> Result<ExecResult> {
+fn exec_union(
+    ctx: &mut ExecContext<'_>,
+    left: &Plan,
+    right: &Plan,
+    all: bool,
+) -> Result<ExecResult> {
     let l = execute(left, ctx)?;
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
@@ -5579,7 +6383,10 @@ fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Resul
             seen.push(row.clone());
         }
     }
-    Ok(ExecResult { columns, rows: seen })
+    Ok(ExecResult {
+        columns,
+        rows: seen,
+    })
 }
 
 fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<ExecResult> {
@@ -5592,14 +6399,21 @@ fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<E
             seen.push(row.clone());
         }
     }
-    Ok(ExecResult { columns, rows: seen })
+    Ok(ExecResult {
+        columns,
+        rows: seen,
+    })
 }
 
 // ============================================================================
 // RowidLookup
 // ============================================================================
 
-fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &Expr) -> Result<ExecResult> {
+fn exec_rowid_lookup(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    rowid_expr: &Expr,
+) -> Result<ExecResult> {
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -5607,11 +6421,15 @@ fn exec_rowid_lookup(ctx: &mut ExecContext<'_>, table: Arc<Table>, rowid_expr: &
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
     let row = match bt.lookup_table(rowid)? {
-        LookupResult::Found(payload) => decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?,
-        LookupResult::NotFound => return Ok(ExecResult {
-            columns: table.col_names.clone(),
-            rows: Vec::new(),
-        }),
+        LookupResult::Found(payload) => {
+            decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?
+        }
+        LookupResult::NotFound => {
+            return Ok(ExecResult {
+                columns: table.col_names.clone(),
+                rows: Vec::new(),
+            })
+        }
     };
     Ok(ExecResult {
         columns: table.col_names.clone(),
@@ -5663,9 +6481,9 @@ fn exec_rowid_in(
     let alias = table.rowid_alias;
     let mut rows: Vec<Row> = Vec::with_capacity(rowids.len());
     for rowid in rowids {
-        if let Some(row) = bt.lookup_table_with(rowid, |payload| {
-            decode_row(payload, n_cols, rowid, alias)
-        })? {
+        if let Some(row) =
+            bt.lookup_table_with(rowid, |payload| decode_row(payload, n_cols, rowid, alias))?
+        {
             // Residual predicate (e.g. `id IN (...) AND name = 'x'`).
             if let Some(pred) = residual {
                 let v = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
@@ -5726,7 +6544,11 @@ fn exec_index_in(
         key_buf.clear();
         // Collated index: fold the probe key the same way stored keys
         // were folded (NOCASE / RTRIM).
-        crate::plugin::encode_collated_index_key_into(&index.columns, std::slice::from_ref(&v), &mut key_buf);
+        crate::plugin::encode_collated_index_key_into(
+            &index.columns,
+            std::slice::from_ref(&v),
+            &mut key_buf,
+        );
         encoded_keys.push(key_buf.clone());
     }
     encoded_keys.sort();
@@ -5735,11 +6557,12 @@ fn exec_index_in(
     for key_buf in &encoded_keys {
         let rowids = index_bt.lookup_index(key_buf)?;
         for rowid in rowids {
-            if let Some(row) = table_bt.lookup_table_with(rowid, |payload| {
-                decode_row(payload, n_cols, rowid, alias)
-            })? {
+            if let Some(row) = table_bt
+                .lookup_table_with(rowid, |payload| decode_row(payload, n_cols, rowid, alias))?
+            {
                 if let Some(pred) = residual {
-                    let pv = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                    let pv =
+                        eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
                     if !pv.is_truthy() {
                         continue;
                     }
@@ -5805,12 +6628,12 @@ fn exec_rowid_range(
     if let Some(res) = residual {
         let params: &[Value] = &ctx.params;
         let named_params = &ctx.named_params;
-        rows.retain(|row| {
-            match eval_row(res, row, &columns, params, named_params) {
+        rows.retain(
+            |row| match eval_row(res, row, &columns, params, named_params) {
                 Ok(v) => v.is_truthy(),
                 Err(_) => false,
-            }
-        });
+            },
+        );
     }
 
     Ok(ExecResult { columns, rows })
@@ -5837,7 +6660,10 @@ const IDENTITY_POSITIONS: &[usize] = &{
 /// decode the full row in table order) and `Some(indices)` means decode only
 /// those table column indices. Returns None unless EVERY projection expr is
 /// a bare column of the table (or the single "*" pseudo-column).
-fn bare_column_projection(columns: &[ProjectExpr], table: &Table) -> Option<crate::types::ProjectionMapping> {
+fn bare_column_projection(
+    columns: &[ProjectExpr],
+    table: &Table,
+) -> Option<crate::types::ProjectionMapping> {
     if columns.len() == 1 {
         if let Expr::Column { name, .. } = &columns[0].expr {
             if name == "*" {
@@ -5852,7 +6678,11 @@ fn bare_column_projection(columns: &[ProjectExpr], table: &Table) -> Option<crat
             Expr::Column { name, .. } => {
                 let idx = table.find_column(name)?;
                 idxs.push(idx);
-                names.push(pe.alias.clone().unwrap_or_else(|| table.columns[idx].name.clone()));
+                names.push(
+                    pe.alias
+                        .clone()
+                        .unwrap_or_else(|| table.columns[idx].name.clone()),
+                );
             }
             _ => return None,
         }
@@ -5891,7 +6721,8 @@ fn exec_rowid_range_projected(
         match project {
             Some(idxs) => {
                 let mut row = Vec::with_capacity(idxs.len());
-                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok() {
+                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok()
+                {
                     rows.push(row);
                 }
             }
@@ -5903,7 +6734,10 @@ fn exec_rowid_range_projected(
         }
         true
     })?;
-    Ok(ExecResult { columns: out_cols, rows })
+    Ok(ExecResult {
+        columns: out_cols,
+        rows,
+    })
 }
 
 /// RowidLookup with the projection fused (mirror of the api.rs fast path
@@ -5933,9 +6767,15 @@ fn exec_rowid_lookup_projected(
                 }
                 None => decode_row(&payload, n_cols, rowid, rowid_alias)?,
             };
-            Ok(ExecResult { columns: out_cols, rows: vec![row] })
+            Ok(ExecResult {
+                columns: out_cols,
+                rows: vec![row],
+            })
         }
-        LookupResult::NotFound => Ok(ExecResult { columns: out_cols, rows: Vec::new() }),
+        LookupResult::NotFound => Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        }),
     }
 }
 
@@ -5949,7 +6789,14 @@ fn exec_index_lookup(
     index: Arc<crate::schema::Index>,
     key_exprs: &[Expr],
 ) -> Result<ExecResult> {
-    exec_index_lookup_impl(ctx, table.clone(), index, key_exprs, None, table.col_names.clone())
+    exec_index_lookup_impl(
+        ctx,
+        table.clone(),
+        index,
+        key_exprs,
+        None,
+        table.col_names.clone(),
+    )
 }
 
 /// IndexLookup with the projection FUSED into the fetch: decodes ONLY the
@@ -5968,12 +6815,11 @@ fn exec_index_lookup_projected(
     if std::env::var_os("RSQL_DBG_IDXL").is_some() {
         eprintln!("[dbg] fused IndexLookup path taken");
     }
-    let (project, out_cols) = match projection
-        .and_then(|columns| bare_column_projection(columns, &table))
-    {
-        Some((p, n)) => (p, n),
-        None => (None, table.col_names.clone()),
-    };
+    let (project, out_cols) =
+        match projection.and_then(|columns| bare_column_projection(columns, &table)) {
+            Some((p, n)) => (p, n),
+            None => (None, table.col_names.clone()),
+        };
     exec_index_lookup_impl(ctx, table, index, key_exprs, project.as_deref(), out_cols)
 }
 
@@ -5989,7 +6835,8 @@ fn exec_index_lookup_impl(
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-    let key_values: Vec<Value> = key_exprs.iter()
+    let key_values: Vec<Value> = key_exprs
+        .iter()
         .map(|e| evaluate(e, &eval_ctx))
         .collect::<Result<_>>()?;
 
@@ -6062,10 +6909,9 @@ fn fetch_rows_by_rowids(
                 }
             }
             None => {
-                let found = table_bt
-                    .lookup_table_with(rowid, |payload| {
-                        decode_row(payload, n_cols, rowid, rowid_alias)
-                    })?;
+                let found = table_bt.lookup_table_with(rowid, |payload| {
+                    decode_row(payload, n_cols, rowid, rowid_alias)
+                })?;
                 if let Some(row) = found {
                     rows.push(row);
                 }
@@ -6123,7 +6969,10 @@ fn exec_index_range(
     };
 
     // Scan the index from the start bound.
-    let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+    let scan_start: Vec<u8> = start_key
+        .as_ref()
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default();
     let mut rowids: Vec<i64> = Vec::new();
     {
         let index_root = ctx.index_root(&index);
@@ -6178,26 +7027,28 @@ fn exec_index_range(
     //   sequential scan — the crossover is around 20-25% of the table.
     //   `max_rowid` (cached) approximates the row count.
     let max_rowid_hint = ctx.get_or_scan_max_rowid(&table).unwrap_or(0);
-    let use_merge_scan = max_rowid_hint > 0
-        && (rowids.len() as i64) * 4 > max_rowid_hint
-        && residual.is_none(); // residual needs full rows in index order? No —
-    // (residual is fine with merge scan too, but the output ORDER changes:
-    // merge scan emits rows in ROWID order, random lookups emit in INDEX
-    // order. Keep order stability only for the no-residual case... actually
-    // both are unordered bags for SQL without ORDER BY; residual is safe.
-    // We keep the residual restriction for simplicity of reasoning about
-    // filter semantics on partially-indexed predicates.)
+    let use_merge_scan =
+        max_rowid_hint > 0 && (rowids.len() as i64) * 4 > max_rowid_hint && residual.is_none(); // residual needs full rows in index order? No —
+                                                                                                // (residual is fine with merge scan too, but the output ORDER changes:
+                                                                                                // merge scan emits rows in ROWID order, random lookups emit in INDEX
+                                                                                                // order. Keep order stability only for the no-residual case... actually
+                                                                                                // both are unordered bags for SQL without ORDER BY; residual is safe.
+                                                                                                // We keep the residual restriction for simplicity of reasoning about
+                                                                                                // filter semantics on partially-indexed predicates.)
 
     if use_merge_scan {
         // Preserve the observable emission order (index order) even though
         // rows are FETCHED in rowid order: remember each rowid's original
         // position, then place decoded rows into a position-indexed slot.
         let index_order: Vec<i64> = rowids.clone();
-        let mut position: std::collections::HashMap<i64, usize, crate::storage::pager::PageIdHashBuild> =
-            std::collections::HashMap::with_capacity_and_hasher(
-                rowids.len(),
-                crate::storage::pager::PageIdHashBuild,
-            );
+        let mut position: std::collections::HashMap<
+            i64,
+            usize,
+            crate::storage::pager::PageIdHashBuild,
+        > = std::collections::HashMap::with_capacity_and_hasher(
+            rowids.len(),
+            crate::storage::pager::PageIdHashBuild,
+        );
         for (pos, rid) in index_order.iter().enumerate() {
             position.insert(*rid, pos);
         }
@@ -6224,10 +7075,12 @@ fn exec_index_range(
             ri += 1;
             if let Ok(row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
                 let keep = match residual_pred {
-                    Some(pred) => match eval_row(pred, &row, &plain_names, &params, &named_params) {
-                        Ok(v) => v.is_truthy(),
-                        Err(_) => false,
-                    },
+                    Some(pred) => {
+                        match eval_row(pred, &row, &plain_names, &params, &named_params) {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => false,
+                        }
+                    }
                     None => true,
                 };
                 if keep {
@@ -6354,7 +7207,15 @@ pub(crate) fn make_index_states(
         .collect()
 }
 
-fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, columns: Option<Vec<usize>>, on_conflict: ConflictResolution, upsert: Option<&crate::sql::ast::UpsertClause>, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+fn exec_insert(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    source: &Plan,
+    columns: Option<Vec<usize>>,
+    on_conflict: ConflictResolution,
+    upsert: Option<&crate::sql::ast::UpsertClause>,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+) -> Result<ExecResult> {
     // Virtual table: xUpdate with old_rowid = None. The source rows are
     // evaluated normally, then handed to the module.
     if table.vtab.is_some() {
@@ -6373,12 +7234,24 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
             let mut rows = Vec::with_capacity(returning_snapshot.len());
             for row in &returning_snapshot {
-                rows.push(project_returning_row(ret, row, &col_names, &ctx.params, &ctx.named_params)?);
+                rows.push(project_returning_row(
+                    ret,
+                    row,
+                    &col_names,
+                    &ctx.params,
+                    &ctx.named_params,
+                )?);
             }
             let names = returning_column_names(ret, &col_names);
-            return Ok(ExecResult { columns: names.into(), rows });
+            return Ok(ExecResult {
+                columns: names.into(),
+                rows,
+            });
         }
-        return Ok(ExecResult { columns: Arc::from(Vec::new()), rows: Vec::new() });
+        return Ok(ExecResult {
+            columns: Arc::from(Vec::new()),
+            rows: Vec::new(),
+        });
     }
     let target_indices: Vec<usize> = columns.unwrap_or_else(|| (0..table.n_columns()).collect());
     // Track the current root page — it may change if the B+tree splits.
@@ -6432,7 +7305,8 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             for v in full_row.iter_mut() {
                 *v = Value::Null;
             }
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut explicit_rowid: Option<i64> = None;
             for (i, expr) in exprs.iter().enumerate() {
                 if i < target_indices.len() {
@@ -6450,7 +7324,12 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             for (i, col) in table.columns.iter().enumerate() {
                 if full_row[i].is_null() && col.default.is_some() {
                     if let Some(default_expr) = &col.default {
-                        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                        let eval_ctx = EvalContext::new(
+                            &empty_row,
+                            &empty_cols,
+                            &ctx.params,
+                            &ctx.named_params,
+                        );
                         full_row[i] = evaluate(default_expr, &eval_ctx)?;
                     }
                 }
@@ -6474,14 +7353,24 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             // NOT NULL + CHECK constraints. Always enforced: the NOT NULL
             // loop is purely positional (no names needed); col_names is
             // only consulted for CHECK expressions (empty when absent).
-            enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+            enforce_row_constraints(
+                &table,
+                &full_row,
+                &col_names,
+                &ctx.params,
+                &ctx.named_params,
+            )?;
             // FOREIGN KEY (child side) — enforced only when the pragma is on.
             enforce_child_fks(ctx, &table, &full_row)?;
 
             // BEFORE INSERT triggers (NEW = the row about to be inserted,
             // rowid assigned + constraints enforced). An error aborts the
             // statement before the row is written.
-            if crate::executor::triggers::has_triggers_for(ctx, &table, &crate::sql::ast::TriggerEvent::Insert) {
+            if crate::executor::triggers::has_triggers_for(
+                ctx,
+                &table,
+                &crate::sql::ast::TriggerEvent::Insert,
+            ) {
                 crate::executor::triggers::fire_triggers(
                     ctx,
                     &table,
@@ -6502,22 +7391,46 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             }
 
             let outcome = exec_insert_one_row(
-                ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-                &mut full_row, &mut payload_buf, &mut index_states, on_conflict, upsert, rowid_autogen,
+                ctx,
+                &table,
+                &table_name_lc,
+                &mut current_root,
+                &mut max_rowid,
+                &mut full_row,
+                &mut payload_buf,
+                &mut index_states,
+                on_conflict,
+                upsert,
+                rowid_autogen,
                 explicit_rowid,
             )?;
-            let trigger_fired = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
+            let trigger_fired = matches!(
+                outcome,
+                InsertOutcome::Inserted | InsertOutcome::UpdatedExisting
+            );
             match outcome {
                 InsertOutcome::Inserted => {
                     inserted += 1;
                     if let Some(ret) = returning {
-                        returning_rows.push(project_returning_row(ret, &full_row, &col_names, &ctx.params, &ctx.named_params)?);
+                        returning_rows.push(project_returning_row(
+                            ret,
+                            &full_row,
+                            &col_names,
+                            &ctx.params,
+                            &ctx.named_params,
+                        )?);
                     }
                 }
                 InsertOutcome::UpdatedExisting => {
                     inserted += 1;
                     if let Some(ret) = returning {
-                        returning_rows.push(project_returning_row(ret, &full_row, &col_names, &ctx.params, &ctx.named_params)?);
+                        returning_rows.push(project_returning_row(
+                            ret,
+                            &full_row,
+                            &col_names,
+                            &ctx.params,
+                            &ctx.named_params,
+                        )?);
                     }
                 }
                 InsertOutcome::Skipped => {}
@@ -6525,7 +7438,11 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
             // AFTER INSERT triggers (skip the catalog lookup entirely when
             // the table has none).
             if trigger_fired
-                && crate::executor::triggers::has_triggers_for(ctx, &table, &crate::sql::ast::TriggerEvent::Insert)
+                && crate::executor::triggers::has_triggers_for(
+                    ctx,
+                    &table,
+                    &crate::sql::ast::TriggerEvent::Insert,
+                )
             {
                 crate::executor::triggers::fire_triggers(
                     ctx,
@@ -6554,7 +7471,12 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
-        return Ok(finish_insert_result(inserted, returning, &col_names, returning_rows));
+        return Ok(finish_insert_result(
+            inserted,
+            returning,
+            &col_names,
+            returning_rows,
+        ));
     }
 
     // Slow path: source is something else (subquery, etc.) — go through
@@ -6586,7 +7508,8 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         // Apply column defaults.
         for (i, col) in table.columns.iter().enumerate() {
             if full_row[i].is_null() && col.default.is_some() {
-                let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                let eval_ctx =
+                    EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 if let Some(default_expr) = &col.default {
                     full_row[i] = evaluate(default_expr, &eval_ctx)?;
                 }
@@ -6607,36 +7530,62 @@ fn exec_insert(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, colu
         }
 
         // NOT NULL + CHECK constraints (see fast path).
-        enforce_row_constraints(&table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
+        enforce_row_constraints(
+            &table,
+            &full_row,
+            &col_names,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
         enforce_child_fks(ctx, &table, &full_row)?;
 
         let outcome = exec_insert_one_row(
-            ctx, &table, &table_name_lc, &mut current_root, &mut max_rowid,
-            &mut full_row, &mut payload_buf, &mut index_states, on_conflict, upsert, rowid_autogen,
+            ctx,
+            &table,
+            &table_name_lc,
+            &mut current_root,
+            &mut max_rowid,
+            &mut full_row,
+            &mut payload_buf,
+            &mut index_states,
+            on_conflict,
+            upsert,
+            rowid_autogen,
             explicit_rowid,
         )?;
         match outcome {
             InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
                 inserted += 1;
                 if let Some(ret) = returning {
-                    returning_rows.push(project_returning_row(ret, &full_row, &col_names, &ctx.params, &ctx.named_params)?);
+                    returning_rows.push(project_returning_row(
+                        ret,
+                        &full_row,
+                        &col_names,
+                        &ctx.params,
+                        &ctx.named_params,
+                    )?);
                 }
             }
             InsertOutcome::Skipped => {}
         }
     }
-        // Write back any index-root moves (splits) to the context so the
-        // NEXT statement descends from the current root — the catalog's
-        // Arc<Index> still holds the CREATE-time root.
-        for st in index_states.iter() {
-            if ctx.index_root(&st.idx) != st.root {
-                ctx.set_index_root(&st.idx.name, st.root);
-            }
+    // Write back any index-root moves (splits) to the context so the
+    // NEXT statement descends from the current root — the catalog's
+    // Arc<Index> still holds the CREATE-time root.
+    for st in index_states.iter() {
+        if ctx.index_root(&st.idx) != st.root {
+            ctx.set_index_root(&st.idx.name, st.root);
         }
+    }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
-    Ok(finish_insert_result(inserted, returning, &col_names, returning_rows))
+    Ok(finish_insert_result(
+        inserted,
+        returning,
+        &col_names,
+        returning_rows,
+    ))
 }
 
 /// Build the final ExecResult for an INSERT (with or without RETURNING).
@@ -6746,7 +7695,9 @@ pub fn fast_insert_literal_rows(
             if row.len() != n_cols {
                 return Err(Error::semantic(format!(
                     "table {} has {} columns but {} values were supplied",
-                    table.name, n_cols, row.len()
+                    table.name,
+                    n_cols,
+                    row.len()
                 )));
             }
             for (i, v) in row.into_iter().enumerate() {
@@ -6787,7 +7738,11 @@ pub fn fast_insert_literal_rows(
         enforce_child_fks(ctx, table, &full_row)?;
 
         // BEFORE INSERT triggers.
-        if crate::executor::triggers::has_triggers_for(ctx, table, &crate::sql::ast::TriggerEvent::Insert) {
+        if crate::executor::triggers::has_triggers_for(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Insert,
+        ) {
             crate::executor::triggers::fire_triggers(
                 ctx,
                 table,
@@ -6819,13 +7774,20 @@ pub fn fast_insert_literal_rows(
             rowid_autogen,
             explicit_rowid,
         )?;
-        let ok = matches!(outcome, InsertOutcome::Inserted | InsertOutcome::UpdatedExisting);
+        let ok = matches!(
+            outcome,
+            InsertOutcome::Inserted | InsertOutcome::UpdatedExisting
+        );
         if ok {
             inserted += 1;
         }
         // AFTER INSERT triggers.
         if ok
-            && crate::executor::triggers::has_triggers_for(ctx, table, &crate::sql::ast::TriggerEvent::Insert)
+            && crate::executor::triggers::has_triggers_for(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Insert,
+            )
         {
             crate::executor::triggers::fire_triggers(
                 ctx,
@@ -6971,7 +7933,11 @@ fn exec_insert_one_row(
                 rowid_was_autogenerated = true;
                 r
             }
-            _ => return Err(Error::semantic("rowid alias column must be an integer or NULL")),
+            _ => {
+                return Err(Error::semantic(
+                    "rowid alias column must be an integer or NULL",
+                ))
+            }
         }
     } else {
         let r = next_auto_rowid(ctx.pager, *current_root, *max_rowid)?;
@@ -6998,7 +7964,10 @@ fn exec_insert_one_row(
                 st.idx.unique
                     && st.idx.columns.len() == u.target.len()
                     && u.target.iter().all(|t| {
-                        st.idx.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&t.name))
+                        st.idx
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&t.name))
                     })
             });
             match idx_pos {
@@ -7046,12 +8015,12 @@ fn exec_insert_one_row(
         // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
         // with ANY NULL among the indexed columns is exempt from the
         // uniqueness check, so multiple NULL rows coexist.
-        if st
-            .idx
-            .columns
-            .iter()
-            .any(|c| table.find_column(&c.name).map(|p| full_row.get(p).map(|v| v.is_null()).unwrap_or(false)).unwrap_or(false))
-        {
+        if st.idx.columns.iter().any(|c| {
+            table
+                .find_column(&c.name)
+                .map(|p| full_row.get(p).map(|v| v.is_null()).unwrap_or(false))
+                .unwrap_or(false)
+        }) {
             continue;
         }
         // Any REPLACE/UPSERT path below mutates the index trees, so the
@@ -7070,12 +8039,15 @@ fn exec_insert_one_row(
                 .iter()
                 .map(|c| format!("{}.{}", table.name, c.name))
                 .collect();
-            conflict_on_target = matches!(
-                upsert_target,
-                UpsertTarget::Any | UpsertTarget::Index(_)
-            ) && (matches!(upsert_target, UpsertTarget::Any) || {
-                if let UpsertTarget::Index(t) = &upsert_target { *t == i } else { false }
-            });
+            conflict_on_target =
+                matches!(upsert_target, UpsertTarget::Any | UpsertTarget::Index(_))
+                    && (matches!(upsert_target, UpsertTarget::Any) || {
+                        if let UpsertTarget::Index(t) = &upsert_target {
+                            *t == i
+                        } else {
+                            false
+                        }
+                    });
             break;
         }
     }
@@ -7085,8 +8057,15 @@ fn exec_insert_one_row(
         if conflict_on_target {
             if let Some(u) = upsert {
                 return exec_upsert_row(
-                    ctx, table, table_name_lc, current_root, full_row, payload_buf,
-                    index_states, existing_rowid, u,
+                    ctx,
+                    table,
+                    table_name_lc,
+                    current_root,
+                    full_row,
+                    payload_buf,
+                    index_states,
+                    existing_rowid,
+                    u,
                 );
             }
         }
@@ -7104,7 +8083,12 @@ fn exec_insert_one_row(
                 *current_root = bt.root;
                 ctx.set_table_root_lc(table_name_lc, *current_root);
                 if let Some(old_payload) = old_payload_opt {
-                    if let Ok(old_row) = decode_row(&old_payload, table.n_columns(), existing_rowid, table.rowid_alias) {
+                    if let Ok(old_row) = decode_row(
+                        &old_payload,
+                        table.n_columns(),
+                        existing_rowid,
+                        table.rowid_alias,
+                    ) {
                         for st in index_states.iter_mut() {
                             let old_key = encode_index_key(&st.idx, table, &old_row);
                             let mut ibt = Btree::new(ctx.pager, st.root, true);
@@ -7186,8 +8170,15 @@ fn exec_insert_one_row(
                         if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk) {
                             drop_payload(existing_payload);
                             return exec_upsert_row(
-                                ctx, table, table_name_lc, current_root, full_row, payload_buf,
-                                index_states, rowid, u,
+                                ctx,
+                                table,
+                                table_name_lc,
+                                current_root,
+                                full_row,
+                                payload_buf,
+                                index_states,
+                                rowid,
+                                u,
                             );
                         }
                     }
@@ -7199,15 +8190,15 @@ fn exec_insert_one_row(
                         }
                         ConflictResolution::Ignore => return Ok(InsertOutcome::Skipped),
                         _ => {
-                        let pk = table
-                            .rowid_alias
-                            .and_then(|i| table.columns.get(i).map(|c| c.name.clone()))
-                            .unwrap_or_else(|| "rowid".to_string());
-                        return Err(Error::constraint(format!(
-                            "UNIQUE constraint failed: {}.{}",
-                            table.name, pk
-                        )));
-                    }
+                            let pk = table
+                                .rowid_alias
+                                .and_then(|i| table.columns.get(i).map(|c| c.name.clone()))
+                                .unwrap_or_else(|| "rowid".to_string());
+                            return Err(Error::constraint(format!(
+                                "UNIQUE constraint failed: {}.{}",
+                                table.name, pk
+                            )));
+                        }
                     }
                 }
                 LookupResult::NotFound => {
@@ -7223,7 +8214,9 @@ fn exec_insert_one_row(
     // On conflict: delete the old row's index entries first.
     if let Some(old_payload) = old_payload_opt {
         if !index_states.is_empty() {
-            if let Ok(old_row) = decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias) {
+            if let Ok(old_row) =
+                decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)
+            {
                 for st in index_states.iter_mut() {
                     let old_key = encode_index_key(&st.idx, table, &old_row);
                     let mut ibt = Btree::new(ctx.pager, st.root, true);
@@ -7278,9 +8271,7 @@ fn exec_upsert_row(
     upsert: &crate::sql::ast::UpsertClause,
 ) -> Result<InsertOutcome> {
     match &upsert.action {
-        crate::sql::ast::UpsertAction::DoNothing => {
-            Ok(InsertOutcome::Skipped)
-        }
+        crate::sql::ast::UpsertAction::DoNothing => Ok(InsertOutcome::Skipped),
         crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } => {
             // Read the existing row.
             let mut bt = Btree::new(ctx.pager, *current_root, false);
@@ -7292,7 +8283,8 @@ fn exec_upsert_row(
                 }
             };
             let n_cols = table.n_columns();
-            let old_row = match decode_row(&old_payload, n_cols, existing_rowid, table.rowid_alias) {
+            let old_row = match decode_row(&old_payload, n_cols, existing_rowid, table.rowid_alias)
+            {
                 Ok(r) => r,
                 Err(_) => return Ok(InsertOutcome::Skipped),
             };
@@ -7332,7 +8324,13 @@ fn exec_upsert_row(
 
             // Enforce NOT NULL + CHECK on the merged row.
             let plain_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-            enforce_row_constraints(table, &new_row, &plain_names, &ctx.params, &ctx.named_params)?;
+            enforce_row_constraints(
+                table,
+                &new_row,
+                &plain_names,
+                &ctx.params,
+                &ctx.named_params,
+            )?;
 
             // Rowid alias must stay consistent (it's the B+tree key).
             if let Some(idx) = table.rowid_alias {
@@ -7345,7 +8343,9 @@ fn exec_upsert_row(
             encode_row_aliased_into(&new_row, table.rowid_alias, payload_buf);
             {
                 let mut bt = Btree::new(ctx.pager, *current_root, false);
-                let did_in_place = bt.update_table(existing_rowid, payload_buf).unwrap_or(false);
+                let did_in_place = bt
+                    .update_table(existing_rowid, payload_buf)
+                    .unwrap_or(false);
                 if !did_in_place {
                     bt.delete_table(existing_rowid)?;
                     bt.insert_table(existing_rowid, payload_buf)?;
@@ -7384,7 +8384,11 @@ fn exec_upsert_row(
 /// Uses the ORDER-PRESERVING key encoding (see `Value::encode_order_key_into`)
 /// so that the index B+tree's byte order matches SQL value ordering —
 /// required for range scans and binary-search equality lookups.
-pub(crate) fn encode_index_key(index: &crate::schema::Index, table: &Table, row: &[Value]) -> Vec<u8> {
+pub(crate) fn encode_index_key(
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+) -> Vec<u8> {
     let mut key_bytes = Vec::new();
     for col in &index.columns {
         if let Some(pos) = table.find_column(&col.name) {
@@ -7416,10 +8420,12 @@ pub(crate) struct UpdateConflictPlan {
 
 /// True when any indexed column of `row` is NULL (UNIQUE-exempt).
 fn index_key_has_null(index: &crate::schema::Index, table: &Table, row: &[Value]) -> bool {
-    index
-        .columns
-        .iter()
-        .any(|c| table.find_column(&c.name).map(|p| row.get(p).map(|v| v.is_null()).unwrap_or(false)).unwrap_or(false))
+    index.columns.iter().any(|c| {
+        table
+            .find_column(&c.name)
+            .map(|p| row.get(p).map(|v| v.is_null()).unwrap_or(false))
+            .unwrap_or(false)
+    })
 }
 
 /// Simulate SQLite's per-row sequential unique-index checking for an
@@ -7459,8 +8465,11 @@ pub(crate) fn simulate_update_unique(
         return Ok(plan);
     }
     // rowid -> write-set position (classifies probe matches).
-    let pos_of: std::collections::HashMap<i64, usize> =
-        write_set.iter().enumerate().map(|(i, r)| (r.0, i)).collect();
+    let pos_of: std::collections::HashMap<i64, usize> = write_set
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.0, i))
+        .collect();
     // Rows already condemned by OR REPLACE in this statement — their
     // entries are (virtually) gone for every index.
     let mut deleted: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -7469,7 +8478,10 @@ pub(crate) fn simulate_update_unique(
         // keys too (they have index entries) but are exempt from CHECKING.
         let mut keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(write_set.len());
         for (_, old_row, new_row) in write_set {
-            keys.push((encode_index_key(idx, table, old_row), encode_index_key(idx, table, new_row)));
+            keys.push((
+                encode_index_key(idx, table, old_row),
+                encode_index_key(idx, table, new_row),
+            ));
         }
         let root = ctx.index_root(idx);
         let mut ibt = Btree::new(ctx.pager, root, true);
@@ -7546,7 +8558,10 @@ pub(crate) fn simulate_update_unique(
                             .map(|c| format!("{}.{}", table.name, c.name))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        return Err(Error::constraint(format!("UNIQUE constraint failed: {}", cols)));
+                        return Err(Error::constraint(format!(
+                            "UNIQUE constraint failed: {}",
+                            cols
+                        )));
                     }
                 }
             }
@@ -7675,9 +8690,14 @@ fn apply_rowid_alias_move(
     Ok(true)
 }
 
-
 /// Insert an entry into an index for a given row.
-fn insert_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
+fn insert_index_entry(
+    ctx: &mut ExecContext<'_>,
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+    rowid: i64,
+) -> Result<()> {
     let key_bytes = encode_index_key(index, table, row);
     // Override-aware root: an earlier split may have moved this index's
     // root since the catalog snapshot was taken.
@@ -7691,7 +8711,13 @@ fn insert_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, t
 }
 
 /// Delete an entry from an index for a given row.
-fn delete_index_entry(ctx: &mut ExecContext<'_>, index: &crate::schema::Index, table: &Table, row: &[Value], rowid: i64) -> Result<()> {
+fn delete_index_entry(
+    ctx: &mut ExecContext<'_>,
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+    rowid: i64,
+) -> Result<()> {
     let key_bytes = encode_index_key(index, table, row);
     let root = ctx.index_root(index);
     let mut bt = Btree::new(ctx.pager, root, true);
@@ -7823,7 +8849,8 @@ fn exec_update(
     // semantics: a target row matching multiple FROM rows is updated
     // ONCE (the last match supplies the SET expression values).
     if let Some(uf) = from {
-        let result = exec_update_from(ctx, &table, source, assignments, returning, or_conflict, uf)?;
+        let result =
+            exec_update_from(ctx, &table, source, assignments, returning, or_conflict, uf)?;
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
@@ -7834,7 +8861,10 @@ fn exec_update(
     if table.vtab.is_some() {
         let pred = extract_source_predicate(source);
         vtab_exec::exec_update_vtab(ctx, &table, assignments, pred.as_ref())?;
-        return Ok(ExecResult { columns: Arc::from(Vec::new()), rows: Vec::new() });
+        return Ok(ExecResult {
+            columns: Arc::from(Vec::new()),
+            rows: Vec::new(),
+        });
     }
     // Streaming UPDATE fast path: when the source is a bare `Scan`, a
     // `Filter { Scan, predicate }`, or a `RowidRange`, iterate the B+tree
@@ -7849,7 +8879,9 @@ fn exec_update(
     // across rows) and ONE Vec<u8> allocation for the encoded payload
     // (also reused). Cuts ~80% of the allocations on a 10k-row UPDATE,
     // closing the 23× UPDATE-range gap vs SQLite.
-    if let Some(result) = try_streaming_update(ctx, &table, source, assignments, returning, or_conflict)? {
+    if let Some(result) =
+        try_streaming_update(ctx, &table, source, assignments, returning, or_conflict)?
+    {
         // Autocommit flush (transactional execution defers this to COMMIT;
         // deferred_flush leaves it to the threshold/requery logic). The
         // flush used to live at the end of the general path — the fast
@@ -7872,12 +8904,15 @@ fn exec_update(
     // without applying anything. This keeps the statement atomic: any
     // constraint error (NOT NULL, CHECK, UNIQUE) aborts BEFORE the first
     // B+tree modification, exactly like SQLite's statement-level ABORT.
-    let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::with_capacity(source_res.rows.len());
+    let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> =
+        Vec::with_capacity(source_res.rows.len());
     for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else {
-            return Err(Error::Unsupported("UPDATE on a table without INTEGER PRIMARY KEY"));
+            return Err(Error::Unsupported(
+                "UPDATE on a table without INTEGER PRIMARY KEY",
+            ));
         };
 
         let mut new_row = row.clone();
@@ -7906,8 +8941,10 @@ fn exec_update(
     // produces the OR IGNORE skip / OR REPLACE delete plan otherwise.
     let unique_indexes: Vec<Arc<crate::schema::Index>> =
         indexes.iter().filter(|i| i.unique).cloned().collect();
-    let ws_refs: Vec<(i64, &[Value], &[Value])> =
-        write_set.iter().map(|(r, o, n)| (*r, o.as_slice(), n.as_slice())).collect();
+    let ws_refs: Vec<(i64, &[Value], &[Value])> = write_set
+        .iter()
+        .map(|(r, o, n)| (*r, o.as_slice(), n.as_slice()))
+        .collect();
     let plan = simulate_update_unique(ctx, &table, &unique_indexes, &ws_refs, or_conflict)?;
 
     // OR REPLACE: delete the conflicting holder rows (table + all index
@@ -7927,11 +8964,25 @@ fn exec_update(
             if let Some(new_alias) = new_row.get(alias_idx) {
                 if !matches!(new_alias, Value::Integer(i) if *i == rowid) {
                     let payload = encode_row_aliased(&new_row, table.rowid_alias);
-                    if apply_rowid_alias_move(ctx, &table, rowid, new_alias, &payload, &new_row, or_conflict)? {
+                    if apply_rowid_alias_move(
+                        ctx,
+                        &table,
+                        rowid,
+                        new_alias,
+                        &payload,
+                        &new_row,
+                        or_conflict,
+                    )? {
                         ctx.changes += 1;
                         updated += 1;
                         if let Some(ret) = returning {
-                            returning_rows.push(project_returning_row(ret, &new_row, &col_names, &ctx.params, &ctx.named_params)?);
+                            returning_rows.push(project_returning_row(
+                                ret,
+                                &new_row,
+                                &col_names,
+                                &ctx.params,
+                                &ctx.named_params,
+                            )?);
                         }
                         continue;
                     }
@@ -7985,7 +9036,13 @@ fn exec_update(
         ctx.changes += 1;
         updated += 1;
         if let Some(ret) = returning {
-            returning_rows.push(project_returning_row(ret, &new_row, &col_names, &ctx.params, &ctx.named_params)?);
+            returning_rows.push(project_returning_row(
+                ret,
+                &new_row,
+                &col_names,
+                &ctx.params,
+                &ctx.named_params,
+            )?);
         }
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
@@ -8032,9 +9089,8 @@ fn exec_update_from(
     let target_res = execute(target, ctx)?;
     let from_res = execute(&uf.plan, ctx)?;
     // Combined namespace for SET / WHERE evaluation.
-    let mut combined_cols: Vec<String> = Vec::with_capacity(
-        target_res.columns.len() + from_res.columns.len(),
-    );
+    let mut combined_cols: Vec<String> =
+        Vec::with_capacity(target_res.columns.len() + from_res.columns.len());
     combined_cols.extend(target_res.columns.iter().cloned());
     combined_cols.extend(from_res.columns.iter().cloned());
     let n_target = target_res.columns.len();
@@ -8058,7 +9114,9 @@ fn exec_update_from(
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else {
-            return Err(Error::Unsupported("UPDATE on a table without INTEGER PRIMARY KEY"));
+            return Err(Error::Unsupported(
+                "UPDATE on a table without INTEGER PRIMARY KEY",
+            ));
         };
         // Find the LAST FROM row (if any) whose combination with this
         // target row satisfies the WHERE clause.
@@ -8079,8 +9137,13 @@ fn exec_update_from(
 
         let mut new_row = row.clone();
         for (col_idx, expr) in assignments {
-            new_row[*col_idx] =
-                eval_row(expr, &combined, &combined_cols, &ctx.params, &ctx.named_params)?;
+            new_row[*col_idx] = eval_row(
+                expr,
+                &combined,
+                &combined_cols,
+                &ctx.params,
+                &ctx.named_params,
+            )?;
             let aff = table.columns[*col_idx].affinity;
             new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
         }
@@ -8100,8 +9163,10 @@ fn exec_update_from(
     // ---- Unique-index write-set simulation (collation-aware).
     let unique_indexes: Vec<Arc<crate::schema::Index>> =
         indexes.iter().filter(|i| i.unique).cloned().collect();
-    let ws_refs: Vec<(i64, &[Value], &[Value])> =
-        write_set.iter().map(|(r, o, n)| (*r, o.as_slice(), n.as_slice())).collect();
+    let ws_refs: Vec<(i64, &[Value], &[Value])> = write_set
+        .iter()
+        .map(|(r, o, n)| (*r, o.as_slice(), n.as_slice()))
+        .collect();
     let plan = simulate_update_unique(ctx, table, &unique_indexes, &ws_refs, or_conflict)?;
     if !plan.delete_rowids.is_empty() {
         delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
@@ -8117,7 +9182,15 @@ fn exec_update_from(
             if let Some(new_alias) = new_row.get(alias_idx) {
                 if !matches!(new_alias, Value::Integer(i) if *i == rowid) {
                     let payload = encode_row_aliased(&new_row, table.rowid_alias);
-                    if apply_rowid_alias_move(ctx, table, rowid, new_alias, &payload, &new_row, or_conflict)? {
+                    if apply_rowid_alias_move(
+                        ctx,
+                        table,
+                        rowid,
+                        new_alias,
+                        &payload,
+                        &new_row,
+                        or_conflict,
+                    )? {
                         ctx.changes += 1;
                         updated += 1;
                         if let Some(ret) = returning {
@@ -8231,9 +9304,20 @@ fn try_streaming_update(
 ) -> Result<Option<ExecResult>> {
     // Detect the source shape and extract (table, filter_predicate, range, rowid).
     enum StreamingSource<'a> {
-        Scan { table: &'a Arc<Table>, filter: Option<&'a Expr> },
-        RowidRange { table: &'a Arc<Table>, start: Option<&'a Expr>, end: Option<&'a Expr>, residual: Option<&'a Expr> },
-        RowidLookup { table: &'a Arc<Table>, rowid: &'a Expr },
+        Scan {
+            table: &'a Arc<Table>,
+            filter: Option<&'a Expr>,
+        },
+        RowidRange {
+            table: &'a Arc<Table>,
+            start: Option<&'a Expr>,
+            end: Option<&'a Expr>,
+            residual: Option<&'a Expr>,
+        },
+        RowidLookup {
+            table: &'a Arc<Table>,
+            rowid: &'a Expr,
+        },
         IndexRange {
             table: &'a Arc<Table>,
             index: &'a Arc<crate::schema::Index>,
@@ -8243,23 +9327,49 @@ fn try_streaming_update(
         },
     }
     let src = match source {
-        Plan::Scan { table: t, .. } => StreamingSource::Scan { table: t, filter: None },
+        Plan::Scan { table: t, .. } => StreamingSource::Scan {
+            table: t,
+            filter: None,
+        },
         Plan::Filter { input, predicate } => {
             if let Plan::Scan { table: t, .. } = input.as_ref() {
-                StreamingSource::Scan { table: t, filter: Some(predicate) }
+                StreamingSource::Scan {
+                    table: t,
+                    filter: Some(predicate),
+                }
             } else {
                 return Ok(None);
             }
         }
-        Plan::RowidRange { table: t, start, end, residual, .. } => {
-            StreamingSource::RowidRange { table: t, start: start.as_ref(), end: end.as_ref(), residual: residual.as_ref() }
-        }
-        Plan::RowidLookup { table: t, rowid, .. } => {
-            StreamingSource::RowidLookup { table: t, rowid }
-        }
-        Plan::IndexRange { table: t, index, start, end, residual, .. } => {
-            StreamingSource::IndexRange { table: t, index, start: start.as_ref(), end: end.as_ref(), residual: residual.as_ref() }
-        }
+        Plan::RowidRange {
+            table: t,
+            start,
+            end,
+            residual,
+            ..
+        } => StreamingSource::RowidRange {
+            table: t,
+            start: start.as_ref(),
+            end: end.as_ref(),
+            residual: residual.as_ref(),
+        },
+        Plan::RowidLookup {
+            table: t, rowid, ..
+        } => StreamingSource::RowidLookup { table: t, rowid },
+        Plan::IndexRange {
+            table: t,
+            index,
+            start,
+            end,
+            residual,
+            ..
+        } => StreamingSource::IndexRange {
+            table: t,
+            index,
+            start: start.as_ref(),
+            end: end.as_ref(),
+            residual: residual.as_ref(),
+        },
         _ => return Ok(None),
     };
 
@@ -8304,8 +9414,14 @@ fn try_streaming_update(
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
-            let s = match start { Some(e) => evaluate(e, &eval_ctx)?.as_integer(), None => i64::MIN };
-            let e = match end { Some(e) => evaluate(e, &eval_ctx)?.as_integer(), None => i64::MAX };
+            let s = match start {
+                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+                None => i64::MIN,
+            };
+            let e = match end {
+                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
+                None => i64::MAX,
+            };
             (s, e)
         }
         _ => (i64::MIN, i64::MAX),
@@ -8321,10 +9437,8 @@ fn try_streaming_update(
     // against the full table-order row is ~5-15 ns/row vs the ~60-120
     // ns/row AST walk + name-resolution of eval_row. `UPDATE t SET ...
     // WHERE val > ?` over 10k rows saves ~0.5-1 ms per statement.
-    let compiled_residual: Option<crate::executor::predicate::CompiledPredicate> =
-        residual_pred.and_then(|p| {
-            crate::executor::predicate::compile_predicate(p, table, &table.name)
-        });
+    let compiled_residual: Option<crate::executor::predicate::CompiledPredicate> = residual_pred
+        .and_then(|p| crate::executor::predicate::compile_predicate(p, table, &table.name));
 
     // For RowidLookup, evaluate the rowid expression now.
     let lookup_rowid: Option<i64> = match &src {
@@ -8345,13 +9459,10 @@ fn try_streaming_update(
     // Compile SET expressions positionally ONCE per statement: `score =
     // score + 1.0` costs an AST walk + name resolution per row on the
     // general path (~80-120 ns); compiled evaluation is ~5-15 ns.
-    let compiled_assignments: Vec<Option<crate::executor::predicate::CompiledExpr>> =
-        assignments
-            .iter()
-            .map(|(_, e)| {
-                crate::executor::predicate::compile_expr(e, col_names, params.len())
-            })
-            .collect();
+    let compiled_assignments: Vec<Option<crate::executor::predicate::CompiledExpr>> = assignments
+        .iter()
+        .map(|(_, e)| crate::executor::predicate::compile_expr(e, col_names, params.len()))
+        .collect();
     let compiled_ref: Option<&[Option<crate::executor::predicate::CompiledExpr>]> =
         if compiled_assignments.iter().any(|c| c.is_some()) {
             Some(&compiled_assignments)
@@ -8384,9 +9495,7 @@ fn try_streaming_update(
             idx.columns.iter().any(|c| {
                 table
                     .find_column(&c.name)
-                    .map(|col_idx| {
-                        assignments.iter().any(|(a_idx, _)| *a_idx == col_idx)
-                    })
+                    .map(|col_idx| assignments.iter().any(|(a_idx, _)| *a_idx == col_idx))
                     .unwrap_or(false)
             })
         })
@@ -8423,16 +9532,14 @@ fn try_streaming_update(
         // decode → SET → constraints → encode → in-place patch. Skips the
         // `updates` / `order` / `sorted_updates` / `deferred` / `done_mask`
         // Vec machinery and its per-statement allocations entirely.
-        if touched_indexes.is_empty()
-            && !has_update_triggers
-            && residual_pred.is_none()
-        {
+        if touched_indexes.is_empty() && !has_update_triggers && residual_pred.is_none() {
             let mut applied = false;
             let fetch = bt.lookup_table_with(rowid, |payload| {
                 // Decode + SET + constraints + encode, all before the page
                 // lock is released (payload borrowed, no copy).
                 row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err() {
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
+                {
                     return Ok(());
                 }
                 new_row.clear();
@@ -8447,7 +9554,13 @@ fn try_streaming_update(
                 payload_buf.clear();
                 encode_row_aliased_into(&new_row, table.rowid_alias, &mut payload_buf);
                 if let Some(ret) = returning {
-                    returning_rows.push(project_returning_row(ret, &new_row, col_names, &params, &named_params)?);
+                    returning_rows.push(project_returning_row(
+                        ret,
+                        &new_row,
+                        col_names,
+                        &params,
+                        &named_params,
+                    )?);
                 }
                 applied = true;
                 Ok(())
@@ -8464,7 +9577,8 @@ fn try_streaming_update(
                     ctx.set_table_root(&table.name, bt.root);
                 }
                 return Ok(Some(ExecResult {
-                    columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names).into(),
+                    columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names)
+                        .into(),
                     rows: returning_rows,
                 }));
             }
@@ -8474,7 +9588,8 @@ fn try_streaming_update(
             } else {
                 // Rowid absent: zero rows updated.
                 return Ok(Some(ExecResult {
-                    columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names).into(),
+                    columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names)
+                        .into(),
                     rows: returning_rows,
                 }));
             }
@@ -8484,11 +9599,30 @@ fn try_streaming_update(
             LookupResult::Found(payload) => {
                 // `payload` is an owned Vec — hand it over for phase 2's
                 // index maintenance (free stash, saves a re-fetch descent).
-                let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
+                let old_owned = if needs_old_payload {
+                    Some(payload.clone())
+                } else {
+                    None
+                };
                 if let Err(e) = process_update_row(
-                    ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                    assignments, col_names, &params, &named_params, table,
-                    residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                    ctx,
+                    &payload,
+                    n_cols,
+                    rowid,
+                    &mut row_buf,
+                    &mut new_row,
+                    &mut payload_buf,
+                    assignments,
+                    col_names,
+                    &params,
+                    &named_params,
+                    table,
+                    residual_pred,
+                    &mut updates,
+                    &mut update_arena,
+                    &mut returning_rows,
+                    returning,
+                    old_owned,
                     compiled_ref,
                     compiled_residual.as_ref(),
                     patch_ctx.as_mut(),
@@ -8501,11 +9635,30 @@ fn try_streaming_update(
         Ok::<(), crate::error::Error>(())
     } else if matches!(src, StreamingSource::RowidRange { .. }) {
         bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
-            let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
+            let old_owned = if needs_old_payload {
+                Some(payload.to_vec())
+            } else {
+                None
+            };
             if let Err(e) = process_update_row(
-                ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                assignments, col_names, &params, &named_params, table,
-                residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                ctx,
+                payload,
+                n_cols,
+                rowid,
+                &mut row_buf,
+                &mut new_row,
+                &mut payload_buf,
+                assignments,
+                col_names,
+                &params,
+                &named_params,
+                table,
+                residual_pred,
+                &mut updates,
+                &mut update_arena,
+                &mut returning_rows,
+                returning,
+                old_owned,
                 compiled_ref,
                 compiled_residual.as_ref(),
                 patch_ctx.as_mut(),
@@ -8515,7 +9668,10 @@ fn try_streaming_update(
             }
             true
         })
-    } else if let StreamingSource::IndexRange { index, start, end, .. } = &src {
+    } else if let StreamingSource::IndexRange {
+        index, start, end, ..
+    } = &src
+    {
         // IndexRange source: `UPDATE ... WHERE indexed_col > ?` (and
         // BETWEEN / < / >= variants). Phase 1a scans the index between the
         // encoded bounds collecting rowids; phase 1b fetches each row from
@@ -8542,7 +9698,10 @@ fn try_streaming_update(
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
-        let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+        let scan_start: Vec<u8> = start_key
+            .as_ref()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
         let mut rowids: Vec<i64> = Vec::new();
         {
             let index_root = ctx.index_root(index);
@@ -8634,11 +9793,30 @@ fn try_streaming_update(
                 if !dense {
                     ri += 1;
                 }
-                let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
+                let old_owned = if needs_old_payload {
+                    Some(payload.to_vec())
+                } else {
+                    None
+                };
                 if let Err(e) = process_update_row(
-                    ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                    assignments, col_names, &params, &named_params, table,
-                    residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                    ctx,
+                    payload,
+                    n_cols,
+                    rowid,
+                    &mut row_buf,
+                    &mut new_row,
+                    &mut payload_buf,
+                    assignments,
+                    col_names,
+                    &params,
+                    &named_params,
+                    table,
+                    residual_pred,
+                    &mut updates,
+                    &mut update_arena,
+                    &mut returning_rows,
+                    returning,
+                    old_owned,
                     compiled_ref,
                     compiled_residual.as_ref(),
                     patch_ctx.as_mut(),
@@ -8652,37 +9830,75 @@ fn try_streaming_update(
                 first_error = Some(e);
             }
         } else {
-        for rowid in rowids {
-            match bt.lookup_table(rowid)? {
-                LookupResult::Found(payload) => {
-                    // Owned payload — stash for phase 2's index maintenance
-                    // (saves a re-fetch descent per row when the SET clause
-                    // touches an indexed column).
-                    let old_owned = if needs_old_payload { Some(payload.clone()) } else { None };
-                    if let Err(e) = process_update_row(
-                        ctx, &payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                        assignments, col_names, &params, &named_params, table,
-                        residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
-                        compiled_ref,
-                        compiled_residual.as_ref(),
-                        patch_ctx.as_mut(),
-                    ) {
-                        first_error = Some(e);
-                        break;
+            for rowid in rowids {
+                match bt.lookup_table(rowid)? {
+                    LookupResult::Found(payload) => {
+                        // Owned payload — stash for phase 2's index maintenance
+                        // (saves a re-fetch descent per row when the SET clause
+                        // touches an indexed column).
+                        let old_owned = if needs_old_payload {
+                            Some(payload.clone())
+                        } else {
+                            None
+                        };
+                        if let Err(e) = process_update_row(
+                            ctx,
+                            &payload,
+                            n_cols,
+                            rowid,
+                            &mut row_buf,
+                            &mut new_row,
+                            &mut payload_buf,
+                            assignments,
+                            col_names,
+                            &params,
+                            &named_params,
+                            table,
+                            residual_pred,
+                            &mut updates,
+                            &mut update_arena,
+                            &mut returning_rows,
+                            returning,
+                            old_owned,
+                            compiled_ref,
+                            compiled_residual.as_ref(),
+                            patch_ctx.as_mut(),
+                        ) {
+                            first_error = Some(e);
+                            break;
+                        }
                     }
+                    LookupResult::NotFound => {}
                 }
-                LookupResult::NotFound => {}
             }
-        }
         }
         Ok::<(), crate::error::Error>(())
     } else {
         bt.scan_table_borrowed(|rowid, payload| {
-            let old_owned = if needs_old_payload { Some(payload.to_vec()) } else { None };
+            let old_owned = if needs_old_payload {
+                Some(payload.to_vec())
+            } else {
+                None
+            };
             if let Err(e) = process_update_row(
-                ctx, payload, n_cols, rowid, &mut row_buf, &mut new_row, &mut payload_buf,
-                assignments, col_names, &params, &named_params, table,
-                residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
+                ctx,
+                payload,
+                n_cols,
+                rowid,
+                &mut row_buf,
+                &mut new_row,
+                &mut payload_buf,
+                assignments,
+                col_names,
+                &params,
+                &named_params,
+                table,
+                residual_pred,
+                &mut updates,
+                &mut update_arena,
+                &mut returning_rows,
+                returning,
+                old_owned,
                 compiled_ref,
                 compiled_residual.as_ref(),
                 patch_ctx.as_mut(),
@@ -8718,20 +9934,26 @@ fn try_streaming_update(
         let mut ws_new: Vec<Value> = Vec::with_capacity(n_cols);
         let mut ws: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::with_capacity(updates.len());
         for (rowid, range, old_stash) in updates.iter() {
-            let Some(old_payload) = old_stash.as_deref() else { continue };
+            let Some(old_payload) = old_stash.as_deref() else {
+                continue;
+            };
             ws_old.clear();
-            if decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut ws_old).is_err() {
+            if decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut ws_old).is_err()
+            {
                 continue;
             }
             let new_payload = &update_arena[range.clone()];
             ws_new.clear();
-            if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut ws_new).is_err() {
+            if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut ws_new).is_err()
+            {
                 continue;
             }
             ws.push((*rowid, ws_old.clone(), ws_new.clone()));
         }
-        let ws_refs: Vec<(i64, &[Value], &[Value])> =
-            ws.iter().map(|(r, o, n)| (*r, o.as_slice(), n.as_slice())).collect();
+        let ws_refs: Vec<(i64, &[Value], &[Value])> = ws
+            .iter()
+            .map(|(r, o, n)| (*r, o.as_slice(), n.as_slice()))
+            .collect();
         simulate_update_unique(ctx, table, &unique_touched, &ws_refs, or_conflict)?
     } else {
         UpdateConflictPlan::default()
@@ -8832,9 +10054,8 @@ fn try_streaming_update(
         // we can't reconstruct it — triggers on indexed-SET updates always
         // have the stash since needs_old_payload is true for them).
         if has_update_triggers {
-            let old_row_v: Option<Vec<Value>> = old_payload_opt.and_then(|op| {
-                decode_row(op, n_cols, *rowid, table.rowid_alias).ok()
-            });
+            let old_row_v: Option<Vec<Value>> = old_payload_opt
+                .and_then(|op| decode_row(op, n_cols, *rowid, table.rowid_alias).ok());
             let new_row_v = decode_row(new_payload, n_cols, *rowid, table.rowid_alias).ok();
             if let (Some(old_r), Some(new_r)) = (old_row_v, new_row_v) {
                 let changed_cols: Vec<String> = assignments
@@ -8862,11 +10083,21 @@ fn try_streaming_update(
         if needs_old_payload {
             if let Some(old_payload) = old_payload_opt {
                 old_row_buf.clear();
-                if decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut old_row_buf).is_err() {
+                if decode_row_into(
+                    old_payload,
+                    n_cols,
+                    *rowid,
+                    table.rowid_alias,
+                    &mut old_row_buf,
+                )
+                .is_err()
+                {
                     continue;
                 }
                 new_row.clear();
-                if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut new_row).is_err() {
+                if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut new_row)
+                    .is_err()
+                {
                     continue;
                 }
                 for (ti, idx) in touched_indexes.iter().enumerate() {
@@ -8877,14 +10108,15 @@ fn try_streaming_update(
                     }
                     let ibt = &mut index_bts[ti];
                     if ibt.delete_index(&old_key, *rowid).is_ok()
-                        && ibt.insert_index(&new_key, *rowid).is_err() {
-                            // Insert failed after a successful delete — the
-                            // entry is gone; propagate a hard error.
-                            return Err(Error::corruption(format!(
-                                "index maintenance failed for {} (rowid {})",
-                                idx.name, rowid
-                            )));
-                        }
+                        && ibt.insert_index(&new_key, *rowid).is_err()
+                    {
+                        // Insert failed after a successful delete — the
+                        // entry is gone; propagate a hard error.
+                        return Err(Error::corruption(format!(
+                            "index maintenance failed for {} (rowid {})",
+                            idx.name, rowid
+                        )));
+                    }
                     if ibt.root != index_roots[ti] {
                         index_roots[ti] = ibt.root;
                         ctx.set_index_root(&idx.name, ibt.root);
@@ -9032,7 +10264,16 @@ fn process_update_row(
     // (size change, missing column, decode error) — the generic body
     // re-decodes the full row, so correctness is identical.
     if let Some(pc) = patch {
-        if decode_row_selective_wide(payload, n_cols, &pc.wanted, rowid, table.rowid_alias, row_buf).is_ok() {
+        if decode_row_selective_wide(
+            payload,
+            n_cols,
+            &pc.wanted,
+            rowid,
+            table.rowid_alias,
+            row_buf,
+        )
+        .is_ok()
+        {
             let keep = match (residual_pred, compiled_pred) {
                 (None, _) => true,
                 (Some(_), Some(cp)) => cp.eval(row_buf, IDENTITY_POSITIONS, params),
@@ -9056,7 +10297,10 @@ fn process_update_row(
             }
             // Patch the old payload's byte regions.
             if crate::storage::row_codec::row_column_regions_into(
-                payload, n_cols, table.rowid_alias, &mut pc.regions,
+                payload,
+                n_cols,
+                table.rowid_alias,
+                &mut pc.regions,
             ) {
                 // Start from a byte copy of the old payload; assigned
                 // regions are overwritten below.
@@ -9131,7 +10375,13 @@ fn process_update_row(
     encode_row_aliased_into(new_row, table.rowid_alias, payload_buf);
     // RETURNING: project now (the row is final).
     if let Some(ret) = returning {
-        returning_rows.push(project_returning_row(ret, new_row, col_names, params, named_params)?);
+        returning_rows.push(project_returning_row(
+            ret,
+            new_row,
+            col_names,
+            params,
+            named_params,
+        )?);
     }
     // Stash the (rowid, new payload, old payload) for phase 2. The new
     // payload goes into the shared arena — no per-row allocation.
@@ -9169,19 +10419,44 @@ fn try_streaming_delete(
 
     // The source table must be the DELETE target itself.
     let (src_table, residual_pred, range, index_range) = match source {
-        Plan::Scan { table: t, predicate, .. } => (t, predicate.as_ref(), None, None),
-        Plan::Filter { input, predicate } => {
-            match input.as_ref() {
-                Plan::Scan { table: t, predicate: None, .. } => (t, Some(predicate), None, None),
-                _ => return Ok(None),
-            }
-        }
-        Plan::RowidRange { table: t, start, end, residual, .. } => {
-            (t, residual.as_ref(), Some((start.as_ref(), end.as_ref())), None)
-        }
-        Plan::IndexRange { table: t, index, start, end, residual, .. } => {
-            (t, residual.as_ref(), None, Some((index, start.as_ref(), end.as_ref())))
-        }
+        Plan::Scan {
+            table: t,
+            predicate,
+            ..
+        } => (t, predicate.as_ref(), None, None),
+        Plan::Filter { input, predicate } => match input.as_ref() {
+            Plan::Scan {
+                table: t,
+                predicate: None,
+                ..
+            } => (t, Some(predicate), None, None),
+            _ => return Ok(None),
+        },
+        Plan::RowidRange {
+            table: t,
+            start,
+            end,
+            residual,
+            ..
+        } => (
+            t,
+            residual.as_ref(),
+            Some((start.as_ref(), end.as_ref())),
+            None,
+        ),
+        Plan::IndexRange {
+            table: t,
+            index,
+            start,
+            end,
+            residual,
+            ..
+        } => (
+            t,
+            residual.as_ref(),
+            None,
+            Some((index, start.as_ref(), end.as_ref())),
+        ),
         _ => return Ok(None),
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
@@ -9229,7 +10504,10 @@ fn try_streaming_delete(
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
-        let scan_start: Vec<u8> = start_key.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
+        let scan_start: Vec<u8> = start_key
+            .as_ref()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
         let index_root = ctx.index_root(index);
         {
             let mut index_bt = Btree::new(ctx.pager, index_root, true);
@@ -9258,7 +10536,9 @@ fn try_streaming_delete(
                 match bt.lookup_table(rid)? {
                     LookupResult::Found(payload) => {
                         row_buf.clear();
-                        if decode_row_into(&payload, n_cols, rid, table.rowid_alias, &mut row_buf).is_err() {
+                        if decode_row_into(&payload, n_cols, rid, table.rowid_alias, &mut row_buf)
+                            .is_err()
+                        {
                             continue;
                         }
                         if let Some(pred) = residual_pred {
@@ -9295,7 +10575,8 @@ fn try_streaming_delete(
         bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
             if let Some(pred) = residual_pred {
                 row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err() {
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
+                {
                     return true; // skip undecodable rows, keep walking
                 }
                 match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
@@ -9315,7 +10596,8 @@ fn try_streaming_delete(
         bt.scan_table_borrowed(|rowid, payload| {
             if let Some(pred) = residual_pred {
                 row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err() {
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
+                {
                     return true;
                 }
                 match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
@@ -9371,7 +10653,13 @@ fn try_streaming_delete(
         if need_row {
             let row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
             if let Some(ret) = returning {
-                returning_rows.push(project_returning_row(ret, &row, &col_names, &params, &named_params)?);
+                returning_rows.push(project_returning_row(
+                    ret,
+                    &row,
+                    &col_names,
+                    &params,
+                    &named_params,
+                )?);
             }
             for idx in &indexes {
                 delete_index_entry(ctx, idx, table, &row, rid)?;
@@ -9404,13 +10692,21 @@ fn try_streaming_delete(
     }))
 }
 
-fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, returning: Option<&[crate::sql::ast::ResultColumn]>) -> Result<ExecResult> {
+fn exec_delete(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    source: &Plan,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+) -> Result<ExecResult> {
     // Virtual table: collect matching rowids through the module, batch
     // xUpdate (delete ops).
     if table.vtab.is_some() {
         let pred = extract_source_predicate(source);
         vtab_exec::exec_delete_vtab(ctx, &table, pred.as_ref())?;
-        return Ok(ExecResult { columns: Arc::from(Vec::new()), rows: Vec::new() });
+        return Ok(ExecResult {
+            columns: Arc::from(Vec::new()),
+            rows: Vec::new(),
+        });
     }
     // Streaming path first: handles Scan/Filter, RowidRange and IndexRange
     // sources without materializing matched rows, and — critically —
@@ -9439,11 +10735,17 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
     } else {
         None
     };
-    if let Plan::RowidLookup { table: src_table, rowid, .. } = source {
+    if let Plan::RowidLookup {
+        table: src_table,
+        rowid,
+        ..
+    } = source
+    {
         if Arc::ptr_eq(src_table, &table) || src_table.name.eq_ignore_ascii_case(&table.name) {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let rowid_val = evaluate(rowid, &eval_ctx)?.as_integer();
             let root = ctx.table_root(&table);
             // FOREIGN KEY (parent side): check BEFORE deleting — the row's
@@ -9452,7 +10754,9 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
             if ctx.pager.foreign_keys_enabled() {
                 let mut bt = Btree::new(ctx.pager, root, false);
                 if let LookupResult::Found(payload) = bt.lookup_table(rowid_val)? {
-                    if let Ok(old_row) = decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias) {
+                    if let Ok(old_row) =
+                        decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias)
+                    {
                         enforce_parent_delete_fks(ctx, &table, &old_row, rowid_val, 0)?;
                     }
                 }
@@ -9478,9 +10782,16 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
                 if need_row {
                     // Decode the old row only for index keys / RETURNING /
                     // triggers.
-                    let row = decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias)?;
+                    let row =
+                        decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias)?;
                     if let (Some(ret), Some(names)) = (returning, col_names_fast.as_deref()) {
-                        returning_rows.push(project_returning_row(ret, &row, names, &ctx.params, &ctx.named_params)?);
+                        returning_rows.push(project_returning_row(
+                            ret,
+                            &row,
+                            names,
+                            &ctx.params,
+                            &ctx.named_params,
+                        )?);
                     }
                     for idx in &indexes {
                         delete_index_entry(ctx, idx, &table, &row, rowid_val)?;
@@ -9531,14 +10842,22 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else {
-            return Err(Error::Unsupported("DELETE on a table without INTEGER PRIMARY KEY"));
+            return Err(Error::Unsupported(
+                "DELETE on a table without INTEGER PRIMARY KEY",
+            ));
         };
         if rowid > max_deleted {
             max_deleted = rowid;
         }
         // RETURNING: project the pre-delete row.
         if let Some(ret) = returning {
-            returning_rows.push(project_returning_row(ret, row, &col_names, &ctx.params, &ctx.named_params)?);
+            returning_rows.push(project_returning_row(
+                ret,
+                row,
+                &col_names,
+                &ctx.params,
+                &ctx.named_params,
+            )?);
         }
         // FOREIGN KEY (parent side): reject / cascade / set-null before the
         // row goes away (only when the pragma is on and some table
@@ -9598,4 +10917,3 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         rows: vec![vec![Value::Integer(deleted)]],
     })
 }
-

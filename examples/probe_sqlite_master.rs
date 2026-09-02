@@ -2,13 +2,26 @@ use rustqlite::Database;
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)", []).unwrap();
-    db.execute("CREATE INDEX idx_users_name ON users(name)", []).unwrap();
-    db.execute("CREATE VIEW v AS SELECT id, name FROM users", []).unwrap();
-    db.execute("CREATE TRIGGER trg AFTER INSERT ON users BEGIN UPDATE users SET name = name; END", []).unwrap();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)",
+        [],
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_users_name ON users(name)", [])
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT id, name FROM users", [])
+        .unwrap();
+    db.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON users BEGIN UPDATE users SET name = name; END",
+        [],
+    )
+    .unwrap();
 
     // The sqlite_master surface every migration tool reads.
-    let r = db.query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master", []);
+    let r = db.query(
+        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master",
+        [],
+    );
     match r {
         Ok(rows) => {
             for row in rows {
@@ -41,6 +54,9 @@ fn main() {
     let r = db.query("SELECT sqlite_version()", []);
     println!("sqlite_version(): {:?}", r);
     // Table list order (migrators rely on rowid ordering of sqlite_master).
-    let r = db.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY rowid", []);
+    let r = db.query(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY rowid",
+        [],
+    );
     println!("tables by rowid: {:?}", r);
 }

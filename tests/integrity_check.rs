@@ -59,13 +59,23 @@ fn clean_database_reports_ok() {
     build_clean_db(&path);
 
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
-    assert_eq!(first_col(&mut db, "PRAGMA quick_check"), vec!["ok".to_string()]);
+    assert_eq!(
+        first_col(&mut db, "PRAGMA integrity_check"),
+        vec!["ok".to_string()]
+    );
+    assert_eq!(
+        first_col(&mut db, "PRAGMA quick_check"),
+        vec!["ok".to_string()]
+    );
 
     // Live-session check after more DML (checks the live-root plumbing):
     // the flush inside the pragma makes the on-disk state current.
-    db.execute("INSERT INTO t (s, r, b) VALUES ('live', 1.0, X'01')", []).unwrap();
-    assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
+    db.execute("INSERT INTO t (s, r, b) VALUES ('live', 1.0, X'01')", [])
+        .unwrap();
+    assert_eq!(
+        first_col(&mut db, "PRAGMA integrity_check"),
+        vec!["ok".to_string()]
+    );
 }
 
 #[test]
@@ -75,7 +85,8 @@ fn wal_mode_database_reports_ok() {
     {
         let mut db = Database::open(&path).unwrap();
         db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-        db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         for i in 1..=300i64 {
             db.execute(
                 "INSERT INTO w (v) VALUES (?)",
@@ -84,12 +95,18 @@ fn wal_mode_database_reports_ok() {
             .unwrap();
         }
         db.flush().unwrap();
-        assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
+        assert_eq!(
+            first_col(&mut db, "PRAGMA integrity_check"),
+            vec!["ok".to_string()]
+        );
     }
     // Re-open with a live WAL: WAL-served pages must satisfy the file-shape
     // check (no false "truncated" report).
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
+    assert_eq!(
+        first_col(&mut db, "PRAGMA integrity_check"),
+        vec!["ok".to_string()]
+    );
 }
 
 #[test]
@@ -137,7 +154,9 @@ fn rowid_order_corruption_is_reported_or_graceful() {
     if let Ok(mut db) = Database::open(&path) {
         let report = first_col(&mut db, "PRAGMA integrity_check");
         assert!(
-            report.iter().any(|m| m.contains("truncated") || m.contains("unreadable")),
+            report
+                .iter()
+                .any(|m| m.contains("truncated") || m.contains("unreadable")),
             "phantom page count must be reported, got {:?}",
             report
         );
@@ -181,7 +200,8 @@ fn payload_corruption_does_not_false_positive() {
     let path = tmp.path().join("payload.db");
     {
         let mut db = Database::open(&path).unwrap();
-        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, s TEXT)", []).unwrap();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, s TEXT)", [])
+            .unwrap();
         for i in 1..=20i64 {
             let filler = "A".repeat(200);
             db.execute(
@@ -205,15 +225,24 @@ fn payload_corruption_does_not_false_positive() {
     std::fs::write(&path, &bytes).unwrap();
 
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
+    assert_eq!(
+        first_col(&mut db, "PRAGMA integrity_check"),
+        vec!["ok".to_string()]
+    );
     // The data DID change — one 'A' became 'B' — proving the strike was a
     // live value byte (not a structural no-op).
-    let rows = db.query("SELECT COUNT(*) FROM p WHERE s LIKE '%B%'", []).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM p WHERE s LIKE '%B%'", [])
+        .unwrap();
     let n = match rows.first().and_then(|r| r.first()) {
         Some(Value::Integer(n)) => *n,
         other => panic!("COUNT returned {:?}", other),
     };
-    assert!(n >= 1, "flipped byte should appear as a changed value, got {}", n);
+    assert!(
+        n >= 1,
+        "flipped byte should appear as a changed value, got {}",
+        n
+    );
 }
 
 #[test]
@@ -236,7 +265,8 @@ fn crash_recovered_database_passes_integrity() {
     let path = tmp.path().join("crash.db");
     {
         let mut db = Database::open(&path).unwrap();
-        db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         for i in 1..=200i64 {
             db.execute(
                 "INSERT INTO c (v) VALUES (?)",
@@ -268,7 +298,10 @@ fn crash_recovered_database_passes_integrity() {
     // the process). Restoring the pristine copy emulates that exactly.
     std::fs::write(&path, &original).unwrap();
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
+    assert_eq!(
+        first_col(&mut db, "PRAGMA integrity_check"),
+        vec!["ok".to_string()]
+    );
     let rows = db.query("SELECT COUNT(*) FROM c", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(200));
 }
@@ -282,7 +315,8 @@ fn savepoint_rollback_leaves_ok_database() {
     let path = tmp.path().join("sp.db");
     {
         let mut db = Database::open(&path).unwrap();
-        db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         for i in 1..=300i64 {
             db.execute(
                 "INSERT INTO s (v) VALUES (?)",
@@ -293,7 +327,8 @@ fn savepoint_rollback_leaves_ok_database() {
         db.execute("SAVEPOINT outer", []).unwrap();
         db.execute("DELETE FROM s WHERE id > 150", []).unwrap();
         db.execute("SAVEPOINT inner", []).unwrap();
-        db.execute("INSERT INTO s (v) VALUES ('extra')", []).unwrap();
+        db.execute("INSERT INTO s (v) VALUES ('extra')", [])
+            .unwrap();
         db.execute("ROLLBACK TO inner", []).unwrap();
         // 'inner' stays on the stack: ROLLBACK TO again must work.
         db.execute("ROLLBACK TO inner", []).unwrap();
@@ -305,5 +340,8 @@ fn savepoint_rollback_leaves_ok_database() {
         assert_eq!(rows[0][0], Value::Integer(300));
     }
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(first_col(&mut db, "PRAGMA integrity_check"), vec!["ok".to_string()]);
+    assert_eq!(
+        first_col(&mut db, "PRAGMA integrity_check"),
+        vec!["ok".to_string()]
+    );
 }

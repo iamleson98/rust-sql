@@ -1,6 +1,7 @@
 //! Layer-by-layer cost breakdown of the remaining benchmark gaps:
 //!   1. point lookup by rowid (engine loses ~8% in bench_compare)
 //!   2. GROUP BY 100 buckets (~4%)
+//!
 //! Run: cargo run --release --example probe_gaps2
 
 use rustqlite::storage::btree::Btree;
@@ -15,7 +16,9 @@ fn best(mut f: impl FnMut() -> std::time::Duration) -> std::time::Duration {
     let mut best = std::time::Duration::MAX;
     for _ in 0..5 {
         let d = f();
-        if d < best { best = d; }
+        if d < best {
+            best = d;
+        }
     }
     best
 }
@@ -23,15 +26,18 @@ fn best(mut f: impl FnMut() -> std::time::Duration) -> std::time::Duration {
 fn main() {
     // ---------- build the same table as bench_compare (10k rows) ----------
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     {
         // fast bulk insert
         let mut vals = String::new();
         for i in 1..=10000i64 {
             vals.push_str(&format!(
-                "({i}, 'user{:04}', {v}, {s}),\n",
+                "({i}, 'user{v:04}', {v}, {s}),\n",
                 v = (i * 37) % 10000,
                 s = (i % 1000) as f64 + 0.5
             ));
@@ -88,7 +94,12 @@ fn main() {
                 .lookup_table_with(target, |payload| {
                     let mut out = Vec::with_capacity(3);
                     rustqlite::storage::row_codec::decode_row_selective(
-                        payload, ncols, &project, target, rowid_alias, &mut out,
+                        payload,
+                        ncols,
+                        &project,
+                        target,
+                        rowid_alias,
+                        &mut out,
                     )
                     .map(|_| out)
                 })
@@ -168,7 +179,9 @@ fn main() {
     let d = best(|| {
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            let _ = db.query("SELECT COUNT(*), SUM(val), AVG(val) FROM t", []).unwrap();
+            let _ = db
+                .query("SELECT COUNT(*), SUM(val), AVG(val) FROM t", [])
+                .unwrap();
         }
         start.elapsed()
     });

@@ -208,8 +208,15 @@ impl std::fmt::Debug for RustqliteRow {
 // Shared column-metadata construction
 // ---------------------------------------------------------------------------
 
+/// Shared per-statement column list.
+pub(crate) type Columns = Arc<Vec<RustqliteColumn>>;
+/// Shared column name → ordinal map.
+pub(crate) type NameMap = Arc<HashMap<Arc<str>, usize>>;
+/// Both halves of a statement's column metadata.
+pub(crate) type ColumnMeta = (Columns, NameMap);
+
 /// Build `(columns, name_map)` from a set of column names.
-pub(crate) fn columns_from_names(names: &[String]) -> (Arc<Vec<RustqliteColumn>>, Arc<HashMap<Arc<str>, usize>>) {
+pub(crate) fn columns_from_names(names: &[String]) -> ColumnMeta {
     let mut columns = Vec::with_capacity(names.len());
     let mut map = HashMap::with_capacity(names.len());
     for (ordinal, name) in names.iter().enumerate() {

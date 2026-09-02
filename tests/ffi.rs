@@ -82,7 +82,10 @@ fn ffi_bind_and_types() {
     unsafe {
         let mut db: *mut RqlConn = std::ptr::null_mut();
         rustqlite_open(c":memory:".as_ptr(), &mut db);
-        rustqlite_exec(db, c"CREATE TABLE t (i INTEGER, r REAL, s TEXT, b BLOB)".as_ptr());
+        rustqlite_exec(
+            db,
+            c"CREATE TABLE t (i INTEGER, r REAL, s TEXT, b BLOB)".as_ptr(),
+        );
         let mut stmt: *mut RqlStmt = std::ptr::null_mut();
         rustqlite_prepare_v2(
             db,
@@ -94,13 +97,7 @@ fn ffi_bind_and_types() {
         assert_eq!(rustqlite_bind_parameter_count(stmt), 4);
         rustqlite_bind_int64(stmt, 1, 42);
         rustqlite_bind_double(stmt, 2, 2.5);
-        rustqlite_bind_text(
-            stmt,
-            3,
-            c"hello".as_ptr(),
-            -1,
-            None,
-        );
+        rustqlite_bind_text(stmt, 3, c"hello".as_ptr(), -1, None);
         let blob: [u8; 3] = [1, 2, 3];
         rustqlite_bind_blob(stmt, 4, blob.as_ptr() as *const std::ffi::c_void, 3, None);
         assert_eq!(rustqlite_step(stmt), RQL_DONE); // 101
@@ -108,7 +105,13 @@ fn ffi_bind_and_types() {
         rustqlite_finalize(stmt);
 
         let mut q: *mut RqlStmt = std::ptr::null_mut();
-        rustqlite_prepare_v2(db, c"SELECT i, r, s, b FROM t".as_ptr(), -1, &mut q, std::ptr::null_mut());
+        rustqlite_prepare_v2(
+            db,
+            c"SELECT i, r, s, b FROM t".as_ptr(),
+            -1,
+            &mut q,
+            std::ptr::null_mut(),
+        );
         assert_eq!(rustqlite_step(q), RQL_ROW);
         assert_eq!(rustqlite_column_type(q, 0), RQL_INTEGER);
         assert_eq!(rustqlite_column_int64(q, 0), 42);
@@ -133,7 +136,13 @@ fn ffi_close_refuses_live_statements() {
         rustqlite_open(c":memory:".as_ptr(), &mut db);
         rustqlite_exec(db, c"CREATE TABLE t (x)".as_ptr());
         let mut stmt: *mut RqlStmt = std::ptr::null_mut();
-        rustqlite_prepare_v2(db, c"SELECT x FROM t".as_ptr(), -1, &mut stmt, std::ptr::null_mut());
+        rustqlite_prepare_v2(
+            db,
+            c"SELECT x FROM t".as_ptr(),
+            -1,
+            &mut stmt,
+            std::ptr::null_mut(),
+        );
         // Statement alive → close returns MISUSE (SQLite's SQLITE_BUSY).
         assert_eq!(rustqlite_close(db), RQL_MISUSE);
         rustqlite_finalize(stmt);
@@ -168,14 +177,16 @@ fn load_c_extension() {
     assert_eq!(rows[0][0].as_text(), "uryyb");
     // Aggregate registered by the C plugin (sum of squares).
     db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", []).unwrap();
+    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", [])
+        .unwrap();
     let rows = db.query("SELECT sumsq(x) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_real(), 14.0);
     // Collation.
     let rows = db.query("SELECT 'nop' < 'abc' COLLATE ROT13", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 1); // rot13('nop')='abc' < rot13('abc')='nop'
-    // Virtual table from the C plugin.
-    db.execute("CREATE VIRTUAL TABLE s USING series(5)", []).unwrap();
+                                            // Virtual table from the C plugin.
+    db.execute("CREATE VIRTUAL TABLE s USING series(5)", [])
+        .unwrap();
     let rows = db.query("SELECT count(*) FROM s", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 6);
 }
@@ -193,21 +204,29 @@ fn load_cpp_extension() {
     assert_eq!(rows[0][0].as_text(), "HELLO!");
     // Aggregate with std::deque state.
     db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (2), (4), (9)", []).unwrap();
+    db.execute("INSERT INTO t (x) VALUES (2), (4), (9)", [])
+        .unwrap();
     let rows = db.query("SELECT movavg(x) FROM t", []).unwrap();
-    assert!((rows[0][0].as_real() - 5.0).abs() < 1e-12, "movavg = {}", rows[0][0].as_real());
+    assert!(
+        (rows[0][0].as_real() - 5.0).abs() < 1e-12,
+        "movavg = {}",
+        rows[0][0].as_real()
+    );
     // Collation: numeric-aware ordering (2 < 10 numerically, but
     // '10' < '2' in BINARY byte order).
     let rows = db.query("SELECT '2' < '10' COLLATE NUMERIC", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 1);
     let rows = db.query("SELECT '2' < '10'", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 0); // BINARY: '10' < '2'
-    // Writable vtab from C++.
-    db.execute("CREATE VIRTUAL TABLE kv USING kvstore()", []).unwrap();
-    db.execute("INSERT INTO kv (k, v) VALUES ('a', '1'), ('b', '2')", []).unwrap();
+                                            // Writable vtab from C++.
+    db.execute("CREATE VIRTUAL TABLE kv USING kvstore()", [])
+        .unwrap();
+    db.execute("INSERT INTO kv (k, v) VALUES ('a', '1'), ('b', '2')", [])
+        .unwrap();
     let rows = db.query("SELECT v FROM kv WHERE k = 'b'", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "2");
-    db.execute("UPDATE kv SET v = '20' WHERE k = 'b'", []).unwrap();
+    db.execute("UPDATE kv SET v = '20' WHERE k = 'b'", [])
+        .unwrap();
     let rows = db.query("SELECT v FROM kv WHERE k = 'b'", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "20");
     db.execute("DELETE FROM kv WHERE k = 'a'", []).unwrap();
@@ -227,14 +246,16 @@ fn load_zig_extension() {
     assert_eq!(rows[0][0].as_text(), "uryyb");
     // Aggregate.
     db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (NULL), (3)", []).unwrap();
+    db.execute("INSERT INTO t (x) VALUES (1), (NULL), (3)", [])
+        .unwrap();
     let rows = db.query("SELECT zcount(x) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 2);
     // Collation.
     let rows = db.query("SELECT 'ba' < 'ab' COLLATE ZREVERSE", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 1); // reversed: 'ab' vs 'ba' → 'ab' < 'ba' → 'ba' sorts first → 'ba' < 'ab' = true
-    // Virtual table with args.
-    db.execute("CREATE VIRTUAL TABLE rng USING zrange(7)", []).unwrap();
+                                            // Virtual table with args.
+    db.execute("CREATE VIRTUAL TABLE rng USING zrange(7)", [])
+        .unwrap();
     let rows = db.query("SELECT count(*) FROM rng", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 7);
 }
@@ -255,11 +276,13 @@ fn load_rust_extension() {
     assert_eq!(rows[0][0].as_integer(), 24);
     // Aggregate.
     db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (2), (3), (4)", []).unwrap();
+    db.execute("INSERT INTO t (x) VALUES (2), (3), (4)", [])
+        .unwrap();
     let rows = db.query("SELECT product(x) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_real(), 24.0);
     // vtab.
-    db.execute("CREATE VIRTUAL TABLE m USING mirror(5)", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE m USING mirror(5)", [])
+        .unwrap();
     let rows = db.query("SELECT count(*) FROM m", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 5);
     let rows = db.query("SELECT label FROM m WHERE n = 2", []).unwrap();
@@ -270,7 +293,9 @@ fn load_rust_extension() {
 #[test]
 fn load_extension_bad_path_and_entry() {
     let mut db = Database::open_in_memory().unwrap();
-    let err = db.load_extension("/nonexistent/plugin.so", None).unwrap_err();
+    let err = db
+        .load_extension("/nonexistent/plugin.so", None)
+        .unwrap_err();
     assert!(err.to_string().contains("load_extension"));
     // Valid file, missing entry point.
     let dir = tempfile::tempdir().unwrap();
@@ -278,4 +303,3 @@ fn load_extension_bad_path_and_entry() {
     std::fs::write(&fake, b"not a shared library").unwrap();
     assert!(db.load_extension(&fake, None).is_err());
 }
-

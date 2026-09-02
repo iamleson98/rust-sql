@@ -34,7 +34,10 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 1)
+        Rng(seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+            | 1)
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -45,7 +48,11 @@ impl Rng {
         x.wrapping_mul(2685821657736338717)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
 }
 
@@ -71,8 +78,11 @@ fn env_seed() -> u64 {
 ///   - a WITHOUT ROWID table? (if supported — best effort)
 fn build_valid_db(path: &std::path::Path) -> (usize, usize) {
     let mut db = Database::open(path).expect("build fresh db");
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, r REAL, b BLOB)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, r REAL, b BLOB)",
+        [],
+    )
+    .unwrap();
     db.execute("CREATE INDEX idx_s ON t(s)", []).unwrap();
     for i in 1..=2000i64 {
         db.execute(
@@ -87,12 +97,16 @@ fn build_valid_db(path: &std::path::Path) -> (usize, usize) {
     }
     db.flush().unwrap();
     let n_rows = db.query("SELECT COUNT(*) FROM t", []).unwrap().len();
-    let committed = db
-        .query("SELECT COUNT(*) FROM t", [])
-        .unwrap()[0][0]
-        .clone();
+    let committed = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].clone();
     let file_len = std::fs::metadata(path).unwrap().len() as usize;
-    (file_len, if let Value::Integer(n) = committed { n as usize } else { n_rows })
+    (
+        file_len,
+        if let Value::Integer(n) = committed {
+            n as usize
+        } else {
+            n_rows
+        },
+    )
 }
 
 /// Read every page of every table + index: a full structural walk. The
@@ -118,7 +132,10 @@ fn full_read(db: &mut Database) -> Result<(), String> {
     }
     // Also exercise count/aggregate paths over the primary key.
     for (name, _t) in &tables {
-        let _ = db.query(&format!("SELECT COUNT(*), MIN(rowid), MAX(rowid) FROM {}", name), []);
+        let _ = db.query(
+            &format!("SELECT COUNT(*), MIN(rowid), MAX(rowid) FROM {}", name),
+            [],
+        );
     }
     Ok(())
 }
@@ -130,7 +147,10 @@ fn write_still_works_or_errors(path: &std::path::Path) {
     match Database::open(path) {
         Ok(mut db) => {
             // If the DB opened, a write either succeeds or fails gracefully.
-            let _ = db.execute("INSERT INTO t (s, r, b) VALUES ('post-corruption', 1.0, X'00')", []);
+            let _ = db.execute(
+                "INSERT INTO t (s, r, b) VALUES ('post-corruption', 1.0, X'00')",
+                [],
+            );
             let _ = db.execute("DELETE FROM t WHERE s = 'post-corruption'", []);
             let _ = db.flush();
         }
@@ -139,7 +159,12 @@ fn write_still_works_or_errors(path: &std::path::Path) {
 }
 
 fn corrupt_and_verify(path: &std::path::Path, original: &[u8], corrupted: &[u8], label: &str) {
-    assert_ne!(Some(corrupted), Some(original), "{}: mutation was a no-op", label);
+    assert_ne!(
+        Some(corrupted),
+        Some(original),
+        "{}: mutation was a no-op",
+        label
+    );
     std::fs::write(path, corrupted).unwrap();
     // The core contract: no panic, no abort, no infinite loop (test harness
     // imposes the time limit).
@@ -172,7 +197,11 @@ fn corrupt_and_verify(path: &std::path::Path, original: &[u8], corrupted: &[u8],
             "{}: read outcome flipped between passes ({} -> {})",
             label,
             outcome,
-            if second.is_ok() { "readable" } else { "corruption-detected" }
+            if second.is_ok() {
+                "readable"
+            } else {
+                "corruption-detected"
+            }
         );
     }
     write_still_works_or_errors(path);
@@ -185,7 +214,11 @@ fn malformed_database_files_never_panic() {
     let db_path = tmp.path().join("corrupt.db");
     let (file_len, committed_rows) = build_valid_db(&db_path);
     let original = std::fs::read(&db_path).unwrap();
-    assert!(file_len > 4096, "test DB suspiciously small: {} bytes", file_len);
+    assert!(
+        file_len > 4096,
+        "test DB suspiciously small: {} bytes",
+        file_len
+    );
     assert_eq!(committed_rows, 2000);
 
     let iters = env_iters(600);
@@ -257,7 +290,12 @@ fn structural_corruption_never_panics() {
                     continue;
                 }
                 bytes[base + off] = v;
-                corrupt_and_verify(&db_path, &original, &bytes, &format!("page{} hdr+{} = {:#x}", page, off, v));
+                corrupt_and_verify(
+                    &db_path,
+                    &original,
+                    &bytes,
+                    &format!("page{} hdr+{} = {:#x}", page, off, v),
+                );
             }
         }
     }
@@ -282,12 +320,22 @@ fn structural_corruption_never_panics() {
             if original[off..off + 4] != [0xFF, 0xFF, 0xFF, 0xFF] {
                 let mut bytes = original.clone();
                 bytes[off..off + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-                corrupt_and_verify(&db_path, &original, &bytes, &format!("file-header {} = 0xFFFFFFFF", name));
+                corrupt_and_verify(
+                    &db_path,
+                    &original,
+                    &bytes,
+                    &format!("file-header {} = 0xFFFFFFFF", name),
+                );
             }
             if original[off..off + 4] != [0x00, 0x00, 0x00, 0x00] {
                 let mut bytes = original.clone();
                 bytes[off..off + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                corrupt_and_verify(&db_path, &original, &bytes, &format!("file-header {} = 0", name));
+                corrupt_and_verify(
+                    &db_path,
+                    &original,
+                    &bytes,
+                    &format!("file-header {} = 0", name),
+                );
             }
         }
     }
@@ -304,7 +352,11 @@ fn truncated_and_garbage_files_fail_gracefully() {
     let original = std::fs::read(&db_path).unwrap();
     // Our header: page_size is u32 LE at bytes 8..12 (see FileHeader).
     let page_size = u32::from_le_bytes(original[8..12].try_into().unwrap()) as usize;
-    assert!(page_size >= 512 && page_size.is_power_of_two(), "bad page size {}", page_size);
+    assert!(
+        page_size >= 512 && page_size.is_power_of_two(),
+        "bad page size {}",
+        page_size
+    );
 
     // Truncate at every page boundary (and a few mid-page points). The
     // cut must be strictly shorter than the file — truncating to the full
@@ -317,7 +369,12 @@ fn truncated_and_garbage_files_fail_gracefully() {
     for cut in [page_size + page_size / 2, original.len() - page_size / 2] {
         if cut < original.len() {
             let bytes = original[..cut].to_vec();
-            corrupt_and_verify(&db_path, &original, &bytes, &format!("truncate-mid-{}", cut));
+            corrupt_and_verify(
+                &db_path,
+                &original,
+                &bytes,
+                &format!("truncate-mid-{}", cut),
+            );
         }
     }
 
@@ -344,27 +401,24 @@ fn truncated_and_garbage_files_fail_gracefully() {
         ),
         ("all-zeros".into(), vec![0u8; 8192]),
         ("all-ff".into(), vec![0xFF; 8192]),
-        ("random".into(), (0..8192).map(|i| (i * 31 + 7) as u8).collect()),
         (
-            "huge-page-count".into(),
-            {
-                let mut b = original.clone();
-                // Claim 0x7FFFFFFF pages in OUR header field (bytes
-                // 16..20, u32 LE — see FileHeader).
-                b[16..20].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
-                b
-            },
+            "random".into(),
+            (0..8192).map(|i| (i * 31 + 7) as u8).collect(),
         ),
-        (
-            "huge-page-count-be".into(),
-            {
-                // Also strike the field with a BE-encoded value: catches
-                // any parser that accidentally reads big-endian.
-                let mut b = original.clone();
-                b[16..20].copy_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
-                b
-            },
-        ),
+        ("huge-page-count".into(), {
+            let mut b = original.clone();
+            // Claim 0x7FFFFFFF pages in OUR header field (bytes
+            // 16..20, u32 LE — see FileHeader).
+            b[16..20].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+            b
+        }),
+        ("huge-page-count-be".into(), {
+            // Also strike the field with a BE-encoded value: catches
+            // any parser that accidentally reads big-endian.
+            let mut b = original.clone();
+            b[16..20].copy_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
+            b
+        }),
     ];
     for (name, bytes) in garbage_files {
         corrupt_and_verify(&db_path, &original, &bytes, &format!("garbage-{}", name));
@@ -395,9 +449,14 @@ fn corrupted_wal_is_rejected_or_ignored() {
     // leave multiple frames in the WAL.
     let mut db = Database::open(&db_path).unwrap();
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     for i in 1..=500i64 {
-        db.execute("INSERT INTO w (v) VALUES (?)", [Value::Text(format!("row{}", i).into())]).unwrap();
+        db.execute(
+            "INSERT INTO w (v) VALUES (?)",
+            [Value::Text(format!("row{}", i).into())],
+        )
+        .unwrap();
     }
     db.flush().unwrap();
     drop(db);
@@ -475,7 +534,10 @@ fn corrupt_file_survives_full_workload() {
             let _ = db.execute("INSERT INTO z VALUES (1)", []);
             let _ = db.execute("UPDATE z SET x = 2 WHERE x = 1", []);
             let _ = db.query("SELECT * FROM t ORDER BY id LIMIT 100", []);
-            let _ = db.query("SELECT s, COUNT(*) FROM t GROUP BY s HAVING COUNT(*) > 0 LIMIT 10", []);
+            let _ = db.query(
+                "SELECT s, COUNT(*) FROM t GROUP BY s HAVING COUNT(*) > 0 LIMIT 10",
+                [],
+            );
             let _ = db.query("SELECT * FROM t a JOIN t b ON a.id = b.id - 1 LIMIT 10", []);
             let _ = db.execute("DELETE FROM z WHERE x = 2", []);
             let _ = db.flush();

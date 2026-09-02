@@ -150,7 +150,12 @@ impl CodecState {
     }
 
     /// Decode a page from disk.
-    pub fn decode_page(&self, is_header_page: bool, data: &[u8], page_size: usize) -> Result<Vec<u8>> {
+    pub fn decode_page(
+        &self,
+        is_header_page: bool,
+        data: &[u8],
+        page_size: usize,
+    ) -> Result<Vec<u8>> {
         let c = match &self.active {
             None => {
                 let mut out = vec![0u8; page_size.max(data.len())];
@@ -190,7 +195,11 @@ impl CodecState {
 /// Validate that a codec name is well-formed before activation.
 pub fn validate_codec_name(name: &str) -> Result<String> {
     let lowered = name.to_ascii_lowercase();
-    if lowered.is_empty() || !lowered.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if lowered.is_empty()
+        || !lowered
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
         return Err(Error::semantic(format!("invalid codec name: {name:?}")));
     }
     Ok(lowered)

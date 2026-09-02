@@ -184,6 +184,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(note.is_none());
     println!("blob + NULL roundtrip ok");
 
+    println!("== 11. read-only connection (mode=ro / SqliteConnectOptions.read_only) ==");
+    {
+        // Read-only pool over the SAME file: SELECTs work, writes are
+        // rejected with SQLITE_READONLY ("attempt to write a readonly
+        // database") — SQLite's readonly-connection semantics.
+        let ro_opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true);
+        let ro_pool: SqlitePool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(ro_opts)
+            .await?;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&ro_pool)
+            .await?;
+        assert_eq!(n, 1);
+        let write = sqlx::query("INSERT INTO blobs (data, note) VALUES (?, ?)")
+            .bind(vec![9u8])
+            .bind("nope")
+            .execute(&ro_pool)
+            .await;
+        let msg = format!("{}", write.err().expect("write must fail on ro connection"));
+        assert!(
+            msg.contains("readonly") || msg.contains("read-only"),
+            "unexpected error: {}",
+            msg
+        );
+        println!("read-only enforcement ok: writes rejected, reads served");
+        ro_pool.close().await;
+    }
+
     pool.close().await;
     let _ = std::fs::remove_file(&path);
     println!("\nALL SQLX INTEROP TESTS PASSED");

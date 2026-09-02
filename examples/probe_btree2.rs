@@ -25,7 +25,11 @@ fn main() {
             hint = bt.insert_table_append_hinted(i, &payload, hint).unwrap();
         }
         let d = start.elapsed();
-        println!("500 single-page appends: {:?} ({:.0} ns/append)", d, d.as_nanos() as f64 / 500.0);
+        println!(
+            "500 single-page appends: {:?} ({:.0} ns/append)",
+            d,
+            d.as_nanos() as f64 / 500.0
+        );
 
         // get_page alone.
         let start = Instant::now();
@@ -33,7 +37,11 @@ fn main() {
             let _p = pager.get_page(root).unwrap();
         }
         let d = start.elapsed();
-        println!("10k get_page hits: {:?} ({:.0} ns/call)", d, d.as_nanos() as f64 / 10_000.0);
+        println!(
+            "10k get_page hits: {:?} ({:.0} ns/call)",
+            d,
+            d.as_nanos() as f64 / 10_000.0
+        );
 
         // lock + unlock alone.
         let p = pager.get_page(root).unwrap();
@@ -44,6 +52,10 @@ fn main() {
             drop(g);
         }
         let d = start.elapsed();
-        println!("10k lock+n_cells: {:?} ({:.0} ns/call)", d, d.as_nanos() as f64 / 10_000.0);
+        println!(
+            "10k lock+n_cells: {:?} ({:.0} ns/call)",
+            d,
+            d.as_nanos() as f64 / 10_000.0
+        );
     }
 }

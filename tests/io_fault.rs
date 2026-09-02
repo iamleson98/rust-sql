@@ -32,11 +32,18 @@ use rustqlite::{Database, Value};
 
 fn build_baseline(path: &std::path::Path) {
     let mut db = Database::open(path).unwrap();
-    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT, r REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT, r REAL)",
+        [],
+    )
+    .unwrap();
     for i in 1..=500i64 {
         db.execute(
             "INSERT INTO b (v, r) VALUES (?, ?)",
-            [Value::Text(format!("row-{}", i).into()), Value::Real(i as f64 / 7.0)],
+            [
+                Value::Text(format!("row-{}", i).into()),
+                Value::Real(i as f64 / 7.0),
+            ],
         )
         .unwrap();
     }
@@ -61,7 +68,9 @@ fn examine_database(path: &std::path::Path) {
         );
     }
     let mut db = Database::open(path).expect("re-open after I/O fault");
-    let rows = db.query("SELECT COUNT(*), SUM(r), MIN(v), MAX(v) FROM b", []).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*), SUM(r), MIN(v), MAX(v) FROM b", [])
+        .unwrap();
     assert_eq!(
         rows.first().and_then(|r| r.first()),
         Some(&Value::Integer(500)),
@@ -71,10 +80,18 @@ fn examine_database(path: &std::path::Path) {
     let rows = db.query("SELECT * FROM b ORDER BY id", []).unwrap();
     assert_eq!(rows.len(), 500);
     // Index scan.
-    let rows = db.query("SELECT id FROM b WHERE v LIKE 'row-1%' ORDER BY v", []).unwrap();
-    assert_eq!(rows.len(), 111, "row-1xx prefix scan found {} rows", rows.len());
+    let rows = db
+        .query("SELECT id FROM b WHERE v LIKE 'row-1%' ORDER BY v", [])
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        111,
+        "row-1xx prefix scan found {} rows",
+        rows.len()
+    );
     // Write + rollback cycle.
-    db.execute("INSERT INTO b (v, r) VALUES ('probe', 0)", []).unwrap();
+    db.execute("INSERT INTO b (v, r) VALUES ('probe', 0)", [])
+        .unwrap();
     db.execute("DELETE FROM b WHERE v = 'probe'", []).unwrap();
     db.flush().unwrap();
 }
@@ -92,8 +109,13 @@ fn readonly_file_rejects_writes_gracefully() {
     std::fs::set_permissions(&db_path, perms).unwrap();
 
     // Reads must keep working.
-    let rows = db.query("SELECT COUNT(*) FROM b", []).expect("reads must survive chmod 444");
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(500)));
+    let rows = db
+        .query("SELECT COUNT(*) FROM b", [])
+        .expect("reads must survive chmod 444");
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(500))
+    );
 
     // NOTE (POSIX semantics): chmod cannot revoke write access on a file
     // descriptor that is already open — even SQLite SUCCEEDS writing
@@ -127,7 +149,11 @@ fn readonly_file_rejects_writes_gracefully() {
             .query("SELECT v, r FROM b WHERE v = 'mid'", [])
             .expect("mid-session row must be fully readable (atomic write)");
         assert_eq!(rows.len(), 1, "mid-session row torn: {} rows", rows.len());
-        assert_eq!(rows[0][1], Value::Real(1.0), "mid-session row columns damaged");
+        assert_eq!(
+            rows[0][1],
+            Value::Real(1.0),
+            "mid-session row columns damaged"
+        );
         db.execute("DELETE FROM b WHERE v = 'mid'", []).unwrap();
         db.flush().unwrap();
     }
@@ -201,7 +227,10 @@ fn deleted_file_fails_flush_gracefully() {
     // Reads through the still-open handle keep working...
     let rows = db.query("SELECT COUNT(*) FROM b", []);
     if let Ok(rows) = rows {
-        assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(500)));
+        assert_eq!(
+            rows.first().and_then(|r| r.first()),
+            Some(&Value::Integer(500))
+        );
     }
     // ...and a flush of NEW data must fail gracefully or succeed into the
     // orphaned inode — never panic.
@@ -259,11 +288,15 @@ fn io_error_during_open_transaction_aborts_cleanly() {
 
     let mut db = Database::open(&db_path).unwrap();
     db.execute("BEGIN", []).unwrap();
-    db.execute("INSERT INTO b (v, r) VALUES ('in-flight', 42)", []).unwrap();
+    db.execute("INSERT INTO b (v, r) VALUES ('in-flight', 42)", [])
+        .unwrap();
 
     // Fault: truncate the database to a sliver mid-transaction (a failing
     // disk that lost its tail). The engine must not panic on either path.
-    let f = std::fs::OpenOptions::new().write(true).open(&db_path).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .unwrap();
     f.set_len(4096).unwrap();
     drop(f);
 

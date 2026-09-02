@@ -21,9 +21,17 @@ pub enum Error {
     /// reclaimed, or two writers collided.
     Transaction(String),
     /// SQL lexer error (bad token, unterminated string, etc.).
-    Lex { line: usize, col: usize, msg: String },
+    Lex {
+        line: usize,
+        col: usize,
+        msg: String,
+    },
     /// SQL parser error (unexpected token, malformed syntax).
-    Parse { line: usize, col: usize, msg: String },
+    Parse {
+        line: usize,
+        col: usize,
+        msg: String,
+    },
     /// SQL semantic error (unknown column, type mismatch, ambiguous name).
     Semantic(String),
     /// Constraint violation with a SQLite-exact message. The Display is
@@ -49,10 +57,18 @@ pub enum Error {
 
 impl Error {
     pub fn lex(line: usize, col: usize, msg: impl Into<String>) -> Self {
-        Error::Lex { line, col, msg: msg.into() }
+        Error::Lex {
+            line,
+            col,
+            msg: msg.into(),
+        }
     }
     pub fn parse(line: usize, col: usize, msg: impl Into<String>) -> Self {
-        Error::Parse { line, col, msg: msg.into() }
+        Error::Parse {
+            line,
+            col,
+            msg: msg.into(),
+        }
     }
     pub fn corruption(msg: impl Into<String>) -> Self {
         Error::Corruption(msg.into())
@@ -78,7 +94,9 @@ impl fmt::Display for Error {
             Error::Wal(m) => write!(f, "wal: {}", m),
             Error::Transaction(m) => write!(f, "transaction: {}", m),
             Error::Lex { line, col, msg } => write!(f, "lex error at {}:{}: {}", line, col, msg),
-            Error::Parse { line, col, msg } => write!(f, "parse error at {}:{}: {}", line, col, msg),
+            Error::Parse { line, col, msg } => {
+                write!(f, "parse error at {}:{}: {}", line, col, msg)
+            }
             Error::Semantic(m) => write!(f, "semantic error: {}", m),
             // Prefix-free: byte-identical to SQLite's errmsg.
             Error::Constraint(m) => write!(f, "{}", m),

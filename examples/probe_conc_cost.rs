@@ -6,6 +6,7 @@
 //!   3. 8 tasks, 8-connection pool (true concurrency)
 //!   4. reads-only 8 tasks, 8 conns
 //!   5. writes-only 8 tasks, 8 conns
+//!
 //! …plus per-query atomic counters to see lock/gate behavior.
 
 use std::time::Instant;
@@ -66,12 +67,13 @@ async fn mixed_op(pool: &RustqlitePool, task: usize, i: usize, counter: &mut usi
             .unwrap()
             .flatten()
             .unwrap_or(0);
-        let _: (i64, f64) = sqlx::query_as("SELECT COUNT(*), AVG(b) FROM bench WHERE a BETWEEN ? AND ?")
-            .bind(v)
-            .bind(v + 50)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        let _: (i64, f64) =
+            sqlx::query_as("SELECT COUNT(*), AVG(b) FROM bench WHERE a BETWEEN ? AND ?")
+                .bind(v)
+                .bind(v + 50)
+                .fetch_one(pool)
+                .await
+                .unwrap();
         *counter += 2;
     }
 }
@@ -85,7 +87,10 @@ async fn main() {
     for i in 0..PER {
         mixed_op(&pool, 0, i, &mut n).await;
     }
-    println!("serial 1 conn        : {:>8.1} ms  ({n} queries)", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "serial 1 conn        : {:>8.1} ms  ({n} queries)",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     drop(pool);
 
     // 2. 8 tasks, 1 connection
@@ -106,7 +111,10 @@ async fn main() {
     for h in handles {
         total += h.await.unwrap();
     }
-    println!("8 tasks 1 conn       : {:>8.1} ms  ({total} queries)", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "8 tasks 1 conn       : {:>8.1} ms  ({total} queries)",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     drop(pool);
 
     // 3. 8 tasks, 8 connections
@@ -127,7 +135,10 @@ async fn main() {
     for h in handles {
         total += h.await.unwrap();
     }
-    println!("8 tasks 8 conns      : {:>8.1} ms  ({total} queries)", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "8 tasks 8 conns      : {:>8.1} ms  ({total} queries)",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     drop(pool);
 
     // 4. reads-only, 8 conns
@@ -158,7 +169,10 @@ async fn main() {
     for h in handles {
         h.await.unwrap();
     }
-    println!("8 tasks reads-only   : {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "8 tasks reads-only   : {:>8.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     drop(pool);
 
     // 5. writes-only, 8 conns
@@ -190,7 +204,10 @@ async fn main() {
     for h in handles {
         h.await.unwrap();
     }
-    println!("8 tasks writes-only  : {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "8 tasks writes-only  : {:>8.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
 
     // 6. single aggregate query cost (for scale)
     let pool = setup("probe-agg", 1).await;
@@ -204,5 +221,8 @@ async fn main() {
                 .await
                 .unwrap();
     }
-    println!("2000 agg queries     : {:>8.1} ms  (serial, 1 conn)", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "2000 agg queries     : {:>8.1} ms  (serial, 1 conn)",
+        t.elapsed().as_secs_f64() * 1e3
+    );
 }

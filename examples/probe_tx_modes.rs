@@ -3,7 +3,12 @@ use rustqlite::Database;
 fn main() {
     // Transaction modes sqlx/sea-orm issue (pool BEGIN, migrator lock).
     let mut db = Database::open_in_memory().unwrap();
-    for mode in ["BEGIN", "BEGIN DEFERRED", "BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+    for mode in [
+        "BEGIN",
+        "BEGIN DEFERRED",
+        "BEGIN IMMEDIATE",
+        "BEGIN EXCLUSIVE",
+    ] {
         let r = db.execute(mode, []);
         println!("{mode:16} -> {:?}", r);
         let _ = db.execute("COMMIT", []);

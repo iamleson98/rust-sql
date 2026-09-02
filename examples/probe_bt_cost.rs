@@ -11,15 +11,23 @@ fn ns(d: std::time::Duration) -> f64 {
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     let ins = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
     for i in 1..=10000i64 {
-        db.execute(ins, [
-            Value::Text(format!("name{}", i).into()),
-            Value::Integer(i * 2),
-            Value::Real(i as f64 * 1.5),
-        ]).unwrap();
+        db.execute(
+            ins,
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
@@ -34,13 +42,21 @@ fn main() {
             let name = row.get(1);
             let root = row.get(3).map(|v| v.as_integer());
             if let (Some(Value::Text(n)), Some(r)) = (name, root) {
-                if n.as_str() == "t" { t_root = r as u32; }
-                if n.as_str() == "idx_val" { idx_root = r as u32; }
+                if n.as_str() == "t" {
+                    t_root = r as u32;
+                }
+                if n.as_str() == "idx_val" {
+                    idx_root = r as u32;
+                }
             }
         }
         true
-    }).unwrap();
-    println!("t root={t_root} idx_val root={idx_root} pages={}", pager.n_pages());
+    })
+    .unwrap();
+    println!(
+        "t root={t_root} idx_val root={idx_root} pages={}",
+        pager.n_pages()
+    );
 
     // Warm: run each op pattern once so hint caches exist.
     let n = 200_000i64;
@@ -63,7 +79,10 @@ fn main() {
             Value::Integer(v).encode_order_key_into(&mut key);
             ibt.lookup_index_into(&key, &mut out).unwrap();
         }
-        println!("index lookup rotate-10k:   {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
+        println!(
+            "index lookup rotate-10k:   {:>7.1} ns/op",
+            ns(t.elapsed()) / n as f64
+        );
         // same-leaf pattern: vals 2..2600 (~4 leaves), higher hint-hit rate
         let t = Instant::now();
         for i in 0..n {
@@ -72,7 +91,10 @@ fn main() {
             Value::Integer(v).encode_order_key_into(&mut key);
             ibt.lookup_index_into(&key, &mut out).unwrap();
         }
-        println!("index lookup rotate-1.3k:  {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
+        println!(
+            "index lookup rotate-1.3k:  {:>7.1} ns/op",
+            ns(t.elapsed()) / n as f64
+        );
         // single val (100% hint hit, same binary search position)
         let t = Instant::now();
         for _i in 0..n {
@@ -80,7 +102,10 @@ fn main() {
             Value::Integer(6666).encode_order_key_into(&mut key);
             ibt.lookup_index_into(&key, &mut out).unwrap();
         }
-        println!("index lookup same-key:     {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
+        println!(
+            "index lookup same-key:     {:>7.1} ns/op",
+            ns(t.elapsed()) / n as f64
+        );
     }
 
     // (2) table lookups only — rotate rowids 1..10000.
@@ -91,9 +116,14 @@ fn main() {
         let t = Instant::now();
         for i in 0..n {
             let rid = (i % 10000) + 1;
-            let _ = tbt.lookup_table_with(rid, |_p| Ok::<_, rustqlite::Error>(0)).unwrap();
+            let _ = tbt
+                .lookup_table_with(rid, |_p| Ok::<_, rustqlite::Error>(0))
+                .unwrap();
         }
-        println!("table lookup alone:        {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
+        println!(
+            "table lookup alone:        {:>7.1} ns/op",
+            ns(t.elapsed()) / n as f64
+        );
     }
 
     // (3) key encoding alone.
@@ -104,7 +134,10 @@ fn main() {
             key.clear();
             Value::Integer(((i % 10000) + 1) * 2).encode_order_key_into(&mut key);
         }
-        println!("key encode alone:          {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
+        println!(
+            "key encode alone:          {:>7.1} ns/op",
+            ns(t.elapsed()) / n as f64
+        );
     }
 
     // (4) full query for reference.
@@ -118,9 +151,9 @@ fn main() {
             let target = ((i % 10000) + 1) * 2;
             let _ = db.query(sql, [Value::Integer(target)]).unwrap();
         }
-        println!("full query:                {:>7.1} ns/op", ns(t.elapsed()) / n as f64);
+        println!(
+            "full query:                {:>7.1} ns/op",
+            ns(t.elapsed()) / n as f64
+        );
     }
-
 }
-
-

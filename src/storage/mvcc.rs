@@ -46,7 +46,10 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn new(txid: Txid, wal_frame_count: u32) -> Self {
-        Self { txid, wal_frame_count }
+        Self {
+            txid,
+            wal_frame_count,
+        }
     }
 }
 
@@ -63,7 +66,9 @@ pub struct VersionTracker {
 
 impl VersionTracker {
     pub fn new() -> Self {
-        Self { page_versions: HashMap::new() }
+        Self {
+            page_versions: HashMap::new(),
+        }
     }
 
     /// Record that a page was written at the given WAL frame index.

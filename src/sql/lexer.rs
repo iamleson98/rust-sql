@@ -112,13 +112,21 @@ impl<'a> Lexer<'a> {
         loop {
             self.skip_whitespace_and_comments()?;
             if self.pos >= self.src.len() {
-                out.push(SpannedToken { token: Token::Eof, line: self.line, col: self.col });
+                out.push(SpannedToken {
+                    token: Token::Eof,
+                    line: self.line,
+                    col: self.col,
+                });
                 break;
             }
             let line = self.line;
             let col = self.col;
             let tok = self.next_token()?;
-            out.push(SpannedToken { token: tok, line, col });
+            out.push(SpannedToken {
+                token: tok,
+                line,
+                col,
+            });
         }
         Ok(out)
     }
@@ -175,7 +183,9 @@ impl<'a> Lexer<'a> {
             return self.lex_ident_or_keyword();
         }
         // Numeric literal
-        if c.is_ascii_digit() || (c == b'.' && self.peek(1).map(|d| d.is_ascii_digit()).unwrap_or(false)) {
+        if c.is_ascii_digit()
+            || (c == b'.' && self.peek(1).map(|d| d.is_ascii_digit()).unwrap_or(false))
+        {
             return self.lex_number();
         }
         // String literal
@@ -200,7 +210,21 @@ impl<'a> Lexer<'a> {
             return Ok(Token::Op(op));
         }
         // Single-char operator
-        if matches!(c, b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'!' | b'|' | b'&' | b'~' | b'^') {
+        if matches!(
+            c,
+            b'+' | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'='
+                | b'<'
+                | b'>'
+                | b'!'
+                | b'|'
+                | b'&'
+                | b'~'
+                | b'^'
+        ) {
             self.advance();
             let op: &'static str = match c {
                 b'+' => "+",
@@ -220,7 +244,11 @@ impl<'a> Lexer<'a> {
             };
             return Ok(Token::Op(op));
         }
-        Err(Error::lex(self.line, self.col, format!("unexpected character '{}'", c as char)))
+        Err(Error::lex(
+            self.line,
+            self.col,
+            format!("unexpected character '{}'", c as char),
+        ))
     }
 
     fn lex_ident_or_keyword(&mut self) -> Result<Token> {
@@ -233,9 +261,8 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        let s = std::str::from_utf8(&self.src[start..self.pos]).map_err(|_| {
-            Error::lex(self.line, self.col, "invalid utf8 in identifier")
-        })?;
+        let s = std::str::from_utf8(&self.src[start..self.pos])
+            .map_err(|_| Error::lex(self.line, self.col, "invalid utf8 in identifier"))?;
         // Zero-allocation keyword recognition: binary search over the sorted
         // static table, comparing case-insensitively. Previously this did
         // `s.to_ascii_uppercase()` (a String allocation per identifier!) plus
@@ -259,9 +286,9 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
             let s = std::str::from_utf8(&self.src[start + 2..self.pos]).unwrap();
-            return Ok(Token::Integer(i64::from_str_radix(s, 16).map_err(|_| {
-                Error::lex(self.line, self.col, "invalid hex literal")
-            })?));
+            return Ok(Token::Integer(i64::from_str_radix(s, 16).map_err(
+                |_| Error::lex(self.line, self.col, "invalid hex literal"),
+            )?));
         }
         // Integer part
         while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
@@ -301,9 +328,9 @@ impl<'a> Lexer<'a> {
                 // `SELECT 9223372036854775808` is 9.223372036854776e18).
                 Err(_) => match s.parse::<u64>() {
                     Ok(u) => Ok(Token::HugeInteger(u)),
-                    Err(_) => Ok(Token::Float(s.parse::<f64>().map_err(
-                        |_| Error::lex(self.line, self.col, "invalid integer literal"),
-                    )?)),
+                    Err(_) => Ok(Token::Float(s.parse::<f64>().map_err(|_| {
+                        Error::lex(self.line, self.col, "invalid integer literal")
+                    })?)),
                 },
             }
         }
@@ -311,14 +338,18 @@ impl<'a> Lexer<'a> {
 
     fn lex_string(&mut self) -> Result<Token> {
         self.advance(); // skip opening quote
-        // Collect RAW BYTES, then decode as UTF-8 at the end. The previous
-        // implementation pushed each byte with `c as char`, which passes
-        // every byte through Latin-1 — multi-byte UTF-8 text like 'héllo'
-        // was silently mangled into "hÃ©llo".
+                        // Collect RAW BYTES, then decode as UTF-8 at the end. The previous
+                        // implementation pushed each byte with `c as char`, which passes
+                        // every byte through Latin-1 — multi-byte UTF-8 text like 'héllo'
+                        // was silently mangled into "hÃ©llo".
         let mut bytes: Vec<u8> = Vec::new();
         loop {
             if self.pos >= self.src.len() {
-                return Err(Error::lex(self.line, self.col, "unterminated string literal"));
+                return Err(Error::lex(
+                    self.line,
+                    self.col,
+                    "unterminated string literal",
+                ));
             }
             let c = self.src[self.pos];
             if c == b'\'' {
@@ -342,9 +373,8 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        let s = String::from_utf8(bytes).map_err(|_| {
-            Error::lex(self.line, self.col, "invalid utf8 in string literal")
-        })?;
+        let s = String::from_utf8(bytes)
+            .map_err(|_| Error::lex(self.line, self.col, "invalid utf8 in string literal"))?;
         Ok(Token::String(s))
     }
 
@@ -365,7 +395,11 @@ impl<'a> Lexer<'a> {
         let hex_bytes = &self.src[start..self.pos];
         self.advance(); // skip closing quote
         if hex_bytes.len() % 2 != 0 {
-            return Err(Error::lex(self.line, self.col, "blob literal must have even number of hex digits"));
+            return Err(Error::lex(
+                self.line,
+                self.col,
+                "blob literal must have even number of hex digits",
+            ));
         }
         let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
         for i in (0..hex_bytes.len()).step_by(2) {
@@ -387,11 +421,15 @@ impl<'a> Lexer<'a> {
 
     fn lex_quoted_ident(&mut self) -> Result<Token> {
         self.advance(); // skip opening quote
-        // Raw bytes + UTF-8 decode (see lex_string — same Latin-1 bug fix).
+                        // Raw bytes + UTF-8 decode (see lex_string — same Latin-1 bug fix).
         let mut bytes: Vec<u8> = Vec::new();
         loop {
             if self.pos >= self.src.len() {
-                return Err(Error::lex(self.line, self.col, "unterminated quoted identifier"));
+                return Err(Error::lex(
+                    self.line,
+                    self.col,
+                    "unterminated quoted identifier",
+                ));
             }
             let c = self.src[self.pos];
             if c == b'"' {
@@ -408,9 +446,8 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
         }
-        let s = String::from_utf8(bytes).map_err(|_| {
-            Error::lex(self.line, self.col, "invalid utf8 in quoted identifier")
-        })?;
+        let s = String::from_utf8(bytes)
+            .map_err(|_| Error::lex(self.line, self.col, "invalid utf8 in quoted identifier"))?;
         Ok(Token::QuotedIdent(s))
     }
 
@@ -535,24 +572,150 @@ pub fn keyword_lookup(s: &str) -> Option<&'static str> {
 /// The set of SQL keywords recognized by the lexer. MUST stay sorted by
 /// raw byte order (binary search in `keyword_lookup` depends on it).
 pub const KEYWORDS: &[&str] = &[
-    "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ANALYZE", "AND",
-    "AS", "ASC", "ATTACH", "AUTOINCREMENT", "BEFORE", "BEGIN", "BETWEEN", "BY",
-    "CASCADE", "CASE", "CAST", "CHECK", "COLLATE", "COLUMN", "COMMIT", "CONFLICT",
-    "CONSTRAINT", "CREATE", "CROSS", "CURRENT", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATABASE",
-    "DEFAULT", "DEFERRABLE", "DEFERRED", "DELETE", "DESC", "DETACH", "DISTINCT", "DO",
-    "DROP", "EACH", "ELSE", "END", "ESCAPE", "EXCEPT", "EXCLUDE", "EXCLUSIVE",
-    "EXISTS", "EXPLAIN", "FAIL", "FILTER", "FOLLOWING", "FOR", "FOREIGN", "FROM",
-    "FULL", "GLOB", "GROUP", "GROUPS", "HAVING", "IF", "IGNORE", "IMMEDIATE",
-    "IN", "INDEX", "INDEXED", "INITIALLY", "INNER", "INSERT", "INSTEAD", "INTERSECT",
-    "INTO", "IS", "ISNULL", "JOIN", "KEY", "LEFT", "LIKE", "LIMIT",
-    "MATCH", "MATERIALIZED", "NATURAL", "NO", "NOT", "NOTHING", "NOTNULL", "NULL",
-    "NULLS", "OF", "OFFSET", "ON", "OR", "ORDER", "OTHERS", "OUTER",
-    "OVER", "PARTITION", "PLAN", "PRAGMA", "PRECEDING", "PRIMARY", "QUERY", "RAISE",
-    "RANGE", "RECURSIVE", "REFERENCES", "REGEXP", "REINDEX", "RELEASE", "RENAME", "REPLACE",
-    "RESTRICT", "RETURNING", "RIGHT", "ROLLBACK", "ROW", "ROWS", "SAVEPOINT", "SELECT",
-    "SET", "STORED", "TABLE", "TEMP", "TEMPORARY", "THEN", "TIES", "TO",
-    "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE", "USING", "VACUUM",
-    "VALUES", "VIEW", "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT",
+    "ABORT",
+    "ACTION",
+    "ADD",
+    "AFTER",
+    "ALL",
+    "ALTER",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "ATTACH",
+    "AUTOINCREMENT",
+    "BEFORE",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "CONFLICT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DATABASE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DELETE",
+    "DESC",
+    "DETACH",
+    "DISTINCT",
+    "DO",
+    "DROP",
+    "EACH",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCEPT",
+    "EXCLUDE",
+    "EXCLUSIVE",
+    "EXISTS",
+    "EXPLAIN",
+    "FAIL",
+    "FILTER",
+    "FOLLOWING",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GLOB",
+    "GROUP",
+    "GROUPS",
+    "HAVING",
+    "IF",
+    "IGNORE",
+    "IMMEDIATE",
+    "IN",
+    "INDEX",
+    "INDEXED",
+    "INITIALLY",
+    "INNER",
+    "INSERT",
+    "INSTEAD",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "KEY",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "MATERIALIZED",
+    "NATURAL",
+    "NO",
+    "NOT",
+    "NOTHING",
+    "NOTNULL",
+    "NULL",
+    "NULLS",
+    "OF",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER",
+    "OTHERS",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PLAN",
+    "PRAGMA",
+    "PRECEDING",
+    "PRIMARY",
+    "QUERY",
+    "RAISE",
+    "RANGE",
+    "RECURSIVE",
+    "REFERENCES",
+    "REGEXP",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPLACE",
+    "RESTRICT",
+    "RETURNING",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "STORED",
+    "TABLE",
+    "TEMP",
+    "TEMPORARY",
+    "THEN",
+    "TIES",
+    "TO",
+    "TRANSACTION",
+    "TRIGGER",
+    "UNBOUNDED",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VACUUM",
+    "VALUES",
+    "VIEW",
+    "VIRTUAL",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+    "WITHOUT",
 ];
 
 #[cfg(test)]

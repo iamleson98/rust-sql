@@ -11,9 +11,9 @@
 
 use std::time::Instant;
 
+use rustqlite::sqlx_driver::{RustqliteConnectOptions, RustqlitePool, RustqlitePoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
-use rustqlite::sqlx_driver::{RustqliteConnectOptions, RustqlitePool, RustqlitePoolOptions};
 
 const ROWS: i64 = 5_000;
 const OPS: usize = 2_000;
@@ -63,7 +63,11 @@ async fn main() {
                     .unwrap();
             }
             tx.commit().await.unwrap();
-            println!("  seed ({}): {:.1} ms for {ROWS} rows", $name, t.elapsed().as_secs_f64() * 1e3);
+            println!(
+                "  seed ({}): {:.1} ms for {ROWS} rows",
+                $name,
+                t.elapsed().as_secs_f64() * 1e3
+            );
         }};
     }
     seed!("rustqlite", rq);
@@ -191,24 +195,22 @@ async fn main() {
     {
         let t = Instant::now();
         for _ in 0..50 {
-            let rows: Vec<(i64, i64, f64)> = sqlx::query_as(
-                "SELECT a / 100, COUNT(*), SUM(b) FROM bench GROUP BY a / 100",
-            )
-            .fetch_all(&rq)
-            .await
-            .unwrap();
+            let rows: Vec<(i64, i64, f64)> =
+                sqlx::query_as("SELECT a / 100, COUNT(*), SUM(b) FROM bench GROUP BY a / 100")
+                    .fetch_all(&rq)
+                    .await
+                    .unwrap();
             std::hint::black_box(rows.len());
         }
         let rq_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let t = Instant::now();
         for _ in 0..50 {
-            let rows: Vec<(i64, i64, f64)> = sqlx::query_as(
-                "SELECT a / 100, COUNT(*), SUM(b) FROM bench GROUP BY a / 100",
-            )
-            .fetch_all(&sq)
-            .await
-            .unwrap();
+            let rows: Vec<(i64, i64, f64)> =
+                sqlx::query_as("SELECT a / 100, COUNT(*), SUM(b) FROM bench GROUP BY a / 100")
+                    .fetch_all(&sq)
+                    .await
+                    .unwrap();
             std::hint::black_box(rows.len());
         }
         let sq_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -585,15 +587,14 @@ async fn main() {
             let pool = rq.clone();
             handles.push(tokio::spawn(async move {
                 for i in 0..CONC_PER {
-                    let _: Option<i64> = sqlx::query_scalar(
-                        "SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1",
-                    )
-                    .bind(((i * 37 + r * 11) % 4000) as i64)
-                    .bind((((i * 37 + r * 11) % 4000) + 100) as i64)
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap()
-                    .flatten();
+                    let _: Option<i64> =
+                        sqlx::query_scalar("SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1")
+                            .bind(((i * 37 + r * 11) % 4000) as i64)
+                            .bind((((i * 37 + r * 11) % 4000) + 100) as i64)
+                            .fetch_optional(&pool)
+                            .await
+                            .unwrap()
+                            .flatten();
                 }
             }));
         }
@@ -628,15 +629,14 @@ async fn main() {
             let pool = sq.clone();
             handles.push(tokio::spawn(async move {
                 for i in 0..CONC_PER {
-                    let _: Option<i64> = sqlx::query_scalar(
-                        "SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1",
-                    )
-                    .bind(((i * 37 + r * 11) % 4000) as i64)
-                    .bind((((i * 37 + r * 11) % 4000) + 100) as i64)
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap()
-                    .flatten();
+                    let _: Option<i64> =
+                        sqlx::query_scalar("SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1")
+                            .bind(((i * 37 + r * 11) % 4000) as i64)
+                            .bind((((i * 37 + r * 11) % 4000) + 100) as i64)
+                            .fetch_optional(&pool)
+                            .await
+                            .unwrap()
+                            .flatten();
                 }
             }));
         }
@@ -668,7 +668,10 @@ async fn main() {
     }
 
     // ------------------------------------------------------------------ report
-    println!("{:<26} {:>12} {:>12} {:>10}", "scenario", "rustqlite", "sqlx-sqlite", "speedup");
+    println!(
+        "{:<26} {:>12} {:>12} {:>10}",
+        "scenario", "rustqlite", "sqlx-sqlite", "speedup"
+    );
     println!("{:-<62}", "");
     let mut wins = 0usize;
     let mut total_rq = 0.0;

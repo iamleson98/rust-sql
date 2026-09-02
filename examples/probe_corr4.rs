@@ -14,5 +14,9 @@ fn main() {
         db.execute(s, []).unwrap();
     }
     db.execute("UPDATE users SET salary = (SELECT MAX(total) FROM orders o WHERE o.user_id = users.id) WHERE id <= 2", []).unwrap();
-    println!("after UPDATE: {:?}", db.query("SELECT id, salary FROM users ORDER BY id", []).unwrap());
+    println!(
+        "after UPDATE: {:?}",
+        db.query("SELECT id, salary FROM users ORDER BY id", [])
+            .unwrap()
+    );
 }

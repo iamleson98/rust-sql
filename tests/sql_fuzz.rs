@@ -37,7 +37,10 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 1)
+        Rng(seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+            | 1)
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -48,7 +51,11 @@ impl Rng {
         x.wrapping_mul(2685821657736338717)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
     fn range(&mut self, lo: i64, hi: i64) -> i64 {
         lo + (self.next_u64() % (hi - lo + 1) as u64) as i64
@@ -133,7 +140,8 @@ fn mutate(rng: &mut Rng, src: &str) -> String {
             }
             // insert junk token
             5 => {
-                let junk = [b'\'', b'"', b';', b'-', b'(', b')', b'?', b'@', b'\0', 0xFF][rng.below(10)];
+                let junk =
+                    [b'\'', b'"', b';', b'-', b'(', b')', b'?', b'@', b'\0', 0xFF][rng.below(10)];
                 bytes.insert(pos, junk);
             }
             // swap two bytes
@@ -199,9 +207,17 @@ fn mutation_fuzz_never_panics() {
             if let Ok(rows) = db.query("SELECT COUNT(*) FROM t", []) {
                 let n = match rows.first().and_then(|r| r.first()) {
                     Some(Value::Integer(n)) => *n,
-                    other => panic!("COUNT(*) returned non-integer {:?} after fuzz input {:?}", other, sql),
+                    other => panic!(
+                        "COUNT(*) returned non-integer {:?} after fuzz input {:?}",
+                        other, sql
+                    ),
                 };
-                assert!(n >= 0, "COUNT(*) returned negative {} after fuzz input {:?}", n, sql);
+                assert!(
+                    n >= 0,
+                    "COUNT(*) returned negative {} after fuzz input {:?}",
+                    n,
+                    sql
+                );
             }
         }
     }
@@ -218,11 +234,18 @@ fn parameter_fuzz_never_panics() {
     let iters = env_iters(5_000);
     let mut rng = Rng::new(env_seed() ^ 0xBEEF);
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, r REAL, b BLOB)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, r REAL, b BLOB)",
+        [],
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO t (s, r, b) VALUES (?, ?, ?)",
-        [Value::Text("seed".into()), Value::Real(1.0), Value::Blob(vec![1, 2, 3])],
+        [
+            Value::Text("seed".into()),
+            Value::Real(1.0),
+            Value::Blob(vec![1, 2, 3]),
+        ],
     )
     .unwrap();
 
@@ -257,16 +280,27 @@ fn parameter_fuzz_never_panics() {
         let c = odd_values[rng.below(odd_values.len())].clone();
 
         // Every statement type that binds parameters.
-        let _ = db.execute("INSERT INTO t (s, r, b) VALUES (?, ?, ?)", [a.clone(), b.clone(), c.clone()]);
-        let _ = db.query("SELECT * FROM t WHERE s = ? OR r = ? OR b = ?", [a.clone(), b.clone(), c.clone()]);
-        let _ = db.query("SELECT id + ? FROM t WHERE id BETWEEN ? AND ?", [a.clone(), b.clone(), c.clone()]);
+        let _ = db.execute(
+            "INSERT INTO t (s, r, b) VALUES (?, ?, ?)",
+            [a.clone(), b.clone(), c.clone()],
+        );
+        let _ = db.query(
+            "SELECT * FROM t WHERE s = ? OR r = ? OR b = ?",
+            [a.clone(), b.clone(), c.clone()],
+        );
+        let _ = db.query(
+            "SELECT id + ? FROM t WHERE id BETWEEN ? AND ?",
+            [a.clone(), b.clone(), c.clone()],
+        );
         let _ = db.query("SELECT substr(s, ?, ?) FROM t LIMIT ?", [a, b, c]);
         if i % 256 == 255 {
             // Sanity: the seed row must always be findable.
             let rows = db
                 .query("SELECT COUNT(*) FROM t", [])
                 .expect("parameter fuzz corrupted engine state");
-            assert!(matches!(rows.first().and_then(|r| r.first()), Some(Value::Integer(n)) if *n >= 1));
+            assert!(
+                matches!(rows.first().and_then(|r| r.first()), Some(Value::Integer(n)) if *n >= 1)
+            );
         }
     }
 }
@@ -276,7 +310,10 @@ fn parameter_fuzz_never_panics() {
 //    (dbsqlfuzz-style: same statement, two engines, same answer.)
 // ===========================================================================
 
-fn run_on_sqlite(conn: &rusqlite::Connection, sql: &str) -> Option<Vec<Vec<rusqlite::types::Value>>> {
+fn run_on_sqlite(
+    conn: &rusqlite::Connection,
+    sql: &str,
+) -> Option<Vec<Vec<rusqlite::types::Value>>> {
     use rusqlite::types::Value as Sv;
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
@@ -346,9 +383,24 @@ fn gen_predicate(rng: &mut Rng) -> String {
     let cmp = CMPS[rng.below(CMPS.len())];
     match rng.below(4) {
         0 => format!("{} {} {}", COLS[rng.below(3)], cmp, gen_expr(rng, 1)),
-        1 => format!("{} IS {}", COLS[rng.below(3)], if rng.chance(50) { "NULL" } else { "NOT NULL" }),
-        2 => format!("{} BETWEEN {} AND {}", COLS[rng.below(3)], gen_expr(rng, 0), gen_expr(rng, 0)),
-        _ => format!("{} IN ({}, {}, {})", COLS[rng.below(3)], rng.range(-5, 5), rng.range(-5, 5), rng.range(-5, 5)),
+        1 => format!(
+            "{} IS {}",
+            COLS[rng.below(3)],
+            if rng.chance(50) { "NULL" } else { "NOT NULL" }
+        ),
+        2 => format!(
+            "{} BETWEEN {} AND {}",
+            COLS[rng.below(3)],
+            gen_expr(rng, 0),
+            gen_expr(rng, 0)
+        ),
+        _ => format!(
+            "{} IN ({}, {}, {})",
+            COLS[rng.below(3)],
+            rng.range(-5, 5),
+            rng.range(-5, 5),
+            rng.range(-5, 5)
+        ),
     }
 }
 
@@ -364,9 +416,21 @@ fn structured_random_sql_matches_sqlite() {
         // Generate the data once, materialize as INSERTs both engines run.
         let mut inserts = String::new();
         for i in 0..n_rows {
-            let a = if rng.chance(10) { "NULL".into() } else { rng.range(-50, 50).to_string() };
-            let b = if rng.chance(10) { "NULL".into() } else { format!("{:.2}", rng.range(-99, 99) as f64 / 3.0) };
-            let c = if rng.chance(10) { "NULL".into() } else { format!("'t{}'", rng.below(8)) };
+            let a = if rng.chance(10) {
+                "NULL".into()
+            } else {
+                rng.range(-50, 50).to_string()
+            };
+            let b = if rng.chance(10) {
+                "NULL".into()
+            } else {
+                format!("{:.2}", rng.range(-99, 99) as f64 / 3.0)
+            };
+            let c = if rng.chance(10) {
+                "NULL".into()
+            } else {
+                format!("'t{}'", rng.below(8))
+            };
             if i > 0 {
                 inserts.push_str(", ");
             }
@@ -381,13 +445,17 @@ fn structured_random_sql_matches_sqlite() {
         let select = match rng.below(6) {
             0 => format!(
                 "SELECT {} FROM d WHERE {} ORDER BY 1, 2, 3 LIMIT {}",
-                COLS[rng.below(3)], gen_predicate(&mut rng), rng.below(50)
+                COLS[rng.below(3)],
+                gen_predicate(&mut rng),
+                rng.below(50)
             ),
-            1 => "SELECT c, COUNT(*), SUM(a), AVG(b), MIN(a), MAX(b) FROM d GROUP BY c ORDER BY c".to_string(),
+            1 => "SELECT c, COUNT(*), SUM(a), AVG(b), MIN(a), MAX(b) FROM d GROUP BY c ORDER BY c"
+                .to_string(),
             2 => "SELECT DISTINCT a FROM d ORDER BY a".to_string(),
             3 => format!(
                 "SELECT {} FROM d WHERE {} ORDER BY 1 DESC",
-                gen_expr(&mut rng, 2), gen_predicate(&mut rng)
+                gen_expr(&mut rng, 2),
+                gen_predicate(&mut rng)
             ),
             4 => "SELECT a, b FROM d UNION SELECT b, a FROM d ORDER BY 1, 2".to_string(),
             _ => format!(
@@ -427,10 +495,18 @@ fn structured_random_sql_matches_sqlite() {
                     our_rows.len(),
                     their_rows.len(),
                     "case {}: row-count divergence for {:?} (setup rows: {})",
-                    case_no, select, n_rows
+                    case_no,
+                    select,
+                    n_rows
                 );
                 for (i, (r1, r2)) in our_rows.iter().zip(their_rows.iter()).enumerate() {
-                    assert_eq!(r1.len(), r2.len(), "case {}: column count differs at row {}", case_no, i);
+                    assert_eq!(
+                        r1.len(),
+                        r2.len(),
+                        "case {}: column count differs at row {}",
+                        case_no,
+                        i
+                    );
                     for (j, (v1, v2)) in r1.iter().zip(r2.iter()).enumerate() {
                         assert!(
                             values_match(v1, v2),
@@ -444,7 +520,8 @@ fn structured_random_sql_matches_sqlite() {
             (ours, theirs) => {
                 panic!(
                     "case {}: success/failure divergence for {:?}: ours={:?} sqlite={:?}",
-                    case_no, select,
+                    case_no,
+                    select,
                     ours.as_ref().map(|r| r.len()),
                     theirs.as_ref().map(|r| r.len())
                 );

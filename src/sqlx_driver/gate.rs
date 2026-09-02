@@ -59,8 +59,7 @@ fn ensure_gate_thread() {
     if g.thread_started.load(Ordering::Acquire) {
         return;
     }
-    if g
-        .thread_started
+    if g.thread_started
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -84,7 +83,9 @@ fn gate_thread_main() {
         let now = Instant::now();
         let mut i = 0;
         while i < entries.len() {
-            let clear = !entries[i].db.foreign_tx_blocked(entries[i].me, entries[i].only_dirty);
+            let clear = !entries[i]
+                .db
+                .foreign_tx_blocked(entries[i].me, entries[i].only_dirty);
             let expired = now >= entries[i].deadline;
             if clear || expired {
                 let entry = entries.remove(i);
@@ -109,7 +110,14 @@ fn gate_thread_main() {
 }
 
 /// Register (or re-register) an async waiter.
-fn gate_register(db: &Arc<SharedDb>, me: usize, only_dirty: bool, deadline: Instant, waker: Waker, gen: u64) {
+fn gate_register(
+    db: &Arc<SharedDb>,
+    me: usize,
+    only_dirty: bool,
+    deadline: Instant,
+    waker: Waker,
+    gen: u64,
+) {
     ensure_gate_thread();
     let g = gate();
     let mut entries = g.entries.lock();

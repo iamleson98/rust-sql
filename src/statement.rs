@@ -47,8 +47,8 @@ use crate::executor::{execute, ExecContext};
 use crate::planner::plan::Plan;
 use crate::sql::ast::{Expr, Statement as AstStatement};
 use crate::types::{Row, Value};
-use std::collections::VecDeque;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Batch size for streaming drivers.
@@ -147,7 +147,10 @@ impl<'a> Statement<'a> {
         // Output columns at PREPARE time when a streaming driver covers
         // the plan (SQLite's column_count/column_name work before the
         // first step). Materialized shapes set columns on first step.
-        let prep_columns = plan.as_ref().and_then(try_build_driver).map(|d| d.columns());
+        let prep_columns = plan
+            .as_ref()
+            .and_then(try_build_driver)
+            .map(|d| d.columns());
         Ok(Self {
             db,
             sql: sql.to_string(),
@@ -370,7 +373,10 @@ impl<'a> Statement<'a> {
     /// Begin execution: choose the streaming driver or materialize.
     fn start(&mut self) -> Result<()> {
         // Deferred-flush consistency (same contract as Database::query).
-        if self.db.deferred_flush.load(std::sync::atomic::Ordering::Acquire)
+        if self
+            .db
+            .deferred_flush
+            .load(std::sync::atomic::Ordering::Acquire)
             && self.db.pager.has_dirty_pages()
         {
             let _ = self.db.pager.flush();
@@ -460,6 +466,13 @@ impl<'a> Statement<'a> {
                 execute(plan_ref, ctx)
             })?;
             if is_dml {
+                // DML through a prepared statement bypasses
+                // Database::execute (and its write-epoch bump), so the
+                // statement path must invalidate the memoized COUNT(*)
+                // answers itself — see Database::write_epoch.
+                self.db
+                    .write_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.merge_dml_maps();
                 self.db.sync_schema_roots_public()?;
             } else if self.deltas.max_rowids_changed {
@@ -484,7 +497,11 @@ impl<'a> Statement<'a> {
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
         let shared = db.maps.read().clone();
         let in_txn = db.in_transaction.load(std::sync::atomic::Ordering::Acquire);
-        let txn_snap = if in_txn { db.txn_snapshot.lock().clone() } else { None };
+        let txn_snap = if in_txn {
+            db.txn_snapshot.lock().clone()
+        } else {
+            None
+        };
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = db.deferred_flush.load(std::sync::atomic::Ordering::Acquire);
@@ -565,7 +582,13 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
     let mut saw_numeric = false;
     let mut counter = 0usize;
 
-    fn walk_expr(e: &Expr, max_pos: &mut usize, saw_numeric: &mut bool, named: &mut Vec<String>, counter: &mut usize) {
+    fn walk_expr(
+        e: &Expr,
+        max_pos: &mut usize,
+        saw_numeric: &mut bool,
+        named: &mut Vec<String>,
+        counter: &mut usize,
+    ) {
         match e {
             Expr::Parameter(p) => {
                 // Numeric names are Vec indices (the lexer numbers
@@ -578,9 +601,10 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                 } else {
                     let bare = p.trim_start_matches([':', '@', '$']).to_ascii_lowercase();
                     if !bare.is_empty()
-                        && !named
-                            .iter()
-                            .any(|n| n.trim_start_matches([':', '@', '$']).eq_ignore_ascii_case(&bare))
+                        && !named.iter().any(|n| {
+                            n.trim_start_matches([':', '@', '$'])
+                                .eq_ignore_ascii_case(&bare)
+                        })
                     {
                         named.push(p.clone()); // keep the sigil form — that's the HashMap key
                     }
@@ -591,7 +615,9 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                 walk_expr(right, max_pos, saw_numeric, named, counter);
             }
             Expr::Unary { expr, .. } => walk_expr(expr, max_pos, saw_numeric, named, counter),
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 walk_expr(expr, max_pos, saw_numeric, named, counter);
                 walk_expr(low, max_pos, saw_numeric, named, counter);
                 walk_expr(high, max_pos, saw_numeric, named, counter);
@@ -604,7 +630,12 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                     }
                 }
             }
-            Expr::Like { expr, pattern, escape, .. } => {
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
                 walk_expr(expr, max_pos, saw_numeric, named, counter);
                 walk_expr(pattern, max_pos, saw_numeric, named, counter);
                 if let Some(e) = escape {
@@ -621,7 +652,11 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                     walk_expr(a, max_pos, saw_numeric, named, counter);
                 }
             }
-            Expr::Case { operand, whens, else_ } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
                 if let Some(o) = operand {
                     walk_expr(o, max_pos, saw_numeric, named, counter);
                 }
@@ -662,7 +697,13 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
         }
     }
 
-    fn walk_body(b: &crate::sql::ast::SelectBody, max_pos: &mut usize, saw_numeric: &mut bool, named: &mut Vec<String>, counter: &mut usize) {
+    fn walk_body(
+        b: &crate::sql::ast::SelectBody,
+        max_pos: &mut usize,
+        saw_numeric: &mut bool,
+        named: &mut Vec<String>,
+        counter: &mut usize,
+    ) {
         use crate::sql::ast::SelectBody;
         match b {
             SelectBody::Simple(body) => {
@@ -691,12 +732,23 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
         }
     }
 
-    fn walk_table(te: &crate::sql::ast::TableExpression, max_pos: &mut usize, saw_numeric: &mut bool, named: &mut Vec<String>, counter: &mut usize) {
+    fn walk_table(
+        te: &crate::sql::ast::TableExpression,
+        max_pos: &mut usize,
+        saw_numeric: &mut bool,
+        named: &mut Vec<String>,
+        counter: &mut usize,
+    ) {
         match te {
             crate::sql::ast::TableExpression::Subquery { select, .. } => {
                 walk_select(select, max_pos, saw_numeric, named, counter)
             }
-            crate::sql::ast::TableExpression::Join { left, right, constraint, .. } => {
+            crate::sql::ast::TableExpression::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
                 walk_table(left, max_pos, saw_numeric, named, counter);
                 walk_table(right, max_pos, saw_numeric, named, counter);
                 if let crate::sql::ast::JoinConstraint::On(e) = constraint {
@@ -707,7 +759,9 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
         }
     }
     match stmt {
-        AstStatement::Select(s) => walk_select(s, &mut max_pos, &mut saw_numeric, named, &mut counter),
+        AstStatement::Select(s) => {
+            walk_select(s, &mut max_pos, &mut saw_numeric, named, &mut counter)
+        }
         AstStatement::Insert(i) => {
             if let crate::sql::ast::InsertSource::Values(rows) = &i.source {
                 for r in rows {
@@ -772,14 +826,29 @@ fn scan_columns(table: &Arc<crate::schema::Table>, alias: Option<&str>) -> Arc<[
 /// Try to build a streaming driver for a plan shape. `None` → materialize.
 fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
     match plan {
-        Plan::Scan { table, alias, index: None, predicate } => {
+        Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate,
+        } => {
             if table.vtab.is_some() {
                 Some(Box::new(VtabDriver::new(table.clone(), alias.clone())))
             } else {
-                Some(Box::new(ScanDriver::new(table.clone(), alias.clone(), predicate.clone())))
+                Some(Box::new(ScanDriver::new(
+                    table.clone(),
+                    alias.clone(),
+                    predicate.clone(),
+                )))
             }
         }
-        Plan::RowidRange { table, alias, start, end, residual } => Some(Box::new(RangeDriver::new(
+        Plan::RowidRange {
+            table,
+            alias,
+            start,
+            end,
+            residual,
+        } => Some(Box::new(RangeDriver::new(
             table.clone(),
             alias.clone(),
             start.clone(),
@@ -795,7 +864,13 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             // walks the predicate AST with per-row name lookups). Only
             // taken when the predicate actually compiles (correct alias
             // prefix); otherwise the generic chain applies.
-            if let Plan::Scan { table, alias, index: None, predicate: scan_pred } = input.as_ref() {
+            if let Plan::Scan {
+                table,
+                alias,
+                index: None,
+                predicate: scan_pred,
+            } = input.as_ref()
+            {
                 if scan_pred.is_none()
                     && table.vtab.is_none()
                     && FilteredScanDriver::compiles(table, alias.as_deref(), predicate)
@@ -814,9 +889,17 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             let base = try_build_driver(input)?;
             Some(Box::new(ProjectDriver::new(base, columns.clone())))
         }
-        Plan::Limit { input, count, offset } => {
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => {
             let base = try_build_driver(input)?;
-            Some(Box::new(LimitDriver::new(base, count.clone(), offset.clone())))
+            Some(Box::new(LimitDriver::new(
+                base,
+                count.clone(),
+                offset.clone(),
+            )))
         }
         _ => None,
     }
@@ -834,9 +917,19 @@ struct ScanDriver {
 }
 
 impl ScanDriver {
-    fn new(table: Arc<crate::schema::Table>, alias: Option<String>, predicate: Option<Expr>) -> Self {
+    fn new(
+        table: Arc<crate::schema::Table>,
+        alias: Option<String>,
+        predicate: Option<Expr>,
+    ) -> Self {
         let columns = scan_columns(&table, alias.as_deref());
-        Self { table, columns, predicate, last_rowid: i64::MIN, eof: false }
+        Self {
+            table,
+            columns,
+            predicate,
+            last_rowid: i64::MIN,
+            eof: false,
+        }
     }
 }
 
@@ -869,7 +962,11 @@ impl Driver for ScanDriver {
         let predicate = self.predicate.as_ref();
         let col_names: Vec<String> = self.columns.iter().cloned().collect();
         let params_owned: Vec<Value> = params.to_vec();
-        let start = if self.last_rowid == i64::MIN { i64::MIN } else { self.last_rowid + 1 };
+        let start = if self.last_rowid == i64::MIN {
+            i64::MIN
+        } else {
+            self.last_rowid + 1
+        };
         let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
         let mut last = self.last_rowid;
         let mut hit_end = true;
@@ -924,23 +1021,22 @@ impl FilteredScanDriver {
     /// Does the predicate compile against this (table, prefix)? Gates the
     /// fusion at driver-build time so a non-compiling predicate keeps the
     /// generic (correct, slower) chain.
-    fn compiles(
-        table: &Arc<crate::schema::Table>,
-        alias: Option<&str>,
-        predicate: &Expr,
-    ) -> bool {
+    fn compiles(table: &Arc<crate::schema::Table>, alias: Option<&str>, predicate: &Expr) -> bool {
         let prefix = alias.unwrap_or(&table.name);
         crate::executor::predicate::compile_predicate(predicate, table, prefix).is_some()
     }
 
-    fn new(
-        table: Arc<crate::schema::Table>,
-        alias: Option<String>,
-        predicate: Expr,
-    ) -> Self {
+    fn new(table: Arc<crate::schema::Table>, alias: Option<String>, predicate: Expr) -> Self {
         let columns = scan_columns(&table, alias.as_deref());
         let prefix = alias.unwrap_or_else(|| table.name.clone());
-        Self { table, columns, predicate, prefix, last_rowid: i64::MIN, eof: false }
+        Self {
+            table,
+            columns,
+            predicate,
+            prefix,
+            last_rowid: i64::MIN,
+            eof: false,
+        }
     }
 }
 
@@ -966,9 +1062,11 @@ impl Driver for FilteredScanDriver {
         }
         let _g = db.plugin_scope();
         let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
-        let Some(pred) =
-            crate::executor::predicate::compile_predicate(&self.predicate, &self.table, &self.prefix)
-        else {
+        let Some(pred) = crate::executor::predicate::compile_predicate(
+            &self.predicate,
+            &self.table,
+            &self.prefix,
+        ) else {
             // Compilability was checked at build time; if it somehow fails
             // here (schema drift), degrade to the generic materialized path
             // rather than silently dropping rows.
@@ -990,7 +1088,11 @@ impl Driver for FilteredScanDriver {
         // Wanted = predicate columns (selective decode while scanning).
         let mut wanted: Vec<usize> = Vec::new();
         crate::executor::predicate::compiled_columns(&pred, &mut wanted);
-        let start = if self.last_rowid == i64::MIN { i64::MIN } else { self.last_rowid + 1 };
+        let start = if self.last_rowid == i64::MIN {
+            i64::MIN
+        } else {
+            self.last_rowid + 1
+        };
         let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
         let mut last = self.last_rowid;
         let mut hit_end = true;
@@ -1029,7 +1131,12 @@ impl Driver for FilteredScanDriver {
                 }
                 last = last.max(rowid);
                 if crate::storage::row_codec::decode_row_selective(
-                    payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf,
+                    payload,
+                    n_cols,
+                    &wanted,
+                    rowid,
+                    rowid_alias,
+                    &mut sel_buf,
                 )
                 .is_err()
                 {
@@ -1073,7 +1180,15 @@ impl RangeDriver {
         residual: Option<Expr>,
     ) -> Self {
         let columns = scan_columns(&table, alias.as_deref());
-        Self { table, columns, start, end, residual, last_rowid: i64::MIN, eof: false }
+        Self {
+            table,
+            columns,
+            start,
+            end,
+            residual,
+            last_rowid: i64::MIN,
+            eof: false,
+        }
     }
 }
 
@@ -1101,8 +1216,7 @@ impl Driver for RangeDriver {
         let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
-        let eval_ctx =
-            crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+        let eval_ctx = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
         let lo = match &self.start {
             Some(e) => {
                 let v = crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer();
@@ -1180,7 +1294,12 @@ struct VtabDriver {
 impl VtabDriver {
     fn new(table: Arc<crate::schema::Table>, alias: Option<String>) -> Self {
         let columns = scan_columns(&table, alias.as_deref());
-        Self { table, columns, cursor: None, eof: false }
+        Self {
+            table,
+            columns,
+            cursor: None,
+            eof: false,
+        }
     }
 }
 
@@ -1247,7 +1366,12 @@ struct FilterDriver {
 
 impl FilterDriver {
     fn new(base: Box<dyn Driver>, predicate: Expr) -> Self {
-        Self { base, predicate, leftover: Vec::new(), base_eof: false }
+        Self {
+            base,
+            predicate,
+            leftover: Vec::new(),
+            base_eof: false,
+        }
     }
 }
 
@@ -1275,7 +1399,9 @@ impl Driver for FilterDriver {
         let params_owned: Vec<Value> = params.to_vec();
         let mut matched: Vec<Row> = Vec::new();
         while matched.len() < budget {
-            let batch = self.base.next_batch(db, params, named, (budget * 4).max(BATCH))?;
+            let batch = self
+                .base
+                .next_batch(db, params, named, (budget * 4).max(BATCH))?;
             if batch.is_empty() {
                 self.base_eof = true;
                 break;
@@ -1310,7 +1436,10 @@ struct ProjectDriver {
 
 impl ProjectDriver {
     fn new(base: Box<dyn Driver>, columns: Vec<crate::planner::plan::ProjectExpr>) -> Self {
-        Self { base, exprs: columns }
+        Self {
+            base,
+            exprs: columns,
+        }
     }
 }
 
@@ -1381,7 +1510,15 @@ struct LimitDriver {
 
 impl LimitDriver {
     fn new(base: Box<dyn Driver>, count: Expr, offset: Expr) -> Self {
-        Self { base, count, offset, remaining: None, offset_left: 0, initialized: false, base_eof: false }
+        Self {
+            base,
+            count,
+            offset,
+            remaining: None,
+            offset_left: 0,
+            initialized: false,
+            base_eof: false,
+        }
     }
 }
 
@@ -1414,7 +1551,9 @@ impl Driver for LimitDriver {
             if self.base_eof {
                 return Ok(Vec::new());
             }
-            let want = (self.offset_left as usize).min(BATCH).max(1);
+            // offset_left > 0 here, so the value is already >= 1 — clamp
+            // (not min/max pairs) documents the [1, BATCH] window.
+            let want = (self.offset_left as usize).clamp(1, BATCH);
             let batch = self.base.next_batch(db, params, named, want)?;
             if batch.is_empty() {
                 self.base_eof = true;
@@ -1445,7 +1584,10 @@ impl Driver for LimitDriver {
 /// executor's naming rules, sufficient for statement consumers).
 fn expr_display(e: &Expr) -> String {
     match e {
-        Expr::Column { table: Some(t), name } => format!("{}.{}", t, name),
+        Expr::Column {
+            table: Some(t),
+            name,
+        } => format!("{}.{}", t, name),
         Expr::Column { table: None, name } => name.clone(),
         Expr::Literal(Value::Text(s)) => s.as_str().to_string(),
         Expr::Literal(Value::Integer(i)) => i.to_string(),

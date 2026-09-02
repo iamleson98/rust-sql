@@ -40,15 +40,14 @@ async fn readers(pool: &RustqlitePool) {
         let pool = pool.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..PER {
-                let _: Option<i64> = sqlx::query_scalar(
-                    "SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1",
-                )
-                .bind(((i * 37 + r * 11) % 4000) as i64)
-                .bind((((i * 37 + r * 11) % 4000) + 100) as i64)
-                .fetch_optional(&pool)
-                .await
-                .unwrap()
-                .flatten();
+                let _: Option<i64> =
+                    sqlx::query_scalar("SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1")
+                        .bind(((i * 37 + r * 11) % 4000) as i64)
+                        .bind((((i * 37 + r * 11) % 4000) + 100) as i64)
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap()
+                        .flatten();
             }
         }));
     }
@@ -77,20 +76,31 @@ async fn writer(pool: &RustqlitePool) {
 
 #[tokio::main]
 async fn main() {
-    println!("cores: {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+    println!(
+        "cores: {}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
 
     // (a) readers only
     let pool = setup("probe-w7r-a", 8).await;
     let t = Instant::now();
     readers(&pool).await;
-    println!("readers-only   : {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "readers-only   : {:>8.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     drop(pool);
 
     // (b) writer only
     let pool = setup("probe-w7r-b", 8).await;
     let t = Instant::now();
     writer(&pool).await;
-    println!("writer-only    : {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "writer-only    : {:>8.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     drop(pool);
 
     // (c) combined
@@ -102,7 +112,10 @@ async fn main() {
     };
     readers(&pool).await;
     w.await.unwrap();
-    println!("combined       : {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "combined       : {:>8.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
 
     // (d) point-lookup readers + writer (same shape but indexed reads)
     let pool = setup("probe-w7r-d", 8).await;
@@ -129,19 +142,26 @@ async fn main() {
         h.await.unwrap();
     }
     w.await.unwrap();
-    println!("combined (idx) : {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "combined (idx) : {:>8.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
 
     // (e) single reader query latency (serial, for scale)
     let pool = setup("probe-w7r-e", 1).await;
     let t = Instant::now();
     for i in 0..500 {
-        let _: Option<i64> = sqlx::query_scalar("SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1")
-            .bind(((i * 37) % 4000) as i64)
-            .bind((((i * 37) % 4000) + 100) as i64)
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            .flatten();
+        let _: Option<i64> =
+            sqlx::query_scalar("SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1")
+                .bind(((i * 37) % 4000) as i64)
+                .bind((((i * 37) % 4000) + 100) as i64)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
     }
-    println!("serial latency : {:>8.1} µs/query", t.elapsed().as_secs_f64() * 1e6 / 500.0);
+    println!(
+        "serial latency : {:>8.1} µs/query",
+        t.elapsed().as_secs_f64() * 1e6 / 500.0
+    );
 }

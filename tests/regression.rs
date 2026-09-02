@@ -27,13 +27,15 @@ fn regression_index_roots_survive_splits_and_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("reg-roots.db");
     let mut db = Database::open(&path).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+        .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
 
     // Enough rows to split both the table B+tree AND the index B+tree
     // several times (root page moves with each level-0 split).
     for i in 1..=5_000i64 {
-        db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i * 13)]).unwrap();
+        db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i * 13)])
+            .unwrap();
     }
     // Every indexed lookup must find its row (stale roots made entries
     // past the first split silently unreachable).
@@ -41,7 +43,12 @@ fn regression_index_roots_survive_splits_and_reopen() {
         let rows = db
             .query("SELECT id FROM t WHERE val = ?", [Value::Integer(i * 13)])
             .unwrap();
-        assert_eq!(rows.len(), 1, "val={} not found via index (stale root?)", i * 13);
+        assert_eq!(
+            rows.len(),
+            1,
+            "val={} not found via index (stale root?)",
+            i * 13
+        );
     }
     // Close and reopen: roots must have been persisted to the schema rows.
     drop(db);
@@ -50,11 +57,25 @@ fn regression_index_roots_survive_splits_and_reopen() {
         let rows = db
             .query("SELECT id FROM t WHERE val = ?", [Value::Integer(i * 13)])
             .unwrap();
-        assert_eq!(rows.len(), 1, "val={} missing after reopen (root not persisted?)", i * 13);
+        assert_eq!(
+            rows.len(),
+            1,
+            "val={} missing after reopen (root not persisted?)",
+            i * 13
+        );
     }
     // And the index still updates after reopen.
-    db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(5_001 * 13)]).unwrap();
-    let rows = db.query("SELECT id FROM t WHERE val = ?", [Value::Integer(5_001 * 13)]).unwrap();
+    db.execute(
+        "INSERT INTO t (val) VALUES (?)",
+        [Value::Integer(5_001 * 13)],
+    )
+    .unwrap();
+    let rows = db
+        .query(
+            "SELECT id FROM t WHERE val = ?",
+            [Value::Integer(5_001 * 13)],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1);
 }
 
@@ -66,7 +87,8 @@ fn regression_index_roots_survive_splits_and_reopen() {
 #[test]
 fn regression_create_index_backfills_existing_rows() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", [])
+        .unwrap();
     for i in 1..=2_000i64 {
         db.execute(
             "INSERT INTO t (name) VALUES (?)",
@@ -78,12 +100,20 @@ fn regression_create_index_backfills_existing_rows() {
     db.execute("CREATE INDEX idx_name ON t(name)", []).unwrap();
     for i in 1..=2_000i64 {
         let rows = db
-            .query("SELECT id FROM t WHERE name = ?", [Value::Text(format!("name{:04}", i).into())])
+            .query(
+                "SELECT id FROM t WHERE name = ?",
+                [Value::Text(format!("name{:04}", i).into())],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1, "backfilled index lost name{:04}", i);
     }
-    let rows = db.query("SELECT COUNT(*) FROM t WHERE name IS NOT NULL", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(2_000)));
+    let rows = db
+        .query("SELECT COUNT(*) FROM t WHERE name IS NOT NULL", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(2_000))
+    );
 }
 
 // ===========================================================================
@@ -96,7 +126,8 @@ fn regression_create_index_backfills_existing_rows() {
 #[test]
 fn regression_quick_split_boundary_exact_bytes() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE q (id INTEGER PRIMARY KEY, pad TEXT)", []).unwrap();
+    db.execute("CREATE TABLE q (id INTEGER PRIMARY KEY, pad TEXT)", [])
+        .unwrap();
     // Variable-width rows: pads of every length 0..64 drive the cell-size
     // distribution through the quick-split median boundary repeatedly.
     for round in 0..8 {
@@ -110,17 +141,28 @@ fn regression_quick_split_boundary_exact_bytes() {
         }
     }
     let rows = db.query("SELECT COUNT(*) FROM q", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(512)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(512))
+    );
     // Every row must round-trip with its exact payload (page corruption
     // manifests as wrong payloads or structure errors).
     for round in 0..8 {
         for len in 0..64usize {
             let id = round * 1000 + len as i64 + 1;
             let rows = db
-                .query("SELECT pad, length(pad) FROM q WHERE id = ?", [Value::Integer(id)])
+                .query(
+                    "SELECT pad, length(pad) FROM q WHERE id = ?",
+                    [Value::Integer(id)],
+                )
                 .unwrap();
             assert_eq!(rows.len(), 1, "row id={} lost after split", id);
-            assert_eq!(rows[0][1], Value::Integer(len as i64), "row id={} pad corrupted", id);
+            assert_eq!(
+                rows[0][1],
+                Value::Integer(len as i64),
+                "row id={} pad corrupted",
+                id
+            );
             if len > 0 {
                 assert_eq!(rows[0][0], Value::Text("p".repeat(len).into()));
             }
@@ -136,27 +178,42 @@ fn regression_quick_split_boundary_exact_bytes() {
 #[test]
 fn regression_max_rowid_invalidation_after_delete() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     for i in 1..=100i64 {
-        db.execute("INSERT INTO m (v) VALUES (?)", [Value::Text(format!("v{}", i).into())]).unwrap();
+        db.execute(
+            "INSERT INTO m (v) VALUES (?)",
+            [Value::Text(format!("v{}", i).into())],
+        )
+        .unwrap();
     }
     // Delete the top 10 rows.
     db.execute("DELETE FROM m WHERE id > 90", []).unwrap();
     // New inserts get fresh rowids (max+1 semantics: 91.., never a reused
     // id that still exists, never a collision).
     for i in 0..20i64 {
-        db.execute("INSERT INTO m (v) VALUES (?)", [Value::Text(format!("w{}", i).into())]).unwrap();
+        db.execute(
+            "INSERT INTO m (v) VALUES (?)",
+            [Value::Text(format!("w{}", i).into())],
+        )
+        .unwrap();
     }
     let rows = db.query("SELECT COUNT(*) FROM m", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(110)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(110))
+    );
     // No duplicate rowids.
-    let rows = db
-        .query("SELECT COUNT(DISTINCT id) FROM m", [])
-        .unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(110)));
+    let rows = db.query("SELECT COUNT(DISTINCT id) FROM m", []).unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(110))
+    );
     // Lookups by every id must return exactly one row.
     for id in 1..=110i64 {
-        let rows = db.query("SELECT v FROM m WHERE id = ?", [Value::Integer(id)]).unwrap();
+        let rows = db
+            .query("SELECT v FROM m WHERE id = ?", [Value::Integer(id)])
+            .unwrap();
         assert_eq!(rows.len(), 1, "id={} returned {} rows", id, rows.len());
     }
 }
@@ -170,7 +227,11 @@ fn regression_max_rowid_invalidation_after_delete() {
 #[test]
 fn regression_projection_permutation_via_rowid_range() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)",
+        [],
+    )
+    .unwrap();
     for i in 1..=500i64 {
         db.execute(
             "INSERT INTO p (a, b, c) VALUES (?, ?, ?)",
@@ -198,12 +259,14 @@ fn regression_projection_permutation_via_rowid_range() {
             let va = Value::Text(format!("a{}", id).into());
             let vb = Value::Integer(id * 3);
             let vc = Value::Real(id as f64 + 0.5);
-            let expected: Vec<Value> = perm.split(", ").map(|c| match c {
-                "a" => va.clone(),
-                "b" => vb.clone(),
-                _ => vc.clone(),
-            })
-            .collect();
+            let expected: Vec<Value> = perm
+                .split(", ")
+                .map(|c| match c {
+                    "a" => va.clone(),
+                    "b" => vb.clone(),
+                    _ => vc.clone(),
+                })
+                .collect();
             assert_eq!(row, &expected, "perm {} row {} scrambled", perm, id);
         }
     }
@@ -218,7 +281,11 @@ fn regression_projection_permutation_via_rowid_range() {
 #[test]
 fn regression_update_delete_where_routing() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)", []).unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        [],
+    )
+    .unwrap();
     for i in 1..=300i64 {
         db.execute(
             "INSERT INTO u (v, s) VALUES (?, ?)",
@@ -227,27 +294,48 @@ fn regression_update_delete_where_routing() {
         .unwrap();
     }
     // Non-sargable UPDATE predicate (expression on the column).
-    db.execute("UPDATE u SET v = -v WHERE v % 3 = 0", []).unwrap();
-    let rows = db
-        .query("SELECT COUNT(*) FROM u WHERE v < 0", [])
+    db.execute("UPDATE u SET v = -v WHERE v % 3 = 0", [])
         .unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(100)));
+    let rows = db.query("SELECT COUNT(*) FROM u WHERE v < 0", []).unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(100))
+    );
 
     // UPDATE with a join-shaped predicate.
-    db.execute("UPDATE u SET s = 'gone' WHERE v IN (SELECT v FROM u WHERE v = -6)", []).unwrap();
-    let rows = db.query("SELECT COUNT(*) FROM u WHERE s = 'gone'", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(1)));
+    db.execute(
+        "UPDATE u SET s = 'gone' WHERE v IN (SELECT v FROM u WHERE v = -6)",
+        [],
+    )
+    .unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM u WHERE s = 'gone'", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(1))
+    );
 
     // Non-sargable DELETE predicate.
-    db.execute("DELETE FROM u WHERE v % 5 = 0 AND v < 0", []).unwrap();
+    db.execute("DELETE FROM u WHERE v % 5 = 0 AND v < 0", [])
+        .unwrap();
     let rows = db.query("SELECT COUNT(*) FROM u", []).unwrap();
     // 300 - 100 updated (v in {-3,-6,...,-300}) + 20 of those deleted (v%5==0)
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(280)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(280))
+    );
 
     // IS NULL routing on UPDATE.
-    db.execute("UPDATE u SET s = NULL WHERE id < 10", []).unwrap();
-    let rows = db.query("SELECT COUNT(*) FROM u WHERE s IS NULL", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(9)));
+    db.execute("UPDATE u SET s = NULL WHERE id < 10", [])
+        .unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM u WHERE s IS NULL", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(9))
+    );
 }
 
 // ===========================================================================
@@ -258,19 +346,36 @@ fn regression_update_delete_where_routing() {
 #[test]
 fn regression_null_semantics_corners() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE n (a INTEGER, b INTEGER)", []).unwrap();
-    db.execute("INSERT INTO n VALUES (1, 1), (NULL, 2), (3, NULL), (NULL, NULL), (2, 2)", []).unwrap();
+    db.execute("CREATE TABLE n (a INTEGER, b INTEGER)", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO n VALUES (1, 1), (NULL, 2), (3, NULL), (NULL, NULL), (2, 2)",
+        [],
+    )
+    .unwrap();
 
     // NULL comparisons are never TRUE.
-    let rows = db.query("SELECT COUNT(*) FROM n WHERE a = NULL", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(0)));
-    let rows = db.query("SELECT COUNT(*) FROM n WHERE a <> NULL", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(0)));
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE a = NULL", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(0))
+    );
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE a <> NULL", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(0))
+    );
 
     // COUNT(column) skips NULLs; COUNT(*) does not. The rows are
     // (1,1), (NULL,2), (3,NULL), (NULL,NULL), (2,2): non-NULL a = {1,3,2}
     // = 3, non-NULL b = {1,2,2} = 3 (verified against real SQLite).
-    let rows = db.query("SELECT COUNT(*), COUNT(a), COUNT(b) FROM n", []).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*), COUNT(a), COUNT(b) FROM n", [])
+        .unwrap();
     assert_eq!(
         rows[0],
         vec![Value::Integer(5), Value::Integer(3), Value::Integer(3)]
@@ -278,11 +383,20 @@ fn regression_null_semantics_corners() {
 
     // SUM/AVG/MIN/MAX over all-NULL → NULL.
     db.execute("CREATE TABLE e (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO e VALUES (NULL), (NULL)", []).unwrap();
-    let rows = db.query("SELECT SUM(x), AVG(x), MIN(x), MAX(x), COUNT(x) FROM e", []).unwrap();
+    db.execute("INSERT INTO e VALUES (NULL), (NULL)", [])
+        .unwrap();
+    let rows = db
+        .query("SELECT SUM(x), AVG(x), MIN(x), MAX(x), COUNT(x) FROM e", [])
+        .unwrap();
     assert_eq!(
         rows[0],
-        vec![Value::Null, Value::Null, Value::Null, Value::Null, Value::Integer(0)]
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Integer(0)
+        ]
     );
 
     // DISTINCT treats NULLs as equal (one NULL row): a values are
@@ -291,7 +405,9 @@ fn regression_null_semantics_corners() {
     assert_eq!(rows.len(), 4);
 
     // GROUP BY groups NULLs together.
-    let rows = db.query("SELECT a, COUNT(*) FROM n GROUP BY a ORDER BY a", []).unwrap();
+    let rows = db
+        .query("SELECT a, COUNT(*) FROM n GROUP BY a ORDER BY a", [])
+        .unwrap();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[0][0], Value::Null);
     assert_eq!(rows[0][1], Value::Integer(2));
@@ -323,7 +439,8 @@ fn regression_rename_column_after_root_split_uses_live_root() {
         .unwrap();
     }
     // Rename the column — the schema row must record the LIVE root.
-    db.execute("ALTER TABLE rc RENAME COLUMN old_name TO new_name", []).unwrap();
+    db.execute("ALTER TABLE rc RENAME COLUMN old_name TO new_name", [])
+        .unwrap();
     // Write more (forces another split past the rename)...
     for i in 3_001..=4_000i64 {
         db.execute(
@@ -339,7 +456,10 @@ fn regression_rename_column_after_root_split_uses_live_root() {
     // ...and every row must still be reachable under the new column name.
     for i in 1..=4_000i64 {
         let rows = db
-            .query("SELECT v FROM rc WHERE new_name = ?", [Value::Text(format!("n{}", i).into())])
+            .query(
+                "SELECT v FROM rc WHERE new_name = ?",
+                [Value::Text(format!("n{}", i).into())],
+            )
             .unwrap();
         assert_eq!(
             rows.len(),
@@ -349,7 +469,10 @@ fn regression_rename_column_after_root_split_uses_live_root() {
         );
     }
     let rows = db.query("SELECT COUNT(*) FROM rc", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(4_000)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(4_000))
+    );
 }
 
 // ===========================================================================
@@ -360,11 +483,22 @@ fn regression_rename_column_after_root_split_uses_live_root() {
 #[test]
 fn regression_statement_cache_does_not_leak_state() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, g TEXT, v INTEGER)", []).unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, g TEXT, v INTEGER)",
+        [],
+    )
+    .unwrap();
     for i in 1..=100i64 {
         db.execute(
             "INSERT INTO c (g, v) VALUES (?, ?)",
-            [Value::Text(if i % 2 == 0 { "even".into() } else { "odd".into() }), Value::Integer(i)],
+            [
+                Value::Text(if i % 2 == 0 {
+                    "even".into()
+                } else {
+                    "odd".into()
+                }),
+                Value::Integer(i),
+            ],
         )
         .unwrap();
     }
@@ -373,10 +507,17 @@ fn regression_statement_cache_does_not_leak_state() {
     // classic leak.
     for run in 0..5 {
         let rows = db
-            .query("SELECT COUNT(*), SUM(v) FROM c WHERE g = ? AND v > ?", [
-                Value::Text(if run % 2 == 0 { "even".into() } else { "odd".into() }),
-                Value::Integer(20 + run * 10),
-            ])
+            .query(
+                "SELECT COUNT(*), SUM(v) FROM c WHERE g = ? AND v > ?",
+                [
+                    Value::Text(if run % 2 == 0 {
+                        "even".into()
+                    } else {
+                        "odd".into()
+                    }),
+                    Value::Integer(20 + run * 10),
+                ],
+            )
             .unwrap();
         let g = if run % 2 == 0 { "even" } else { "odd" };
         let threshold = 20 + run * 10;
@@ -388,9 +529,14 @@ fn regression_statement_cache_does_not_leak_state() {
             .sum();
         assert_eq!(
             rows[0],
-            vec![Value::Integer(expected_count as i64), Value::Integer(expected_sum)],
+            vec![
+                Value::Integer(expected_count as i64),
+                Value::Integer(expected_sum)
+            ],
             "run {} (g={}, v>{}): cached-statement leak suspected",
-            run, g, threshold
+            run,
+            g,
+            threshold
         );
     }
 }
@@ -407,10 +553,14 @@ fn regression_wal_recovery_without_checkpoint() {
     {
         let mut db = Database::open(&path).unwrap();
         db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-        db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         for i in 1..=1_000i64 {
-            db.execute("INSERT INTO w (v) VALUES (?)", [Value::Text(format!("v{}", i).into())])
-                .unwrap();
+            db.execute(
+                "INSERT INTO w (v) VALUES (?)",
+                [Value::Text(format!("v{}", i).into())],
+            )
+            .unwrap();
         }
         db.flush().unwrap();
         // NO explicit checkpoint: drop the connection with frames in the WAL.
@@ -424,9 +574,13 @@ fn regression_wal_recovery_without_checkpoint() {
         "WAL frames lost on reopen (recovery did not run?)"
     );
     // And the recovered table accepts further writes.
-    db.execute("INSERT INTO w (v) VALUES ('post-recovery')", []).unwrap();
+    db.execute("INSERT INTO w (v) VALUES ('post-recovery')", [])
+        .unwrap();
     let rows = db.query("SELECT COUNT(*) FROM w", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(1_001)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(1_001))
+    );
 }
 
 // ===========================================================================
@@ -437,31 +591,56 @@ fn regression_wal_recovery_without_checkpoint() {
 #[test]
 fn regression_nested_savepoint_bulk_rollback() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
     for i in 1..=500i64 {
-        db.execute("INSERT INTO s (v) VALUES (?)", [Value::Text(format!("orig{}", i).into())])
-            .unwrap();
+        db.execute(
+            "INSERT INTO s (v) VALUES (?)",
+            [Value::Text(format!("orig{}", i).into())],
+        )
+        .unwrap();
     }
     db.execute("SAVEPOINT outer", []).unwrap();
     db.execute("DELETE FROM s WHERE id > 250", []).unwrap();
-    db.execute("UPDATE s SET v = 'changed' WHERE id <= 250", []).unwrap();
+    db.execute("UPDATE s SET v = 'changed' WHERE id <= 250", [])
+        .unwrap();
     db.execute("SAVEPOINT inner", []).unwrap();
     db.execute("CREATE TABLE extra (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO extra VALUES (1), (2), (3)", []).unwrap();
+    db.execute("INSERT INTO extra VALUES (1), (2), (3)", [])
+        .unwrap();
     // Rollback to inner: `extra` disappears, the outer changes stay.
     db.execute("ROLLBACK TO inner", []).unwrap();
     let rows = db.query("SELECT COUNT(*) FROM s", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(250)));
-    let rows = db.query("SELECT COUNT(*) FROM s WHERE v = 'changed'", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(250)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(250))
+    );
+    let rows = db
+        .query("SELECT COUNT(*) FROM s WHERE v = 'changed'", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(250))
+    );
     let err = db.query("SELECT COUNT(*) FROM extra", []);
-    assert!(err.is_err(), "table created inside a rolled-back savepoint still exists");
+    assert!(
+        err.is_err(),
+        "table created inside a rolled-back savepoint still exists"
+    );
     // Rollback to outer: everything is back to the original 500 rows.
     db.execute("ROLLBACK TO outer", []).unwrap();
     let rows = db.query("SELECT COUNT(*) FROM s", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(500)));
-    let rows = db.query("SELECT COUNT(*) FROM s WHERE v LIKE 'orig%'", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(500)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(500))
+    );
+    let rows = db
+        .query("SELECT COUNT(*) FROM s WHERE v LIKE 'orig%'", [])
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(500))
+    );
 }
 
 // ===========================================================================
@@ -475,7 +654,8 @@ fn regression_nested_savepoint_bulk_rollback() {
 #[test]
 fn regression_multiple_aggregates_different_args() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE li (oid INT, qty INT, price REAL)", []).unwrap();
+    db.execute("CREATE TABLE li (oid INT, qty INT, price REAL)", [])
+        .unwrap();
     db.execute(
         "INSERT INTO li (oid, qty, price) VALUES (1, 3, 10), (2, 2, 6)",
         [],
@@ -483,9 +663,7 @@ fn regression_multiple_aggregates_different_args() {
     .unwrap();
 
     // No GROUP BY: two SUMs over different columns.
-    let rows = db
-        .query("SELECT SUM(qty), SUM(price) FROM li", [])
-        .unwrap();
+    let rows = db.query("SELECT SUM(qty), SUM(price) FROM li", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(5));
     assert_eq!(rows[0][1], Value::Real(16.0));
 
@@ -498,17 +676,35 @@ fn regression_multiple_aggregates_different_args() {
 
     // GROUP BY: per-group values must differ per aggregate.
     let rows = db
-        .query("SELECT oid, SUM(qty), SUM(price) FROM li GROUP BY oid ORDER BY oid", [])
+        .query(
+            "SELECT oid, SUM(qty), SUM(price) FROM li GROUP BY oid ORDER BY oid",
+            [],
+        )
         .unwrap();
-    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(3), Value::Real(10.0)]);
-    assert_eq!(rows[1], vec![Value::Integer(2), Value::Integer(2), Value::Real(6.0)]);
+    assert_eq!(
+        rows[0],
+        vec![Value::Integer(1), Value::Integer(3), Value::Real(10.0)]
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::Integer(2), Value::Integer(2), Value::Real(6.0)]
+    );
 
     // Swapped order (the loose matcher favored aggregates[0] regardless).
     let rows = db
-        .query("SELECT oid, SUM(price), SUM(qty) FROM li GROUP BY oid ORDER BY oid", [])
+        .query(
+            "SELECT oid, SUM(price), SUM(qty) FROM li GROUP BY oid ORDER BY oid",
+            [],
+        )
         .unwrap();
-    assert_eq!(rows[0], vec![Value::Integer(1), Value::Real(10.0), Value::Integer(3)]);
-    assert_eq!(rows[1], vec![Value::Integer(2), Value::Real(6.0), Value::Integer(2)]);
+    assert_eq!(
+        rows[0],
+        vec![Value::Integer(1), Value::Real(10.0), Value::Integer(3)]
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::Integer(2), Value::Real(6.0), Value::Integer(2)]
+    );
 
     // Aggregates in ORDER BY / expressions.
     let rows = db
@@ -560,7 +756,11 @@ fn regression_statement_dml_survives_btree_splits() {
 
     for tx in [false, true] {
         let mut db = Database::open_in_memory().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b REAL, c TEXT)", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b REAL, c TEXT)",
+            [],
+        )
+        .unwrap();
         // An index makes index-root splits happen too.
         db.execute("CREATE INDEX idx_c ON t (c)", []).unwrap();
 
@@ -604,14 +804,18 @@ fn regression_statement_dml_survives_btree_splits() {
 
         // ...and through the index.
         let rows = db
-            .query("SELECT id FROM t WHERE c = ?", [Value::Text("name-04999".into())])
+            .query(
+                "SELECT id FROM t WHERE c = ?",
+                [Value::Text("name-04999".into())],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1, "index lookup for the last row (tx={tx})");
         assert_eq!(rows[0][0], Value::Integer(5000));
 
         // One prepared statement re-bound per row (the reset path).
         let mut db2 = Database::open_in_memory().unwrap();
-        db2.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT)", []).unwrap();
+        db2.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT)", [])
+            .unwrap();
         {
             let mut stmt = db2.prepare("INSERT INTO t (a) VALUES (?)").unwrap();
             for i in 0..3000i64 {

@@ -22,4 +22,3 @@ pub type ProjectionMapping = (Option<Vec<usize>>, Arc<[String]>);
 /// One in-place cell payload update during index maintenance:
 /// (rowid, byte range in the index key, replacement bytes).
 pub type CellUpdate = (i64, Range<usize>, Option<Vec<u8>>);
-

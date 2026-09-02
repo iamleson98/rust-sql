@@ -9,9 +9,9 @@
 
 #![cfg(feature = "sqlx")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use rustqlite::sqlx_driver::{raw_sql, RustqliteConnectOptions, RustqlitePool};
 use rustqlite::sqlx_driver::{SqlStr, Statement as _Statement};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::{Connection, Executor, Row};
 
@@ -37,17 +37,17 @@ struct User {
 #[tokio::test]
 async fn connect_and_ddl() {
     let pool = mem_pool().await;
-        // DDL via execute (raw SQL, no binds)
-        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .unwrap();
+    // DDL via execute (raw SQL, no binds)
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // ...and via raw_sql()
-        raw_sql("CREATE TABLE t2 (a INT, b REAL); CREATE INDEX t2_a ON t2 (a);")
-            .execute(&pool)
-            .await
-            .unwrap();
+    // ...and via raw_sql()
+    raw_sql("CREATE TABLE t2 (a INT, b REAL); CREATE INDEX t2_a ON t2 (a);")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -89,8 +89,16 @@ async fn typed_binds_and_fetch() {
     assert_eq!(
         rows,
         vec![
-            User { id: 1, name: "Ada".into(), score: Some(1.5) },
-            User { id: 2, name: "Bob".into(), score: Some(2.0) },
+            User {
+                id: 1,
+                name: "Ada".into(),
+                score: Some(1.5)
+            },
+            User {
+                id: 2,
+                name: "Bob".into(),
+                score: Some(2.0)
+            },
         ]
     );
 
@@ -172,11 +180,10 @@ async fn blob_bool_and_types() {
         .await
         .unwrap();
 
-    let (data, flag): (Vec<u8>, bool) =
-        sqlx::query_as("SELECT data, flag FROM b WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (data, flag): (Vec<u8>, bool) = sqlx::query_as("SELECT data, flag FROM b WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(data, vec![1, 2, 3, 4]);
     assert!(flag);
 
@@ -274,7 +281,10 @@ async fn connection_level_api() {
         .unwrap();
     conn.ping().await.unwrap();
 
-    let v: String = sqlx::query_scalar("SELECT 'ping'").fetch_one(&mut conn).await.unwrap();
+    let v: String = sqlx::query_scalar("SELECT 'ping'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(v, "ping");
     conn.close().await.unwrap();
 }
@@ -326,40 +336,40 @@ async fn url_parsing() {
 
 #[tokio::test]
 async fn file_backed_pool() {
-let tmp = tempfile::tempdir().unwrap();
-let path = tmp.path().join("app.db");
-let opts = RustqliteConnectOptions::filename(&path).create_if_missing(true);
-let pool = RustqlitePool::connect_with(opts).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    let opts = RustqliteConnectOptions::filename(&path).create_if_missing(true);
+    let pool = RustqlitePool::connect_with(opts).await.unwrap();
 
-sqlx::query("CREATE TABLE f (id INTEGER PRIMARY KEY, v TEXT)")
-    .execute(&pool)
-    .await
-    .unwrap();
-for i in 0..10 {
-    sqlx::query("INSERT INTO f (v) VALUES (?)")
-        .bind(format!("row{i}"))
+    sqlx::query("CREATE TABLE f (id INTEGER PRIMARY KEY, v TEXT)")
         .execute(&pool)
         .await
         .unwrap();
-}
-let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM f")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-assert_eq!(n, 10);
-pool.close().await;
+    for i in 0..10 {
+        sqlx::query("INSERT INTO f (v) VALUES (?)")
+            .bind(format!("row{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM f")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 10);
+    pool.close().await;
 
-// Reopen: persistence across pools (registry keyed by path, engine
-// re-reads the file on a fresh process; within one process the
-// engine stays hot — verify by reading back through a new pool).
-let opts = RustqliteConnectOptions::filename(&path);
-let pool2 = RustqlitePool::connect_with(opts).await.unwrap();
-let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM f")
-    .fetch_one(&pool2)
-    .await
-    .unwrap();
-assert_eq!(n, 10);
-pool2.close().await;
+    // Reopen: persistence across pools (registry keyed by path, engine
+    // re-reads the file on a fresh process; within one process the
+    // engine stays hot — verify by reading back through a new pool).
+    let opts = RustqliteConnectOptions::filename(&path);
+    let pool2 = RustqlitePool::connect_with(opts).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM f")
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
+    assert_eq!(n, 10);
+    pool2.close().await;
 }
 
 #[tokio::test]
@@ -435,10 +445,8 @@ async fn pragma_roundtrip() {
     // foreign_keys is connection state (a fresh pool connection would
     // re-apply the default ON, exactly like sqlx-sqlite) — use ONE
     // connection for a deterministic sequence.
-    let mut conn = rustqlite::sqlx_driver::RustqliteConnection::open(
-        &RustqliteConnectOptions::new(),
-    )
-    .unwrap();
+    let mut conn =
+        rustqlite::sqlx_driver::RustqliteConnection::open(&RustqliteConnectOptions::new()).unwrap();
     // read form
     let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
         .fetch_one(&mut conn)
@@ -522,13 +530,12 @@ async fn complex_queries() {
     assert!((rows[0].amount - 30.0).abs() < 1e-9);
 
     // window-ish subquery + LIMIT/OFFSET
-    let top: Option<String> = sqlx::query_scalar(
-        "SELECT cust FROM (SELECT cust FROM o ORDER BY total DESC LIMIT 1)",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap()
-    .flatten();
+    let top: Option<String> =
+        sqlx::query_scalar("SELECT cust FROM (SELECT cust FROM o ORDER BY total DESC LIMIT 1)")
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten();
     assert_eq!(top.as_deref(), Some("ada"));
 }
 
@@ -613,14 +620,23 @@ async fn isolation_no_dirty_read() {
 #[tokio::test]
 async fn isolation_rollback_invisible() {
     let pool = mem_pool_fast().await;
-    sqlx::raw_sql("CREATE TABLE rb (id INTEGER PRIMARY KEY, v TEXT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE rb (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut a = pool.acquire().await.unwrap();
     sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
-    sqlx::query("INSERT INTO rb (v) VALUES ('x')").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO rb (v) VALUES ('x')")
+        .execute(&mut *a)
+        .await
+        .unwrap();
     sqlx::query("ROLLBACK").execute(&mut *a).await.unwrap();
 
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rb").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rb")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -628,8 +644,14 @@ async fn isolation_rollback_invisible() {
 #[tokio::test]
 async fn readonly_tx_does_not_block_readers() {
     let pool = mem_pool().await;
-    sqlx::raw_sql("CREATE TABLE ro (id INTEGER PRIMARY KEY, v INT)").execute(&pool).await.unwrap();
-    sqlx::raw_sql("INSERT INTO ro (v) VALUES (1),(2),(3)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE ro (id INTEGER PRIMARY KEY, v INT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO ro (v) VALUES (1),(2),(3)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut a = pool.acquire().await.unwrap();
     let mut b = pool.acquire().await.unwrap();
@@ -651,12 +673,18 @@ async fn readonly_tx_does_not_block_readers() {
 #[tokio::test]
 async fn write_busy_timeout_then_sqlite_busy() {
     let pool = mem_pool_fast().await; // 150 ms busy timeout
-    sqlx::raw_sql("CREATE TABLE bt (id INTEGER PRIMARY KEY, v TEXT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE bt (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut a = pool.acquire().await.unwrap();
     let mut b = pool.acquire().await.unwrap();
     sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
-    sqlx::query("INSERT INTO bt (v) VALUES ('a')").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO bt (v) VALUES ('a')")
+        .execute(&mut *a)
+        .await
+        .unwrap();
 
     let t0 = std::time::Instant::now();
     let err = sqlx::query("INSERT INTO bt (v) VALUES ('b')")
@@ -675,7 +703,10 @@ async fn write_busy_timeout_then_sqlite_busy() {
     sqlx::query("ROLLBACK").execute(&mut *a).await.unwrap();
     drop(a);
     drop(b);
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bt").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bt")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 0, "A rolled back");
 }
 
@@ -684,12 +715,18 @@ async fn write_busy_timeout_then_sqlite_busy() {
 #[tokio::test]
 async fn writer_wakes_after_foreign_commit() {
     let pool = mem_pool().await; // 5 s busy timeout
-    sqlx::raw_sql("CREATE TABLE wk (id INTEGER PRIMARY KEY, v TEXT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE wk (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut a = pool.acquire().await.unwrap();
     let mut b = pool.acquire().await.unwrap();
     sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
-    sqlx::query("INSERT INTO wk (v) VALUES ('a')").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO wk (v) VALUES ('a')")
+        .execute(&mut *a)
+        .await
+        .unwrap();
 
     // b writes while a's tx is open; a commits 150 ms later.
     let committer = tokio::spawn(async move {
@@ -708,7 +745,10 @@ async fn writer_wakes_after_foreign_commit() {
         waited >= std::time::Duration::from_millis(120),
         "writer should have waited for the commit ({waited:?})"
     );
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wk").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wk")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 2);
 }
 
@@ -722,12 +762,18 @@ async fn zero_busy_timeout_fails_instantly() {
     )
     .await
     .unwrap();
-    sqlx::raw_sql("CREATE TABLE z (id INTEGER PRIMARY KEY)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE z (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut a = pool.acquire().await.unwrap();
     let mut b = pool.acquire().await.unwrap();
     sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
-    sqlx::query("INSERT INTO z (id) VALUES (1)").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO z (id) VALUES (1)")
+        .execute(&mut *a)
+        .await
+        .unwrap();
 
     let t0 = std::time::Instant::now();
     let err = sqlx::query("INSERT INTO z (id) VALUES (2)")
@@ -735,7 +781,10 @@ async fn zero_busy_timeout_fails_instantly() {
         .await
         .expect_err("must fail");
     assert!(err.to_string().contains("database is locked"));
-    assert!(t0.elapsed() < std::time::Duration::from_millis(100), "must be instant");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(100),
+        "must be instant"
+    );
     sqlx::query("ROLLBACK").execute(&mut *a).await.unwrap();
     drop(a);
     drop(b);
@@ -746,15 +795,24 @@ async fn zero_busy_timeout_fails_instantly() {
 #[tokio::test]
 async fn dropped_connection_releases_tx() {
     let pool = mem_pool_fast().await;
-    sqlx::raw_sql("CREATE TABLE dr (id INTEGER PRIMARY KEY, v TEXT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE dr (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Open a raw BEGIN + INSERT on a dedicated connection, then DROP it.
     let mut a = pool.acquire().await.unwrap();
     sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
-    sqlx::query("INSERT INTO dr (v) VALUES ('doomed')").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO dr (v) VALUES ('doomed')")
+        .execute(&mut *a)
+        .await
+        .unwrap();
     drop(a); // must roll back
 
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dr").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dr")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -762,7 +820,10 @@ async fn dropped_connection_releases_tx() {
 #[tokio::test]
 async fn dropped_connection_releases_raw_script_tx() {
     let pool = mem_pool_fast().await;
-    sqlx::raw_sql("CREATE TABLE ds (id INTEGER PRIMARY KEY)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE ds (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut a = pool.acquire().await.unwrap();
     sqlx::raw_sql("BEGIN; INSERT INTO ds (id) VALUES (1);")
@@ -771,7 +832,10 @@ async fn dropped_connection_releases_raw_script_tx() {
         .unwrap();
     drop(a);
 
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ds").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ds")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -780,7 +844,10 @@ async fn dropped_connection_releases_raw_script_tx() {
 #[tokio::test]
 async fn sqlx_transactions_with_isolation() {
     let pool = mem_pool().await;
-    sqlx::raw_sql("CREATE TABLE tr (id INTEGER PRIMARY KEY, v TEXT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE tr (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Commit path
     let mut tx = pool.begin().await.unwrap();
@@ -800,10 +867,16 @@ async fn sqlx_transactions_with_isolation() {
 
     // Nested savepoint: inner rollback only discards inner writes.
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query("INSERT INTO tr (v) VALUES ('outer')").execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO tr (v) VALUES ('outer')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     {
         let mut sp = tx.begin().await.unwrap();
-        sqlx::query("INSERT INTO tr (v) VALUES ('inner-doomed')").execute(&mut *sp).await.unwrap();
+        sqlx::query("INSERT INTO tr (v) VALUES ('inner-doomed')")
+            .execute(&mut *sp)
+            .await
+            .unwrap();
         sp.rollback().await.unwrap();
     }
     tx.commit().await.unwrap();
@@ -820,7 +893,10 @@ async fn sqlx_transactions_with_isolation() {
 #[tokio::test]
 async fn concurrent_transactions_serialize_correctly() {
     let pool = mem_pool().await;
-    sqlx::raw_sql("CREATE TABLE cs (id INTEGER PRIMARY KEY, w INT, v INT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE cs (id INTEGER PRIMARY KEY, w INT, v INT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut handles = Vec::new();
     for w in 0..4 {
@@ -841,7 +917,10 @@ async fn concurrent_transactions_serialize_correctly() {
     for h in handles {
         h.await.unwrap();
     }
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cs").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 40);
 }
 
@@ -850,7 +929,10 @@ async fn concurrent_transactions_serialize_correctly() {
 #[tokio::test]
 async fn concurrent_mixed_read_write_consistency() {
     let pool = mem_pool().await;
-    sqlx::raw_sql("CREATE TABLE mx (id INTEGER PRIMARY KEY, batch INT, v INT)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE mx (id INTEGER PRIMARY KEY, batch INT, v INT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     const BATCHES: i64 = 20;
     const BATCH_SIZE: i64 = 5;
@@ -899,7 +981,10 @@ async fn concurrent_mixed_read_write_consistency() {
 
     writer.await.unwrap();
     let max_seen = reader.await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mx").fetch_one(&pool).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mx")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, BATCHES * BATCH_SIZE);
     assert!(max_seen <= n);
 }
@@ -909,8 +994,14 @@ async fn concurrent_mixed_read_write_consistency() {
 #[tokio::test]
 async fn multiple_concurrent_read_transactions() {
     let pool = mem_pool().await;
-    sqlx::raw_sql("CREATE TABLE rt (id INTEGER PRIMARY KEY, v INT)").execute(&pool).await.unwrap();
-    sqlx::raw_sql("INSERT INTO rt (v) VALUES (42)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE rt (id INTEGER PRIMARY KEY, v INT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO rt (v) VALUES (42)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..4 {

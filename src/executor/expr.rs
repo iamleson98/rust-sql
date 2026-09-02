@@ -73,9 +73,7 @@ fn cast_value(v: Value, type_name: &str) -> Value {
             Value::Integer(i) => Value::Integer(i),
             // Rust's float→int `as` saturates exactly like SQLite clamps.
             Value::Real(f) => Value::Integer(f as i64),
-            Value::Text(_) | Value::Blob(_) => {
-                Value::Integer(parse_int_prefix(&v.as_text()))
-            }
+            Value::Text(_) | Value::Blob(_) => Value::Integer(parse_int_prefix(&v.as_text())),
         },
         Affinity::Real => match v {
             Value::Null => Value::Null,
@@ -359,7 +357,9 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             // COLLATE on either comparison operand applies a collation to
             // text comparison (SQLite: `a < b COLLATE NOCASE`). Only
             // ordering / equality operators honor it.
-            if let Some(coll_name) = comparison_collation(left).or_else(|| comparison_collation(right)) {
+            if let Some(coll_name) =
+                comparison_collation(left).or_else(|| comparison_collation(right))
+            {
                 if let Some(coll) = crate::plugin::lookup_collation(&coll_name) {
                     return Ok(apply_binary_collated(*op, &l, &r, coll.as_ref()));
                 }
@@ -396,10 +396,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             // comparisons (SQLite).
             let in_range = if let Some(name) = comparison_collation(expr) {
                 let coll = crate::plugin::lookup_collation(&name).ok_or_else(|| {
-                    crate::error::Error::semantic(format!(
-                        "no such collation sequence: {}",
-                        name
-                    ))
+                    crate::error::Error::semantic(format!("no such collation sequence: {}", name))
                 })?;
                 let ge = crate::plugin::compare_collated(&v, &lo, coll.as_ref())
                     != std::cmp::Ordering::Less;
@@ -433,10 +430,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             // Three-valued logic: any NULL operand makes the whole
             // comparison NULL (unknown) — NOT LIKE included — so WHERE
             // filters the row out either way (SQLite semantics).
-            if v.is_null()
-                || p.is_null()
-                || esc.as_ref().map(|e| e.is_null()).unwrap_or(false)
-            {
+            if v.is_null() || p.is_null() || esc.as_ref().map(|e| e.is_null()).unwrap_or(false) {
                 return Ok(Value::Null);
             }
             let result = match op {
@@ -603,9 +597,7 @@ fn evaluate_in(
             (found, list_has_null)
         }
         InSource::Table(_) => {
-            return Err(Error::Unsupported(
-                "IN table via evaluator (use executor)",
-            ));
+            return Err(Error::Unsupported("IN table via evaluator (use executor)"));
         }
     };
     if found {
@@ -632,7 +624,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
 /// Call a scalar SQL function.
 pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
     let fname = name.to_ascii_lowercase();
-    Ok(    match fname.as_str() {
+    Ok(match fname.as_str() {
         "abs" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             // SQLite: abs() of the most-negative integer raises
@@ -692,7 +684,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "substr" | "substring" => {
-            if args.len() >= 2 && args.iter().take(2).all(|v| !v.is_null())
+            if args.len() >= 2
+                && args.iter().take(2).all(|v| !v.is_null())
                 && (args.len() < 3 || !args[2].is_null())
             {
                 // Blob operands are byte-indexed and yield a blob
@@ -701,12 +694,20 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     let (begin, end) = substr_range(
                         b.len() as i64,
                         args[1].as_integer(),
-                        if args.len() == 3 { args[2].as_integer() } else { i64::MAX / 4 },
+                        if args.len() == 3 {
+                            args[2].as_integer()
+                        } else {
+                            i64::MAX / 4
+                        },
                     );
                     return Ok(Value::Blob(b[begin as usize..end as usize].to_vec()));
                 }
                 let s = args[0].as_text();
-                let z = if args.len() == 3 { args[2].as_integer() } else { i64::MAX / 4 };
+                let z = if args.len() == 3 {
+                    args[2].as_integer()
+                } else {
+                    i64::MAX / 4
+                };
                 if s.is_ascii() {
                     // Fast path: byte index == char index for ASCII.
                     let (begin, end) = substr_range(s.len() as i64, args[1].as_integer(), z);
@@ -783,7 +784,11 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             // invalid UTF-8, which corrupted 0xff into U+FFFD).
             let out = match args.first() {
                 Some(Value::Blob(b)) => b.iter().map(|x| format!("{:02X}", x)).collect::<String>(),
-                Some(v) => v.as_text().bytes().map(|b| format!("{:02X}", b)).collect::<String>(),
+                Some(v) => v
+                    .as_text()
+                    .bytes()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<String>(),
                 None => String::new(),
             };
             Value::Text(out.into())
@@ -797,7 +802,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 Some(Value::Blob(_)) => "blob",
                 None => "null",
             }
-            .to_string().into(),
+            .to_string()
+            .into(),
         ),
         "date" | "time" | "datetime" | "strftime" | "julianday" | "unixepoch" | "timediff" => {
             // Full SQLite-compatible date/time engine (see datetime.rs).
@@ -946,7 +952,11 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
                 let x = v.as_real();
-                if x < 0.0 { Value::Null } else { Value::Real(x.sqrt()) }
+                if x < 0.0 {
+                    Value::Null
+                } else {
+                    Value::Real(x.sqrt())
+                }
             }
         },
         // FLOOR / CEIL / CEILING.
@@ -975,7 +985,11 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
                 let x = v.as_real();
-                if x <= 0.0 { Value::Null } else { Value::Real(x.ln()) }
+                if x <= 0.0 {
+                    Value::Null
+                } else {
+                    Value::Real(x.ln())
+                }
             }
         },
         // LOG(x) / LOG10(x) — base-10 log. With two args, LOG(b, x) is base-b.
@@ -992,14 +1006,22 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 return Ok(Value::Real(x.log(b)));
             }
             let x = args[0].as_real();
-            if x <= 0.0 { Value::Null } else { Value::Real(x.log10()) }
+            if x <= 0.0 {
+                Value::Null
+            } else {
+                Value::Real(x.log10())
+            }
         }
         // LOG2(x) — base-2 log.
         "log2" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
                 let x = v.as_real();
-                if x <= 0.0 { Value::Null } else { Value::Real(x.log2()) }
+                if x <= 0.0 {
+                    Value::Null
+                } else {
+                    Value::Real(x.log2())
+                }
             }
         },
         // ABS already defined above.
@@ -1028,7 +1050,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     None => Value::Null,
                 }
             }
-        }
+        },
         // TRUE() / FALSE() — SQLite 3.23+ boolean literals.
         "true" => Value::Integer(1),
         "false" => Value::Integer(0),
@@ -1041,8 +1063,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
                 return r;
             }
-            crate::executor::json::call_json_function(&fname, args)
-                .unwrap_or(Value::Null)
+            crate::executor::json::call_json_function(&fname, args).unwrap_or(Value::Null)
         }
     })
 }
@@ -1053,18 +1074,82 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
 /// included so user aggregates can't silently shadow them either.
 pub(crate) fn is_builtin_scalar(name: &str) -> bool {
     const BUILTIN: &[&str] = &[
-        "abs", "avg", "ceil", "ceiling", "changes", "char", "coalesce", "count",
-        "currentdate", "currenttime", "currenttimestamp", "date", "datetime",
-        "dense_rank", "exp", "false", "floor", "group_concat", "hex", "ifnull", "iif",
-        "instr", "json", "json_array", "json_array_length", "json_extract",
-        "json_insert", "json_object", "json_patch", "json_quote", "json_remove",
-        "json_replace", "json_set", "json_valid", "julianday", "last_insert_rowid",
-        "length", "ln", "log", "log10", "log2", "lower", "ltrim", "max", "min",
-        "nullif", "pi", "power", "printf", "quote", "random", "randomblob", "rank",
-        "replace", "round", "row_number", "rtrim", "sign", "sqlite_version", "sqrt",
-        "strftime", "substr", "substring", "sum", "time", "timediff", "total",
-        "total_changes", "trim", "true", "trunc", "typeof", "unicode", "unixepoch",
-        "upper", "zeroblob",
+        "abs",
+        "avg",
+        "ceil",
+        "ceiling",
+        "changes",
+        "char",
+        "coalesce",
+        "count",
+        "currentdate",
+        "currenttime",
+        "currenttimestamp",
+        "date",
+        "datetime",
+        "dense_rank",
+        "exp",
+        "false",
+        "floor",
+        "group_concat",
+        "hex",
+        "ifnull",
+        "iif",
+        "instr",
+        "json",
+        "json_array",
+        "json_array_length",
+        "json_extract",
+        "json_insert",
+        "json_object",
+        "json_patch",
+        "json_quote",
+        "json_remove",
+        "json_replace",
+        "json_set",
+        "json_valid",
+        "julianday",
+        "last_insert_rowid",
+        "length",
+        "ln",
+        "log",
+        "log10",
+        "log2",
+        "lower",
+        "ltrim",
+        "max",
+        "min",
+        "nullif",
+        "pi",
+        "power",
+        "printf",
+        "quote",
+        "random",
+        "randomblob",
+        "rank",
+        "replace",
+        "round",
+        "row_number",
+        "rtrim",
+        "sign",
+        "sqlite_version",
+        "sqrt",
+        "strftime",
+        "substr",
+        "substring",
+        "sum",
+        "time",
+        "timediff",
+        "total",
+        "total_changes",
+        "trim",
+        "true",
+        "trunc",
+        "typeof",
+        "unicode",
+        "unixepoch",
+        "upper",
+        "zeroblob",
     ];
     let lowered = name.to_ascii_lowercase();
     BUILTIN.binary_search(&lowered.as_str()).is_ok()
@@ -1105,24 +1190,29 @@ fn comparison_collation(e: &Expr) -> Option<String> {
 /// Comparison through a collation (text-text pairs only; other types keep
 /// the engine's total order). Result mirrors `apply_binary` for the six
 /// comparison operators.
-fn apply_binary_collated(op: BinaryOp, l: &Value, r: &Value, coll: &dyn crate::plugin::Collation) -> Value {
-    use BinaryOp::*;
+fn apply_binary_collated(
+    op: BinaryOp,
+    l: &Value,
+    r: &Value,
+    coll: &dyn crate::plugin::Collation,
+) -> Value {
     use std::cmp::Ordering;
+    use BinaryOp::*;
     match op {
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
             if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 return Value::Null;
             }
             let ord = crate::plugin::compare_collated(l, r, coll);
-            let b = match (op, ord) {
-                (Eq, Ordering::Equal) => true,
-                (NotEq, Ordering::Less | Ordering::Greater) => true,
-                (Lt, Ordering::Less) => true,
-                (LtEq, Ordering::Less | Ordering::Equal) => true,
-                (Gt, Ordering::Greater) => true,
-                (GtEq, Ordering::Greater | Ordering::Equal) => true,
-                _ => false,
-            };
+            let b = matches!(
+                (op, ord),
+                (BinaryOp::Eq, Ordering::Equal)
+                    | (BinaryOp::NotEq, Ordering::Less | Ordering::Greater)
+                    | (BinaryOp::Lt, Ordering::Less)
+                    | (BinaryOp::LtEq, Ordering::Less | Ordering::Equal)
+                    | (BinaryOp::Gt, Ordering::Greater)
+                    | (BinaryOp::GtEq, Ordering::Greater | Ordering::Equal)
+            );
             Value::Integer(if b { 1 } else { 0 })
         }
         _ => apply_binary(op, l, r),

@@ -157,6 +157,8 @@ use crate::statement::StepResult;
 use crate::types::Value as EngineValue;
 
 use statement::columns_from_names;
+use statement::Columns;
+use statement::NameMap;
 
 /// An alias for [`Pool`], specialized for rustqlite.
 pub type RustqlitePool = Pool<Rustqlite>;
@@ -603,7 +605,7 @@ impl RustqliteConnection {
         values: &[EngineValue],
         limit_one: bool,
     ) -> Result<Vec<Either<RustqliteQueryResult, RustqliteRow>>, SqlxError> {
-        let ast = parser::parse(stmt_sql).map_err(|e| crate::sqlx_driver::error::engine_err(e))?;
+        let ast = parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?;
         let kind = classify(&ast);
 
         let mut logger = QueryLogger::new(script.clone(), self.log_settings.clone());
@@ -684,10 +686,7 @@ impl RustqliteConnection {
                     .map_err(crate::sqlx_driver::error::engine_err)?;
                 stmt.bind_all(values)
                     .map_err(crate::sqlx_driver::error::engine_err)?;
-                let (mut columns, mut names): (
-                    Option<Arc<Vec<RustqliteColumn>>>,
-                    Option<Arc<sqlx_core::HashMap<Arc<str>, usize>>>,
-                ) = (None, None);
+                let (mut columns, mut names): (Option<Columns>, Option<NameMap>) = (None, None);
                 loop {
                     match stmt.step() {
                         Ok(StepResult::Row) => {
@@ -745,13 +744,12 @@ impl RustqliteConnection {
                             self.shared.tx_reset();
                         }
                     }
-                    Ast::Rollback(r) => {
-                        // Only a FULL rollback ends the transaction;
-                        // `ROLLBACK TO SAVEPOINT` keeps it open.
-                        if r.savepoint.is_none() && self.i_own_engine_tx() {
-                            self.shared.tx_reset();
-                        }
+                    // Only a FULL rollback ends the transaction;
+                    // `ROLLBACK TO SAVEPOINT` keeps it open.
+                    Ast::Rollback(r) if r.savepoint.is_none() && self.i_own_engine_tx() => {
+                        self.shared.tx_reset();
                     }
+                    Ast::Rollback(_) => {}
                     _ => {}
                 }
                 rows_affected = db.changes().max(0) as u64;

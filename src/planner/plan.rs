@@ -94,15 +94,30 @@ pub enum Plan {
     },
     /// A constant single-row source. Columns are filled with the given expressions.
     /// Used for `SELECT 1+1` without a FROM clause.
-    Values { rows: Vec<Vec<Expr>> },
+    Values {
+        rows: Vec<Vec<Expr>>,
+    },
     /// Filter rows by a predicate.
-    Filter { input: Box<Plan>, predicate: Expr },
+    Filter {
+        input: Box<Plan>,
+        predicate: Expr,
+    },
     /// Project columns.
-    Project { input: Box<Plan>, columns: Vec<ProjectExpr> },
+    Project {
+        input: Box<Plan>,
+        columns: Vec<ProjectExpr>,
+    },
     /// Sort rows.
-    Sort { input: Box<Plan>, terms: Vec<OrderTerm> },
+    Sort {
+        input: Box<Plan>,
+        terms: Vec<OrderTerm>,
+    },
     /// Limit rows.
-    Limit { input: Box<Plan>, count: Expr, offset: Expr },
+    Limit {
+        input: Box<Plan>,
+        count: Expr,
+        offset: Expr,
+    },
     /// Aggregate rows (with optional grouping).
     Aggregate {
         input: Box<Plan>,
@@ -149,7 +164,9 @@ pub enum Plan {
         outer_key_col: usize,
     },
     /// Subquery (materialized).
-    Subquery { plan: Box<Plan> },
+    Subquery {
+        plan: Box<Plan>,
+    },
     /// A materialized CTE result (WITH clause). The rows were computed
     /// BEFORE planning (see api.rs's CTE materialization); references to
     /// the CTE name in FROM scan these rows. Recomputed per statement
@@ -159,11 +176,23 @@ pub enum Plan {
         columns: Arc<[String]>,
     },
     /// Distinct.
-    Distinct { input: Box<Plan> },
+    Distinct {
+        input: Box<Plan>,
+    },
     /// Set operations.
-    Union { left: Box<Plan>, right: Box<Plan>, all: bool },
-    Intersect { left: Box<Plan>, right: Box<Plan> },
-    Except { left: Box<Plan>, right: Box<Plan> },
+    Union {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        all: bool,
+    },
+    Intersect {
+        left: Box<Plan>,
+        right: Box<Plan>,
+    },
+    Except {
+        left: Box<Plan>,
+        right: Box<Plan>,
+    },
     /// INSERT / UPDATE / DELETE wrappers.
     Insert {
         table: Arc<Table>,

@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::types::Value;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
-use crate::plugin::{AggregateFunction, AggCtx, AggState, Collation, FnCtx, ScalarFunction};
+use crate::plugin::{AggCtx, AggState, AggregateFunction, Collation, FnCtx, ScalarFunction};
 
 /// Value type codes (SQLite-compatible numbering).
 pub const RQL_INTEGER: c_int = 1;
@@ -89,7 +89,8 @@ pub struct RqlApi {
     // --- aggregates ---
     /// Returns per-group, zero-initialized state memory (allocated once,
     /// freed after xFinal). NULL on allocation failure.
-    pub aggregate_context: unsafe extern "C" fn(ctx: *mut RqlContext, n_bytes: c_int) -> *mut c_void,
+    pub aggregate_context:
+        unsafe extern "C" fn(ctx: *mut RqlContext, n_bytes: c_int) -> *mut c_void,
     // --- registration ---
     pub create_function: unsafe extern "C" fn(
         db: *mut RqlDb,
@@ -97,8 +98,12 @@ pub struct RqlApi {
         n_arg: c_int,
         e_text_rep: c_int,
         p_app: *mut c_void,
-        x_func: Option<unsafe extern "C" fn(ctx: *mut RqlContext, argc: c_int, argv: *mut *mut RqlValue)>,
-        x_step: Option<unsafe extern "C" fn(ctx: *mut RqlContext, argc: c_int, argv: *mut *mut RqlValue)>,
+        x_func: Option<
+            unsafe extern "C" fn(ctx: *mut RqlContext, argc: c_int, argv: *mut *mut RqlValue),
+        >,
+        x_step: Option<
+            unsafe extern "C" fn(ctx: *mut RqlContext, argc: c_int, argv: *mut *mut RqlValue),
+        >,
         x_final: Option<unsafe extern "C" fn(ctx: *mut RqlContext)>,
     ) -> c_int,
     pub create_collation: unsafe extern "C" fn(
@@ -144,18 +149,41 @@ pub struct RqlModule {
     /// `argv`: module name, db name, table name, then user args (SQLite
     /// protocol). Declare columns via `api->declare_vtab`.
     pub x_create: Option<
-        unsafe extern "C" fn(db: *mut RqlDb, p_aux: *mut c_void, argc: c_int, argv: *const *const c_char, pp_vtab: *mut *mut RqlVtab, perr: *mut *mut c_char) -> c_int,
+        unsafe extern "C" fn(
+            db: *mut RqlDb,
+            p_aux: *mut c_void,
+            argc: c_int,
+            argv: *const *const c_char,
+            pp_vtab: *mut *mut RqlVtab,
+            perr: *mut *mut c_char,
+        ) -> c_int,
     >,
     pub x_connect: Option<
-        unsafe extern "C" fn(db: *mut RqlDb, p_aux: *mut c_void, argc: c_int, argv: *const *const c_char, pp_vtab: *mut *mut RqlVtab, perr: *mut *mut c_char) -> c_int,
+        unsafe extern "C" fn(
+            db: *mut RqlDb,
+            p_aux: *mut c_void,
+            argc: c_int,
+            argv: *const *const c_char,
+            pp_vtab: *mut *mut RqlVtab,
+            perr: *mut *mut c_char,
+        ) -> c_int,
     >,
-    pub x_best_index: Option<unsafe extern "C" fn(vtab: *mut RqlVtab, info: *mut RqlIndexInfo) -> c_int>,
+    pub x_best_index:
+        Option<unsafe extern "C" fn(vtab: *mut RqlVtab, info: *mut RqlIndexInfo) -> c_int>,
     pub x_disconnect: Option<unsafe extern "C" fn(vtab: *mut RqlVtab) -> c_int>,
     pub x_destroy: Option<unsafe extern "C" fn(vtab: *mut RqlVtab) -> c_int>,
-    pub x_open: Option<unsafe extern "C" fn(vtab: *mut RqlVtab, pp_cursor: *mut *mut RqlVtabCursor) -> c_int>,
+    pub x_open: Option<
+        unsafe extern "C" fn(vtab: *mut RqlVtab, pp_cursor: *mut *mut RqlVtabCursor) -> c_int,
+    >,
     pub x_close: Option<unsafe extern "C" fn(cursor: *mut RqlVtabCursor) -> c_int>,
     pub x_filter: Option<
-        unsafe extern "C" fn(cursor: *mut RqlVtabCursor, idx_num: c_int, idx_str: *const c_char, argc: c_int, argv: *mut *mut RqlValue) -> c_int,
+        unsafe extern "C" fn(
+            cursor: *mut RqlVtabCursor,
+            idx_num: c_int,
+            idx_str: *const c_char,
+            argc: c_int,
+            argv: *mut *mut RqlValue,
+        ) -> c_int,
     >,
     pub x_next: Option<unsafe extern "C" fn(cursor: *mut RqlVtabCursor) -> c_int>,
     /// Returns 1 at end-of-scan, 0 otherwise.
@@ -163,14 +191,22 @@ pub struct RqlModule {
     /// Reads column `i` into the context: call `api->result_int64(ctx, v)`
     /// / `result_text` / `result_null` from the module (SQLite's
     /// xColumn + sqlite3_result_* model).
-    pub x_column: Option<unsafe extern "C" fn(cursor: *mut RqlVtabCursor, ctx: *mut RqlContext, i: c_int) -> c_int>,
-    pub x_rowid: Option<unsafe extern "C" fn(cursor: *mut RqlVtabCursor, p_rowid: *mut i64) -> c_int>,
+    pub x_column: Option<
+        unsafe extern "C" fn(cursor: *mut RqlVtabCursor, ctx: *mut RqlContext, i: c_int) -> c_int,
+    >,
+    pub x_rowid:
+        Option<unsafe extern "C" fn(cursor: *mut RqlVtabCursor, p_rowid: *mut i64) -> c_int>,
     /// xUpdate protocol (SQLite): argv[0] = old rowid (NULL for insert),
     /// argv[1..n_cols] = new values (NULL = unchanged); empty argv
     /// (argc == 1 with a NULL argv[0] and no columns) = delete. Modules
     /// not providing x_update are read-only.
     pub x_update: Option<
-        unsafe extern "C" fn(vtab: *mut RqlVtab, argc: c_int, argv: *mut *mut RqlValue, p_rowid: *mut i64) -> c_int,
+        unsafe extern "C" fn(
+            vtab: *mut RqlVtab,
+            argc: c_int,
+            argv: *mut *mut RqlValue,
+            p_rowid: *mut i64,
+        ) -> c_int,
     >,
 }
 
@@ -245,6 +281,7 @@ pub(crate) struct CallCtx {
 pub(crate) type ValueHandle = Box<Value>;
 
 /// Convert a `*mut RqlValue` handle into a reference.
+#[cfg(feature = "extension")]
 unsafe fn value_ref(v: *mut RqlValue) -> Option<&'static Value> {
     if v.is_null() {
         return None;
@@ -288,19 +325,27 @@ pub(crate) fn clear_call_ctx() {
 
 // --- results ---
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_result_int64(ctx: *mut RqlContext, v: i64) {
     with_ctx_ptr(ctx, |c| c.out = Some(Value::Integer(v)));
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_result_double(ctx: *mut RqlContext, v: f64) {
     with_ctx_ptr(ctx, |c| c.out = Some(Value::Real(v)));
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_result_text(ctx: *mut RqlContext, s: *const c_char, len: c_int) {
     let bytes = cstr_or_len(s, len);
-    with_ctx_ptr(ctx, |c| c.out = Some(Value::Text(String::from_utf8_lossy(&bytes).into_owned().into())));
+    with_ctx_ptr(ctx, |c| {
+        c.out = Some(Value::Text(
+            String::from_utf8_lossy(&bytes).into_owned().into(),
+        ))
+    });
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_result_blob(ctx: *mut RqlContext, data: *const c_void, len: c_int) {
     let bytes = if data.is_null() || len <= 0 {
         Vec::new()
@@ -310,10 +355,12 @@ unsafe extern "C" fn tramp_result_blob(ctx: *mut RqlContext, data: *const c_void
     with_ctx_ptr(ctx, |c| c.out = Some(Value::Blob(bytes)));
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_result_null(ctx: *mut RqlContext) {
     with_ctx_ptr(ctx, |c| c.out = Some(Value::Null));
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_result_error(ctx: *mut RqlContext, msg: *const c_char, len: c_int) {
     let bytes = cstr_or_len(msg, len);
     with_ctx_ptr(ctx, |c| {
@@ -332,6 +379,7 @@ fn with_ctx_ptr<R>(ctx: *mut RqlContext, f: impl FnOnce(&mut CallCtx) -> R) -> O
 
 // --- value access ---
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_value_type(v: *mut RqlValue) -> c_int {
     match value_ref(v) {
         Some(Value::Null) | None => RQL_NULL,
@@ -342,14 +390,17 @@ unsafe extern "C" fn tramp_value_type(v: *mut RqlValue) -> c_int {
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_value_int64(v: *mut RqlValue) -> i64 {
     value_ref(v).map(|val| val.as_integer()).unwrap_or(0)
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_value_double(v: *mut RqlValue) -> f64 {
     value_ref(v).map(|val| val.as_real()).unwrap_or(0.0)
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_value_text(v: *mut RqlValue, plen: *mut c_int) -> *const c_char {
     match value_ref(v) {
         Some(Value::Text(t)) => {
@@ -406,6 +457,7 @@ pub(crate) fn free_detached_text() {
     });
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_value_blob(v: *mut RqlValue, plen: *mut c_int) -> *const c_void {
     match value_ref(v) {
         Some(Value::Blob(b)) => {
@@ -423,9 +475,10 @@ unsafe extern "C" fn tramp_value_blob(v: *mut RqlValue, plen: *mut c_int) -> *co
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_value_bytes(v: *mut RqlValue) -> c_int {
     match value_ref(v) {
-        Some(Value::Text(t)) => t.as_str().as_bytes().len() as c_int,
+        Some(Value::Text(t)) => t.as_str().len() as c_int,
         Some(Value::Blob(b)) => b.len() as c_int,
         _ => 0,
     }
@@ -441,7 +494,12 @@ unsafe extern "C" fn tramp_aggregate_context(ctx: *mut RqlContext, n_bytes: c_in
                 if n_bytes <= 0 {
                     return std::ptr::null_mut();
                 }
-                let p = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(n_bytes as usize, 8)) };
+                let p = unsafe {
+                    std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+                        n_bytes as usize,
+                        8,
+                    ))
+                };
                 c.agg_mem = Some(p);
                 c.agg_len = n_bytes as usize;
                 p as *mut c_void
@@ -451,6 +509,7 @@ unsafe extern "C" fn tramp_aggregate_context(ctx: *mut RqlContext, n_bytes: c_in
     .unwrap_or(std::ptr::null_mut())
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_malloc(n: usize) -> *mut c_void {
     // 16-byte header before the returned pointer stores the allocation
     // size; tramp_free recovers it.
@@ -478,12 +537,14 @@ unsafe extern "C" fn tramp_free(p: *mut c_void) {
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
 // --- registration trampolines (forwarded into crate::ffi) ---
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_create_function(
     db: *mut RqlDb,
     name: *const c_char,
@@ -507,7 +568,9 @@ unsafe extern "C" fn tramp_create_function(
     } else if let (Some(xs), Some(xfin)) = (x_step, x_final) {
         crate::ffi::register_c_aggregate(db_ref, &name, n_arg, p_app, xs, xfin)
     } else {
-        Err(Error::semantic("create_function requires xFunc or xStep+xFinal"))
+        Err(Error::semantic(
+            "create_function requires xFunc or xStep+xFinal",
+        ))
     };
     match res {
         Ok(()) => RQL_OK,
@@ -515,11 +578,18 @@ unsafe extern "C" fn tramp_create_function(
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_create_collation(
     db: *mut RqlDb,
     name: *const c_char,
     p_app: *mut c_void,
-    x_compare: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+    x_compare: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *const c_void,
+        c_int,
+        *const c_void,
+    ) -> c_int,
 ) -> c_int {
     let name = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(s) => s.to_string(),
@@ -535,6 +605,7 @@ unsafe extern "C" fn tramp_create_collation(
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_create_module(
     db: *mut RqlDb,
     name: *const c_char,
@@ -564,6 +635,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_declare_vtab(_db: *mut RqlDb, sql: *const c_char) -> c_int {
     let sql = match unsafe { CStr::from_ptr(sql) }.to_str() {
         Ok(s) => s,
@@ -571,7 +643,10 @@ unsafe extern "C" fn tramp_declare_vtab(_db: *mut RqlDb, sql: *const c_char) -> 
     };
     // Parse "CREATE TABLE x(a INT, b TEXT)" and record the columns.
     match crate::sql::parse(sql) {
-        Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table { columns, .. })) => {
+        Ok(crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+            columns,
+            ..
+        })) => {
             let cols: Vec<(String, String)> = columns
                 .iter()
                 .map(|c| (c.name.clone(), c.type_name.clone()))
@@ -583,6 +658,7 @@ unsafe extern "C" fn tramp_declare_vtab(_db: *mut RqlDb, sql: *const c_char) -> 
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_exec(db: *mut RqlDb, sql: *const c_char) -> c_int {
     let sql = match unsafe { CStr::from_ptr(sql) }.to_str() {
         Ok(s) => s,
@@ -594,6 +670,7 @@ unsafe extern "C" fn tramp_exec(db: *mut RqlDb, sql: *const c_char) -> c_int {
     }
 }
 
+#[cfg(feature = "extension")]
 unsafe extern "C" fn tramp_errmsg(db: *mut RqlDb) -> *const c_char {
     crate::ffi::errmsg_ptr(db)
 }
@@ -602,11 +679,13 @@ unsafe extern "C" fn tramp_errmsg(db: *mut RqlDb) -> *const c_char {
 /// receive in `rustqlite_extension_init` (SQLite's contract: the routines
 /// pointer stays valid), so the table must be leaked ONCE — a stack local
 /// would dangle after `load_extension` returns.
+#[cfg(feature = "extension")]
 pub(crate) fn api_table() -> &'static RqlApi {
     static TABLE: std::sync::OnceLock<&'static RqlApi> = std::sync::OnceLock::new();
-    *TABLE.get_or_init(|| Box::leak(Box::new(build_api_table())))
+    TABLE.get_or_init(|| Box::leak(Box::new(build_api_table())))
 }
 
+#[cfg(feature = "extension")]
 fn build_api_table() -> RqlApi {
     RqlApi {
         version: 1,
@@ -690,7 +769,10 @@ impl ScalarFunction for CScalar {
     fn call(&self, _ctx: &FnCtx, args: &[Value]) -> Result<Value> {
         // Box the argument values into handles.
         let handles: Vec<Box<Value>> = args.iter().cloned().map(Box::new).collect();
-        let mut argv: Vec<*mut RqlValue> = handles.iter().map(|h| h.as_ref() as *const Value as *mut RqlValue).collect();
+        let mut argv: Vec<*mut RqlValue> = handles
+            .iter()
+            .map(|h| h.as_ref() as *const Value as *mut RqlValue)
+            .collect();
         let mut call = CallCtx {
             out: None,
             err: None,
@@ -701,7 +783,13 @@ impl ScalarFunction for CScalar {
         };
         let call_ptr = &mut call as *mut CallCtx;
         set_call_ctx(call_ptr);
-        unsafe { (self.x_func)(call_ptr as *mut RqlContext, argv.len() as c_int, argv.as_mut_ptr()) };
+        unsafe {
+            (self.x_func)(
+                call_ptr as *mut RqlContext,
+                argv.len() as c_int,
+                argv.as_mut_ptr(),
+            )
+        };
         clear_call_ctx();
         // Free text pointers handed out during the call.
         for p in call.leaked.drain(..) {
@@ -760,8 +848,10 @@ struct CAggState {
 impl AggState for CAggState {
     fn step(&mut self, _ctx: &AggCtx, args: &[Value]) -> Result<()> {
         let handles: Vec<Box<Value>> = args.iter().cloned().map(Box::new).collect();
-        let mut argv: Vec<*mut RqlValue> =
-            handles.iter().map(|h| h.as_ref() as *const Value as *mut RqlValue).collect();
+        let mut argv: Vec<*mut RqlValue> = handles
+            .iter()
+            .map(|h| h.as_ref() as *const Value as *mut RqlValue)
+            .collect();
         let mut call = CallCtx {
             out: None,
             err: None,
@@ -772,7 +862,13 @@ impl AggState for CAggState {
         };
         let call_ptr = &mut call as *mut CallCtx;
         set_call_ctx(call_ptr);
-        unsafe { (self.x_step)(call_ptr as *mut RqlContext, argv.len() as c_int, argv.as_mut_ptr()) };
+        unsafe {
+            (self.x_step)(
+                call_ptr as *mut RqlContext,
+                argv.len() as c_int,
+                argv.as_mut_ptr(),
+            )
+        };
         clear_call_ctx();
         for p in call.leaked.drain(..) {
             unsafe { drop(CString::from_raw(p as *mut c_char)) };
@@ -824,7 +920,8 @@ impl Drop for CAggState {
 pub struct CCollation {
     pub name: String,
     pub app: *mut c_void,
-    pub x_compare: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+    pub x_compare:
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
 }
 
 impl Collation for CCollation {
@@ -860,13 +957,14 @@ pub(crate) fn load_extension(
     use libloading::{Library, Symbol};
 
     unsafe {
-        let library = Library::new(path)
-            .map_err(|e| Error::runtime(format!("load_extension: {}", e)))?;
+        let library =
+            Library::new(path).map_err(|e| Error::runtime(format!("load_extension: {}", e)))?;
         let entry_name = entry.unwrap_or("rustqlite_extension_init");
-        let init: Symbol<unsafe extern "C" fn(*const RqlApi, *mut RqlDb, *mut *mut c_char) -> c_int> =
-            library
-                .get(entry_name.as_bytes())
-                .map_err(|e| Error::runtime(format!("load_extension: entry point {}: {}", entry_name, e)))?;
+        let init: Symbol<
+            unsafe extern "C" fn(*const RqlApi, *mut RqlDb, *mut *mut c_char) -> c_int,
+        > = library.get(entry_name.as_bytes()).map_err(|e| {
+            Error::runtime(format!("load_extension: entry point {}: {}", entry_name, e))
+        })?;
 
         // The connection handle for the extension = the raw Database
         // pointer (valid for the duration of load_extension's &mut borrow).
@@ -892,17 +990,6 @@ pub(crate) fn load_extension(
         std::mem::forget(library);
     }
     Ok(())
-}
-
-#[cfg(not(feature = "extension"))]
-pub(crate) fn load_extension(
-    _db: &mut crate::api::Database,
-    _path: &std::path::Path,
-    _entry: Option<&str>,
-) -> Result<()> {
-    Err(Error::Unsupported(
-        "extension loading requires the `extension` cargo feature",
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +1043,7 @@ impl CVtabModule {
         } else {
             m.x_create.or(m.x_connect)
         };
-        let f = f.ok_or_else(|| Error::Unsupported("vtab module has no xCreate"))?;
+        let f = f.ok_or(Error::Unsupported("vtab module has no xCreate"))?;
         // argv: module name, db name (path), table name, then user args.
         let mut argv_owned: Vec<CString> = Vec::with_capacity(3 + args.len());
         argv_owned.push(CString::new(self.name.clone()).unwrap());
@@ -981,7 +1068,9 @@ impl CVtabModule {
             )
         };
         if !err.is_null() {
-            let msg = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+            let msg = unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned();
             unsafe { tramp_free(err as *mut c_void) };
             if rc != RQL_OK {
                 return Err(Error::runtime(msg));
@@ -1034,8 +1123,13 @@ impl crate::plugin::VirtualTableModule for CVtabModule {
         }))
     }
 
-    fn connect(&self, table: &str, args: &[String]) -> Result<Box<dyn crate::plugin::VirtualTable>> {
-        self.is_connect.store(true, std::sync::atomic::Ordering::Release);
+    fn connect(
+        &self,
+        table: &str,
+        args: &[String],
+    ) -> Result<Box<dyn crate::plugin::VirtualTable>> {
+        self.is_connect
+            .store(true, std::sync::atomic::Ordering::Release);
         let db = current_db_thread();
         if db.is_null() {
             return Err(Error::runtime(
@@ -1099,7 +1193,9 @@ impl CVtab {
         if rc != RQL_OK {
             let msg = unsafe {
                 if !(*self.vtab_ptr).z_err_msg.is_null() {
-                    let m = CStr::from_ptr((*self.vtab_ptr).z_err_msg).to_string_lossy().into_owned();
+                    let m = CStr::from_ptr((*self.vtab_ptr).z_err_msg)
+                        .to_string_lossy()
+                        .into_owned();
                     tramp_free((*self.vtab_ptr).z_err_msg as *mut c_void);
                     (*self.vtab_ptr).z_err_msg = std::ptr::null_mut();
                     m
@@ -1118,7 +1214,10 @@ impl crate::plugin::VirtualTable for CVtab {
         self.columns.clone()
     }
 
-    fn best_index(&self, constraints: &[crate::plugin::vtab::VtabConstraint]) -> Result<crate::plugin::vtab::IndexInfo> {
+    fn best_index(
+        &self,
+        constraints: &[crate::plugin::vtab::VtabConstraint],
+    ) -> Result<crate::plugin::vtab::IndexInfo> {
         let m = unsafe { &*self.module.0 };
         let Some(xb) = m.x_best_index else {
             return Ok(crate::plugin::vtab::IndexInfo::full_scan(constraints.len()));
@@ -1146,7 +1245,6 @@ impl crate::plugin::VirtualTable for CVtab {
             .collect();
         let mut usage: Vec<u8> = vec![0; c_constraints.len()];
         let _ = &mut usage;
-        let idx_str: *mut c_char;
         let mut info = RqlIndexInfo {
             n_constraint: c_constraints.len() as c_int,
             a_constraint: c_constraints.as_ptr(),
@@ -1157,14 +1255,18 @@ impl crate::plugin::VirtualTable for CVtab {
             estimated_rows: 0,
         };
         let rc = unsafe { xb(self.vtab_ptr, &mut info as *mut RqlIndexInfo) };
-        idx_str = info.idx_str;
+        let idx_str = info.idx_str;
         let mut out = crate::plugin::vtab::IndexInfo::full_scan(constraints.len());
         out.idx_num = info.idx_num as usize;
         out.estimated_cost = info.estimated_cost;
         out.estimated_rows = info.estimated_rows;
         out.handled = usage.into_iter().map(|u| u != 0).collect();
         if !idx_str.is_null() {
-            out.idx_str = Some(unsafe { CStr::from_ptr(idx_str) }.to_string_lossy().into_owned());
+            out.idx_str = Some(
+                unsafe { CStr::from_ptr(idx_str) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             unsafe { tramp_free(idx_str as *mut c_void) };
         }
         self.with_err(rc)?;
@@ -1208,8 +1310,10 @@ impl crate::plugin::VirtualTable for CVtab {
                 .into_iter()
                 .map(|v| Box::new(v.unwrap_or(Value::Null)))
                 .collect();
-            let mut argv: Vec<*mut RqlValue> =
-                handles.iter().map(|h| h.as_ref() as *const Value as *mut RqlValue).collect();
+            let mut argv: Vec<*mut RqlValue> = handles
+                .iter()
+                .map(|h| h.as_ref() as *const Value as *mut RqlValue)
+                .collect();
             // For DELETE SQLite passes argc == 1 with a non-NULL rowid.
             let argc = if op.columns.is_empty() && op.old_rowid.is_some() {
                 1
@@ -1217,9 +1321,20 @@ impl crate::plugin::VirtualTable for CVtab {
                 argv.len()
             };
             let mut rowid_out: i64 = 0;
-            let rc = unsafe { xu(self.vtab_ptr, argc as c_int, argv.as_mut_ptr(), &mut rowid_out) };
+            let rc = unsafe {
+                xu(
+                    self.vtab_ptr,
+                    argc as c_int,
+                    argv.as_mut_ptr(),
+                    &mut rowid_out,
+                )
+            };
             self.with_err(rc)?;
-            out_rowids.push(if op.old_rowid.is_none() { Some(rowid_out) } else { None });
+            out_rowids.push(if op.old_rowid.is_none() {
+                Some(rowid_out)
+            } else {
+                None
+            });
         }
         Ok(out_rowids)
     }
@@ -1242,25 +1357,25 @@ struct CCursor {
 }
 
 impl crate::plugin::VirtualTableCursor for CCursor {
-    fn filter(
-        &mut self,
-        idx_num: usize,
-        idx_str: Option<&str>,
-        args: &[Value],
-    ) -> Result<()> {
+    fn filter(&mut self, idx_num: usize, idx_str: Option<&str>, args: &[Value]) -> Result<()> {
         let m = unsafe { &*self.module.0 };
         let Some(xf) = m.x_filter else {
             return Err(Error::Unsupported("vtab module has no xFilter"));
         };
         let idx_c = idx_str.map(|s| CString::new(s.as_bytes().to_vec()).unwrap());
         let handles: Vec<Box<Value>> = args.iter().cloned().map(Box::new).collect();
-        let mut argv: Vec<*mut RqlValue> =
-            handles.iter().map(|h| h.as_ref() as *const Value as *mut RqlValue).collect();
+        let mut argv: Vec<*mut RqlValue> = handles
+            .iter()
+            .map(|h| h.as_ref() as *const Value as *mut RqlValue)
+            .collect();
         let rc = unsafe {
             xf(
                 self.cursor_ptr,
                 idx_num as c_int,
-                idx_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+                idx_c
+                    .as_ref()
+                    .map(|c| c.as_ptr())
+                    .unwrap_or(std::ptr::null()),
                 argv.len() as c_int,
                 argv.as_mut_ptr(),
             )
@@ -1270,7 +1385,9 @@ impl crate::plugin::VirtualTableCursor for CCursor {
         if rc != RQL_OK {
             let msg = unsafe {
                 if !(*self.vtab_ptr).z_err_msg.is_null() {
-                    let m = CStr::from_ptr((*self.vtab_ptr).z_err_msg).to_string_lossy().into_owned();
+                    let m = CStr::from_ptr((*self.vtab_ptr).z_err_msg)
+                        .to_string_lossy()
+                        .into_owned();
                     tramp_free((*self.vtab_ptr).z_err_msg as *mut c_void);
                     (*self.vtab_ptr).z_err_msg = std::ptr::null_mut();
                     m
@@ -1289,7 +1406,9 @@ impl crate::plugin::VirtualTableCursor for CCursor {
         if rc != RQL_OK {
             let msg = unsafe {
                 if !(*self.vtab_ptr).z_err_msg.is_null() {
-                    let m = CStr::from_ptr((*self.vtab_ptr).z_err_msg).to_string_lossy().into_owned();
+                    let m = CStr::from_ptr((*self.vtab_ptr).z_err_msg)
+                        .to_string_lossy()
+                        .into_owned();
                     tramp_free((*self.vtab_ptr).z_err_msg as *mut c_void);
                     (*self.vtab_ptr).z_err_msg = std::ptr::null_mut();
                     m
@@ -1413,38 +1532,50 @@ pub fn api_result_null(ctx: *mut RqlContext) {
 }
 
 /// `sqlite3_result_text` (len < 0 = NUL-terminated).
-pub fn api_result_text(ctx: *mut RqlContext, s: *const c_char, len: c_int) {
-    #[allow(unused_unsafe)]
-    unsafe {
+///
+/// # Safety
+///
+/// `ctx` must be a pointer handed out by this engine's plugin bridge
+/// (an `RqlContext` backing a live function/aggregate call), and `s` (with
+/// `len`) must be a valid readable buffer for the duration of the call —
+/// the C-ABI contract of `sqlite3_result_text`.
+pub unsafe fn api_result_text(ctx: *mut RqlContext, s: *const c_char, len: c_int) {
     let bytes = cstr_or_len(s, len);
     let _ = with_ctx_ptr(ctx, |c| {
-        c.out = Some(Value::Text(String::from_utf8_lossy(&bytes).into_owned().into()))
+        c.out = Some(Value::Text(
+            String::from_utf8_lossy(&bytes).into_owned().into(),
+        ))
     });
-    }
 }
 
 /// `sqlite3_result_blob`.
-pub fn api_result_blob(ctx: *mut RqlContext, data: *const c_void, len: c_int) {
-    #[allow(unused_unsafe)]
-    unsafe {
+///
+/// # Safety
+///
+/// `ctx` must be a pointer handed out by this engine's plugin bridge, and
+/// `data` (with `len > 0`) must be a valid readable buffer for the
+/// duration of the call — the C-ABI contract of `sqlite3_result_blob`.
+pub unsafe fn api_result_blob(ctx: *mut RqlContext, data: *const c_void, len: c_int) {
     let bytes = if data.is_null() || len <= 0 {
         Vec::new()
     } else {
         std::slice::from_raw_parts(data as *const u8, len as usize).to_vec()
     };
     let _ = with_ctx_ptr(ctx, |c| c.out = Some(Value::Blob(bytes)));
-    }
 }
 
 /// `sqlite3_result_error`.
-pub fn api_result_error(ctx: *mut RqlContext, msg: *const c_char, len: c_int) {
-    #[allow(unused_unsafe)]
-    unsafe {
+///
+/// # Safety
+///
+/// `ctx` must be a pointer handed out by this engine's plugin bridge, and
+/// `msg` (with `len`) must be a valid readable buffer for the duration of
+/// the call — the C-ABI contract of `sqlite3_result_error`.
+pub unsafe fn api_result_error(ctx: *mut RqlContext, msg: *const c_char, len: c_int) {
     let bytes = cstr_or_len(msg, len);
     let _ = with_ctx_ptr(ctx, |c| {
         c.err = Some(String::from_utf8_lossy(&bytes).into_owned())
     });
-    }
 }
 
 /// `sqlite3_user_data` — the p_app pointer registered with the function.
@@ -1453,6 +1584,12 @@ pub fn api_user_data(ctx: *mut RqlContext) -> *mut c_void {
 }
 
 /// `sqlite3_aggregate_context` — plugin-managed scratch memory.
-pub fn api_aggregate_context(ctx: *mut RqlContext, n_bytes: c_int) -> *mut c_void {
-    unsafe { tramp_aggregate_context(ctx, n_bytes) }
+///
+/// # Safety
+///
+/// `ctx` must be a pointer handed out by this engine's plugin bridge
+/// (an `RqlContext` backing a live aggregate step/final call) — the
+/// C-ABI contract of `sqlite3_aggregate_context`.
+pub unsafe fn api_aggregate_context(ctx: *mut RqlContext, n_bytes: c_int) -> *mut c_void {
+    tramp_aggregate_context(ctx, n_bytes)
 }

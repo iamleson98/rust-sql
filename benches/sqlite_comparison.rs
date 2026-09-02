@@ -11,13 +11,13 @@
 //! Output is printed to stdout with a final summary table.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use parking_lot::RwLock;
 use rusqlite::params;
 use rustqlite::{Database, Value};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 // ============================================================
 // Setup helpers
@@ -27,13 +27,18 @@ const N_ROWS: i64 = 10_000;
 
 fn setup_rusqlite(n: i64) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     conn.execute("BEGIN", []).unwrap();
     for i in 1..=n {
         conn.execute(
             "INSERT INTO t (name, val) VALUES (?1, ?2)",
             params![format!("name{}", i), i * 2],
-        ).unwrap();
+        )
+        .unwrap();
     }
     conn.execute("COMMIT", []).unwrap();
     conn
@@ -41,7 +46,11 @@ fn setup_rusqlite(n: i64) -> rusqlite::Connection {
 
 fn setup_rustqlite(n: i64) -> Database {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=n {
         let sql = format!("INSERT INTO t (name, val) VALUES ('name{}', {})", i, i * 2);
@@ -53,14 +62,24 @@ fn setup_rustqlite(n: i64) -> Database {
 
 fn setup_rusqlite_join(left: i64, right: i64) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, y INTEGER)", []).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
     conn.execute("BEGIN", []).unwrap();
     for i in 1..=left {
-        conn.execute("INSERT INTO a (x) VALUES (?1)", params![i]).unwrap();
+        conn.execute("INSERT INTO a (x) VALUES (?1)", params![i])
+            .unwrap();
     }
     for i in 1..=right {
-        conn.execute("INSERT INTO b (a_id, y) VALUES (?1, ?2)", params![(i % left) + 1, i]).unwrap();
+        conn.execute(
+            "INSERT INTO b (a_id, y) VALUES (?1, ?2)",
+            params![(i % left) + 1, i],
+        )
+        .unwrap();
     }
     conn.execute("COMMIT", []).unwrap();
     conn
@@ -68,8 +87,13 @@ fn setup_rusqlite_join(left: i64, right: i64) -> rusqlite::Connection {
 
 fn setup_rustqlite_join(left: i64, right: i64) -> Database {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, y INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=left {
         let sql = format!("INSERT INTO a (x) VALUES ({})", i);
@@ -96,7 +120,11 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let mut db = Database::open_in_memory().unwrap();
-                db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+                db.execute(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                    [],
+                )
+                .unwrap();
                 db
             },
             |mut db| {
@@ -113,7 +141,11 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let mut db = Database::open_in_memory().unwrap();
-                db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+                db.execute(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                    [],
+                )
+                .unwrap();
                 db
             },
             |mut db| {
@@ -132,7 +164,11 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let conn = rusqlite::Connection::open_in_memory().unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+                conn.execute(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                    [],
+                )
+                .unwrap();
                 conn
             },
             |conn| {
@@ -140,7 +176,8 @@ fn bench_insert(c: &mut Criterion) {
                     conn.execute(
                         "INSERT INTO t (name, val) VALUES (?1, ?2)",
                         params![format!("name{}", i), i],
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
             },
         )
@@ -151,7 +188,11 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let conn = rusqlite::Connection::open_in_memory().unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", []).unwrap();
+                conn.execute(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+                    [],
+                )
+                .unwrap();
                 conn
             },
             |conn| {
@@ -160,7 +201,8 @@ fn bench_insert(c: &mut Criterion) {
                     conn.execute(
                         "INSERT INTO t (name, val) VALUES (?1, ?2)",
                         params![format!("name{}", i), i],
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
                 conn.execute("COMMIT", []).unwrap();
             },
@@ -181,10 +223,9 @@ fn bench_point_lookup(c: &mut Criterion) {
     let db = setup_rustqlite(N_ROWS);
     group.bench_function("rustqlite", |b| {
         b.iter(|| {
-            let rows = db.query(
-                "SELECT name, val FROM t WHERE id = 500",
-                [],
-            ).unwrap();
+            let rows = db
+                .query("SELECT name, val FROM t WHERE id = 500", [])
+                .unwrap();
             let _ = black_box(rows);
         })
     });
@@ -192,7 +233,9 @@ fn bench_point_lookup(c: &mut Criterion) {
     let conn = setup_rusqlite(N_ROWS);
     group.bench_function("rusqlite_prepared", |b| {
         b.iter(|| {
-            let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, val FROM t WHERE id = ?1")
+                .unwrap();
             let mut rows = stmt.query(params![black_box(500)]).unwrap();
             while rows.next().unwrap().is_some() {}
         })
@@ -212,10 +255,9 @@ fn bench_range_scan(c: &mut Criterion) {
     let db = setup_rustqlite(N_ROWS);
     group.bench_function("rustqlite_100_rows", |b| {
         b.iter(|| {
-            let rows = db.query(
-                "SELECT name, val FROM t WHERE id BETWEEN 1 AND 100",
-                [],
-            ).unwrap();
+            let rows = db
+                .query("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100", [])
+                .unwrap();
             let _ = black_box(rows);
         })
     });
@@ -223,7 +265,9 @@ fn bench_range_scan(c: &mut Criterion) {
     let conn = setup_rusqlite(N_ROWS);
     group.bench_function("rusqlite_100_rows", |b| {
         b.iter(|| {
-            let mut stmt = conn.prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100")
+                .unwrap();
             let mut rows = stmt.query([]).unwrap();
             while rows.next().unwrap().is_some() {}
         })
@@ -271,10 +315,12 @@ fn bench_join(c: &mut Criterion) {
     let db = setup_rustqlite_join(1000, 1000);
     group.bench_function("rustqlite_inner_join", |b| {
         b.iter(|| {
-            let rows = db.query(
-                "SELECT a.id, a.x, b.id, b.y FROM a INNER JOIN b ON a.id = b.a_id LIMIT 1000",
-                [],
-            ).unwrap();
+            let rows = db
+                .query(
+                    "SELECT a.id, a.x, b.id, b.y FROM a INNER JOIN b ON a.id = b.a_id LIMIT 1000",
+                    [],
+                )
+                .unwrap();
             let _ = black_box(rows);
         })
     });
@@ -282,9 +328,11 @@ fn bench_join(c: &mut Criterion) {
     let conn = setup_rusqlite_join(1000, 1000);
     group.bench_function("rusqlite_inner_join", |b| {
         b.iter(|| {
-            let mut stmt = conn.prepare(
-                "SELECT a.id, a.x, b.id, b.y FROM a INNER JOIN b ON a.id = b.a_id LIMIT 1000"
-            ).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.id, a.x, b.id, b.y FROM a INNER JOIN b ON a.id = b.a_id LIMIT 1000",
+                )
+                .unwrap();
             let mut rows = stmt.query([]).unwrap();
             while rows.next().unwrap().is_some() {}
         })
@@ -362,7 +410,9 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
                             let id = (i % N_ROWS as usize) as i64 + 1;
                             {
                                 let guard = conn.lock().unwrap();
-                                let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
+                                let mut stmt = guard
+                                    .prepare("SELECT name, val FROM t WHERE id = ?1")
+                                    .unwrap();
                                 let mut rows = stmt.query(params![id]).unwrap();
                                 while rows.next().unwrap().is_some() {}
                             }
@@ -409,7 +459,11 @@ fn bench_mixed_rw(c: &mut Criterion) {
                             let mut guard = db.write();
                             let _ = guard.execute(
                                 "INSERT INTO t (id, name, val) VALUES (?, ?, ?)",
-                                [Value::Integer(id), Value::Text(format!("new{i}").into()), Value::Integer(i)],
+                                [
+                                    Value::Integer(id),
+                                    Value::Text(format!("new{i}").into()),
+                                    Value::Integer(i),
+                                ],
                             );
                             drop(guard);
                         }
@@ -472,7 +526,9 @@ fn bench_mixed_rw(c: &mut Criterion) {
                             let id = (i % N_ROWS as usize) as i64 + 1;
                             {
                                 let guard = conn.lock().unwrap();
-                                let mut stmt = guard.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
+                                let mut stmt = guard
+                                    .prepare("SELECT name, val FROM t WHERE id = ?1")
+                                    .unwrap();
                                 let mut rows = stmt.query(params![id]).unwrap();
                                 while rows.next().unwrap().is_some() {}
                             }

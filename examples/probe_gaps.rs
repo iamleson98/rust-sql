@@ -3,12 +3,18 @@ fn main() {
     let mut db = Database::open_in_memory().unwrap();
     // 1. UPDATE ... FROM
     println!("--- UPDATE FROM ---");
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
-    db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
-    db.execute("INSERT INTO t VALUES (1,'old'),(2,'keep')", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'old'),(2,'keep')", [])
+        .unwrap();
     db.execute("INSERT INTO src VALUES (1,'new')", []).unwrap();
     match db.execute("UPDATE t SET v = src.v FROM src WHERE t.id = src.id", []) {
-        Ok(_) => println!("UPDATE FROM: OK, v={:?}", db.query("SELECT v FROM t ORDER BY id", []).unwrap()),
+        Ok(_) => println!(
+            "UPDATE FROM: OK, v={:?}",
+            db.query("SELECT v FROM t ORDER BY id", []).unwrap()
+        ),
         Err(e) => println!("UPDATE FROM: FAIL {}", e),
     }
     // 2. NOCASE in index + comparison
@@ -32,16 +38,23 @@ fn main() {
     }
     // 4. UNIQUE + NOCASE conflict
     println!("--- UNIQUE NOCASE ---");
-    db.execute("CREATE TABLE u (name TEXT UNIQUE COLLATE NOCASE)", []).unwrap();
+    db.execute("CREATE TABLE u (name TEXT UNIQUE COLLATE NOCASE)", [])
+        .unwrap();
     db.execute("INSERT INTO u VALUES ('Alice')", []).unwrap();
     match db.execute("INSERT INTO u VALUES ('ALICE')", []) {
         Ok(_) => println!("UNIQUE NOCASE: ACCEPTED (BUG - should conflict)"),
-        Err(e) => println!("UNIQUE NOCASE: conflict raised ({:?})", e.to_string().chars().take(80).collect::<String>()),
+        Err(e) => println!(
+            "UNIQUE NOCASE: conflict raised ({:?})",
+            e.to_string().chars().take(80).collect::<String>()
+        ),
     }
     // 5. sqlite_master via SQL
     println!("--- sqlite_master ---");
     match db.query("SELECT name, type FROM sqlite_master ORDER BY name", []) {
-        Ok(r) => println!("sqlite_master: {:?}", r.iter().map(|row| format!("{:?}", row)).collect::<Vec<_>>()),
+        Ok(r) => println!(
+            "sqlite_master: {:?}",
+            r.iter().map(|row| format!("{:?}", row)).collect::<Vec<_>>()
+        ),
         Err(e) => println!("sqlite_master: FAIL {}", e),
     }
     match db.query("SELECT type FROM sqlite_temp_master", []) {
@@ -102,17 +115,18 @@ fn main() {
     // 14. view support
     println!("--- views ---");
     match db.execute("CREATE VIEW vv AS SELECT id FROM t", []) {
-        Ok(_) => {
-            match db.query("SELECT * FROM vv", []) {
-                Ok(_) => println!("CREATE VIEW + query: OK"),
-                Err(e) => println!("view query: FAIL {}", e),
-            }
+        Ok(_) => match db.query("SELECT * FROM vv", []) {
+            Ok(_) => println!("CREATE VIEW + query: OK"),
+            Err(e) => println!("view query: FAIL {}", e),
         },
         Err(e) => println!("CREATE VIEW: FAIL {}", e),
     }
     // 15. trigger support
     println!("--- triggers ---");
-    match db.execute("CREATE TRIGGER tg AFTER INSERT ON t BEGIN UPDATE u SET name = name; END", []) {
+    match db.execute(
+        "CREATE TRIGGER tg AFTER INSERT ON t BEGIN UPDATE u SET name = name; END",
+        [],
+    ) {
         Ok(_) => println!("CREATE TRIGGER: OK"),
         Err(e) => println!("CREATE TRIGGER: FAIL {}", e),
     }

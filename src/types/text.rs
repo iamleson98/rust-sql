@@ -74,7 +74,9 @@ impl Text {
             let mut buf = [0u8; 24];
             buf[..bytes.len()].copy_from_slice(bytes);
             buf[23] = bytes.len() as u8;
-            Text { repr: Repr { inline: buf } }
+            Text {
+                repr: Repr { inline: buf },
+            }
         } else {
             Text::from_bytes_heap(bytes)
         }
@@ -220,7 +222,9 @@ impl Text {
         if self.is_inline() {
             // SAFETY: reading the u8 view of the union is always valid.
             let buf = unsafe { self.repr.inline };
-            Text { repr: Repr { inline: buf } }
+            Text {
+                repr: Repr { inline: buf },
+            }
         } else {
             Text::from_bytes_heap(self.as_bytes())
         }
@@ -402,7 +406,9 @@ impl Text {
             buf[..a.len()].copy_from_slice(a.as_bytes());
             buf[a.len()..a.len() + b.len()].copy_from_slice(b.as_bytes());
             buf[23] = (a.len() + b.len()) as u8;
-            Text { repr: Repr { inline: buf } }
+            Text {
+                repr: Repr { inline: buf },
+            }
         } else {
             let mut s = String::with_capacity(a.len() + b.len());
             s.push_str(a);
@@ -634,7 +640,8 @@ mod tests {
         assert!(t.is_inline());
         assert_eq!(t.as_str(), "short");
 
-        let owned_long = "a fairly long string that definitely overflows the inline capacity".to_string();
+        let owned_long =
+            "a fairly long string that definitely overflows the inline capacity".to_string();
         let t2 = Text::from(owned_long.clone());
         assert!(!t2.is_inline());
         assert_eq!(t2.as_str(), owned_long);

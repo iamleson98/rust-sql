@@ -389,7 +389,7 @@ impl Encode<'_, Rustqlite> for i64 {
 
 impl Decode<'_, Rustqlite> for i64 {
     fn decode(value: RustqliteValueRef<'_>) -> Result<Self, BoxDynError> {
-        Ok(value.int64()?)
+        value.int64()
     }
 }
 
@@ -514,7 +514,7 @@ impl Encode<'_, Rustqlite> for f64 {
 
 impl Decode<'_, Rustqlite> for f64 {
     fn decode(value: RustqliteValueRef<'_>) -> Result<Self, BoxDynError> {
-        Ok(value.double()?)
+        value.double()
     }
 }
 

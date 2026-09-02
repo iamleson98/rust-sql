@@ -14,7 +14,12 @@ use std::sync::Arc;
 
 /// One conjunct of a WHERE clause (an AND-chain element).
 fn split_conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
-    if let Expr::Binary { op: BinaryOp::And, left, right } = e {
+    if let Expr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = e
+    {
         split_conjuncts(left, out);
         split_conjuncts(right, out);
     } else {
@@ -25,11 +30,16 @@ fn split_conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
 /// Rebuild an AND-chain from owned conjuncts.
 fn rebuild_and(mut conjuncts: Vec<Expr>) -> Option<Expr> {
     let first = conjuncts.pop()?;
-    Some(conjuncts.into_iter().rev().fold(first, |acc, e| Expr::Binary {
-        op: BinaryOp::And,
-        left: Box::new(e),
-        right: Box::new(acc),
-    }))
+    Some(
+        conjuncts
+            .into_iter()
+            .rev()
+            .fold(first, |acc, e| Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(e),
+                right: Box::new(acc),
+            }),
+    )
 }
 
 /// Extract vtab constraints from a predicate: conjuncts of the shape
@@ -57,7 +67,9 @@ fn extract_constraints(
                     expr: (**right).clone(),
                 });
                 matched = true;
-            } else if let (Some(col), Some(vop)) = (column_of(right, table, prefix), vtab_op(flip_op(op))) {
+            } else if let (Some(col), Some(vop)) =
+                (column_of(right, table, prefix), vtab_op(flip_op(op)))
+            {
                 constraints.push(VtabConstraint {
                     column: col,
                     op: vop,
@@ -65,7 +77,14 @@ fn extract_constraints(
                 });
                 matched = true;
             }
-        } else if let Expr::Like { op, expr, pattern, negated: false, .. } = c {
+        } else if let Expr::Like {
+            op,
+            expr,
+            pattern,
+            negated: false,
+            ..
+        } = c
+        {
             // `col LIKE pattern` (GLOB too)
             if let Some(col) = column_of(expr, table, prefix) {
                 let vop = match op {
@@ -143,6 +162,9 @@ fn vtab_output_columns(table: &Arc<crate::schema::Table>, alias: Option<&str>) -
     }
 }
 
+/// vtab scan output: column names + (rowid, row) pairs.
+pub(crate) type VtabScanResult = Result<(Arc<[String]>, Vec<(i64, Row)>)>;
+
 /// Scan a virtual table, applying `predicate` (constraints pushed into the
 /// module via best_index; the rest applied as a residual filter).
 /// Returns (columns, (rowid, row) pairs).
@@ -151,11 +173,10 @@ pub(crate) fn scan_vtab(
     table: &Arc<crate::schema::Table>,
     alias: Option<&str>,
     predicate: Option<&Expr>,
-) -> Result<(Arc<[String]>, Vec<(i64, Row)>)> {
-    let inst = table
-        .vtab
-        .as_ref()
-        .ok_or_else(|| Error::corruption(format!("vtab exec on non-virtual table {}", table.name)))?;
+) -> VtabScanResult {
+    let inst = table.vtab.as_ref().ok_or_else(|| {
+        Error::corruption(format!("vtab exec on non-virtual table {}", table.name))
+    })?;
     inst.ensure_connected()?;
 
     // 1. best_index + cursor open (state lock held only for these calls).
@@ -210,7 +231,11 @@ pub(crate) fn scan_vtab(
                         if consumed.get(i).copied().unwrap_or(false) {
                             let handled = handled_flags.get(ci).copied().unwrap_or(false);
                             ci += 1;
-                            if handled { None } else { Some(e.clone()) }
+                            if handled {
+                                None
+                            } else {
+                                Some(e.clone())
+                            }
                         } else {
                             Some(e.clone())
                         }
@@ -227,7 +252,11 @@ pub(crate) fn scan_vtab(
     let columns = vtab_output_columns(table, alias);
     let mut out: Vec<(i64, Row)> = Vec::new();
     let mut cursor = inst.with_table(|vt| vt.open())?;
-    cursor.filter(prepared.info.idx_num, prepared.info.idx_str.as_deref(), &prepared.filter_args)?;
+    cursor.filter(
+        prepared.info.idx_num,
+        prepared.info.idx_str.as_deref(),
+        &prepared.filter_args,
+    )?;
     while !cursor.eof() {
         let rowid = cursor.rowid()?;
         let mut row = Vec::with_capacity(n_cols);
@@ -244,12 +273,12 @@ pub(crate) fn scan_vtab(
         let params: &[Value] = &ctx.params;
         let named_params = &ctx.named_params;
         let col_names: Vec<String> = columns.iter().cloned().collect();
-        out.retain(|(_, row)| {
-            match eval_row(pred, row, &col_names, params, named_params) {
+        out.retain(
+            |(_, row)| match eval_row(pred, row, &col_names, params, named_params) {
                 Ok(v) => v.is_truthy(),
                 Err(_) => false,
-            }
-        });
+            },
+        );
     }
     Ok((columns, out))
 }
@@ -279,7 +308,10 @@ pub(crate) fn exec_insert_vtab(
         .as_ref()
         .ok_or_else(|| Error::corruption("vtab exec on non-virtual table".to_string()))?;
     if !inst.writable()? {
-return Err(Error::semantic(format!("cannot INSERT into read-only virtual table {}", table.name)));
+        return Err(Error::semantic(format!(
+            "cannot INSERT into read-only virtual table {}",
+            table.name
+        )));
     }
     let n_cols = table.n_columns();
     let mut changes = 0i64;
@@ -288,7 +320,9 @@ return Err(Error::semantic(format!("cannot INSERT into read-only virtual table {
         let mut values: Vec<Option<Value>> = vec![None; n_cols];
         if let Some(idxs) = column_indices {
             if idxs.len() != row.len() {
-                return Err(Error::semantic("table {} has a different number of columns".replace("{}", &table.name)));
+                return Err(Error::semantic(
+                    "table {} has a different number of columns".replace("{}", &table.name),
+                ));
             }
             for (i, col_idx) in idxs.iter().enumerate() {
                 values[*col_idx] = Some(row[i].clone());
@@ -316,7 +350,7 @@ return Err(Error::semantic(format!("cannot INSERT into read-only virtual table {
         };
         let assigned = inst.with_table(|vt| vt.update(vec![op]))?;
         changes += 1;
-        if let Some(Some(rid)) = assigned.first().map(|r| *r) {
+        if let Some(Some(rid)) = assigned.first().copied() {
             last_rowid = rid;
         }
     }
@@ -348,11 +382,18 @@ pub(crate) fn exec_update_vtab(
         .as_ref()
         .ok_or_else(|| Error::corruption("vtab exec on non-virtual table".to_string()))?;
     if !inst.writable()? {
-return Err(Error::semantic(format!("cannot UPDATE read-only virtual table {}", table.name)));
+        return Err(Error::semantic(format!(
+            "cannot UPDATE read-only virtual table {}",
+            table.name
+        )));
     }
     let pairs = scan_vtab_for_dml(ctx, table, predicate)?;
     let n_cols = table.n_columns();
-    let col_names: Vec<String> = table.columns.iter().map(|c| format!("{}.{}", table.name, c.name)).collect();
+    let col_names: Vec<String> = table
+        .columns
+        .iter()
+        .map(|c| format!("{}.{}", table.name, c.name))
+        .collect();
     let params: Vec<Value> = ctx.params.clone();
     let named = ctx.named_params.clone();
     let mut ops = Vec::with_capacity(pairs.len());
@@ -385,7 +426,10 @@ pub(crate) fn exec_delete_vtab(
         .as_ref()
         .ok_or_else(|| Error::corruption("vtab exec on non-virtual table".to_string()))?;
     if !inst.writable()? {
-return Err(Error::semantic(format!("cannot DELETE from read-only virtual table {}", table.name)));
+        return Err(Error::semantic(format!(
+            "cannot DELETE from read-only virtual table {}",
+            table.name
+        )));
     }
     let pairs = scan_vtab_for_dml(ctx, table, predicate)?;
     let ops: Vec<crate::plugin::vtab::UpdateOp> = pairs
@@ -410,14 +454,16 @@ return Err(Error::semantic(format!("cannot DELETE from read-only virtual table {
 /// EXPLAIN row rendering for a vtab scan.
 #[allow(dead_code)]
 pub(crate) fn explain_scan_vtab(table: &Arc<crate::schema::Table>) -> Vec<Row> {
-    let module = table.vtab.as_ref().map(|v| v.module_name.clone()).unwrap_or_default();
-    vec![
-        vec![
-            Value::Text("SCAN".into()),
-            Value::Text(format!("{} VIRTUAL TABLE", table.name).into()),
-            Value::Text(format!("module={}", module).into()),
-        ],
-    ]
+    let module = table
+        .vtab
+        .as_ref()
+        .map(|v| v.module_name.clone())
+        .unwrap_or_default();
+    vec![vec![
+        Value::Text("SCAN".into()),
+        Value::Text(format!("{} VIRTUAL TABLE", table.name).into()),
+        Value::Text(format!("module={}", module).into()),
+    ]]
 }
 
 /// ORDER terms for vtab scans are applied by the generic Sort — nothing

@@ -19,7 +19,12 @@ fn alias_of(alias: &Option<String>, table: &str) -> String {
 
 fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
     match plan {
-        Plan::Scan { table, alias, index, .. } => {
+        Plan::Scan {
+            table,
+            alias,
+            index,
+            ..
+        } => {
             let a = alias_of(alias, &table.name);
             let detail = match index {
                 Some(idx) => format!("SCAN {a} USING INDEX {}", idx.name),
@@ -29,45 +34,119 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
         }
         Plan::RowidLookup { table, alias, .. } => {
             let a = alias_of(alias, &table.name);
-            push_row(parent, rows, next_id, format!("SEARCH {a} USING INTEGER PRIMARY KEY (rowid=?)"));
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INTEGER PRIMARY KEY (rowid=?)"),
+            );
         }
-        Plan::IndexIn { table, alias, index, key_exprs, .. } => {
+        Plan::IndexIn {
+            table,
+            alias,
+            index,
+            key_exprs,
+            ..
+        } => {
             let a = alias_of(alias, &table.name);
             push_row(
                 parent,
                 rows,
                 next_id,
-                format!("SEARCH {} USING INDEX {} ({} IN values)", a, index.name, key_exprs.len()),
+                format!(
+                    "SEARCH {} USING INDEX {} ({} IN values)",
+                    a,
+                    index.name,
+                    key_exprs.len()
+                ),
             );
         }
-        Plan::RowidIn { table, alias, values, .. } => {
+        Plan::RowidIn {
+            table,
+            alias,
+            values,
+            ..
+        } => {
             let a = alias_of(alias, &table.name);
             push_row(
                 parent,
                 rows,
                 next_id,
-                format!("SEARCH {} USING INTEGER PRIMARY KEY (rowid IN {} values)", a, values.len()),
+                format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid IN {} values)",
+                    a,
+                    values.len()
+                ),
             );
         }
-        Plan::RowidRange { table, alias, start, end, .. } => {
+        Plan::RowidRange {
+            table,
+            alias,
+            start,
+            end,
+            ..
+        } => {
             let a = alias_of(alias, &table.name);
             let lo = if start.is_some() { "rowid>?" } else { "" };
             let hi = if end.is_some() { "rowid<?" } else { "" };
-            let join = if !lo.is_empty() && !hi.is_empty() { " AND " } else { "" };
-            push_row(parent, rows, next_id, format!("SEARCH {a} USING INTEGER PRIMARY KEY ({lo}{join}{hi})"));
+            let join = if !lo.is_empty() && !hi.is_empty() {
+                " AND "
+            } else {
+                ""
+            };
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INTEGER PRIMARY KEY ({lo}{join}{hi})"),
+            );
         }
-        Plan::IndexLookup { table, alias, index, key_exprs } => {
+        Plan::IndexLookup {
+            table,
+            alias,
+            index,
+            key_exprs,
+        } => {
             let a = alias_of(alias, &table.name);
             let cols = index_columns_desc(index, key_exprs.len());
-            push_row(parent, rows, next_id, format!("SEARCH {a} USING INDEX {} ({cols}=?)", index.name));
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INDEX {} ({cols}=?)", index.name),
+            );
         }
-        Plan::IndexRange { table, alias, index, start, end, .. } => {
+        Plan::IndexRange {
+            table,
+            alias,
+            index,
+            start,
+            end,
+            ..
+        } => {
             let a = alias_of(alias, &table.name);
             let cols = index_columns_desc(index, 1);
-            let lo = if start.is_some() { format!("{cols}>?") } else { String::new() };
-            let hi = if end.is_some() { format!("{cols}<?") } else { String::new() };
-            let join = if !lo.is_empty() && !hi.is_empty() { " AND " } else { "" };
-            push_row(parent, rows, next_id, format!("SEARCH {a} USING INDEX {} ({lo}{join}{hi})", index.name));
+            let lo = if start.is_some() {
+                format!("{cols}>?")
+            } else {
+                String::new()
+            };
+            let hi = if end.is_some() {
+                format!("{cols}<?")
+            } else {
+                String::new()
+            };
+            let join = if !lo.is_empty() && !hi.is_empty() {
+                " AND "
+            } else {
+                ""
+            };
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INDEX {} ({lo}{join}{hi})", index.name),
+            );
         }
         Plan::Values { .. } => {
             push_row(parent, rows, next_id, "SCAN 1 CONSTANT ROW".to_string());
@@ -77,16 +156,33 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
         Plan::Limit { input, .. } => walk(input, parent, rows, next_id),
         Plan::Distinct { input } => {
             walk(input, parent, rows, next_id);
-            push_row(parent, rows, next_id, "USE TEMP B-TREE FOR DISTINCT".to_string());
+            push_row(
+                parent,
+                rows,
+                next_id,
+                "USE TEMP B-TREE FOR DISTINCT".to_string(),
+            );
         }
         Plan::Sort { input, .. } => {
             walk(input, parent, rows, next_id);
-            push_row(parent, rows, next_id, "USE TEMP B-TREE FOR ORDER BY".to_string());
+            push_row(
+                parent,
+                rows,
+                next_id,
+                "USE TEMP B-TREE FOR ORDER BY".to_string(),
+            );
         }
-        Plan::Aggregate { input, group_by, .. } => {
+        Plan::Aggregate {
+            input, group_by, ..
+        } => {
             walk(input, parent, rows, next_id);
             if !group_by.is_empty() {
-                push_row(parent, rows, next_id, "USE TEMP B-TREE FOR GROUP BY".to_string());
+                push_row(
+                    parent,
+                    rows,
+                    next_id,
+                    "USE TEMP B-TREE FOR GROUP BY".to_string(),
+                );
             }
         }
         Plan::Window { input, .. } => {
@@ -97,11 +193,22 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             walk(left, parent, rows, next_id);
             walk(right, parent, rows, next_id);
         }
-        Plan::IndexNestedLoopJoin { outer, inner_table, inner_alias, inner_index, .. } => {
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            inner_index,
+            ..
+        } => {
             walk(outer, parent, rows, next_id);
             let a = alias_of(inner_alias, &inner_table.name);
             let cols = index_columns_desc(inner_index, 1);
-            push_row(parent, rows, next_id, format!("SEARCH {a} USING INDEX {} ({cols}=?)", inner_index.name));
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INDEX {} ({cols}=?)", inner_index.name),
+            );
         }
         Plan::Subquery { plan } => {
             // Give the subquery its own top-level id group, like SQLite.
@@ -113,17 +220,32 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
         Plan::Union { left, right, .. } => {
             walk(left, parent, rows, next_id);
             walk(right, parent, rows, next_id);
-            push_row(parent, rows, next_id, "USE TEMP B-TREE FOR UNION".to_string());
+            push_row(
+                parent,
+                rows,
+                next_id,
+                "USE TEMP B-TREE FOR UNION".to_string(),
+            );
         }
         Plan::Intersect { left, right } => {
             walk(left, parent, rows, next_id);
             walk(right, parent, rows, next_id);
-            push_row(parent, rows, next_id, "USE TEMP B-TREE FOR INTERSECT".to_string());
+            push_row(
+                parent,
+                rows,
+                next_id,
+                "USE TEMP B-TREE FOR INTERSECT".to_string(),
+            );
         }
         Plan::Except { left, right } => {
             walk(left, parent, rows, next_id);
             walk(right, parent, rows, next_id);
-            push_row(parent, rows, next_id, "USE TEMP B-TREE FOR EXCEPT".to_string());
+            push_row(
+                parent,
+                rows,
+                next_id,
+                "USE TEMP B-TREE FOR EXCEPT".to_string(),
+            );
         }
         Plan::Insert { source, table, .. } => {
             walk(source, parent, rows, next_id);

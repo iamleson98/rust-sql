@@ -32,7 +32,12 @@ fn main() {
     ];
     for sql in cases {
         match db.query(sql, []) {
-            Ok(rows) => println!("{:.66} => {} rows: {:?}", sql, rows.len(), rows.iter().take(4).collect::<Vec<_>>()),
+            Ok(rows) => println!(
+                "{:.66} => {} rows: {:?}",
+                sql,
+                rows.len(),
+                rows.iter().take(4).collect::<Vec<_>>()
+            ),
             Err(e) => println!("{:.66} => ERR {}", sql, e),
         }
     }

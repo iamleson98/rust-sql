@@ -173,7 +173,11 @@ pub struct PageCache {
 
 impl PageCache {
     pub fn new() -> Self {
-        Self { slots: Vec::new(), overflow: PageCacheMap::default(), count: 0 }
+        Self {
+            slots: Vec::new(),
+            overflow: PageCacheMap::default(),
+            count: 0,
+        }
     }
 
     #[inline]
@@ -498,8 +502,8 @@ impl Pager {
                 for idx in base_n..slots_len.min(PAGE_VEC_DIRECT_LIMIT) {
                     cache.slots[idx] = None;
                 }
-                cache.count = cache.slots.iter().filter(|s| s.is_some()).count()
-                    + cache.overflow.len();
+                cache.count =
+                    cache.slots.iter().filter(|s| s.is_some()).count() + cache.overflow.len();
             }
             cache.overflow.retain(|&id, _| id < base.n_pages);
             let mut dp = self.dirty_pages.lock();
@@ -509,9 +513,12 @@ impl Pager {
         self.lru.lock().clear();
         // Phase 4: rewind mutable metadata + truncate the file if it grew.
         self.n_pages.store(base.n_pages, Ordering::Release);
-        self.freelist_head.store(base.freelist_head, Ordering::Release);
-        self.freelist_count.store(base.freelist_count, Ordering::Release);
-        self.schema_cookie.store(base.schema_cookie, Ordering::Release);
+        self.freelist_head
+            .store(base.freelist_head, Ordering::Release);
+        self.freelist_count
+            .store(base.freelist_count, Ordering::Release);
+        self.schema_cookie
+            .store(base.schema_cookie, Ordering::Release);
         let target_size = base.n_pages as u64 * self.page_size() as u64;
         if let Ok(meta) = self.file.metadata() {
             if meta.len() > target_size {
@@ -531,7 +538,9 @@ impl Pager {
     /// (0 = none left), or None when the name is unknown.
     pub fn release_savepoint(&self, name: &str) -> Option<usize> {
         let mut sp = self.savepoints.lock();
-        let idx = sp.iter().rposition(|s| s.name == name.to_ascii_lowercase())?;
+        let idx = sp
+            .iter()
+            .rposition(|s| s.name == name.to_ascii_lowercase())?;
         sp.truncate(idx);
         let remaining = sp.len();
         self.savepoint_depth.store(remaining, Ordering::Release);
@@ -561,7 +570,11 @@ impl Pager {
         }
         // Fast exit: the newest level already has this page (the common
         // re-fetch loop on a hot page).
-        if sp.last().map(|s| s.pages.contains_key(&id)).unwrap_or(false) {
+        if sp
+            .last()
+            .map(|s| s.pages.contains_key(&id))
+            .unwrap_or(false)
+        {
             return;
         }
         let bytes = {
@@ -575,8 +588,7 @@ impl Pager {
 }
 
 /// Process-wide Pager instance counter (see `Pager::instance_id`).
-static PAGER_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PAGER_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Drop for Pager {
     fn drop(&mut self) {
@@ -651,7 +663,11 @@ impl Pager {
             // (WAL-served reads) — committed data survives an unclean
             // shutdown, torn transactions are discarded at frame level.
             let wal_file = crate::storage::wal::wal_path_for(&pager.path);
-            if wal_file.exists() && std::fs::metadata(&wal_file).map(|m| m.len() > 0).unwrap_or(false) {
+            if wal_file.exists()
+                && std::fs::metadata(&wal_file)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
                 pager.enable_wal()?;
             }
         }
@@ -704,7 +720,9 @@ impl Pager {
         if FileHeader::magic(&header) != Some(&crate::storage::page::DB_MAGIC) {
             // Distinguish "not a rustqlite file" from "old format version"
             // so users get an actionable message.
-            let m = FileHeader::magic(&header).map(|m| String::from_utf8_lossy(m).into_owned()).unwrap_or_default();
+            let m = FileHeader::magic(&header)
+                .map(|m| String::from_utf8_lossy(m).into_owned())
+                .unwrap_or_default();
             if m.starts_with("RSQLDB") {
                 return Err(Error::corruption(format!(
                     "unsupported database format version: {} (this build reads {};                      re-create the database or use the version that wrote it)",
@@ -921,11 +939,12 @@ impl Pager {
     }
 
     pub fn bump_schema_cookie(&self) -> Result<()> {
-        let new_cookie = self.schema_cookie.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |x| Some(x.wrapping_add(1)),
-        ).unwrap_or_else(|x| x);
+        let new_cookie = self
+            .schema_cookie
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                Some(x.wrapping_add(1))
+            })
+            .unwrap_or_else(|x| x);
         let mut header = [0u8; 100];
         self.read_file_at(0, &mut header)?;
         FileHeader::set_schema_cookie(&mut header, new_cookie.wrapping_add(1));
@@ -1049,11 +1068,15 @@ impl Pager {
             let freed = head;
             self.freelist_head.store(next, Ordering::Release);
             // Use fetch_sub to safely decrement without overflow.
-            self.freelist_count.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |x| if x > 0 { Some(x - 1) } else { None },
-            ).map_err(|_| Error::corruption("freelist underflow"))?;
+            self.freelist_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                    if x > 0 {
+                        Some(x - 1)
+                    } else {
+                        None
+                    }
+                })
+                .map_err(|_| Error::corruption("freelist underflow"))?;
 
             // Clear the page before reuse.
             {
@@ -1117,7 +1140,10 @@ impl Pager {
     /// when the file carries a DIFFERENT codec's marker. When activating
     /// on a codec-less file, the marker is written into the in-cache page
     /// 0 (flushed with the next commit) so reopen knows what to require.
-    pub fn set_codec(&self, codec: Option<std::sync::Arc<dyn crate::plugin::PageCodec>>) -> Result<()> {
+    pub fn set_codec(
+        &self,
+        codec: Option<std::sync::Arc<dyn crate::plugin::PageCodec>>,
+    ) -> Result<()> {
         if codec.is_some() && self.wal_enabled() {
             return Err(crate::error::Error::semantic(
                 "page codecs require journal_mode=delete (WAL frames are not encoded)",
@@ -1195,10 +1221,8 @@ impl Pager {
         // Flush pending dirty pages in DELETE mode first.
         self.flush()?;
         let mut wal = crate::storage::wal::Wal::open(&self.path, self.page_size())?;
-        let map: std::collections::HashMap<PageId, u64, PageIdHashBuild> = wal
-            .committed_page_map()?
-            .into_iter()
-            .collect();
+        let map: std::collections::HashMap<PageId, u64, PageIdHashBuild> =
+            wal.committed_page_map()?.into_iter().collect();
         let n = wal.n_frames();
         let mut guard = self.wal.write();
         *guard = Some(WalState { wal, map });
@@ -1443,12 +1467,7 @@ impl Pager {
             let page0 = self.cache.read().get(0).cloned();
             if let Some(page0) = page0 {
                 let mut borrowed = page0.lock();
-                FileHeader::write(
-                    &mut borrowed.data,
-                    psz,
-                    n_pages_val,
-                    schema_cookie_val,
-                );
+                FileHeader::write(&mut borrowed.data, psz, n_pages_val, schema_cookie_val);
                 borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
                 borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
                 borrowed.dirty = true;
@@ -1592,9 +1611,12 @@ impl Pager {
 
         // 2. Restore mutable metadata.
         self.n_pages.store(snap.n_pages, Ordering::Release);
-        self.freelist_head.store(snap.freelist_head, Ordering::Release);
-        self.freelist_count.store(snap.freelist_count, Ordering::Release);
-        self.schema_cookie.store(snap.schema_cookie, Ordering::Release);
+        self.freelist_head
+            .store(snap.freelist_head, Ordering::Release);
+        self.freelist_count
+            .store(snap.freelist_count, Ordering::Release);
+        self.schema_cookie
+            .store(snap.schema_cookie, Ordering::Release);
 
         // 3. Truncate the file back if pages were allocated during the txn.
         let target_size = snap.n_pages as u64 * self.page_size() as u64;
@@ -1678,20 +1700,24 @@ impl Pager {
     /// Total bytes used by the cache (for instrumentation).
     /// FOREIGN KEY enforcement toggle (PRAGMA foreign_keys = ON/OFF).
     pub fn set_foreign_keys_enabled(&self, enabled: bool) {
-        self.foreign_keys_enabled.store(enabled, std::sync::atomic::Ordering::Release);
+        self.foreign_keys_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     pub fn foreign_keys_enabled(&self) -> bool {
-        self.foreign_keys_enabled.load(std::sync::atomic::Ordering::Acquire)
+        self.foreign_keys_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Advisory PRAGMA locking_mode toggle — see the field docs.
     pub fn set_locking_mode_exclusive(&self, exclusive: bool) {
-        self.locking_mode_exclusive.store(exclusive, std::sync::atomic::Ordering::Release);
+        self.locking_mode_exclusive
+            .store(exclusive, std::sync::atomic::Ordering::Release);
     }
 
     pub fn locking_mode_exclusive(&self) -> bool {
-        self.locking_mode_exclusive.load(std::sync::atomic::Ordering::Acquire)
+        self.locking_mode_exclusive
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// PRAGMA synchronous level: 0=OFF, 1=NORMAL, 2=FULL (default).
@@ -1707,11 +1733,13 @@ impl Pager {
     /// SQLite's default: triggers do not re-fire from inside another
     /// trigger's body.
     pub fn set_recursive_triggers_enabled(&self, enabled: bool) {
-        self.recursive_triggers_enabled.store(enabled, std::sync::atomic::Ordering::Release);
+        self.recursive_triggers_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     pub fn recursive_triggers_enabled(&self) -> bool {
-        self.recursive_triggers_enabled.load(std::sync::atomic::Ordering::Acquire)
+        self.recursive_triggers_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn cache_bytes(&self) -> usize {
@@ -1787,7 +1815,10 @@ fn codec_marker_name(header: &[u8; 100]) -> Option<String> {
         return None;
     }
     let name_bytes = &area[prefix.len()..];
-    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+    let end = name_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name_bytes.len());
     if end == 0 {
         return None;
     }

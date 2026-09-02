@@ -112,7 +112,7 @@ fn child_main(db_path: &std::path::Path, mode: &str, crash_at: usize) -> i32 {
     crashpoint!(); // after flush
 
     let _ = ops; // labels used by the parent
-    // Survived the whole workload (crash_at beyond the end = control run).
+                 // Survived the whole workload (crash_at beyond the end = control run).
     0
 }
 
@@ -131,9 +131,12 @@ fn verify_after_crash(db_path: &std::path::Path, crash_at: usize, mode: &str) {
         .unwrap_or_else(|e| panic!("crash@{} ({}): DB failed to re-open: {}", crash_at, mode, e));
 
     // 1. Baseline rows must ALL survive every crash point.
-    let rows = db
-        .query("SELECT COUNT(*) FROM t", [])
-        .unwrap_or_else(|e| panic!("crash@{} ({}): baseline COUNT failed: {}", crash_at, mode, e));
+    let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap_or_else(|e| {
+        panic!(
+            "crash@{} ({}): baseline COUNT failed: {}",
+            crash_at, mode, e
+        )
+    });
     let n = match rows.first().and_then(|r| r.first()) {
         Some(Value::Integer(n)) => *n,
         other => panic!("crash@{} ({}): COUNT returned {:?}", crash_at, mode, other),
@@ -141,7 +144,10 @@ fn verify_after_crash(db_path: &std::path::Path, crash_at: usize, mode: &str) {
     assert!(
         n >= BASELINE_ROWS,
         "crash@{} ({}): LOST COMMITTED DATA — baseline {} rows, found {}",
-        crash_at, mode, BASELINE_ROWS, n
+        crash_at,
+        mode,
+        BASELINE_ROWS,
+        n
     );
 
     // 2. All-or-nothing: the in-flight transaction is either fully
@@ -161,7 +167,10 @@ fn verify_after_crash(db_path: &std::path::Path, crash_at: usize, mode: &str) {
         assert!(
             tx_n == 0 || tx_n == TX_ROWS,
             "crash@{} ({}): TORN COMMIT — {} of {} tx rows visible after COMMIT",
-            crash_at, mode, tx_n, TX_ROWS
+            crash_at,
+            mode,
+            tx_n,
+            TX_ROWS
         );
     } else {
         assert_eq!(
@@ -175,9 +184,12 @@ fn verify_after_crash(db_path: &std::path::Path, crash_at: usize, mode: &str) {
     //     same verification SQLite's crash tests perform on recovered
     //     files: structure fully intact, indexes consistent).
     {
-        let rows = db
-            .query("PRAGMA integrity_check", [])
-            .unwrap_or_else(|e| panic!("crash@{} ({}): integrity_check failed: {}", crash_at, mode, e));
+        let rows = db.query("PRAGMA integrity_check", []).unwrap_or_else(|e| {
+            panic!(
+                "crash@{} ({}): integrity_check failed: {}",
+                crash_at, mode, e
+            )
+        });
         assert!(
             rows.iter().all(|r| r[0].as_text() == "ok"),
             "crash@{} ({}): integrity_check reported problems after recovery: {:?}",
@@ -189,14 +201,24 @@ fn verify_after_crash(db_path: &std::path::Path, crash_at: usize, mode: &str) {
 
     // 3. The database must still accept writes — a crashed-and-recovered
     //    file must never poison the writer.
-    db.execute(
-        "INSERT INTO t (v) VALUES ('post-crash-write')",
-        [],
-    )
-    .unwrap_or_else(|e| panic!("crash@{} ({}): post-crash write failed: {}", crash_at, mode, e));
+    db.execute("INSERT INTO t (v) VALUES ('post-crash-write')", [])
+        .unwrap_or_else(|e| {
+            panic!(
+                "crash@{} ({}): post-crash write failed: {}",
+                crash_at, mode, e
+            )
+        });
     db.flush().expect("post-crash flush failed");
-    let rows = db.query("SELECT COUNT(*) FROM t WHERE v = 'post-crash-write'", []).unwrap();
-    assert_eq!(rows.len(), 1, "crash@{} ({}): post-crash write not readable", crash_at, mode);
+    let rows = db
+        .query("SELECT COUNT(*) FROM t WHERE v = 'post-crash-write'", [])
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "crash@{} ({}): post-crash write not readable",
+        crash_at,
+        mode
+    );
 }
 
 fn run_crash_matrix(mode: &str) {
@@ -207,7 +229,8 @@ fn run_crash_matrix(mode: &str) {
     // Parent creates the committed baseline.
     {
         let mut db = Database::open(&db_path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         for i in 1..=BASELINE_ROWS {
             db.execute(
                 "INSERT INTO t (v) VALUES (?)",
@@ -232,8 +255,14 @@ fn run_crash_matrix(mode: &str) {
         // otherwise leak committed-but-uncheckpointed data into the next
         // iteration and make crash points order-dependent.
         for sidecar in [
-            db_path.with_file_name(format!("{}-wal", db_path.file_name().unwrap().to_string_lossy())),
-            db_path.with_file_name(format!("{}-shm", db_path.file_name().unwrap().to_string_lossy())),
+            db_path.with_file_name(format!(
+                "{}-wal",
+                db_path.file_name().unwrap().to_string_lossy()
+            )),
+            db_path.with_file_name(format!(
+                "{}-shm",
+                db_path.file_name().unwrap().to_string_lossy()
+            )),
         ] {
             let _ = std::fs::remove_file(&sidecar);
         }
@@ -256,7 +285,8 @@ fn run_crash_matrix(mode: &str) {
         assert!(
             !status.success(),
             "crash@{} ({}): child exited 0 but should have aborted",
-            crash_at, mode
+            crash_at,
+            mode
         );
         verify_after_crash(&db_path, crash_at, mode);
     }
@@ -271,7 +301,11 @@ fn run_crash_matrix(mode: &str) {
             .env("RUSTQLITE_CRASH_POINT", usize::MAX.to_string())
             .status()
             .unwrap();
-        assert!(status.success(), "control (no-crash) run failed in {}", mode);
+        assert!(
+            status.success(),
+            "control (no-crash) run failed in {}",
+            mode
+        );
         let db = Database::open(&db_path).unwrap();
         let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
         let n = match rows.first().and_then(|r| r.first()) {
@@ -281,7 +315,9 @@ fn run_crash_matrix(mode: &str) {
         assert!(
             n >= BASELINE_ROWS + TX_ROWS,
             "control ({}): expected >= {} rows after clean run, found {}",
-            mode, BASELINE_ROWS + TX_ROWS, n
+            mode,
+            BASELINE_ROWS + TX_ROWS,
+            n
         );
     }
 }

@@ -14,11 +14,22 @@ fn main() {
     let path = "/tmp/probe_layers.db";
     let _ = std::fs::remove_file(path);
     let mut db = Database::open(path).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=10000i64 {
-        db.execute("INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
-            [Value::Text(format!("user{}", i).into()), Value::Integer(i), Value::Real(i as f64 * 1.5)]).unwrap();
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("user{}", i).into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
@@ -46,8 +57,16 @@ fn main() {
     let mut cb = |rid: i64, pl: &[u8]| collect_roots(rid, pl, &mut sink);
     sbt.scan_table_borrowed(&mut cb).unwrap();
     roots = sink;
-    let troot = roots.iter().find(|(n, _)| n == "t").map(|(_, r)| *r).unwrap();
-    let iroot = roots.iter().find(|(n, _)| n == "idx_val").map(|(_, r)| *r).unwrap();
+    let troot = roots
+        .iter()
+        .find(|(n, _)| n == "t")
+        .map(|(_, r)| *r)
+        .unwrap();
+    let iroot = roots
+        .iter()
+        .find(|(n, _)| n == "idx_val")
+        .map(|(_, r)| *r)
+        .unwrap();
     println!("table root={troot}, index root={iroot}, all={roots:?}");
 
     // Warm everything
@@ -73,7 +92,10 @@ fn main() {
         Value::Integer((((i % 1000) + 1) * 2) as i64).encode_order_key_into(&mut key_buf);
         let _ = ibt.lookup_index(&key_buf).unwrap();
     }
-    println!("index seek (encode+lookup_index):  {:>7.1} ns", ns(start.elapsed(), n));
+    println!(
+        "index seek (encode+lookup_index):  {:>7.1} ns",
+        ns(start.elapsed(), n)
+    );
 
     // Layer 1b: key encode only
     let start = Instant::now();
@@ -81,14 +103,20 @@ fn main() {
         key_buf.clear();
         Value::Integer((((i % 1000) + 1) * 2) as i64).encode_order_key_into(&mut key_buf);
     }
-    println!("key encode alone:                 {:>7.1} ns", ns(start.elapsed(), n));
+    println!(
+        "key encode alone:                 {:>7.1} ns",
+        ns(start.elapsed(), n)
+    );
 
     // Layer 2: table fetch only
     let start = Instant::now();
     for i in 0u64..n {
         let _ = tbt.lookup_table(((i % 1000) + 1) as i64).unwrap();
     }
-    println!("table fetch (lookup_table):       {:>7.1} ns", ns(start.elapsed(), n));
+    println!(
+        "table fetch (lookup_table):       {:>7.1} ns",
+        ns(start.elapsed(), n)
+    );
 
     // Layer 3: decode only (constant payload)
     let payload = match tbt.lookup_table(500).unwrap() {
@@ -97,10 +125,14 @@ fn main() {
     };
     let start = Instant::now();
     for _ in 0u64..n {
-        let v: Vec<Value> = rustqlite::storage::row_codec::decode_row(&payload, 4, 500, Some(0)).unwrap();
+        let v: Vec<Value> =
+            rustqlite::storage::row_codec::decode_row(&payload, 4, 500, Some(0)).unwrap();
         std::hint::black_box(&v);
     }
-    println!("decode_row alone (4 cols):        {:>7.1} ns", ns(start.elapsed(), n));
+    println!(
+        "decode_row alone (4 cols):        {:>7.1} ns",
+        ns(start.elapsed(), n)
+    );
 
     // Combined: what the fast path does minus query() overhead
     let start = Instant::now();
@@ -109,11 +141,17 @@ fn main() {
         Value::Integer((((i % 1000) + 1) * 2) as i64).encode_order_key_into(&mut key_buf);
         let rids = ibt.lookup_index(&key_buf).unwrap();
         if let Some(rid) = rids.first() {
-            if let rustqlite::storage::btree::LookupResult::Found(p) = tbt.lookup_table(*rid).unwrap() {
-                let v: Vec<Value> = rustqlite::storage::row_codec::decode_row(&p, 4, 500, Some(0)).unwrap();
+            if let rustqlite::storage::btree::LookupResult::Found(p) =
+                tbt.lookup_table(*rid).unwrap()
+            {
+                let v: Vec<Value> =
+                    rustqlite::storage::row_codec::decode_row(&p, 4, 500, Some(0)).unwrap();
                 std::hint::black_box(&v);
             }
         }
     }
-    println!("combined btree+decode:            {:>7.1} ns", ns(start.elapsed(), n));
+    println!(
+        "combined btree+decode:            {:>7.1} ns",
+        ns(start.elapsed(), n)
+    );
 }

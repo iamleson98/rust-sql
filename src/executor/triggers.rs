@@ -62,11 +62,9 @@ pub(crate) fn fire_triggers(
             (TriggerEvent::Delete, TriggerEvent::Delete) => true,
             (TriggerEvent::Update(list), TriggerEvent::Update(changed)) => {
                 list.is_empty()
-                    || list.iter().any(|c| {
-                        changed
-                            .iter()
-                            .any(|cc| c.eq_ignore_ascii_case(cc))
-                    })
+                    || list
+                        .iter()
+                        .any(|c| changed.iter().any(|cc| c.eq_ignore_ascii_case(cc)))
             }
             _ => false,
         });
@@ -87,15 +85,9 @@ pub(crate) fn fire_triggers(
                 let mut s = stmt.clone();
                 substitute_new_old(&mut s, new_row, old_row, col_names)?;
                 let plan = match &s {
-                    Statement::Insert(_) => {
-                        crate::api::Database::plan_insert(ctx.catalog(), &s)?
-                    }
-                    Statement::Update(_) => {
-                        crate::api::Database::plan_update(ctx.catalog(), &s)?
-                    }
-                    Statement::Delete(_) => {
-                        crate::api::Database::plan_delete(ctx.catalog(), &s)?
-                    }
+                    Statement::Insert(_) => crate::api::Database::plan_insert(ctx.catalog(), &s)?,
+                    Statement::Update(_) => crate::api::Database::plan_update(ctx.catalog(), &s)?,
+                    Statement::Delete(_) => crate::api::Database::plan_delete(ctx.catalog(), &s)?,
                     Statement::Select(sel) => {
                         let mut planner = crate::planner::Planner::new(ctx.catalog());
                         planner.plan_select(sel)?
@@ -141,13 +133,7 @@ fn eval_with_new_old(
         combined.extend(o.iter().cloned());
         names.extend(col_names.iter().map(|c| format!("old.{}", c)));
     }
-    crate::executor::eval_row_public(
-        expr,
-        &combined,
-        &names,
-        &ctx.params,
-        &ctx.named_params,
-    )
+    crate::executor::eval_row_public(expr, &combined, &names, &ctx.params, &ctx.named_params)
 }
 
 /// True when the table has at least one trigger for this event (lets hot
@@ -160,11 +146,14 @@ pub(crate) fn has_triggers_for(
 ) -> bool {
     let triggers = ctx.catalog().triggers_on_table(&table.name);
     triggers.iter().any(|t| {
-        t.events
-            .iter()
-            .any(|e| matches!((e, event), (TriggerEvent::Insert, TriggerEvent::Insert)
-                | (TriggerEvent::Delete, TriggerEvent::Delete)
-                | (TriggerEvent::Update(_), TriggerEvent::Update(_))))
+        t.events.iter().any(|e| {
+            matches!(
+                (e, event),
+                (TriggerEvent::Insert, TriggerEvent::Insert)
+                    | (TriggerEvent::Delete, TriggerEvent::Delete)
+                    | (TriggerEvent::Update(_), TriggerEvent::Update(_))
+            )
+        })
     })
 }
 
@@ -192,7 +181,10 @@ fn substitute_new_old(
         lookup: &dyn Fn(&str, &str) -> Option<Value>,
     ) -> crate::error::Result<()> {
         match e {
-            Expr::Column { table: Some(t), name } => {
+            Expr::Column {
+                table: Some(t),
+                name,
+            } => {
                 if let Some(v) = lookup(t, name) {
                     *e = Expr::Literal(v);
                 } else if t.eq_ignore_ascii_case("new") || t.eq_ignore_ascii_case("old") {
@@ -208,7 +200,9 @@ fn substitute_new_old(
                 walk_expr(right, lookup)
             }
             Expr::Unary { expr, .. } => walk_expr(expr, lookup),
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 walk_expr(expr, lookup)?;
                 walk_expr(low, lookup)?;
                 walk_expr(high, lookup)
@@ -222,7 +216,12 @@ fn substitute_new_old(
                 }
                 Ok(())
             }
-            Expr::Like { expr, pattern, escape, .. } => {
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
                 walk_expr(expr, lookup)?;
                 walk_expr(pattern, lookup)?;
                 if let Some(es) = escape {
@@ -244,7 +243,11 @@ fn substitute_new_old(
                 }
                 Ok(())
             }
-            Expr::Case { operand, whens, else_ } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
                 if let Some(o) = operand {
                     walk_expr(o, lookup)?;
                 }
@@ -324,7 +327,8 @@ fn substitute_new_old(
             }
             if let Some(u) = ins.upsert.as_mut() {
                 // ON CONFLICT ... DO UPDATE SET expr = expr [WHERE expr]
-                if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &mut u.action {
+                if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &mut u.action
+                {
                     for (_, e) in set.iter_mut() {
                         walk_expr(e, &lookup)?;
                     }

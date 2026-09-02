@@ -39,7 +39,9 @@ fn diff_program(setup: &[&str], program: &[&str], check: &str) {
                                 rusqlite::types::ValueRef::Null => "NULL".to_string(),
                                 rusqlite::types::ValueRef::Integer(v) => format!("I:{v}"),
                                 rusqlite::types::ValueRef::Real(v) => format!("R:{v}"),
-                                rusqlite::types::ValueRef::Text(t) => format!("T:{}", String::from_utf8_lossy(t)),
+                                rusqlite::types::ValueRef::Text(t) => {
+                                    format!("T:{}", String::from_utf8_lossy(t))
+                                }
                                 rusqlite::types::ValueRef::Blob(b) => format!("B:{}", b.len()),
                             };
                             row.push(v);
@@ -62,8 +64,12 @@ fn diff_program(setup: &[&str], program: &[&str], check: &str) {
                             "error mismatch on {s}\n  rustqlite: {ours_msg}\n  sqlite:   {theirs_msg}"
                         );
                     }
-                    (Err(e), Ok(_)) => panic!("rustqlite failed where SQLite succeeded on {s}: {e}"),
-                    (Ok(_), Err(te)) => panic!("SQLite failed where rustqlite succeeded on {s}: {te}"),
+                    (Err(e), Ok(_)) => {
+                        panic!("rustqlite failed where SQLite succeeded on {s}: {e}")
+                    }
+                    (Ok(_), Err(te)) => {
+                        panic!("SQLite failed where rustqlite succeeded on {s}: {te}")
+                    }
                 }
                 continue;
             }
@@ -343,7 +349,9 @@ fn update_from_changes_count() {
     let ours: i64 = db.query("SELECT changes()", []).unwrap()[0][0].as_integer();
     conn.execute("UPDATE t SET v = src.v FROM src WHERE t.id = src.id", [])
         .unwrap();
-    let theirs: i64 = conn.query_row("SELECT changes()", [], |r| r.get(0)).unwrap();
+    let theirs: i64 = conn
+        .query_row("SELECT changes()", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(ours, theirs, "changes() after UPDATE FROM must match");
 }
 
@@ -581,20 +589,14 @@ fn nocase_delete_with_index() {
 fn collated_index_survives_reopen() {
     // The implicit UNIQUE auto-index with COLLATE round-trips through the
     // schema SQL on reopen.
-    let dir = std::env::temp_dir().join(format!(
-        "rustqlite_collate_reopen_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("rustqlite_collate_reopen_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("t.db");
     {
         let mut db = Database::open(&path).unwrap();
-        db.execute(
-            "CREATE TABLE w (email TEXT UNIQUE COLLATE NOCASE)",
-            [],
-        )
-        .unwrap();
+        db.execute("CREATE TABLE w (email TEXT UNIQUE COLLATE NOCASE)", [])
+            .unwrap();
         db.execute("INSERT INTO w VALUES ('alice@example.com')", [])
             .unwrap();
     }

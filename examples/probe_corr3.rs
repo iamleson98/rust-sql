@@ -15,7 +15,11 @@ fn main() {
     }
 
     // Sanity: order 1 has 2 items.
-    println!("items of order 1: {:?}", db.query("SELECT COUNT(*) FROM items WHERE order_id = 1", []).unwrap());
+    println!(
+        "items of order 1: {:?}",
+        db.query("SELECT COUNT(*) FROM items WHERE order_id = 1", [])
+            .unwrap()
+    );
 
     let sql = "SELECT u.name, o.id FROM users u JOIN orders o ON o.user_id = u.id WHERE (SELECT COUNT(*) FROM items i WHERE i.order_id = o.id) >= 2";
     println!("case4: {:?}", db.query(sql, []).map(|r| r.len()));

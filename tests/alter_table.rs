@@ -5,8 +5,10 @@ use rustqlite::{Database, Value};
 #[test]
 fn alter_rename_basic() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", [])
+        .unwrap();
     db.execute("ALTER TABLE t RENAME TO t2", []).unwrap();
     // Data survives under the new name.
     let rows = db.query("SELECT COUNT(*), MAX(x) FROM t2", []).unwrap();
@@ -26,13 +28,17 @@ fn alter_rename_persists_across_reopen() {
     let path = tmp.path();
     {
         let mut db = Database::open(path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
         db.execute("INSERT INTO t (x) VALUES (7)", []).unwrap();
         db.execute("ALTER TABLE t RENAME TO renamed", []).unwrap();
-        db.execute("INSERT INTO renamed (x) VALUES (8)", []).unwrap();
+        db.execute("INSERT INTO renamed (x) VALUES (8)", [])
+            .unwrap();
     }
     let db = Database::open(path).unwrap();
-    let rows = db.query("SELECT id, x FROM renamed ORDER BY id", []).unwrap();
+    let rows = db
+        .query("SELECT id, x FROM renamed ORDER BY id", [])
+        .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][1], Value::Integer(7));
     assert_eq!(rows[1][1], Value::Integer(8));
@@ -42,8 +48,10 @@ fn alter_rename_persists_across_reopen() {
 #[test]
 fn alter_rename_keeps_indexes_attached() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (x) VALUES (10), (20), (30)", [])
+        .unwrap();
     db.execute("CREATE INDEX idx_x ON t(x)", []).unwrap();
     db.execute("ALTER TABLE t RENAME TO t2", []).unwrap();
     // Indexed lookups must still work (the catalog's index registration
@@ -55,8 +63,10 @@ fn alter_rename_keeps_indexes_attached() {
     let path = tmp.path();
     {
         let mut db2 = Database::open(path).unwrap();
-        db2.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, y INTEGER)", []).unwrap();
-        db2.execute("INSERT INTO a (y) VALUES (1), (2)", []).unwrap();
+        db2.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, y INTEGER)", [])
+            .unwrap();
+        db2.execute("INSERT INTO a (y) VALUES (1), (2)", [])
+            .unwrap();
         db2.execute("CREATE INDEX ia ON a(y)", []).unwrap();
         db2.execute("ALTER TABLE a RENAME TO b", []).unwrap();
     }
@@ -68,17 +78,21 @@ fn alter_rename_keeps_indexes_attached() {
 #[test]
 fn alter_rename_rewrites_fk_references() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)", []).unwrap();
+    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
         [],
     )
     .unwrap();
-    db.execute("ALTER TABLE parent RENAME TO guardian", []).unwrap();
+    db.execute("ALTER TABLE parent RENAME TO guardian", [])
+        .unwrap();
     db.execute("PRAGMA foreign_keys = ON", []).unwrap();
     // FK now resolves against the renamed parent.
-    db.execute("INSERT INTO guardian (id) VALUES (1)", []).unwrap();
-    db.execute("INSERT INTO child (pid) VALUES (1)", []).unwrap();
+    db.execute("INSERT INTO guardian (id) VALUES (1)", [])
+        .unwrap();
+    db.execute("INSERT INTO child (pid) VALUES (1)", [])
+        .unwrap();
     let err = db.execute("INSERT INTO child (pid) VALUES (99)", []);
     assert!(err.is_err(), "FK must survive the rename");
     let err = db.execute("DELETE FROM guardian WHERE id = 1", []);
@@ -93,21 +107,35 @@ fn alter_rename_collision_rejected() {
     let err = db.execute("ALTER TABLE a RENAME TO b", []);
     assert!(err.is_err(), "rename onto an existing name must fail");
     // Both tables intact after the failure.
-    assert_eq!(db.query("SELECT COUNT(*) FROM a", []).unwrap()[0][0], Value::Integer(0));
-    assert_eq!(db.query("SELECT COUNT(*) FROM b", []).unwrap()[0][0], Value::Integer(0));
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM a", []).unwrap()[0][0],
+        Value::Integer(0)
+    );
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM b", []).unwrap()[0][0],
+        Value::Integer(0)
+    );
 }
 
 #[test]
 fn alter_add_column_basic() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
     db.execute("INSERT INTO t (x) VALUES (1), (2)", []).unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN name TEXT", []).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN name TEXT", [])
+        .unwrap();
     // Existing rows see NULL for the new column.
-    let rows = db.query("SELECT id, x, name FROM t ORDER BY id", []).unwrap();
-    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(1), Value::Null]);
+    let rows = db
+        .query("SELECT id, x, name FROM t ORDER BY id", [])
+        .unwrap();
+    assert_eq!(
+        rows[0],
+        vec![Value::Integer(1), Value::Integer(1), Value::Null]
+    );
     // New inserts can use it.
-    db.execute("INSERT INTO t (x, name) VALUES (3, 'three')", []).unwrap();
+    db.execute("INSERT INTO t (x, name) VALUES (3, 'three')", [])
+        .unwrap();
     let rows = db.query("SELECT name FROM t WHERE x = 3", []).unwrap();
     assert_eq!(rows, vec![vec![Value::Text("three".into())]]);
 }
@@ -115,16 +143,21 @@ fn alter_add_column_basic() {
 #[test]
 fn alter_add_column_default_backfill() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", []).unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'active'", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", [])
+        .unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'active'", [])
+        .unwrap();
     // Existing rows materialize the default (SQLite read-time semantics).
     let rows = db.query("SELECT status FROM t ORDER BY id", []).unwrap();
     for r in rows {
         assert_eq!(r[0], Value::Text("active".into()));
     }
     // COUNT on the defaulted column works.
-    let n = db.query("SELECT COUNT(*) FROM t WHERE status = 'active'", []).unwrap();
+    let n = db
+        .query("SELECT COUNT(*) FROM t WHERE status = 'active'", [])
+        .unwrap();
     assert_eq!(n[0][0], Value::Integer(3));
 }
 
@@ -140,7 +173,8 @@ fn alter_add_column_restrictions() {
     assert!(err.is_err());
     // NOT NULL WITH a default is fine.
     db.execute("INSERT INTO t VALUES (1)", []).unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN y INTEGER NOT NULL DEFAULT 0", []).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN y INTEGER NOT NULL DEFAULT 0", [])
+        .unwrap();
     let rows = db.query("SELECT y FROM t", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(0));
 }
@@ -151,15 +185,18 @@ fn alter_add_column_persists_across_reopen() {
     let path = tmp.path();
     {
         let mut db = Database::open(path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
         db.execute("INSERT INTO t (x) VALUES (5)", []).unwrap();
-        db.execute("ALTER TABLE t ADD COLUMN note TEXT DEFAULT 'hi'", []).unwrap();
+        db.execute("ALTER TABLE t ADD COLUMN note TEXT DEFAULT 'hi'", [])
+            .unwrap();
     }
     let mut db = Database::open(path).unwrap();
     let rows = db.query("SELECT x, note FROM t", []).unwrap();
     assert_eq!(rows[0], vec![Value::Integer(5), Value::Text("hi".into())]);
     // And new inserts see the wider column list.
-    db.execute("INSERT INTO t (x, note) VALUES (6, 'there')", []).unwrap();
+    db.execute("INSERT INTO t (x, note) VALUES (6, 'there')", [])
+        .unwrap();
     let rows = db.query("SELECT note FROM t WHERE x = 6", []).unwrap();
     assert_eq!(rows, vec![vec![Value::Text("there".into())]]);
 }
@@ -169,11 +206,13 @@ fn alter_add_column_with_index_still_works() {
     // Index maintenance after widening: inserts must update the index with
     // the full (wider) row encoding.
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
     db.execute("INSERT INTO t (x) VALUES (1)", []).unwrap();
     db.execute("CREATE INDEX ix ON t(x)", []).unwrap();
     db.execute("ALTER TABLE t ADD COLUMN tag TEXT", []).unwrap();
-    db.execute("INSERT INTO t (x, tag) VALUES (2, 'b')", []).unwrap();
+    db.execute("INSERT INTO t (x, tag) VALUES (2, 'b')", [])
+        .unwrap();
     let rows = db.query("SELECT tag FROM t WHERE x = 2", []).unwrap();
     assert_eq!(rows, vec![vec![Value::Text("b".into())]]);
     // DELETE by indexed column after the widen.
@@ -188,9 +227,12 @@ fn alter_rename_column_and_drop_work() {
     // tests/alter_column.rs for full coverage). The single-column
     // rejection for DROP is still enforced here.
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (x INTEGER, y INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x, y) VALUES (1, 2)", []).unwrap();
-    db.execute("ALTER TABLE t RENAME COLUMN x TO a", []).unwrap();
+    db.execute("CREATE TABLE t (x INTEGER, y INTEGER)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (x, y) VALUES (1, 2)", [])
+        .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN x TO a", [])
+        .unwrap();
     let rows = db.query("SELECT a, y FROM t", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(1));
     db.execute("ALTER TABLE t DROP COLUMN y", []).unwrap();

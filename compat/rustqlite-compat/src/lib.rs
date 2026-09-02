@@ -61,7 +61,7 @@ use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
 use std::os::raw::{c_double, c_uchar as u_uchar};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use rustqlite::types::Value;
 use rustqlite::{Database, Statement as EngineStatement, StepResult};
@@ -222,15 +222,28 @@ struct ConnState {
 struct Conn {
     id: usize,
     engine: Option<Arc<Engine>>,
-    /// True when this connection owns a private engine (`:memory:`).
-    private_engine: bool,
+    /// True when the connection was opened read-only (SQLITE_OPEN_READONLY
+    /// or `mode=ro`): preparing a database-mutating statement returns
+    /// SQLITE_READONLY (SQLite's readonly-connection semantics).
+    readonly: bool,
     state: ConnState,
     live_statements: AtomicUsize,
     /// Progress handler: (n_ops, callback, user ptr).
-    progress: StdMutex<(c_int, Option<unsafe extern "C" fn(*mut c_void) -> c_int>, *mut c_void)>,
+    progress: StdMutex<(
+        c_int,
+        Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        *mut c_void,
+    )>,
     /// Hooks: update / commit / rollback.
-    update_hook: StdMutex<Option<(*mut c_void, Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, i64)>)>>,
-    commit_hook: StdMutex<Option<(*mut c_void, Option<unsafe extern "C" fn(*mut c_void) -> c_int>)>>,
+    /// (C callback, user-data pointer) pairs — raw pointers are the sqlite3
+    /// hook ABI; each slot is mutex-guarded.
+    update_hook: StdMutex<UpdateHook>,
+    commit_hook: StdMutex<
+        Option<(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        )>,
+    >,
     rollback_hook: StdMutex<Option<(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>)>>,
     /// Collations / functions are registered on the SHARED engine — with
     /// one engine per file they are visible to every connection of that
@@ -238,15 +251,36 @@ struct Conn {
     _unused: (),
 }
 
+// SAFETY: `Conn` is handed to C as `sqlite3*` (a raw pointer, where
+// Send/Sync are meaningless to C). Rust-side, the only fields carrying
+// raw pointers are the C callback slots (progress/hooks), each guarded by
+// a StdMutex, and all database state lives behind the engine's own
+// RwLock. SQLite's default SQLITE_THREADSAFE=1 (serialized) builds allow
+// a connection to be used from multiple threads serially — which is
+// exactly what the `unsafe impl`s declare, and what sqlx-sqlite relies on
+// when it moves the handle to its worker thread.
+unsafe impl Send for Conn {}
+unsafe impl Sync for Conn {}
+
+/// sqlite3_update_hook slot: (user-data, callback) — the raw pointers are
+/// the C hook ABI, guarded by a StdMutex on the connection.
+type UpdateHook = Option<(
+    *mut c_void,
+    Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, i64)>,
+)>;
+
 impl Conn {
     fn set_err(&self, code: c_int, msg: &str) -> c_int {
         self.state.err_code.store(code as i64, Ordering::Release);
-        let c = CString::new(msg.replace('\0', " ")).unwrap_or_else(|_| CString::new("error").unwrap());
+        let c =
+            CString::new(msg.replace('\0', " ")).unwrap_or_else(|_| CString::new("error").unwrap());
         *self.state.err_msg.lock().unwrap() = c;
         code
     }
     fn clear_err(&self) {
-        self.state.err_code.store(SQLITE_OK as i64, Ordering::Release);
+        self.state
+            .err_code
+            .store(SQLITE_OK as i64, Ordering::Release);
         *self.state.err_msg.lock().unwrap() = CString::new("").unwrap();
     }
 }
@@ -255,13 +289,14 @@ impl Drop for Conn {
     fn drop(&mut self) {
         // Auto-rollback of an abandoned transaction (SQLite rolls back at
         // close when the connection had an open tx).
-        if let Some(engine) = &self.engine {
-            if self.state.in_tx.load(Ordering::Acquire) {
-                if engine.tx_owner.load(Ordering::Acquire) == self.id {
-                    let _ = engine.db.write().execute("ROLLBACK", []);
-                    engine.tx_owner.store(0, Ordering::Release);
-                }
-            }
+        if let Some(engine) = self
+            .engine
+            .as_ref()
+            .filter(|_| self.state.in_tx.load(Ordering::Acquire))
+            .filter(|e| e.tx_owner.load(Ordering::Acquire) == self.id)
+        {
+            let _ = engine.db.write().execute("ROLLBACK", []);
+            engine.tx_owner.store(0, Ordering::Release);
         }
     }
 }
@@ -284,8 +319,6 @@ enum StmtKind {
     /// BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / DDL / ATTACH /
     /// VACUUM / ALTER — executed once via Database::execute.
     Once,
-    /// Only whitespace / comments remained.
-    Empty,
 }
 
 fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
@@ -293,11 +326,21 @@ fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
     match stmt {
         S::Select(_) => StmtKind::Select,
         S::Explain(_) => StmtKind::Select,
-        S::Insert(i) => StmtKind::Dml { returning: i.returning.is_some() },
-        S::Update(u) => StmtKind::Dml { returning: u.returning.is_some() },
-        S::Delete(d) => StmtKind::Dml { returning: d.returning.is_some() },
+        S::Insert(i) => StmtKind::Dml {
+            returning: i.returning.is_some(),
+        },
+        S::Update(u) => StmtKind::Dml {
+            returning: u.returning.is_some(),
+        },
+        S::Delete(d) => StmtKind::Dml {
+            returning: d.returning.is_some(),
+        },
         S::Pragma(p) => {
-            if p.value.is_some() { StmtKind::PragmaWrite } else { StmtKind::PragmaRead }
+            if p.value.is_some() {
+                StmtKind::PragmaWrite
+            } else {
+                StmtKind::PragmaRead
+            }
         }
         _ => StmtKind::Once,
     }
@@ -326,7 +369,11 @@ enum Exec {
     Once { sql: String },
     /// Read-pragma / query form: run `Database::query_with_columns` on the
     /// first step and serve the buffered rows.
-    Query { sql: String, rows: std::vec::IntoIter<Vec<Value>>, columns: Vec<String> },
+    Query {
+        sql: String,
+        rows: std::vec::IntoIter<Vec<Value>>,
+        columns: Vec<String>,
+    },
 }
 
 struct Stmt {
@@ -400,9 +447,13 @@ fn engine_err_code(e: &rustqlite::Error) -> c_int {
     use rustqlite::Error as E;
     match e {
         E::Io(io) => {
-            if io.kind() == std::io::ErrorKind::PermissionDenied { SQLITE_PERM }
-            else if io.kind() == std::io::ErrorKind::NotFound { SQLITE_CANTOPEN }
-            else { SQLITE_IOERR }
+            if io.kind() == std::io::ErrorKind::PermissionDenied {
+                SQLITE_PERM
+            } else if io.kind() == std::io::ErrorKind::NotFound {
+                SQLITE_CANTOPEN
+            } else {
+                SQLITE_IOERR
+            }
         }
         E::Corruption(_) | E::Btree(_) | E::Wal(_) => SQLITE_CORRUPT,
         E::Constraint(msg) => {
@@ -424,9 +475,7 @@ fn engine_err_code(e: &rustqlite::Error) -> c_int {
         }
         E::Transaction(_) => SQLITE_BUSY,
         E::Lex { .. } | E::Parse { .. } => SQLITE_ERROR,
-        E::Semantic(_) => {
-            if msg.contains("already exists") { SQLITE_ERROR } else { SQLITE_ERROR }
-        }
+        E::Semantic(_) => SQLITE_ERROR, // already-exists and other semantic errors share SQLITE_ERROR
         E::NotFound(_) => SQLITE_ERROR,
         E::AlreadyExists(_) => SQLITE_ERROR,
         E::Planner(_) | E::Runtime(_) => SQLITE_ERROR,
@@ -437,6 +486,20 @@ fn engine_err_code(e: &rustqlite::Error) -> c_int {
 
 fn set_conn_err(conn: &Conn, e: &rustqlite::Error) -> c_int {
     conn.set_err(engine_err_code(e), &engine_err_msg(e))
+}
+
+/// Would executing this AST mutate the database? (Read-only connection
+/// enforcement — see `Conn::readonly`.)
+fn ast_mutates_database(stmt: &rustqlite::sql::ast::Statement) -> bool {
+    use rustqlite::sql::ast::Statement as S;
+    match stmt {
+        S::Select(_) | S::Explain(_) => false,
+        S::Begin(_) | S::Commit | S::Rollback(_) | S::Savepoint(_) | S::Release(_) => false,
+        S::Pragma(p) => p.value.is_some(),
+        // INSERT / UPDATE / DELETE / CREATE / DROP / ALTER / ATTACH /
+        // DETACH / VACUUM all mutate.
+        _ => true,
+    }
 }
 
 /// The user-visible message WITHOUT the engine's taxonomy prefix
@@ -486,11 +549,15 @@ fn scan_stmt_end(sql: &[u8]) -> usize {
                 i += 1;
             }
             b'-' if i + 1 < sql.len() && sql[i + 1] == b'-' => {
-                while i < sql.len() && sql[i] != b'\n' { i += 1; }
+                while i < sql.len() && sql[i] != b'\n' {
+                    i += 1;
+                }
             }
             b'/' if i + 1 < sql.len() && sql[i + 1] == b'*' => {
                 i += 2;
-                while i + 1 < sql.len() && !(sql[i] == b'*' && sql[i + 1] == b'/') { i += 1; }
+                while i + 1 < sql.len() && !(sql[i] == b'*' && sql[i + 1] == b'/') {
+                    i += 1;
+                }
                 i += 2.min(sql.len() - i);
             }
             b';' => return i + 1,
@@ -606,7 +673,7 @@ enum OpenTarget {
     File(PathBuf),
 }
 
-fn resolve_open_target(filename: &str, flags: c_int) -> Result<OpenTarget, String> {
+fn resolve_open_target(filename: &str, flags: c_int) -> Result<(OpenTarget, bool), String> {
     let uri = if flags & SQLITE_OPEN_URI != 0 {
         parse_uri(filename)
     } else {
@@ -615,26 +682,26 @@ fn resolve_open_target(filename: &str, flags: c_int) -> Result<OpenTarget, Strin
     if let Some(u) = uri {
         if u.mode_memory {
             if u.cache_shared {
-                return Ok(OpenTarget::Shared(format!("mem:{}", u.path)));
+                return Ok((OpenTarget::Shared(format!("mem:{}", u.path)), u.readonly));
             }
-            return Ok(OpenTarget::PrivateMemory);
+            return Ok((OpenTarget::PrivateMemory, u.readonly));
         }
         if u.path.is_empty() {
-            return Ok(OpenTarget::PrivateMemory);
+            return Ok((OpenTarget::PrivateMemory, u.readonly));
         }
-        return Ok(OpenTarget::File(PathBuf::from(u.path)));
+        return Ok((OpenTarget::File(PathBuf::from(u.path)), u.readonly));
     }
     if filename == ":memory:" {
-        return Ok(OpenTarget::PrivateMemory);
+        return Ok((OpenTarget::PrivateMemory, false));
     }
     if filename.is_empty() {
         // SQLite: empty filename = a temporary on-disk database. We map it
         // to a private temp file.
         let mut p = std::env::temp_dir();
         p.push(format!("rustqlite-anon-{}.db", std::process::id()));
-        return Ok(OpenTarget::File(p));
+        return Ok((OpenTarget::File(p), false));
     }
-    Ok(OpenTarget::File(PathBuf::from(filename)))
+    Ok((OpenTarget::File(PathBuf::from(filename)), false))
 }
 
 fn open_engine(target: &OpenTarget, create: bool, readonly: bool) -> Result<Database, String> {
@@ -678,10 +745,13 @@ fn acquire_engine(
     match target {
         OpenTarget::PrivateMemory => {
             let db = open_engine(target, create, readonly)?;
-            Ok((Some(Arc::new(Engine {
-                db: parking_lot::RwLock::new(db),
-                tx_owner: AtomicUsize::new(0),
-            })), true))
+            Ok((
+                Some(Arc::new(Engine {
+                    db: parking_lot::RwLock::new(db),
+                    tx_owner: AtomicUsize::new(0),
+                })),
+                true,
+            ))
         }
         OpenTarget::Shared(key) => {
             let mut map = engines().lock().unwrap();
@@ -720,11 +790,11 @@ fn acquire_engine(
 // Connection lifecycle
 // ---------------------------------------------------------------------------
 
-fn new_conn(engine: Option<Arc<Engine>>, private: bool) -> Arc<Conn> {
+fn new_conn(engine: Option<Arc<Engine>>, readonly: bool) -> Arc<Conn> {
     Arc::new(Conn {
         id: next_conn_id(),
         engine,
-        private_engine: private,
+        readonly,
         state: ConnState {
             in_tx: AtomicBool::new(false),
             busy_timeout_ms: AtomicI64::new(0),
@@ -780,8 +850,8 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         Some(s) => s,
         None => return SQLITE_MISUSE,
     };
-    let target = match resolve_open_target(name, flags) {
-        Ok(t) => t,
+    let (target, uri_readonly) = match resolve_open_target(name, flags) {
+        Ok(v) => v,
         Err(e) => {
             // Error-state handle so sqlite3_errmsg works (SQLite behavior).
             let conn = new_conn(None, false);
@@ -791,8 +861,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
     let create = flags & SQLITE_OPEN_CREATE != 0;
-    let readonly = flags & SQLITE_OPEN_READONLY != 0;
-    let (engine, private) = match acquire_engine(&target, create, readonly) {
+    // Read-only when either the open flag or the URI's mode=ro says so.
+    let readonly = (flags & SQLITE_OPEN_READONLY != 0) || uri_readonly;
+    let (engine, _private) = match acquire_engine(&target, create, readonly) {
         Ok(v) => v,
         Err(e) => {
             let conn = new_conn(None, false);
@@ -806,7 +877,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         // Seed connection counters from the shared engine.
         let _ = e.total_changes();
     }
-    let conn = new_conn(engine, private);
+    let conn = new_conn(engine, readonly);
     *ppdb = Arc::into_raw(conn) as *mut sqlite3;
     SQLITE_OK
 }
@@ -911,7 +982,8 @@ pub unsafe extern "C" fn sqlite3_extended_result_codes(_db: *mut sqlite3, _on: c
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_libversion() -> *const c_char {
     static V: OnceLock<CString> = OnceLock::new();
-    V.get_or_init(|| CString::new(SQLITE_LIBVERSION).unwrap()).as_ptr()
+    V.get_or_init(|| CString::new(SQLITE_LIBVERSION).unwrap())
+        .as_ptr()
 }
 
 #[no_mangle]
@@ -995,7 +1067,11 @@ pub unsafe extern "C" fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int {
         return 0;
     }
     let conn = &*(db as *const Conn);
-    if conn.state.in_tx.load(Ordering::Acquire) { 0 } else { 1 }
+    if conn.state.in_tx.load(Ordering::Acquire) {
+        0
+    } else {
+        1
+    }
 }
 
 #[no_mangle]
@@ -1004,7 +1080,9 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: c_int) -> c_
         return SQLITE_MISUSE;
     }
     let conn = &*(db as *const Conn);
-    conn.state.busy_timeout_ms.store(ms as i64, Ordering::Release);
+    conn.state
+        .busy_timeout_ms
+        .store(ms as i64, Ordering::Release);
     SQLITE_OK
 }
 
@@ -1022,7 +1100,8 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 /// Sleep waiting for the engine-level transaction lock, honoring
 /// busy_timeout. Returns true if acquired.
 fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
         let owner = engine.tx_owner.load(Ordering::Acquire);
         if owner == 0 || owner == conn_id {
@@ -1042,10 +1121,9 @@ fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool 
 fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> {
     use rustqlite::sql::ast::Statement as S;
     let mut slots = Vec::new();
-    let mut positional_counter = 0usize; // next implicit `?` index
     let mut max_explicit = 0usize; // highest ?N seen
     match stmt {
-        S::Select(s) => collect_select(s, &mut slots, &mut positional_counter, &mut max_explicit),
+        S::Select(s) => collect_select(s, &mut slots, &mut max_explicit),
         S::Insert(i) => {
             if let Some(cols) = &i.columns {
                 for _ in cols {
@@ -1056,52 +1134,49 @@ fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> 
                 rustqlite::sql::ast::InsertSource::Values(rows) => {
                     for row in rows {
                         for e in row {
-                            walk_expr(e, &mut slots, &mut positional_counter, &mut max_explicit);
+                            walk_expr(e, &mut slots, &mut max_explicit);
                         }
                     }
                 }
                 rustqlite::sql::ast::InsertSource::Select(sel) => {
-                    collect_select(sel, &mut slots, &mut positional_counter, &mut max_explicit);
+                    collect_select(sel, &mut slots, &mut max_explicit);
                 }
                 _ => {}
             }
             if let Some(u) = &i.upsert {
                 if let rustqlite::sql::ast::UpsertAction::DoUpdate { set, .. } = &u.action {
                     for (_, e) in set {
-                        walk_expr(e, &mut slots, &mut positional_counter, &mut max_explicit);
+                        walk_expr(e, &mut slots, &mut max_explicit);
                     }
                 }
             }
             if let Some(rcs) = &i.returning {
-                collect_result_columns(rcs, &mut slots, &mut positional_counter, &mut max_explicit);
+                collect_result_columns(rcs, &mut slots, &mut max_explicit);
             }
         }
         S::Update(u) => {
             for (_, e) in &u.set {
-                walk_expr(e, &mut slots, &mut positional_counter, &mut max_explicit);
+                walk_expr(e, &mut slots, &mut max_explicit);
             }
             if let Some(w) = &u.where_clause {
-                walk_expr(w, &mut slots, &mut positional_counter, &mut max_explicit);
+                walk_expr(w, &mut slots, &mut max_explicit);
             }
             if let Some(rcs) = &u.returning {
-                collect_result_columns(rcs, &mut slots, &mut positional_counter, &mut max_explicit);
+                collect_result_columns(rcs, &mut slots, &mut max_explicit);
             }
         }
         S::Delete(d) => {
             if let Some(w) = &d.where_clause {
-                walk_expr(w, &mut slots, &mut positional_counter, &mut max_explicit);
+                walk_expr(w, &mut slots, &mut max_explicit);
             }
             if let Some(rcs) = &d.returning {
-                collect_result_columns(rcs, &mut slots, &mut positional_counter, &mut max_explicit);
+                collect_result_columns(rcs, &mut slots, &mut max_explicit);
             }
         }
-        S::Pragma(p) => {
-            if let Some(v) = &p.value {
-                if let rustqlite::sql::ast::PragmaValue::Expr(e) = v {
-                    walk_expr(e, &mut slots, &mut positional_counter, &mut max_explicit);
-                }
-            }
-        }
+        S::Pragma(rustqlite::sql::ast::PragmaStatement {
+            value: Some(rustqlite::sql::ast::PragmaValue::Expr(e)),
+            ..
+        }) => walk_expr(e, &mut slots, &mut max_explicit),
         _ => {}
     }
     let _ = max_explicit;
@@ -1111,10 +1186,9 @@ fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> 
 fn collect_select(
     s: &rustqlite::sql::ast::SelectStatement,
     slots: &mut Vec<ParamSlot>,
-    positional_counter: &mut usize,
     max_explicit: &mut usize,
 ) {
-    use rustqlite::sql::ast::{SelectBody, SimpleSelect};
+    use rustqlite::sql::ast::SelectBody;
     let body = match &s.body {
         SelectBody::Simple(sel) => sel,
         // Compound selects: walk the LEFT-most simple body only — the
@@ -1128,49 +1202,43 @@ fn collect_select(
     };
     for rc in &body.columns {
         if let rustqlite::sql::ast::ResultColumn::Expr { expr, .. } = rc {
-            walk_expr(expr, slots, positional_counter, max_explicit);
+            walk_expr(expr, slots, max_explicit);
         }
     }
     if let Some(w) = &body.where_clause {
-        walk_expr(w, slots, positional_counter, max_explicit);
+        walk_expr(w, slots, max_explicit);
     }
     for t in &body.group_by {
-        walk_expr(t, slots, positional_counter, max_explicit);
+        walk_expr(t, slots, max_explicit);
     }
     if let Some(h) = &body.having {
-        walk_expr(h, slots, positional_counter, max_explicit);
+        walk_expr(h, slots, max_explicit);
     }
     // ORDER BY / LIMIT live on the SelectStatement, not the body.
     for o in &s.order_by {
-        walk_expr(&o.expr, slots, positional_counter, max_explicit);
+        walk_expr(&o.expr, slots, max_explicit);
     }
     if let Some(l) = &s.limit {
-        walk_expr(l, slots, positional_counter, max_explicit);
+        walk_expr(l, slots, max_explicit);
     }
     if let Some(off) = &s.offset {
-        walk_expr(off, slots, positional_counter, max_explicit);
+        walk_expr(off, slots, max_explicit);
     }
 }
 
 fn collect_result_columns(
     rcs: &[rustqlite::sql::ast::ResultColumn],
     slots: &mut Vec<ParamSlot>,
-    positional_counter: &mut usize,
     max_explicit: &mut usize,
 ) {
     for rc in rcs {
         if let rustqlite::sql::ast::ResultColumn::Expr { expr, .. } = rc {
-            walk_expr(expr, slots, positional_counter, max_explicit);
+            walk_expr(expr, slots, max_explicit);
         }
     }
 }
 
-fn walk_expr(
-    e: &rustqlite::sql::ast::Expr,
-    slots: &mut Vec<ParamSlot>,
-    positional_counter: &mut usize,
-    max_explicit: &mut usize,
-) {
+fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_explicit: &mut usize) {
     use rustqlite::sql::ast::Expr;
     match e {
         Expr::Parameter(name) => {
@@ -1186,58 +1254,70 @@ fn walk_expr(
             }
         }
         Expr::Binary { left, right, .. } => {
-            walk_expr(left, slots, positional_counter, max_explicit);
-            walk_expr(right, slots, positional_counter, max_explicit);
+            walk_expr(left, slots, max_explicit);
+            walk_expr(right, slots, max_explicit);
         }
-        Expr::Unary { expr, .. } => walk_expr(expr, slots, positional_counter, max_explicit),
+        Expr::Unary { expr, .. } => walk_expr(expr, slots, max_explicit),
         Expr::Function { args, .. } => {
             for a in args {
-                walk_expr(a, slots, positional_counter, max_explicit);
+                walk_expr(a, slots, max_explicit);
             }
         }
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             if let Some(o) = operand {
-                walk_expr(o, slots, positional_counter, max_explicit);
+                walk_expr(o, slots, max_explicit);
             }
             for (w, t) in whens {
-                walk_expr(w, slots, positional_counter, max_explicit);
-                walk_expr(t, slots, positional_counter, max_explicit);
+                walk_expr(w, slots, max_explicit);
+                walk_expr(t, slots, max_explicit);
             }
             if let Some(el) = else_ {
-                walk_expr(el, slots, positional_counter, max_explicit);
+                walk_expr(el, slots, max_explicit);
             }
         }
-        Expr::In { source, .. } => {
-            if let rustqlite::sql::ast::InSource::List(items) = source {
-                for i in items {
-                    walk_expr(i, slots, positional_counter, max_explicit);
-                }
+        Expr::In {
+            source: rustqlite::sql::ast::InSource::List(items),
+            ..
+        } => {
+            for i in items {
+                walk_expr(i, slots, max_explicit);
             }
         }
-        Expr::Between { expr, low, high, .. } => {
-            walk_expr(expr, slots, positional_counter, max_explicit);
-            walk_expr(low, slots, positional_counter, max_explicit);
-            walk_expr(high, slots, positional_counter, max_explicit);
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_expr(expr, slots, max_explicit);
+            walk_expr(low, slots, max_explicit);
+            walk_expr(high, slots, max_explicit);
         }
-        Expr::Cast { expr, .. } => walk_expr(expr, slots, positional_counter, max_explicit),
-        Expr::Collate { expr, .. } => walk_expr(expr, slots, positional_counter, max_explicit),
+        Expr::Cast { expr, .. } => walk_expr(expr, slots, max_explicit),
+        Expr::Collate { expr, .. } => walk_expr(expr, slots, max_explicit),
         Expr::Exists(..) | Expr::Subquery(..) => {}
-        Expr::IsNull { expr, .. } => walk_expr(expr, slots, positional_counter, max_explicit),
+        Expr::IsNull { expr, .. } => walk_expr(expr, slots, max_explicit),
         Expr::Row(items) => {
             for i in items {
-                walk_expr(i, slots, positional_counter, max_explicit);
+                walk_expr(i, slots, max_explicit);
             }
         }
-        Expr::Like { expr, pattern, escape, .. } => {
-            walk_expr(expr, slots, positional_counter, max_explicit);
-            walk_expr(pattern, slots, positional_counter, max_explicit);
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            walk_expr(expr, slots, max_explicit);
+            walk_expr(pattern, slots, max_explicit);
             if let Some(es) = escape {
-                walk_expr(es, slots, positional_counter, max_explicit);
+                walk_expr(es, slots, max_explicit);
             }
         }
         Expr::Is { left, right, .. } => {
-            walk_expr(left, slots, positional_counter, max_explicit);
-            walk_expr(right, slots, positional_counter, max_explicit);
+            walk_expr(left, slots, max_explicit);
+            walk_expr(right, slots, max_explicit);
         }
         _ => {}
     }
@@ -1313,6 +1393,12 @@ unsafe fn prepare_impl(
         Ok(a) => a,
         Err(e) => return set_conn_err(conn, &e),
     };
+    // Read-only connections reject database-mutating statements at
+    // PREPARE (SQLite's SQLITE_READONLY for a readonly connection —
+    // transaction control and SELECTs are unaffected).
+    if conn.readonly && ast_mutates_database(&ast) {
+        return conn.set_err(SQLITE_READONLY, "attempt to write a readonly database");
+    }
     let kind = classify(&ast);
     let is_write = matches!(
         kind,
@@ -1322,7 +1408,6 @@ unsafe fn prepare_impl(
 
     let mut static_columns: Vec<CString> = Vec::new();
     let exec: Exec = match &kind {
-        StmtKind::Empty => return SQLITE_OK,
         StmtKind::Select | StmtKind::Dml { .. } => {
             let eng_stmt = {
                 let rd = engine.db.read();
@@ -1402,11 +1487,27 @@ unsafe fn prepare_impl(
             if let Ok(c) = CString::new(name) {
                 static_columns.push(c);
             }
-            Exec::Query { sql: stmt_text.clone(), rows: Vec::new().into_iter(), columns: Vec::new() }
+            Exec::Query {
+                sql: stmt_text.clone(),
+                rows: Vec::new().into_iter(),
+                columns: Vec::new(),
+            }
         }
-        StmtKind::PragmaWrite | StmtKind::Once => Exec::Once { sql: stmt_text.clone() },
+        StmtKind::PragmaWrite | StmtKind::Once => Exec::Once {
+            sql: stmt_text.clone(),
+        },
     };
-    finish_prepare(conn, engine, stmt_text, kind, is_write, exec, params, static_columns, pp_stmt)
+    finish_prepare(
+        conn,
+        engine,
+        stmt_text,
+        kind,
+        is_write,
+        exec,
+        params,
+        static_columns,
+        pp_stmt,
+    )
 }
 
 /// Build the statement handle and store it at `*pp_stmt`.
@@ -1522,10 +1623,7 @@ fn run_once(stmt: &mut Stmt) -> c_int {
     if is_tx {
         let is_begin = matches!(ast, Some(rustqlite::sql::ast::Statement::Begin(_)));
         let is_commit = matches!(ast, Some(rustqlite::sql::ast::Statement::Commit));
-        let is_rollback = matches!(
-            ast,
-            Some(rustqlite::sql::ast::Statement::Rollback(_))
-        );
+        let is_rollback = matches!(ast, Some(rustqlite::sql::ast::Statement::Rollback(_)));
         if is_begin {
             if conn.state.in_tx.load(Ordering::Acquire) {
                 return conn.set_err(
@@ -1583,7 +1681,9 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                 conn.state.changes.store(delta, Ordering::Release);
                 conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
                 if delta > 0 {
-                    conn.state.last_rowid.store(engine.last_rowid(), Ordering::Release);
+                    conn.state
+                        .last_rowid
+                        .store(engine.last_rowid(), Ordering::Release);
                     fire_update_hook(&conn, &sql, engine.last_rowid());
                 }
                 conn.clear_err();
@@ -1618,7 +1718,9 @@ fn fire_rollback_hook(conn: &Arc<Conn>) {
 /// kind — fires after any DML that changed rows.
 fn fire_update_hook(conn: &Arc<Conn>, sql: &str, rowid: i64) {
     let h = conn.update_hook.lock().unwrap();
-    let Some((ctx, Some(cb))) = h.as_ref().copied() else { return };
+    let Some((ctx, Some(cb))) = h.as_ref().copied() else {
+        return;
+    };
     drop(h);
     let lower = sql.trim_start().to_ascii_lowercase();
     let (op, table) = if lower.starts_with("insert") {
@@ -1645,11 +1747,14 @@ fn table_name_of(sql: &str) -> String {
     for i in 0..toks.len().saturating_sub(1) {
         let t = toks[i].to_ascii_uppercase();
         if (t == "INTO" || t == "UPDATE" || t == "FROM")
-            && (i > 0 && (toks[i - 1].eq_ignore_ascii_case("insert")
-                || toks[i - 1].eq_ignore_ascii_case("update")
-                || toks[i - 1].eq_ignore_ascii_case("delete")))
+            && (i > 0
+                && (toks[i - 1].eq_ignore_ascii_case("insert")
+                    || toks[i - 1].eq_ignore_ascii_case("update")
+                    || toks[i - 1].eq_ignore_ascii_case("delete")))
         {
-            return toks[i + 1].trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']').to_string();
+            return toks[i + 1]
+                .trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']')
+                .to_string();
         }
     }
     String::new()
@@ -1750,13 +1855,16 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
             if delta > 0 {
                 conn.state.changes.store(delta, Ordering::Release);
                 conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
-                conn.state.last_rowid.store(engine.last_rowid(), Ordering::Release);
+                conn.state
+                    .last_rowid
+                    .store(engine.last_rowid(), Ordering::Release);
                 s.changes_reported = true;
                 if !s.hook_fired {
                     fire_update_hook(&conn, &s.sql.to_string_lossy(), engine.last_rowid());
                     s.hook_fired = true;
                 }
-            } else if matches!(s.kind, StmtKind::Dml { .. }) && eng_done(&outcome)
+            } else if matches!(s.kind, StmtKind::Dml { .. })
+                && eng_done(&outcome)
                 && !s.changes_reported
             {
                 // 0-row DML: SQLite reports changes() == 0 — but only
@@ -1849,8 +1957,14 @@ pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_in
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> c_int {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0 };
-    if s.is_write { 0 } else { 1 }
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0;
+    };
+    if s.is_write {
+        0
+    } else {
+        1
+    }
 }
 
 #[no_mangle]
@@ -1900,7 +2014,11 @@ pub unsafe extern "C" fn sqlite3_bind_int(stmt: *mut sqlite3_stmt, idx: c_int, v
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_bind_double(stmt: *mut sqlite3_stmt, idx: c_int, v: c_double) -> c_int {
+pub unsafe extern "C" fn sqlite3_bind_double(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    v: c_double,
+) -> c_int {
     bind_value(stmt, idx, Value::Real(v))
 }
 
@@ -1994,7 +2112,9 @@ pub unsafe extern "C" fn sqlite3_bind_zeroblob(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_count(stmt: *mut sqlite3_stmt) -> c_int {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0 };
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0;
+    };
     s.params.len() as c_int
 }
 
@@ -2021,7 +2141,9 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_index(
     stmt: *mut sqlite3_stmt,
     name: *const c_char,
 ) -> c_int {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0 };
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0;
+    };
     let Some(name) = cstr(name) else { return 0 };
     for (i, slot) in s.params.iter().enumerate() {
         if let ParamSlot::Named(n) = slot {
@@ -2039,7 +2161,9 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_index(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> c_int {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0 };
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0;
+    };
     if let Exec::Rows(eng) = &s.exec {
         if s.static_columns.is_empty() {
             let n = eng.column_count();
@@ -2074,7 +2198,10 @@ pub unsafe extern "C" fn sqlite3_column_name(stmt: *mut sqlite3_stmt, i: c_int) 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_column_decltype(_stmt: *mut sqlite3_stmt, _i: c_int) -> *const c_char {
+pub unsafe extern "C" fn sqlite3_column_decltype(
+    _stmt: *mut sqlite3_stmt,
+    _i: c_int,
+) -> *const c_char {
     // No declared-type tracking at the C ABI layer yet; sqlx falls back to
     // the runtime column type (NULL decltype is the SQLite behavior for
     // expressions).
@@ -2137,8 +2264,12 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
     let Some(engine) = &conn.engine else {
         return SQLITE_MISUSE;
     };
-    let Some(table) = cstr(table_name) else { return SQLITE_MISUSE };
-    let Some(column) = cstr(column_name) else { return SQLITE_MISUSE };
+    let Some(table) = cstr(table_name) else {
+        return SQLITE_MISUSE;
+    };
+    let Some(column) = cstr(column_name) else {
+        return SQLITE_MISUSE;
+    };
     let rd = engine.db.read();
     let meta = rd.table_column_metadata(table, column);
     match meta {
@@ -2191,7 +2322,9 @@ fn stmt_value(s: &Stmt, i: usize) -> Option<Value> {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_type(stmt: *mut sqlite3_stmt, i: c_int) -> c_int {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return SQLITE_NULL };
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return SQLITE_NULL;
+    };
     match stmt_value(s, i as usize) {
         Some(Value::Null) | None => SQLITE_NULL,
         Some(Value::Integer(_)) => SQLITE_INTEGER,
@@ -2203,8 +2336,12 @@ pub unsafe extern "C" fn sqlite3_column_type(stmt: *mut sqlite3_stmt, i: c_int) 
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, i: c_int) -> i64 {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0 };
-    stmt_value(s, i as usize).map(|v| v.as_integer()).unwrap_or(0)
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0;
+    };
+    stmt_value(s, i as usize)
+        .map(|v| v.as_integer())
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -2214,8 +2351,12 @@ pub unsafe extern "C" fn sqlite3_column_int(stmt: *mut sqlite3_stmt, i: c_int) -
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, i: c_int) -> f64 {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0.0 };
-    stmt_value(s, i as usize).map(|v| v.as_real()).unwrap_or(0.0)
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0.0;
+    };
+    stmt_value(s, i as usize)
+        .map(|v| v.as_real())
+        .unwrap_or(0.0)
 }
 
 #[no_mangle]
@@ -2231,7 +2372,9 @@ pub unsafe extern "C" fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, i: c_int) 
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, i: c_int) -> c_int {
-    let Some(s) = (stmt as *const Stmt).as_ref() else { return 0 };
+    let Some(s) = (stmt as *const Stmt).as_ref() else {
+        return 0;
+    };
     match stmt_value(s, i as usize) {
         Some(Value::Blob(b)) => b.len() as c_int,
         Some(Value::Text(t)) => t.as_bytes().len() as c_int,
@@ -2386,7 +2529,10 @@ pub unsafe extern "C" fn sqlite3_value_nochange(_v: *const sqlite3_value) -> c_i
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_pointer(v: *const sqlite3_value, _name: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn sqlite3_value_pointer(
+    v: *const sqlite3_value,
+    _name: *const c_char,
+) -> *mut c_void {
     let _ = v;
     std::ptr::null_mut()
 }
@@ -2448,7 +2594,11 @@ pub unsafe extern "C" fn sqlite3_result_blob(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_error(ctx: *mut sqlite3_context, msg: *const c_char, len: c_int) {
+pub unsafe extern "C" fn sqlite3_result_error(
+    ctx: *mut sqlite3_context,
+    msg: *const c_char,
+    len: c_int,
+) {
     plugin_abi::api_result_error(ctx as *mut plugin_abi::RqlContext, msg, len);
 }
 
@@ -2477,10 +2627,7 @@ pub unsafe extern "C" fn sqlite3_context_db_handle(_ctx: *mut sqlite3_context) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_get_auxdata(
-    _ctx: *mut sqlite3_context,
-    _n: c_int,
-) -> *mut c_void {
+pub unsafe extern "C" fn sqlite3_get_auxdata(_ctx: *mut sqlite3_context, _n: c_int) -> *mut c_void {
     // No aux-data caching yet (regexp recompiles per call — correct, slower).
     std::ptr::null_mut()
 }
@@ -2527,13 +2674,21 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     let xf = x_func.map(|f| unsafe {
         std::mem::transmute::<
             unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value),
-            unsafe extern "C" fn(*mut plugin_abi::RqlContext, c_int, *mut *mut plugin_abi::RqlValue),
+            unsafe extern "C" fn(
+                *mut plugin_abi::RqlContext,
+                c_int,
+                *mut *mut plugin_abi::RqlValue,
+            ),
         >(f)
     });
     let xs = x_step.map(|f| unsafe {
         std::mem::transmute::<
             unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value),
-            unsafe extern "C" fn(*mut plugin_abi::RqlContext, c_int, *mut *mut plugin_abi::RqlValue),
+            unsafe extern "C" fn(
+                *mut plugin_abi::RqlContext,
+                c_int,
+                *mut *mut plugin_abi::RqlValue,
+            ),
         >(f)
     });
     let xfin = x_final; // same signature
@@ -2583,7 +2738,9 @@ pub unsafe extern "C" fn sqlite3_create_function(
     x_step: Option<unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value)>,
     x_final: Option<unsafe extern "C" fn(*mut sqlite3_context)>,
 ) -> c_int {
-    sqlite3_create_function_v2(db, z_name, n_arg, e_text_rep, p_app, x_func, x_step, x_final, None)
+    sqlite3_create_function_v2(
+        db, z_name, n_arg, e_text_rep, p_app, x_func, x_step, x_final, None,
+    )
 }
 
 #[no_mangle]
@@ -2592,7 +2749,9 @@ pub unsafe extern "C" fn sqlite3_create_collation(
     z_name: *const c_char,
     _e_text_rep: c_int,
     p_arg: *mut c_void,
-    cmp: Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>,
+    cmp: Option<
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+    >,
 ) -> c_int {
     let conn: &Conn = match (db as *const Conn).as_ref() {
         Some(c) => c,
@@ -2627,7 +2786,9 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     z_name: *const c_char,
     e_text_rep: c_int,
     p_arg: *mut c_void,
-    cmp: Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>,
+    cmp: Option<
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+    >,
     _x_destroy: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> c_int {
     sqlite3_create_collation(db, z_name, e_text_rep, p_arg, cmp)
@@ -2644,7 +2805,9 @@ pub unsafe extern "C" fn sqlite3_progress_handler(
     cb: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     ctx: *mut c_void,
 ) {
-    let Some(conn) = (db as *const Conn).as_ref() else { return };
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return;
+    };
     *conn.progress.lock().unwrap() = (n, cb, ctx);
 }
 
@@ -2714,17 +2877,16 @@ pub unsafe extern "C" fn sqlite3_exec(
         Some(c) => c,
         None => return SQLITE_MISUSE,
     };
-    let Some(engine) = &conn.engine else {
+    if conn.engine.is_none() {
         return conn.set_err(SQLITE_MISUSE, "connection is in error state");
-    };
+    }
     let Some(sql) = cstr(sql) else {
         return conn.set_err(SQLITE_MISUSE, "invalid SQL text");
     };
     // Run each statement in the script through the prepare+step machinery
     // (reuses transaction and busy handling).
     let mut remaining = sql.to_string();
-    let mut rc = SQLITE_OK;
-    let mut first = true;
+    let mut rc;
     while !remaining.trim().is_empty() {
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
         let mut tail: *const c_char = std::ptr::null();
@@ -2751,9 +2913,7 @@ pub unsafe extern "C" fn sqlite3_exec(
         }
         let consumed = tail as usize - c_sql.as_ptr() as usize;
         remaining = c_sql.to_string_lossy()[consumed..].to_string();
-        first = false;
     }
-    let _ = first;
     conn.clear_err();
     SQLITE_OK
 }
@@ -2837,7 +2997,9 @@ pub unsafe extern "C" fn sqlite3_unlock_notify(
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_preupdate_hook(
     _db: *mut sqlite3,
-    _cb: Option<unsafe extern "C" fn(*mut c_void, *mut sqlite3, c_int, *const c_char, *const c_char, i64)>,
+    _cb: Option<
+        unsafe extern "C" fn(*mut c_void, *mut sqlite3, c_int, *const c_char, *const c_char, i64),
+    >,
     _ctx: *mut c_void,
 ) {
 }
@@ -2851,11 +3013,19 @@ pub unsafe extern "C" fn sqlite3_preupdate_depth(_stmt: *mut sqlite3_stmt) -> c_
     0
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_preupdate_old(_stmt: *mut sqlite3_stmt, _i: c_int, _pp: *mut *mut sqlite3_value) -> c_int {
+pub unsafe extern "C" fn sqlite3_preupdate_old(
+    _stmt: *mut sqlite3_stmt,
+    _i: c_int,
+    _pp: *mut *mut sqlite3_value,
+) -> c_int {
     SQLITE_ERROR
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_preupdate_new(_stmt: *mut sqlite3_stmt, _i: c_int, _pp: *mut *mut sqlite3_value) -> c_int {
+pub unsafe extern "C" fn sqlite3_preupdate_new(
+    _stmt: *mut sqlite3_stmt,
+    _i: c_int,
+    _pp: *mut *mut sqlite3_value,
+) -> c_int {
     SQLITE_ERROR
 }
 
@@ -2907,7 +3077,7 @@ pub unsafe extern "C" fn sqlite3_realloc(p: *mut c_void, n: c_int) -> *mut c_voi
     if p.is_null() {
         return sqlite3_malloc(n);
     }
-    let old = Vec::from_raw_parts(p as *mut u8, 0, 0.max(0));
+    let old = Vec::from_raw_parts(p as *mut u8, 0, 0);
     drop(old);
     sqlite3_malloc(n.max(0))
 }
@@ -2925,7 +3095,11 @@ pub unsafe extern "C" fn sqlite3_memory_used() -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_memory_alarm(_cb: Option<unsafe extern "C" fn(*mut c_void, c_int, i64)>, _ctx: *mut c_void, _threshold: c_int) -> c_int {
+pub unsafe extern "C" fn sqlite3_memory_alarm(
+    _cb: Option<unsafe extern "C" fn(*mut c_void, c_int, i64)>,
+    _ctx: *mut c_void,
+    _threshold: c_int,
+) -> c_int {
     SQLITE_OK
 }
 

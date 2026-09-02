@@ -137,8 +137,7 @@ fn compute_jd(p: &mut DateTime) {
     let b = 38 - a + a / 4;
     let x1 = 36525 * (y + 4716) / 100;
     let x2 = 306001 * (m + 1) / 10000;
-    p.i_jd = ((x1 + x2 + d + b - 1524) as i64) * 86400000
-        - 43200000; // -1524.5 days → subtract half a day
+    p.i_jd = ((x1 + x2 + d + b - 1524) as i64) * 86400000 - 43200000; // -1524.5 days → subtract half a day
     p.valid_jd = true;
     if p.valid_hms {
         p.i_jd += p.h as i64 * 3600000 + p.min as i64 * 60000 + (p.s * 1000.0 + 0.5) as i64;
@@ -175,8 +174,16 @@ fn compute_ymd(p: &mut DateTime) {
         let e = ((b - d) as f64 / 30.6001) as i64;
         let x1 = (30.6001 * e as f64) as i64;
         p.d = (b - d - x1) as i32;
-        p.m = if e < 14 { (e - 1) as i32 } else { (e - 13) as i32 };
-        p.y = if p.m > 2 { (c - 4716) as i32 } else { (c - 4715) as i32 };
+        p.m = if e < 14 {
+            (e - 1) as i32
+        } else {
+            (e - 13) as i32
+        };
+        p.y = if p.m > 2 {
+            (c - 4716) as i32
+        } else {
+            (c - 4715) as i32
+        };
     }
     p.valid_ymd = true;
 }
@@ -506,7 +513,9 @@ fn parse_modifier(z: &str, idx: usize, p: &mut DateTime) -> bool {
                 p.m = 12;
                 p.d = 31;
                 true
-            } else { unit.eq_ignore_ascii_case("day") }
+            } else {
+                unit.eq_ignore_ascii_case("day")
+            }
         }
         b'f' => {
             // floor
@@ -559,7 +568,6 @@ fn parse_modifier(z: &str, idx: usize, p: &mut DateTime) -> bool {
                 false
             } else if z.eq_ignore_ascii_case("utc") {
                 if !p.is_utc {
-                    
                     let mut i_guess;
                     let mut cnt = 0;
                     compute_jd(p);
@@ -728,7 +736,11 @@ fn parse_numeric_modifier(z: &str, p: &mut DateTime) -> bool {
             p.y += y;
             p.m += m;
         }
-        let x = if p.m > 0 { (p.m - 1) / 12 } else { (p.m - 12) / 12 };
+        let x = if p.m > 0 {
+            (p.m - 1) / 12
+        } else {
+            (p.m - 12) / 12
+        };
         p.y += x;
         p.m -= x * 12;
         compute_floor(p);
@@ -803,7 +815,11 @@ fn parse_numeric_modifier(z: &str, p: &mut DateTime) -> bool {
                     // months
                     compute_ymd_hms(p);
                     p.m += r as i32;
-                    let x = if p.m > 0 { (p.m - 1) / 12 } else { (p.m - 12) / 12 };
+                    let x = if p.m > 0 {
+                        (p.m - 1) / 12
+                    } else {
+                        (p.m - 12) / 12
+                    };
                     p.y += x;
                     p.m -= x * 12;
                     compute_floor(p);
@@ -878,7 +894,10 @@ fn to_localtime(p: &mut DateTime) {
         let mut shifted = p.clone();
         shifted.i_jd += offset_secs as i64 * 1000;
         // Extract Y/M/D h:m:s from the shifted JD.
-        compute_ymd(&mut DateTime { valid_ymd: false, ..shifted.clone() });
+        compute_ymd(&mut DateTime {
+            valid_ymd: false,
+            ..shifted.clone()
+        });
         let mut tmp = shifted;
         tmp.valid_ymd = false;
         tmp.valid_hms = false;
@@ -1028,9 +1047,22 @@ fn parse_tzif(data: &[u8]) -> Option<TzTransition> {
         if data.len() < hdr2 + 44 || &data[hdr2..hdr2 + 4] != b"TZif" {
             return None;
         }
-        parse_tzif_block(data, hdr2 + 20, 8, &mut times, &mut idx, &mut offsets, &mut isdst)?;
+        parse_tzif_block(
+            data,
+            hdr2 + 20,
+            8,
+            &mut times,
+            &mut idx,
+            &mut offsets,
+            &mut isdst,
+        )?;
     }
-    Some(TzTransition { times, idx, offsets, isdst })
+    Some(TzTransition {
+        times,
+        idx,
+        offsets,
+        isdst,
+    })
 }
 
 /// Parse one TZif data block starting at header offset `hdr_off` with
@@ -1048,9 +1080,8 @@ fn parse_tzif_block(
     if data.len() < hdr_off + 24 {
         return None;
     }
-    let rd_u32 = |o: usize| -> u32 {
-        u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
-    };
+    let rd_u32 =
+        |o: usize| -> u32 { u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) };
     let _isutcnt = rd_u32(hdr_off);
     let _isstdcnt = rd_u32(hdr_off + 4);
     let leapcnt = rd_u32(hdr_off + 8);
@@ -1167,9 +1198,13 @@ pub fn date_func(args: &[Value]) -> Option<Value> {
     }
     let y = x.y.abs();
     if x.y < 0 {
-        Some(Value::Text(format!("-{:04}-{:02}-{:02}", y, x.m, x.d).into()))
+        Some(Value::Text(
+            format!("-{:04}-{:02}-{:02}", y, x.m, x.d).into(),
+        ))
     } else {
-        Some(Value::Text(format!("{:04}-{:02}-{:02}", y, x.m, x.d).into()))
+        Some(Value::Text(
+            format!("{:04}-{:02}-{:02}", y, x.m, x.d).into(),
+        ))
     }
 }
 
@@ -1182,15 +1217,13 @@ pub fn time_func(args: &[Value]) -> Option<Value> {
     }
     if x.use_subsec {
         let s = (1000.0 * x.s + 0.5) as i64;
-        Some(Value::Text(format!(
-            "{:02}:{:02}:{:02}.{:03}",
-            x.h,
-            x.min,
-            s / 1000,
-            s % 1000
-        ).into()))
+        Some(Value::Text(
+            format!("{:02}:{:02}:{:02}.{:03}", x.h, x.min, s / 1000, s % 1000).into(),
+        ))
     } else {
-        Some(Value::Text(format!("{:02}:{:02}:{:02}", x.h, x.min, x.s as i64).into()))
+        Some(Value::Text(
+            format!("{:02}:{:02}:{:02}", x.h, x.min, x.s as i64).into(),
+        ))
     }
 }
 
@@ -1205,26 +1238,50 @@ pub fn datetime_func(args: &[Value]) -> Option<Value> {
     if x.use_subsec {
         let s = (1000.0 * x.s + 0.5) as i64;
         if x.y < 0 {
-            Some(Value::Text(format!(
-                "-{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-                y, x.m, x.d, x.h, x.min, s / 1000, s % 1000
-            ).into()))
+            Some(Value::Text(
+                format!(
+                    "-{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+                    y,
+                    x.m,
+                    x.d,
+                    x.h,
+                    x.min,
+                    s / 1000,
+                    s % 1000
+                )
+                .into(),
+            ))
         } else {
-            Some(Value::Text(format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-                y, x.m, x.d, x.h, x.min, s / 1000, s % 1000
-            ).into()))
+            Some(Value::Text(
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+                    y,
+                    x.m,
+                    x.d,
+                    x.h,
+                    x.min,
+                    s / 1000,
+                    s % 1000
+                )
+                .into(),
+            ))
         }
     } else if x.y < 0 {
-        Some(Value::Text(format!(
-            "-{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            y, x.m, x.d, x.h, x.min, x.s as i64
-        ).into()))
+        Some(Value::Text(
+            format!(
+                "-{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y, x.m, x.d, x.h, x.min, x.s as i64
+            )
+            .into(),
+        ))
     } else {
-        Some(Value::Text(format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            y, x.m, x.d, x.h, x.min, x.s as i64
-        ).into()))
+        Some(Value::Text(
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y, x.m, x.d, x.h, x.min, x.s as i64
+            )
+            .into(),
+        ))
     }
 }
 
@@ -1290,10 +1347,13 @@ pub fn timediff_func(args: &[Value]) -> Option<Value> {
     let min = (secs_of_day % 3600) / 60;
     let s = secs_of_day % 60;
     let sign = if neg { "-" } else { "+" };
-    Some(Value::Text(format!(
-        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        sign, y, m, d, h, min, s, ms_frac
-    ).into()))
+    Some(Value::Text(
+        format!(
+            "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            sign, y, m, d, h, min, s, ms_frac
+        )
+        .into(),
+    ))
 }
 
 /// Day number after the most recent Jan 1 (0-based).
@@ -1392,7 +1452,11 @@ pub fn strftime_func(args: &[Value]) -> Option<Value> {
             'M' => out.push_str(&format!("{:02}", x.min)),
             'p' | 'P' => {
                 let s = if x.h >= 12 {
-                    if cf == 'p' { "PM" } else { "pm" }
+                    if cf == 'p' {
+                        "PM"
+                    } else {
+                        "pm"
+                    }
                 } else if cf == 'p' {
                     "AM"
                 } else {
@@ -1456,9 +1520,7 @@ pub fn call_datetime_function(name: &str, args: &[Value]) -> Value {
         "timediff" => timediff_func(args).unwrap_or(Value::Null),
         "current_date" | "currentdate" => date_func(&[]).unwrap_or(Value::Null),
         "current_time" | "currenttime" => time_func(&[]).unwrap_or(Value::Null),
-        "current_timestamp" | "currenttimestamp" => {
-            datetime_func(&[]).unwrap_or(Value::Null)
-        }
+        "current_timestamp" | "currenttimestamp" => datetime_func(&[]).unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }
@@ -1476,7 +1538,10 @@ mod tests {
 
     #[test]
     fn iso_dates() {
-        assert_eq!(text(date_func(&[Value::Text("2023-07-14".into())])), "2023-07-14");
+        assert_eq!(
+            text(date_func(&[Value::Text("2023-07-14".into())])),
+            "2023-07-14"
+        );
         assert_eq!(
             text(datetime_func(&[Value::Text("2023-07-14 13:45:28".into())])),
             "2023-07-14 13:45:28"
@@ -1486,7 +1551,10 @@ mod tests {
             "2023-07-14 13:45:28"
         );
         // Feb 31 normalizes to Mar 3
-        assert_eq!(text(date_func(&[Value::Text("2023-02-31".into())])), "2023-03-03");
+        assert_eq!(
+            text(date_func(&[Value::Text("2023-02-31".into())])),
+            "2023-03-03"
+        );
     }
 
     #[test]
@@ -1581,7 +1649,10 @@ mod tests {
     #[test]
     fn time_only_string() {
         // "12:34:56" → 2000-01-01 12:34:56 (SQLite assumes day 2000-01-01)
-        assert_eq!(text(time_func(&[Value::Text("12:34:56".into())])), "12:34:56");
+        assert_eq!(
+            text(time_func(&[Value::Text("12:34:56".into())])),
+            "12:34:56"
+        );
         assert_eq!(
             text(datetime_func(&[Value::Text("12:34:56".into())])),
             "2000-01-01 12:34:56"
@@ -1591,7 +1662,9 @@ mod tests {
     #[test]
     fn tz_suffix() {
         assert_eq!(
-            text(datetime_func(&[Value::Text("2023-07-14 10:00:00+02:30".into())])),
+            text(datetime_func(&[Value::Text(
+                "2023-07-14 10:00:00+02:30".into()
+            )])),
             "2023-07-14 07:30:00"
         );
         assert_eq!(
@@ -1604,16 +1677,16 @@ mod tests {
     fn null_and_garbage() {
         assert_eq!(date_func(&[Value::Null]), None);
         assert_eq!(date_func(&[Value::Text("not a date".into())]), None);
-        assert_eq!(datetime_func(&[Value::Text("2023-07-14".into()), Value::Null]), None);
+        assert_eq!(
+            datetime_func(&[Value::Text("2023-07-14".into()), Value::Null]),
+            None
+        );
     }
 
     #[test]
     fn julian_day_numbers_as_input() {
         // JD 2460139.5 = 2023-07-14 00:00:00 (JDN 2460140)
-        assert_eq!(
-            text(date_func(&[Value::Real(2460139.5)])),
-            "2023-07-14"
-        );
+        assert_eq!(text(date_func(&[Value::Real(2460139.5)])), "2023-07-14");
         // Integer JD inputs land at noon: 2460140 = 2023-07-14 12:00
         assert_eq!(
             text(datetime_func(&[Value::Real(2460140.0)])),

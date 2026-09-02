@@ -96,7 +96,8 @@ fn reset_peak_rss() {
 
 fn sqlite_open() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;").ok();
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;")
+        .ok();
     conn
 }
 
@@ -144,7 +145,10 @@ fn sqlite_insert_multirow(conn: &rusqlite::Connection, n: usize) -> Duration {
         let values: Vec<String> = (1..=50i64)
             .map(|i| format!("('warm{}', {}, {})", i, i, i as f64))
             .collect();
-        let sql = format!("INSERT INTO t (name, val, score) VALUES {}", values.join(", "));
+        let sql = format!(
+            "INSERT INTO t (name, val, score) VALUES {}",
+            values.join(", ")
+        );
         let _ = conn.execute(&sql, []).unwrap();
     }
     let start = Instant::now();
@@ -193,16 +197,16 @@ fn sqlite_range_scan(conn: &rusqlite::Connection, range: usize) -> Duration {
         .unwrap();
     best_of::<7>(|| {
         let start = Instant::now();
-        let mut rows = stmt
-            .query(params![1000, 1000 + range as i64 - 1])
-            .unwrap();
+        let mut rows = stmt.query(params![1000, 1000 + range as i64 - 1]).unwrap();
         while rows.next().unwrap().is_some() {}
         start.elapsed()
     })
 }
 
 fn sqlite_full_scan_count(conn: &rusqlite::Connection) -> Duration {
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t WHERE val > 5000").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM t WHERE val > 5000")
+        .unwrap();
     best_of::<5>(|| {
         let start = Instant::now();
         let _ = stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap();
@@ -216,15 +220,16 @@ fn sqlite_aggregate(conn: &rusqlite::Connection) -> Duration {
         .unwrap();
     best_of::<5>(|| {
         let start = Instant::now();
-        let _ = stmt.query_row([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .unwrap();
+        let _ = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap();
         start.elapsed()
     })
 }
@@ -242,40 +247,70 @@ fn sqlite_group_by(conn: &rusqlite::Connection) -> Duration {
 }
 
 fn sqlite_setup_join(conn: &rusqlite::Connection) {
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)", []).unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)", []).unwrap();
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)", []).unwrap();
-    conn.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
-    conn.execute("CREATE INDEX idx_items_order ON items(order_id)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)",
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX idx_orders_user ON orders(user_id)", [])
+        .unwrap();
+    conn.execute("CREATE INDEX idx_items_order ON items(order_id)", [])
+        .unwrap();
     conn.execute_batch("BEGIN").unwrap();
     for i in 1..=1000 {
-        conn.execute("INSERT INTO users (name, dept) VALUES (?1, ?2)",
-            params![format!("user{}", i), if i % 2 == 0 { "eng" } else { "sales" }]).unwrap();
+        conn.execute(
+            "INSERT INTO users (name, dept) VALUES (?1, ?2)",
+            params![
+                format!("user{}", i),
+                if i % 2 == 0 { "eng" } else { "sales" }
+            ],
+        )
+        .unwrap();
     }
     for i in 1..=10000 {
         let user_id = (i % 1000) + 1;
-        conn.execute("INSERT INTO orders (user_id, total) VALUES (?1, ?2)",
-            params![user_id, i * 10]).unwrap();
+        conn.execute(
+            "INSERT INTO orders (user_id, total) VALUES (?1, ?2)",
+            params![user_id, i * 10],
+        )
+        .unwrap();
     }
     for i in 1..=50000 {
         let order_id = (i % 10000) + 1;
-        conn.execute("INSERT INTO items (order_id, name, price) VALUES (?1, ?2, ?3)",
-            params![order_id, format!("item{}", i), i as f64 * 0.5]).unwrap();
+        conn.execute(
+            "INSERT INTO items (order_id, name, price) VALUES (?1, ?2, ?3)",
+            params![order_id, format!("item{}", i), i as f64 * 0.5],
+        )
+        .unwrap();
     }
     conn.execute_batch("COMMIT").unwrap();
 }
 
 fn sqlite_join_2table(conn: &rusqlite::Connection) -> Duration {
-    let mut stmt = conn.prepare(
-        "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1",
-    ).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1",
+        )
+        .unwrap();
     // Like-for-like with `Database::query` (which materializes Vec<Row>):
     // materialize typed rows on the SQLite side too. Stepping without
     // reading values would compare DIFFERENT amounts of work.
     best_of::<5>(|| {
         let start = Instant::now();
         let rows: Vec<(String, i64)> = stmt
-            .query_map(params![500], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map(params![500], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -336,34 +371,45 @@ fn sqlite_update_range(conn: &rusqlite::Connection) -> Duration {
     // Mutating: identical work per run (see the rustqlite harness) —
     // warm 3, then best-of-5, mirroring our engine's harness exactly.
     for _ in 0..3 {
-        conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+        conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", [])
+            .unwrap();
     }
     best_of::<5>(|| {
         let start = Instant::now();
-        conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+        conn.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", [])
+            .unwrap();
         start.elapsed()
     })
 }
 
 fn sqlite_delete_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
     // Insert throwaway rows to delete, so we don't deplete the main table.
-    conn.execute("CREATE TABLE t_del (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+    conn.execute("CREATE TABLE t_del (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
     conn.execute_batch("BEGIN").unwrap();
     for i in 1..=n as i64 {
-        conn.execute("INSERT INTO t_del (x) VALUES (?1)", params![i]).unwrap();
+        conn.execute("INSERT INTO t_del (x) VALUES (?1)", params![i])
+            .unwrap();
     }
     conn.execute_batch("COMMIT").unwrap();
     let start = Instant::now();
     for i in 1..=n as i64 {
-        conn.execute("DELETE FROM t_del WHERE id = ?1", params![i]).unwrap();
+        conn.execute("DELETE FROM t_del WHERE id = ?1", params![i])
+            .unwrap();
     }
     start.elapsed()
 }
 
 fn sqlite_mixed_workload(conn: &rusqlite::Connection, ops: usize) -> Duration {
-    let mut stmt_q = conn.prepare("SELECT name, val FROM t WHERE id = ?1").unwrap();
-    let mut stmt_i = conn.prepare("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)").unwrap();
-    let mut stmt_u = conn.prepare("UPDATE t SET score = ?1 WHERE id = ?2").unwrap();
+    let mut stmt_q = conn
+        .prepare("SELECT name, val FROM t WHERE id = ?1")
+        .unwrap();
+    let mut stmt_i = conn
+        .prepare("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+        .unwrap();
+    let mut stmt_u = conn
+        .prepare("UPDATE t SET score = ?1 WHERE id = ?2")
+        .unwrap();
     let start = Instant::now();
     let mut next_id = 100_001i64;
     for i in 0..ops {
@@ -378,7 +424,13 @@ fn sqlite_mixed_workload(conn: &rusqlite::Connection, ops: usize) -> Duration {
                 // Write (insert or update, alternating)
                 if i % 2 == 0 {
                     next_id += 1;
-                    let _ = stmt_i.execute(params![format!("new{}", next_id), next_id * 2, next_id as f64]).ok();
+                    let _ = stmt_i
+                        .execute(params![
+                            format!("new{}", next_id),
+                            next_id * 2,
+                            next_id as f64
+                        ])
+                        .ok();
                 } else {
                     let _ = stmt_u.execute(params![i as f64, (i % 1000) + 1]).ok();
                 }
@@ -419,11 +471,15 @@ fn rustqlite_insert_single(db: &mut rustqlite::Database, n: usize) -> Duration {
     let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
     let start = Instant::now();
     for i in 1..=n as i64 {
-        db.execute(sql, [
-            Value::Text(format!("name{}", i).into()),
-            Value::Integer(i * 2),
-            Value::Real(i as f64 * 1.5),
-        ]).unwrap();
+        db.execute(
+            sql,
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     start.elapsed()
 }
@@ -433,11 +489,15 @@ fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Dur
     let start = Instant::now();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=n as i64 {
-        db.execute(sql, [
-            Value::Text(format!("name{}", i).into()),
-            Value::Integer(i * 2),
-            Value::Real(i as f64 * 1.5),
-        ]).unwrap();
+        db.execute(
+            sql,
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     start.elapsed()
@@ -452,7 +512,10 @@ fn rustqlite_insert_multirow(db: &mut rustqlite::Database, n: usize) -> Duration
         let values: Vec<String> = (1..=50i64)
             .map(|i| format!("('warm{}', {}, {})", i, i, i as f64))
             .collect();
-        let sql = format!("INSERT INTO t (name, val, score) VALUES {}", values.join(", "));
+        let sql = format!(
+            "INSERT INTO t (name, val, score) VALUES {}",
+            values.join(", ")
+        );
         db.execute(&sql, []).unwrap();
     }
     let start = Instant::now();
@@ -502,75 +565,121 @@ fn rustqlite_range_scan(db: &mut rustqlite::Database, range: usize) -> Duration 
     // Steady-state warmup: populate the statement cache (parse+plan) before
     // timing. SQLite's harness prepares its statement OUTSIDE the timer, so
     // without this the comparison would charge us a cold compile.
-    let _ = db.query(sql, [Value::Integer(1), Value::Integer(2)]).unwrap();
+    let _ = db
+        .query(sql, [Value::Integer(1), Value::Integer(2)])
+        .unwrap();
     best_of::<7>(|| {
         let start = Instant::now();
-        let _ = db.query(
-            sql,
-            [Value::Integer(1000), Value::Integer(1000 + range as i64 - 1)],
-        ).unwrap();
+        let _ = db
+            .query(
+                sql,
+                [
+                    Value::Integer(1000),
+                    Value::Integer(1000 + range as i64 - 1),
+                ],
+            )
+            .unwrap();
         start.elapsed()
     })
 }
 
 fn rustqlite_full_scan_count(db: &mut rustqlite::Database) -> Duration {
     // Steady-state warmup (see rustqlite_range_scan).
-    let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
+    let _ = db
+        .query("SELECT COUNT(*) FROM t WHERE val > 5000", [])
+        .unwrap();
     best_of::<5>(|| {
         let start = Instant::now();
-        let _ = db.query("SELECT COUNT(*) FROM t WHERE val > 5000", []).unwrap();
+        let _ = db
+            .query("SELECT COUNT(*) FROM t WHERE val > 5000", [])
+            .unwrap();
         start.elapsed()
     })
 }
 
 fn rustqlite_aggregate(db: &mut rustqlite::Database) -> Duration {
     // Steady-state warmup (see rustqlite_range_scan).
-    let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
+    let _ = db
+        .query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", [])
+        .unwrap();
     best_of::<5>(|| {
         let start = Instant::now();
-        let _ = db.query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", []).unwrap();
+        let _ = db
+            .query("SELECT SUM(val), AVG(score), MIN(val), MAX(val) FROM t", [])
+            .unwrap();
         start.elapsed()
     })
 }
 
 fn rustqlite_group_by(db: &mut rustqlite::Database) -> Duration {
     // Steady-state warmup (see rustqlite_range_scan).
-    let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
+    let _ = db
+        .query(
+            "SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket",
+            [],
+        )
+        .unwrap();
     best_of::<5>(|| {
         let start = Instant::now();
-        let _ = db.query("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket", []).unwrap();
+        let _ = db
+            .query(
+                "SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket",
+                [],
+            )
+            .unwrap();
         start.elapsed()
     })
 }
 
 fn rustqlite_setup_join(db: &mut rustqlite::Database) {
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)", []).unwrap();
-    db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)", []).unwrap();
-    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)", []).unwrap();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL)",
+        [],
+    )
+    .unwrap();
     // Create indexes on the join keys so the planner can pick IndexNestedLoopJoin.
     // Without these, the 2-table join (filter by PK) runs as a hash join that
     // fully materializes the inner side (~10k rows decoded) — 240× slower than
     // SQLite. With indexes, the INLJ path fetches only the ~10 matching rows.
-    db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
-    db.execute("CREATE INDEX idx_items_order ON items(order_id)", []).unwrap();
+    db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", [])
+        .unwrap();
+    db.execute("CREATE INDEX idx_items_order ON items(order_id)", [])
+        .unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=1000 {
         let sql = format!(
             "INSERT INTO users (name, dept) VALUES ('user{}', '{}')",
-            i, if i % 2 == 0 { "eng" } else { "sales" }
+            i,
+            if i % 2 == 0 { "eng" } else { "sales" }
         );
         db.execute(&sql, []).unwrap();
     }
     for i in 1..=10000 {
         let user_id = (i % 1000) + 1;
-        let sql = format!("INSERT INTO orders (user_id, total) VALUES ({}, {})", user_id, i * 10);
+        let sql = format!(
+            "INSERT INTO orders (user_id, total) VALUES ({}, {})",
+            user_id,
+            i * 10
+        );
         db.execute(&sql, []).unwrap();
     }
     for i in 1..=50000 {
         let order_id = (i % 10000) + 1;
         let sql = format!(
             "INSERT INTO items (order_id, name, price) VALUES ({}, 'item{}', {})",
-            order_id, i, i as f64 * 0.5
+            order_id,
+            i,
+            i as f64 * 0.5
         );
         db.execute(&sql, []).unwrap();
     }
@@ -578,7 +687,8 @@ fn rustqlite_setup_join(db: &mut rustqlite::Database) {
 }
 
 fn rustqlite_join_2table(db: &mut rustqlite::Database) -> Duration {
-    let sql = "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
+    let sql =
+        "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query(sql, [Value::Integer(1)]).unwrap();
     best_of::<5>(|| {
@@ -616,7 +726,8 @@ fn rustqlite_update_by_pk(db: &mut rustqlite::Database, n: usize) -> Duration {
     for i in 1..=n as i64 {
         let score = i as f64 * 2.5;
         let id = (i % 1000) + 1;
-        db.execute(sql, [Value::Real(score), Value::Integer(id)]).unwrap();
+        db.execute(sql, [Value::Real(score), Value::Integer(id)])
+            .unwrap();
     }
     start.elapsed()
 }
@@ -627,11 +738,13 @@ fn rustqlite_update_range(db: &mut rustqlite::Database) -> Duration {
     // the first run pays one-time warmup (allocator, page faults) that
     // the steady state doesn't.
     for _ in 0..3 {
-        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", [])
+            .unwrap();
     }
     best_of::<5>(|| {
         let start = Instant::now();
-        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", []).unwrap();
+        db.execute("UPDATE t SET score = score + 1.0 WHERE val > 5000", [])
+            .unwrap();
         start.elapsed()
     })
 }
@@ -639,7 +752,9 @@ fn rustqlite_update_range(db: &mut rustqlite::Database) -> Duration {
 fn rustqlite_delete_by_pk(_db: &mut rustqlite::Database, n: usize) -> Duration {
     // Use a fresh in-memory database to avoid page reuse issues.
     let mut del_db = rustqlite::Database::open_in_memory().unwrap();
-    del_db.execute("CREATE TABLE t_del (id INTEGER PRIMARY KEY, x INTEGER)", []).unwrap();
+    del_db
+        .execute("CREATE TABLE t_del (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
     del_db.execute("BEGIN", []).unwrap();
     let ins_sql = "INSERT INTO t_del (x) VALUES (?)";
     for i in 1..=n as i64 {
@@ -670,16 +785,24 @@ fn rustqlite_mixed_workload(db: &mut rustqlite::Database, ops: usize) -> Duratio
             4 => {
                 if i % 2 == 0 {
                     next_id += 1;
-                    db.execute(ins_sql, [
-                        Value::Text(format!("new{}", next_id).into()),
-                        Value::Integer(next_id * 2),
-                        Value::Real(next_id as f64),
-                    ]).unwrap();
+                    db.execute(
+                        ins_sql,
+                        [
+                            Value::Text(format!("new{}", next_id).into()),
+                            Value::Integer(next_id * 2),
+                            Value::Real(next_id as f64),
+                        ],
+                    )
+                    .unwrap();
                 } else {
-                    db.execute(upd_sql, [
-                        Value::Real(i as f64),
-                        Value::Integer(((i % 1000) + 1) as i64),
-                    ]).unwrap();
+                    db.execute(
+                        upd_sql,
+                        [
+                            Value::Real(i as f64),
+                            Value::Integer(((i % 1000) + 1) as i64),
+                        ],
+                    )
+                    .unwrap();
                 }
             }
             _ => unreachable!(),
@@ -1029,7 +1152,8 @@ fn main() {
     }
     {
         let conn = rusqlite::Connection::open(&s_path).unwrap();
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;").ok();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;")
+            .ok();
         sqlite_create_table(&conn);
         sqlite_insert_single_in_txn(&conn, MEDIUM);
     }
@@ -1046,7 +1170,9 @@ fn main() {
     // Binary size — compare rustqlite-cli vs a minimal SQLite-using binary.
     // We measure the size of our CLI vs the size of an equivalent SQLite CLI
     // we build separately.
-    let r_bin = std::fs::metadata("target/release/rustqlite-cli").map(|m| m.len()).unwrap_or(0);
+    let r_bin = std::fs::metadata("target/release/rustqlite-cli")
+        .map(|m| m.len())
+        .unwrap_or(0);
     // The SQLite library is statically linked into every rusqlite binary.
     // As a proxy, measure the size of the bench_compare binary (which includes
     // both engines) minus the rustqlite-cli binary — this gives a rough

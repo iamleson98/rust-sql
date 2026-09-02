@@ -87,7 +87,9 @@ fn main() {
                 }
             }
             "--help" | "-h" => {
-                println!("Usage: rustqlite-server [--db PATH] [--port PORT] [--host HOST] [--threads N]");
+                println!(
+                    "Usage: rustqlite-server [--db PATH] [--port PORT] [--host HOST] [--threads N]"
+                );
                 println!("  --db PATH    Database file path (default: in-memory)");
                 println!("  --port PORT  TCP port (default: 8080)");
                 println!("  --host HOST  Bind address (default: 127.0.0.1)");
@@ -114,7 +116,9 @@ fn main() {
         })
     };
 
-    let state = Arc::new(State { db: RwLock::new(db) });
+    let state = Arc::new(State {
+        db: RwLock::new(db),
+    });
     let addr = format!("{}:{}", host, port);
     let server = Arc::new(Server::http(&addr).unwrap_or_else(|e| {
         eprintln!("error binding to {}: {}", addr, e);
@@ -148,7 +152,9 @@ fn handle_request(request: tiny_http::Request, state: &State) {
 
     match (&method, url.as_str()) {
         (Method::Get, "/health") => {
-            let _ = request.respond(Response::from_string(r#"{"status":"ok"}"#).with_header(content_type_json()));
+            let _ = request.respond(
+                Response::from_string(r#"{"status":"ok"}"#).with_header(content_type_json()),
+            );
         }
         (Method::Post, "/query") => {
             handle_query(request, state);
@@ -157,7 +163,11 @@ fn handle_request(request: tiny_http::Request, state: &State) {
             handle_execute(request, state);
         }
         _ => {
-            let _ = request.respond(Response::from_string(r#"{"error":"not found"}"#).with_status_code(404).with_header(content_type_json()));
+            let _ = request.respond(
+                Response::from_string(r#"{"error":"not found"}"#)
+                    .with_status_code(404)
+                    .with_header(content_type_json()),
+            );
         }
     }
 }
@@ -214,7 +224,8 @@ fn handle_execute(mut request: tiny_http::Request, state: &State) {
     let mut guard = state.db.write();
     match guard.execute(&parsed.sql, parsed.params) {
         Ok(_) => {
-            let _ = request.respond(Response::from_string(r#"{"ok":true}"#).with_header(content_type_json()));
+            let _ = request
+                .respond(Response::from_string(r#"{"ok":true}"#).with_header(content_type_json()));
         }
         Err(e) => {
             respond_error(request, &e.to_string());
@@ -224,7 +235,10 @@ fn handle_execute(mut request: tiny_http::Request, state: &State) {
 
 fn read_body(request: &mut tiny_http::Request) -> Result<String, String> {
     let mut body = String::new();
-    request.as_reader().read_to_string(&mut body).map_err(|e| e.to_string())?;
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| e.to_string())?;
     Ok(body)
 }
 

@@ -14,7 +14,10 @@ fn json_extract_scalars_and_nesting() {
         vec![vec![Value::Integer(5)]]
     );
     assert_eq!(
-        q(&db, "SELECT json_extract('{\"a\": {\"b\": [1, 2, 3]}}', '$.a.b[2]')"),
+        q(
+            &db,
+            "SELECT json_extract('{\"a\": {\"b\": [1, 2, 3]}}', '$.a.b[2]')"
+        ),
         vec![vec![Value::Integer(3)]]
     );
     // Strings come back unquoted.
@@ -47,11 +50,23 @@ fn json_extract_scalars_and_nesting() {
 #[test]
 fn json_valid_and_type() {
     let db = Database::open_in_memory().unwrap();
-    assert_eq!(q(&db, "SELECT json_valid('{\"a\": 1}')"), vec![vec![Value::Integer(1)]]);
-    assert_eq!(q(&db, "SELECT json_valid('not json')"), vec![vec![Value::Integer(0)]]);
-    assert_eq!(q(&db, "SELECT json_valid('  [1, 2]  ')"), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        q(&db, "SELECT json_valid('{\"a\": 1}')"),
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        q(&db, "SELECT json_valid('not json')"),
+        vec![vec![Value::Integer(0)]]
+    );
+    assert_eq!(
+        q(&db, "SELECT json_valid('  [1, 2]  ')"),
+        vec![vec![Value::Integer(1)]]
+    );
     // Trailing garbage is invalid.
-    assert_eq!(q(&db, "SELECT json_valid('{} x')"), vec![vec![Value::Integer(0)]]);
+    assert_eq!(
+        q(&db, "SELECT json_valid('{} x')"),
+        vec![vec![Value::Integer(0)]]
+    );
     assert_eq!(
         q(&db, "SELECT json_type('{\"a\": 1}')"),
         vec![vec![Value::Text("object".into())]]
@@ -115,7 +130,10 @@ fn json_mutators() {
     );
     // RFC 7396 merge patch: null deletes, new keys add.
     assert_eq!(
-        q(&db, "SELECT json_patch('{\"a\": 1, \"b\": 2}', '{\"b\": null, \"c\": 3}')"),
+        q(
+            &db,
+            "SELECT json_patch('{\"a\": 1, \"b\": 2}', '{\"b\": null, \"c\": 3}')"
+        ),
         vec![vec![Value::Text("{\"a\":1,\"c\":3}".into())]]
     );
 }
@@ -124,14 +142,21 @@ fn json_mutators() {
 fn json_extract_over_table_data() {
     // The OLTP shape: extract from a JSON column across rows.
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, payload TEXT)", []).unwrap();
+    db.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, payload TEXT)",
+        [],
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO events (payload) VALUES ('{\"user\": \"ann\", \"n\": 3}'), ('{\"user\": \"bob\", \"n\": 5}')",
         [],
     )
     .unwrap();
     assert_eq!(
-        q(&db, "SELECT json_extract(payload, '$.user') FROM events ORDER BY id"),
+        q(
+            &db,
+            "SELECT json_extract(payload, '$.user') FROM events ORDER BY id"
+        ),
         vec![
             vec![Value::Text("ann".into())],
             vec![Value::Text("bob".into())],
@@ -141,7 +166,10 @@ fn json_extract_over_table_data() {
     assert_eq!(rows[0][0], Value::Integer(8));
     // WHERE on an extracted field.
     assert_eq!(
-        q(&db, "SELECT id FROM events WHERE json_extract(payload, '$.n') > 4"),
+        q(
+            &db,
+            "SELECT id FROM events WHERE json_extract(payload, '$.n') > 4"
+        ),
         vec![vec![Value::Integer(2)]]
     );
 }
@@ -156,7 +184,10 @@ fn json_unicode_and_escapes() {
     );
     // Emoji (surrogate pair).
     assert_eq!(
-        q(&db, "SELECT json_extract('{\"k\": \"\\ud83d\\ude00\"}', '$.k')"),
+        q(
+            &db,
+            "SELECT json_extract('{\"k\": \"\\ud83d\\ude00\"}', '$.k')"
+        ),
         vec![vec![Value::Text("😀".into())]]
     );
     // Embedded quotes re-escape on serialize.

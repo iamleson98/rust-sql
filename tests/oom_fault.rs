@@ -48,19 +48,28 @@ fn child_workload(db_path: &std::path::Path) -> i32 {
         Err(_) => return 3,
     };
     if db
-        .execute("CREATE TABLE IF NOT EXISTS oom_t (id INTEGER PRIMARY KEY, v TEXT, r REAL)", [])
+        .execute(
+            "CREATE TABLE IF NOT EXISTS oom_t (id INTEGER PRIMARY KEY, v TEXT, r REAL)",
+            [],
+        )
         .is_err()
     {
         return 4;
     }
-    if db.execute("CREATE INDEX IF NOT EXISTS idx_oom_v ON oom_t(v)", []).is_err() {
+    if db
+        .execute("CREATE INDEX IF NOT EXISTS idx_oom_v ON oom_t(v)", [])
+        .is_err()
+    {
         return 5;
     }
     for i in 1..=50i64 {
         if db
             .execute(
                 "INSERT INTO oom_t (v, r) VALUES (?, ?)",
-                [Value::Text(format!("child-{}", i).into()), Value::Real(i as f64 / 4.0)],
+                [
+                    Value::Text(format!("child-{}", i).into()),
+                    Value::Real(i as f64 / 4.0),
+                ],
             )
             .is_err()
         {
@@ -68,7 +77,10 @@ fn child_workload(db_path: &std::path::Path) -> i32 {
         }
     }
     let _ = db.query("SELECT COUNT(*), SUM(r) FROM oom_t", []);
-    let _ = db.query("SELECT * FROM oom_t WHERE v LIKE 'child-%' ORDER BY r DESC LIMIT 10", []);
+    let _ = db.query(
+        "SELECT * FROM oom_t WHERE v LIKE 'child-%' ORDER BY r DESC LIMIT 10",
+        [],
+    );
     let _ = db.execute("UPDATE oom_t SET r = r + 1 WHERE id <= 25", []);
     let _ = db.execute("DELETE FROM oom_t WHERE id > 40", []);
     let _ = db.execute("BEGIN", []);
@@ -101,7 +113,8 @@ fn main() {
     let db_path = tmp.path().join("oom.db");
     {
         let mut db = Database::open(&db_path).unwrap();
-        db.execute("CREATE TABLE keep (id INTEGER PRIMARY KEY, v TEXT)", []).unwrap();
+        db.execute("CREATE TABLE keep (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
         for i in 1..=BASELINE_ROWS {
             db.execute(
                 "INSERT INTO keep (v) VALUES (?)",
@@ -184,7 +197,11 @@ fn main() {
 
     // Control: with injection off, the workload must complete cleanly.
     let status = spawn("none");
-    assert!(status.success(), "control (no OOM) run failed: {:?}", status);
+    assert!(
+        status.success(),
+        "control (no OOM) run failed: {:?}",
+        status
+    );
 
     println!(
         "oom_fault: {} fault points exercised ({} aborted children, {} beyond range) — baseline intact at every point",

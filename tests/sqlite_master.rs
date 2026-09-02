@@ -29,7 +29,9 @@ fn diff_master(setup: &[&str], query: &str) {
                     rusqlite::types::ValueRef::Null => "NULL".to_string(),
                     rusqlite::types::ValueRef::Integer(v) => format!("I:{v}"),
                     rusqlite::types::ValueRef::Real(v) => format!("R:{v}"),
-                    rusqlite::types::ValueRef::Text(t) => format!("T:{}", String::from_utf8_lossy(t)),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        format!("T:{}", String::from_utf8_lossy(t))
+                    }
                     rusqlite::types::ValueRef::Blob(b) => format!("B:{}", b.len()),
                 };
                 row.push(v);

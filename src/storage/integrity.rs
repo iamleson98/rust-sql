@@ -48,7 +48,10 @@ struct Problems {
 
 impl Problems {
     fn new(max: usize) -> Self {
-        Problems { out: Vec::new(), max }
+        Problems {
+            out: Vec::new(),
+            max,
+        }
     }
 
     fn push(&mut self, msg: String) {
@@ -166,10 +169,7 @@ fn check_freelist(pager: &Pager, p: &mut Problems) {
         return;
     }
     if head == 0 {
-        p.push(format!(
-            "freelist count is {} but the head is 0",
-            declared
-        ));
+        p.push(format!("freelist count is {} but the head is 0", declared));
         return;
     }
     let n_pages = pager.n_pages();

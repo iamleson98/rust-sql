@@ -16,12 +16,17 @@ fn bench_rustqlite(mode: &str, sync: Option<&str>, n_txns: usize, rows_per_txn: 
     let mut db = rustqlite::Database::open(&path).unwrap();
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
     if let Some(s) = sync {
-        db.execute(&format!("PRAGMA synchronous = {}", s), []).unwrap();
+        db.execute(&format!("PRAGMA synchronous = {}", s), [])
+            .unwrap();
     }
     if mode != "wal" {
         db.execute("PRAGMA journal_mode = DELETE", []).unwrap();
     }
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        [],
+    )
+    .unwrap();
 
     let start = Instant::now();
     for t in 0..n_txns {
@@ -30,8 +35,10 @@ fn bench_rustqlite(mode: &str, sync: Option<&str>, n_txns: usize, rows_per_txn: 
             let id = t * rows_per_txn + i + 1;
             db.execute(
                 "INSERT INTO t (v, s) VALUES (?, ?)",
-                [rustqlite::Value::Integer(id as i64),
-                 rustqlite::Value::Text(format!("row{id}").into())],
+                [
+                    rustqlite::Value::Integer(id as i64),
+                    rustqlite::Value::Text(format!("row{id}").into()),
+                ],
             )
             .unwrap();
         }
@@ -45,7 +52,12 @@ fn bench_rustqlite(mode: &str, sync: Option<&str>, n_txns: usize, rows_per_txn: 
     assert_eq!(rows[0][0].as_integer(), (n_txns * rows_per_txn) as i64);
     let q_start = Instant::now();
     for k in 1..=200 {
-        let _ = db.query("SELECT s FROM t WHERE id = ?", [rustqlite::Value::Integer(k)]).unwrap();
+        let _ = db
+            .query(
+                "SELECT s FROM t WHERE id = ?",
+                [rustqlite::Value::Integer(k)],
+            )
+            .unwrap();
     }
     let q = ms(q_start.elapsed());
     drop(db);
@@ -70,7 +82,11 @@ fn bench_sqlite(mode: &str, sync: &str, n_txns: usize, rows_per_txn: usize) -> f
         "PRAGMA journal_mode = {mode}; PRAGMA synchronous = {sync};"
     ))
     .unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        [],
+    )
+    .unwrap();
 
     let start = Instant::now();
     for t in 0..n_txns {
@@ -111,7 +127,10 @@ fn main() {
     let n_txns = 200;
     let rows = 20;
 
-    println!("== rustqlite file-backed commit throughput ({} txns x {} rows) ==", n_txns, rows);
+    println!(
+        "== rustqlite file-backed commit throughput ({} txns x {} rows) ==",
+        n_txns, rows
+    );
     let del = bench_rustqlite("delete", None, n_txns, rows);
     let wal_full = bench_rustqlite("wal sync=FULL", Some("FULL"), n_txns, rows);
     let wal_normal = bench_rustqlite("wal sync=NORMAL", Some("NORMAL"), n_txns, rows);
@@ -125,7 +144,16 @@ fn main() {
     println!();
     println!("== ratios (lower is faster) ==");
     println!("rustqlite delete/sqlite delete:      {:.2}x", del / s_del);
-    println!("rustqlite wal-full/sqlite wal-full:  {:.2}x", wal_full / s_wal_full);
-    println!("rustqlite wal-normal/sqlite wal-norm:{:.2}x", wal_normal / s_wal_normal);
-    println!("rustqlite wal-normal vs own delete:  {:.2}x", wal_normal / del);
+    println!(
+        "rustqlite wal-full/sqlite wal-full:  {:.2}x",
+        wal_full / s_wal_full
+    );
+    println!(
+        "rustqlite wal-normal/sqlite wal-norm:{:.2}x",
+        wal_normal / s_wal_normal
+    );
+    println!(
+        "rustqlite wal-normal vs own delete:  {:.2}x",
+        wal_normal / del
+    );
 }

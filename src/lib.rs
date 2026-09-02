@@ -85,15 +85,18 @@ fn engine_init() {
 }
 
 pub mod error;
-/// OOM fault-injection allocator (`oom-injection` feature).
-#[cfg(feature = "oom-injection")]
-pub mod oom_alloc;
-/// Plugin system: user functions, aggregates, collations, virtual-table
-/// modules, page codecs (static Rust + dynamic C/C++/Zig/Rust extensions).
-pub mod plugin;
 /// SQLite-style C ABI (`rustqlite_open` / `rustqlite_prepare` /
 /// `rustqlite_step` / ...) plus the extension loading entry points.
 pub mod ffi;
+/// OOM fault-injection allocator (`oom-injection` feature).
+#[cfg(feature = "oom-injection")]
+pub mod oom_alloc;
+pub mod planner;
+/// Plugin system: user functions, aggregates, collations, virtual-table
+/// modules, page codecs (static Rust + dynamic C/C++/Zig/Rust extensions).
+pub mod plugin;
+pub mod schema;
+pub mod sql;
 /// Native sqlx driver: sqlx-core's `Database` traits implemented directly
 /// against the engine, so `rustqlite` works as a sqlx backend with **no C
 /// ABI, no `libsqlite3.so`, no `[patch.crates-io]`** — just
@@ -102,14 +105,11 @@ pub mod ffi;
 pub mod sqlx_driver;
 /// SQLite-style streaming statement handles (`prepare` / `bind` / `step`).
 pub mod statement;
-pub mod planner;
-pub mod schema;
-pub mod sql;
 pub mod storage;
 pub mod types;
 
-pub mod executor;
 pub mod api;
+pub mod executor;
 
 pub use api::{Database, Params};
 pub use error::{Error, Result};

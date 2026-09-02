@@ -24,7 +24,8 @@ fn main() {
             }
         }
         true
-    }).unwrap();
+    })
+    .unwrap();
     println!("idx_val root page: {}", idx_root);
     println!("total pages: {}", pager.n_pages());
 
@@ -33,16 +34,36 @@ fn main() {
     let borrowed = page.lock();
     let pt = borrowed.page_type().unwrap();
     let n = borrowed.n_cells();
-    println!("root type: {:?}, n_cells: {}, right_most: {}", pt, n, borrowed.right_most_pointer());
+    println!(
+        "root type: {:?}, n_cells: {}, right_most: {}",
+        pt,
+        n,
+        borrowed.right_most_pointer()
+    );
     for i in 0..n {
         let cell_ptr = borrowed.cell_pointer(i) as usize;
         let c = Cell::decode(&borrowed.data[cell_ptr..], pt, page_size).unwrap();
         match c {
-            Cell::IndexInterior { left_child, key, rowid } => {
-                println!("  cell[{}]: left_child={}, sep_rowid={}, sep_key={:02x?}", i, left_child, rowid, &key[..key.len().min(4)]);
+            Cell::IndexInterior {
+                left_child,
+                key,
+                rowid,
+            } => {
+                println!(
+                    "  cell[{}]: left_child={}, sep_rowid={}, sep_key={:02x?}",
+                    i,
+                    left_child,
+                    rowid,
+                    &key[..key.len().min(4)]
+                );
             }
             Cell::IndexLeaf { key, rowid } => {
-                println!("  leaf cell[{}]: rowid={}, key={:02x?}...", i, rowid, &key[..key.len().min(4)]);
+                println!(
+                    "  leaf cell[{}]: rowid={}, key={:02x?}...",
+                    i,
+                    rowid,
+                    &key[..key.len().min(4)]
+                );
             }
             _ => println!("  cell[{}]: other", i),
         }
@@ -52,9 +73,17 @@ fn main() {
     // Now count entries reachable from this root + check a specific lookup.
     let mut ibt = Btree::new(&pager, idx_root, true);
     let mut total = 0usize;
-    ibt.scan_index(|_r, _k| { total += 1; true }).unwrap();
+    ibt.scan_index(|_r, _k| {
+        total += 1;
+        true
+    })
+    .unwrap();
     println!("entries reachable from root: {}", total);
     let key = rustqlite::types::Value::Integer(1236).encode_order_key();
     let found = ibt.lookup_index(&key).unwrap();
-    println!("lookup val=1236: {} rowids {:?}", found.len(), &found[..found.len().min(3)]);
+    println!(
+        "lookup val=1236: {} rowids {:?}",
+        found.len(),
+        &found[..found.len().min(3)]
+    );
 }

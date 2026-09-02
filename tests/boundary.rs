@@ -26,16 +26,9 @@ use rustqlite::{Database, Value};
 #[test]
 fn i64_extremes_round_trip() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)", []).unwrap();
-    let extremes = [
-        i64::MIN,
-        i64::MIN + 1,
-        -1,
-        0,
-        1,
-        i64::MAX - 1,
-        i64::MAX,
-    ];
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
+    let extremes = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
     for (i, v) in extremes.iter().enumerate() {
         db.execute(
             "INSERT INTO n (id, v) VALUES (?, ?)",
@@ -45,16 +38,30 @@ fn i64_extremes_round_trip() {
     }
     for (i, v) in extremes.iter().enumerate() {
         let rows = db
-            .query("SELECT v FROM n WHERE id = ?", [Value::Integer(i as i64 + 1)])
+            .query(
+                "SELECT v FROM n WHERE id = ?",
+                [Value::Integer(i as i64 + 1)],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1, "extreme {} not found", v);
-        assert_eq!(rows[0][0], Value::Integer(*v), "extreme {} did not round-trip", v);
+        assert_eq!(
+            rows[0][0],
+            Value::Integer(*v),
+            "extreme {} did not round-trip",
+            v
+        );
     }
     // And via ORDER BY (comparison boundaries at the extremes).
     let rows = db.query("SELECT v FROM n ORDER BY v", []).unwrap();
     let vals: Vec<i64> = rows
         .iter()
-        .map(|r| if let Value::Integer(i) = &r[0] { *i } else { panic!("non-int") })
+        .map(|r| {
+            if let Value::Integer(i) = &r[0] {
+                *i
+            } else {
+                panic!("non-int")
+            }
+        })
         .collect();
     let mut expected = extremes.to_vec();
     expected.sort_unstable();
@@ -70,7 +77,7 @@ fn integer_overflow_matches_sqlite() {
         "SELECT 9223372036854775807 + 1",
         "SELECT 9223372036854775807 * 2",
         "SELECT -9223372036854775808 - 1",
-        "SELECT -1 * -9223372036854775808",   // the exact UB-provoker from sqlite.org/testing.html
+        "SELECT -1 * -9223372036854775808", // the exact UB-provoker from sqlite.org/testing.html
         "SELECT -1 * (-9223372036854775808)",
         "SELECT 0 - -9223372036854775808",
         "SELECT 9223372036854775807 + 9223372036854775807",
@@ -97,8 +104,20 @@ fn integer_overflow_matches_sqlite() {
         })();
         match (our_res, their_res) {
             (Ok(our_rows), Ok(their_rows)) => {
-                assert_eq!(our_rows.len(), 1, "{} returned {} rows", sql, our_rows.len());
-                assert_eq!(their_rows.len(), 1, "{} returned {} rows on sqlite", sql, their_rows.len());
+                assert_eq!(
+                    our_rows.len(),
+                    1,
+                    "{} returned {} rows",
+                    sql,
+                    our_rows.len()
+                );
+                assert_eq!(
+                    their_rows.len(),
+                    1,
+                    "{} returned {} rows on sqlite",
+                    sql,
+                    their_rows.len()
+                );
                 let our_v = &our_rows[0][0];
                 let their_v = &their_rows[0][0];
                 let equal = match (our_v, their_v) {
@@ -106,8 +125,12 @@ fn integer_overflow_matches_sqlite() {
                     (Value::Real(a), rusqlite::types::Value::Real(b)) => {
                         (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-6
                     }
-                    (Value::Integer(a), rusqlite::types::Value::Real(b)) => (*a as f64 - b).abs() <= 1e-6,
-                    (Value::Real(a), rusqlite::types::Value::Integer(b)) => (*a - *b as f64).abs() <= 1e-6,
+                    (Value::Integer(a), rusqlite::types::Value::Real(b)) => {
+                        (*a as f64 - b).abs() <= 1e-6
+                    }
+                    (Value::Real(a), rusqlite::types::Value::Integer(b)) => {
+                        (*a - *b as f64).abs() <= 1e-6
+                    }
                     _ => false,
                 };
                 assert!(equal, "{}: ours={:?} sqlite={:?}", sql, our_v, their_v);
@@ -156,7 +179,8 @@ fn numeric_function_boundaries_match_sqlite() {
                 assert!(
                     oracle.prepare(sql).is_err(),
                     "{}: rustqlite errored ({}) but SQLite succeeded",
-                    sql, e
+                    sql,
+                    e
                 );
                 continue;
             }
@@ -180,8 +204,12 @@ fn numeric_function_boundaries_match_sqlite() {
                         || (x.is_infinite() && y.is_infinite() && x.signum() == y.signum())
                         || (x - y).abs() <= 1e-9
                 }
-                (Value::Integer(x), rusqlite::types::Value::Real(y)) => (*x as f64 - y).abs() <= 1e-9,
-                (Value::Real(x), rusqlite::types::Value::Integer(y)) => (*x - *y as f64).abs() <= 1e-9,
+                (Value::Integer(x), rusqlite::types::Value::Real(y)) => {
+                    (*x as f64 - y).abs() <= 1e-9
+                }
+                (Value::Real(x), rusqlite::types::Value::Integer(y)) => {
+                    (*x - *y as f64).abs() <= 1e-9
+                }
                 (Value::Text(x), rusqlite::types::Value::Text(y)) => x.as_str() == y,
                 _ => false,
             };
@@ -197,7 +225,8 @@ fn numeric_function_boundaries_match_sqlite() {
 #[test]
 fn real_extremes_round_trip() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, v REAL)", []).unwrap();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, v REAL)", [])
+        .unwrap();
     let vals = [
         0.0,
         -0.0,
@@ -220,7 +249,10 @@ fn real_extremes_round_trip() {
     }
     for (i, v) in vals.iter().enumerate() {
         let rows = db
-            .query("SELECT v FROM r WHERE id = ?", [Value::Integer(i as i64 + 1)])
+            .query(
+                "SELECT v FROM r WHERE id = ?",
+                [Value::Integer(i as i64 + 1)],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1);
         match &rows[0][0] {
@@ -253,7 +285,11 @@ fn real_extremes_round_trip() {
 #[test]
 fn text_and_blob_boundaries() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, t TEXT, b BLOB)", []).unwrap();
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, t TEXT, b BLOB)",
+        [],
+    )
+    .unwrap();
 
     // Empty string, single char, embedded NULs, 4-byte emoji,
     // RTL text, combining characters.
@@ -276,13 +312,26 @@ fn text_and_blob_boundaries() {
     }
     for (i, t) in texts.iter().enumerate() {
         let rows = db
-            .query("SELECT t, length(t) FROM s WHERE id = ?", [Value::Integer(i as i64 + 1)])
+            .query(
+                "SELECT t, length(t) FROM s WHERE id = ?",
+                [Value::Integer(i as i64 + 1)],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::Text(t.clone().into()), "TEXT round-trip failed at {}", i);
+        assert_eq!(
+            rows[0][0],
+            Value::Text(t.clone().into()),
+            "TEXT round-trip failed at {}",
+            i
+        );
         // length() counts CHARACTERS in SQLite.
         let expected_len = t.chars().count() as i64;
-        assert_eq!(rows[0][1], Value::Integer(expected_len), "length() at id {}", i + 1);
+        assert_eq!(
+            rows[0][1],
+            Value::Integer(expected_len),
+            "length() at id {}",
+            i + 1
+        );
     }
 
     // Blobs: empty, 1 byte, all 256 byte values, 4 KiB.
@@ -301,10 +350,18 @@ fn text_and_blob_boundaries() {
     }
     for (i, b) in blobs.iter().enumerate() {
         let rows = db
-            .query("SELECT b, length(b) FROM s WHERE id = ?", [Value::Integer(100 + i as i64)])
+            .query(
+                "SELECT b, length(b) FROM s WHERE id = ?",
+                [Value::Integer(100 + i as i64)],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::Blob(b.clone()), "BLOB round-trip failed at {}", i);
+        assert_eq!(
+            rows[0][0],
+            Value::Blob(b.clone()),
+            "BLOB round-trip failed at {}",
+            i
+        );
         assert_eq!(rows[0][1], Value::Integer(b.len() as i64));
     }
 }
@@ -355,7 +412,10 @@ fn deep_nesting_errors_without_stack_overflow() {
         sql.push_str(&"CASE 1 WHEN 1 THEN ".repeat(depth));
         sql.push('1');
         sql.push_str(&" ELSE 1 END".repeat(depth));
-        assert!(db.query(&sql, []).is_err(), "10k-deep CASE must error gracefully");
+        assert!(
+            db.query(&sql, []).is_err(),
+            "10k-deep CASE must error gracefully"
+        );
     }
 
     // Deeply nested subqueries: same contract.
@@ -382,20 +442,30 @@ fn deep_nesting_errors_without_stack_overflow() {
 #[test]
 fn oversize_payloads_fail_gracefully() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, t TEXT, b BLOB)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, t TEXT, b BLOB)",
+        [],
+    )
+    .unwrap();
     // Overflow chains: payloads far beyond any page size are ACCEPTED
     // (SQLite semantics — SQLITE_MAX_LENGTH is 1 GiB) and round-trip
     // byte-exact through their spill chains.
     let text = "x".repeat(1_048_576);
     db.execute("INSERT INTO big (t) VALUES (?)", [Value::Text(text.into())])
         .expect("1 MiB TEXT must be accepted via overflow chains");
-    let rows = db.query("SELECT length(t) FROM big WHERE id = 1", []).unwrap();
+    let rows = db
+        .query("SELECT length(t) FROM big WHERE id = 1", [])
+        .unwrap();
     assert_eq!(rows[0][0], Value::Integer(1_048_576));
     let blob: Vec<u8> = (0u32..512 * 1024).map(|i| (i % 251) as u8).collect();
-    db.execute("INSERT INTO big (b) VALUES (?)", [Value::Blob(blob.clone())])
-        .expect("512 KiB BLOB must be accepted via overflow chains");
-    let rows = db.query("SELECT length(b) FROM big WHERE id = 2", []).unwrap();
+    db.execute(
+        "INSERT INTO big (b) VALUES (?)",
+        [Value::Blob(blob.clone())],
+    )
+    .expect("512 KiB BLOB must be accepted via overflow chains");
+    let rows = db
+        .query("SELECT length(b) FROM big WHERE id = 2", [])
+        .unwrap();
     assert_eq!(rows[0][0], Value::Integer(512 * 1024));
     // Byte-exact round trip through the chain.
     let rows = db.query("SELECT b FROM big WHERE id = 2", []).unwrap();
@@ -407,9 +477,13 @@ fn oversize_payloads_fail_gracefully() {
     // SQLite's SQLITE_MAX_LENGTH ceiling — verified by unit test; a runtime
     // probe would need a 1 GiB allocation.)
     // The engine must remain fully usable after all of the above.
-    db.execute("INSERT INTO big (t) VALUES ('fine')", []).unwrap();
+    db.execute("INSERT INTO big (t) VALUES ('fine')", [])
+        .unwrap();
     let rows = db.query("SELECT COUNT(*) FROM big", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(3)));
+    assert_eq!(
+        rows.first().and_then(|r| r.first()),
+        Some(&Value::Integer(3))
+    );
 }
 
 #[test]
@@ -424,7 +498,8 @@ fn huge_statements_and_identifiers() {
     // Long identifier (schema row still fits a page).
     let long_ident = "c".repeat(1_000);
     let sql = format!("CREATE TABLE big_id_{} (x INTEGER)", long_ident);
-    db.execute(&sql, []).expect("1k identifier should be accepted");
+    db.execute(&sql, [])
+        .expect("1k identifier should be accepted");
     let sql = format!("INSERT INTO big_id_{} VALUES (1)", long_ident);
     db.execute(&sql, []).unwrap();
     let sql = format!("SELECT x FROM big_id_{}", long_ident);
@@ -460,9 +535,11 @@ fn huge_statements_and_identifiers() {
 #[test]
 fn limit_offset_boundaries() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE l (id INTEGER PRIMARY KEY)", []).unwrap();
+    db.execute("CREATE TABLE l (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
     for i in 1..=10 {
-        db.execute("INSERT INTO l VALUES (?)", [Value::Integer(i)]).unwrap();
+        db.execute("INSERT INTO l VALUES (?)", [Value::Integer(i)])
+            .unwrap();
     }
     // Negative LIMIT = no limit (SQLite convention); must not error.
     let rows = db.query("SELECT * FROM l LIMIT -1", []).unwrap();
@@ -471,7 +548,9 @@ fn limit_offset_boundaries() {
     let rows = db.query("SELECT * FROM l LIMIT 0", []).unwrap();
     assert_eq!(rows.len(), 0);
     // Huge LIMIT is fine.
-    let rows = db.query("SELECT * FROM l LIMIT 9223372036854775807", []).unwrap();
+    let rows = db
+        .query("SELECT * FROM l LIMIT 9223372036854775807", [])
+        .unwrap();
     assert_eq!(rows.len(), 10);
     // OFFSET beyond the end → empty.
     let rows = db.query("SELECT * FROM l LIMIT 5 OFFSET 100", []).unwrap();
@@ -486,8 +565,16 @@ fn rowid_boundaries() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE rd (v TEXT)", []).unwrap();
     // Explicit extreme rowids.
-    db.execute("INSERT INTO rd (rowid, v) VALUES (-9223372036854775808, 'min')", []).unwrap();
-    db.execute("INSERT INTO rd (rowid, v) VALUES (9223372036854775807, 'max')", []).unwrap();
+    db.execute(
+        "INSERT INTO rd (rowid, v) VALUES (-9223372036854775808, 'min')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO rd (rowid, v) VALUES (9223372036854775807, 'max')",
+        [],
+    )
+    .unwrap();
     let rows = db
         .query("SELECT v FROM rd WHERE rowid = -9223372036854775808", [])
         .unwrap();
@@ -501,7 +588,11 @@ fn rowid_boundaries() {
     // random unused rowid; either a fresh rowid or a graceful error is
     // acceptable — a panic is not.
     let r = db.execute("INSERT INTO rd (v) VALUES ('after-max')", []);
-    assert!(r.is_ok(), "insert after max rowid must succeed or error gracefully: {:?}", r.err());
+    assert!(
+        r.is_ok(),
+        "insert after max rowid must succeed or error gracefully: {:?}",
+        r.err()
+    );
 }
 
 // ===========================================================================
@@ -512,7 +603,8 @@ fn rowid_boundaries() {
 #[test]
 fn extreme_keys_in_indexes() {
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE ix (id INTEGER PRIMARY KEY, k INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE ix (id INTEGER PRIMARY KEY, k INTEGER)", [])
+        .unwrap();
     db.execute("CREATE INDEX ix_k ON ix(k)", []).unwrap();
     let keys = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
     for (i, k) in keys.iter().enumerate() {
@@ -523,22 +615,39 @@ fn extreme_keys_in_indexes() {
         .unwrap();
     }
     // Range scans touching each boundary.
-    let rows = db.query("SELECT k FROM ix WHERE k >= ? ORDER BY k", [Value::Integer(i64::MIN)])
+    let rows = db
+        .query(
+            "SELECT k FROM ix WHERE k >= ? ORDER BY k",
+            [Value::Integer(i64::MIN)],
+        )
         .unwrap();
     assert_eq!(rows.len(), 7);
-    let rows = db.query("SELECT k FROM ix WHERE k <= ? ORDER BY k", [Value::Integer(i64::MAX)])
+    let rows = db
+        .query(
+            "SELECT k FROM ix WHERE k <= ? ORDER BY k",
+            [Value::Integer(i64::MAX)],
+        )
         .unwrap();
     assert_eq!(rows.len(), 7);
-    let rows = db.query(
-        "SELECT k FROM ix WHERE k > ? AND k < ? ORDER BY k",
-        [Value::Integer(i64::MIN), Value::Integer(i64::MAX)],
-    )
-    .unwrap();
+    let rows = db
+        .query(
+            "SELECT k FROM ix WHERE k > ? AND k < ? ORDER BY k",
+            [Value::Integer(i64::MIN), Value::Integer(i64::MAX)],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 5);
     // Point lookups at each extreme through the index.
     for k in keys {
-        let rows = db.query("SELECT id FROM ix WHERE k = ?", [Value::Integer(k)]).unwrap();
-        assert_eq!(rows.len(), 1, "index lookup at k={} found {} rows", k, rows.len());
+        let rows = db
+            .query("SELECT id FROM ix WHERE k = ?", [Value::Integer(k)])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "index lookup at k={} found {} rows",
+            k,
+            rows.len()
+        );
     }
 }
 
@@ -548,14 +657,21 @@ fn extreme_keys_in_indexes() {
 fn like_glob_pattern_boundaries() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE p (s TEXT)", []).unwrap();
-    for s in ["", "a", "ab", "abc", "%", "_", "\\", "日本", "🚀fire", "AAA"] {
-        db.execute("INSERT INTO p VALUES (?)", [Value::Text(s.into())]).unwrap();
+    for s in [
+        "", "a", "ab", "abc", "%", "_", "\\", "日本", "🚀fire", "AAA",
+    ] {
+        db.execute("INSERT INTO p VALUES (?)", [Value::Text(s.into())])
+            .unwrap();
     }
-    let patterns = ["", "%", "_", "a%", "%c", "%_%_", "\\%", "🚀%", "%日%", "A%", "a%"];
+    let patterns = [
+        "", "%", "_", "a%", "%c", "%_%_", "\\%", "🚀%", "%日%", "A%", "a%",
+    ];
     let ours = &db;
     let oracle = rusqlite::Connection::open_in_memory().unwrap();
     oracle.execute("CREATE TABLE p (s TEXT)", []).unwrap();
-    for s in ["", "a", "ab", "abc", "%", "_", "\\", "日本", "🚀fire", "AAA"] {
+    for s in [
+        "", "a", "ab", "abc", "%", "_", "\\", "日本", "🚀fire", "AAA",
+    ] {
         oracle.execute("INSERT INTO p VALUES (?)", [s]).unwrap();
     }
     for pat in patterns {
@@ -578,7 +694,10 @@ fn like_glob_pattern_boundaries() {
         );
         // GLOB with pathological wildcards.
         let glob = format!("{}{}", "*".repeat(50), pat);
-        let n_ours = match ours.query("SELECT COUNT(*) FROM p WHERE s GLOB ?", [Value::Text(glob.clone().into())]) {
+        let n_ours = match ours.query(
+            "SELECT COUNT(*) FROM p WHERE s GLOB ?",
+            [Value::Text(glob.clone().into())],
+        ) {
             Ok(r) => match r.first().and_then(|r| r.first()) {
                 Some(Value::Integer(n)) => *n,
                 _ => -1,
@@ -586,7 +705,9 @@ fn like_glob_pattern_boundaries() {
             Err(_) => -1,
         };
         let n_theirs: i64 = oracle
-            .query_row("SELECT COUNT(*) FROM p WHERE s GLOB ?", [&glob], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM p WHERE s GLOB ?", [&glob], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(n_ours, n_theirs, "GLOB {:?} diverged", glob);
     }

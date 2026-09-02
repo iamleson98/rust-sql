@@ -16,27 +16,34 @@
 //!    not single-thread elapsed × 1 (which is what the old write-locked
 //!    server would produce).
 
+use parking_lot::RwLock;
 use rustqlite::{Database, Value};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 fn setup_concurrent_db(n_rows: i64) -> Arc<RwLock<Database>> {
     let mut db = Database::open_in_memory().unwrap();
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, price REAL)",
         [],
-    ).unwrap();
+    )
+    .unwrap();
     // Bulk insert using a transaction for speed.
     db.execute("BEGIN", []).unwrap();
     for i in 0..n_rows {
         let name = format!("item_{i}");
         db.execute(
             "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-            [Value::Integer(i), Value::Text(name.into()), Value::Integer(i % 100), Value::Real((i as f64) * 0.5)],
-        ).unwrap();
+            [
+                Value::Integer(i),
+                Value::Text(name.into()),
+                Value::Integer(i % 100),
+                Value::Real((i as f64) * 0.5),
+            ],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", []).unwrap();
     Arc::new(RwLock::new(db))
@@ -63,8 +70,10 @@ fn pure_read_concurrency_16_threads() {
                 // READ lock — concurrent readers.
                 let guard = db.read();
                 let rows = guard
-                    .query("SELECT id, name, qty, price FROM items WHERE id = ?",
-                            [Value::Integer(id)])
+                    .query(
+                        "SELECT id, name, qty, price FROM items WHERE id = ?",
+                        [Value::Integer(id)],
+                    )
                     .expect("query failed");
                 assert_eq!(rows.len(), 1, "expected 1 row for id={}", id);
                 let row = &rows[0];
@@ -119,10 +128,17 @@ fn mixed_rw_concurrency_8_readers_1_writer() {
                 let id = start_id + i as i64;
                 let name = format!("new_item_{id}");
                 let mut guard = db.write();
-                guard.execute(
-                    "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-                    [Value::Integer(id), Value::Text(name.into()), Value::Integer((i % 50) as i64), Value::Real((i as f64) * 1.5)],
-                ).expect("insert failed");
+                guard
+                    .execute(
+                        "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
+                        [
+                            Value::Integer(id),
+                            Value::Text(name.into()),
+                            Value::Integer((i % 50) as i64),
+                            Value::Real((i as f64) * 1.5),
+                        ],
+                    )
+                    .expect("insert failed");
                 writes_done.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }));
@@ -137,10 +153,12 @@ fn mixed_rw_concurrency_8_readers_1_writer() {
                 let guard = db.read();
                 // Point lookup — should always return a row (the writer appends).
                 let id = (i % 1000) as i64;
-                let rows = guard.query(
-                    "SELECT id, name FROM items WHERE id = ?",
-                    [Value::Integer(id)],
-                ).expect("query failed");
+                let rows = guard
+                    .query(
+                        "SELECT id, name FROM items WHERE id = ?",
+                        [Value::Integer(id)],
+                    )
+                    .expect("query failed");
                 // The row may or may not have been written by the new writer;
                 // but rows with id 0..1000 were inserted by setup, so must exist.
                 if id < 1000 {
@@ -188,10 +206,17 @@ fn concurrent_writers_serialize_correctly() {
             for i in 0..inserts_per_writer {
                 let id = base + i as i64;
                 let mut guard = db.write();
-                guard.execute(
-                    "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-                    [Value::Integer(id), Value::Text(format!("w{writer_id}_item_{i}").into()), Value::Integer(i as i64), Value::Real(0.0)],
-                ).expect("insert failed");
+                guard
+                    .execute(
+                        "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
+                        [
+                            Value::Integer(id),
+                            Value::Text(format!("w{writer_id}_item_{i}").into()),
+                            Value::Integer(i as i64),
+                            Value::Real(0.0),
+                        ],
+                    )
+                    .expect("insert failed");
             }
         }));
     }
@@ -208,10 +233,12 @@ fn concurrent_writers_serialize_correctly() {
     assert_eq!(count, (n_writers * inserts_per_writer) as i64);
 
     // Verify no duplicates via GROUP BY.
-    let dupes = guard.query(
-        "SELECT id, COUNT(*) as cnt FROM items GROUP BY id HAVING cnt > 1",
-        [],
-    ).unwrap();
+    let dupes = guard
+        .query(
+            "SELECT id, COUNT(*) as cnt FROM items GROUP BY id HAVING cnt > 1",
+            [],
+        )
+        .unwrap();
     assert!(dupes.is_empty(), "found {} duplicate ids", dupes.len());
 }
 
@@ -252,10 +279,9 @@ fn read_consistency_under_concurrent_writes() {
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
                 let guard = db.read();
-                let rows = guard.query(
-                    "SELECT COUNT(*), SUM(qty) FROM items",
-                    [],
-                ).expect("query failed");
+                let rows = guard
+                    .query("SELECT COUNT(*), SUM(qty) FROM items", [])
+                    .expect("query failed");
                 assert_eq!(rows.len(), 1);
                 // COUNT and SUM come from the same scan, so they're consistent.
                 let count = match rows[0][0] {
@@ -283,7 +309,10 @@ fn read_consistency_under_concurrent_writes() {
     }
 
     let total_reads = reads_done.load(AtomicOrdering::SeqCst);
-    println!("read_consistency_under_concurrent_writes: {} reads done", total_reads);
+    println!(
+        "read_consistency_under_concurrent_writes: {} reads done",
+        total_reads
+    );
     assert!(total_reads > 0);
 }
 
@@ -305,10 +334,9 @@ fn read_throughput_scales_with_threads() {
         let guard = db.read();
         for i in 0..queries_per_thread {
             let id = (i % 20_000) as i64;
-            let _rows = guard.query(
-                "SELECT id FROM items WHERE id = ?",
-                [Value::Integer(id)],
-            ).unwrap();
+            let _rows = guard
+                .query("SELECT id FROM items WHERE id = ?", [Value::Integer(id)])
+                .unwrap();
         }
     }
     let single_elapsed = start.elapsed();
@@ -324,10 +352,9 @@ fn read_throughput_scales_with_threads() {
             let guard = db.read();
             for i in 0..queries_per_thread {
                 let id = (i % 20_000) as i64;
-                let _rows = guard.query(
-                    "SELECT id FROM items WHERE id = ?",
-                    [Value::Integer(id)],
-                ).unwrap();
+                let _rows = guard
+                    .query("SELECT id FROM items WHERE id = ?", [Value::Integer(id)])
+                    .unwrap();
             }
         }));
     }
@@ -376,7 +403,12 @@ fn stress_32_threads_2_seconds_no_deadlock() {
                 let mut guard = db.write();
                 let _ = guard.execute(
                     "INSERT INTO items (id, name, qty, price) VALUES (?, ?, ?, ?)",
-                    [Value::Integer(id), Value::Text(format!("w{writer_id}_{i}").into()), Value::Integer(i as i64), Value::Real(0.0)],
+                    [
+                        Value::Integer(id),
+                        Value::Text(format!("w{writer_id}_{i}").into()),
+                        Value::Integer(i as i64),
+                        Value::Real(0.0),
+                    ],
                 );
                 drop(guard);
                 i += 1;

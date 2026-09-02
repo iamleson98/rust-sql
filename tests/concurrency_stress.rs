@@ -15,8 +15,8 @@
 mod concurrency_stress {
     use parking_lot::RwLock;
     use rustqlite::{Database, Value};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -32,11 +32,8 @@ mod concurrency_stress {
         // Seed with 100 rows so readers have something to see immediately.
         db.execute("BEGIN", []).expect("begin");
         for i in 1..=100i64 {
-            db.execute(
-                "INSERT INTO t (x) VALUES (?)",
-                [Value::Integer(i)],
-            )
-            .expect("insert");
+            db.execute("INSERT INTO t (x) VALUES (?)", [Value::Integer(i)])
+                .expect("insert");
         }
         db.execute("COMMIT", []).expect("commit");
 
@@ -57,10 +54,7 @@ mod concurrency_stress {
                 for i in 0..n_writes_per_writer {
                     let mut guard = state.write();
                     if guard
-                        .execute(
-                            "INSERT INTO t (x) VALUES (?)",
-                            [Value::Integer(i + 1000)],
-                        )
+                        .execute("INSERT INTO t (x) VALUES (?)", [Value::Integer(i + 1000)])
                         .is_err()
                     {
                         errors.fetch_add(1, Ordering::SeqCst);
@@ -102,15 +96,9 @@ mod concurrency_stress {
         // Final consistency check: the writer inserted n_writes_per_writer
         // rows on top of the 100 we seeded.
         let guard = state.write();
-        let rows = guard
-            .query("SELECT COUNT(*) FROM t", [])
-            .expect("count");
+        let rows = guard.query("SELECT COUNT(*) FROM t", []).expect("count");
         let count = rows[0][0].as_integer();
-        assert_eq!(
-            count,
-            100 + n_writes_per_writer,
-            "final row count mismatch"
-        );
+        assert_eq!(count, 100 + n_writes_per_writer, "final row count mismatch");
     }
 
     /// Verify that `Database` is `Send + Sync` at compile time. This is the

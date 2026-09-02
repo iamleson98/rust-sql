@@ -38,8 +38,8 @@ struct Case {
 /// different textual representations of REALs (e.g. `1.0` vs `1`); we treat
 /// integers and reals as equal when the values are numerically equal.
 fn values_equal(a: &rustqlite::Value, b: &rusqlite::types::Value) -> bool {
-    use rustqlite::Value as Rv;
     use rusqlite::types::Value as Sv;
+    use rustqlite::Value as Rv;
     match (a, b) {
         (Rv::Null, Sv::Null) => true,
         (Rv::Integer(x), Sv::Integer(y)) => x == y,
@@ -76,8 +76,10 @@ fn run_case(case: &Case) {
             continue;
         }
         let upper = trimmed.to_ascii_uppercase();
-        let is_select = upper.starts_with("SELECT") || upper.starts_with("WITH")
-            || upper.starts_with("VALUES") || upper.starts_with("PRAGMA");
+        let is_select = upper.starts_with("SELECT")
+            || upper.starts_with("WITH")
+            || upper.starts_with("VALUES")
+            || upper.starts_with("PRAGMA");
         if is_select {
             let mut stmt = sqlite.prepare(trimmed).expect("sqlite prepare");
             let col_count = stmt.column_count();
@@ -119,8 +121,10 @@ fn run_case(case: &Case) {
             continue;
         }
         let upper = trimmed.to_ascii_uppercase();
-        let is_select = upper.starts_with("SELECT") || upper.starts_with("WITH")
-            || upper.starts_with("VALUES") || upper.starts_with("PRAGMA");
+        let is_select = upper.starts_with("SELECT")
+            || upper.starts_with("WITH")
+            || upper.starts_with("VALUES")
+            || upper.starts_with("PRAGMA");
         if is_select {
             let (cols, rows) = rdb
                 .query_with_columns(trimmed, [])

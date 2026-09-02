@@ -98,7 +98,10 @@ pub struct ColumnDef {
 
 #[derive(Clone, Debug)]
 pub enum ColumnConstraint {
-    PrimaryKey { autoincrement: bool, order: Order },
+    PrimaryKey {
+        autoincrement: bool,
+        order: Order,
+    },
     NotNull,
     Null,
     Unique,
@@ -135,7 +138,9 @@ pub enum Order {
 
 #[derive(Clone, Debug)]
 pub enum TableConstraint {
-    PrimaryKey { columns: Vec<IndexedColumn> },
+    PrimaryKey {
+        columns: Vec<IndexedColumn>,
+    },
     Unique(Vec<IndexedColumn>),
     Check(Expr),
     ForeignKey {
@@ -198,10 +203,16 @@ pub struct TableName {
 
 impl TableName {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { schema: None, name: name.into() }
+        Self {
+            schema: None,
+            name: name.into(),
+        }
     }
     pub fn qualified(schema: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { schema: Some(schema.into()), name: name.into() }
+        Self {
+            schema: Some(schema.into()),
+            name: name.into(),
+        }
     }
 }
 
@@ -262,7 +273,11 @@ pub enum SelectBody {
     /// `SELECT ... FROM ...`
     Simple(SimpleSelect),
     /// `lhs UNION [ALL] rhs`
-    Binary { op: SetOp, left: Box<SelectBody>, right: Box<SelectBody> },
+    Binary {
+        op: SetOp,
+        left: Box<SelectBody>,
+        right: Box<SelectBody>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,19 +503,42 @@ pub enum Expr {
     /// A column reference: `table.column` or just `column`.
     Column { table: Option<String>, name: String },
     /// `expr op expr`
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// `op expr` (unary)
     Unary { op: UnaryOp, expr: Box<Expr> },
     /// `expr BETWEEN low AND high`
-    Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool },
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
     /// `expr IN (values|subquery)`
-    In { expr: Box<Expr>, source: InSource, negated: bool },
+    In {
+        expr: Box<Expr>,
+        source: InSource,
+        negated: bool,
+    },
     /// `expr LIKE pattern` (also GLOB, REGEXP, MATCH)
-    Like { op: LikeOp, expr: Box<Expr>, pattern: Box<Expr>, escape: Option<Box<Expr>>, negated: bool },
+    Like {
+        op: LikeOp,
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Option<Box<Expr>>,
+        negated: bool,
+    },
     /// `expr IS NULL` / `expr IS NOT NULL`
     IsNull { expr: Box<Expr>, negated: bool },
     /// `expr IS [NOT] expr2`
-    Is { left: Box<Expr>, right: Box<Expr>, negated: bool },
+    Is {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        negated: bool,
+    },
     /// Function call: `func(args...)` or `func(DISTINCT args...)`
     Function {
         name: String,
@@ -526,7 +564,10 @@ pub enum Expr {
     /// `expr COLLATE collation`
     Collate { expr: Box<Expr>, collation: String },
     /// `Raise(action, message)`
-    Raise { action: RaiseAction, message: Option<Box<Expr>> },
+    Raise {
+        action: RaiseAction,
+        message: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
