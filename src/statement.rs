@@ -300,6 +300,10 @@ impl<'a> Statement<'a> {
             return Ok(StepResult::Done);
         }
         if matches!(self.stream, StreamState::Fresh) {
+            // A hot INSERT chain owns the table's live root / max-rowid
+            // while the shared maps hold stale values — break (flush) it
+            // before `start()` snapshots the maps for this statement.
+            self.db.break_insert_chain();
             self.start()?;
         }
         // Serve one buffered row.

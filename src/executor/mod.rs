@@ -7667,7 +7667,7 @@ pub fn fast_insert_literal_rows(
     table: &Arc<Table>,
     col_indices: &[usize],
     rows: Vec<Vec<Value>>,
-) -> Result<i64> {
+) -> Result<(i64, u32, i64)> {
     let mut current_root = ctx.table_root(table);
     let mut max_rowid = ctx.get_or_scan_max_rowid(table)?;
     let indexes = ctx.catalog().indexes_on_table(&table.name);
@@ -7812,7 +7812,10 @@ pub fn fast_insert_literal_rows(
             ctx.set_index_root(&st.idx.name, st.root);
         }
     }
-    Ok(inserted)
+    // (rows inserted, final live root, final max rowid) — the caller's
+    // INSERT-chain setup consumes the live root / max-rowid so the next
+    // same-shape statement can skip the derivation entirely.
+    Ok((inserted, current_root, max_rowid))
 }
 
 pub fn fast_insert_single_row(

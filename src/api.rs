@@ -279,6 +279,12 @@ pub struct Database {
     /// read by the C ABI layer (`sqlite3_last_insert_rowid`) so ORMs like
     /// sea-orm / sqlx get real ids after INSERTs.
     last_rowid: AtomicI64,
+    /// Cross-statement INSERT chain (see [`InsertChain`]): consecutive
+    /// single-row literal INSERTs to the same table with the same column
+    /// list execute with near-zero per-statement overhead. Interior-
+    /// mutable (`Mutex`) because the read paths (`query`) must be able to
+    /// break (flush) a hot chain from `&self`.
+    insert_chain: Mutex<Option<InsertChain>>,
 }
 
 /// Default capacity of the statement cache.
@@ -1712,6 +1718,7 @@ impl Database {
             deferred_flush: AtomicBool::new(false),
             deferred_flush_threshold: 1000,
             last_rowid: AtomicI64::new(0),
+            insert_chain: Mutex::new(None),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1810,12 +1817,17 @@ impl Database {
     /// pages are dirty. Use this after a burst of writes when
     /// `set_deferred_flush(true)` is enabled.
     pub fn flush(&mut self) -> Result<()> {
+        // A hot INSERT chain owns the table's live root: flush it into the
+        // bookkeeping maps (and rewrite the schema row if a split moved
+        // the root) BEFORE the pager writes pages to disk.
+        self.break_insert_chain();
         self.pager.flush()
     }
 
     /// Flush from a `&self` reference — used by concurrent readers when they
     /// need to see unflushed writes. Uses the pager's interior mutability.
     pub fn flush_shared(&self) -> Result<()> {
+        self.break_insert_chain();
         self.pager.flush()
     }
 
@@ -1839,6 +1851,281 @@ impl Database {
     /// `Err` for a real failure. Not-applicable cases: WITHOUT ROWID /
     /// STRICT tables, generated columns, missing DEFAULT evaluation,
     /// duplicate column names (the general path produces nicer errors).
+    // ------------------------------------------------------------------
+    // INSERT CHAIN (see `InsertChain` docs for the design).
+    // ------------------------------------------------------------------
+
+    /// Try to execute `sql` as a chained single-row literal INSERT.
+    ///
+    /// Returns `Ok(true)` when the chain handled the statement. Returns
+    /// `Ok(false)` when no chain is hot or the statement's shape doesn't
+    /// match it (the caller falls back to the cold fast-insert path).
+    /// On any error the chain is dropped (after flushing its state), so a
+    /// failed chained statement can never leave stale bookkeeping behind.
+    fn exec_chained_insert(&mut self, sql: &str) -> Result<bool> {
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        let mut guard = self.insert_chain.lock();
+        let Some(ch) = guard.as_mut() else {
+            return Ok(false);
+        };
+        let chain_epoch_ok = ch.epoch == epoch.wrapping_sub(1);
+        if !chain_epoch_ok || matches!(parse_chain_row(sql, ch), ChainParse::Mismatch) {
+            // Epoch gap (another statement ran since the chain's last use)
+            // or shape mismatch: flush the chain's root / max-rowid into
+            // the bookkeeping maps, then drop it. The cold path below (or
+            // a later statement) rebuilds a chain for the new shape.
+            let flushed = guard.take();
+            drop(guard);
+            if let Some(ch) = flushed {
+                self.flush_insert_chain(&ch)?;
+            }
+            return Ok(false);
+        }
+        // Lean per-row execution: NOT NULL -> encode -> B+tree append.
+        // `Ok(false)` = the rowid space is exhausted (bail to the general
+        // path's collision-safe allocation).
+        match self.exec_chain_row(ch) {
+            Ok(true) => {
+                ch.epoch = epoch;
+                Ok(true)
+            }
+            Ok(false) => {
+                let flushed = guard.take();
+                drop(guard);
+                if let Some(ch) = flushed {
+                    self.flush_insert_chain(&ch)?;
+                }
+                Ok(false)
+            }
+            Err(e) => {
+                // Constraint / IO error: nothing was mutated (constraint
+                // checks run before the B+tree insert), but the statement
+                // already bumped the epoch, so the chain can never validate
+                // again — flush and drop it for a clean slate.
+                let flushed = guard.take();
+                drop(guard);
+                if let Some(ch) = flushed {
+                    let _ = self.flush_insert_chain(&ch);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute one row already scanned into `ch.full_row` against the
+    /// table's B+tree. `Ok(false)` means "rowid space exhausted — caller
+    /// must fall back to the general path".
+    fn exec_chain_row(&self, ch: &mut InsertChain) -> Result<bool> {
+        // Rowid allocation: auto-generated only (the scanner rejects
+        // explicit rowid values), so `max_rowid + 1` is collision-free.
+        if ch.max_rowid >= i64::MAX - 1 {
+            return Ok(false);
+        }
+        let rowid = ch.max_rowid + 1;
+        ch.max_rowid = rowid;
+        if let Some(alias) = ch.rowid_alias {
+            ch.full_row[alias] = Value::Integer(rowid);
+        }
+        // NOT NULL enforcement (the rowid alias was pre-assigned above, so
+        // an alias declared NOT NULL — SQLite reports INTEGER PRIMARY KEY
+        // as nullable, but a redundant NOT NULL still holds — is covered).
+        for &c in &ch.not_null {
+            if ch.full_row[c].is_null() {
+                return Err(Error::constraint(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    ch.table.name,
+                    ch.table.columns[c].name
+                )));
+            }
+        }
+        // Payload encode into the reused buffer (elides the rowid-alias
+        // column to a 1-byte marker — its value is the B+tree key).
+        crate::storage::row_codec::encode_row_aliased_into(
+            &ch.full_row,
+            ch.rowid_alias,
+            &mut ch.payload_buf,
+        );
+        // B+tree append with the cross-statement leaf hint.
+        let mut bt = Btree::new(&self.pager, ch.root, false);
+        let hint = ch.leaf_hint.take();
+        let new_hint = bt.insert_table_append_hinted(rowid, &ch.payload_buf, hint)?;
+        ch.leaf_hint = new_hint;
+        if bt.root != ch.root {
+            // Split: track the live root, rewrite the schema row NOW (an
+            // auto-commit flush below must not write a file whose schema
+            // row still points at the stale root), and update the tracker
+            // so `sync_schema_roots` stays a no-op for this table.
+            ch.root = bt.root;
+            self.rewrite_schema_row_root("table", &ch.table.name, ch.root)?;
+            let mut synced = self.schema_root_pages.lock();
+            synced.insert(format!("table:{}", ch.name_lc), ch.root);
+        }
+        // Counters (mirrors the general path's epilogue).
+        self.set_last_insert_rowid(rowid);
+        crate::executor::change_counters::record(1);
+        // Auto-commit flush, exactly like `exec_fast_insert`'s tail.
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let deferred = self.deferred_flush.load(Ordering::Acquire);
+        if !in_txn && !deferred {
+            self.pager.flush()?;
+        } else if deferred && !in_txn {
+            let dirty = self.pager.dirty_page_count();
+            if dirty >= self.deferred_flush_threshold {
+                let _ = self.pager.flush();
+            }
+        }
+        Ok(true)
+    }
+
+    /// Push the chain's live root / max-rowid into the shared
+    /// bookkeeping maps and rewrite the schema row if a split moved the
+    /// root. Runs whenever a hot chain is broken — every general-path
+    /// statement consults the maps, so they must be fresh first.
+    fn flush_insert_chain(&self, ch: &InsertChain) -> Result<()> {
+        let mut m = self.maps.write();
+        let maps = Arc::make_mut(&mut *m);
+        // Root: write under both key forms (as-declared and lowercased) —
+        // `table_root`'s fast path probes the declared name first, so a
+        // pre-existing declared-name entry must not shadow the fresh value.
+        let name = ch.table.name.as_str();
+        let lc: &str = &ch.name_lc;
+        if maps.roots.get(name) != Some(&ch.root) {
+            maps.roots.insert(name.to_string(), ch.root);
+        }
+        if lc != name && maps.roots.get(lc) != Some(&ch.root) {
+            maps.roots.insert(lc.to_string(), ch.root);
+        }
+        // Max rowid: monotonic raise only (the cache must stay an upper
+        // bound of the live rowids for collision-free allocation).
+        let cur = maps.max_rowids.get(name).copied().unwrap_or(i64::MIN);
+        if ch.max_rowid > cur {
+            maps.max_rowids.insert(name.to_string(), ch.max_rowid);
+        }
+        let cur_lc = maps.max_rowids.get(lc).copied().unwrap_or(i64::MIN);
+        if lc != name && ch.max_rowid > cur_lc {
+            maps.max_rowids.insert(lc.to_string(), ch.max_rowid);
+        }
+        let nonempty = !maps.roots.is_empty() || !maps.index_roots.is_empty();
+        drop(m);
+        self.maps_populated.store(nonempty, Ordering::Release);
+        // Schema-row sync for a root that moved while the chain was hot.
+        // Mirrors `sync_schema_roots_inner`: rewrite the row, update the
+        // tracker, and invalidate cached plans (they embed Arc<Table>
+        // snapshots; a fresh plan re-reads the live root from the maps).
+        let key = format!("table:{}", ch.name_lc);
+        let synced = self.schema_root_pages.lock();
+        if synced.get(&key).copied() != Some(ch.root) {
+            drop(synced);
+            self.rewrite_schema_row_root("table", &ch.table.name, ch.root)?;
+            let mut synced = self.schema_root_pages.lock();
+            synced.insert(key, ch.root);
+            drop(synced);
+            self.invalidate_stmt_cache();
+        }
+        Ok(())
+    }
+
+    /// Break (flush + drop) a hot INSERT chain. Every read path that can
+    /// observe table state (`query`, prepared statements, `flush`) calls
+    /// this first: while a chain is hot, the shared maps' root / max-rowid
+    /// entries for the chained table are stale by design.
+    pub(crate) fn break_insert_chain(&self) {
+        let flushed = self.insert_chain.lock().take();
+        if let Some(ch) = flushed {
+            // Flush state. Read paths tolerate flush errors the same way
+            // they tolerate deferred-flush failures: log nothing, keep
+            // going — the next writer re-derives the maps from the catalog.
+            let _ = self.flush_insert_chain(&ch);
+        }
+    }
+
+    /// Build (and store) an INSERT chain for `table` when the table is
+    /// plain enough for the lean chained path. Called after a successful
+    /// cold-path fast insert; the chain serves SUBSEQUENT same-shape
+    /// statements. `explicit_cols` is the statement's column list (empty
+    /// = supplies-all shape).
+    fn try_build_insert_chain(
+        &self,
+        explicit_cols: &[&str],
+        table: &Arc<Table>,
+        col_indices: &[usize],
+        root: u32,
+        max_rowid: i64,
+        leaf_hint: Option<u32>,
+    ) {
+        // Shape gates that `exec_fast_insert` already verified: no vtab,
+        // not WITHOUT ROWID, not STRICT, no generated columns, and either
+        // supplies-all or a table with no DEFAULTs.
+        // Additional gates: no CHECKs, no INSERT triggers, no outgoing
+        // foreign keys, no indexes (the chain maintains only the table
+        // B+tree; index maintenance needs the general path).
+        if !table.check_exprs.is_empty()
+            || !table.foreign_keys.is_empty()
+            || self
+                .catalog
+                .triggers_on_table(&table.name)
+                .iter()
+                .any(|t| {
+                    t.events
+                        .iter()
+                        .any(|ev| matches!(ev, TriggerEvent::Insert))
+                })
+            || !self.catalog.indexes_on_table(&table.name).is_empty()
+            // Explicit `rowid` column (sentinel target) needs the general
+            // path's conflict-checking executor.
+            || col_indices.contains(&crate::executor::ROWID_COLUMN_SENTINEL)
+            // Rowid space must have headroom for the fast `max+1`
+            // allocation (the degenerate case falls to the general path's
+            // collision-safe allocation).
+            || max_rowid >= i64::MAX - 1
+        {
+            return;
+        }
+        let n_cols = table.n_columns();
+        // Supplies-all: col_names stays empty (the shape marker) and
+        // col_indices is the identity 0..n_cols. Explicit list: keep the
+        // lowercased names for the scanner's case-insensitive comparison.
+        let (col_names, col_idx): (Vec<Box<str>>, Vec<usize>) = if explicit_cols.is_empty() {
+            (Vec::new(), (0..n_cols).collect())
+        } else {
+            (
+                explicit_cols
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase().into_boxed_str())
+                    .collect(),
+                col_indices.to_vec(),
+            )
+        };
+        let affinities: Vec<crate::types::Affinity> = col_idx
+            .iter()
+            .map(|&i| table.columns[i].affinity)
+            .collect();
+        let not_null: Vec<usize> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.nullable)
+            .map(|(i, _)| i)
+            .collect();
+        let full_row: Vec<Value> = vec![Value::Null; n_cols];
+        let chain = InsertChain {
+            epoch: self.write_epoch.load(Ordering::Acquire),
+            table: Arc::clone(table),
+            name_lc: table.name.to_ascii_lowercase().into_boxed_str(),
+            col_names,
+            col_indices: col_idx,
+            affinities,
+            not_null,
+            rowid_alias: table.rowid_alias,
+            root,
+            max_rowid,
+            leaf_hint,
+            full_row,
+            payload_buf: Vec::with_capacity(n_cols * 8),
+        };
+        *self.insert_chain.lock() = Some(chain);
+    }
+
     fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
         let table = match self.catalog.get_table_fast(fi.table) {
             Some(t) => t,
@@ -1917,8 +2204,31 @@ impl Database {
         // DETACH the combined maps (zero-copy): `execute`-family callers
         // hold `&mut self`, so no reader can hold a snapshot concurrently.
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+        // The original column-list shape (empty = supplies-all) decides the
+        // chain's scanner gate — take it out before `fi.values` moves.
+        let stmt_columns: Vec<&str> = fi.columns.clone();
         let result =
-            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values);
+            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values)
+                .map(|(inserted, root, max_rowid)| {
+                    // Seed the cross-statement INSERT chain (eligibility
+                    // is checked inside; plain tables only). The chain
+                    // serves the NEXT same-shape statement; this one paid
+                    // the cold-path setup.
+                    let table_key = Arc::as_ptr(&table) as usize;
+                    let leaf_hint = ctx
+                        .table_append_hint
+                        .filter(|(k, _)| *k == table_key)
+                        .map(|(_, leaf)| leaf);
+                    self.try_build_insert_chain(
+                        &stmt_columns,
+                        &table,
+                        &col_indices,
+                        root,
+                        max_rowid,
+                        leaf_hint,
+                    );
+                    inserted
+                });
 
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
@@ -2285,22 +2595,33 @@ impl Database {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         // ---- FAST INSERT PATH ----
         // Single-row literal VALUES inserts are the hottest statement shape
-        // in OLTP. A dedicated byte scanner recognizes them without the
-        // tokenizer/parser/planner/statement-cache pipeline (~1.3 us per
-        // statement of pure overhead). The scanner is conservative: any
-        // deviation (UPSERT, RETURNING, non-literals, multi-row) falls
-        // through to the general path below.
+        // in OLTP. Two tiers:
+        //   1. INSERT CHAIN — consecutive same-shape inserts keep every
+        //      derived fact (table, columns, root, max-rowid, leaf hint)
+        //      alive across statements: zero per-statement setup.
+        //   2. Byte scanner — first sight of a shape: recognizes the
+        //      statement without the tokenizer/parser/planner pipeline.
+        // The scanners are conservative: any deviation (UPSERT, RETURNING,
+        // non-literals, multi-row) falls through to the general path.
         {
             let first = sql
                 .as_bytes()
                 .iter()
                 .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
             if first == Some(&b'I') || first == Some(&b'i') {
+                if self.exec_chained_insert(sql)? {
+                    return Ok(());
+                }
                 if let Some(fi) = try_fast_insert_parse(sql) {
                     if self.exec_fast_insert(fi)? {
                         return Ok(());
                     }
                 }
+            } else {
+                // Any non-INSERT statement ends a hot chain: its root /
+                // max-rowid must reach the bookkeeping maps before the
+                // general path (or a later reader) consults them.
+                self.break_insert_chain();
             }
         }
         let is_ddl = is_ddl_sql(sql);
@@ -2531,6 +2852,10 @@ impl Database {
     /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
     /// the duration of the query — a SELECT never writes them back.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
+        // A hot INSERT chain owns the table's live root / max-rowid while
+        // the shared maps hold stale values — break (flush) it before this
+        // read consults the maps.
+        self.break_insert_chain();
         // Absorb the allocator's post-write-storm wake (see
         // `settle_allocator`) BEFORE the parse/plan allocations would pay
         // it — a bulk-write transaction followed by reads is the classic
@@ -2647,6 +2972,12 @@ impl Database {
                     | crate::planner::plan::Plan::Update { .. }
                     | crate::planner::plan::Plan::Delete { .. }
             ) {
+                // DML via the query path bypasses `Database::execute` (and
+                // its unconditional write-epoch bump) — bump it HERE so
+                // memoized COUNT(*) answers can never outlive the write
+                // they describe (see `FastPath::CountStar`).
+                self.write_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
                 // DML via the query path (e.g. INSERT..RETURNING): merge
                 // any root moves / max-rowid updates back.
                 if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
@@ -2725,6 +3056,7 @@ impl Database {
         sql: &str,
         params: P,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        self.break_insert_chain();
         self.maybe_settle_allocator();
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
@@ -6575,7 +6907,27 @@ fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
             }
         }
     } else if b[i] == b'\'' {
-        // String literal with '' escapes; UTF-8-safe byte collection.
+        // String literal with '' escapes; UTF-8-safe. The common case (no
+        // escaped quote inside) builds the Text value directly from the
+        // SQL slice — one copy, zero heap allocation for short strings
+        // (Text's small-string optimization stores up to 23 bytes inline).
+        let mut k = i + 1;
+        loop {
+            if k >= b.len() {
+                return None; // unterminated
+            }
+            if b[k] == b'\'' {
+                if k + 1 < b.len() && b[k + 1] == b'\'' {
+                    // Escaped quote inside — take the byte-collecting slow
+                    // path below (it restarts from the literal start).
+                    break;
+                }
+                let s = std::str::from_utf8(&b[i + 1..k]).ok()?;
+                return Some((Value::Text(s.into()), k + 1));
+            }
+            k += 1;
+        }
+        // Slow path: at least one '' escape — byte-collect.
         let mut k = i + 1;
         let mut bytes: Vec<u8> = Vec::new();
         loop {
@@ -6597,7 +6949,7 @@ fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
             }
         }
         let s = String::from_utf8(bytes).ok()?;
-        Some((Value::Text(s.into()), k))
+        Some((Value::Text(s.as_str().into()), k))
     } else {
         None
     }
@@ -6685,6 +7037,226 @@ fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
         columns,
         values,
     })
+}
+
+// ============================================================================
+// INSERT CHAIN — cross-statement single-row literal INSERT fast path
+// ============================================================================
+
+/// Cross-statement memo for consecutive single-row literal INSERTs into
+/// the same table with the same column list.
+///
+/// The per-statement INSERT pipeline — scanner allocations, catalog lookup,
+/// column resolution, `ExecContext` construction, maps detach/attach,
+/// per-statement hash-map bookkeeping, page-cache hints that reset on every
+/// statement boundary — costs ~1 µs of pure overhead, which dominates
+/// single-row INSERT throughput. A chain keeps every derived fact (the
+/// `Arc<Table>`, resolved column indices, affinities, the live root page,
+/// the max-rowid cache, and the B+tree right-most-leaf append hint) alive
+/// ACROSS statements, so the steady state per statement is:
+///
+/// ```text
+/// scan SQL into the reused row buffer (zero allocations)
+///   -> NOT NULL check -> payload encode into the reused buffer
+///   -> B+tree append into the pinned leaf -> counters
+/// ```
+///
+/// Correctness rests on two invariants:
+///
+/// 1. **Epoch gate** — `execute` bumps `write_epoch` unconditionally before
+///    dispatch. The chain is valid on entry only when the current epoch is
+///    exactly `chain.epoch + 1`, i.e. the ONLY statement between the chain's
+///    last use and now is the current one. Any other statement (DML, DDL,
+///    transaction control, `query`-path DML) breaks the chain first.
+/// 2. **Flush on break** — while the chain is hot it is the sole owner of
+///    the table's true root page and max-rowid; the shared bookkeeping maps
+///    are stale. Before ANY general-path statement consults those maps, the
+///    chain is flushed: root and max-rowid are written back (and the schema
+///    row is rewritten if a split moved the root, so a reopened database
+///    descends from the live root). The flush sites are `execute`'s general
+///    path, `query`/`query_with_columns`, the prepared-statement path, and
+///    `Database::flush` — every entry point that reads or mutates table
+///    state. Because writers hold `&mut self` (the outer `RwLock` write
+///    half) and readers hold the read half, no thread can observe the
+///    maps mid-chain.
+///
+/// Only "plain" tables are eligible: rowid tables without virtual tables,
+/// WITHOUT ROWID, STRICT, generated columns, CHECK constraints, INSERT
+/// triggers, outgoing foreign keys, indexes, or column-subset inserts on
+/// tables with DEFAULTs. Everything else falls back to the existing
+/// (still fast) general path.
+struct InsertChain {
+    /// `write_epoch` after the statement that last used (or built) this
+    /// chain. See the struct docs for the validity rule.
+    epoch: u64,
+    table: Arc<Table>,
+    /// Lowercased table name — key form used by the maps flush.
+    name_lc: Box<str>,
+    /// Lowercased column names as resolved (`[]` = supplies-all shape).
+    col_names: Vec<Box<str>>,
+    /// Target column index per VALUES position, parallel to
+    /// `col_names.len()` (or the column count for supplies-all).
+    col_indices: Vec<usize>,
+    /// Column affinity per VALUES position (parallel to `col_indices`).
+    affinities: Vec<crate::types::Affinity>,
+    /// Column indices that enforce NOT NULL.
+    not_null: Vec<usize>,
+    /// Rowid-alias column (INTEGER PRIMARY KEY), if any.
+    rowid_alias: Option<usize>,
+    /// Live root page of the table's B+tree (tracks splits).
+    root: u32,
+    /// Monotonic upper bound of rowids present in the table.
+    max_rowid: i64,
+    /// Cross-statement right-most-leaf append hint (page id). Validated on
+    /// every use by the B+tree insert path; falls back automatically.
+    leaf_hint: Option<u32>,
+    /// Reusable full-width row buffer, NULL-reset per row.
+    full_row: Vec<Value>,
+    /// Reusable payload encode buffer.
+    payload_buf: Vec<u8>,
+}
+
+/// Outcome of parsing a statement against an [`InsertChain`].
+enum ChainParse {
+    /// The statement's shape matched and its values were written into the
+    /// chain's row buffer.
+    Matched,
+    /// Any deviation — different table, different column list, multi-row
+    /// VALUES, explicit rowid, non-literal expression, trailing clauses.
+    Mismatch,
+}
+
+/// Parse one single-row literal INSERT whose shape matches `ch`, writing
+/// the affinity-coerced values directly into `ch.full_row` at their
+/// resolved column positions. Zero heap allocations on the matched path
+/// for short strings (Text small-string optimization).
+fn parse_chain_row(sql: &str, ch: &mut InsertChain) -> ChainParse {
+    let b = sql.as_bytes();
+    let mut i = skip_ws(b, 0);
+    // INSERT INTO
+    match match_word_ci(b, i, "INSERT") {
+        Some(j) => i = skip_ws(b, j),
+        None => return ChainParse::Mismatch,
+    }
+    match match_word_ci(b, i, "INTO") {
+        Some(j) => i = skip_ws(b, j),
+        None => return ChainParse::Mismatch,
+    }
+    // Table name must match the chained table (case-insensitive).
+    let (ts, te) = match read_ident(b, i) {
+        Some(r) => r,
+        None => return ChainParse::Mismatch,
+    };
+    if !ch.table.name.as_bytes().eq_ignore_ascii_case(&b[ts..te]) {
+        return ChainParse::Mismatch;
+    }
+    i = skip_ws(b, te);
+    let n_fields = ch.col_indices.len();
+    // Column list: must match the chain's resolved list verbatim
+    // (case-insensitive, same count, same order).
+    if i < b.len() && b[i] == b'(' {
+        if ch.col_names.is_empty() {
+            // Chain is a supplies-all shape; a column list is a different
+            // shape — let the cold path rebuild.
+            return ChainParse::Mismatch;
+        }
+        i += 1;
+        let mut k = 0usize;
+        loop {
+            i = skip_ws(b, i);
+            let (cs, ce) = match read_ident(b, i) {
+                Some(r) => r,
+                None => return ChainParse::Mismatch,
+            };
+            if k >= ch.col_names.len()
+                || !ch.col_names[k].as_bytes().eq_ignore_ascii_case(&b[cs..ce])
+            {
+                return ChainParse::Mismatch;
+            }
+            k += 1;
+            i = skip_ws(b, ce);
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if i >= b.len() || b[i] != b')' {
+            return ChainParse::Mismatch;
+        }
+        i = skip_ws(b, i + 1);
+    } else if !ch.col_names.is_empty() {
+        // Statement supplies all columns; the chain was built for an
+        // explicit column list.
+        return ChainParse::Mismatch;
+    }
+    // VALUES ( <single row> )
+    match match_word_ci(b, i, "VALUES") {
+        Some(j) => i = skip_ws(b, j),
+        None => return ChainParse::Mismatch,
+    }
+    if i >= b.len() || b[i] != b'(' {
+        return ChainParse::Mismatch;
+    }
+    i += 1;
+    // NULL-reset the reusable row buffer (releases nothing: Text values
+    // up to 23 bytes are stored inline inside the Value).
+    for v in ch.full_row.iter_mut() {
+        *v = Value::Null;
+    }
+    let mut k = 0usize;
+    loop {
+        i = skip_ws(b, i);
+        if k >= n_fields {
+            // More values than the chained shape.
+            return ChainParse::Mismatch;
+        }
+        let (v, ni) = match parse_fast_literal(b, i) {
+            Some(r) => r,
+            None => return ChainParse::Mismatch,
+        };
+        let target = ch.col_indices[k];
+        if target == crate::executor::ROWID_COLUMN_SENTINEL {
+            // Explicit `rowid` column on an alias-less table: needs the
+            // executor's conflict-checking path.
+            return ChainParse::Mismatch;
+        }
+        ch.full_row[target] = ch.affinities[k].coerce(v);
+        k += 1;
+        i = skip_ws(b, ni);
+        if i < b.len() && b[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if k != n_fields {
+        return ChainParse::Mismatch;
+    }
+    if i >= b.len() || b[i] != b')' {
+        return ChainParse::Mismatch;
+    }
+    i = skip_ws(b, i + 1);
+    // Multi-row VALUES (a comma follows the row) or any trailing clause
+    // other than a single optional semicolon → cold path.
+    if i < b.len() && b[i] != b';' {
+        return ChainParse::Mismatch;
+    }
+    if i < b.len() && b[i] == b';' {
+        i = skip_ws(b, i + 1);
+    }
+    if i != b.len() {
+        return ChainParse::Mismatch;
+    }
+    // An explicit value for the rowid-alias column (e.g. `id` in
+    // `INSERT INTO t (id, name) VALUES (5, 'x')`) needs the general path's
+    // collision check; the chain only handles auto-generated rowids.
+    if let Some(alias) = ch.rowid_alias {
+        if !ch.full_row[alias].is_null() {
+            return ChainParse::Mismatch;
+        }
+    }
+    ChainParse::Matched
 }
 
 fn is_ddl_sql(sql: &str) -> bool {
