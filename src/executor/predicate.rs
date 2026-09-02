@@ -421,6 +421,79 @@ pub(crate) fn compile_predicate(
     }
 }
 
+/// Column indices referenced by a compiled expression (for building the
+/// selective-decode column list).
+pub(crate) fn compiled_expr_columns(e: &CompiledExpr, out: &mut Vec<usize>) {
+    match e {
+        CompiledExpr::Col(i) => out.push(*i),
+        CompiledExpr::Param(_) | CompiledExpr::Literal(_) => {}
+        CompiledExpr::Unary(_, a) => compiled_expr_columns(a, out),
+        CompiledExpr::Binary(_, l, r) => {
+            compiled_expr_columns(l, out);
+            compiled_expr_columns(r, out);
+        }
+    }
+}
+
+/// Compile an expression against a table (scoped by alias `prefix`),
+/// accepting BOTH bare `col` references and `prefix.col` / `table.col`
+/// qualified references (the general `compile_expr` only accepts bare
+/// ones). Returns None for anything outside the supported shape or any
+/// reference that doesn't bind to this table (correlated/outer refs fall
+/// back to the general AST-walk path).
+pub(crate) fn compile_expr_scoped(
+    e: &Expr,
+    table: &crate::schema::Table,
+    prefix: &str,
+    params_len: usize,
+) -> Option<CompiledExpr> {
+    let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    let normalized = normalize_scope(e, table, prefix)?;
+    compile_expr(&normalized, &col_names, params_len)
+}
+
+/// Rewrite an expression tree so in-scope qualified column references
+/// become bare references (compile_expr's input shape). Returns None if
+/// any reference is out of scope (can't compile against this table).
+fn normalize_scope(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<Expr> {
+    match e {
+        Expr::Column { table: ref_t, name } => match ref_t {
+            None => Some(e.clone()),
+            Some(t) => {
+                let matches = if prefix == table.name {
+                    t == &table.name || t == prefix
+                } else {
+                    t == prefix
+                };
+                if matches && table.find_column(name).is_some() {
+                    Some(Expr::Column { table: None, name: name.clone() })
+                } else {
+                    None
+                }
+            }
+        },
+        Expr::Literal(_) => Some(e.clone()),
+        Expr::Parameter(_) => Some(e.clone()),
+        Expr::Unary { op, expr } => Some(Expr::Unary {
+            op: *op,
+            expr: Box::new(normalize_scope(expr, table, prefix)?),
+        }),
+        Expr::Binary { op, left, right } => {
+            // AND/OR are predicates, not value expressions — exclude here
+            // (compile_expr would reject them anyway).
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                return None;
+            }
+            Some(Expr::Binary {
+                op: *op,
+                left: Box::new(normalize_scope(left, table, prefix)?),
+                right: Box::new(normalize_scope(right, table, prefix)?),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

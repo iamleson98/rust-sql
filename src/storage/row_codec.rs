@@ -312,6 +312,113 @@ fn value_encoded_len(buf: &[u8]) -> Result<usize> {
     })
 }
 
+/// Decode only the wanted columns into a FULL-WIDTH row buffer
+/// (`out.len() == n_cols_total`), leaving every non-wanted column as
+/// `Value::Null`. This is the companion of `decode_row_selective` for
+/// compiled positional expressions: they index by table column position
+/// (identity layout), so the decoded slice must be full-width — but the
+/// decode cost stays proportional to the wanted columns (skipped columns
+/// cost only a length probe, and their slots are never read by
+/// construction: the expression compiler derived `wanted` from exactly
+/// the columns the expressions reference).
+///
+/// `wanted` must be ascending and deduplicated.
+pub fn decode_row_selective_wide(
+    buf: &[u8],
+    n_cols_total: usize,
+    wanted: &[usize],
+    rowid: i64,
+    alias: Option<usize>,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    // Reset to all-Null, full width. Reuses the Vec's allocation; the
+    // previous values' drops are free for Integer/Real/Null and for
+    // SSO Text (no heap free), so the reset is a memset + branch per slot.
+    out.clear();
+    out.resize(n_cols_total, Value::Null);
+
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    let mut pos = 0usize;
+    let mut col = 0usize;
+    let mut wanted_idx = 0usize;
+
+    while pos < buf.len() && col < n_cols_total && wanted_idx < wanted.len() {
+        while wanted_idx < wanted.len() && wanted[wanted_idx] < col {
+            wanted_idx += 1;
+        }
+        if wanted_idx >= wanted.len() {
+            break;
+        }
+        let target = wanted[wanted_idx];
+        if col == target {
+            if alias == Some(col) {
+                if buf[pos] != ROWID_MARKER {
+                    return Err(crate::error::Error::corruption(
+                        "rowid-alias column must hold the rowid marker",
+                    ));
+                }
+                out[col] = Value::Integer(rowid);
+                pos += 1;
+            } else {
+                let (v, n) = Value::decode(&buf[pos..])
+                    .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
+                out[col] = v;
+                pos += n;
+            }
+            wanted_idx += 1;
+        } else if alias == Some(col) {
+            pos += 1;
+        } else {
+            let n = value_encoded_len(&buf[pos..])?;
+            pos += n;
+        }
+        col += 1;
+    }
+    Ok(())
+}
+
+/// Walk the payload's column layout, writing `(offset, encoded_len)` per
+/// column into `out` (cleared first; the rowid-alias column's region is
+/// its 1-byte marker). Returns false when the payload is truncated or
+/// encodes fewer columns than `n_cols` (caller decides whether the
+/// missing columns matter). Used by the UPDATE payload-patch fast path.
+pub fn row_column_regions_into(
+    payload: &[u8],
+    n_cols: usize,
+    alias: Option<usize>,
+    out: &mut Vec<(u32, u32)>,
+) -> bool {
+    out.clear();
+    out.reserve(n_cols);
+    let mut pos = 0usize;
+    for col in 0..n_cols {
+        if pos >= payload.len() {
+            return false; // missing column(s)
+        }
+        if alias == Some(col) {
+            if payload[pos] != ROWID_MARKER {
+                return false;
+            }
+            out.push((pos as u32, 1));
+            pos += 1;
+        } else {
+            let n = match value_encoded_len(&payload[pos..]) {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            if pos + n > payload.len() {
+                return false;
+            }
+            out.push((pos as u32, n as u32));
+            pos += n;
+        }
+    }
+    pos == payload.len()
+}
+
 fn affinity_apply_opt(aff: Affinity, v: Value) -> Option<Value> {
     match (aff, v) {
         (Affinity::None, v) => Some(v),

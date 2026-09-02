@@ -338,7 +338,7 @@ use crate::sql::ast::*;
 use crate::storage::btree::{Btree, LookupResult};
 use crate::storage::page::PageId;
 use crate::storage::pager::Pager;
-use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, encode_row_aliased, encode_row_aliased_into};
+use crate::storage::row_codec::{decode_row, decode_row_into, decode_row_selective, decode_row_selective_wide, encode_row_aliased, encode_row_aliased_into};
 use crate::types::{Row, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -2834,7 +2834,7 @@ impl AggFunc {
 /// group order exactly like the old implementation.
 #[derive(Default)]
 struct HashGrouper {
-    buckets: HashMap<u64, Vec<usize>>,
+    buckets: HashMap<u64, Vec<usize>, crate::api::FxHashBuild>,
     /// (key values, per-aggregate states) in first-seen order.
     groups: Vec<(Vec<Value>, Vec<AggState>)>,
 }
@@ -2845,7 +2845,11 @@ impl HashGrouper {
     /// `key` is typically a reusable scratch buffer — its contents are
     /// cloned only when a NEW group is created.
     fn intern(&mut self, key: &[Value]) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // FxHash-style multiply-rotate hasher: ~5-10 ns for the typical
+        // 1-2 value key vs ~25-40 ns for SipHash (the previous
+        // `DefaultHasher`). The hash quality is more than sufficient for
+        // group interning — collisions cost one wasted values_sql_equal.
+        let mut hasher = crate::api::FxHasher::default();
         for v in key {
             hash_sql_value(v, &mut hasher);
         }
@@ -2866,6 +2870,28 @@ impl HashGrouper {
         // New group.
         let gi = self.groups.len();
         self.groups.push((key.to_vec(), Vec::new()));
+        self.buckets.entry(h).or_default().push(gi);
+        gi
+    }
+
+    /// Single-key variant: skips the key-slice machinery entirely (no
+    /// `key_buf` Vec, no length header, one value hash + one direct
+    /// comparison). This is the overwhelmingly common `GROUP BY <expr>`
+    /// shape.
+    fn intern_one(&mut self, key: &Value) -> usize {
+        let mut hasher = crate::api::FxHasher::default();
+        hash_sql_value(key, &mut hasher);
+        let h = hasher.finish();
+        if let Some(bucket) = self.buckets.get(&h) {
+            for &gi in bucket {
+                let (existing, _) = &self.groups[gi];
+                if existing.len() == 1 && crate::types::values_sql_equal(&existing[0], key) {
+                    return gi;
+                }
+            }
+        }
+        let gi = self.groups.len();
+        self.groups.push((vec![key.clone()], Vec::new()));
         self.buckets.entry(h).or_default().push(gi);
         gi
     }
@@ -3080,7 +3106,128 @@ fn exec_aggregate_streaming_scan(
         let compiled_filter = filter_predicate
             .and_then(|p| crate::executor::predicate::compile_predicate(p, &table, prefix));
         let identity: Vec<usize> = (0..n_cols).collect();
+
+        // ---- Compiled-expression fast path ------------------------------
+        // GROUP BY keys and aggregate args that are ARITHMETIC over
+        // columns/literals/params (`GROUP BY val / 100`, `SUM(val + 1)`)
+        // compile once into positional trees (`CompiledExpr`) — ~5-15
+        // ns/row instead of the ~60-120 ns `eval_row` AST walk with its
+        // per-row name resolution. When EVERY key and arg compiles, the
+        // decode can also be SELECTIVE (only the referenced columns),
+        // through a full-width buffer so identity indexing keeps working.
+        let params_len = params.len();
+        let compiled_keys: Vec<Option<crate::executor::predicate::CompiledExpr>> = group_by
+            .iter()
+            .map(|e| crate::executor::predicate::compile_expr_scoped(e, &table, prefix, params_len))
+            .collect();
+        let compiled_args: Vec<Option<crate::executor::predicate::CompiledExpr>> = aggregates
+            .iter()
+            .enumerate()
+            .map(|(i, agg)| match &agg.arg {
+                Some(arg) => {
+                    // Bare columns keep their zero-cost direct index path.
+                    if agg_col_indices[i].is_some() {
+                        None
+                    } else {
+                        crate::executor::predicate::compile_expr_scoped(
+                            arg, &table, prefix, params_len,
+                        )
+                    }
+                }
+                None => None, // COUNT(*): no argument to evaluate
+            })
+            .collect();
+        let keys_all_compile = compiled_keys.iter().all(|k| k.is_some())
+            && compiled_keys.len() == group_by.len();
+        let args_all_compile = aggregates
+            .iter()
+            .enumerate()
+            .all(|(i, agg)| agg.arg.is_none() || agg_col_indices[i].is_some() || compiled_args[i].is_some());
+
+        let single_key = group_by.len() == 1;
         let rowid_alias = table.rowid_alias;
+
+        if keys_all_compile && args_all_compile {
+            // Referenced columns = union of compiled key/arg columns +
+            // bare-column indices, ascending + deduped.
+            let mut wanted: Vec<usize> = Vec::with_capacity(n_cols);
+            for k in compiled_keys.iter().flatten() {
+                crate::executor::predicate::compiled_expr_columns(k, &mut wanted);
+            }
+            for (i, _agg) in aggregates.iter().enumerate() {
+                if let Some(idx) = agg_col_indices[i] {
+                    wanted.push(idx);
+                } else if let Some(c) = &compiled_args[i] {
+                    crate::executor::predicate::compiled_expr_columns(c, &mut wanted);
+                }
+            }
+            wanted.sort_unstable();
+            wanted.dedup();
+
+            let mut wide: Vec<Value> = vec![Value::Null; n_cols];
+            let mut owned_key: Value = Value::Null;
+            bt.scan_table_borrowed(|rowid, payload| {
+                if decode_row_selective_wide(
+                    payload, n_cols, &wanted, rowid, rowid_alias, &mut wide,
+                )
+                .is_err()
+                {
+                    return true; // skip corrupt rows
+                }
+                if let Some(pred) = filter_predicate {
+                    let keep = if let Some(cp) = &compiled_filter {
+                        cp.eval(&wide, &identity, params)
+                    } else {
+                        match eval_row(pred, &wide, &columns, params, named_params) {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => false,
+                        }
+                    };
+                    if !keep {
+                        return true;
+                    }
+                }
+                // Group key: single-value fast path or full key Vec.
+                let gi = if single_key {
+                    let kv = match &compiled_keys[0] {
+                        Some(c) => c.eval(&wide, params),
+                        None => wide[key_col_indices[0].unwrap()].clone(),
+                    };
+                    owned_key = kv;
+                    grouper.intern_one(&owned_key)
+                } else {
+                    key_buf.clear();
+                    for (i, _g) in group_by.iter().enumerate() {
+                        let kv = match &compiled_keys[i] {
+                            Some(c) => c.eval(&wide, params),
+                            None => wide[key_col_indices[i].unwrap()].clone(),
+                        };
+                        key_buf.push(kv);
+                    }
+                    grouper.intern(&key_buf)
+                };
+                if grouper.groups[gi].1.is_empty() {
+                    grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
+                }
+                for (i, agg) in aggregates.iter().enumerate() {
+                    if agg.arg.is_none() {
+                        // COUNT(*): constant placeholder, no evaluation.
+                        update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &COUNT_STAR_ARG, false);
+                        continue;
+                    }
+                    let arg_val = match (agg_col_indices[i], &compiled_args[i]) {
+                        (Some(idx), _) => wide[idx].clone(),
+                        (None, Some(c)) => c.eval(&wide, params),
+                        (None, None) => Value::Null,
+                    };
+                    update_agg_state(&mut grouper.groups[gi].1[i], agg_funcs[i], &arg_val, agg.distinct);
+                }
+                true
+            })?;
+            return finish_group_result(grouper, group_by, aggregates);
+        }
+
+        let identity_ref: &[usize] = &identity;
         bt.scan_table_borrowed(|rowid, payload| {
             row_buf.clear();
             if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
@@ -3089,7 +3236,7 @@ fn exec_aggregate_streaming_scan(
             // Apply the filter predicate inline (if any).
             if let Some(pred) = filter_predicate {
                 let keep = if let Some(cp) = &compiled_filter {
-                    cp.eval(&row_buf, &identity, params)
+                    cp.eval(&row_buf, identity_ref, params)
                 } else {
                     match eval_row(pred, &row_buf, &columns, params, named_params) {
                         Ok(v) => v.is_truthy(),
@@ -3138,8 +3285,17 @@ fn exec_aggregate_streaming_scan(
         })?;
     }
 
-    // Emit one output row per group, in first-seen order (matches the
-    // previous implementation's `group_order` behavior).
+    finish_group_result(grouper, group_by, aggregates)
+}
+
+/// Emit one output row per group, in first-seen order (matches the
+/// previous implementation's `group_order` behavior). Shared by the
+/// compiled-expression fast path and the general path.
+fn finish_group_result(
+    grouper: HashGrouper,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> Result<ExecResult> {
     let mut out_rows = Vec::with_capacity(grouper.len());
     for (key, states) in grouper.groups {
         let mut row = key;
@@ -3164,6 +3320,10 @@ fn exec_aggregate_streaming_scan(
 
     Ok(ExecResult { columns: out_cols.into(), rows: out_rows })
 }
+
+/// COUNT(*) placeholder argument: update_agg_state's non-NULL integer,
+/// shared so the fast path doesn't build a fresh Value per row.
+static COUNT_STAR_ARG: Value = Value::Integer(1);
 
 /// Vectorized fast path for `SELECT <aggregates> FROM t [WHERE pred]`
 /// (no GROUP BY). Key optimizations vs the generic streaming-scan path:
@@ -8025,6 +8185,19 @@ fn try_streaming_update(
             None
         };
 
+    // Payload-patch fast path state: built when eligible (no constraints,
+    // every SET compiles, no RETURNING) — see `UpdatePatchCtx`.
+    let fk_enforced = ctx.pager.foreign_keys_enabled();
+    let mut patch_ctx: Option<UpdatePatchCtx> = UpdatePatchCtx::try_new(
+        table,
+        assignments,
+        &compiled_assignments,
+        compiled_residual.as_ref(),
+        residual_pred,
+        returning,
+        fk_enforced,
+    );
+
     // Pre-compute which indexes might be touched by the SET assignments
     // BEFORE the scan — when any index column is assigned, the OLD payload
     // must be stashed during the scan phase so phase 2 can compute the old
@@ -8144,6 +8317,7 @@ fn try_streaming_update(
                     residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                     compiled_ref,
                     compiled_residual.as_ref(),
+                    patch_ctx.as_mut(),
                 ) {
                     first_error = Some(e);
                 }
@@ -8160,6 +8334,7 @@ fn try_streaming_update(
                 residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                 compiled_ref,
                 compiled_residual.as_ref(),
+                patch_ctx.as_mut(),
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -8292,6 +8467,7 @@ fn try_streaming_update(
                     residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                     compiled_ref,
                     compiled_residual.as_ref(),
+                    patch_ctx.as_mut(),
                 ) {
                     err = Some(e);
                     return false;
@@ -8315,6 +8491,7 @@ fn try_streaming_update(
                         residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                         compiled_ref,
                         compiled_residual.as_ref(),
+                        patch_ctx.as_mut(),
                     ) {
                         first_error = Some(e);
                         break;
@@ -8334,6 +8511,7 @@ fn try_streaming_update(
                 residual_pred, &mut updates, &mut update_arena, &mut returning_rows, returning, old_owned,
                 compiled_ref,
                 compiled_residual.as_ref(),
+                patch_ctx.as_mut(),
             ) {
                 first_error = Some(e);
                 return false; // stop the scan
@@ -8569,6 +8747,75 @@ fn try_streaming_update(
 /// enforce constraints, encode it into `payload_buf`, and push the
 /// (rowid, payload) tuple into `updates`. Buffers are reused across rows.
 #[allow(clippy::too_many_arguments)]
+/// Precomputed per-statement state for the UPDATE payload-patch fast path.
+/// When the table has no row constraints (no NOT NULL / CHECK / enforced
+/// FK) and every SET expression compiles, the new payload is built by
+/// COPYING the old payload bytes and patching only the assigned columns'
+/// regions — valid whenever each encoded new value keeps its size. This
+/// skips the full-row decode AND the full-row re-encode (~60-90 ns/row on
+/// a 4-column table). Any size change falls back to the generic path,
+/// which re-decodes the full row and re-encodes it.
+pub(crate) struct UpdatePatchCtx {
+    /// Columns to decode: assigned + everything the SET/residual
+    /// expressions reference (ascending, deduped).
+    wanted: Vec<usize>,
+    /// assigned_slot[col] = Some(slot) when column `col` is assigned.
+    assigned_slot: Vec<Option<usize>>,
+    /// Staging buffer for the encoded new values (reused per row).
+    staging: Vec<u8>,
+    /// (offset, len) of each assignment's encoded value in `staging`.
+    slot_regions: Vec<(usize, usize)>,
+    /// Column regions of the current row's old payload (reused per row).
+    regions: Vec<(u32, u32)>,
+}
+
+impl UpdatePatchCtx {
+    /// Build the patch context when eligible, else None.
+    fn try_new(
+        table: &Arc<Table>,
+        assignments: &[(usize, Expr)],
+        compiled: &[Option<crate::executor::predicate::CompiledExpr>],
+        compiled_residual: Option<&crate::executor::predicate::CompiledPredicate>,
+        residual_pred: Option<&Expr>,
+        returning: Option<&[crate::sql::ast::ResultColumn]>,
+        fk_enforced: bool,
+    ) -> Option<UpdatePatchCtx> {
+        // RETURNING may project UNassigned columns — the patch path never
+        // decodes them. No constraints (they'd read undecoded Nulls). Every
+        // SET must compile (the AST walk needs the full row + col names).
+        if returning.is_some()
+            || table.columns.iter().any(|c| !c.nullable)
+            || !table.check_exprs.is_empty()
+            || (fk_enforced && !table.foreign_keys.is_empty())
+            || compiled.len() != assignments.len()
+            || compiled.iter().any(|c| c.is_none())
+            || (residual_pred.is_some() && compiled_residual.is_none())
+        {
+            return None;
+        }
+        let mut wanted: Vec<usize> = Vec::new();
+        for c in compiled.iter().flatten() {
+            crate::executor::predicate::compiled_expr_columns(c, &mut wanted);
+        }
+        if let Some(cp) = compiled_residual {
+            crate::executor::predicate::compiled_columns(cp, &mut wanted);
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut assigned_slot = vec![None; table.n_columns()];
+        for (slot, (col_idx, _)) in assignments.iter().enumerate() {
+            assigned_slot[*col_idx] = Some(slot);
+        }
+        Some(UpdatePatchCtx {
+            wanted,
+            assigned_slot,
+            staging: Vec::with_capacity(64),
+            slot_regions: Vec::with_capacity(assignments.len()),
+            regions: Vec::with_capacity(table.n_columns()),
+        })
+    }
+}
+
 fn process_update_row(
     fk_ctx: &ExecContext<'_>,
     payload: &[u8],
@@ -8599,7 +8846,70 @@ fn process_update_row(
     // doesn't compile — the general AST walk is used then). Identity
     // positions: row_buf holds the full table-order row.
     compiled_pred: Option<&crate::executor::predicate::CompiledPredicate>,
+    // Payload-patch fast path state (see `UpdatePatchCtx`); None when
+    // ineligible. Taken by value (&mut) — the scratch buffers are reused
+    // across rows.
+    patch: Option<&mut UpdatePatchCtx>,
 ) -> Result<()> {
+    // ---- Payload-patch fast path -----------------------------------
+    // Selectively decode ONLY the referenced columns, evaluate the SETs,
+    // and patch the assigned columns' byte regions in a copy of the old
+    // payload. Falls back to the generic path below on ANY mismatch
+    // (size change, missing column, decode error) — the generic body
+    // re-decodes the full row, so correctness is identical.
+    if let Some(pc) = patch {
+        if decode_row_selective_wide(payload, n_cols, &pc.wanted, rowid, table.rowid_alias, row_buf).is_ok() {
+            let keep = match (residual_pred, compiled_pred) {
+                (None, _) => true,
+                (Some(_), Some(cp)) => cp.eval(row_buf, IDENTITY_POSITIONS, params),
+                (Some(_), None) => false, // eligibility guaranteed a compiled residual
+            };
+            if !keep {
+                return Ok(());
+            }
+            // Stage the encoded new values.
+            pc.staging.clear();
+            pc.slot_regions.clear();
+            for (i, (col_idx, _)) in assignments.iter().enumerate() {
+                let v = match compiled.and_then(|c| c.get(i)) {
+                    Some(Some(cexpr)) => cexpr.eval(row_buf, params),
+                    _ => Value::Null, // eligibility guaranteed Some — unreachable
+                };
+                let v = table.columns[*col_idx].affinity.coerce(v);
+                let off = pc.staging.len();
+                v.encode_into(&mut pc.staging);
+                pc.slot_regions.push((off, pc.staging.len() - off));
+            }
+            // Patch the old payload's byte regions.
+            if crate::storage::row_codec::row_column_regions_into(
+                payload, n_cols, table.rowid_alias, &mut pc.regions,
+            ) {
+                // Start from a byte copy of the old payload; assigned
+                // regions are overwritten below.
+                payload_buf.clear();
+                payload_buf.extend_from_slice(payload);
+                let mut sizes_match = true;
+                for (col, (roff, rlen)) in pc.regions.iter().enumerate() {
+                    if let Some(slot) = pc.assigned_slot.get(col).and_then(|s| *s) {
+                        let (soff, slen) = pc.slot_regions[slot];
+                        if slen as u32 != *rlen {
+                            sizes_match = false;
+                            break;
+                        }
+                        payload_buf[(*roff as usize)..(*roff as usize + *rlen as usize)]
+                            .copy_from_slice(&pc.staging[soff..soff + slen]);
+                    }
+                }
+                if sizes_match {
+                    let start = update_arena.len();
+                    update_arena.extend_from_slice(payload_buf);
+                    updates.push((rowid, start..update_arena.len(), old_payload_stash));
+                    return Ok(());
+                }
+            }
+            // Fall through — the generic path re-decodes the full row.
+        }
+    }
     row_buf.clear();
     if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {
         return Ok(());
