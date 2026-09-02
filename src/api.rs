@@ -25,11 +25,42 @@ use crate::types::{Row, Value};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// The maximum number of pages cached in memory.
 const DEFAULT_CACHE_PAGES: usize = 2048;
+
+/// Allocator-wake drain state: the delayed-free sweep happens once per
+/// process (verified by examples/probe_rounds.rs), so a global flag
+/// suffices — the first qualifying write burst drains it, everything
+/// after runs clean.
+static ALLOC_SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// Estimated freed blocks that must accumulate before a drain is worth
+/// its ~170 µs cost: roughly 3.7k single-row write statements (or any
+/// bulk txn / index backfill). Below this, a possible wake is smaller
+/// than the drain itself.
+const ALLOC_WAKE_THRESHOLD: u64 = 400_000;
+
+/// Drain mimalloc's delayed-free wake: ~512 allocations across the small
+/// size classes (8..128 bytes) force the page-acquisition sweep that
+/// read-path allocations would otherwise pay after a bulk-write storm
+/// (200-400 µs, measured in examples/probe_drain_cold.rs). The sweep
+/// frees pages back to the size-class queues; every later allocation —
+/// in any class — runs at steady-state cost. No-op cost when the
+/// allocator has nothing pending (~2 µs for 512 empty Vec allocations).
+#[cfg(not(feature = "mimalloc"))]
+fn drain_mimalloc_wake() {}
+
+#[cfg(feature = "mimalloc")]
+fn drain_mimalloc_wake() {
+    let mut sink: Vec<Vec<u8>> = Vec::with_capacity(512);
+    for i in 0..512usize {
+        sink.push(vec![0u8; (i % 16) * 8 + 8]);
+    }
+    drop(sink);
+}
 
 /// Lightweight phase profiler (nanosecond accumulators). Zero-cost when
 /// not being read; used by `examples/phase_profile.rs` to attribute
@@ -127,6 +158,22 @@ pub struct Database {
     /// Only writes (DML causing root splits / rowid-cache fills) take the
     /// write lock, and the writer (`&mut self`) detaches the Arc entirely.
     pub(crate) maps: RwLock<std::sync::Arc<crate::executor::StmtMaps>>,
+    /// Fast-path guard for `maps`: false while the root-override maps are
+    /// empty (the common case — they only gain entries after a B+tree
+    /// split moves a root). A relaxed atomic load + branch replaces the
+    /// read-lock on every fast-path point lookup. Writers hold `&mut self`
+    /// (exclusive with all readers at the type level), so a stale `false`
+    /// is impossible: the flag is refreshed at every maps attach site.
+    maps_populated: AtomicBool,
+    /// Estimated allocator blocks freed by write statements since the last
+    /// read-side settle (see `settle_allocator`). Bulk-write transactions
+    /// free hundreds of thousands of small blocks (statement ASTs, encode
+    /// buffers, payload Vecs); mimalloc defers the free-queue recovery,
+    /// and the FIRST allocating READ after the storm pays a 200-570 µs
+    /// wake. A ~15-20 µs allocation tap on the read side absorbs it —
+    /// mirroring how SQLite's costs land inside the operations that cause
+    /// them, not on the next unrelated query.
+    alloc_burst: AtomicU64,
     /// Root page currently persisted in the schema table per object
     /// ("table:name" / "index:name" -> rootpage in the schema row).
     /// `sync_schema_roots` rewrites a schema row only when the live root
@@ -1393,6 +1440,8 @@ impl Database {
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             maps: RwLock::new(empty_maps()),
+            maps_populated: AtomicBool::new(false),
+            alloc_burst: AtomicU64::new(0),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
             last_stmt: RwLock::new(None),
@@ -1618,6 +1667,7 @@ impl Database {
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         if let Ok(n) = result {
             crate::executor::change_counters::record(n);
+            self.note_alloc_burst(n as u64, 0);
         }
         // Merge overlays back regardless of success — a failed statement
         // may still have split a B+tree (page writes are not undone), so
@@ -1637,6 +1687,7 @@ impl Database {
             Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
         }
         *self.maps.get_mut() = ctx.shared;
+        self.refresh_maps_flag();
         if result.is_ok() && ctx.roots_changed {
             self.sync_schema_roots_inner()?;
         }
@@ -1652,6 +1703,8 @@ impl Database {
                 let _ = self.pager.flush();
             }
         }
+        // Allocator-wake drain at auto-commit write-burst completion.
+        self.maybe_drain_after_burst();
         Ok(true)
     }
 
@@ -1792,6 +1845,64 @@ impl Database {
         self.sync_schema_roots_inner()
     }
 
+    /// Refresh `maps_populated` from the live maps. Called at every attach
+    /// site (all on `&mut self` / write-lock paths — never on a reader).
+    /// A relaxed store is enough: readers can only run before or after a
+    /// writer at the type level (`query` is `&self`, writers `&mut self`).
+    fn refresh_maps_flag(&self) {
+        let nonempty = {
+            let m = self.maps.read();
+            !m.roots.is_empty() || !m.index_roots.is_empty()
+        };
+        self.maps_populated.store(nonempty, Ordering::Release);
+    }
+
+    /// Account allocator blocks freed by a write statement: an AST + token
+    /// + plan teardown baseline per statement, plus per-row encode buffers,
+    /// plus newly-dirtied pages (index backfills, page splits). Feeds the
+    /// `drain_mimalloc_wake` threshold (checked at transaction end — see
+    /// `maybe_drain_after_burst`).
+    fn note_alloc_burst(&self, changes: u64, dirty_delta: u64) {
+        // `dirty_delta` counts mutating write ops (the pager's upper-bound
+        // counter) — each spills encode buffers + cell bytes, so weight it
+        // as ~150 blocks.
+        let blocks = 48 + changes * 6 + dirty_delta * 150;
+        self.alloc_burst.fetch_add(blocks, Ordering::Relaxed);
+    }
+
+    /// Drain mimalloc's delayed-free wake when a write burst COMPLETES —
+    /// i.e. a statement ends with no transaction open (auto-commit write,
+    /// COMMIT, ROLLBACK, DDL). Draining mid-transaction is useless: the
+    /// remaining statements re-arm the queue (measured in
+    /// examples/probe_mid_drain.rs — mid-storm drain leaves a 212 µs wake
+    /// on the next read; a post-storm drain leaves 19.5 µs). Once per
+    /// process: later bursts never re-wake (examples/probe_rounds.rs).
+    fn maybe_drain_after_burst(&self) {
+        if !ALLOC_SETTLED.load(Ordering::Relaxed)
+            && !self.in_transaction.load(Ordering::Acquire)
+            && self.alloc_burst.load(Ordering::Relaxed) > ALLOC_WAKE_THRESHOLD
+            && !ALLOC_SETTLED.swap(true, Ordering::Relaxed)
+        {
+            drain_mimalloc_wake();
+            self.alloc_burst.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Read-side safety net for the allocator wake (see
+    /// `drain_mimalloc_wake`): covers write bursts that completed without
+    /// passing the transaction-end check (e.g. DML via the query/RETURNING
+    /// path). Free once the process-level flag is settled.
+    #[inline]
+    fn maybe_settle_allocator(&self) {
+        if !ALLOC_SETTLED.load(Ordering::Relaxed)
+            && self.alloc_burst.load(Ordering::Relaxed) > ALLOC_WAKE_THRESHOLD
+            && !ALLOC_SETTLED.swap(true, Ordering::Relaxed)
+        {
+            drain_mimalloc_wake();
+            self.alloc_burst.store(0, Ordering::Relaxed);
+        }
+    }
+
     fn sync_schema_roots_inner(&self) -> Result<()> {
         // (object name, root page) pairs for tables and indexes.
         let (tables, indexes): (Vec<RootEntry>, Vec<RootEntry>) = {
@@ -1900,6 +2011,7 @@ impl Database {
             }
         }
         let is_ddl = is_ddl_sql(sql);
+        let dirty_before = self.pager.dirty_page_count() as u64;
         let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
         profile::span(t_cache, &profile::CACHE_NS);
@@ -1932,6 +2044,7 @@ impl Database {
                     Arc::make_mut(&mut ctx.shared).max_rowids.extend(ctx.max_rowids.drain());
                 }
                 *self.maps.get_mut() = ctx.shared;
+                self.refresh_maps_flag();
                 res?;
                 return Ok(());
             }
@@ -2030,6 +2143,16 @@ impl Database {
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         crate::executor::change_counters::record(ctx.changes);
+        // Allocator-burst accounting (see `settle_allocator`): estimate the
+        // blocks this statement freed — AST/plan teardown + per-row encode
+        // buffers + newly-dirtied pages (index backfill, splits). The dirty
+        // count is a DELTA (pages dirtied by THIS statement), not the
+        // cumulative count — lazy write-back never resets the total.
+        if result.is_ok() && (ctx.changes > 0 || is_ddl) {
+            let dirty_now = self.pager.dirty_page_count() as u64;
+            let dirty_delta = dirty_now.saturating_sub(dirty_before);
+            self.note_alloc_burst(ctx.changes.unsigned_abs(), dirty_delta);
+        }
         // Merge local overlay entries into the DETACHED maps (in place —
         // the statement is the sole owner, so make_mut never clones) and
         // attach them back to the Database. Merge regardless of `result`:
@@ -2050,6 +2173,7 @@ impl Database {
             Arc::make_mut(&mut ctx.shared).index_roots.extend(ctx.index_roots.drain());
         }
         *self.maps.get_mut() = ctx.shared;
+        self.refresh_maps_flag();
         if result.is_ok() && ctx.rolled_back {
             // ROLLBACK discarded in-transaction schema-row rewrites; reset
             // the persisted-root map to the catalog's (CREATE-time) values,
@@ -2065,6 +2189,7 @@ impl Database {
                 synced.insert(format!("index:{}", name), i.root_page);
             }
             *self.maps.get_mut() = empty_maps();
+            self.refresh_maps_flag();
         }
         // Persist any root-page moves (B+tree splits) to the schema rows so
         // a reopened database sees the full tree. Without this, every table
@@ -2087,6 +2212,9 @@ impl Database {
                 let _ = self.pager.flush();
             }
         }
+        // Allocator-wake drain at write-burst completion (COMMIT / auto-
+        // commit / DDL): see `maybe_drain_after_burst`.
+        self.maybe_drain_after_burst();
         result
     }
 
@@ -2100,6 +2228,11 @@ impl Database {
     /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
     /// the duration of the query — a SELECT never writes them back.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
+        // Absorb the allocator's post-write-storm wake (see
+        // `settle_allocator`) BEFORE the parse/plan allocations would pay
+        // it — a bulk-write transaction followed by reads is the classic
+        // bench (and production) shape.
+        self.maybe_settle_allocator();
         // In deferred_flush mode, a SELECT must see all writes that
         // happened since the last flush.
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
@@ -2228,6 +2361,8 @@ impl Database {
                     if ctx.index_roots_changed {
                         bk.index_roots.extend(ctx.index_roots.drain());
                     }
+                    let nonempty = !bk.roots.is_empty() || !bk.index_roots.is_empty();
+                    self.maps_populated.store(nonempty, Ordering::Release);
                 }
                 self.sync_schema_roots_inner()?;
             } else if ctx.max_rowids_changed {
@@ -2283,6 +2418,7 @@ impl Database {
     ///
     /// Takes `&self` — concurrent readers can call this simultaneously.
     pub fn query_with_columns<P: Params>(&self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)> {
+        self.maybe_settle_allocator();
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
@@ -2386,6 +2522,8 @@ impl Database {
                     if ctx.index_roots_changed {
                         bk.index_roots.extend(ctx.index_roots.drain());
                     }
+                    let nonempty = !bk.roots.is_empty() || !bk.index_roots.is_empty();
+                    self.maps_populated.store(nonempty, Ordering::Release);
                 }
                 self.sync_schema_roots_inner()?;
             } else if ctx.max_rowids_changed {
@@ -2703,6 +2841,7 @@ impl Database {
                 maps_snaps.truncate(depth);
                 if let Some(restored) = maps_snaps.last().cloned() {
                     *self.maps.get_mut() = restored;
+                    self.refresh_maps_flag();
                 }
                 Ok(())
             }
@@ -3119,27 +3258,25 @@ impl Database {
     }
 
     fn run_fast_path(&self, fp: &FastPath, params: &[Value]) -> Result<Vec<Row>> {
-        // One combined snapshot read for root overrides (tables + indexes).
-        // The maps are empty for the vast majority of OLTP databases (they
-        // only gain entries after a B+tree split moves a root), and a
-        // failed HashMap probe still pays name-hash + bucket-walk per map
-        // per query. An empty check is a load + compare: skip all four
-        // probes until the first split actually populates them.
-        let (table_root, index_root) = {
+        // Root-override resolution. `maps_populated` is a single atomic
+        // load: the maps only gain root entries after a B+tree split
+        // actually moves a root (rare), and until then an empty check
+        // replaces the read-lock + two HashMap probes on this hottest
+        // OLTP path. Writers hold `&mut self`, so the flag can never be
+        // stale while a reader runs.
+        let (table_root, index_root) = if self.maps_populated.load(Ordering::Acquire) {
             let m = self.maps.read();
-            if m.roots.is_empty() && m.index_roots.is_empty() {
-                (None, None)
-            } else {
-                let name = fp.table_name();
-                let t = m.roots.get(name).copied()
-                    .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
-                let i = match fp {
-                    FastPath::IndexPoint { index, .. } => m.index_roots.get(&index.name).copied()
-                        .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
-                    _ => None,
-                };
-                (t, i)
-            }
+            let name = fp.table_name();
+            let t = m.roots.get(name).copied()
+                .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
+            let i = match fp {
+                FastPath::IndexPoint { index, .. } => m.index_roots.get(&index.name).copied()
+                    .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
+                _ => None,
+            };
+            (t, i)
+        } else {
+            (None, None)
         };
         match fp {
             FastPath::RowidPoint { table, rowid, project, columns: _ } => {
@@ -5865,6 +6002,40 @@ impl<const N: usize> Params for [Value; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocator_wake_drained_after_bulk_txn() {
+        // A bulk-write transaction followed by COMMIT must drain the
+        // mimalloc deferred-free wake INSIDE the COMMIT (see
+        // `maybe_drain_after_burst`) — the next read then pays no
+        // post-storm recovery. Capture the pre-state so PARALLEL tests
+        // that already settled the process flag don't mask the check.
+        let was_settled_before = ALLOC_SETTLED.load(Ordering::Relaxed);
+        let mut db = Database::open_in_memory().unwrap();
+        db.set_deferred_flush(true);
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)", []).unwrap();
+        let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
+        db.execute("BEGIN", []).unwrap();
+        // 5000 single-row statements ≈ 1.02M accounted blocks — past the
+        // 400k ALLOC_WAKE_THRESHOLD, so the COMMIT-path drain must fire.
+        for i in 1..=5000i64 {
+            db.execute(sql, [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+                Value::Real(i as f64 * 1.5),
+            ]).unwrap();
+        }
+        db.execute("COMMIT", []).unwrap();
+        if !was_settled_before {
+            assert!(
+                ALLOC_SETTLED.load(Ordering::Relaxed),
+                "wake should be drained after a 5000-row txn COMMIT"
+            );
+        }
+        // Data intact either way.
+        let n = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer();
+        assert_eq!(n, 5000);
+    }
 
     #[test]
     fn test_rename_column_in_object_sql() {
