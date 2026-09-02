@@ -459,6 +459,91 @@ fn decode_rowid_only(buf: &[u8]) -> Option<(i64, usize)> {
 use std::sync::Arc;
 use crate::storage::pager::{PageRef, PageIdHashBuild};
 
+/// Biased cell search in a table leaf — SQLite's cursor-ix bias.
+///
+/// Probes the remembered cell first; a hit costs ONE probe. On a miss to
+/// the right, gallops exponentially (1, 2, 4, ... cells past the bias)
+/// before a bounded binary search; a miss to the left binary-searches
+/// [0, bias). Sequential rowid access (`WHERE id = ?` loops cycling +1,
+/// merge cursors, index-scan rowid batches) resolves in 1-2 probes vs
+/// log2(cells) ≈ 8-10 for a ~280-1000-cell leaf.
+///
+/// Exactness is unconditional: the bias only picks the first probe and
+/// narrows the search bracket; a completed search that misses means the
+/// rowid is absent (cells are sorted, brackets are proven).
+///
+/// Returns the matching cell index, or None when the rowid is absent.
+fn biased_rowid_search(
+    borrowed: &crate::storage::page::Page,
+    n: usize,
+    bias: u32,
+    rowid: i64,
+) -> Result<Option<usize>> {
+    #[inline]
+    fn cell_rowid(borrowed: &crate::storage::page::Page, i: usize) -> Result<i64> {
+        let ptr = borrowed.cell_pointer(i as u16) as usize;
+        let Some((r, _)) = decode_rowid_only(borrowed.cell_slice_checked(ptr)?) else {
+            return Err(Error::corruption("truncated leaf rowid in biased search"));
+        };
+        Ok(r)
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+    let bias = (bias as usize).min(n - 1);
+    let b = cell_rowid(borrowed, bias)?;
+    if b == rowid {
+        return Ok(Some(bias));
+    }
+    if b > rowid {
+        // Target is left of the bias: plain binary search [0, bias).
+        let mut lo = 0usize;
+        let mut hi = bias;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let r = cell_rowid(borrowed, mid)?;
+            if r == rowid {
+                return Ok(Some(mid));
+            } else if r < rowid {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return Ok(None);
+    }
+    // Target is right of the bias: probe the immediately-next cell (the
+    // sequential +1 pattern — cursor stepping, ordered batches — resolves
+    // in ONE more probe), then binary-search the remaining bracket.
+    // Invariant: cells [0, lo) are all < rowid; cells [hi, n) are all > rowid.
+    let mut lo = bias + 1;
+    let mut hi = n;
+    if lo < hi {
+        let r = cell_rowid(borrowed, lo)?;
+        if r == rowid {
+            return Ok(Some(lo));
+        }
+        if r < rowid {
+            lo += 1;
+        } else {
+            hi = lo;
+        }
+    }
+    // Bounded binary search in [lo, hi).
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let r = cell_rowid(borrowed, mid)?;
+        if r == rowid {
+            return Ok(Some(mid));
+        } else if r < rowid {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(None)
+}
+
 /// Software-prefetch the page header + cell-pointer array (first 1 KiB).
 ///
 /// A cold-leaf binary search touches the header line, then pointer-array
@@ -499,6 +584,9 @@ struct IndexLeafHint {
     /// First and last cell keys of the leaf (full key bytes).
     lo: Vec<u8>,
     hi: Vec<u8>,
+    /// Cell index of the last successful lower-bound probe in this leaf —
+    /// the search bias for `lookup_index_leaf`'s first probe.
+    last_cell: u32,
 }
 
 type HintMap<V> = std::collections::HashMap<PageId, V, PageIdHashBuild>;
@@ -526,45 +614,131 @@ fn hint_epoch_matches(epoch: u64) -> bool {
     LEAF_HINTS.with(|c| c.borrow().epoch == epoch)
 }
 
-/// Probe the table-leaf hint for `root`. Returns the cached page when
-/// `rowid` is inside the remembered bounds.
+/// Probe the table-leaf hint for `root`. Returns the cached page AND the
+/// remembered cell index of the last successful lookup in that leaf — the
+/// search bias (see `biased_rowid_search`).
+///
+/// Slots are keyed by rowid BUCKET (`rowid >> TABLE_HINT_BUCKET_SHIFT`),
+/// 2-way set-associative: one descent primes a whole 256-rowid range, so
+/// a first-visit sweep over sequential rowids (the fixed-parameter OLTP
+/// loop shape) descends ~once per leaf pair instead of once per rowid.
 #[inline]
-fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageRef> {
+fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<(PageRef, u32)> {
     TABLE_HINTS.with(|c| {
         let slots = &*c.borrow();
-        let slot = slots.get((rowid as usize) & (TABLE_HINT_SLOTS - 1))?.as_ref()?;
-        if slot.epoch == epoch && slot.root == root && rowid >= slot.lo && rowid <= slot.hi {
-            Some(Arc::clone(&slot.page))
-        } else {
-            None
+        let pair = table_hint_pair(rowid);
+        for slot in pair {
+            if let Some(s) = slots.get(slot).and_then(|x| x.as_ref()) {
+                if s.epoch == epoch && s.root == root && rowid >= s.lo && rowid <= s.hi {
+                    return Some((Arc::clone(&s.page), s.last_cell));
+                }
+            }
         }
+        None
     })
+}
+
+/// The two candidate slot indices for a rowid's bucket.
+#[inline(always)]
+fn table_hint_pair(rowid: i64) -> [usize; 2] {
+    let bucket = (rowid >> TABLE_HINT_BUCKET_SHIFT) as usize;
+    let base = (bucket << 1) & (TABLE_HINT_SLOTS - 1);
+    [base, base | 1]
 }
 
 /// Record the table-leaf hint for `root` (bounds read live from the page).
 #[inline]
-fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64) {
+fn set_table_hint(root: PageId, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64, cell: u32) {
     // Generation-tagged slots: each entry carries the write-epoch it was
     // recorded under; stale entries fail their per-slot epoch check on
     // probe. Epoch changes are therefore FREE (the old global-clear design
     // paid an O(slots) wipe on EVERY write — which is also why it could
     // not afford more than 64 slots).
+    //
+    // Fill policy (2-way): keep an existing entry for the SAME page (just
+    // refresh it), else replace an empty/stale slot, else replace the slot
+    // whose leaf is FARTHER from the probed rowid — the near one is the
+    // one this access pattern is actually walking through. This resolves
+    // the bucket-straddling-leaf-boundary case without thrashing: both
+    // leaves of the straddle live in the pair.
     TABLE_HINTS.with(|c| {
         let mut slots = c.borrow_mut();
-        let slot = (probed_rowid as usize) & (TABLE_HINT_SLOTS - 1);
-        slots[slot] = Some(TableHintSlot { epoch, root, page: Arc::clone(page), lo, hi });
+        let pair = table_hint_pair(probed_rowid);
+        // same page already present? refresh in place.
+        for slot in pair {
+            if let Some(s) = slots[slot].as_mut() {
+                if s.page_ref_eq(page) {
+                    s.epoch = epoch;
+                    s.root = root;
+                    s.lo = lo;
+                    s.hi = hi;
+                    s.last_cell = cell;
+                    return;
+                }
+            }
+        }
+        let entry = TableHintSlot { epoch, root, page: Arc::clone(page), lo, hi, last_cell: cell };
+        // prefer an empty or stale slot
+        for slot in pair {
+            let take = match slots[slot].as_ref() {
+                None => true,
+                Some(s) => s.epoch != epoch,
+            };
+            if take {
+                slots[slot] = Some(entry);
+                return;
+            }
+        }
+        // both live: evict the one farther from the probed rowid
+        let dist = |slot: usize| {
+            slots[slot]
+                .as_ref()
+                .map(|s| {
+                    if probed_rowid < s.lo {
+                        s.lo - probed_rowid
+                    } else if probed_rowid > s.hi {
+                        probed_rowid - s.hi
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(i64::MAX)
+        };
+        let victim = if dist(pair[0]) >= dist(pair[1]) { pair[0] } else { pair[1] };
+        slots[victim] = Some(entry);
+    })
+}
+
+/// Update the remembered cell index for a hint hit, so the next lookup's
+/// biased search starts from the position that just succeeded. Touches
+/// whichever slot of the rowid's pair holds this (root, epoch).
+#[inline]
+fn bump_table_hint_cell(root: PageId, probed_rowid: i64, cell: u32, epoch: u64) {
+    TABLE_HINTS.with(|c| {
+        let mut slots = c.borrow_mut();
+        for slot in table_hint_pair(probed_rowid) {
+            if let Some(s) = &mut slots[slot] {
+                if s.epoch == epoch && s.root == root {
+                    s.last_cell = cell;
+                    return;
+                }
+            }
+        }
     });
 }
 
-/// Direct-mapped table-leaf hint slots: `rowid & (SLOTS-1)` → the leaf
-/// covering that rowid (validated by [lo, hi] + root + epoch). A single
-/// leaf can appear in several slots (its whole rowid range hashes across
-/// them); collisions simply overwrite. This lifts the per-root hint from
-/// ONE remembered leaf to a working set of 64 leaves — repeated probes of
-/// the SAME scattered rowids (fixed-parameter OLTP, join inner loops)
-/// hit ~10/10 instead of 1/10, skipping the root→interior→leaf descent
-/// entirely. Probe cost: a RefCell borrow + one slot check (~8 ns).
+/// Table-leaf hint slots, keyed by rowid BUCKET with 2-way associativity:
+/// pair index = `(rowid >> BUCKET_SHIFT) * 2`, two slots per pair. One
+/// descent primes a whole 256-rowid bucket, so sequential first-visit
+/// sweeps (fixed-parameter OLTP loops, table scans feeding joins) hit the
+/// cache on every rowid after the first per leaf pair — versus a
+/// per-rowid keying that descends once per ROWID on first visit. A pair
+/// holds both leaves of a bucket that straddles a leaf boundary (a
+/// 290-cell leaf holds ~1.13 buckets), eliminating straddle thrash.
+/// 1024 slots = 512 pairs ≈ 130k rowids of leaves — the working set of a
+/// 1M-row table's hot range. Validated by [lo, hi] + root + epoch.
 const TABLE_HINT_SLOTS: usize = 1024;
+const TABLE_HINT_BUCKET_SHIFT: i64 = 8;
 
 struct TableHintSlot {
     epoch: u64,
@@ -572,6 +746,17 @@ struct TableHintSlot {
     page: PageRef,
     lo: i64,
     hi: i64,
+    /// Cell index of the last successful lookup in this leaf — the search
+    /// bias (SQLite's cursor-ix bias): sequential or near-sequential rowid
+    /// access resolves in 1-2 probes instead of log2(cells).
+    last_cell: u32,
+}
+
+impl TableHintSlot {
+    #[inline]
+    fn page_ref_eq(&self, other: &PageRef) -> bool {
+        Arc::ptr_eq(&self.page, other)
+    }
 }
 
 thread_local! {
@@ -591,6 +776,8 @@ struct StructTableHint {
     lo: i64,
     hi: i64,
     epoch: u64,
+    /// Last successful cell index — search bias for hoisted handles.
+    last_cell: u32,
 }
 
 /// Struct-local INDEX leaf hint (byte-key bounds — order-preserving
@@ -601,12 +788,15 @@ struct StructIndexHint {
     lo: Vec<u8>,
     hi: Vec<u8>,
     epoch: u64,
+    /// Last successful lower-bound cell — search bias for hoisted handles.
+    last_cell: u32,
 }
 
 /// Probe the index-leaf hint for `root`. Byte comparison — index cell keys
-/// use the order-preserving encoding, so byte order == key order.
+/// use the order-preserving encoding, so byte order == key order. Returns
+/// the page plus the remembered search-bias cell index.
 #[inline]
-fn index_hint_page(root: PageId, key: &[u8], epoch: u64) -> Option<PageRef> {
+fn index_hint_page(root: PageId, key: &[u8], epoch: u64) -> Option<(PageRef, u32)> {
     if !hint_epoch_matches(epoch) {
         return None;
     }
@@ -614,11 +804,26 @@ fn index_hint_page(root: PageId, key: &[u8], epoch: u64) -> Option<PageRef> {
         let c = c.borrow();
         let h = c.indexes.get(&root)?;
         if key >= h.lo.as_slice() && key <= h.hi.as_slice() {
-            Some(Arc::clone(&h.page))
+            Some((Arc::clone(&h.page), h.last_cell))
         } else {
             None
         }
     })
+}
+
+/// Update the remembered bias cell of the index hint for `root` (only when
+/// the entry still lives under this epoch).
+#[inline]
+fn bump_index_hint_cell(root: PageId, cell: u32, epoch: u64) {
+    LEAF_HINTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.epoch != epoch {
+            return;
+        }
+        if let Some(h) = c.indexes.get_mut(&root) {
+            h.last_cell = cell;
+        }
+    });
 }
 
 /// Record the index-leaf hint for `root`.
@@ -633,6 +838,7 @@ fn set_index_hint(root: PageId, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64
             page: Arc::clone(page),
             lo: Vec::new(),
             hi: Vec::new(),
+            last_cell: 0,
         });
         h.page = Arc::clone(page);
         h.lo.clear();
@@ -744,46 +950,71 @@ impl<'a> Btree<'a> {
     }
 
     /// Probe the struct-local TABLE leaf hint. ~2 ns; checked before the
-    /// thread-local hint map.
+    /// thread-local hint map. Returns the page and the search-bias cell.
     #[inline]
-    fn probe_struct_table_hint(&self, rowid: i64, epoch: u64) -> Option<PageRef> {
+    fn probe_struct_table_hint(&self, rowid: i64, epoch: u64) -> Option<(PageRef, u32)> {
         let h = self.table_leaf.as_ref()?;
         if h.epoch != epoch {
             return None;
         }
         if rowid >= h.lo && rowid <= h.hi {
-            Some(Arc::clone(&h.page))
+            Some((Arc::clone(&h.page), h.last_cell))
         } else {
             None
         }
     }
 
-    /// Probe the struct-local INDEX leaf hint (byte bounds).
+    /// Probe the struct-local INDEX leaf hint (byte bounds). Returns the
+    /// page plus the remembered search-bias cell.
     #[inline]
-    fn probe_struct_index_hint(&self, key: &[u8], epoch: u64) -> Option<PageRef> {
+    fn probe_struct_index_hint(&self, key: &[u8], epoch: u64) -> Option<(PageRef, u32)> {
         let h = self.index_leaf.as_ref()?;
         if h.epoch != epoch {
             return None;
         }
         if key >= h.lo.as_slice() && key <= h.hi.as_slice() {
-            Some(Arc::clone(&h.page))
+            Some((Arc::clone(&h.page), h.last_cell))
         } else {
             None
         }
     }
 
     /// Record both the struct-local and thread-local table hints.
+    /// `cell` is the just-found cell index (the search bias); 0 means
+    /// "unknown — start unbiased".
     #[inline]
-    fn record_table_hint(&mut self, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64) {
-        self.table_leaf = Some(StructTableHint { page: Arc::clone(page), lo, hi, epoch });
-        set_table_hint(self.root, page, lo, hi, epoch, probed_rowid);
+    fn record_table_hint(&mut self, page: &PageRef, lo: i64, hi: i64, epoch: u64, probed_rowid: i64, cell: u32) {
+        self.table_leaf = Some(StructTableHint { page: Arc::clone(page), lo, hi, epoch, last_cell: cell });
+        set_table_hint(self.root, page, lo, hi, epoch, probed_rowid, cell);
+    }
+
+    /// Note a successful cell index on the CURRENT hints (struct-local +
+    /// thread-local slot), so the next lookup's biased search starts from
+    /// the position that just succeeded.
+    #[inline]
+    fn note_table_cell(&mut self, probed_rowid: i64, cell: u32, epoch: u64) {
+        if let Some(h) = &mut self.table_leaf {
+            h.last_cell = cell;
+        }
+        bump_table_hint_cell(self.root, probed_rowid, cell, epoch);
     }
 
     /// Record both the struct-local and thread-local index hints.
     #[inline]
     fn record_index_hint(&mut self, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64) {
-        self.index_leaf = Some(StructIndexHint { page: Arc::clone(page), lo: lo.to_vec(), hi: hi.to_vec(), epoch });
+        self.index_leaf = Some(StructIndexHint { page: Arc::clone(page), lo: lo.to_vec(), hi: hi.to_vec(), epoch, last_cell: 0 });
         set_index_hint(self.root, page, lo, hi, epoch);
+    }
+
+    /// Note a successful lower-bound cell on the current index hints
+    /// (struct-local + thread-local) so the next lookup's biased search
+    /// starts from the position that just succeeded.
+    #[inline]
+    fn note_index_cell(&mut self, cell: u32, epoch: u64) {
+        if let Some(h) = &mut self.index_leaf {
+            h.last_cell = cell;
+        }
+        bump_index_hint_cell(self.root, cell, epoch);
     }
 
     /// The root page, pinned across seeks when no write has happened since
@@ -845,7 +1076,7 @@ impl<'a> Btree<'a> {
                                 .map(|(r, _)| r)
                                 .unwrap_or(i64::MAX);
                             drop(borrowed);
-                            self.record_table_hint(&page, lo, hi, epoch, lo);
+                            self.record_table_hint(&page, lo, hi, epoch, lo, 0);
                         }
                         break;
                     }
@@ -954,6 +1185,7 @@ impl<'a> Btree<'a> {
         &self,
         page_ref: &PageRef,
         rowid: i64,
+        bias: u32,
     ) -> Result<Option<LookupResult>> {
         let borrowed = page_ref.lock();
         let pt = borrowed.page_type()?;
@@ -964,29 +1196,21 @@ impl<'a> Btree<'a> {
         if n == 0 {
             return Ok(None);
         }
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-            let Some((cell_rowid, _)) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?) else {
-                return Ok(None);
-            };
-            if cell_rowid == rowid {
+        match biased_rowid_search(&borrowed, n, bias, rowid)? {
+            Some(cell) => {
+                let cell_ptr = borrowed.cell_pointer(cell as u16) as usize;
                 let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                 if let Cell::TableLeaf { payload, .. } = cell {
                     return Ok(Some(LookupResult::Found(payload)));
                 }
                 unreachable!();
-            } else if cell_rowid < rowid {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+            }
+            None => {
+                // In bounds (verified via the hint) but not present: the rowid is
+                // genuinely absent — keys are sorted and the bounds are exact.
+                Ok(Some(LookupResult::NotFound))
             }
         }
-        // In bounds (verified via the hint) but not present: the rowid is
-        // genuinely absent — keys are sorted and the bounds are exact.
-        Ok(Some(LookupResult::NotFound))
     }
 
     /// Point lookup that decodes the payload UNDER the page lock via `f`,
@@ -1001,10 +1225,12 @@ impl<'a> Btree<'a> {
         // --- Hint probe --------------------------------------------------
         // Struct-local FIRST (~2 ns), then the thread-local map (~40 ns):
         // a hoisted B+tree handle probing scattered rowids misses both, but
-        // the struct probe makes the miss nearly free.
+        // the struct probe makes the miss nearly free. The slot also carries
+        // the last successful CELL INDEX — the biased search below resolves
+        // sequential rowids in 1-2 probes instead of log2(cells).
         let epoch = self.pager.write_epoch();
         'hint: {
-            let page_ref = match self
+            let (page_ref, bias) = match self
                 .probe_struct_table_hint(rowid, epoch)
                 .or_else(|| table_hint_page(self.root, rowid, epoch))
             {
@@ -1017,15 +1243,9 @@ impl<'a> Btree<'a> {
                 break 'hint; // wrong page type — full descent
             }
             let n = borrowed.n_cells() as usize;
-            let mut lo = 0usize;
-            let mut hi = n;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                let Some((cell_rowid, _)) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?) else {
-                    break 'hint; // corrupt cell — full descent
-                };
-                if cell_rowid == rowid {
+            match biased_rowid_search(&borrowed, n, bias, rowid)? {
+                Some(cell) => {
+                    let cell_ptr = borrowed.cell_pointer(cell as u16) as usize;
                     let rest = borrowed.cell_slice_checked(cell_ptr)?;
                     let Some((_rid, rn)) = decode_rowid_only(rest) else {
                         break 'hint;
@@ -1039,16 +1259,17 @@ impl<'a> Btree<'a> {
                         break 'hint;
                     }
                     let out = f(&rest[start..end])?;
+                    drop(borrowed);
+                    self.note_table_cell(rowid, cell as u32, epoch);
                     return Ok(Some(out));
-                } else if cell_rowid < rowid {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+                }
+                None => {
+                    // Completed search, no match: the epoch-checked hint
+                    // guarantees the remembered bounds are exact, so the
+                    // rowid is absent.
+                    return Ok(None);
                 }
             }
-            // Completed search, no match: the epoch-checked hint guarantees
-            // the remembered bounds are exact, so the rowid is absent.
-            return Ok(None);
         }
         // --- Full descent --------------------------------------------------
         let mut page_id = self.root;
@@ -1076,19 +1297,15 @@ impl<'a> Btree<'a> {
                             .ok()
                             .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
                         if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
-                            self.record_table_hint(&page, lo, hi, epoch, rowid);
+                            self.record_table_hint(&page, lo, hi, epoch, rowid, 0);
                         }
                     }
-                    let mut lo = 0usize;
-                    let mut hi = n;
-                    while lo < hi {
-                        let mid = (lo + hi) / 2;
-                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                        let Some((cell_rowid, _)) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
-                        else {
-                            return Err(Error::corruption("truncated leaf rowid in lookup"));
-                        };
-                        if cell_rowid == rowid {
+                    // Descent search: bias 0 (plain binary). The record
+                    // above just seeded the hints; the bias pays off on
+                    // subsequent hint-hit lookups.
+                    match biased_rowid_search(&borrowed, n, 0, rowid)? {
+                        Some(cell) => {
+                            let cell_ptr = borrowed.cell_pointer(cell as u16) as usize;
                             let rest = borrowed.cell_slice_checked(cell_ptr)?;
                             let (_rid, rn) = decode_rowid_only(rest)
                                 .ok_or_else(|| Error::corruption("truncated rowid"))?;
@@ -1100,14 +1317,12 @@ impl<'a> Btree<'a> {
                                 return Err(Error::corruption("truncated payload"));
                             }
                             let out = f(&rest[start..end])?;
+                            drop(borrowed);
+                            self.note_table_cell(rowid, cell as u32, epoch);
                             return Ok(Some(out));
-                        } else if cell_rowid < rowid {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
                         }
+                        None => return Ok(None),
                     }
-                    return Ok(None);
                 }
                 PageType::InteriorTable => {
                     let n = borrowed.n_cells() as usize;
@@ -1169,8 +1384,8 @@ impl<'a> Btree<'a> {
     pub fn lookup_table(&mut self, rowid: i64) -> Result<LookupResult> {
         // --- Hint probe: try the remembered leaf directly ---------------
         let epoch = self.pager.write_epoch();
-        if let Some(page_ref) = table_hint_page(self.root, rowid, epoch) {
-            if let Ok(Some(res)) = self.lookup_table_leaf(&page_ref, rowid) {
+        if let Some((page_ref, bias)) = table_hint_page(self.root, rowid, epoch) {
+            if let Ok(Some(res)) = self.lookup_table_leaf(&page_ref, rowid, bias) {
                 return Ok(res);
             }
             // fall through to the full descent on any miss
@@ -1205,32 +1420,24 @@ impl<'a> Btree<'a> {
                             .ok()
                             .and_then(|s| decode_rowid_only(s).map(|(r, _)| r));
                         if let (Some(lo), Some(hi)) = (lo_key, hi_key) {
-                            self.record_table_hint(&page, lo, hi, epoch, rowid);
+                            self.record_table_hint(&page, lo, hi, epoch, rowid, 0);
                         }
                     }
-                    // Binary search by rowid (cells are stored sorted).
-                    let mut lo = 0usize;
-                    let mut hi = n;
-                    while lo < hi {
-                        let mid = (lo + hi) / 2;
-                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                        // Read just the rowid — no payload allocation.
-                        let (cell_rowid, _) = decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
-                            .ok_or_else(|| Error::corruption("truncated leaf rowid in lookup"))?;
-                        if cell_rowid == rowid {
+                    // Biased search by rowid (cells are stored sorted).
+                    match biased_rowid_search(&borrowed, n, 0, rowid)? {
+                        Some(cell_idx) => {
+                            let cell_ptr = borrowed.cell_pointer(cell_idx as u16) as usize;
                             // Found — decode the full cell ONCE.
                             let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
                             if let Cell::TableLeaf { payload, .. } = cell {
+                                drop(borrowed);
+                                self.note_table_cell(rowid, cell_idx as u32, epoch);
                                 return Ok(LookupResult::Found(payload));
                             }
                             unreachable!();
-                        } else if cell_rowid < rowid {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
                         }
+                        None => return Ok(LookupResult::NotFound),
                     }
-                    return Ok(LookupResult::NotFound);
                 }
                 PageType::InteriorTable => {
                     let n = borrowed.n_cells() as usize;
@@ -1924,7 +2131,7 @@ impl<'a> Btree<'a> {
         // falls through to the full descent).
         {
             let epoch = self.pager.write_epoch();
-            if let Some(page_ref) = table_hint_page(self.root, rowid, epoch) {
+            if let Some((page_ref, _bias)) = table_hint_page(self.root, rowid, epoch) {
                 let mut borrowed = page_ref.lock();
                 if borrowed.page_type()? == PageType::LeafTable {
                     let n = borrowed.n_cells() as usize;
@@ -4285,11 +4492,12 @@ impl<'a> Btree<'a> {
         // a hoisted B+tree handle probing scattered keys misses both, but
         // the struct probe makes the miss nearly free.
         let epoch = self.pager.write_epoch();
-        let hinted: Option<PageRef> = self
+        let hinted: Option<(PageRef, u32)> = self
             .probe_struct_index_hint(key, epoch)
             .or_else(|| index_hint_page(self.root, key, epoch));
-        if let Some(page_ref) = hinted {
-            if let Ok(true) = self.lookup_index_leaf(&page_ref, key, out) {
+        if let Some((page_ref, bias)) = hinted {
+            if let Ok((true, cell)) = self.lookup_index_leaf(&page_ref, key, out, bias) {
+                self.note_index_cell(cell, epoch);
                 return Ok(());
             }
         }
@@ -4311,38 +4519,91 @@ impl<'a> Btree<'a> {
     /// Search the hinted index leaf for all cells whose key starts with
     /// `key`, appending their rowids to `out`. The epoch was checked by
     /// the caller, so the remembered bounds are exact and content
-    /// unchanged. Returns `Ok(false)` to signal "hint unusable — do the
-    /// full scan" (wrong page type, or a prefix run that may continue
+    /// unchanged. Returns `Ok((false, _))` to signal "hint unusable — do
+    /// the full scan" (wrong page type, or a prefix run that may continue
     /// into either sibling); `out` may then hold a partial run which the
-    /// caller must clear before re-scanning.
-    fn lookup_index_leaf(&self, page_ref: &PageRef, key: &[u8], out: &mut Vec<i64>) -> Result<bool> {
+    /// caller must clear before re-scanning. On success returns
+    /// `(true, run_start_cell)` — the caller stores the cell as the next
+    /// probe's search bias.
+    ///
+    /// `bias` is the remembered cell index of the last successful probe —
+    /// the search probes it first (SQLite's cursor-ix bias), then falls
+    /// back to an exact lower-bound search. Sequential key access
+    /// (fixed-parameter loops, INLJ inner probes with ordered outer keys)
+    /// resolves in 1-2 probes instead of log2(cells).
+    fn lookup_index_leaf(&self, page_ref: &PageRef, key: &[u8], out: &mut Vec<i64>, bias: u32) -> Result<(bool, u32)> {
         let borrowed = page_ref.lock();
         prefetch_search_lines(&borrowed.data);
         let pt = borrowed.page_type()?;
         if pt != PageType::LeafIndex {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let n = borrowed.n_cells() as usize;
         if n == 0 {
-            return Ok(false);
+            return Ok((false, 0));
         }
         // The caller already verified key ∈ [first, last] via the hint
         // bounds; with no mutation since, that check stands.
-        // Binary search for the first cell with key >= `key`.
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
-                return Ok(false);
+        // Read the key of cell i (borrow-only view).
+        #[inline]
+        fn cell_key<'a>(borrowed: &'a crate::storage::page::Page, i: usize) -> Result<&'a [u8]> {
+            let ptr = borrowed.cell_pointer(i as u16) as usize;
+            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(ptr)?, false) else {
+                return Err(Error::corruption("corrupt index cell in biased search"));
             };
-            if v.key < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+            Ok(v.key)
         }
+        // Lower-bound search for the first cell with key >= `key`,
+        // biased at `bias`. Invariant: cells [0, lo) have key < `key`;
+        // cells [hi, n) have key > `key`.
+        let bias = (bias as usize).min(n - 1);
+        let bk = cell_key(&borrowed, bias)?;
+        let lo: usize = if bk >= key {
+            // Target is at/left of the bias: binary search [0, bias],
+            // then walk left over any equal-key run (bias may sit inside
+            // the run — its key equals `key` exactly).
+            let mut l = 0usize;
+            let mut h = bias + 1;
+            while l < h {
+                let mid = (l + h) / 2;
+                let k = cell_key(&borrowed, mid)?;
+                if k < key {
+                    l = mid + 1;
+                } else {
+                    h = mid;
+                }
+            }
+            l
+        } else {
+            // Target is right of the bias: probe the immediately-next cell
+            // (the sequential +1 pattern — ordered outer keys in join inner
+            // loops — resolves in ONE more probe), then a bounded binary
+            // search over the remaining bracket.
+            let mut lo_b = bias + 1;
+            let mut hi_b = n;
+            if lo_b < hi_b {
+                let k = cell_key(&borrowed, lo_b)?;
+                if k < key {
+                    lo_b += 1;
+                } else {
+                    hi_b = lo_b;
+                }
+            }
+            // Bounded binary search in [lo_b, hi_b) for the first
+            // key >= `key`.
+            let mut l = lo_b;
+            let mut h = hi_b;
+            while l < h {
+                let mid = (l + h) / 2;
+                let k = cell_key(&borrowed, mid)?;
+                if k < key {
+                    l = mid + 1;
+                } else {
+                    h = mid;
+                }
+            }
+            l
+        };
         // LEFT-SPILL guard: if the run starts at the leaf's very first
         // cell, equal keys may ALSO exist in the left sibling — the hint
         // bounds only prove the key is present in THIS leaf. (The hint-hit
@@ -4352,7 +4613,7 @@ impl<'a> Btree<'a> {
         // seeding the rightmost leaf: `COUNT(*) WHERE cat = 'b'` then saw
         // only the right leaf's half of a leaf-spanning duplicate run.
         if lo == 0 {
-            return Ok(false);
+            return Ok((false, 0));
         }
         // Collect the prefix run.
         let mut i = lo;
@@ -4371,9 +4632,9 @@ impl<'a> Btree<'a> {
         if i == n && lo < n {
             // The run reached the END of the leaf — duplicates may continue
             // into the right sibling; only the full scan is exact.
-            return Ok(false);
+            return Ok((false, 0));
         }
-        Ok(true)
+        Ok((true, lo as u32))
     }
 
     /// Scan index entries in (key, rowid) order, starting at the first entry
