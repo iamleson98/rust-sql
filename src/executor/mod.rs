@@ -2268,40 +2268,10 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     // FUSED PATH: Filter over a bare table Scan with a compilable predicate.
     // Scans with the predicate evaluated positionally (compiled once) and
     // skips materializing rows that fail it — non-matching rows cost a
-    // payload decode and nothing else (no Vec<Value>, no clone, no move).
-    if let Plan::Scan { table, alias, index: None, predicate: None } = input {
-        // Virtual table: pass the Filter's predicate into the vtab scan
-        // (best_index sees it; unhandled conjuncts become the residual).
-        if table.vtab.is_some() {
-            let res = vtab_exec::exec_scan_vtab(ctx, table, alias.as_ref(), Some(predicate))?;
+    // selective decode and nothing else (no Vec<Value>, no clone, no move).
+    if let Plan::Scan { .. } = input {
+        if let Some(res) = scan_filter_limit(ctx, input, Some(predicate), None)? {
             return Ok(res);
-        }
-        let prefix = alias.as_deref().unwrap_or(&table.name);
-        if let Some(pred) = crate::executor::predicate::compile_predicate(predicate, table, prefix) {
-            let n_cols = table.n_columns();
-            let root = ctx.table_root(table);
-            let mut bt = Btree::new(ctx.pager, root, false);
-            let rowid_alias = table.rowid_alias;
-            let params: &[Value] = &ctx.params;
-            // Identity positions: rows are decoded in full table order.
-            let positions: Vec<usize> = (0..n_cols).collect();
-            let mut rows = Vec::new();
-            bt.scan_table_borrowed(|rowid, payload| {
-                // Decode the full row (the Filter's output must expose all
-                // columns for the parent operators).
-                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    if pred.eval(&row, &positions, params) {
-                        rows.push(row);
-                    }
-                }
-                true
-            })?;
-            let columns: Arc<[String]> = if prefix == table.name {
-                table.qualified_col_names.clone()
-            } else {
-                table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect::<Vec<String>>().into()
-            };
-            return Ok(ExecResult { columns, rows });
         }
     }
 
@@ -2332,6 +2302,145 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         }
     }
     Ok(ExecResult { columns: inner.columns, rows })
+}
+
+/// FUSED Scan+Filter(+Limit) path: scan the table with a compiled
+/// predicate, selectively decoding ONLY the predicate's columns for
+/// non-matching rows, and — when `stop_after` is set — terminating the
+/// scan as soon as enough rows have passed (LIMIT pushdown; the classic
+/// `WHERE ... LIMIT k` shape stops at the k-th match instead of scanning
+/// the whole table).
+///
+/// * `input` MUST be `Plan::Scan { index: None, predicate: None }`.
+/// * `predicate` — the filter to apply (from the enclosing Filter node,
+///   or the Scan's own pushed-down predicate). `None` accepts every row.
+/// * Returns `Ok(None)` when the shape is unsupported (virtual table,
+///   non-compilable predicate, index scan) so the caller falls back.
+/// * `stop_after` — include offset: stop once this many rows PASS
+///   (the caller then applies offset/truncation).
+fn scan_filter_limit(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    predicate: Option<&Expr>,
+    stop_after: Option<usize>,
+) -> Result<Option<ExecResult>> {
+    let Plan::Scan { table, alias, index: None, predicate: scan_pred } = input else {
+        return Ok(None);
+    };
+    // Effective predicate: the caller's (Filter's) predicate, the Scan's own
+    // pushed-down predicate, or none — never both (that shape falls back).
+    let predicate = match (predicate, scan_pred.as_ref()) {
+        (Some(p), None) => Some(p),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Ok(None),
+    };
+    // Virtual table: pass the Filter's predicate into the vtab scan
+    // (best_index sees it; unhandled conjuncts become the residual).
+    if table.vtab.is_some() {
+        if stop_after.is_none() {
+            let res = vtab_exec::exec_scan_vtab(ctx, table, alias.as_ref(), predicate)?;
+            return Ok(Some(res));
+        }
+        return Ok(None); // vtab LIMIT pushdown is the vtab's business
+    }
+    let prefix = alias.as_deref().unwrap_or(&table.name);
+    let pred = match predicate {
+        Some(p) => match crate::executor::predicate::compile_predicate(p, table, prefix) {
+            Some(c) => Some(c),
+            None => return Ok(None),
+        },
+        None => None, // accept every row
+    };
+    let n_cols = table.n_columns();
+    let root = ctx.table_root(table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let rowid_alias = table.rowid_alias;
+    let params: &[Value] = &ctx.params;
+    // Selective decode for the predicate: decode ONLY the columns the
+    // predicate references while scanning; decode the full row just for
+    // the (usually few) rows that PASS. For a selective filter over a wide
+    // table this skips the dominant per-row decode cost of every
+    // non-matching row.
+    let mut wanted: Vec<usize> = Vec::new();
+    if let Some(p) = &pred {
+        crate::executor::predicate::compiled_columns(p, &mut wanted);
+    }
+    let columns: Arc<[String]> = if prefix == table.name {
+        table.qualified_col_names.clone()
+    } else {
+        table.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect::<Vec<String>>().into()
+    };
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    match (&pred, !wanted.is_empty()) {
+        (Some(pred), true) => {
+            wanted.sort_unstable();
+            wanted.dedup();
+            let mut positions = vec![usize::MAX; n_cols];
+            for (pos, &c) in wanted.iter().enumerate() {
+                positions[c] = pos;
+            }
+            let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
+            let stop = stop_after;
+            bt.scan_table_borrowed(|rowid, payload| {
+                if crate::storage::row_codec::decode_row_selective(
+                    payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf,
+                )
+                .is_err()
+                {
+                    return true;
+                }
+                if !pred.eval(&sel_buf, &positions, params) {
+                    return true; // non-matching row: cost = selective decode only
+                }
+                // Matching row: materialize the full row for output.
+                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    rows.push(row);
+                }
+                // LIMIT pushdown: stop the scan once enough rows have passed.
+                if let Some(stop) = stop {
+                    if rows.len() >= stop {
+                        return false;
+                    }
+                }
+                true
+            })?;
+        }
+        (Some(pred), false) => {
+            // Degenerate predicate (constant): full decode as before.
+            let positions: Vec<usize> = (0..n_cols).collect();
+            let stop = stop_after;
+            bt.scan_table_borrowed(|rowid, payload| {
+                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    if pred.eval(&row, &positions, params) {
+                        rows.push(row);
+                    }
+                }
+                if let Some(stop) = stop {
+                    if rows.len() >= stop {
+                        return false;
+                    }
+                }
+                true
+            })?;
+        }
+        (None, _) => {
+            // No predicate: accept every row (bare Scan + LIMIT).
+            let stop = stop_after;
+            bt.scan_table_borrowed(|rowid, payload| {
+                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    rows.push(row);
+                }
+                if let Some(stop) = stop {
+                    if rows.len() >= stop {
+                        return false;
+                    }
+                }
+                true
+            })?;
+        }
+    }
+    Ok(Some(ExecResult { columns, rows }))
 }
 
 // ============================================================================
@@ -2706,6 +2815,71 @@ fn sort_key(
 // ============================================================================
 
 fn exec_limit(ctx: &mut ExecContext<'_>, input: &Plan, count: &Expr, offset: &Expr) -> Result<ExecResult> {
+    // LIMIT PUSHDOWN: for `Limit(Filter(Scan))` and `Limit(Scan)`, stop the
+    // scan as soon as `offset + count` rows have passed the filter instead
+    // of materializing the whole table and truncating — the classic
+    // `WHERE ... LIMIT k` top-k shape. Only valid without a Sort between
+    // them (ordering is the input's natural scan order, which is exactly
+    // what the fallback would produce too).
+    {
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+        if let Ok(count_val) = evaluate(count, &eval_ctx) {
+            if let Ok(offset_val) = evaluate(offset, &eval_ctx) {
+                let count_i = count_val.as_integer();
+                let offset_i = offset_val.as_integer().max(0);
+                if count_i >= 0 && offset_i <= (i64::MAX / 2) {
+                    let total = count_i.saturating_add(offset_i);
+                    if total >= 0 {
+                        let stop = (total as usize).min(1 << 40);
+                        // Shapes that allow pushing the limit into the scan:
+                        // Limit(Filter(Scan)), Limit(Scan), and the common
+                        // SELECT shape Limit(Project(Filter(Scan))) /
+                        // Limit(Project(Scan)) — the projection is 1:1, so
+                        // limiting before projecting yields identical rows.
+                        let pushed: Option<ExecResult> = match input {
+                            Plan::Filter { input: inner, predicate } => {
+                                scan_filter_limit(ctx, inner, Some(predicate), Some(stop))?
+                            }
+                            Plan::Scan { index: None, .. } => {
+                                scan_filter_limit(ctx, input, None, Some(stop))?
+                            }
+                            Plan::Project { input: inner, columns } => match inner.as_ref() {
+                                Plan::Filter { input: scan, predicate } => {
+                                    scan_filter_limit(ctx, scan, Some(predicate), Some(stop))?
+                                        .map(|res| apply_projection(res, columns, ctx))
+                                        .transpose()?
+                                }
+                                Plan::Scan { index: None, .. } => {
+                                    scan_filter_limit(ctx, inner, None, Some(stop))?
+                                        .map(|res| apply_projection(res, columns, ctx))
+                                        .transpose()?
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(mut res) = pushed {
+                            let skip = offset_i as usize;
+                            if skip >= res.rows.len() {
+                                res.rows.clear();
+                            } else {
+                                res.rows.drain(0..skip);
+                                if count_i >= 0 {
+                                    let c = count_i as usize;
+                                    if res.rows.len() > c {
+                                        res.rows.truncate(c);
+                                    }
+                                }
+                            }
+                            return Ok(res);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut inner = execute(input, ctx)?;
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
@@ -9424,3 +9598,4 @@ fn exec_delete(ctx: &mut ExecContext<'_>, table: Arc<Table>, source: &Plan, retu
         rows: vec![vec![Value::Integer(deleted)]],
     })
 }
+

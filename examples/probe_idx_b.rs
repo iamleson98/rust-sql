@@ -22,6 +22,7 @@ fn main() {
     drop(db);
 
     let pager = Pager::open(path, 0).unwrap();
+    let page_size = pager.page_size();
     // Find idx_cat root via schema.
     let mut sbt = Btree::new(&pager, 0, false);
     let mut idx_root = 0u32;
@@ -43,7 +44,7 @@ fn main() {
     println!("idx_cat root = {}   total pages = {}", idx_root, pager.n_pages());
 
     // Walk the tree, printing each leaf's first/last cell keys.
-    fn walk(pager: &Pager, page_id: u32, depth: usize, out: &mut Vec<(u32, String, String, usize)>) {
+    fn walk(pager: &Pager, page_id: u32, depth: usize, out: &mut Vec<(u32, String, String, usize)>, page_size: u32) {
         let page = pager.get_page(page_id).unwrap();
         let borrowed = page.lock();
         let pt = borrowed.page_type().unwrap();
@@ -52,8 +53,8 @@ fn main() {
             PageType::LeafIndex => {
                 let first = borrowed.cell_pointer(0) as usize;
                 let last = borrowed.cell_pointer((n - 1) as u16) as usize;
-                let f = rustqlite::storage::btree::Cell::decode(&borrowed.data[first..], pt).unwrap();
-                let l = rustqlite::storage::btree::Cell::decode(&borrowed.data[last..], pt).unwrap();
+                let f = rustqlite::storage::btree::Cell::decode(&borrowed.data[first..], pt, page_size).unwrap();
+                let l = rustqlite::storage::btree::Cell::decode(&borrowed.data[last..], pt, page_size).unwrap();
                 let fk = String::from_utf8_lossy(f.index_key());
                 let lk = String::from_utf8_lossy(l.index_key());
                 out.push((page_id, fk.to_string(), lk.to_string(), n));
@@ -68,7 +69,7 @@ fn main() {
                 {
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
-                        let c = rustqlite::storage::btree::Cell::decode(&borrowed.data[cell_ptr..], pt).unwrap();
+                        let c = rustqlite::storage::btree::Cell::decode(&borrowed.data[cell_ptr..], pt, page_size).unwrap();
                         eprintln!("{}  cell{}: left_child={} key_bytes={:?} rowid={}",
                             "  ".repeat(depth), i, c.left_child(),
                             &c.index_key()[..c.index_key().len().min(10)], c.key());
@@ -80,10 +81,10 @@ fn main() {
                 let right = borrowed.right_most_pointer();
                 drop(borrowed);
                 for child in child_ids {
-                    walk(pager, child, depth + 1, out);
+                    walk(pager, child, depth + 1, out, page_size);
                 }
                 if right > 0 {
-                    walk(pager, right, depth + 1, out);
+                    walk(pager, right, depth + 1, out, page_size);
                 }
             }
             _ => eprintln!("{}?? p{} type {:?}", "  ".repeat(depth), page_id, pt),
@@ -91,7 +92,7 @@ fn main() {
     }
 
     let mut leaves = Vec::new();
-    walk(&pager, idx_root, 0, &mut leaves);
+    walk(&pager, idx_root, 0, &mut leaves, page_size);
 
     // Count 'b'-prefixed keys per leaf.
     println!("\n--- 'b' entries per leaf ---");
@@ -103,7 +104,7 @@ fn main() {
         let mut cnt = 0;
         for i in 0..n {
             let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
-            let c = rustqlite::storage::btree::Cell::decode(&borrowed.data[cell_ptr..], PageType::LeafIndex).unwrap();
+            let c = rustqlite::storage::btree::Cell::decode(&borrowed.data[cell_ptr..], PageType::LeafIndex, page_size).unwrap();
             // cell key = order_key(cat) + ... — text key starts with 0x02 len prefix
             if c.index_key().len() > 6 && c.index_key()[5] == b'b' && c.index_key()[0] == 0x02 {
                 cnt += 1;

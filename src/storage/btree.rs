@@ -108,12 +108,48 @@ pub mod varint {
     }
 }
 
+/// Deterministic LOCAL (in-cell) size for a table-leaf payload, as a
+/// pure function of (total, page_size) — the SQLite overflow-cell
+/// contract: readers derive the split point from the payload length
+/// alone, without knowing the cell's byte span.
+///
+/// * `total <= page_size - 128`: the whole payload is in-page (no
+///   overflow).
+/// * Otherwise the tail spills to a chain of Overflow pages; the local
+///   prefix is `min_local + (total - min_local) % chain_capacity`,
+///   clamped so it always fits the leaf's reserved margin. The formula
+///   distributes the tail so chain pages fill evenly.
+pub(crate) fn overflow_local_len_for(total: usize, page_size: usize) -> usize {
+    let max_local = page_size.saturating_sub(128);
+    if total <= max_local {
+        return total;
+    }
+    let chain_cap = page_size.saturating_sub(16);
+    let min_local = (page_size / 4).clamp(16, max_local.saturating_sub(8));
+    let surplus = min_local + (total - min_local) % chain_cap.max(1);
+    if surplus <= max_local {
+        surplus
+    } else {
+        min_local
+    }
+}
+
 /// A cell in a B+tree. This is a logical representation; on-disk format
 /// is varint-encoded.
 #[derive(Clone, Debug)]
 pub enum Cell {
-    /// Table leaf: (rowid, payload).
+    /// Table leaf: (rowid, payload) — payload fully in-page.
     TableLeaf { rowid: i64, payload: Vec<u8> },
+    /// Table leaf with an overflow chain: the cell stores a LOCAL prefix
+    /// of the payload plus the first overflow page id; the tail lives in
+    /// a linked chain of Overflow pages. `total` is the FULL payload
+    /// length (local + chain). SQLite-overflow equivalent.
+    TableLeafOverflow {
+        rowid: i64,
+        total: u64,
+        local: Vec<u8>,
+        overflow: PageId,
+    },
     /// Table interior: (left_child_page, key).
     TableInterior { left_child: PageId, key: i64 },
     /// Index leaf: (key, rowid).
@@ -130,6 +166,7 @@ impl Cell {
     pub fn key(&self) -> i64 {
         match self {
             Cell::TableLeaf { rowid, .. } => *rowid,
+            Cell::TableLeafOverflow { rowid, .. } => *rowid,
             Cell::TableInterior { key, .. } => *key,
             Cell::IndexLeaf { rowid, .. } => *rowid,
             Cell::IndexInterior { rowid, .. } => *rowid,
@@ -167,6 +204,11 @@ impl Cell {
                 let p = varint::encode(payload.len() as u64, &mut buf);
                 k + p + payload.len()
             }
+            Cell::TableLeafOverflow { rowid, total, local, .. } => {
+                let k = varint::encode_signed(*rowid, &mut buf);
+                let p = varint::encode(*total, &mut buf);
+                k + p + local.len() + 4
+            }
             Cell::TableInterior { left_child: _, key } => 4 + varint::encode_signed(*key, &mut buf),
             Cell::IndexLeaf { key, rowid } => {
                 // Format: varint(rowid) + varint(key_len) + key
@@ -198,6 +240,14 @@ impl Cell {
                 out.extend_from_slice(&buf[..p]);
                 out.extend_from_slice(payload);
             }
+            Cell::TableLeafOverflow { rowid, total, local, overflow } => {
+                let k = varint::encode_signed(*rowid, &mut buf);
+                out.extend_from_slice(&buf[..k]);
+                let p = varint::encode(*total, &mut buf);
+                out.extend_from_slice(&buf[..p]);
+                out.extend_from_slice(local);
+                out.extend_from_slice(&overflow.to_be_bytes());
+            }
             Cell::TableInterior { left_child, key } => {
                 out.extend_from_slice(&left_child.to_be_bytes());
                 let k = varint::encode_signed(*key, &mut buf);
@@ -226,7 +276,9 @@ impl Cell {
     }
 
     /// Decode a cell from a byte buffer at a given page type.
-    pub fn decode(buf: &[u8], page_type: PageType) -> Result<Self> {
+    /// `page_size` is needed to derive the overflow local-size for spilled
+    /// payloads (the split point is a pure function of the length).
+    pub fn decode(buf: &[u8], page_type: PageType, page_size: u32) -> Result<Self> {
         match page_type {
             PageType::LeafTable => {
                 let (rowid, n) = varint::decode_signed(buf)
@@ -235,13 +287,31 @@ impl Cell {
                 let (plen, m) = varint::decode(rest)
                     .ok_or_else(|| Error::corruption("truncated leaf payload length"))?;
                 let rest = &rest[m..];
-                if rest.len() < plen as usize {
-                    return Err(Error::corruption("truncated leaf payload"));
+                let plen_us = plen as usize;
+                let local_len = overflow_local_len_for(plen_us, page_size as usize);
+                if local_len == plen_us {
+                    // Fully in-page payload.
+                    if rest.len() < plen_us {
+                        return Err(Error::corruption("truncated leaf payload"));
+                    }
+                    Ok(Cell::TableLeaf {
+                        rowid,
+                        payload: rest[..plen_us].to_vec(),
+                    })
+                } else {
+                    // Overflow cell: local prefix + 4-byte first chain page.
+                    if rest.len() < local_len + 4 {
+                        return Err(Error::corruption("truncated overflow leaf cell"));
+                    }
+                    let overflow =
+                        u32::from_be_bytes(rest[local_len..local_len + 4].try_into().unwrap());
+                    Ok(Cell::TableLeafOverflow {
+                        rowid,
+                        total: plen,
+                        local: rest[..local_len].to_vec(),
+                        overflow,
+                    })
                 }
-                Ok(Cell::TableLeaf {
-                    rowid,
-                    payload: rest[..plen as usize].to_vec(),
-                })
             }
             PageType::InteriorTable => {
                 if buf.len() < 4 {
@@ -287,6 +357,9 @@ impl Cell {
                     rowid,
                 })
             }
+            PageType::Overflow => Err(Error::corruption(
+                "overflow page reached as a btree cell page",
+            )),
         }
     }
 }
@@ -1058,6 +1131,10 @@ impl<'a> Btree<'a> {
                 let borrowed = page.lock();
                 let pt = borrowed.page_type()?;
                 match pt {
+                    PageType::Overflow => {
+                        // Never a valid tree node — treat as no hint.
+                        break;
+                    }
                     PageType::LeafTable => {
                         let n = borrowed.n_cells() as usize;
                         if n > 0 {
@@ -1182,7 +1259,7 @@ impl<'a> Btree<'a> {
     /// `Ok(None)` only on structural surprises (wrong page type, corrupt
     /// cell), which the caller treats as "fall back to the full descent".
     fn lookup_table_leaf(
-        &self,
+        &mut self,
         page_ref: &PageRef,
         rowid: i64,
         bias: u32,
@@ -1199,11 +1276,19 @@ impl<'a> Btree<'a> {
         match biased_rowid_search(&borrowed, n, bias, rowid)? {
             Some(cell) => {
                 let cell_ptr = borrowed.cell_pointer(cell as u16) as usize;
-                let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
-                if let Cell::TableLeaf { payload, .. } = cell {
-                    return Ok(Some(LookupResult::Found(payload)));
+                let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
+                match cell {
+                    Cell::TableLeaf { payload, .. } => {
+                        return Ok(Some(LookupResult::Found(payload)));
+                    }
+                    Cell::TableLeafOverflow { local, total, overflow, .. } => {
+                        // Lock order leaf → overflow pages is global (chains
+                        // are only ever entered from a decoded leaf cell).
+                        let payload = self.assemble_overflow_payload(&local, total, overflow)?;
+                        return Ok(Some(LookupResult::Found(payload)));
+                    }
+                    _ => unreachable!(),
                 }
-                unreachable!();
             }
             None => {
                 // In bounds (verified via the hint) but not present: the rowid is
@@ -1254,6 +1339,25 @@ impl<'a> Btree<'a> {
                         break 'hint;
                     };
                     let start = rn + pn;
+                    let local_len = overflow_local_len_for(plen as usize, borrowed.data.len());
+                    if local_len != plen as usize {
+                        // Spilled row: local prefix + 4-byte chain head;
+                        // assemble after releasing the leaf lock.
+                        if start + local_len + 4 > rest.len() {
+                            break 'hint;
+                        }
+                        let local = rest[start..start + local_len].to_vec();
+                        let chain = u32::from_be_bytes(
+                            rest[start + local_len..start + local_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        drop(borrowed);
+                        self.note_table_cell(rowid, cell as u32, epoch);
+                        let payload = self.assemble_overflow_payload(&local, plen, chain)?;
+                        let out = f(&payload)?;
+                        return Ok(Some(out));
+                    }
                     let end = start + plen as usize;
                     if end > rest.len() {
                         break 'hint;
@@ -1312,6 +1416,26 @@ impl<'a> Btree<'a> {
                             let (plen, pn) = varint::decode(&rest[rn..])
                                 .ok_or_else(|| Error::corruption("truncated payload length"))?;
                             let start = rn + pn;
+                            let local_len =
+                                overflow_local_len_for(plen as usize, borrowed.data.len());
+                            if local_len != plen as usize {
+                                // Spilled row: assemble local prefix + chain.
+                                if start + local_len + 4 > rest.len() {
+                                    return Err(Error::corruption("truncated overflow cell"));
+                                }
+                                let local = rest[start..start + local_len].to_vec();
+                                let chain = u32::from_be_bytes(
+                                    rest[start + local_len..start + local_len + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                drop(borrowed);
+                                self.note_table_cell(rowid, cell as u32, epoch);
+                                let payload =
+                                    self.assemble_overflow_payload(&local, plen, chain)?;
+                                let out = f(&payload)?;
+                                return Ok(Some(out));
+                            }
                             let end = start + plen as usize;
                             if end > rest.len() {
                                 return Err(Error::corruption("truncated payload"));
@@ -1428,13 +1552,22 @@ impl<'a> Btree<'a> {
                         Some(cell_idx) => {
                             let cell_ptr = borrowed.cell_pointer(cell_idx as u16) as usize;
                             // Found — decode the full cell ONCE.
-                            let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
-                            if let Cell::TableLeaf { payload, .. } = cell {
-                                drop(borrowed);
-                                self.note_table_cell(rowid, cell_idx as u32, epoch);
-                                return Ok(LookupResult::Found(payload));
+                            let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
+                            match cell {
+                                Cell::TableLeaf { payload, .. } => {
+                                    drop(borrowed);
+                                    self.note_table_cell(rowid, cell_idx as u32, epoch);
+                                    return Ok(LookupResult::Found(payload));
+                                }
+                                Cell::TableLeafOverflow { local, total, overflow, .. } => {
+                                    drop(borrowed);
+                                    self.note_table_cell(rowid, cell_idx as u32, epoch);
+                                    let payload =
+                                        self.assemble_overflow_payload(&local, total, overflow)?;
+                                    return Ok(LookupResult::Found(payload));
+                                }
+                                _ => unreachable!(),
                             }
-                            unreachable!();
                         }
                         None => return Ok(LookupResult::NotFound),
                     }
@@ -1489,33 +1622,188 @@ impl<'a> Btree<'a> {
     }
 
     /// Insert a (rowid, payload) pair into a table B+tree.
-    /// Maximum payload that can be stored in a single cell. The engine
-    /// does not (yet) write overflow page chains, so a cell must fit in
-    /// one page alongside its header and the cell-pointer array; going
-    /// over must be a graceful error, never an allocator underflow.
+    /// Maximum payload stored fully IN-PAGE. Larger payloads spill to an
+    /// overflow chain (local prefix + linked Overflow pages). The margin
+    /// covers the page header, the cell pointer, the rowid/payload-length
+    /// varints, and the 4-byte overflow page pointer — an overflow cell is
+    /// always ≥ 8 bytes SMALLER than this, which keeps the overflow-cell
+    /// format unambiguous against a plain in-page cell of the same length.
     fn max_cell_payload(&self) -> usize {
-        // Page header + cell pointer + a healthy margin for cell overhead
-        // (rowid varint, payload length varint) and the pointer array.
         self.pager.page_size() as usize - 128
+    }
+
+    /// Data capacity of one overflow chain page (page size minus the
+    /// 12-byte page header and 4-byte next pointer).
+    fn overflow_page_capacity(&self) -> usize {
+        self.pager.page_size() as usize - 16
+    }
+
+    /// SQLite's practical blob ceiling (SQLITE_MAX_LENGTH default).
+    pub const MAX_PAYLOAD: usize = 1 << 30;
+
+    /// Write `payload[local_len..]` into a fresh chain of Overflow pages.
+    /// Returns the first page id (0 only when nothing needed to spill).
+    fn build_overflow_chain(&mut self, payload: &[u8], local_len: usize) -> Result<PageId> {
+        let cap = self.overflow_page_capacity();
+        let mut rest = &payload[local_len..];
+        let mut first: PageId = 0;
+        let mut prev: PageId = 0;
+        while !rest.is_empty() {
+            let take = rest.len().min(cap);
+            let page_id = self.pager.allocate_page()?;
+            {
+                let page_ref = self.pager.get_page(page_id)?;
+                let mut p = page_ref.lock();
+                p.init_overflow();
+                p.overflow_data_mut()[..take].copy_from_slice(&rest[..take]);
+            }
+            if prev == 0 {
+                first = page_id;
+            } else {
+                let page_ref = self.pager.get_page(prev)?;
+                let mut p = page_ref.lock();
+                p.set_overflow_next(page_id);
+            }
+            prev = page_id;
+            rest = &rest[take..];
+        }
+        Ok(first)
+    }
+
+    /// Free every page in an overflow chain (delete/update of a spilled
+    /// row). Safe against cycles: bounds the walk by the file's page count.
+    fn free_overflow_chain(&mut self, first: PageId) -> Result<()> {
+        let mut cur = first;
+        let max_pages = self.pager.n_pages() as usize + 4;
+        let mut steps = 0usize;
+        while cur != 0 {
+            steps += 1;
+            if steps > max_pages {
+                return Err(Error::corruption(format!(
+                    "overflow chain cycle starting at page {first}"
+                )));
+            }
+            let next = {
+                let page_ref = self.pager.get_page(cur)?;
+                let p = page_ref.lock();
+                let pt = p.page_type()?;
+                if pt != PageType::Overflow {
+                    return Err(Error::corruption(format!(
+                        "overflow chain hit non-overflow page {} ({:?})",
+                        cur, pt
+                    )));
+                }
+                p.overflow_next()
+            };
+            self.pager.free_page(cur)?;
+            cur = next;
+        }
+        Ok(())
+    }
+
+    /// Reassemble the FULL payload of an overflow cell: local prefix +
+    /// every chain page's data. The returned length is exactly `total`.
+    pub(crate) fn assemble_overflow_payload(
+        &mut self,
+        local: &[u8],
+        total: u64,
+        first: PageId,
+    ) -> Result<Vec<u8>> {
+        let total = total as usize;
+        if total < local.len() {
+            return Err(Error::corruption(format!(
+                "overflow cell local prefix {} longer than payload {}",
+                local.len(),
+                total
+            )));
+        }
+        // Corrupt files can carry multi-exabyte length varints: clamp the
+        // reservation (the walk below grows/validates the real length).
+        let mut out = Vec::with_capacity(total.min(1 << 20));
+        out.extend_from_slice(local);
+        let cap = self.overflow_page_capacity();
+        let mut remaining = total - local.len();
+        let mut cur = first;
+        let max_pages = self.pager.n_pages() as usize + 4;
+        let mut steps = 0usize;
+        while cur != 0 {
+            steps += 1;
+            if steps > max_pages {
+                return Err(Error::corruption(format!(
+                    "overflow chain cycle starting at page {first}"
+                )));
+            }
+            // The number of VALID bytes on this page is deterministic:
+            // every page except the last is full; the last carries the
+            // remainder. (Pages are not zeroed on allocation — never read
+            // past `take`.)
+            let take = remaining.min(cap);
+            if take == 0 {
+                return Err(Error::corruption(format!(
+                    "overflow chain longer than payload ({} > {})",
+                    total, total
+                )));
+            }
+            let page_ref = self.pager.get_page(cur)?;
+            let p = page_ref.lock();
+            let pt = p.page_type()?;
+            if pt != PageType::Overflow {
+                return Err(Error::corruption(format!(
+                    "overflow chain hit non-overflow page {} ({:?})",
+                    cur, pt
+                )));
+            }
+            let data = p.overflow_data();
+            if data.len() < take {
+                return Err(Error::corruption("overflow page data region truncated"));
+            }
+            out.extend_from_slice(&data[..take]);
+            remaining -= take;
+            cur = p.overflow_next();
+        }
+        if remaining != 0 {
+            return Err(Error::corruption(format!(
+                "overflow chain shorter than payload ({} < {})",
+                total - remaining,
+                total
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Make a leaf cell for (rowid, payload): in-page when it fits,
+    /// overflow-spilled when it does not. The local-prefix size uses the
+    /// SAME deterministic formula as `Cell::decode` (readers derive the
+    /// split from the payload length alone).
+    fn make_leaf_cell(&mut self, rowid: i64, payload: &[u8]) -> Result<Cell> {
+        if payload.len() <= self.max_cell_payload() {
+            return Ok(Cell::TableLeaf { rowid, payload: payload.to_vec() });
+        }
+        if payload.len() > Self::MAX_PAYLOAD {
+            return Err(Error::InvalidArgument(format!(
+                "string or blob too big ({} bytes; max is {})",
+                payload.len(),
+                Self::MAX_PAYLOAD
+            )));
+        }
+        let page_size = self.pager.page_size() as usize;
+        let local_len = overflow_local_len_for(payload.len(), page_size);
+        debug_assert!(local_len + 4 <= self.max_cell_payload());
+        let overflow = self.build_overflow_chain(payload, local_len)?;
+        Ok(Cell::TableLeafOverflow {
+            rowid,
+            total: payload.len() as u64,
+            local: payload[..local_len].to_vec(),
+            overflow,
+        })
     }
 
     pub fn insert_table(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
         // Notify the pager that a write is about to happen. This maintains
         // the O(1) dirty-page counter used by `flush()`'s fast path
         // (see `Pager::note_write`).
-        if payload.len() > self.max_cell_payload() {
-            return Err(Error::InvalidArgument(format!(
-                "string or blob too big ({} bytes; max in-page cell payload is {} \
-— overflow page chains are not yet supported)",
-                payload.len(),
-                self.max_cell_payload()
-            )));
-        }
         self.pager.note_write();
-        let cell = Cell::TableLeaf {
-            rowid,
-            payload: payload.to_vec(),
-        };
+        let cell = self.make_leaf_cell(rowid, payload)?;
         match self.insert_into_page(self.root, cell)? {
             InsertResult::Done => Ok(()),
             InsertResult::Split {
@@ -1593,13 +1881,6 @@ impl<'a> Btree<'a> {
         payload: &[u8],
         hint: Option<PageId>,
     ) -> Result<Option<PageId>> {
-        if payload.len() > self.max_cell_payload() {
-            return Err(Error::InvalidArgument(format!(
-                "string or blob too big ({} bytes; max in-page cell payload is {})",
-                payload.len(),
-                self.max_cell_payload()
-            )));
-        }
         self.pager.note_write();
 
         // Fast path: validate the hinted leaf and append directly into it.
@@ -1661,6 +1942,11 @@ impl<'a> Btree<'a> {
     /// not a table leaf, the rowid isn't past the last cell, or there is no
     /// room (caller falls back to the full insert path).
     fn try_append_into_leaf(&self, leaf_id: PageId, rowid: i64, payload: &[u8]) -> Result<Option<PageId>> {
+        // Overflow-spilled payloads go through the full insert path (the
+        // cell is local-prefix + chain pointer, built by `make_leaf_cell`).
+        if payload.len() > self.max_cell_payload() {
+            return Ok(None);
+        }
         let page = self.pager.get_page(leaf_id)?;
         // Cell bytes: varint rowid + varint payload len + payload. Typical
         // rows are well under 256 bytes — build in a stack buffer and only
@@ -1711,8 +1997,13 @@ impl<'a> Btree<'a> {
 
         // Append: write cell at the new content start, write pointer at end.
         {
-            let new_content_start = borrowed.cell_content_start() - cell_size;
+            let new_content_start = borrowed.cell_content_start().saturating_sub(cell_size);
             let off = new_content_start as usize;
+            if off + cell_size as usize > borrowed.data.len() {
+                // Corrupt page header (content start out of range): refuse
+                // the append instead of slicing out of bounds.
+                return Ok(None);
+            }
             borrowed.data[off..off + cell_size as usize].copy_from_slice(cell);
             borrowed.set_cell_content_start(new_content_start);
 
@@ -2033,6 +2324,7 @@ impl<'a> Btree<'a> {
                             let payload_offset = plen_pos + n_plen;
                             if plen as usize == new_payload.len()
                                 && payload_offset + new_payload.len() <= psz
+                                && overflow_local_len_for(plen as usize, psz) == plen as usize
                             {
                                 borrowed.data[payload_offset..payload_offset + new_payload.len()]
                                     .copy_from_slice(new_payload);
@@ -2163,6 +2455,13 @@ impl<'a> Btree<'a> {
                     }
                     let page_id_now = borrowed.id;
                     if let Some((_cp, off, plen)) = hit {
+                        // Spilled rows never take the in-place patch path
+                        // (their bytes span a chain, not the leaf).
+                        let psz = borrowed.data.len();
+                        let local_len = overflow_local_len_for(plen, psz);
+                        if local_len != plen {
+                            return Ok(false);
+                        }
                         if plen == new_payload.len()
                             && off + new_payload.len() <= borrowed.data.len()
                         {
@@ -2236,6 +2535,13 @@ impl<'a> Btree<'a> {
                         // Size changed — caller must fall back to delete+insert.
                         return Ok(false);
                     }
+                    // Spilled rows never take the in-place patch path.
+                    {
+                        let psz = page.lock().data.len();
+                        if overflow_local_len_for(old_len, psz) != old_len {
+                            return Ok(false);
+                        }
+                    }
                     // Overwrite the payload bytes — single mutable borrow,
                     // no immutable borrows outstanding.
                     {
@@ -2253,7 +2559,7 @@ impl<'a> Btree<'a> {
                     let mut next = borrowed.right_most_pointer();
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                        let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                         if let Cell::TableInterior { left_child, key } = cell {
                             if rowid <= key {
                                 next = left_child;
@@ -2550,7 +2856,7 @@ impl<'a> Btree<'a> {
                         right_most = borrowed.right_most_pointer();
                         for i in 0..n_cells {
                             let cell_ptr = borrowed.cell_pointer(i) as usize;
-                            let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt2)?;
+                            let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt2, borrowed.page_size())?;
                             if c.left_child() == child_id {
                                 found_idx = Some(i as usize);
                             }
@@ -2768,7 +3074,7 @@ impl<'a> Btree<'a> {
         // Allocate space at the cell content area.
         let new_content_start = {
             let borrowed = page.lock();
-            borrowed.cell_content_start() - cell_size as u32
+            borrowed.cell_content_start().saturating_sub(cell_size as u32)
         };
 
         // Write the cell bytes.
@@ -2777,6 +3083,14 @@ impl<'a> Btree<'a> {
             let mut buf = Vec::with_capacity(cell_size);
             cell.encode(&mut buf);
             let off = new_content_start as usize;
+            if off + cell_size > borrowed.data.len() {
+                // Corrupt page header (content start out of range): clean
+                // corruption error, never an out-of-bounds slice.
+                return Err(Error::corruption(format!(
+                    "cell content area out of range in insert (page {})",
+                    page_id
+                )));
+            }
             borrowed.data[off..off + cell_size].copy_from_slice(&buf);
             borrowed.set_cell_content_start(new_content_start);
 
@@ -3183,7 +3497,7 @@ impl<'a> Btree<'a> {
         for i in 0..n {
             let borrowed = page.lock();
             let cell_ptr = borrowed.cell_pointer(i) as usize;
-            let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+            let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
             let existing_before_new = if is_idx {
                 c.cmp_index_target(new_cell.index_key(), new_cell.key())
                     == std::cmp::Ordering::Less
@@ -3197,7 +3511,7 @@ impl<'a> Btree<'a> {
                 for j in i..n {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(j) as usize;
-                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                     cells.push(c);
                 }
                 break;
@@ -3253,7 +3567,7 @@ impl<'a> Btree<'a> {
                     let page_ref = self.pager.get_page(page_id)?;
                     let borrowed = page_ref.lock();
                     let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
-                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                     Some((c.index_key().to_vec(), c.key()))
                 } else {
                     None
@@ -3351,7 +3665,7 @@ impl<'a> Btree<'a> {
     //     for i in 0..n {
     //         let borrowed = page.lock();
     //         let cell_ptr = borrowed.cell_pointer(i) as usize;
-    //         let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+    //         let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
     //         if !inserted && new_cell.key() < c.key() {
     //             cells.push(new_cell.clone());
     //             inserted = true;
@@ -3440,7 +3754,7 @@ impl<'a> Btree<'a> {
             let mut found = None;
             for i in 0..n {
                 let cell_ptr = borrowed.cell_pointer(i) as usize;
-                let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                 if c.left_child() == child_id {
                     found = Some(i as usize);
                     break;
@@ -3480,7 +3794,7 @@ impl<'a> Btree<'a> {
                     let parent_ref = self.pager.get_page(parent_id)?;
                     let borrowed = parent_ref.lock();
                     let cell_ptr = borrowed.cell_pointer(last_idx as u16) as usize;
-                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                    let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                     c.left_child()
                 };
                 let parent_ref = self.pager.get_page(parent_id)?;
@@ -3514,6 +3828,13 @@ impl<'a> Btree<'a> {
     /// doesn't exist.
     pub fn delete_table_get_payload(&mut self, rowid: i64) -> Result<Option<Vec<u8>>> {
         self.pager.note_write();
+        // Payload of the doomed cell: inline bytes, or a spilled prefix +
+        // chain head that must be assembled (and whose chain is freed by
+        // `delete_from_page`).
+        enum DecodedOldPayload {
+            Inline(Vec<u8>),
+            Spilled { local: Vec<u8>, total: u64, chain: PageId },
+        }
         // Find the leaf and capture the payload before removing the cell.
         let mut page_id = self.root;
         loop {
@@ -3553,13 +3874,35 @@ impl<'a> Btree<'a> {
                                 let (plen, n_plen) = varint::decode(&borrowed.data[plen_pos..])
                                     .ok_or_else(|| Error::corruption("truncated payload length"))?;
                                 let start = plen_pos + n_plen;
-                                Some(borrowed.data[start..start + plen as usize].to_vec())
+                                let psz = borrowed.data.len();
+                                let local_len = overflow_local_len_for(plen as usize, psz);
+                                if local_len == plen as usize {
+                                    Some(DecodedOldPayload::Inline(
+                                        borrowed.data[start..start + plen as usize].to_vec(),
+                                    ))
+                                } else {
+                                    // Spilled row: local prefix + 4-byte chain
+                                    // head; assembled after the page lock drops.
+                                    let local = borrowed.data[start..start + local_len].to_vec();
+                                    let chain = u32::from_be_bytes(
+                                        borrowed.data[start + local_len..start + local_len + 4]
+                                            .try_into()
+                                            .unwrap(),
+                                    );
+                                    Some(DecodedOldPayload::Spilled { local, total: plen, chain })
+                                }
                             }
                         }
                     };
-                    if payload.is_none() {
-                        return Ok(None);
-                    }
+                    let payload: Option<Vec<u8>> = match payload {
+                        None => return Ok(None),
+                        Some(DecodedOldPayload::Inline(v)) => Some(v),
+                        Some(DecodedOldPayload::Spilled { local, total, chain }) => {
+                            // Leaf guard already dropped above; the chain
+                            // walk locks only overflow pages.
+                            Some(self.assemble_overflow_payload(&local, total, chain)?)
+                        }
+                    };
                     drop(page);
                     let deleted = self.delete_from_page(page_id, rowid)?;
                     debug_assert!(deleted, "binary search found the cell but delete_from_page didn't");
@@ -3609,6 +3952,9 @@ impl<'a> Btree<'a> {
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
         match pt {
+            PageType::Overflow => Err(Error::corruption(
+                "overflow page reached as a btree node in delete_from_page",
+            )),
             PageType::LeafTable | PageType::LeafIndex => {
                 let n = page.lock().n_cells();
                 // Allocation-free binary search over cell views (the old
@@ -3658,6 +4004,25 @@ impl<'a> Btree<'a> {
                 };
                 if !key_matches {
                     return Ok(false);
+                }
+                // Spilled row: free its overflow chain BEFORE removing the
+                // cell (the chain pages are otherwise unreachable garbage).
+                if pt == PageType::LeafTable {
+                    let cell_ptr = {
+                        let borrowed = page.lock();
+                        borrowed.cell_pointer(pos) as usize
+                    };
+                    let cell = {
+                        let borrowed = page.lock();
+                        Cell::decode(
+                            borrowed.cell_slice_checked(cell_ptr)?,
+                            pt,
+                            borrowed.page_size(),
+                        )?
+                    };
+                    if let Cell::TableLeafOverflow { overflow, .. } = cell {
+                        self.free_overflow_chain(overflow)?;
+                    }
                 }
                 // Shift cell pointers left to remove the slot at `pos` —
                 // one memmove (copy_within) instead of a per-element loop.
@@ -3777,7 +4142,7 @@ impl<'a> Btree<'a> {
     /// Scan all rows in a table B+tree, calling `f(rowid, payload)` for each.
     /// Stops early if `f` returns false.
     pub fn scan_table<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
-        self.scan_subtree(self.root, &mut f)
+        self.scan_subtree(self.root, &mut f).map(|_| ())
     }
 
     /// Zero-allocation table scan: callback receives `(rowid, payload_bytes)`
@@ -3792,14 +4157,17 @@ impl<'a> Btree<'a> {
     /// back into the pager (no `get_page`, no `allocate_page`). For pure
     /// decode/transform callbacks this is fine.
     pub fn scan_table_borrowed<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
-        self.scan_subtree_borrowed(self.root, &mut f)
+        self.scan_subtree_borrowed(self.root, &mut f).map(|_| ())
     }
 
+    /// Returns `Ok(false)` when the visitor stopped the scan early —
+    /// interior nodes propagate the stop so `false` unwinds the whole
+    /// tree walk instead of visiting every remaining leaf.
     fn scan_subtree_borrowed<F: FnMut(i64, &[u8]) -> bool>(
         &mut self,
         page_id: PageId,
         f: &mut F,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
         match pt {
@@ -3829,18 +4197,42 @@ impl<'a> Btree<'a> {
                         .ok_or_else(|| Error::corruption("truncated leaf payload len in scan_borrowed"))?;
                     let payload_start = n1 + n2;
                     let plen = plen as usize;
-                    // Corrupt files can carry huge payload-length varints:
-                    // checked add, not `payload_start + plen` (which
-                    // overflows usize and panics in debug builds).
-                    if plen.checked_add(payload_start).map_or(true, |end| end > buf.len()) {
-                        return Err(Error::corruption("truncated leaf payload in scan_borrowed"));
-                    }
-                    let payload = &buf[payload_start..payload_start + plen];
-                    if !f(rowid, payload) {
-                        return Ok(());
+                    let page_size = psz;
+                    let local_len = overflow_local_len_for(plen, page_size);
+                    if local_len == plen {
+                        // In-page payload. Corrupt files can carry huge
+                        // payload-length varints: checked add, not
+                        // `payload_start + plen` (which overflows usize and
+                        // panics in debug builds).
+                        if plen.checked_add(payload_start).map_or(true, |end| end > buf.len()) {
+                            return Err(Error::corruption("truncated leaf payload in scan_borrowed"));
+                        }
+                        let payload = &buf[payload_start..payload_start + plen];
+                        if !f(rowid, payload) {
+                            return Ok(false);
+                        }
+                    } else {
+                        // Overflow cell: local prefix + 4-byte chain head.
+                        // Assemble the payload while still holding this
+                        // leaf's lock — the lock order leaf → overflow is
+                        // global (chains are only entered from leaf cells).
+                        if local_len + 4 > buf.len() - payload_start {
+                            return Err(Error::corruption("truncated overflow cell in scan_borrowed"));
+                        }
+                        let local = &buf[payload_start..payload_start + local_len];
+                        let chain = u32::from_be_bytes(
+                            buf[payload_start + local_len..payload_start + local_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let assembled =
+                            self.assemble_overflow_payload(local, plen as u64, chain)?;
+                        if !f(rowid, &assembled) {
+                            return Ok(false);
+                        }
                     }
                 }
-                Ok(())
+                Ok(true)
             }
             PageType::InteriorTable => {
                 let n = page.lock().n_cells();
@@ -3850,7 +4242,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                         if let Cell::TableInterior { left_child, .. } = c {
                             v.push(left_child);
                         }
@@ -3860,9 +4252,11 @@ impl<'a> Btree<'a> {
                 };
                 drop(page);
                 for child in cells {
-                    self.scan_subtree_borrowed(child, f)?;
+                    if !self.scan_subtree_borrowed(child, f)? {
+                        return Ok(false);
+                    }
                 }
-                Ok(())
+                Ok(true)
             }
             _ => Err(Error::corruption(format!(
                 "unexpected page type in scan_borrowed: {:?}",
@@ -4012,7 +4406,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                         if let Cell::TableInterior { left_child, .. } = c {
                             v.push(left_child);
                         }
@@ -4037,7 +4431,7 @@ impl<'a> Btree<'a> {
         &mut self,
         page_id: PageId,
         f: &mut F,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let page = self.pager.get_page(page_id)?;
         // ONE lock per page (was: one lock for page_type, one for n_cells,
         // then PER CELL: a lock for cell_pointer + another for the data —
@@ -4049,14 +4443,24 @@ impl<'a> Btree<'a> {
                 let n = borrowed.n_cells();
                 for i in 0..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
-                    if let Cell::TableLeaf { rowid, payload } = cell {
-                        if !f(rowid, &payload) {
-                            return Ok(());
+                    let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
+                    match cell {
+                        Cell::TableLeaf { rowid, payload } => {
+                            if !f(rowid, &payload) {
+                                return Ok(false);
+                            }
                         }
+                        Cell::TableLeafOverflow { rowid, local, total, overflow, .. } => {
+                            let payload =
+                                self.assemble_overflow_payload(&local, total, overflow)?;
+                            if !f(rowid, &payload) {
+                                return Ok(false);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Ok(())
+                Ok(true)
             }
             PageType::InteriorTable => {
                 let n = borrowed.n_cells();
@@ -4065,7 +4469,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                         if let Cell::TableInterior { left_child, .. } = c {
                             v.push(left_child);
                         }
@@ -4076,9 +4480,11 @@ impl<'a> Btree<'a> {
                 drop(borrowed);
                 drop(page);
                 for child in cells {
-                    self.scan_subtree(child, f)?;
+                    if !self.scan_subtree(child, f)? {
+                        return Ok(false);
+                    }
                 }
-                Ok(())
+                Ok(true)
             }
             _ => Err(Error::corruption(format!(
                 "unexpected page type in scan: {:?}",
@@ -4175,12 +4581,31 @@ impl<'a> Btree<'a> {
                             .ok_or_else(|| Error::corruption("truncated payload len in range_borrowed"))?;
                         let payload_start = n1 + n2;
                         let plen_usize = plen as usize;
-                        if payload_start + plen_usize > buf.len() {
-                            return Err(Error::corruption("truncated payload in range_borrowed"));
-                        }
-                        let payload = &buf[payload_start..payload_start + plen_usize];
-                        if !f(rowid, payload) {
-                            return Ok(false);
+                        let local_len = overflow_local_len_for(plen_usize, psz);
+                        if local_len == plen_usize {
+                            if payload_start + plen_usize > buf.len() {
+                                return Err(Error::corruption("truncated payload in range_borrowed"));
+                            }
+                            let payload = &buf[payload_start..payload_start + plen_usize];
+                            if !f(rowid, payload) {
+                                return Ok(false);
+                            }
+                        } else {
+                            // Overflow cell: local prefix + chain head.
+                            if local_len + 4 > buf.len() - payload_start {
+                                return Err(Error::corruption("truncated overflow cell in range_borrowed"));
+                            }
+                            let local = &buf[payload_start..payload_start + local_len];
+                            let chain = u32::from_be_bytes(
+                                buf[payload_start + local_len..payload_start + local_len + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let assembled =
+                                self.assemble_overflow_payload(local, plen, chain)?;
+                            if !f(rowid, &assembled) {
+                                return Ok(false);
+                            }
                         }
                     }
                 }
@@ -4250,15 +4675,30 @@ impl<'a> Btree<'a> {
                 for i in 0..n {
                     let cell_ptr = page.lock().cell_pointer(i) as usize;
                     let borrowed = page.lock();
-                    let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
-                    if let Cell::TableLeaf { rowid, payload } = cell {
-                        if rowid > end {
-                            return Ok(());
-                        }
-                        if rowid >= start
-                            && !f(rowid, &payload) {
+                    let cell = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
+                    match cell {
+                        Cell::TableLeaf { rowid, payload } => {
+                            if rowid > end {
                                 return Ok(());
                             }
+                            if rowid >= start
+                                && !f(rowid, &payload) {
+                                    return Ok(());
+                            }
+                        }
+                        Cell::TableLeafOverflow { rowid, local, total, overflow, .. } => {
+                            if rowid > end {
+                                return Ok(());
+                            }
+                            if rowid >= start {
+                                let payload =
+                                    self.assemble_overflow_payload(&local, total, overflow)?;
+                                if !f(rowid, &payload) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(())
@@ -4271,7 +4711,7 @@ impl<'a> Btree<'a> {
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt)?;
+                        let c = Cell::decode(borrowed.cell_slice_checked(cell_ptr)?, pt, borrowed.page_size())?;
                         if let Cell::TableInterior { left_child, key } = c {
                             v.push((left_child, key));
                         }

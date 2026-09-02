@@ -463,3 +463,165 @@ fn regression_nested_savepoint_bulk_rollback() {
     let rows = db.query("SELECT COUNT(*) FROM s WHERE v LIKE 'orig%'", []).unwrap();
     assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(500)));
 }
+
+// ===========================================================================
+// Aggregate rewrite keyed only by function name (sqlx-driver sprint,
+// 2026-09-02): `SELECT SUM(qty), SUM(price) ...` rewrote BOTH calls to
+// __agg_0, so every aggregate after the first silently reported the
+// FIRST aggregate's value (any path — GROUP BY, no-GROUP BY, streaming).
+// The rewrite must match on the argument expression as well.
+// ===========================================================================
+
+#[test]
+fn regression_multiple_aggregates_different_args() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE li (oid INT, qty INT, price REAL)", []).unwrap();
+    db.execute(
+        "INSERT INTO li (oid, qty, price) VALUES (1, 3, 10), (2, 2, 6)",
+        [],
+    )
+    .unwrap();
+
+    // No GROUP BY: two SUMs over different columns.
+    let rows = db
+        .query("SELECT SUM(qty), SUM(price) FROM li", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(5));
+    assert_eq!(rows[0][1], Value::Real(16.0));
+
+    // Same function, expression vs column.
+    let rows = db
+        .query("SELECT SUM(qty), SUM(qty * price) FROM li", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(5));
+    assert_eq!(rows[0][1], Value::Real(42.0));
+
+    // GROUP BY: per-group values must differ per aggregate.
+    let rows = db
+        .query("SELECT oid, SUM(qty), SUM(price) FROM li GROUP BY oid ORDER BY oid", [])
+        .unwrap();
+    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(3), Value::Real(10.0)]);
+    assert_eq!(rows[1], vec![Value::Integer(2), Value::Integer(2), Value::Real(6.0)]);
+
+    // Swapped order (the loose matcher favored aggregates[0] regardless).
+    let rows = db
+        .query("SELECT oid, SUM(price), SUM(qty) FROM li GROUP BY oid ORDER BY oid", [])
+        .unwrap();
+    assert_eq!(rows[0], vec![Value::Integer(1), Value::Real(10.0), Value::Integer(3)]);
+    assert_eq!(rows[1], vec![Value::Integer(2), Value::Real(6.0), Value::Integer(2)]);
+
+    // Aggregates in ORDER BY / expressions.
+    let rows = db
+        .query("SELECT SUM(qty) * 2, SUM(price) + 1 FROM li", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(10));
+    assert_eq!(rows[0][1], Value::Real(17.0));
+
+    // AVG/ MIN/ MAX with different args.
+    let rows = db
+        .query("SELECT MIN(qty), MAX(price), AVG(price) FROM li", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0][1], Value::Real(10.0));
+    assert!((rows[0][2].as_real() - 8.0).abs() < 1e-9);
+
+    // COUNT(*) alongside SUM stays independent.
+    let rows = db
+        .query("SELECT COUNT(*), SUM(qty), COUNT(qty) FROM li", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0][1], Value::Integer(5));
+    assert_eq!(rows[0][2], Value::Integer(2));
+
+    // HAVING referencing a second aggregate with different args.
+    let rows = db
+        .query(
+            "SELECT oid FROM li GROUP BY oid HAVING SUM(qty) > 2 AND SUM(price) > 8",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+}
+
+// ===========================================================================
+// Statement-path DML merge-back dropped root overrides (sqlx-driver
+// sprint, 2026-09-02): a prepared-statement INSERT that triggered a B+tree
+// split recorded the new root only in the reader context; the merge-back
+// wrote back max-rowids but NOT root/index overrides, so the catalog kept
+// pointing at the pre-split root. Every insert/read after the first split
+// went through the stale root — 5000 inserts silently retained ~391 rows
+// (one leaf page), in BOTH transaction and autocommit modes.
+// ===========================================================================
+
+#[test]
+fn regression_statement_dml_survives_btree_splits() {
+    use rustqlite::{Statement, StepResult};
+
+    for tx in [false, true] {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b REAL, c TEXT)", []).unwrap();
+        // An index makes index-root splits happen too.
+        db.execute("CREATE INDEX idx_c ON t (c)", []).unwrap();
+
+        if tx {
+            db.execute("BEGIN", []).unwrap();
+        }
+        // Per-row prepare/step (exactly what the sqlx driver does).
+        for i in 0..5000i64 {
+            let mut stmt: Statement<'_> = db
+                .prepare("INSERT INTO t (a, b, c) VALUES (?, ?, ?)")
+                .unwrap();
+            stmt.bind_all(&[
+                Value::Integer(i),
+                Value::Real(i as f64),
+                Value::Text(format!("name-{i:05}").into()),
+            ])
+            .unwrap();
+            while stmt.step().unwrap() == StepResult::Row {}
+            stmt.finalize().unwrap();
+        }
+        if tx {
+            db.execute("COMMIT", []).unwrap();
+        }
+
+        let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(
+            rows[0][0],
+            Value::Integer(5000),
+            "row count after bulk insert (tx={tx})"
+        );
+
+        // Every row must be reachable by rowid (stale roots made rows past
+        // the first split unreachable).
+        for i in [1i64, 100, 391, 392, 1000, 2500, 4999, 5000] {
+            let rows = db
+                .query("SELECT a FROM t WHERE id = ?", [Value::Integer(i)])
+                .unwrap();
+            assert_eq!(rows.len(), 1, "row {i} reachable (tx={tx})");
+            assert_eq!(rows[0][0], Value::Integer(i - 1));
+        }
+
+        // ...and through the index.
+        let rows = db
+            .query("SELECT id FROM t WHERE c = ?", [Value::Text("name-04999".into())])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "index lookup for the last row (tx={tx})");
+        assert_eq!(rows[0][0], Value::Integer(5000));
+
+        // One prepared statement re-bound per row (the reset path).
+        let mut db2 = Database::open_in_memory().unwrap();
+        db2.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT)", []).unwrap();
+        {
+            let mut stmt = db2.prepare("INSERT INTO t (a) VALUES (?)").unwrap();
+            for i in 0..3000i64 {
+                stmt.bind_all(&[Value::Integer(i)]).unwrap();
+                while stmt.step().unwrap() == StepResult::Row {}
+                stmt.reset();
+            }
+            stmt.finalize().unwrap();
+        }
+        let rows = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(3000), "reset path (tx={tx})");
+    }
+}

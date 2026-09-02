@@ -164,7 +164,7 @@ pub struct Database {
     /// read-lock on every fast-path point lookup. Writers hold `&mut self`
     /// (exclusive with all readers at the type level), so a stale `false`
     /// is impossible: the flag is refreshed at every maps attach site.
-    maps_populated: AtomicBool,
+    pub(crate) maps_populated: AtomicBool,
     /// Estimated allocator blocks freed by write statements since the last
     /// read-side settle (see `settle_allocator`). Bulk-write transactions
     /// free hundreds of thousands of small blocks (statement ASTs, encode
@@ -5959,6 +5959,19 @@ impl Params for Vec<Value> {
     type Iter = std::vec::IntoIter<Value>;
     fn into_iter(self) -> Self::Iter {
         <Vec<Value> as IntoIterator>::into_iter(self)
+    }
+    fn as_slice(&self) -> Option<&[Value]> {
+        Some(self)
+    }
+}
+
+/// Borrowed parameter slices (used by the sqlx driver and other callers
+/// that already hold a `Vec<Value>`). Binding goes through the zero-copy
+/// `as_slice` fast path; consuming paths clone.
+impl<'a> Params for &'a [Value] {
+    type Iter = std::iter::Cloned<std::slice::Iter<'a, Value>>;
+    fn into_iter(self) -> Self::Iter {
+        self.iter().cloned()
     }
     fn as_slice(&self) -> Option<&[Value]> {
         Some(self)

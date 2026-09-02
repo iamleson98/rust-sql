@@ -52,7 +52,7 @@ fn page_size_ignored_after_content() {
     // Content exists — the pragma must be a silent no-op (SQLite behavior).
     db.execute("PRAGMA page_size = 65536", []).unwrap();
     let cur = db.query("PRAGMA page_size", []).unwrap()[0][0].as_integer();
-    assert_eq!(cur, 8192, "page size must not change after content exists");
+    assert_eq!(cur, 4096, "page size must not change after content exists");
     // Data survives.
     assert_eq!(db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer(), 1);
     let _ = std::fs::remove_file(&_path);
@@ -63,6 +63,6 @@ fn page_size_invalid_values_rejected() {
     let (mut db, _path) = tmpdb("pagesize_invalid");
     // Not a power of two in the supported set — silently ignored.
     db.execute("PRAGMA page_size = 5000", []).unwrap();
-    assert_eq!(db.query("PRAGMA page_size", []).unwrap()[0][0].as_integer(), 8192);
+    assert_eq!(db.query("PRAGMA page_size", []).unwrap()[0][0].as_integer(), 4096);
     let _ = std::fs::remove_file(&_path);
 }

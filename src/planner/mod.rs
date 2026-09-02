@@ -648,13 +648,34 @@ pub fn rewrite_aggregates_and_groups(
             // columns when a real same-name aggregate exists elsewhere in
             // the query.
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
-                let first_arg_is_star = args.first().map(|a| matches!(a, Expr::Column { name, .. } if name == "*")).unwrap_or(false);
+                // The aggregate's INPUT expression: `None` for star / no-arg
+                // calls (COUNT(*)), otherwise the first argument.
+                let call_arg: Option<&Expr> = if args.is_empty()
+                    || args.first().map(|a| matches!(a, Expr::Column { name, .. } if name == "*")).unwrap_or(false)
+                {
+                    None
+                } else {
+                    args.first()
+                };
                 for (i, agg) in aggregates.iter().enumerate() {
-                    let agg_arg_is_star = agg.arg.is_none();
-                    if agg.func == name.to_ascii_lowercase()
-                        && agg.distinct == *distinct
-                        && (agg_arg_is_star == first_arg_is_star || first_arg_is_star)
-                    {
+                    if agg.func != name.to_ascii_lowercase() || agg.distinct != *distinct {
+                        continue;
+                    }
+                    // Match on the argument expression as well: two calls
+                    // of the same function with DIFFERENT arguments are
+                    // different aggregates. Previously only the function
+                    // name + distinct + star-ness were compared, so
+                    // `SELECT SUM(qty), SUM(price) ...` rewrote BOTH to
+                    // __agg_0 and the second aggregate silently reported
+                    // the first one's value. Expr has no PartialEq, so use
+                    // the same Display-based structural heuristic as the
+                    // GROUP BY matcher above.
+                    let args_match = match (&agg.arg, call_arg) {
+                        (None, None) => true,
+                        (Some(a), Some(c)) => format!("{:?}", a) == format!("{:?}", c),
+                        _ => false,
+                    };
+                    if args_match {
                         let col_name = format!("__agg_{}", i);
                         return Expr::Column { table: None, name: col_name };
                     }
@@ -2414,5 +2435,56 @@ pub(crate) fn rewrite_column_collations(
             }
         }
         _ => e.clone(),
+    }
+}
+
+#[cfg(test)]
+mod plan_dump_tests {
+    use crate::api::Database;
+
+    #[test]
+    fn dump_limit_plan_shapes() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b REAL NOT NULL, c TEXT NOT NULL)", []).unwrap();
+        for sql in [
+            "SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1",
+            "SELECT a FROM bench WHERE a % 10 = 0 LIMIT 5",
+            "SELECT * FROM bench WHERE a > 3 LIMIT 5",
+        ] {
+            let stmt = crate::sql::parser::parse(sql).unwrap();
+            let plan = Database::plan_for_statement(db.catalog_ref(), &stmt).unwrap();
+            let mut s = String::new();
+            if let Some(p) = plan {
+                fn walk(p: &crate::planner::plan::Plan, s: &mut String, depth: usize) {
+                    let name = match p {
+                        crate::planner::plan::Plan::Scan { predicate, index, .. } => {
+                            if index.is_some() { "Scan(idx)" } else if predicate.is_some() { "Scan(pred)" } else { "Scan" }
+                        }
+                        crate::planner::plan::Plan::Project { .. } => "Project",
+                        crate::planner::plan::Plan::Filter { .. } => "Filter",
+                        crate::planner::plan::Plan::Limit { .. } => "Limit",
+                        crate::planner::plan::Plan::Sort { .. } => "Sort",
+                        crate::planner::plan::Plan::Aggregate { .. } => "Aggregate",
+                        _ => "Other",
+                    };
+                    s.push_str(&"  ".repeat(depth));
+                    s.push_str(name);
+                    s.push('\n');
+                    let kids: Vec<&crate::planner::plan::Plan> = match p {
+                        crate::planner::plan::Plan::Project { input, .. }
+                        | crate::planner::plan::Plan::Filter { input, .. }
+                        | crate::planner::plan::Plan::Limit { input, .. }
+                        | crate::planner::plan::Plan::Sort { input, .. }
+                        | crate::planner::plan::Plan::Aggregate { input, .. }
+                        | crate::planner::plan::Plan::Distinct { input }
+                        | crate::planner::plan::Plan::Window { input, .. } => vec![input.as_ref()],
+                        _ => vec![],
+                    };
+                    for k in kids { walk(k, s, depth + 1); }
+                }
+                walk(&p, &mut s, 0);
+            }
+            println!("{sql}\n{s}");
+        }
     }
 }

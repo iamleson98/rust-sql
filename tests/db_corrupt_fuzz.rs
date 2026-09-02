@@ -193,11 +193,18 @@ fn malformed_database_files_never_panic() {
 
     for i in 0..iters {
         let mut bytes = original.clone();
-        // 1–8 random byte strikes anywhere in the file.
+        // 1–8 random byte strikes anywhere in the file. Force each strike
+        // to actually flip the byte (a strike that rewrites the same value
+        // is a no-op and would make `corrupted == original`).
         let strikes = 1 + rng.below(8);
         for _ in 0..strikes {
             let pos = rng.below(bytes.len());
-            bytes[pos] = rng.next_u64() as u8;
+            let old = bytes[pos];
+            let mut new = rng.next_u64() as u8;
+            if new == old {
+                new = new.wrapping_add(1);
+            }
+            bytes[pos] = new;
         }
         corrupt_and_verify(&db_path, &original, &bytes, &format!("random-strike-{}", i));
     }

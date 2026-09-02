@@ -4,6 +4,7 @@ use rustqlite::storage::pager::Pager;
 fn main() {
     // probe_idx_sql3.db left behind by the previous probe.
     let pager = Pager::open("/tmp/probe_idx_sql3.db", 2048).unwrap();
+    let page_size = pager.page_size();
     // Read schema table (page 0) to find idx_val's root page.
     let mut sbt = Btree::new(&pager, 0, false);
     let mut idx_root = 0u32;
@@ -35,7 +36,7 @@ fn main() {
     println!("root type: {:?}, n_cells: {}, right_most: {}", pt, n, borrowed.right_most_pointer());
     for i in 0..n {
         let cell_ptr = borrowed.cell_pointer(i) as usize;
-        let c = Cell::decode(&borrowed.data[cell_ptr..], pt).unwrap();
+        let c = Cell::decode(&borrowed.data[cell_ptr..], pt, page_size).unwrap();
         match c {
             Cell::IndexInterior { left_child, key, rowid } => {
                 println!("  cell[{}]: left_child={}, sep_rowid={}, sep_key={:02x?}", i, left_child, rowid, &key[..key.len().min(4)]);

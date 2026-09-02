@@ -95,6 +95,15 @@ pub struct Statement<'a> {
 
 #[derive(Default)]
 struct CtxDeltas {
+    /// Table name → new root page after a B+tree split (statement DML
+    /// merge-back). Previously only max-rowids were merged back, so the
+    /// first split's new root was dropped and every subsequent insert/read
+    /// went through the STALE root — a 5000-row insert silently retained
+    /// ~391 rows (one leaf's worth).
+    root_overrides: HashMap<String, u32>,
+    index_roots: HashMap<String, u32>,
+    roots_changed: bool,
+    index_roots_changed: bool,
     max_rowids: HashMap<String, i64>,
     max_rowids_invalidated: Vec<String>,
     max_rowids_changed: bool,
@@ -497,6 +506,10 @@ impl<'a> Statement<'a> {
         let out = out?;
         // Capture deltas (query()'s DML merge-back semantics).
         self.deltas = CtxDeltas {
+            root_overrides: ctx.root_overrides.clone(),
+            index_roots: ctx.index_roots.clone(),
+            roots_changed: ctx.roots_changed,
+            index_roots_changed: ctx.index_roots_changed,
             max_rowids: ctx.max_rowids.clone(),
             max_rowids_invalidated: ctx.max_rowids_invalidated.clone(),
             max_rowids_changed: ctx.max_rowids_changed || !ctx.max_rowids_invalidated.is_empty(),
@@ -506,15 +519,32 @@ impl<'a> Statement<'a> {
 
     fn merge_dml_maps(&mut self) {
         // DML via the shared path: merge root/index/max-rowid deltas into
-        // the Database's bookkeeping maps (mirrors Database::query).
+        // the Database's bookkeeping maps — ALL THREE map kinds, plus the
+        // maps_populated fast-path flag (mirrors Database::query).
+        if !(self.deltas.roots_changed
+            || self.deltas.index_roots_changed
+            || self.deltas.max_rowids_changed)
+        {
+            return;
+        }
         let mut m = self.db.maps.write();
         let bk = Arc::make_mut(&mut *m);
+        if self.deltas.roots_changed {
+            bk.roots.extend(self.deltas.root_overrides.drain());
+        }
+        if self.deltas.index_roots_changed {
+            bk.index_roots.extend(self.deltas.index_roots.drain());
+        }
         if self.deltas.max_rowids_changed {
             bk.max_rowids.extend(self.deltas.max_rowids.drain());
             for k in self.deltas.max_rowids_invalidated.drain(..) {
                 bk.max_rowids.remove(&k);
             }
         }
+        let nonempty = !bk.roots.is_empty() || !bk.index_roots.is_empty();
+        self.db
+            .maps_populated
+            .store(nonempty, std::sync::atomic::Ordering::Release);
     }
 
     fn merge_max_rowids(&mut self) {
@@ -757,6 +787,26 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             residual.clone(),
         ))),
         Plan::Filter { input, predicate } => {
+            // FUSED: Filter over a bare table Scan becomes ONE driver that
+            // scans with a compiled predicate (positional comparison tree)
+            // and selective decode — non-matching rows cost a decode of
+            // just the predicate's columns, never a full-row Vec (the
+            // generic FilterDriver materializes every row first, then
+            // walks the predicate AST with per-row name lookups). Only
+            // taken when the predicate actually compiles (correct alias
+            // prefix); otherwise the generic chain applies.
+            if let Plan::Scan { table, alias, index: None, predicate: scan_pred } = input.as_ref() {
+                if scan_pred.is_none()
+                    && table.vtab.is_none()
+                    && FilteredScanDriver::compiles(table, alias.as_deref(), predicate)
+                {
+                    return Some(Box::new(FilteredScanDriver::new(
+                        table.clone(),
+                        alias.clone(),
+                        predicate.clone(),
+                    )));
+                }
+            }
             let base = try_build_driver(input)?;
             Some(Box::new(FilterDriver::new(base, predicate.clone())))
         }
@@ -845,6 +895,158 @@ impl Driver for ScanDriver {
             last = last.max(rowid);
             true
         })?;
+        self.eof = hit_end && out.len() < budget;
+        self.last_rowid = last;
+        Ok(out)
+    }
+}
+
+/// FUSED Filter-over-Scan driver: scans with a COMPILED predicate and
+/// SELECTIVE decode, resumable across batches by rowid.
+///
+/// This is the streaming twin of the executor's `scan_filter_limit` fast
+/// path: non-matching rows cost only a decode of the predicate's columns
+/// (no full-row Vec, no AST walk, no per-row name lookups); matching rows
+/// are fully materialized for the driver chain above. Bounded by `budget`
+/// PASSING rows per call, so a `LimitDriver` with a small limit stops the
+/// walk almost immediately.
+struct FilteredScanDriver {
+    table: Arc<crate::schema::Table>,
+    columns: Arc<[String]>,
+    predicate: Expr,
+    /// Alias (or table name) the predicate compiles against.
+    prefix: String,
+    last_rowid: i64,
+    eof: bool,
+}
+
+impl FilteredScanDriver {
+    /// Does the predicate compile against this (table, prefix)? Gates the
+    /// fusion at driver-build time so a non-compiling predicate keeps the
+    /// generic (correct, slower) chain.
+    fn compiles(
+        table: &Arc<crate::schema::Table>,
+        alias: Option<&str>,
+        predicate: &Expr,
+    ) -> bool {
+        let prefix = alias.unwrap_or(&table.name);
+        crate::executor::predicate::compile_predicate(predicate, table, prefix).is_some()
+    }
+
+    fn new(
+        table: Arc<crate::schema::Table>,
+        alias: Option<String>,
+        predicate: Expr,
+    ) -> Self {
+        let columns = scan_columns(&table, alias.as_deref());
+        let prefix = alias.unwrap_or_else(|| table.name.clone());
+        Self { table, columns, predicate, prefix, last_rowid: i64::MIN, eof: false }
+    }
+}
+
+impl Driver for FilteredScanDriver {
+    fn columns(&self) -> Arc<[String]> {
+        self.columns.clone()
+    }
+    fn next_batch(
+        &mut self,
+        db: &Database,
+        params: &[Value],
+        _named: &HashMap<String, Value>,
+        budget: usize,
+    ) -> Result<Vec<Row>> {
+        if self.eof {
+            return Ok(Vec::new());
+        }
+        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let shared = db.maps.read().clone();
+        let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+        for p in params {
+            ctx.bind_positional(p.clone());
+        }
+        let _g = db.plugin_scope();
+        let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        let Some(pred) =
+            crate::executor::predicate::compile_predicate(&self.predicate, &self.table, &self.prefix)
+        else {
+            // Compilability was checked at build time; if it somehow fails
+            // here (schema drift), degrade to the generic materialized path
+            // rather than silently dropping rows.
+            let alias = if self.prefix == self.table.name {
+                None
+            } else {
+                Some(self.prefix.clone())
+            };
+            let mut generic = FilterDriver::new(
+                Box::new(ScanDriver::new(self.table.clone(), alias, None)),
+                self.predicate.clone(),
+            );
+            return generic.next_batch(db, params, _named, budget);
+        };
+        let root = ctx.table_root(&self.table);
+        let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
+        let n_cols = self.table.n_columns();
+        let rowid_alias = self.table.rowid_alias;
+        // Wanted = predicate columns (selective decode while scanning).
+        let mut wanted: Vec<usize> = Vec::new();
+        crate::executor::predicate::compiled_columns(&pred, &mut wanted);
+        let start = if self.last_rowid == i64::MIN { i64::MIN } else { self.last_rowid + 1 };
+        let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
+        let mut last = self.last_rowid;
+        let mut hit_end = true;
+        if wanted.is_empty() {
+            // Degenerate (constant) predicate: full decode + positional eval.
+            let positions: Vec<usize> = (0..n_cols).collect();
+            let sel_pred = pred;
+            bt.scan_table_range_borrowed(start, i64::MAX, |rowid, payload| {
+                if out.len() >= budget {
+                    hit_end = false;
+                    return false;
+                }
+                last = last.max(rowid);
+                if let Ok(row) =
+                    crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+                {
+                    if sel_pred.eval(&row, &positions, params) {
+                        out.push(row);
+                    }
+                }
+                true
+            })?;
+        } else {
+            wanted.sort_unstable();
+            wanted.dedup();
+            let mut positions = vec![usize::MAX; n_cols];
+            for (pos, &c) in wanted.iter().enumerate() {
+                positions[c] = pos;
+            }
+            let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
+            let sel_pred = pred;
+            bt.scan_table_range_borrowed(start, i64::MAX, |rowid, payload| {
+                if out.len() >= budget {
+                    hit_end = false;
+                    return false; // stop the walk; resume next batch
+                }
+                last = last.max(rowid);
+                if crate::storage::row_codec::decode_row_selective(
+                    payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf,
+                )
+                .is_err()
+                {
+                    return true;
+                }
+                if !sel_pred.eval(&sel_buf, &positions, params) {
+                    return true; // non-matching row: selective decode only
+                }
+                // Matching row: materialize the full row for the chain above.
+                if let Ok(row) =
+                    crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+                {
+                    out.push(row);
+                }
+                true
+            })?;
+        }
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
         Ok(out)

@@ -24,9 +24,12 @@
 use crate::error::{Error, Result};
 use std::convert::TryInto;
 
-/// Default page size. 4 KiB matches SQLite's default and is a good fit for
-/// most modern file systems and CPU caches.
-pub const DEFAULT_PAGE_SIZE: u32 = 8192;
+/// Default page size. 4 KiB matches SQLite's default (since 3.12):
+/// same page granularity means same on-disk footprint for identical
+/// workloads, and benchmarks show it equal-or-faster than 8 KiB on this
+/// engine's hot paths (fewer bytes to fault in per leaf touch, better
+/// cache locality for the leaf cache).
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
 /// Smallest allowed page size.
 pub const MIN_PAGE_SIZE: u32 = 512;
@@ -60,6 +63,11 @@ pub enum PageType {
     InteriorIndex = 0x02,
     /// Leaf index B+tree page.
     LeafIndex = 0x0A,
+    /// Overflow chain page: `[be_u32 next (0 = end of chain)] + payload
+    /// bytes`. Reached from a table-leaf cell whose payload does not fit
+    /// in-page; the cell stores a local prefix plus the first overflow
+    /// page id (SQLite overflow-chain equivalent).
+    Overflow = 0x04,
 }
 
 impl PageType {
@@ -67,6 +75,7 @@ impl PageType {
         match b {
             0x05 => Ok(PageType::InteriorTable),
             0x0D => Ok(PageType::LeafTable),
+            0x04 => Ok(PageType::Overflow),
             0x02 => Ok(PageType::InteriorIndex),
             0x0A => Ok(PageType::LeafIndex),
             _ => Err(Error::corruption(format!("invalid page type byte: {:#x}", b))),
@@ -78,7 +87,7 @@ impl PageType {
     }
 
     pub fn is_interior(&self) -> bool {
-        !self.is_leaf()
+        matches!(self, PageType::InteriorTable | PageType::InteriorIndex)
     }
 
     pub fn is_table(&self) -> bool {
@@ -252,6 +261,47 @@ impl Page {
     /// Total usable space (excluding the header and the reserved bytes at the end).
     pub fn usable_size(&self) -> u32 {
         self.page_size()
+    }
+
+    /// Initialize an empty overflow chain page. Layout: the standard
+    /// 12-byte page header (type byte = Overflow, n_cells = 0,
+    /// cell_content_start = 12), then `[be_u32 next (0 = end of chain)]`
+    /// at offset 12, with payload bytes from offset 16.
+    pub fn init_overflow(&mut self) {
+        self.set_page_type(PageType::Overflow);
+        self.set_n_cells(0);
+        self.set_cell_content_start(12);
+        self.set_right_most_pointer(0);
+        // next = 0 (end of chain)
+        let off = self.header_offset() as usize + 12;
+        self.data[off..off + 4].copy_from_slice(&0u32.to_be_bytes());
+        self.dirty = true;
+    }
+
+    /// Overflow chain: the next page id (0 = end of chain).
+    pub fn overflow_next(&self) -> PageId {
+        let off = self.header_offset() as usize + 12;
+        u32::from_be_bytes(self.data[off..off + 4].try_into().unwrap())
+    }
+
+    /// Overflow chain: set the next page id.
+    pub fn set_overflow_next(&mut self, next: PageId) {
+        let off = self.header_offset() as usize + 12;
+        self.data[off..off + 4].copy_from_slice(&next.to_be_bytes());
+        self.dirty = true;
+    }
+
+    /// Overflow chain: data region (after the 12-byte page header + 4-byte
+    /// next pointer).
+    pub fn overflow_data(&self) -> &[u8] {
+        let off = self.header_offset() as usize + 16;
+        &self.data[off..]
+    }
+
+    /// Overflow chain: mutable data region.
+    pub fn overflow_data_mut(&mut self) -> &mut [u8] {
+        let off = self.header_offset() as usize + 16;
+        &mut self.data[off..]
     }
 
     /// Initialize an empty leaf table page.

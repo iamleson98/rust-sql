@@ -384,26 +384,32 @@ fn oversize_payloads_fail_gracefully() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, t TEXT, b BLOB)", [])
         .unwrap();
-    // Far beyond any page size.
-    let r = db.execute(
-        "INSERT INTO big (t) VALUES (?)",
-        [Value::Text("x".repeat(1_048_576).into())],
-    );
-    match r {
-        Err(rustqlite::Error::InvalidArgument(msg)) => {
-            assert!(msg.contains("too big"), "unexpected message: {}", msg);
-        }
-        other => panic!("oversize TEXT must error gracefully, got {:?}", other.map(|_| ())),
+    // Overflow chains: payloads far beyond any page size are ACCEPTED
+    // (SQLite semantics — SQLITE_MAX_LENGTH is 1 GiB) and round-trip
+    // byte-exact through their spill chains.
+    let text = "x".repeat(1_048_576);
+    db.execute("INSERT INTO big (t) VALUES (?)", [Value::Text(text.into())])
+        .expect("1 MiB TEXT must be accepted via overflow chains");
+    let rows = db.query("SELECT length(t) FROM big WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(1_048_576));
+    let blob: Vec<u8> = (0u32..512 * 1024).map(|i| (i % 251) as u8).collect();
+    db.execute("INSERT INTO big (b) VALUES (?)", [Value::Blob(blob.clone())])
+        .expect("512 KiB BLOB must be accepted via overflow chains");
+    let rows = db.query("SELECT length(b) FROM big WHERE id = 2", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(512 * 1024));
+    // Byte-exact round trip through the chain.
+    let rows = db.query("SELECT b FROM big WHERE id = 2", []).unwrap();
+    match &rows[0][0] {
+        Value::Blob(got) => assert_eq!(got, &blob, "overflow blob must round-trip exactly"),
+        other => panic!("expected blob, got {other:?}"),
     }
-    let r = db.execute(
-        "INSERT INTO big (b) VALUES (?)",
-        [Value::Blob(vec![0u8; 512 * 1024])],
-    );
-    assert!(matches!(r, Err(rustqlite::Error::InvalidArgument(_))));
-    // The engine must remain fully usable after the rejections.
+    // (Beyond 1 GiB the engine rejects with a clean InvalidArgument —
+    // SQLite's SQLITE_MAX_LENGTH ceiling — verified by unit test; a runtime
+    // probe would need a 1 GiB allocation.)
+    // The engine must remain fully usable after all of the above.
     db.execute("INSERT INTO big (t) VALUES ('fine')", []).unwrap();
     let rows = db.query("SELECT COUNT(*) FROM big", []).unwrap();
-    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(1)));
+    assert_eq!(rows.first().and_then(|r| r.first()), Some(&Value::Integer(3)));
 }
 
 #[test]
@@ -424,15 +430,17 @@ fn huge_statements_and_identifiers() {
     let sql = format!("SELECT x FROM big_id_{}", long_ident);
     let rows = db.query(&sql, []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(1));
-    // A 10k identifier makes the stored CREATE statement exceed the
-    // in-page cell payload: clean error, not a panic.
+    // A 10k identifier: the stored CREATE statement exceeds one page, so
+    // it spills to an overflow chain — accepted and readable, like SQLite.
     let huge_ident = "d".repeat(10_000);
     let sql = format!("CREATE TABLE big_id_{} (x INTEGER)", huge_ident);
-    let r = db.execute(&sql, []);
-    assert!(
-        matches!(r, Err(rustqlite::Error::InvalidArgument(_))),
-        "10k identifier must be rejected gracefully"
-    );
+    db.execute(&sql, [])
+        .expect("10k identifier spills to overflow chains and must be accepted");
+    let sql = format!("INSERT INTO big_id_{} VALUES (7)", huge_ident);
+    db.execute(&sql, []).unwrap();
+    let sql = format!("SELECT x FROM big_id_{}", huge_ident);
+    let rows = db.query(&sql, []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(7));
 
     // Wide table: 500 columns at the boundary of usability.
     let cols: Vec<String> = (0..500).map(|i| format!("c{} INTEGER", i)).collect();

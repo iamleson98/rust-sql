@@ -21,6 +21,7 @@ fn main() {
     }
 
     let pager = Pager::open(path, 0).unwrap();
+    let page_size = pager.page_size();
     eprintln!("total pages = {}", pager.n_pages());
     for pid in 0..pager.n_pages() {
         let page = pager.get_page(pid).unwrap();
@@ -39,7 +40,7 @@ fn main() {
             let n = b.n_cells();
             for i in 0..n {
                 let ptr = b.cell_pointer(i) as usize;
-                let c = rustqlite::storage::btree::Cell::decode(&b.data[ptr..], pt).unwrap();
+                let c = rustqlite::storage::btree::Cell::decode(&b.data[ptr..], pt, page_size).unwrap();
                 let keyhex: String = c.index_key().iter().map(|x| format!("{:02x}", x)).collect();
                 let keytxt = if c.index_key().len() > 6 {
                     String::from_utf8_lossy(&c.index_key()[6..]).to_string()
@@ -55,7 +56,7 @@ fn main() {
             let n = b.n_cells();
             for (label, idx) in [("first", 0u16), ("last", n - 1)] {
                 let ptr = b.cell_pointer(idx) as usize;
-                let c = rustqlite::storage::btree::Cell::decode(&b.data[ptr..], pt).unwrap();
+                let c = rustqlite::storage::btree::Cell::decode(&b.data[ptr..], pt, page_size).unwrap();
                 let keytxt = if c.index_key().len() > 6 {
                     String::from_utf8_lossy(&c.index_key()[6..]).to_string()
                 } else {
@@ -67,7 +68,7 @@ fn main() {
             let mut cnt = 0;
             for i in 0..n {
                 let ptr = b.cell_pointer(i) as usize;
-                let c = rustqlite::storage::btree::Cell::decode(&b.data[ptr..], pt).unwrap();
+                let c = rustqlite::storage::btree::Cell::decode(&b.data[ptr..], pt, page_size).unwrap();
                 if c.index_key().len() > 6 && c.index_key()[6] == b'b' {
                     cnt += 1;
                 }
