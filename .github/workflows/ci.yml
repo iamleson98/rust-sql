@@ -183,7 +183,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, self-hosted]
     env:
       # A row fails when rustqlite is this much slower than SQLite (percent).
       # 5 = the project's own tie band (wins AND ties pass). 0 = strict
