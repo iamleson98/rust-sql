@@ -108,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, self-hosted]
         config: [default, sqlx, no-default]
     env:
       # Tests are correctness, not throughput: thin LTO + 16 CGU cut the
