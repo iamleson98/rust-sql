@@ -3064,15 +3064,25 @@ fn resolve_column_index_two_sides(
     None
 }
 
-fn resolve_column_index(col_names: &[String], table: Option<&str>, name: &str) -> Option<usize> {
+fn resolve_column_index<T: AsRef<str>>(
+    col_names: &[T],
+    table: Option<&str>,
+    name: &str,
+) -> Option<usize> {
     // Allocation-free: the old version built `to_ascii_lowercase()` copies
     // of the qualifier, the name, AND every candidate column name — 3+
     // heap Strings per resolution, paid per projected column per query in
-    // the join fusion paths.
+    // the join fusion paths. Generic over `AsRef<str>` so callers can pass
+    // `&[String]` OR a borrowed `Vec<&str>` combined list (the fused join
+    // avoids cloning every column String per query).
     if let Some(t) = table {
         // Qualified exact match: "table.column" (case-insensitive on both
-        // components, dot at exactly `t.len()`).
+        // components, dot at exactly `t.len()`). Runs over the WHOLE list
+        // before any unqualified fallback — the pass ORDER is what makes
+        // `b.id` resolve to the b side rather than a same-named `a.id`
+        // via the suffix pass.
         for (i, n) in col_names.iter().enumerate() {
+            let n = n.as_ref();
             if n.len() == t.len() + 1 + name.len()
                 && n.as_bytes().get(t.len()) == Some(&b'.')
                 && n[..t.len()].eq_ignore_ascii_case(t)
@@ -3085,12 +3095,13 @@ fn resolve_column_index(col_names: &[String], table: Option<&str>, name: &str) -
     }
     // Exact match first.
     for (i, n) in col_names.iter().enumerate() {
-        if n.eq_ignore_ascii_case(name) {
+        if n.as_ref().eq_ignore_ascii_case(name) {
             return Some(i);
         }
     }
     // Qualified match by suffix (e.g. "u.id" matches ref "id").
     for (i, n) in col_names.iter().enumerate() {
+        let n = n.as_ref();
         if let Some(pos) = n.rfind('.') {
             if n[pos + 1..].eq_ignore_ascii_case(name) {
                 return Some(i);
@@ -5445,6 +5456,405 @@ fn exec_join(
 /// 5. **Single-allocation combined rows.** `Vec::with_capacity(n_l+n_r)` +
 ///    two `extend_from_slice`s, instead of cloning one side wholesale into
 ///    a temporary Vec that was immediately consumed by `extend`.
+
+/// Static column list a bare `Plan::Scan` would report — without executing
+/// it. Must match `exec_scan` exactly (alias-qualified names when the
+/// effective prefix differs from the table name, the cached qualified
+/// names otherwise).
+fn scan_columns_static(
+    table: &Arc<Table>,
+    alias: &Option<String>,
+) -> std::sync::Arc<[String]> {
+    let prefix = alias.as_deref().unwrap_or(&table.name);
+    if prefix == table.name {
+        table.qualified_col_names.clone()
+    } else {
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect::<Vec<String>>()
+            .into()
+    }
+}
+
+/// Fused streaming hash join for the OLTP-canonical shape:
+/// `INNER JOIN` + single equi-key + both sides bare table scans + all-bare
+/// column projection. See `exec_hash_join`'s fused-path comment.
+///
+/// Returns `Ok(None)` whenever the shape or the data doesn't qualify (the
+/// caller falls back to the materialized hash join — never an error, just
+/// a different cost profile for the SAME semantics).
+fn try_fused_scan_hash_join(
+    ctx: &mut ExecContext<'_>,
+    left: &Plan,
+    right: &Plan,
+    condition: &Option<Expr>,
+    projection: Option<&[crate::planner::plan::ProjectExpr]>,
+) -> Result<Option<ExecResult>> {
+    // ---- Shape gates -------------------------------------------------
+    let (l_table, l_alias) = match left {
+        Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } if table.vtab.is_none() => (table, alias),
+        _ => return Ok(None),
+    };
+    let (r_table, r_alias) = match right {
+        Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } if table.vtab.is_none() => (table, alias),
+        _ => return Ok(None),
+    };
+    let columns = match projection {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    // Static column lists (identical to what exec_scan reports).
+    let l_cols = scan_columns_static(l_table, l_alias);
+    let r_cols = scan_columns_static(r_table, r_alias);
+    let n_left = l_cols.len();
+    // Single pure equi-join key.
+    let eq_pairs = extract_equi_join_keys(condition, &l_cols, &r_cols);
+    if eq_pairs.len() != 1 {
+        return Ok(None);
+    }
+    let pure_equi = matches!(
+        count_eq_leaves_and_purity(condition, &l_cols, &r_cols),
+        Some(n) if n == 1
+    );
+    if !pure_equi {
+        return Ok(None);
+    }
+    let (l_key, r_key) = eq_pairs[0];
+
+    // ---- Projection resolution (bare columns only) --------------------
+    // Combined column list as BORROWED strings (left then right — exactly
+    // the layout the materialized path's combined list has). One small
+    // Vec<&str>, no per-column String clones. Resolution pass ORDER
+    // (qualified-exact across both sides BEFORE any suffix fallback) is
+    // what makes `b.id` resolve to the b side, not a same-named `a.id`.
+    let combined: Vec<&str> = l_cols
+        .iter()
+        .map(|s| s.as_str())
+        .chain(r_cols.iter().map(|s| s.as_str()))
+        .collect();
+    let mut out_combined: Vec<usize> = Vec::with_capacity(columns.len());
+    let mut out_names: Vec<String> = Vec::with_capacity(columns.len());
+    for c in columns {
+        match &c.expr {
+            Expr::Column { table, name } => {
+                match resolve_column_index(&combined, table.as_deref(), name) {
+                    Some(p) => {
+                        out_combined.push(p);
+                        out_names.push(match &c.alias {
+                            Some(a) => a.clone(),
+                            None => expr_display_name(&c.expr),
+                        });
+                    }
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None), // non-bare projection: materialized path
+        }
+    }
+
+    // ---- Side selection (smaller side builds) --------------------------
+    // Per side: table, wanted-column count, local join-key index, live
+    // root, row count (a pure n_cells walk — no payload decode).
+    struct JoinSide {
+        table: Arc<Table>,
+        n_cols: usize,
+        key_local: usize,
+        root: u32,
+        count: usize,
+    }
+    let pager = ctx.pager;
+    let side = |t: &Arc<Table>, a: &Option<String>, key: usize| -> Result<JoinSide> {
+        let root = ctx.table_root(t);
+        let count = Btree::new(pager, root, false).count_rows()? as usize;
+        let n_cols = scan_columns_static(t, a).len();
+        Ok(JoinSide {
+            table: Arc::clone(t),
+            n_cols,
+            key_local: key,
+            root,
+            count,
+        })
+    };
+    let l_side = side(l_table, l_alias, l_key)?;
+    let r_side = side(r_table, r_alias, r_key)?;
+    let (build, probe) = if l_side.count <= r_side.count {
+        (l_side, r_side)
+    } else {
+        (r_side, l_side)
+    };
+
+    // ---- Decode plans ---------------------------------------------------
+    // Per output column: (is_build_side, position in that side's decode
+    // buffer) — packed into ONE struct per column so the emit loop loads
+    // a single cache line per output slot.
+    struct OutSlot {
+        from_build: bool,
+        pos: usize,
+    }
+    let build_is_left = Arc::ptr_eq(&build.table, l_table);
+    let mut out_side_build: Vec<bool> = Vec::with_capacity(out_combined.len());
+    let mut out_local: Vec<usize> = Vec::with_capacity(out_combined.len());
+    for &p in &out_combined {
+        let from_left = p < n_left;
+        out_side_build.push(from_left == build_is_left);
+        out_local.push(if from_left { p } else { p - n_left });
+    }
+    // Build side wanted columns: key + every build-side projected local.
+    // Sorted + deduplicated so `decode_row_selective` takes its
+    // allocation-free ascending path (an unsorted list costs a
+    // permutation Vec allocation PER ROW).
+    let mut build_wanted: Vec<usize> = vec![build.key_local];
+    for (i, &is_build) in out_side_build.iter().enumerate() {
+        if is_build {
+            build_wanted.push(out_local[i]);
+        }
+    }
+    build_wanted.sort_unstable();
+    build_wanted.dedup();
+    let build_key_pos = build_wanted
+        .iter()
+        .position(|&c| c == build.key_local)
+        .unwrap_or(0);
+    // Probe side: same construction.
+    let mut probe_wanted: Vec<usize> = vec![probe.key_local];
+    for (i, &is_build) in out_side_build.iter().enumerate() {
+        if !is_build {
+            probe_wanted.push(out_local[i]);
+        }
+    }
+    probe_wanted.sort_unstable();
+    probe_wanted.dedup();
+    let probe_key_pos = probe_wanted
+        .iter()
+        .position(|&c| c == probe.key_local)
+        .unwrap_or(0);
+    // Position of each output column's value inside its side's decode
+    // buffer, packed with the side flag for the emit loop.
+    let out_slots: Vec<OutSlot> = out_side_build
+        .iter()
+        .zip(out_local.iter())
+        .map(|(&is_build, &local)| {
+            if is_build {
+                OutSlot {
+                    from_build: true,
+                    pos: build_wanted.iter().position(|&c| c == local).unwrap_or(0),
+                }
+            } else {
+                OutSlot {
+                    from_build: false,
+                    pos: probe_wanted.iter().position(|&c| c == local).unwrap_or(0),
+                }
+            }
+        })
+        .collect();
+    let stride = build_wanted.len();
+
+    // ---- BUILD: stream scan + selective decode + SoA store --------------
+    // build_vals: build.count * stride Values (ONE allocation); one
+    // u32 ordinal per build row; chain: ordinal -> next ordinal with the
+    // same key (u32::MAX = end).
+    //
+    // The key -> head-ordinal index is a small OPEN-ADDRESSING table with
+    // multiplicative (Fibonacci) hashing and linear probing. Join keys are
+    // IEEE-754 order keys of small integers — their mantissa lives in the
+    // HIGH bits and the low ~43 bits are ZERO, so any hash that relies on
+    // low bits (FxHash — measured clustering 1000 keys into ~16 buckets,
+    // 142 ns/insert) degrades to linear scans. Taking the TOP log2(cap)
+    // bits of key * PHI spreads monotone keys uniformly (~5 ns/op, faster
+    // than std's SipHash at ~15 ns/op).
+    let n_build = build.count;
+    let mut build_vals: Vec<Value> =
+        Vec::with_capacity(n_build.saturating_mul(stride).max(1));
+    let mut chain: Vec<u32> = vec![u32::MAX; n_build];
+    // Capacity: next power of two >= 2 * n_build (load factor <= 0.5 —
+    // probe chains stay ~1.3 slots on average, and an empty slot always
+    // exists so the linear probe terminates).
+    let table_cap = (n_build.max(1)).next_power_of_two() << 1;
+    let table_mask = table_cap.wrapping_sub(1) as usize;
+    // Top-bits shift for multiplicative hashing (see the comment above).
+    let hash_shift = 64 - table_cap.trailing_zeros();
+    #[inline]
+    fn key_slot(k: u64, shift: u32, mask: usize) -> usize {
+        ((k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize) & mask
+    }
+    // One (key, head) pair per slot — a single cache-line load per probe
+    // (two parallel arrays would cost two dependent loads). key == u64::MAX
+    // marks an empty slot; a real key can never be u64::MAX (order keys of
+    // finite doubles / |i| <= 2^53 integers never reach it, and NaN decodes
+    // as NULL which skips the build entirely).
+    #[derive(Clone, Copy)]
+    struct JoinSlot {
+        key: u64,
+        head: u32,
+    }
+    const EMPTY_SLOT: JoinSlot = JoinSlot {
+        key: u64::MAX,
+        head: u32::MAX,
+    };
+    let mut slots: Vec<JoinSlot> = vec![EMPTY_SLOT; table_cap];
+    let mut aborted = false;
+    let mut stored: usize = 0;
+    let mut buf: Vec<Value> = Vec::new();
+    let build_alias = build.table.rowid_alias;
+    let probe_alias = probe.table.rowid_alias;
+    {
+        let mut bt = Btree::new(pager, build.root, false);
+        bt.scan_table_borrowed(|rowid, payload| {
+            if crate::storage::row_codec::decode_row_selective(
+                payload,
+                build.n_cols,
+                &build_wanted,
+                rowid,
+                build_alias,
+                &mut buf,
+            )
+            .is_err()
+            {
+                return true; // corrupt row: skip (matches exec_scan)
+            }
+            let k = match buf.get(build_key_pos) {
+                Some(Value::Integer(i)) => {
+                    // Same 2^53 gate as the materialized path's u64_mode:
+                    // beyond it, i as f64 rounds and keys could collide.
+                    if i.unsigned_abs() > (1u64 << 53) {
+                        aborted = true;
+                        return false;
+                    }
+                    crate::types::value::double_order_key(*i as f64)
+                }
+                Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
+                // NULL build keys never match anything (INNER join: skip);
+                // TEXT/BLOB build keys need the byte-key path.
+                Some(Value::Null) => return true,
+                _ => {
+                    aborted = true;
+                    return false;
+                }
+            };
+            // count_rows under-counted (corrupt page metadata) or the
+            // tree grew mid-scan: fall back to the materialized path
+            // rather than indexing past the pre-sized buffers.
+            if stored >= n_build {
+                aborted = true;
+                return false;
+            }
+            let ord = stored as u32;
+            stored += 1;
+            for v in buf.iter() {
+                build_vals.push(v.clone());
+            }
+            // Open-addressing insert: find the key's slot (match = bucket
+            // chain prepend; empty slot = new head). Load factor <= 0.5
+            // (table_cap >= 2 * n_build >= 2 * stored) guarantees an empty
+            // slot exists, so the probe always terminates.
+            let mut slot = key_slot(k, hash_shift, table_mask);
+            loop {
+                let existing = slots[slot].key;
+                if existing == u64::MAX {
+                    slots[slot] = JoinSlot { key: k, head: ord };
+                    break;
+                }
+                if existing == k {
+                    chain[ord as usize] = slots[slot].head;
+                    slots[slot].head = ord;
+                    break;
+                }
+                slot = (slot + 1) & table_mask;
+            }
+            true
+        })?;
+    }
+    if aborted {
+        return Ok(None);
+    }
+
+    // ---- PROBE: stream scan + selective decode + emit -------------------
+    let n_out = out_combined.len();
+    let mut out_rows: Vec<Row> = Vec::with_capacity(probe.count.max(1));
+    let mut pbuf: Vec<Value> = Vec::new();
+    {
+        let mut bt = Btree::new(pager, probe.root, false);
+        bt.scan_table_borrowed(|rowid, payload| {
+            if crate::storage::row_codec::decode_row_selective(
+                payload,
+                probe.n_cols,
+                &probe_wanted,
+                rowid,
+                probe_alias,
+                &mut pbuf,
+            )
+            .is_err()
+            {
+                return true; // corrupt row: skip
+            }
+            let k = match pbuf.get(probe_key_pos) {
+                Some(Value::Integer(i)) => {
+                    // Mirrors the materialized path exactly (no 2^53 gate
+                    // on probe keys): identical match semantics either way.
+                    crate::types::value::double_order_key(*i as f64)
+                }
+                Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
+                // NULL / TEXT / BLOB probe keys cannot equal the
+                // all-numeric build keys: no match, next row.
+                _ => return true,
+            };
+            let mut next = {
+                // Open-addressing lookup: probe until an empty slot (no
+                // match) or the exact key.
+                let mut slot = key_slot(k, hash_shift, table_mask);
+                loop {
+                    let existing = slots[slot].key;
+                    if existing == u64::MAX {
+                        break u32::MAX;
+                    }
+                    if existing == k {
+                        break slots[slot].head;
+                    }
+                    slot = (slot + 1) & table_mask;
+                }
+            };
+            while next != u32::MAX {
+                let ord = next as usize;
+                let mut out: Row = Vec::with_capacity(n_out);
+                for s in &out_slots {
+                    let v = if s.from_build {
+                        // (ord + 1) rows of `stride` values each are
+                        // resident — bounds are structural.
+                        &build_vals[ord * stride + s.pos]
+                    } else {
+                        &pbuf[s.pos]
+                    };
+                    out.push(v.clone());
+                }
+                out_rows.push(out);
+                next = chain[ord];
+            }
+            true
+        })?;
+    }
+
+    let columns_out: std::sync::Arc<[String]> = out_names.into();
+    Ok(Some(ExecResult {
+        columns: columns_out,
+        rows: out_rows,
+    }))
+}
+
 fn exec_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -5453,6 +5863,23 @@ fn exec_hash_join(
     condition: &Option<Expr>,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
 ) -> Result<ExecResult> {
+    // ---- FUSED STREAMING PATH ----
+    // INNER equi-join of two bare table scans under a bare-column
+    // projection: stream both sides straight off their B+trees with
+    // selective decode into reusable buffers — neither side is ever
+    // materialized as `Vec<Row>` (which costs one heap allocation per row
+    // plus a full-width decode), the build side's projected values live in
+    // one SoA allocation, and the key index is an open-addressing
+    // Fibonacci-hashed table (~5 ns per op). Returns Ok(None) on any
+    // shape or value the fast path doesn't cover; the materialized path
+    // below is then 100% in charge (same semantics, different cost
+    // profile).
+    if projection.is_some() && matches!(join_type, crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross)
+    {
+        if let Some(res) = try_fused_scan_hash_join(ctx, left, right, condition, projection)? {
+            return Ok(res);
+        }
+    }
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
     let mut combined_cols: Vec<String> = left_res.columns.to_vec();
