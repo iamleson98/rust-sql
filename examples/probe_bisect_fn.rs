@@ -28,7 +28,7 @@ fn query_first_point(db: &mut Database) -> std::time::Duration {
 fn main() {
     // variant A: storm, then timed query — direct code (bisect style)
     {
-        let mut db = fresh_db();
+        let db = fresh_db();
         let d = {
             let t0 = Instant::now();
             let _ = db.query("SELECT name, val, score FROM t WHERE id = ?", [Value::Integer(1)]).unwrap();
@@ -44,7 +44,7 @@ fn main() {
     }
     // variant C: storm in a function, query direct
     {
-        let mut db = fresh_db();
+        let db = fresh_db();
         let t0 = Instant::now();
         let _ = db.query("SELECT name, val, score FROM t WHERE id = ?", [Value::Integer(1)]).unwrap();
         println!("C storm-fn, direct:  {:>7.1} µs", t0.elapsed().as_secs_f64() * 1e6);

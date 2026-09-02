@@ -24,7 +24,9 @@ fn diff_query(setup: &[&str], query: &str) {
                 let mut stmt = conn.prepare(s).unwrap();
                 let _ = stmt.query([]).unwrap();
             }
-            other => { other.unwrap(); }
+            other => {
+                other.unwrap();
+            }
         }
     }
     let ours = db
@@ -43,7 +45,9 @@ fn diff_query(setup: &[&str], query: &str) {
                     rusqlite::types::ValueRef::Null => "NULL".to_string(),
                     rusqlite::types::ValueRef::Integer(v) => format!("I:{v}"),
                     rusqlite::types::ValueRef::Real(v) => format!("R:{v}"),
-                    rusqlite::types::ValueRef::Text(t) => format!("T:{}", String::from_utf8_lossy(t)),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        format!("T:{}", String::from_utf8_lossy(t))
+                    }
                     rusqlite::types::ValueRef::Blob(b) => format!("B:{}", b.len()),
                 };
                 row.push(v);
@@ -261,8 +265,10 @@ fn foreign_key_list_no_fks() {
 
 #[test]
 fn journal_mode_write_returns_row() {
-    let mut db = Database::open_in_memory().unwrap();
-    let res = db.query_with_columns("PRAGMA journal_mode=WAL", []).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let res = db
+        .query_with_columns("PRAGMA journal_mode=WAL", [])
+        .unwrap();
     assert_eq!(res.0, vec!["journal_mode".to_string()]);
     assert_eq!(res.1.len(), 1);
     match &res.1[0][0] {
@@ -279,7 +285,7 @@ fn journal_mode_write_returns_row() {
 
 #[test]
 fn journal_mode_call_form_writes() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let res = db.query("PRAGMA journal_mode(WAL)", []).unwrap();
     assert_eq!(res.len(), 1);
     match &res[0][0] {
@@ -359,7 +365,6 @@ fn pragma_table_info_through_prepared_statement() {
     );
 }
 
-
 /// Run identical SQL programs on both engines (each statement via
 /// execute), then compare a final query — used for transaction-mode and
 /// write-pragma round-trip programs.
@@ -386,7 +391,8 @@ fn diff_program(setup: &[&str], program: &[&str], check: &str) {
                 (Err(e), Err(te)) => {
                     let (o, t) = (e.to_string(), te.to_string());
                     assert!(
-                        o.starts_with(&t[..t.len().min(30)]) || t.starts_with(&o[..o.len().min(30)]),
+                        o.starts_with(&t[..t.len().min(30)])
+                            || t.starts_with(&o[..o.len().min(30)]),
                         "error mismatch on {s}\n  rustqlite: {o}\n  sqlite:   {t}"
                     );
                 }
@@ -411,12 +417,12 @@ fn locking_mode_write_returns_new_mode() {
 #[test]
 fn locking_mode_round_trip() {
     // Write -> read back -> reset -> read back.
+    diff_query(&["PRAGMA locking_mode = EXCLUSIVE"], "PRAGMA locking_mode");
     diff_query(
-        &["PRAGMA locking_mode = EXCLUSIVE"],
-        "PRAGMA locking_mode",
-    );
-    diff_query(
-        &["PRAGMA locking_mode = EXCLUSIVE", "PRAGMA locking_mode = NORMAL"],
+        &[
+            "PRAGMA locking_mode = EXCLUSIVE",
+            "PRAGMA locking_mode = NORMAL",
+        ],
         "PRAGMA locking_mode",
     );
 }

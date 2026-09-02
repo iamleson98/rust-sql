@@ -23,7 +23,7 @@ fn fresh_db() -> Database {
 fn main() {
     // tap-then-query FIRST in the process (cold everything)
     {
-        let mut db = fresh_db();
+        let db = fresh_db();
         let t0 = Instant::now();
         let mut sink: Vec<Vec<u8>> = Vec::with_capacity(64);
         for i in 0..64u32 {
@@ -37,7 +37,7 @@ fn main() {
     }
     // now warm — repeat
     {
-        let mut db = fresh_db();
+        let db = fresh_db();
         let t0 = Instant::now();
         let mut sink: Vec<Vec<u8>> = Vec::with_capacity(64);
         for i in 0..64u32 {

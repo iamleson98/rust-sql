@@ -20,7 +20,7 @@ fn fresh_db() -> Database {
 }
 
 fn drain(n: usize) -> (std::time::Duration, std::time::Duration) {
-    let mut db = fresh_db();
+    let db = fresh_db();
     let t0 = Instant::now();
     let mut sink: Vec<Vec<u8>> = Vec::with_capacity(n);
     for i in 0..n {
@@ -35,7 +35,7 @@ fn drain(n: usize) -> (std::time::Duration, std::time::Duration) {
 fn main() {
     // warm the process code paths first with a throwaway db+query
     {
-        let mut db = fresh_db();
+        let db = fresh_db();
         let _ = db.query("SELECT name, val, score FROM t WHERE id = ?", [Value::Integer(1)]).unwrap();
     }
     for n in [0usize, 64, 512, 4096, 32768] {

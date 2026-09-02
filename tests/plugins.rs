@@ -2,9 +2,12 @@
 //! collations, virtual tables (read + writable), and page codecs —
 //! the static Rust registration path (`Database::create_*`).
 
-use rustqlite::plugin::vtab::{IndexInfo, ModuleCaps, UpdateOp, VtabConstraint, VirtualTable, VirtualTableCursor, VirtualTableModule, VtabConstraintOp};
 use rustqlite::plugin::codec::XorCodec;
-use rustqlite::plugin::{AggregateFunction, AggCtx, AggState, Collation, FnCtx, ScalarFunction};
+use rustqlite::plugin::vtab::{
+    IndexInfo, ModuleCaps, UpdateOp, VirtualTable, VirtualTableCursor, VirtualTableModule,
+    VtabConstraint, VtabConstraintOp,
+};
+use rustqlite::plugin::{AggCtx, AggState, AggregateFunction, Collation, FnCtx, ScalarFunction};
 use rustqlite::types::Value;
 use rustqlite::{Database, StepResult};
 use std::cmp::Ordering;
@@ -45,7 +48,9 @@ fn scalar_function_basic() {
     let rows = db.query("SELECT rot13('hello')", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "uryyb");
     // Double application round-trips.
-    let rows = db.query("SELECT rot13(rot13('Uryyb, Jbeyq!'))", []).unwrap();
+    let rows = db
+        .query("SELECT rot13(rot13('Uryyb, Jbeyq!'))", [])
+        .unwrap();
     assert_eq!(rows[0][0].as_text(), "Uryyb, Jbeyq!");
 }
 
@@ -54,11 +59,17 @@ fn scalar_function_in_where_and_with_params() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_function(Rot13).unwrap();
     db.execute("CREATE TABLE t (word TEXT)", []).unwrap();
-    db.execute("INSERT INTO t (word) VALUES ('apple'), ('uryyb'), ('banana')", [])
-        .unwrap();
+    db.execute(
+        "INSERT INTO t (word) VALUES ('apple'), ('uryyb'), ('banana')",
+        [],
+    )
+    .unwrap();
     // rot13('hello') = 'uryyb' — the WHERE clause finds it.
     let rows = db
-        .query("SELECT word FROM t WHERE word = rot13(?)", vec![Value::Text("hello".into())])
+        .query(
+            "SELECT word FROM t WHERE word = rot13(?)",
+            vec![Value::Text("hello".into())],
+        )
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_text(), "uryyb");
@@ -141,7 +152,8 @@ fn aggregate_median_ungrouped() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_aggregate(Median).unwrap();
     db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (2), (3), (4), (100)", []).unwrap();
+    db.execute("INSERT INTO t (x) VALUES (1), (2), (3), (4), (100)", [])
+        .unwrap();
     let rows = db.query("SELECT median(x) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_real(), 3.0);
 }
@@ -150,20 +162,25 @@ fn aggregate_median_ungrouped() {
 fn aggregate_median_grouped_and_empty() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_aggregate(Median).unwrap();
-    db.execute("CREATE TABLE t (g TEXT, x INTEGER)", []).unwrap();
+    db.execute("CREATE TABLE t (g TEXT, x INTEGER)", [])
+        .unwrap();
     db.execute(
         "INSERT INTO t (g, x) VALUES ('a', 1), ('a', 2), ('a', 100), ('b', 10), ('b', 20)",
         [],
     )
     .unwrap();
-    let rows = db.query("SELECT g, median(x) FROM t GROUP BY g ORDER BY g", []).unwrap();
+    let rows = db
+        .query("SELECT g, median(x) FROM t GROUP BY g ORDER BY g", [])
+        .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0].as_text(), "a");
     assert_eq!(rows[0][1].as_real(), 2.0);
     assert_eq!(rows[1][1].as_real(), 15.0);
 
     // Empty input with no GROUP BY → one row (SQLite semantics).
-    let rows = db.query("SELECT median(x) FROM t WHERE g = 'zzz'", []).unwrap();
+    let rows = db
+        .query("SELECT median(x) FROM t WHERE g = 'zzz'", [])
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0][0].is_null());
 }
@@ -173,8 +190,11 @@ fn aggregate_mixed_with_builtin() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_aggregate(Median).unwrap();
     db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", []).unwrap();
-    let rows = db.query("SELECT count(*), median(x), sum(x) FROM t", []).unwrap();
+    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", [])
+        .unwrap();
+    let rows = db
+        .query("SELECT count(*), median(x), sum(x) FROM t", [])
+        .unwrap();
     assert_eq!(rows[0][0].as_integer(), 3);
     assert_eq!(rows[0][1].as_real(), 2.0);
     assert_eq!(rows[0][2].as_integer(), 6);
@@ -207,21 +227,21 @@ fn nocase_builtin_order_by() {
 
 #[test]
 fn nocase_comparison_operators() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let rows = db
         .query("SELECT 'HELLO' = 'hello' COLLATE NOCASE", [])
         .unwrap();
     assert_eq!(rows[0][0].as_integer(), 1);
-    let rows = db.query("SELECT 'HELLO' < 'hello' COLLATE NOCASE", []).unwrap();
+    let rows = db
+        .query("SELECT 'HELLO' < 'hello' COLLATE NOCASE", [])
+        .unwrap();
     assert_eq!(rows[0][0].as_integer(), 0);
 }
 
 #[test]
 fn rtrim_collation() {
-    let mut db = Database::open_in_memory().unwrap();
-    let rows = db
-        .query("SELECT 'ab  ' = 'ab' COLLATE RTRIM", [])
-        .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let rows = db.query("SELECT 'ab  ' = 'ab' COLLATE RTRIM", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 1);
 }
 
@@ -242,10 +262,16 @@ fn custom_collation_registration() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_collation(ReverseColl).unwrap();
     db.execute("CREATE TABLE t (w TEXT)", []).unwrap();
-    db.execute("INSERT INTO t (w) VALUES ('ab'), ('ba'), ('ca'), ('ac')", []).unwrap();
+    db.execute(
+        "INSERT INTO t (w) VALUES ('ab'), ('ba'), ('ca'), ('ac')",
+        [],
+    )
+    .unwrap();
     // REVERSE sorts by the reversed string: ab->ba, ba->ab, ca->ac, ac->ca
     // order: ab(ba), ac(ca), ba(ab), ca(ac).
-    let rows = db.query("SELECT w FROM t ORDER BY w COLLATE REVERSE", []).unwrap();
+    let rows = db
+        .query("SELECT w FROM t ORDER BY w COLLATE REVERSE", [])
+        .unwrap();
     let got: Vec<String> = rows.iter().map(|r| r[0].as_text()).collect();
     assert_eq!(got, vec!["ba", "ca", "ab", "ac"]);
 }
@@ -281,7 +307,10 @@ struct SeriesTable {
 
 impl VirtualTable for SeriesTable {
     fn columns(&self) -> Vec<(String, String)> {
-        vec![("n".into(), "INTEGER".into()), ("label".into(), "TEXT".into())]
+        vec![
+            ("n".into(), "INTEGER".into()),
+            ("label".into(), "TEXT".into()),
+        ]
     }
 
     fn best_index(&self, constraints: &[VtabConstraint]) -> rustqlite::Result<IndexInfo> {
@@ -316,7 +345,12 @@ struct SeriesCursor {
 }
 
 impl VirtualTableCursor for SeriesCursor {
-    fn filter(&mut self, idx_num: usize, _idx_str: Option<&str>, args: &[Value]) -> rustqlite::Result<()> {
+    fn filter(
+        &mut self,
+        idx_num: usize,
+        _idx_str: Option<&str>,
+        args: &[Value],
+    ) -> rustqlite::Result<()> {
         self.current = 0;
         if idx_num == 1 {
             if let Some(v) = args.first() {
@@ -347,7 +381,8 @@ impl VirtualTableCursor for SeriesCursor {
 fn vtab_scan_and_projection() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(SeriesModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE s USING series(5)", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE s USING series(5)", [])
+        .unwrap();
     let rows = db.query("SELECT n FROM s", []).unwrap();
     let got: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
     assert_eq!(got, vec![0, 1, 2, 3, 4, 5]);
@@ -362,16 +397,24 @@ fn vtab_scan_and_projection() {
 fn vtab_with_rows_and_join() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(SeriesModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE s USING series(3)", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE s USING series(3)", [])
+        .unwrap();
     // WHERE with residual + handled constraints.
-    let rows = db.query("SELECT n FROM s WHERE n >= 2 AND label <> 'x'", []).unwrap();
+    let rows = db
+        .query("SELECT n FROM s WHERE n >= 2 AND label <> 'x'", [])
+        .unwrap();
     let got: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
     assert_eq!(got, vec![2, 3]);
     // Joins treat the vtab like any table.
-    db.execute("CREATE TABLE m (k INTEGER, v TEXT)", []).unwrap();
-    db.execute("INSERT INTO m (k, v) VALUES (1, 'one'), (2, 'two')", []).unwrap();
+    db.execute("CREATE TABLE m (k INTEGER, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO m (k, v) VALUES (1, 'one'), (2, 'two')", [])
+        .unwrap();
     let rows = db
-        .query("SELECT s.n, m.v FROM s JOIN m ON s.n = m.k ORDER BY s.n", [])
+        .query(
+            "SELECT s.n, m.v FROM s JOIN m ON s.n = m.k ORDER BY s.n",
+            [],
+        )
         .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][1].as_text(), "one");
@@ -386,8 +429,11 @@ fn vtab_if_not_exists_and_namespace_conflict() {
         .execute("CREATE VIRTUAL TABLE taken USING series(2)", [])
         .unwrap_err();
     assert!(err.to_string().contains("already exists"));
-    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS taken USING series(2)", [])
-        .unwrap(); // no error
+    db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS taken USING series(2)",
+        [],
+    )
+    .unwrap(); // no error
 }
 
 #[test]
@@ -403,7 +449,8 @@ fn vtab_create_without_module_fails() {
 fn vtab_drop_table() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(SeriesModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE s USING series(2)", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE s USING series(2)", [])
+        .unwrap();
     db.execute("DROP TABLE s", []).unwrap();
     let err = db.query("SELECT * FROM s", []).unwrap_err();
     assert!(err.to_string().contains("table"));
@@ -416,12 +463,10 @@ fn vtab_persist_and_reconnect_via_create_module() {
     {
         let mut db = Database::open(&path).unwrap();
         db.create_module(SeriesModule).unwrap();
-        db.execute("CREATE VIRTUAL TABLE s USING series(4)", []).unwrap();
-        db.execute(
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY, x INTEGER)",
-            [],
-        )
-        .unwrap();
+        db.execute("CREATE VIRTUAL TABLE s USING series(4)", [])
+            .unwrap();
+        db.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, x INTEGER)", [])
+            .unwrap();
         db.execute("INSERT INTO plain (x) VALUES (10)", []).unwrap();
     }
     // Reopen WITHOUT the module: the schema row loads as a PENDING vtab
@@ -537,7 +582,12 @@ struct KvCursor {
 }
 
 impl VirtualTableCursor for KvCursor {
-    fn filter(&mut self, idx_num: usize, _s: Option<&str>, args: &[Value]) -> rustqlite::Result<()> {
+    fn filter(
+        &mut self,
+        idx_num: usize,
+        _s: Option<&str>,
+        args: &[Value],
+    ) -> rustqlite::Result<()> {
         if idx_num == 2 {
             if let Some(v) = args.first() {
                 let k = v.as_text();
@@ -569,12 +619,14 @@ impl VirtualTableCursor for KvCursor {
 fn vtab_insert_update_delete() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(KvModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE kvstore USING kv()", []).unwrap();
-    db.execute("INSERT INTO kvstore (k, v) VALUES ('a', '1'), ('b', '2')", [])
+    db.execute("CREATE VIRTUAL TABLE kvstore USING kv()", [])
         .unwrap();
-    let rows = db
-        .query("SELECT k, v FROM kvstore ORDER BY k", [])
-        .unwrap();
+    db.execute(
+        "INSERT INTO kvstore (k, v) VALUES ('a', '1'), ('b', '2')",
+        [],
+    )
+    .unwrap();
+    let rows = db.query("SELECT k, v FROM kvstore ORDER BY k", []).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][1].as_text(), "1");
 
@@ -584,7 +636,8 @@ fn vtab_insert_update_delete() {
     assert_eq!(rows[0][0].as_text(), "2");
 
     // UPDATE via xUpdate.
-    db.execute("UPDATE kvstore SET v = '20' WHERE k = 'b'", []).unwrap();
+    db.execute("UPDATE kvstore SET v = '20' WHERE k = 'b'", [])
+        .unwrap();
     let rows = db.query("SELECT v FROM kvstore WHERE k = 'b'", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "20");
 
@@ -594,7 +647,8 @@ fn vtab_insert_update_delete() {
     assert_eq!(rows.len(), 1);
 
     // Upsert-style reinsert.
-    db.execute("INSERT INTO kvstore (k, v) VALUES ('b', '99')", []).unwrap();
+    db.execute("INSERT INTO kvstore (k, v) VALUES ('b', '99')", [])
+        .unwrap();
     let rows = db.query("SELECT v FROM kvstore", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "99");
 }
@@ -603,7 +657,8 @@ fn vtab_insert_update_delete() {
 fn vtab_readonly_module_rejects_writes() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(SeriesModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE s USING series(2)", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE s USING series(2)", [])
+        .unwrap();
     let err = db.execute("INSERT INTO s (n) VALUES (5)", []).unwrap_err();
     assert!(err.to_string().contains("read-only"));
 }
@@ -612,8 +667,11 @@ fn vtab_readonly_module_rejects_writes() {
 fn vtab_aggregate_over_scan() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(SeriesModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE s USING series(10)", []).unwrap();
-    let rows = db.query("SELECT count(*), sum(n), min(n), max(n) FROM s", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE s USING series(10)", [])
+        .unwrap();
+    let rows = db
+        .query("SELECT count(*), sum(n), min(n), max(n) FROM s", [])
+        .unwrap();
     assert_eq!(rows[0][0].as_integer(), 11);
     assert_eq!(rows[0][1].as_integer(), 55);
     assert_eq!(rows[0][2].as_integer(), 0);
@@ -624,7 +682,8 @@ fn vtab_aggregate_over_scan() {
 fn vtab_through_streaming_statement() {
     let mut db = Database::open_in_memory().unwrap();
     db.create_module(SeriesModule).unwrap();
-    db.execute("CREATE VIRTUAL TABLE s USING series(100)", []).unwrap();
+    db.execute("CREATE VIRTUAL TABLE s USING series(100)", [])
+        .unwrap();
     let mut stmt = db.prepare("SELECT n FROM s").unwrap();
     let mut count = 0;
     let mut last = -1;
@@ -685,7 +744,8 @@ fn codec_wrong_key_rejected() {
         db.create_codec(XorCodec::new(0x5A)).unwrap();
         db.execute("PRAGMA codec = xor", []).unwrap();
         db.execute("CREATE TABLE t (x TEXT)", []).unwrap();
-        db.execute("INSERT INTO t (x) VALUES ('hello')", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES ('hello')", [])
+            .unwrap();
         db.flush().unwrap();
     }
     // The codec NAME matches ("xor"), so the marker check passes — the

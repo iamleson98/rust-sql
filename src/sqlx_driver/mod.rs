@@ -105,7 +105,9 @@ use futures_core::stream::BoxStream;
 use futures_util::{future, stream, FutureExt, StreamExt};
 use log::LevelFilter;
 
-use sqlx_core::connection::{Connection as SqlxConnection, ConnectOptions as SqlxConnectOptions, LogSettings};
+use sqlx_core::connection::{
+    ConnectOptions as SqlxConnectOptions, Connection as SqlxConnection, LogSettings,
+};
 use sqlx_core::database::Database as SqlxDatabase;
 use sqlx_core::error::Error as SqlxError;
 use sqlx_core::executor::{Execute, Executor as SqlxExecutor};
@@ -124,13 +126,15 @@ mod types;
 
 pub use error::RustqliteError;
 pub use statement::{RustqliteColumn, RustqliteQueryResult, RustqliteRow, RustqliteStatement};
-pub use types::{DataType, RustqliteArguments, RustqliteTypeInfo, RustqliteValue, RustqliteValueRef};
+pub use types::{
+    DataType, RustqliteArguments, RustqliteTypeInfo, RustqliteValue, RustqliteValueRef,
+};
 
 // Re-export the generic sqlx-core API so this driver can be used without
 // depending on the `sqlx` facade crate.
 pub use sqlx_core::acquire::Acquire;
 pub use sqlx_core::column::ColumnIndex;
-pub use sqlx_core::connection::{Connection, ConnectOptions};
+pub use sqlx_core::connection::{ConnectOptions, Connection};
 pub use sqlx_core::error::Error;
 pub use sqlx_core::executor::Executor;
 pub use sqlx_core::from_row::FromRow;
@@ -455,13 +459,14 @@ impl RustqliteConnection {
     /// while a foreign transaction with uncommitted writes is open so
     /// readers never observe dirty state. Read-only foreign transactions
     /// never block readers.
-    fn acquire_read(
-        &self,
-    ) -> Result<parking_lot::RwLockReadGuard<'_, Engine>, SqlxError> {
+    fn acquire_read(&self) -> Result<parking_lot::RwLockReadGuard<'_, Engine>, SqlxError> {
         let deadline = std::time::Instant::now() + self.busy_timeout;
         loop {
             let db = self.shared.db.read();
-            if !self.shared.foreign_tx_blocked(self.id, /* only_dirty: */ true) {
+            if !self
+                .shared
+                .foreign_tx_blocked(self.id, /* only_dirty: */ true)
+            {
                 return Ok(db);
             }
             drop(db);
@@ -477,9 +482,7 @@ impl RustqliteConnection {
     /// busy handler: the write proceeds as soon as the other connection
     /// commits or rolls back; only on timeout does it fail with
     /// SQLITE_BUSY.
-    fn acquire_write(
-        &self,
-    ) -> Result<parking_lot::RwLockWriteGuard<'_, Engine>, SqlxError> {
+    fn acquire_write(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Engine>, SqlxError> {
         let deadline = std::time::Instant::now() + self.busy_timeout;
         loop {
             // Pre-wait outside the lock: the gate condvar parks us instead
@@ -519,8 +522,7 @@ impl RustqliteConnection {
                 if self.gate_cache.len() >= 512 {
                     self.gate_cache.clear();
                 }
-                self.gate_cache
-                    .insert(sql.as_str().to_string(), m);
+                self.gate_cache.insert(sql.as_str().to_string(), m);
                 m
             }
         };
@@ -620,11 +622,16 @@ impl RustqliteConnection {
                         .map_err(crate::sqlx_driver::error::engine_err)?;
                     stmt.bind_all(values)
                         .map_err(crate::sqlx_driver::error::engine_err)?;
-                    if stmt.step().map_err(crate::sqlx_driver::error::engine_err)? == StepResult::Row {
-                        let (columns, names) =
-                            columns_from_names(&stmt_column_names(&stmt));
+                    if stmt.step().map_err(crate::sqlx_driver::error::engine_err)?
+                        == StepResult::Row
+                    {
+                        let (columns, names) = columns_from_names(&stmt_column_names(&stmt));
                         if let Some(row) = stmt.row() {
-                            out.push(Either::Right(RustqliteRow::new(row.clone(), &columns, &names)));
+                            out.push(Either::Right(RustqliteRow::new(
+                                row.clone(),
+                                &columns,
+                                &names,
+                            )));
                             logger.increment_rows_returned();
                         }
                     }
@@ -715,10 +722,7 @@ impl RustqliteConnection {
                 // here (keeps DDL inside the deferred tx transactional, like
                 // SQLite). A raw `BEGIN` statement starts it directly.
                 let is_begin = matches!(&ast, Ast::Begin(_));
-                if !is_begin
-                    && self.tx_active
-                    && !db.in_transaction.load(Ordering::Acquire)
-                {
+                if !is_begin && self.tx_active && !db.in_transaction.load(Ordering::Acquire) {
                     db.execute("BEGIN", &[] as &[EngineValue])
                         .map_err(crate::sqlx_driver::error::engine_err)?;
                     self.shared.tx_owner.store(self.id, Ordering::Release);
@@ -987,8 +991,10 @@ impl SqlxConnection for RustqliteConnection {
 
     fn begin(
         &mut self,
-    ) -> impl Future<Output = Result<sqlx_core::transaction::Transaction<'_, Self::Database>, SqlxError>> + Send + '_
-    {
+    ) -> impl Future<
+        Output = Result<sqlx_core::transaction::Transaction<'_, Self::Database>, SqlxError>,
+    > + Send
+           + '_ {
         sqlx_core::transaction::Transaction::begin(self, None)
     }
 
@@ -1078,8 +1084,7 @@ impl<'c> SqlxExecutor<'c> for &'c mut RustqliteConnection {
     {
         Box::pin(async move {
             let stmt_sql = sql.as_str();
-            let ast =
-                parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?;
+            let ast = parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?;
             let kind = classify(&ast);
 
             let (param_count, names): (usize, Vec<String>) = match kind {
@@ -1114,7 +1119,10 @@ pub struct RustqliteTransactionManager;
 impl SqlxTransactionManager for RustqliteTransactionManager {
     type Database = Rustqlite;
 
-    async fn begin(conn: &mut RustqliteConnection, statement: Option<SqlStr>) -> Result<(), SqlxError> {
+    async fn begin(
+        conn: &mut RustqliteConnection,
+        statement: Option<SqlStr>,
+    ) -> Result<(), SqlxError> {
         let sql = statement.unwrap_or_else(|| begin_ansi_transaction_sql(conn.tx_depth));
         conn.run_control(sql.as_str())?;
         conn.tx_depth += 1;
@@ -1204,7 +1212,7 @@ impl Default for RustqliteConnectOptions {
             in_memory: true,
             shared_cache: false,
             create_if_missing: false,
-            foreign_keys: true, // sqlx-sqlite parity
+            foreign_keys: true,                   // sqlx-sqlite parity
             busy_timeout: Duration::from_secs(5), // sqlx-sqlite parity
             log_settings: LogSettings::default(),
         }

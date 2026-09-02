@@ -1,7 +1,6 @@
 //! Inspect page accounting for the 10k-row file: where do our 33 pages go
 //! vs SQLite's 64?
 use rustqlite::Database;
-use std::time::Instant;
 
 fn main() {
     // Our engine, default 8 KiB pages

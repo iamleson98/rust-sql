@@ -34,7 +34,7 @@ fn main() {
     for i in 0..n {
         let lo = ((i * 37) % 4000) as i64;
         let mut stmt = db.prepare("SELECT a FROM bench WHERE a BETWEEN ? AND ? LIMIT 1").unwrap();
-        stmt.bind_all(&[Value::Integer(lo), Value::Integer(lo + 100)]);
+        let _ = stmt.bind_all(&[Value::Integer(lo), Value::Integer(lo + 100)]);
         let _ = stmt.step();
     }
     println!("step    BETWEEN LIMIT 1 : {:>7.1} µs/q", t.elapsed().as_secs_f64() * 1e6 / n as f64);
