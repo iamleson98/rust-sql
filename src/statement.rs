@@ -9,7 +9,7 @@
 //! ```no_run
 //! use rustqlite::{Database, Value, StepResult};
 //!
-//! let db = Database::open_in_memory().unwrap();
+//! let mut db = Database::open_in_memory().unwrap();
 //! db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
 //! db.execute("INSERT INTO t (x) VALUES ('a'), ('b'), ('c')", []).unwrap();
 //!

@@ -733,7 +733,15 @@ pub unsafe extern "C" fn rustqlite_load_extension(
         cstr(entry)
     };
     let mut w = conn.db.write();
+    #[cfg(feature = "extension")]
     let res = w.load_extension(std::path::Path::new(p), entry);
+    #[cfg(not(feature = "extension"))]
+    let res = {
+        let _ = (&mut *w, p, entry); // path/entry parsed for arg validation
+        Err(crate::error::Error::semantic(
+            "extension loading is disabled in this build (enable the `extension` feature)",
+        ))
+    };
     drop(w);
     match res {
         Ok(()) => RQL_OK,

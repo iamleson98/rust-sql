@@ -25,7 +25,8 @@
 //! let mut db = Database::open_in_memory().unwrap();
 //! db.create_codec(XorCodec::new(0x5A)).unwrap();
 //! // PRAGMA codec is sticky: writes from here on are encoded on disk.
-//! db.execute("PRAGMA codec = xor5a", []).unwrap();
+//! // (The demo codec registers under the name "xor".)
+//! db.execute("PRAGMA codec = xor", []).unwrap();
 //! ```
 
 use crate::error::{Error, Result};
