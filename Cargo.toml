@@ -20,7 +20,10 @@ members = ["compat/rustqlite-compat"]
 # compat layer — a workspace cannot [patch] a crate it also contains as
 # a path dependency of a member, so it stays self-contained.
 # Run: cd sqlx-interop && RUSTQLITE_LIB_DIR=../target/release cargo run --release
-exclude = ["compat/libsqlite3-sys", "sqlx-interop"]
+# `plugins/rust` is a standalone example cdylib built by tests/build_plugins.sh
+# against the raw C ABI (no engine linkage) — excluded so `cargo build` inside
+# its directory does not collide with this workspace.
+exclude = ["compat/libsqlite3-sys", "sqlx-interop", "plugins/rust"]
 
 [lib]
 name = "rustqlite"

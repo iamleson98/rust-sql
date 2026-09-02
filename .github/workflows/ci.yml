@@ -1,0 +1,260 @@
+# CI — the full rustqlite pipeline.
+#
+# Gates (all must be green for the pipeline to succeed):
+#   fmt          — rustfmt --check
+#   clippy       — zero-warning lint gate across 4 feature configs
+#   test         — the whole SQLite-style test matrix on Linux, Windows AND
+#                  macOS: unit + integration + differential vs real SQLite +
+#                  SLT conformance + fuzz + crash recovery
+#   test-oom     — OOM fault-injection sweep (532 allocation-failure points)
+#   test-compat  — the C-ABI compat layer's own tests
+#   bench-gate   — THE throughput gate: every head-to-head benchmark row must
+#                  beat (or tie) SQLite on Linux, Windows AND macOS. A single
+#                  feature losing to SQLite fails the pipeline.
+#   ci-ok        — aggregate status job, the single required check to select
+#                  in branch protection
+#
+# Bench-gate mechanics (see .github/scripts/bench_gate.py):
+#   - runs the four canonical head-to-head harnesses:
+#       examples/bench_compare.rs, examples/bench_full_vs_sqlite.rs,
+#       examples/bench_sqlx_native.rs (--features sqlx),
+#       benches/sqlite_comparison.rs (criterion)
+#   - a row FAILS the build when rustqlite is slower than SQLite by more than
+#     BENCH_TOLERANCE_PCT (default 5% — the same "tie" band the project's own
+#     bench summary uses; wins and ties pass). Set it to 0 in the env below
+#     for a strict every-row-must-win gate.
+#   - noisy rows are retried up to N attempts, keeping the BEST observed
+#     value per engine (identical rule for both engines — the same
+#     best-of-N approach the benches themselves use internally), so shared
+#     CI runners cannot flake the gate, while a consistent regression always
+#     fails it.
+#   - unparsable/empty bench output also fails (exit 2): a format drift can
+#     never make the gate vacuously green.
+#
+# Runner-minute note: this repo is private, so macOS jobs bill at 10x and
+# Windows at 2x. Full pipeline ≈ 3.5–4 runner-hours per run.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------- formatting
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ------------------------------------------------------------------- linting
+  clippy:
+    name: clippy (${{ matrix.config }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # The four configs the project keeps clippy-clean in:
+        #   default / +sqlx / --no-default-features / --workspace (compat crate)
+        config: [default, sqlx, no-default, workspace]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.config }}
+      - name: cargo clippy
+        run: |
+          case "${{ matrix.config }}" in
+            default)     cargo clippy --all-targets -- -D warnings ;;
+            sqlx)        cargo clippy --all-targets --features sqlx -- -D warnings ;;
+            no-default)  cargo clippy --all-targets --no-default-features -- -D warnings ;;
+            workspace)   cargo clippy --workspace --all-targets -- -D warnings ;;
+          esac
+
+  # --------------------------------------------------------------------- tests
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.config }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        config: [default, sqlx, no-default]
+    env:
+      # Tests are correctness, not throughput: thin LTO + 16 CGU cut the
+      # release-compile cost dramatically without changing semantics.
+      # (bench-gate does NOT use these — it needs the real fat-LTO profile.)
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Restore the build cache BEFORE any build step (incl. the plugin
+      # build below) so nothing pollutes or delays the cache key.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}-${{ matrix.config }}
+      # Extension (.so plugin) tests: build C/C++/Rust plugins first
+      # (Zig is optional). Missing binaries make those tests skip — so
+      # Windows (no cc in bash) simply exercises fewer tests, never fails.
+      - name: Build extension plugins
+        if: runner.os != 'Windows'
+        run: bash tests/build_plugins.sh
+      - name: cargo test (${{ matrix.config }})
+        run: |
+          case "${{ matrix.config }}" in
+            default)     cargo test --release ;;
+            sqlx)        cargo test --release --features sqlx ;;
+            no-default)  cargo test --release --no-default-features ;;
+          esac
+
+  # OOM fault injection: 532 allocation-failure points, each verified to
+  # leave the baseline intact (SQLite's memsys fault-injection equivalent).
+  # Uses its own allocator, so it must build without mimalloc.
+  test-oom:
+    name: test (ubuntu, oom-injection)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-oom
+      - run: cargo test --release --no-default-features --features oom-injection
+
+  # The C-ABI compatibility layer (sqlite3_* symbols over the rustqlite
+  # engine) — its own differential/ABI test suite.
+  test-compat:
+    name: test (ubuntu, compat ABI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-compat
+      - run: cargo test --release -p rustqlite-compat
+
+  # ------------------------------------------------------------- BENCH GATE --
+  # rustqlite must beat (or tie) SQLite on EVERY row, on EVERY OS.
+  # Any feature losing throughput to SQLite fails the pipeline.
+  bench-gate:
+    name: bench-gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      # A row fails when rustqlite is this much slower than SQLite (percent).
+      # 5 = the project's own tie band (wins AND ties pass). 0 = strict
+      # every-row-must-win. Keep >=3 on shared CI runners.
+      BENCH_TOLERANCE_PCT: "5"
+      # Plain text only: the gate parses this job's stdout.
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-${{ matrix.os }}
+      # NOTE: no LTO overrides here — throughput fidelity requires the real
+      # release profile (lto=fat, codegen-units=1).
+
+      - name: "Gate: bench_full_vs_sqlite (18 workloads, ops/s)"
+        run: >
+          python .github/scripts/bench_gate.py
+          --parser bench_full_vs_sqlite
+          --timeout 2400
+          -- cargo run --release --example bench_full_vs_sqlite
+
+      - name: "Gate: bench_compare (20 workloads, times)"
+        run: >
+          python .github/scripts/bench_gate.py
+          --parser bench_compare
+          --timeout 2400
+          -- cargo run --release --example bench_compare
+
+      - name: "Gate: criterion sqlite_comparison (8 paired scenarios)"
+        run: >
+          python .github/scripts/bench_gate.py
+          --parser criterion_sqlite_comparison
+          --attempts 2
+          --timeout 2400
+          -- cargo bench --bench sqlite_comparison -- --noplot
+
+      - name: "Gate: bench_sqlx_native (sqlx driver vs sqlx-sqlite)"
+        run: >
+          python .github/scripts/bench_gate.py
+          --parser bench_sqlx_native
+          --timeout 2400
+          -- cargo run --release --features sqlx --example bench_sqlx_native
+
+      - name: Upload bench results and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ matrix.os }}
+          path: target/bench-results/
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------ aggregate OK
+  ci-ok:
+    name: ci-ok (all gates green)
+    needs: [fmt, clippy, test, test-oom, test-compat, bench-gate]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any gate failed or was cancelled
+        if: >
+          contains(join(needs.*.result, ','), 'failure')
+          || contains(join(needs.*.result, ','), 'cancelled')
+        run: |
+          echo "One or more required jobs failed:"
+          echo "${{ join(needs.*.result, ',') }}"
+          exit 1
+      - name: All green
+        run: echo "fmt + clippy + tests + beat-SQLite bench gates all green on Linux, Windows and macOS."
