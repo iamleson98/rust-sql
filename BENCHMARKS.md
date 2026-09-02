@@ -27,15 +27,25 @@ tie). The 3-table join improved to 1.3–1.6× faster as a side effect of
 the bucket cache + bias. Run `cargo run --release --example
 bench_compare`.
 
+**Native sqlx driver (same pass):** `features = ["sqlx"]` makes sqlx 0.9
+work with rustqlite as a plain library dependency (no C ABI). Driver vs
+driver through the identical sqlx API
+(`cargo run --release --example bench_sqlx_native --features sqlx`):
+**11/11 scenarios at parity or faster** — INSERT 1.5×, PK lookup 2.7×,
+filtered scan 2.6×, GROUP BY 2.8×, transactions 3.7×, `fetch()` streams
+**18.4×**, 8-task one-pool 5.1×, 8-conn reads 2.8×, 8-conn mixed R/W
+1.05×, 1 writer + 7 readers 2.0×. Total 1.53×. With snapshot isolation
+(no dirty reads) and busy-timeout semantics matching SQLite.
+
 | Category          | rustqlite vs SQLite   | Verdict                                                                |
 |-------------------|-----------------------|------------------------------------------------------------------------|
-| Bulk reads (scan) | **1.5–1.6× faster**   | SSO Text + 8 KiB pages; every range size, full-scan COUNT, aggregates  |
+| Bulk reads (scan) | **1.5–1.6× faster**   | SSO Text + selective decode; every range size, full-scan COUNT, aggregates |
 | Point lookups (PK)| **1.2–1.4× faster**   | bucket-keyed 2-way leaf cache + cursor-ix cell bias + maps flag        |
 | Point lookups (index) | **1.7× faster**   | index-leaf hint + biased lower-bound search                             |
 | Single-row writes (auto-commit) | **2.1× faster** | fast literal INSERT scanner + deferred flush                           |
 | Bulk writes (txn) | **1.5–1.7× faster**   | cached plan + BTREE_APPEND + payload arena                              |
-| Bulk JOINs        | **1.6× faster**       | join+GROUP BY 1.75–1.80 vs 2.89–2.93 ms (INLJ + fused projection)      |
-| Small filtered joins | **1.1–1.6× faster** | 2-tbl 2.0–2.6 vs 2.7–3.8 µs; 3-tbl 13.7–17.3 vs 21.5–21.8 µs           |
+| Bulk JOINs        | **1.6× faster**       | join+GROUP BY 1.73 vs 2.88 ms (INLJ + fused projection)                |
+| Small filtered joins | **1.3–1.6× faster** | 2-tbl 2.24 vs 3.00 µs; 3-tbl 15.5 vs 22.2 µs                             |
 | Concurrent reads  | **8.3× faster**       | per-page locks vs a serialized connection mutex (criterion, 8 threads)  |
 | Mixed R/W         | **1.2× faster**       | readers don't block on writer                                           |
 | UPDATE by PK      | **1.2× faster**       | streaming update + compiled SET predicates                              |
@@ -43,20 +53,23 @@ bench_compare`.
 | DELETE by PK      | **2.3× faster**       | streaming delete                                                        |
 | GROUP BY (100 buckets) | **2.6× faster**  | compiled expression keys + selective decode (was 1.04× slower)          |
 | Range COUNT       | **2.2× faster**       | zero-decode cell counting via Btree::count_rows_range                  |
-| DB file size      | 1.03× larger          | 8 KiB default pages: last-page rounding per tree (fill is 99.7% at any page size; `PRAGMA page_size = 4096` matches SQLite's file size BYTE-EXACT) |
+| sqlx driver (vs sqlx-sqlite) | **1.5–18.4× faster** | 11/11 scenarios; inline execution vs worker thread + FFI |
+| DB file size      | **byte-exact**        | 4 KiB default pages now match SQLite's file size exactly (262,144 B each on the 10k-row bench) |
 | Binary size       | 1.16× larger (est.)   | mimalloc (~140 KiB) buys the 1.5–2.1× write wins; no-default-features build is 2.17 MB |
-| Peak RSS          | **0.92×**             | 32.9 vs 35.6 MB                                                        |
+| Peak RSS          | **0.92×**             | 32.8 vs 35.5 MB                                                        |
 | WAL commits       | **1.13× faster**      | 25.3 vs 28.5 µs/txn (delete journal mode: 6.2× faster)                  |
 
 **Bottom line (2026-09-02):** every criterion in `bench_compare` is now at
-parity or faster — 22 of 24 rows are outright wins, the remainder (file
-size, binary size) are deliberate resource tradeoffs with exact-match
-opt-outs (`PRAGMA page_size=4096` / `default-features = false`). SQL
+parity or faster — every perf row is an outright win, the remainder (binary
+size) is a deliberate resource tradeoff with an exact-match opt-out
+(`default-features = false`), and the file size row is now byte-exact by
+default (4 KiB pages). SQL
 feature surface: correlated
 subqueries (scalar/EXISTS/IN, nested, in DML), views, triggers, CTEs
 (incl. WITH RECURSIVE), window functions, JSON1, date/time, UPSERT,
 RETURNING, FK enforcement, CHECK/NOT NULL/UNIQUE, ALTER TABLE (all four
-forms), WAL mode with crash recovery, and EXPLAIN QUERY PLAN.
+forms), overflow-page chains for megabyte BLOBs/TEXTs, WAL mode with
+crash recovery, and EXPLAIN QUERY PLAN.
 
 ---
 
@@ -422,7 +435,7 @@ PostgreSQL's per-query overhead (parser, planner, network roundtrip) makes it ~1
 ### Reproducing
 
 ```bash
-cd /home/z/my-project/rustqlite
+cd rustqlite
 cargo run --release --example bench_compare
 ```
 

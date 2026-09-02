@@ -1,5 +1,83 @@
 # Changelog
 
+## [Unreleased] — 2026-09-02 native sqlx driver + overflow pages sprint
+
+### sqlx (native Rust driver, `features = ["sqlx"]`)
+
+- **`src/sqlx_driver`** — sqlx-core 0.9's driver traits implemented
+  directly against the engine: `rustqlite` now works with sqlx as a
+  **plain library dependency** — no `libsqlite3.so`, no C ABI, no
+  `[patch.crates-io]`, no C toolchain, 100% safe Rust. `Pool`,
+  `query()`/`query_as()`/`query_scalar()`, `FromRow`, transactions with
+  isolation levels, `fetch()` streaming, pool options, `?` and `:name`
+  binds, `RETURNING`, and multi-statement raw scripts all work through
+  the unmodified `sqlx` facade. URL scheme:
+  `rustqlite://app.db?mode=rwc`, `rustqlite://:memory:?cache=shared`.
+- **Snapshot isolation between connections (SQLite semantics)**: while a
+  transaction with uncommitted writes is open, other connections' reads
+  WAIT (never observe half-applied state — verified by
+  `examples/probe_dirty_read.rs`), read-only transactions never block
+  readers, blocked statements fail with `SQLITE_BUSY` after the
+  busy timeout (default 5 s, sqlx-sqlite parity), and a dropped
+  connection rolls back whatever engine-level transaction it left open
+  (sqlx-managed or raw `BEGIN`) so one connection can never wedge the
+  pool.
+- **Driver-vs-driver benchmark** (`examples/bench_sqlx_native.rs`):
+  11/11 scenarios at parity or faster than sqlx-sqlite through the
+  identical sqlx API — 1.5× INSERT/UPDATE, 2.7× PK lookups, 2.6×
+  filtered scans, 2.8× GROUP BY, 3.7× transactions, **18.4× `fetch()`
+  streaming**, 5.1× 8-task single-pool concurrency, 2.8× 8-connection
+  reads, 2.0× 1-writer/7-readers.
+- **27 new tests** (`tests/sqlx_driver.rs`): pool + URL parsing, typed
+  binds and fetch, transactions with isolation and rollback, concurrent
+  transactions serialize correctly, multiple concurrent read
+  transactions, readonly transactions don't block readers, writer
+  wake-after-foreign-commit, dropped-connection cleanup (sqlx and raw
+  scripts), busy-timeout behavior (instant fail, timeout, then BUSY),
+  constraint error mapping, file-backed pools, pragma round-trips.
+
+### Storage
+
+- **Overflow pages** (SQLite's overflow-chain layout): payloads larger
+  than a page store a local prefix in the table-leaf cell plus a linked
+  chain of `Overflow` pages for the tail. Megabyte BLOBs/TEXTs
+  round-trip exactly (previously a hard "too big" error at ~page size),
+  reads stream the chain without buffering, DELETEs recycle the chain's
+  pages through the freelist, and corruption of chain linkage fails
+  gracefully (integrity_check + db_corrupt_fuzz coverage).
+- **Default page size 8192 → 4096** (SQLite's default since 3.12):
+  byte-exact file-size parity with SQLite on identical workloads
+  (262,144 bytes each on the 10k-row bench DB), equal-or-faster on all
+  hot paths (leaf cache gets 2× the entries for the same memory).
+- **Fixed: statement DML could lose rows after the first B+tree split**
+  — the statement's DML merge-back propagated max-rowids but not new
+  root pages, so after the first split every subsequent insert/read went
+  through the STALE root: a 5000-row insert silently retained ~391 rows
+  (one leaf's worth). Regression test
+  `regression_statement_dml_survives_btree_splits` inserts 5000 rows via
+  a prepared statement and verifies all of them survive.
+
+### Performance
+
+- **Fused Filter-over-Scan streaming with selective decode + LIMIT
+  pushdown** (executor + statement drivers): `WHERE`-filtered table
+  scans decode ONLY the predicate's columns for non-matching rows
+  (matching rows materialize fully for parent operators); `LIMIT k`
+  stops the walk at the k-th passing row instead of scanning the whole
+  table. Streaming statements (`prepare`/`step`) resume the driver
+  across batches by rowid — `fetch()` streams 18× faster than
+  sqlx-sqlite.
+
+### Tests
+
+- 12 new overflow tests (`tests/overflow.rs`): round-trips at the
+  local/spill boundary and far beyond, 1 MiB blobs, exact-byte
+  verification, delete-and-reuse of chain pages, integrity check,
+  corrupt-chain graceful failure.
+- Corruption-fuzz hardening: random byte strikes now force a real flip
+  (a strike rewriting the same byte value was a no-op that tripped the
+  test's own no-op assert).
+
 ## [Unreleased] — 2026-09-02 gap-close sprint: every benchmark row at parity or faster
 
 ### Performance
