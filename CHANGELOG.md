@@ -1,5 +1,77 @@
 # Changelog
 
+## [Unreleased] — 2026-09-02 COUNT(*) memoization + zero-warning clippy pass
+
+### Performance
+
+- **`SELECT COUNT(*) FROM t` 2.5 µs → 92 ns (27× faster than SQLite)**:
+  bare `COUNT(*)` (no WHERE / GROUP BY / DISTINCT) now hits a dedicated
+  `FastPath::CountStar` that skips executor dispatch entirely, and the
+  answer is memoized per table, keyed by a monotonic `write_epoch`.
+  Every mutating statement bumps the epoch ONCE at the top of
+  `Database::execute` (the gateway for DML/DDL/transaction control/fast
+  inserts), and prepared-statement DML bumps it in its own merge-back
+  path — so a cached (epoch, count) pair can never outlive the state it
+  describes (writers are `&mut self`, exclusive with `&self` readers;
+  SQLite semantics preserved for uncommitted rows, ROLLBACK, and
+  savepoint rollbacks). 10 new tests (`tests/count_cache.rs`) verify
+  every invalidation path: per-insert counts, uncommitted rows,
+  ROLLBACK, ROLLBACK TO SAVEPOINT, prepared-statement DML, DROP +
+  re-CREATE, cross-table independence, WHERE-range counts, file reopen,
+  and DISTINCT/GROUP BY correctness.
+- **`bench_full_vs_sqlite`: 18/18 rows now outright wins** (was 16
+  wins / 1 tie / 1 loss): COUNT(*) 32.9×, multi-VALUES 100-row batches
+  1.17× (quiet-machine probes: fixed per-batch cost 0.77 µs vs SQLite's
+  1.37 µs, per-row 311 vs 427 ns).
+
+### Compat (C ABI)
+
+- **`mode=ro` / `SQLITE_OPEN_READONLY` is now enforced**: a read-only
+  connection rejects database-mutating statements at PREPARE with
+  `SQLITE_READONLY` ("attempt to write a readonly database"); SELECTs
+  and transaction control are unaffected (SQLite readonly-connection
+  semantics; previously the parsed flag was advisory-only). Verified
+  end-to-end through real sqlx: `SqliteConnectOptions::read_only(true)`
+  serves reads and rejects writes (new interop test #11).
+- `Conn` is now explicitly `Send + Sync` (unsafe impls with SAFETY
+  comments: raw pointers only appear in mutex-guarded C callback slots;
+  database state lives behind the engine's own RwLock — the serialized
+  mode SQLite's default builds provide and sqlx-sqlite's worker thread
+  relies on).
+- `sqlite3_exec`'s vestigial bookkeeping removed (dead initial `rc`,
+  unused `first` flag); the never-constructed `StmtKind::Empty` variant
+  and the dead `private_engine` field are gone; the
+  `positional_counter` parameter (threaded through 44 sites, never
+  read) is removed from the parameter-walker.
+
+### Code quality (clippy: 0 warnings across all configurations)
+
+- All 4 build configs clean: default, `--features sqlx`,
+  `--no-default-features`, and `-p rustqlite-compat` — no suppressions
+  added; every warning fixed at the source:
+  - 3 clippy **errors** (`not_unsafe_ptr_arg_deref`): the plugin ABI's
+    `api_result_text` / `api_result_blob` / `api_result_error` /
+    `api_aggregate_context` are now `unsafe` with `# Safety` sections
+    (the C-ABI contract they always had, now encoded in the types).
+  - 37 missing `# Safety` sections in `src/ffi.rs`: every unsafe C-ABI
+    function documents its pointer contract (live connection / live
+    statement / valid NUL-terminated strings / valid (buf, len) pairs).
+    The three pointer-free functions (`libversion`, `threadsafe`,
+    `source_id`) became plain safe `extern "C" fn` — safe is safe.
+  - The C trampoline table and the ffi handle/registration bridges are
+    `#[cfg(feature = "extension")]`-gated: without the feature there is
+    no `load_extension`, so they were dead code (mirrors SQLite's
+    `SQLITE_OMIT_LOAD_EXTENSION`).
+  - Style fixes throughout: `?` operator instead of match-return,
+    `matches!` instead of bool match, `clamp` instead of `.min().max()`,
+    `sort_by_key(Reverse)`, `Option::filter` instead of nested ifs,
+    needless returns/closures/parens/trailing semicolons, type aliases
+    for complex types (`VtabScanResult`, `ColumnMeta`, `UpdateHook`,
+    `QueryCase`), doc-lazy-continuation rewrites, rustfmt fixes.
+- Probe fixes: 3 stale engine probes updated for `Cell::decode`'s
+  page_size argument; new probes `probe_count_cost` (COUNT breakdown vs
+  SQLite) and `probe_mvalues_cost` (multi-VALUES fixed vs per-row cost).
+
 ## [Unreleased] — 2026-09-02 native sqlx driver + overflow pages sprint
 
 ### sqlx (native Rust driver, `features = ["sqlx"]`)

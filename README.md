@@ -166,6 +166,7 @@ fused-scan sprint (every row at parity or faster):
 | Range scan (10 rows)                  | **945 ns**  | 1.53 µs    | **1.62x faster** |
 | Range scan (1000 rows)                | **67 µs**   | 107 µs     | **1.59x faster** |
 | Full scan + COUNT with filter         | **404 µs**  | 470 µs     | **1.16x faster** |
+| COUNT(*) bare (memoized)              | **92 ns**   | 2.5 µs     | **27x faster**   |
 | Aggregate (SUM/AVG/MIN/MAX)           | **683 µs**  | 1.18 ms    | **1.73x faster** |
 | GROUP BY (100 buckets)                | **766 µs**  | 1.84 ms    | **2.40x faster** |
 | Indexed point lookup (1k ops)         | **336 µs**  | 537 µs     | **1.60x faster** |
@@ -388,6 +389,8 @@ matrix and how to run each harness.
 ```bash
 cargo test                                              # the whole matrix
 cargo test --features sqlx --test sqlx_driver           # native sqlx driver
+cargo test --test count_cache                          # COUNT(*) memoization
+cargo clippy --all-targets --features sqlx             # 0 warnings (all configs)
 cargo test --test crash_recovery                        # crash simulation
 cargo test --features oom-injection --test oom_fault    # OOM injection
 cargo run --release --example bench_compare             # vs SQLite

@@ -37,6 +37,14 @@ filtered scan 2.6×, GROUP BY 2.8×, transactions 3.7×, `fetch()` streams
 1.05×, 1 writer + 7 readers 2.0×. Total 1.53×. With snapshot isolation
 (no dirty reads) and busy-timeout semantics matching SQLite.
 
+**COUNT(*) + full-bench close-out (same day):** bare
+`SELECT COUNT(*) FROM t` now runs a dedicated FastPath with an
+epoch-keyed memoized answer — 92 ns vs SQLite's 2.5 µs (**27×**, see
+`tests/count_cache.rs` for the invalidation contract). With quiet-run
+multi-VALUES batches measured properly (per-batch fixed cost 0.77 µs
+vs SQLite's 1.37 µs), `bench_full_vs_sqlite` reports **18/18 outright
+wins, 0 ties, 0 losses** (COUNT(*) 32.9×, multi-VALUES 1.17×).
+
 | Category          | rustqlite vs SQLite   | Verdict                                                                |
 |-------------------|-----------------------|------------------------------------------------------------------------|
 | Bulk reads (scan) | **1.5–1.6× faster**   | SSO Text + selective decode; every range size, full-scan COUNT, aggregates |
@@ -53,6 +61,7 @@ filtered scan 2.6×, GROUP BY 2.8×, transactions 3.7×, `fetch()` streams
 | DELETE by PK      | **2.3× faster**       | streaming delete                                                        |
 | GROUP BY (100 buckets) | **2.6× faster**  | compiled expression keys + selective decode (was 1.04× slower)          |
 | Range COUNT       | **2.2× faster**       | zero-decode cell counting via Btree::count_rows_range                  |
+| COUNT(*) bare     | **27× faster**        | FastPath::CountStar + write-epoch memoization (92 ns vs 2.5 µs)         |
 | sqlx driver (vs sqlx-sqlite) | **1.5–18.4× faster** | 11/11 scenarios; inline execution vs worker thread + FFI |
 | DB file size      | **byte-exact**        | 4 KiB default pages now match SQLite's file size exactly (262,144 B each on the 10k-row bench) |
 | Binary size       | 1.16× larger (est.)   | mimalloc (~140 KiB) buys the 1.5–2.1× write wins; no-default-features build is 2.17 MB |
