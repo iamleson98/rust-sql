@@ -9,3 +9,4 @@ plugins/rust/target/
 
 # sqlx-interop build artifacts (separate workspace)
 sqlx-interop/target/
+compat/libsqlite3-sys/target
