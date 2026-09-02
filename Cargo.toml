@@ -38,6 +38,35 @@ path = "src/bin/server.rs"
 name = "bench_vs_sqlite"
 path = "examples/bench_vs_sqlite.rs"
 
+# sqlx driver-vs-driver benchmark: native rustqlite driver vs sqlx-sqlite
+# (C SQLite) through the identical sqlx API.
+# Run: cargo run --release --example bench_sqlx_native --features sqlx
+[[example]]
+name = "bench_sqlx_native"
+path = "examples/bench_sqlx_native.rs"
+required-features = ["sqlx"]
+
+# Concurrency probes need the native sqlx driver (Pool API).
+# Run: cargo run --release --example probe_conc_cost --features sqlx
+[[example]]
+name = "probe_conc_cost"
+path = "examples/probe_conc_cost.rs"
+required-features = ["sqlx"]
+
+# Dirty-read probe: WAL snapshots + writer gate vs read-uncommitted.
+# Run: cargo run --release --example probe_dirty_read --features sqlx
+[[example]]
+name = "probe_dirty_read"
+path = "examples/probe_dirty_read.rs"
+required-features = ["sqlx"]
+
+# 7-writers/1-reader stress probe through the sqlx Pool.
+# Run: cargo run --release --example probe_w7r --features sqlx
+[[example]]
+name = "probe_w7r"
+path = "examples/probe_w7r.rs"
+required-features = ["sqlx"]
+
 [dependencies]
 # HTTP server (tiny, no async runtime — keeps binary size small)
 tiny_http = "0.12"
@@ -64,12 +93,30 @@ libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 # Optional: disable with `default-features = false` for a hardened build
 # (mirrors SQLite's SQLITE_OMIT_LOAD_EXTENSION).
 libloading = { version = "0.8", optional = true }
+# --- Native sqlx driver (feature `sqlx`) -------------------------------
+# sqlx-core's driver traits, implemented directly against the engine —
+# sqlx works with rustqlite as a plain Rust crate dependency: no C ABI,
+# no libsqlite3.so, no [patch.crates-io]. Version-pinned to match the
+# `sqlx` 0.9 facade exactly (sqlx-sqlite pins `=0.9.0`; a mismatch would
+# create two sqlx-core copies and break type identity).
+sqlx-core = { version = "=0.9.0", default-features = false, optional = true }
+futures-core = { version = "0.3", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
+log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 rand = "0.8"
+# For tests/sqlx_driver.rs: the real sqlx facade + a runtime (proves
+# facade/driver type identity through the public API users actually use).
+# It also provides `sqlx-core/_rt-tokio` for pool timers in test builds.
+# `sqlite-unbundled` links the SYSTEM C SQLite so
+# examples/bench_sqlx_native.rs can compare the native driver against the
+# real sqlx-sqlite through the identical API (worker thread + FFI).
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "derive", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = ["mimalloc", "extension"]
@@ -83,6 +130,11 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 extension = ["dep:libloading"]
 # Disable to remove rustyline (smaller binary)
 no-cli-readline = []
+# Native sqlx driver: `Pool<Rustqlite>`, `query()`, transactions, ... see
+# `src/sqlx_driver`. (The `sqlx` facade crate in YOUR app should enable a
+# runtime feature, e.g. `runtime-tokio`, which also provides the async
+# timers sqlx-core's pool uses.)
+sqlx = ["dep:sqlx-core", "dep:futures-core", "dep:futures-util", "dep:log"]
 
 # Crash/power-loss simulation (SQLite testing.html §3.3): spawns itself as
 # a child that hard-aborts mid-transaction at advancing statement

@@ -94,6 +94,12 @@ pub mod plugin;
 /// SQLite-style C ABI (`rustqlite_open` / `rustqlite_prepare` /
 /// `rustqlite_step` / ...) plus the extension loading entry points.
 pub mod ffi;
+/// Native sqlx driver: sqlx-core's `Database` traits implemented directly
+/// against the engine, so `rustqlite` works as a sqlx backend with **no C
+/// ABI, no `libsqlite3.so`, no `[patch.crates-io]`** — just
+/// `rustqlite = { features = ["sqlx"] }`. See `rustqlite::sqlx_driver`.
+#[cfg(feature = "sqlx")]
+pub mod sqlx_driver;
 /// SQLite-style streaming statement handles (`prepare` / `bind` / `step`).
 pub mod statement;
 pub mod planner;
