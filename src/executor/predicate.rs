@@ -35,18 +35,66 @@ pub(crate) enum PredValue {
     Param(usize),
     /// A literal constant.
     Literal(Value),
+    /// A compiled ARITHMETIC operand (`a % 10`, `b + 1` — any BinaryOp
+    /// chain over columns/literals/params). Needed so predicates like
+    /// `WHERE a % 10 = 0` compile: the leaf-only compiler bails on them
+    /// and the fused scan+filter degrades to full materialization + AST
+    /// walks. Positions-aware (unlike CompiledExpr) so it composes with
+    /// selectively-decoded row buffers.
+    Expr(PredExpr),
+}
+
+/// A positions-aware arithmetic expression tree for predicate operands.
+#[derive(Clone, Debug)]
+pub(crate) enum PredExpr {
+    Col(usize),
+    Param(usize),
+    Literal(Value),
+    Unary(UnaryOp, Box<PredExpr>),
+    Binary(BinaryOp, Box<PredExpr>, Box<PredExpr>),
+}
+
+impl PredExpr {
+    #[inline]
+    fn eval(&self, row: &[Value], positions: &[usize], params: &[Value]) -> Value {
+        match self {
+            PredExpr::Col(i) => positions
+                .get(*i)
+                .and_then(|&p| row.get(p))
+                .cloned()
+                .unwrap_or(Value::Null),
+            PredExpr::Param(i) => params.get(*i).cloned().unwrap_or(Value::Null),
+            PredExpr::Literal(v) => v.clone(),
+            PredExpr::Unary(op, e) => {
+                let v = e.eval(row, positions, params);
+                crate::executor::expr::apply_unary(*op, &v)
+            }
+            PredExpr::Binary(op, l, r) => {
+                let lv = l.eval(row, positions, params);
+                let rv = r.eval(row, positions, params);
+                apply_binary(*op, &lv, &rv)
+            }
+        }
+    }
 }
 
 impl PredValue {
     #[inline]
-    fn eval<'a>(&'a self, row: &'a [Value], positions: &[usize], params: &'a [Value]) -> &'a Value {
+    fn eval<'a>(
+        &'a self,
+        row: &'a [Value],
+        positions: &[usize],
+        params: &'a [Value],
+    ) -> std::borrow::Cow<'a, Value> {
+        use std::borrow::Cow;
         match self {
             PredValue::Col(i) => {
                 let pos = positions[*i];
-                row.get(pos).unwrap_or(null_ref())
+                Cow::Borrowed(row.get(pos).unwrap_or(null_ref()))
             }
-            PredValue::Param(i) => params.get(*i).unwrap_or(null_ref()),
-            PredValue::Literal(v) => v,
+            PredValue::Param(i) => Cow::Borrowed(params.get(*i).unwrap_or(null_ref())),
+            PredValue::Literal(v) => Cow::Borrowed(v),
+            PredValue::Expr(pe) => Cow::Owned(pe.eval(row, positions, params)),
         }
     }
 }
@@ -148,7 +196,7 @@ impl CompiledPredicate {
             CompiledPredicate::Cmp { lhs, op, rhs } => {
                 let l = lhs.eval(row, positions, params);
                 let r = rhs.eval(row, positions, params);
-                apply_binary(*op, l, r).is_truthy()
+                apply_binary(*op, &l, &r).is_truthy()
             }
             CompiledPredicate::And(a, b) => {
                 a.eval(row, positions, params) && b.eval(row, positions, params)
@@ -173,12 +221,14 @@ impl CompiledPredicate {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let l = lo.eval(row, positions, params);
                 let h = hi.eval(row, positions, params);
-                if matches!(v, Value::Null) || matches!(l, Value::Null) || matches!(h, Value::Null)
+                if matches!(v, Value::Null)
+                    || matches!(&*l, Value::Null)
+                    || matches!(&*h, Value::Null)
                 {
                     return false;
                 }
-                let in_range = apply_binary(BinaryOp::GtEq, v, l).is_truthy()
-                    && apply_binary(BinaryOp::LtEq, v, h).is_truthy();
+                let in_range = apply_binary(BinaryOp::GtEq, v, &l).is_truthy()
+                    && apply_binary(BinaryOp::LtEq, v, &h).is_truthy();
                 in_range != *negated
             }
             CompiledPredicate::InList { col, vals, negated } => {
@@ -191,9 +241,9 @@ impl CompiledPredicate {
                 let mut saw_null = matches!(v, Value::Null);
                 for cand in vals {
                     let c = cand.eval(row, positions, params);
-                    if matches!(c, Value::Null) {
+                    if matches!(&*c, Value::Null) {
                         saw_null = true;
-                    } else if apply_binary(BinaryOp::Eq, v, c).is_truthy() {
+                    } else if apply_binary(BinaryOp::Eq, v, &c).is_truthy() {
                         found = true;
                         break;
                     }
@@ -221,9 +271,9 @@ impl CompiledPredicate {
                     return false;
                 }
                 let matched = if *glob {
-                    crate::executor::expr::glob_match(v, p)
+                    crate::executor::expr::glob_match(v, &p)
                 } else {
-                    crate::executor::expr::like_match(v, p, None, false)
+                    crate::executor::expr::like_match(v, &p, None, false)
                 };
                 matched != *negated
             }
@@ -232,6 +282,61 @@ impl CompiledPredicate {
 }
 
 /// Bind a leaf expression (literal / positional parameter / bare column).
+/// Comparison-operand compiler: a leaf when possible (borrow-friendly
+/// evaluation), otherwise a positions-aware ARITHMETIC expression
+/// (`a % 10 = 0`, `b + 1 < c`). Leaf-only operands used to send such
+/// predicates to the general AST-walk path — and, worse, to bail out of
+/// the fused scan+filter entirely (full row materialization before the
+/// filter). Falls back to None only for genuinely unsupported shapes.
+fn bind_operand(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<PredValue> {
+    if let Some(leaf) = bind_leaf(e, table, prefix) {
+        return Some(leaf);
+    }
+    compile_pred_expr(e, table, prefix).map(PredValue::Expr)
+}
+
+/// Positions-aware arithmetic expression compiler (see `PredExpr`).
+/// AND/OR are excluded (short-circuit semantics belong to the predicate
+/// level, not eager operand evaluation).
+fn compile_pred_expr(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<PredExpr> {
+    match e {
+        Expr::Literal(v) => Some(PredExpr::Literal(v.clone())),
+        Expr::Parameter(p) => p.parse::<usize>().ok().map(PredExpr::Param),
+        Expr::Column { table: ref_t, name } => {
+            let matches = ref_t
+                .as_ref()
+                .map(|t| {
+                    // Same scoping rule as bind_leaf: an alias REPLACES the
+                    // table name.
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
+                .unwrap_or(true);
+            if matches {
+                table.find_column(name).map(PredExpr::Col)
+            } else {
+                None
+            }
+        }
+        Expr::Unary { op, expr } => {
+            let inner = compile_pred_expr(expr, table, prefix)?;
+            Some(PredExpr::Unary(*op, Box::new(inner)))
+        }
+        Expr::Binary { op, left, right } => {
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                return None;
+            }
+            let l = compile_pred_expr(left, table, prefix)?;
+            let r = compile_pred_expr(right, table, prefix)?;
+            Some(PredExpr::Binary(*op, Box::new(l), Box::new(r)))
+        }
+        _ => None,
+    }
+}
+
 fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<PredValue> {
     match e {
         Expr::Literal(v) => Some(PredValue::Literal(v.clone())),
@@ -293,8 +398,8 @@ pub(crate) fn compile_predicate(
                 Box::new(compile_predicate(right, table, prefix)?),
             )),
             op if is_cmp_op(*op) => {
-                let lhs = bind_leaf(left, table, prefix)?;
-                let rhs = bind_leaf(right, table, prefix)?;
+                let lhs = bind_operand(left, table, prefix)?;
+                let rhs = bind_operand(right, table, prefix)?;
                 // SQL comparison with NULL on either side is never true —
                 // handled by apply_binary's semantics, so pass through.
                 Some(CompiledPredicate::Cmp { lhs, op: *op, rhs })

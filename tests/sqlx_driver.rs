@@ -356,6 +356,16 @@ async fn file_backed_pool() {
         .fetch_one(&pool)
         .await
         .unwrap();
+    if n != 10 {
+        // Failure forensics: WHICH rows made it distinguishes a lost LAST
+        // insert (commit/chain flush), a rowid collision (overlap), or a
+        // dropped middle row (allocation race).
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, v FROM f ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        panic!("COUNT(*) = {n} (expected 10); rows present: {rows:?}");
+    }
     assert_eq!(n, 10);
     pool.close().await;
 
