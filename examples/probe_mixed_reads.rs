@@ -159,6 +159,34 @@ fn main() {
         );
     }
 
+    // ---- filtered scan (a % 10 = 0): the arithmetic-predicate shape ----
+    {
+        let sqlf = "SELECT a, b, c FROM bench WHERE a % 10 = 0";
+        // warm
+        let _ = db.query(sqlf, []).unwrap();
+        let t = Instant::now();
+        for _ in 0..50 {
+            let _ = db.query(sqlf, []).unwrap();
+        }
+        let rq_us = t.elapsed().as_secs_f64() * 1e6 / 50.0;
+
+        let mut stmt = sqlite.prepare(sqlf).unwrap();
+        let _ = stmt.query([]).unwrap();
+        let t = Instant::now();
+        for _ in 0..50 {
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _a: i64 = row.get(0).unwrap();
+                let _b: f64 = row.get(1).unwrap();
+                let _c: String = row.get(2).unwrap();
+            }
+        }
+        let sq_us = t.elapsed().as_secs_f64() * 1e6 / 50.0;
+        println!(
+            "filtered scan a%10=0 (700 rows of 7000): rustqlite {rq_us:.1}µs vs SQLite {sq_us:.1}µs"
+        );
+    }
+
     // ---- rustqlite: PK point lookup ----
     {
         let t = Instant::now();

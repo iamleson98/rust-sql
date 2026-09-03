@@ -76,6 +76,71 @@ impl PredExpr {
             }
         }
     }
+
+    /// Fast INTEGER-only evaluation: `Some(i64)` when the whole
+    /// expression folds over INTEGER operands; `None` on any NULL /
+    /// REAL / TEXT involvement, division by zero, or integer overflow —
+    /// the caller then takes the general path, which preserves full
+    /// SQLite semantics (NULL results, REAL promotion of overflowing
+    /// integer arithmetic, mixed-type coercion). Mirrors `arith_checked`
+    /// and the Div/Mod NULL rules exactly, but without the per-row Value
+    /// clones + apply_binary dispatch that dominated filtered scans:
+    /// `WHERE a % 10 = 0` paid ~100 ns/row for two full Value
+    /// round-trips (measured in examples/probe_mixed_reads.rs); this
+    /// path evaluates it as two i64 ops (~5 ns).
+    #[inline]
+    fn eval_int(&self, row: &[Value], positions: &[usize], params: &[Value]) -> Option<i64> {
+        match self {
+            PredExpr::Literal(Value::Integer(i)) => Some(*i),
+            PredExpr::Param(i) => match params.get(*i) {
+                Some(Value::Integer(n)) => Some(*n),
+                _ => None,
+            },
+            PredExpr::Col(i) => match positions.get(*i).and_then(|&p| row.get(p)) {
+                Some(Value::Integer(n)) => Some(*n),
+                _ => None,
+            },
+            PredExpr::Unary(op, e) => {
+                if matches!(op, crate::sql::ast::UnaryOp::Neg) {
+                    e.eval_int(row, positions, params)?.checked_neg()
+                } else {
+                    None
+                }
+            }
+            PredExpr::Binary(op, l, r) => {
+                use crate::sql::ast::BinaryOp as B;
+                let a = l.eval_int(row, positions, params)?;
+                let b = r.eval_int(row, positions, params)?;
+                match op {
+                    B::Add => a.checked_add(b),
+                    B::Sub => a.checked_sub(b),
+                    B::Mul => a.checked_mul(b),
+                    // SQLite: x / 0 is NULL (fallback); MIN / -1 promotes
+                    // to REAL (checked_div None → fallback → REAL).
+                    B::Div => {
+                        if b == 0 {
+                            None
+                        } else {
+                            a.checked_div(b)
+                        }
+                    }
+                    // SQLite: x % 0 is NULL (fallback); MIN % -1 is 0.
+                    B::Mod => {
+                        if b == 0 {
+                            None
+                        } else if b == -1 {
+                            Some(0)
+                        } else {
+                            Some(a % b)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            // Non-integer literal, or any shape the fast path declines.
+            _ => None,
+        }
+    }
 }
 
 impl PredValue {
@@ -129,6 +194,23 @@ fn pred_int(pv: &PredValue, row: &[Value], positions: &[usize], params: &[Value]
     }
 }
 
+/// `pred_int` extended to arithmetic EXPRESSION operands: `WHERE
+/// a % 10 = 0` / `WHERE id + 1 = ?` compile to `PredValue::Expr`, which
+/// the leaf-only resolver declines. Any integer-only expression folds
+/// here; everything else falls back to the general path.
+#[inline]
+fn resolve_int(
+    pv: &PredValue,
+    row: &[Value],
+    positions: &[usize],
+    params: &[Value],
+) -> Option<i64> {
+    match pv {
+        PredValue::Expr(pe) => pe.eval_int(row, positions, params),
+        other => pred_int(other, row, positions, params),
+    }
+}
+
 /// A predicate compiled against a fixed column-position layout.
 #[derive(Clone, Debug)]
 pub(crate) enum CompiledPredicate {
@@ -172,15 +254,42 @@ pub(crate) enum CompiledPredicate {
 
 /// Column indices referenced by the predicate (for building the selective
 /// decode list).
+impl PredExpr {
+    /// Collect the table columns this expression references, so the
+    /// fused scan can selective-decode exactly them (see
+    /// `compiled_columns`). Without this, `PredValue::Expr` operands
+    /// (`a % 10 = 0`) yielded an EMPTY wanted list — the scan fell back
+    /// to full-row decode for EVERY scanned row, paying ~50-60 ns/row of
+    /// unneeded column materialization.
+    fn collect_columns(&self, out: &mut Vec<usize>) {
+        match self {
+            PredExpr::Col(i) => out.push(*i),
+            PredExpr::Unary(_, e) => e.collect_columns(out),
+            PredExpr::Binary(_, l, r) => {
+                l.collect_columns(out);
+                r.collect_columns(out);
+            }
+            PredExpr::Literal(_) | PredExpr::Param(_) => {}
+        }
+    }
+}
+
+/// Collect column indices referenced by a `PredValue` operand
+/// (leaf or expression).
+#[inline]
+fn operand_columns(pv: &PredValue, out: &mut Vec<usize>) {
+    match pv {
+        PredValue::Col(i) => out.push(*i),
+        PredValue::Expr(pe) => pe.collect_columns(out),
+        _ => {}
+    }
+}
+
 pub(crate) fn compiled_columns(p: &CompiledPredicate, out: &mut Vec<usize>) {
     match p {
         CompiledPredicate::Cmp { lhs, rhs, .. } => {
-            if let PredValue::Col(i) = lhs {
-                out.push(*i);
-            }
-            if let PredValue::Col(i) = rhs {
-                out.push(*i);
-            }
+            operand_columns(lhs, out);
+            operand_columns(rhs, out);
         }
         CompiledPredicate::And(a, b) | CompiledPredicate::Or(a, b) => {
             compiled_columns(a, out);
@@ -190,19 +299,13 @@ pub(crate) fn compiled_columns(p: &CompiledPredicate, out: &mut Vec<usize>) {
         CompiledPredicate::IsNull { col, .. } => out.push(*col),
         CompiledPredicate::Between { col, lo, hi, .. } => {
             out.push(*col);
-            if let PredValue::Col(i) = lo {
-                out.push(*i);
-            }
-            if let PredValue::Col(i) = hi {
-                out.push(*i);
-            }
+            operand_columns(lo, out);
+            operand_columns(hi, out);
         }
         CompiledPredicate::InList { col, vals, .. } => {
             out.push(*col);
             for v in vals {
-                if let PredValue::Col(i) = v {
-                    out.push(*i);
-                }
+                operand_columns(v, out);
             }
         }
         CompiledPredicate::Like { col, .. } => out.push(*col),
@@ -225,8 +328,8 @@ impl CompiledPredicate {
                 // path with full SQLite semantics.
                 if is_cmp_op(*op) {
                     if let (Some(l), Some(r)) = (
-                        pred_int(lhs, row, positions, params),
-                        pred_int(rhs, row, positions, params),
+                        resolve_int(lhs, row, positions, params),
+                        resolve_int(rhs, row, positions, params),
                     ) {
                         return match op {
                             BinaryOp::Eq => l == r,
@@ -269,8 +372,8 @@ impl CompiledPredicate {
                 };
                 if let (Some(x), Some(lo_i), Some(hi_i)) = (
                     v_i,
-                    pred_int(lo, row, positions, params),
-                    pred_int(hi, row, positions, params),
+                    resolve_int(lo, row, positions, params),
+                    resolve_int(hi, row, positions, params),
                 ) {
                     let in_range = x >= lo_i && x <= hi_i;
                     return in_range != *negated;
