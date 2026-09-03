@@ -1031,3 +1031,49 @@ async fn multiple_concurrent_read_transactions() {
         assert_eq!(h.await.unwrap(), 42);
     }
 }
+
+/// Diagnostic companion to `file_backed_pool`: the macOS CI runner has
+/// seen that test lose the LAST insert (COUNT=9 of 10, rows row0..row8)
+/// three runs in a row while every other platform passes. This test runs
+/// the same scenario with a COUNT after EVERY insert, so a CI failure
+/// pinpoints exactly which insert vanishes (and the state dump separates
+/// a lost write from a lost visibility).
+#[tokio::test]
+async fn file_backed_pool_diagnostic() {
+    for round in 0..5 {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("diag.db");
+        let opts = RustqliteConnectOptions::filename(&path).create_if_missing(true);
+        let pool = RustqlitePool::connect_with(opts).await.unwrap();
+        sqlx::query("CREATE TABLE f (id INTEGER PRIMARY KEY, v TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for i in 0..10i64 {
+            sqlx::query("INSERT INTO f (v) VALUES (?)")
+                .bind(format!("row{i}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM f")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if n != i + 1 {
+                let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, v FROM f ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+                let max: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM f")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                panic!(
+                    "round {round}: after insert #{i} COUNT={n} (expected {}); rows={rows:?}; MAX(id)={max:?}",
+                    i + 1
+                );
+            }
+        }
+        pool.close().await;
+    }
+}
