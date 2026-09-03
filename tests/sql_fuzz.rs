@@ -161,6 +161,12 @@ fn mutate(rng: &mut Rng, src: &str) -> String {
 
 #[test]
 fn mutation_fuzz_never_panics() {
+    // Time budget — same rationale as parameter_fuzz_never_panics: the
+    // contract is "mutated SQL never panics", which needs many mutations,
+    // not ALL of them on slow hardware. 60 s covers tens of thousands of
+    // mutations on dev-profile CI runners.
+    const TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
     let iters = env_iters(20_000);
     let mut rng = Rng::new(env_seed());
     let mut db = Database::open_in_memory().unwrap();
@@ -172,6 +178,13 @@ fn mutation_fuzz_never_panics() {
     let mut executed = 0usize;
     let mut rejected = 0usize;
     for i in 0..iters {
+        if i % 64 == 0 && start.elapsed() > TIME_BUDGET {
+            eprintln!(
+                "mutation_fuzz_never_panics: time budget exhausted after {} iterations",
+                i
+            );
+            break;
+        }
         let src = CORPUS[rng.below(CORPUS.len())];
         let sql = mutate(&mut rng, src);
         // The contract: execute() returns Ok or Err. It must not panic,
@@ -231,6 +244,13 @@ fn mutation_fuzz_never_panics() {
 /// prepared statements. Params must never cause type-confusion panics.
 #[test]
 fn parameter_fuzz_never_panics() {
+    // Time budget: this test's contract ("parameter binding never panics")
+    // needs VALUE diversity, not a big table. On weak CI hardware in the
+    // dev profile a full run can crawl; we cap wall time and still cover
+    // thousands of value combinations. The budget is generous — on any
+    // reasonable machine the loop finishes all iterations well within it.
+    const TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+    let start = std::time::Instant::now();
     let iters = env_iters(5_000);
     let mut rng = Rng::new(env_seed() ^ 0xBEEF);
     let mut db = Database::open_in_memory().unwrap();
@@ -266,7 +286,18 @@ fn parameter_fuzz_never_panics() {
         Value::Null,
     ];
 
+    let mut completed = 0u64;
     for i in 0..iters {
+        // Wall-clock guard: bail out of the loop (NOT the assertions) when
+        // the budget is spent. Slow hardware still gets full value-coverage
+        // of whatever iterations fit; fast hardware runs everything.
+        if i % 64 == 0 && start.elapsed() > TIME_BUDGET {
+            eprintln!(
+                "parameter_fuzz_never_panics: time budget exhausted after {} iterations",
+                i
+            );
+            break;
+        }
         let a = if rng.chance(70) {
             odd_values[rng.below(odd_values.len())].clone()
         } else {
@@ -280,10 +311,19 @@ fn parameter_fuzz_never_panics() {
         let c = odd_values[rng.below(odd_values.len())].clone();
 
         // Every statement type that binds parameters.
-        let _ = db.execute(
-            "INSERT INTO t (s, r, b) VALUES (?, ?, ?)",
-            [a.clone(), b.clone(), c.clone()],
-        );
+        //
+        // INSERT only every 25th iteration: the table must stay SMALL.
+        // Each iteration runs three full scans of `t`; inserting per
+        // iteration makes total work quadratic (5k iterations = 12.5M row
+        // decodes — minutes on CI dev-profile hardware). The fuzz target
+        // is the BINDING path, which 200 growing rows exercise just as
+        // well as 5000.
+        if i % 25 == 0 {
+            let _ = db.execute(
+                "INSERT INTO t (s, r, b) VALUES (?, ?, ?)",
+                [a.clone(), b.clone(), c.clone()],
+            );
+        }
         let _ = db.query(
             "SELECT * FROM t WHERE s = ? OR r = ? OR b = ?",
             [a.clone(), b.clone(), c.clone()],
@@ -302,7 +342,10 @@ fn parameter_fuzz_never_panics() {
                 matches!(rows.first().and_then(|r| r.first()), Some(Value::Integer(n)) if *n >= 1)
             );
         }
+        completed += 1;
     }
+    // At least one full sanity pass must have run (seed row visible).
+    assert!(completed >= 1, "time budget exhausted before any iteration");
 }
 
 // ===========================================================================

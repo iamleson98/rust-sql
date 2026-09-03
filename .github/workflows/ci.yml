@@ -136,12 +136,13 @@ jobs:
       # redundancy in the old plain `cargo test` matrix.
       - name: cargo test (${{ matrix.config }})
         run: |
-          DOC_FLAGS=""
-          if [ "${{ matrix.config }}" = "default" ]; then
-            DOC_FLAGS="--doc"
-          fi
+          # NOTE: cargo forbids mixing --doc with --lib/--tests, so doc-tests
+          # run as a separate invocation (default config only, once).
           case "${{ matrix.config }}" in
-            default)     cargo test --lib --tests $DOC_FLAGS ;;
+            default)
+              cargo test --lib --tests
+              cargo test --doc
+              ;;
             sqlx)        cargo test --lib --tests --features sqlx ;;
             no-default)  cargo test --lib --tests --no-default-features ;;
           esac

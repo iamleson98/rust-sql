@@ -1753,28 +1753,66 @@ impl Database {
     /// Open an in-memory database (no file). The data is lost when the
     /// `Database` is dropped.
     ///
-    /// Uses a tempfile under the hood — but tells the pager to skip fsyncs
-    /// since the file lives on tmpfs and will be deleted on close. This
-    /// makes `:memory:` mode match SQLite's `:memory:` per-statement
-    /// overhead (no fsync syscall round-trip per auto-commit INSERT,
-    /// which was the dominant cost in the 4× INSERT gap vs SQLite).
+    /// PURE in-memory: the page image lives in a `Vec<u8>` inside the
+    /// pager — no temp file is ever created, opened, written, or unlinked.
+    /// (The old tempfile-backed scheme cost 50-100 µs per open on Linux
+    /// tmpfs and several hundred µs on macOS APFS, which dominated every
+    /// open-per-iteration workload. SQLite's `:memory:` is fully
+    /// file-free; this now matches it.)
+    ///
+    /// `skip_fsync` and `lazy_writeback` are armed before the header is
+    /// even written, so initialization and per-statement flushes cost
+    /// plain memory copies — no syscalls, no fsync round-trips.
     pub fn open_in_memory() -> Result<Self> {
         let path = PathBuf::from(":memory:");
-        // Use a temp file under the hood — we don't support pure in-memory yet.
-        let tmp = tempfile::NamedTempFile::new().map_err(Error::Io)?;
-        // memory=true: skip_fsync is armed BEFORE the header write, so the
-        // initial flush inside `open` costs a plain write() — no fsync
-        // (which was 0.4-10 ms per open depending on OS/filesystem and
-        // dominated every open-per-iteration benchmark row).
-        let mut db = Self::open_inner(tmp.path(), None, true)?;
+        let mut db = Self::open_memory_inner()?;
         db.path = path;
-        db.pager.set_skip_fsync(true);
-        // Lazy write-back: per-statement flushes skip file writes entirely;
-        // dirty pages spill to the temp file only on cache eviction. The
-        // file is deleted on close, so this is pure win: autocommit
-        // INSERTs in :memory: mode drop the write() syscall per statement.
-        db.pager.set_lazy_writeback(true);
         Ok(db)
+    }
+
+    /// Constructor for `open_in_memory` that skips the path bookkeeping
+    /// (the pager already names itself `:memory:`).
+    fn open_memory_inner() -> Result<Self> {
+        crate::engine_init();
+        let pager = Pager::open_memory(DEFAULT_CACHE_PAGES)?;
+        let mut catalog = Catalog::new();
+        catalog.schema_cookie = pager.schema_cookie();
+        load_schema(&pager, &mut catalog)?;
+        let mut schema_root_pages = HashMap::new();
+        for (name, t) in catalog.all_tables() {
+            schema_root_pages.insert(format!("table:{}", name), t.root_page);
+        }
+        for (name, i) in catalog.all_indexes() {
+            schema_root_pages.insert(format!("index:{}", name), i.root_page);
+        }
+        Ok(Self {
+            pager,
+            catalog,
+            path: PathBuf::from(":memory:"),
+            in_transaction: AtomicBool::new(false),
+            txn_snapshot: Mutex::new(None),
+            savepoint_maps: Mutex::new(Vec::new()),
+            savepoint_txn: AtomicBool::new(false),
+            maps: RwLock::new(empty_maps()),
+            maps_populated: AtomicBool::new(false),
+            write_epoch: AtomicU64::new(0),
+            table_count_cache: RwLock::new(HashMap::new()),
+            alloc_burst: AtomicU64::new(0),
+            schema_root_pages: Mutex::new(schema_root_pages),
+            stmt_cache: RwLock::new(StmtCacheMap::default()),
+            last_stmt: RwLock::new(None),
+            stmt_cache_order: Mutex::new(Vec::new()),
+            stmt_cache_capacity: DEFAULT_STMT_CACHE_CAPACITY,
+            seen_hashes: Mutex::new(std::collections::HashSet::default()),
+            seen_hashes_cap: 4096,
+            deferred_flush: AtomicBool::new(false),
+            deferred_flush_threshold: 1000,
+            last_rowid: AtomicI64::new(0),
+            insert_chain: Mutex::new(None),
+            insert_chain_hot: AtomicBool::new(false),
+            plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
+            has_plugins: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Set the statement cache capacity. A larger cache uses more memory but

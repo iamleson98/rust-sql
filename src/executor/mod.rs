@@ -11424,70 +11424,93 @@ fn process_update_row(
     // payload. Falls back to the generic path below on ANY mismatch
     // (size change, missing column, decode error) — the generic body
     // re-decodes the full row, so correctness is identical.
+    //
+    // SINGLE header walk + SINGLE payload copy: the record header is
+    // walked once (row_column_regions_into) to get every column's
+    // (offset, len) region; the wanted columns decode straight from
+    // those regions; the arena gets ONE copy of the old payload with
+    // the assigned regions patched in place. (The previous shape walked
+    // the header twice and copied the payload twice — ~25-40 ns/row on
+    // UPDATE-range-shaped workloads.)
     if let Some(pc) = patch {
-        if decode_row_selective_wide(
+        if crate::storage::row_codec::row_column_regions_into(
             payload,
             n_cols,
-            &pc.wanted,
-            rowid,
             table.rowid_alias,
-            row_buf,
-        )
-        .is_ok()
-        {
-            let keep = match (residual_pred, compiled_pred) {
-                (None, _) => true,
-                (Some(_), Some(cp)) => cp.eval(row_buf, IDENTITY_POSITIONS, params),
-                (Some(_), None) => false, // eligibility guaranteed a compiled residual
-            };
-            if !keep {
-                return Ok(());
+            &mut pc.regions,
+        ) {
+            // Decode ONLY the wanted columns, directly from their regions.
+            row_buf.clear();
+            row_buf.resize(n_cols, Value::Null);
+            let mut decode_ok = true;
+            for &col in &pc.wanted {
+                if table.rowid_alias == Some(col) {
+                    row_buf[col] = Value::Integer(rowid);
+                } else {
+                    let (roff, rlen) = pc.regions[col];
+                    match Value::decode(&payload[roff as usize..(roff + rlen) as usize]) {
+                        Ok((v, _)) => row_buf[col] = v,
+                        Err(_) => {
+                            decode_ok = false;
+                            break;
+                        }
+                    }
+                }
             }
-            // Stage the encoded new values.
-            pc.staging.clear();
-            pc.slot_regions.clear();
-            for (i, (col_idx, _)) in assignments.iter().enumerate() {
-                let v = match compiled.and_then(|c| c.get(i)) {
-                    Some(Some(cexpr)) => cexpr.eval(row_buf, params),
-                    _ => Value::Null, // eligibility guaranteed Some — unreachable
+            if decode_ok {
+                let keep = match (residual_pred, compiled_pred) {
+                    (None, _) => true,
+                    (Some(_), Some(cp)) => cp.eval(row_buf, IDENTITY_POSITIONS, params),
+                    (Some(_), None) => false, // eligibility guaranteed a compiled residual
                 };
-                let v = table.columns[*col_idx].affinity.coerce(v);
-                let off = pc.staging.len();
-                v.encode_into(&mut pc.staging);
-                pc.slot_regions.push((off, pc.staging.len() - off));
-            }
-            // Patch the old payload's byte regions.
-            if crate::storage::row_codec::row_column_regions_into(
-                payload,
-                n_cols,
-                table.rowid_alias,
-                &mut pc.regions,
-            ) {
-                // Start from a byte copy of the old payload; assigned
-                // regions are overwritten below.
-                payload_buf.clear();
-                payload_buf.extend_from_slice(payload);
+                if !keep {
+                    return Ok(());
+                }
+                // Stage the encoded new values.
+                pc.staging.clear();
+                pc.slot_regions.clear();
+                for (i, (col_idx, _)) in assignments.iter().enumerate() {
+                    let v = match compiled.and_then(|c| c.get(i)) {
+                        Some(Some(cexpr)) => cexpr.eval(row_buf, params),
+                        _ => Value::Null, // eligibility guaranteed Some — unreachable
+                    };
+                    let v = table.columns[*col_idx].affinity.coerce(v);
+                    let off = pc.staging.len();
+                    v.encode_into(&mut pc.staging);
+                    pc.slot_regions.push((off, pc.staging.len() - off));
+                }
+                // All assigned regions must keep their encoded size for
+                // the in-place patch to work.
                 let mut sizes_match = true;
-                for (col, (roff, rlen)) in pc.regions.iter().enumerate() {
+                for (col, (_roff, rlen)) in pc.regions.iter().enumerate() {
                     if let Some(slot) = pc.assigned_slot.get(col).and_then(|s| *s) {
-                        let (soff, slen) = pc.slot_regions[slot];
+                        let (_soff, slen) = pc.slot_regions[slot];
                         if slen as u32 != *rlen {
                             sizes_match = false;
                             break;
                         }
-                        payload_buf[(*roff as usize)..(*roff as usize + *rlen as usize)]
-                            .copy_from_slice(&pc.staging[soff..soff + slen]);
                     }
                 }
                 if sizes_match {
+                    // ONE payload copy — into the arena — then patch the
+                    // assigned regions in place.
                     let start = update_arena.len();
-                    update_arena.extend_from_slice(payload_buf);
+                    update_arena.extend_from_slice(payload);
+                    for (col, (roff, rlen)) in pc.regions.iter().enumerate() {
+                        if let Some(slot) = pc.assigned_slot.get(col).and_then(|s| *s) {
+                            let (soff, slen) = pc.slot_regions[slot];
+                            update_arena[start + *roff as usize..start + (*roff + *rlen) as usize]
+                                .copy_from_slice(&pc.staging[soff..soff + slen]);
+                        }
+                    }
                     updates.push((rowid, start..update_arena.len(), old_payload_stash));
                     return Ok(());
                 }
+                // Fall through — the generic path re-decodes the full row.
             }
             // Fall through — the generic path re-decodes the full row.
         }
+        // Fall through — the generic path re-decodes the full row.
     }
     row_buf.clear();
     if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {

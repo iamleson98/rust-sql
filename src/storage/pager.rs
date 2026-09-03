@@ -270,8 +270,138 @@ pub struct WalState {
 /// count).
 const WAL_AUTOCHECKPOINT_FRAMES: u32 = 1000;
 
+/// Backing store for the pager: either a real file (positioned I/O) or a
+/// pure in-memory byte image (`:memory:` databases).
+///
+/// The memory store eliminates ALL file syscalls from the `:memory:`
+/// open/write path. The old tempfile-backed scheme paid
+/// open+create+stat+write+unlink per `Database::open_in_memory()` —
+/// 50-100 µs on Linux tmpfs, and far worse on macOS APFS (file creation
+/// there is markedly slower), which dominated every workload that opens
+/// a throwaway database per iteration (bench harnesses, tests, probes).
+enum Store {
+    File(File),
+    Memory(std::sync::Mutex<Vec<u8>>),
+}
+
+impl Store {
+    /// Positioned read so multiple threads can read without serializing
+    /// on a file offset. Returns the number of bytes read (0 at EOF).
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Store::File(f) => {
+                use std::os::unix::fs::FileExt;
+                f.read_at(buf, offset)
+            }
+            #[cfg(windows)]
+            Store::File(f) => {
+                use std::os::windows::fs::FileExt;
+                f.seek_read(buf, offset)
+            }
+            Store::Memory(m) => {
+                let m = m.lock().unwrap_or_else(|e| e.into_inner());
+                let off = offset as usize;
+                if off >= m.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(m.len() - off);
+                buf[..n].copy_from_slice(&m[off..off + n]);
+                Ok(n)
+            }
+        }
+    }
+
+    /// Positioned write (pread/pwrite analogue). The memory image grows
+    /// on demand, zero-filling any gap — same semantics as writing at an
+    /// offset past EOF on a sparse file.
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Store::File(f) => {
+                use std::os::unix::fs::FileExt;
+                f.write_all_at(buf, offset)
+            }
+            #[cfg(windows)]
+            Store::File(f) => {
+                use std::os::windows::fs::FileExt;
+                let mut done = 0usize;
+                while done < buf.len() {
+                    let n = f.seek_write(&buf[done..], offset + done as u64)?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        ));
+                    }
+                    done += n;
+                }
+                Ok(())
+            }
+            Store::Memory(m) => {
+                let mut m = m.lock().unwrap_or_else(|e| e.into_inner());
+                let off = offset as usize;
+                let end = off + buf.len();
+                if end > m.len() {
+                    m.resize(end, 0);
+                }
+                m[off..end].copy_from_slice(buf);
+                Ok(())
+            }
+        }
+    }
+
+    /// Current image length in bytes.
+    fn len(&self) -> std::io::Result<u64> {
+        match self {
+            Store::File(f) => Ok(f.metadata()?.len()),
+            Store::Memory(m) => Ok(m.lock().unwrap_or_else(|e| e.into_inner()).len() as u64),
+        }
+    }
+
+    /// Truncate or zero-extend the image.
+    fn set_len(&self, n: u64) -> std::io::Result<()> {
+        match self {
+            Store::File(f) => f.set_len(n),
+            Store::Memory(m) => {
+                m.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .resize(n as usize, 0);
+                Ok(())
+            }
+        }
+    }
+
+    /// Durability barrier. Pure no-op for the memory store (nothing to
+    /// sync — the image IS the durable state for as long as the pager
+    /// lives, and it is deleted on drop by design).
+    fn sync_all(&self) -> std::io::Result<()> {
+        match self {
+            Store::File(f) => f.sync_all(),
+            Store::Memory(_) => Ok(()),
+        }
+    }
+
+    /// `std::fs::Metadata` for file-backed stores. Memory stores have no
+    /// meaningful fs metadata — callers treat the error as "file-shape
+    /// checks don't apply" (e.g. integrity_check's truncation probe).
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        match self {
+            Store::File(f) => f.metadata(),
+            Store::Memory(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "in-memory store has no file metadata",
+            )),
+        }
+    }
+
+    fn is_memory(&self) -> bool {
+        matches!(self, Store::Memory(_))
+    }
+}
+
 pub struct Pager {
-    file: File,
+    store: Store,
     path: PathBuf,
     /// Page size in bytes (immutable after `open`).
     page_size: AtomicU32,
@@ -520,9 +650,9 @@ impl Pager {
         self.schema_cookie
             .store(base.schema_cookie, Ordering::Release);
         let target_size = base.n_pages as u64 * self.page_size() as u64;
-        if let Ok(meta) = self.file.metadata() {
-            if meta.len() > target_size {
-                self.file.set_len(target_size)?;
+        if let Ok(len) = self.store.len() {
+            if len > target_size {
+                self.store.set_len(target_size)?;
             }
         }
         // Phase 5: restored content differs from disk → restored pages are
@@ -628,9 +758,36 @@ impl Pager {
             // demand); truncation would destroy the database.
             .truncate(false)
             .open(&path)?;
+        Self::from_store(Store::File(file), path, cache_capacity, skip_sync)
+    }
 
+    /// Open a PURE in-memory pager: no file is ever created, opened,
+    /// written, or unlinked. The page image lives in a `Vec<u8>` that
+    /// grows on demand (spill target for cache eviction) and is dropped
+    /// with the pager. `skip_fsync` and `lazy_writeback` come pre-armed —
+    /// the durability flags are meaningless when there is no file.
+    ///
+    /// This replaces the old tempfile-backed `:memory:` scheme, whose
+    /// open cost (create+stat+write+unlink) ranged from ~50 µs on Linux
+    /// tmpfs to several hundred µs on macOS APFS and dominated every
+    /// per-iteration-open workload.
+    pub fn open_memory(cache_capacity: usize) -> Result<Self> {
+        let store = Store::Memory(std::sync::Mutex::new(Vec::new()));
+        let path = PathBuf::from(":memory:");
+        let pager = Self::from_store(store, path, cache_capacity, true)?;
+        pager.lazy_writeback.store(true, Ordering::Release);
+        Ok(pager)
+    }
+
+    /// Shared constructor from an already-built backing store.
+    fn from_store(
+        store: Store,
+        path: PathBuf,
+        cache_capacity: usize,
+        skip_sync: bool,
+    ) -> Result<Self> {
         let pager = Self {
-            file,
+            store,
             path,
             page_size: AtomicU32::new(DEFAULT_PAGE_SIZE),
             n_pages: AtomicU32::new(0),
@@ -663,7 +820,7 @@ impl Pager {
             required_codec: Mutex::new(None),
         };
 
-        let file_size = pager.file.metadata()?.len();
+        let file_size = pager.store.len()?;
         if file_size == 0 {
             pager.is_new.store(true, Ordering::Release);
             pager.initialize_new_db()?;
@@ -674,13 +831,17 @@ impl Pager {
             // WAL mode and makes those frames visible through the page map
             // (WAL-served reads) — committed data survives an unclean
             // shutdown, torn transactions are discarded at frame level.
-            let wal_file = crate::storage::wal::wal_path_for(&pager.path);
-            if wal_file.exists()
-                && std::fs::metadata(&wal_file)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-            {
-                pager.enable_wal()?;
+            // Memory stores have no sidecar WAL (enable_wal is a no-op
+            // there), so the probe only runs for file-backed pagers.
+            if !pager.store.is_memory() {
+                let wal_file = crate::storage::wal::wal_path_for(&pager.path);
+                if wal_file.exists()
+                    && std::fs::metadata(&wal_file)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                {
+                    pager.enable_wal()?;
+                }
             }
         }
         Ok(pager)
@@ -714,7 +875,7 @@ impl Pager {
         // an fsync here costs ~0.4 ms on CI Linux, ~1.5 ms on macOS and
         // ~10 ms on Windows per open, and buys nothing.
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.file.sync_all()?;
+            self.store.sync_all()?;
         }
         self.n_pages.store(1, Ordering::Release);
         self.page_size.store(page_size, Ordering::Release);
@@ -779,7 +940,7 @@ impl Pager {
         self.schema_cookie.store(schema_cookie, Ordering::Release);
 
         // Verify file size matches the claimed page count.
-        let actual_size = self.file.metadata()?.len();
+        let actual_size = self.store.len()?;
         let expected_size = n_pages as u64 * page_size as u64;
         if actual_size < expected_size {
             return Err(Error::corruption(format!(
@@ -839,11 +1000,11 @@ impl Pager {
             .copy_from_slice(&0u32.to_be_bytes());
         // Truncate the file to exactly one page at the NEW size: the old
         // header page may have been larger (or the file smaller).
-        let _ = self.file.set_len(size as u64);
+        let _ = self.store.set_len(size as u64);
         if self.write_file_at(0, &page0.data).is_err() {
             return false;
         }
-        let _ = self.file.sync_all();
+        let _ = self.store.sync_all();
         self.page_size.store(size, Ordering::Release);
         true
     }
@@ -867,7 +1028,7 @@ impl Pager {
     /// Metadata of the underlying database file (size, mtime). Used by
     /// `PRAGMA integrity_check` to validate the file's shape.
     pub fn file_metadata(&self) -> Result<std::fs::Metadata> {
-        Ok(self.file.metadata()?)
+        Ok(self.store.metadata()?)
     }
 
     pub fn schema_cookie(&self) -> u32 {
@@ -1231,6 +1392,14 @@ impl Pager {
                 return Ok(()); // already in WAL mode
             }
         }
+        // A pure in-memory pager has no main file, so there is no place
+        // for a sidecar -wal file to live. SQLite likewise reports
+        // `journal_mode=memory` (and rejects WAL) for :memory: databases.
+        if self.store.is_memory() {
+            return Err(crate::error::Error::semantic(
+                "journal_mode=WAL is unavailable for in-memory databases",
+            ));
+        }
         if self.codec.read().is_active() {
             return Err(crate::error::Error::semantic(
                 "journal_mode=WAL is unavailable while a page codec is active",
@@ -1295,12 +1464,12 @@ impl Pager {
         // may be shorter than the committed page count — new pages live
         // only in the WAL until now).
         let want_len = self.n_pages.load(Ordering::Acquire) as u64 * psz as u64;
-        let cur_len = self.file.metadata()?.len();
+        let cur_len = self.store.len()?;
         if want_len > cur_len {
-            self.file.set_len(want_len)?;
+            self.store.set_len(want_len)?;
         }
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.file.sync_all()?;
+            self.store.sync_all()?;
         }
         state.wal.reset()?;
         state.map.clear();
@@ -1549,7 +1718,7 @@ impl Pager {
         // Skip the entire call to make in-memory mode match SQLite's `:memory:`
         // performance.
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.file.sync_all()?;
+            self.store.sync_all()?;
         }
         self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
@@ -1638,9 +1807,9 @@ impl Pager {
 
         // 3. Truncate the file back if pages were allocated during the txn.
         let target_size = snap.n_pages as u64 * self.page_size() as u64;
-        let current_size = self.file.metadata()?.len();
+        let current_size = self.store.len()?;
         if current_size > target_size {
-            self.file.set_len(target_size)?;
+            self.store.set_len(target_size)?;
         }
 
         // 4. Reset the dirty counter.
@@ -1773,43 +1942,17 @@ impl Pager {
     }
 
     // ----- File I/O helpers: positioned I/O so multiple threads can
-    //       read/write without serializing on the file offset. -----
+    //       read/write without serializing on the file offset. Both route
+    //       through the `Store` enum — the OS-specific positioned-I/O APIs
+    //       (pread/pwrite vs seek_read/seek_write) live in `Store`, and the
+    //       memory store serves reads/writes from its byte image. -----
 
-    #[cfg(unix)]
     fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
-        Ok(self.file.read_at(buf, offset)?)
+        Ok(self.store.read_at(offset, buf)?)
     }
 
-    #[cfg(unix)]
     fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.write_all_at(buf, offset)?;
-        Ok(())
-    }
-
-    // Windows: `FileExt::seek_read` / `seek_write` are the positioned-I/O
-    // equivalents of pread/pwrite (they take &self, so reads stay lock-free).
-    #[cfg(windows)]
-    fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        use std::os::windows::fs::FileExt;
-        Ok(self.file.seek_read(buf, offset)?)
-    }
-
-    #[cfg(windows)]
-    fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        use std::os::windows::fs::FileExt;
-        let mut done = 0usize;
-        while done < buf.len() {
-            let n = self.file.seek_write(&buf[done..], offset + done as u64)?;
-            if n == 0 {
-                return Err(crate::error::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                )));
-            }
-            done += n;
-        }
+        self.store.write_all_at(offset, buf)?;
         Ok(())
     }
 }
