@@ -56,6 +56,11 @@ path = "examples/probe_mv_breakdown.rs"
 name = "probe_open_cost"
 path = "examples/probe_open_cost.rs"
 
+# Scan-cost isolation: walk vs decode vs materialize (pinned + unpinned).
+[[example]]
+name = "probe_scan_cost"
+path = "examples/probe_scan_cost.rs"
+
 # sqlx driver-vs-driver benchmark: native rustqlite driver vs sqlx-sqlite
 # (C SQLite) through the identical sqlx API.
 # Run: cargo run --release --example bench_sqlx_native --features sqlx

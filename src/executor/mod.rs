@@ -2573,7 +2573,137 @@ fn exec_scan(
     let rowid_alias = table.rowid_alias;
     let n_cols = table.n_columns();
     bt.scan_table_borrowed(|rowid, payload| {
-        if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+        // Fused inline serial decode — semantics identical to
+        // `decode_row` (short rows pad NULL, alias column materializes
+        // from the B+tree key, corrupt rows are skipped), but the tag
+        // dispatch happens inline in the scan loop: no per-value
+        // Result wrap, no re-entrant length walk, direct Value writes.
+        let mut row: Vec<Value> = Vec::with_capacity(n_cols);
+        let mut pos = 0usize;
+        let mut col = 0usize;
+        let mut ok = true;
+        while col < n_cols {
+            if Some(col) == rowid_alias {
+                row.push(Value::Integer(rowid));
+                pos += 1; // 0x09 marker (short rows: harmlessly past end)
+                col += 1;
+                continue;
+            }
+            if pos >= payload.len() {
+                // Short row (ALTER TABLE ADD COLUMN): pad NULLs.
+                while row.len() < n_cols {
+                    row.push(Value::Null);
+                }
+                break;
+            }
+            let tag = payload[pos];
+            let rest = &payload[pos + 1..];
+            match tag {
+                0x00 => {
+                    row.push(Value::Null);
+                    pos += 1;
+                }
+                0x01 => {
+                    row.push(Value::Integer(0));
+                    pos += 1;
+                }
+                0x02 => {
+                    if rest.is_empty() {
+                        ok = false;
+                        break;
+                    }
+                    row.push(Value::Integer(rest[0] as i8 as i64));
+                    pos += 2;
+                }
+                0x03 => {
+                    if rest.len() < 2 {
+                        ok = false;
+                        break;
+                    }
+                    row.push(Value::Integer(i16::from_le_bytes([rest[0], rest[1]]) as i64));
+                    pos += 3;
+                }
+                0x04 => {
+                    if rest.len() < 4 {
+                        ok = false;
+                        break;
+                    }
+                    row.push(Value::Integer(
+                        i32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as i64,
+                    ));
+                    pos += 5;
+                }
+                0x05 => {
+                    if rest.len() < 8 {
+                        ok = false;
+                        break;
+                    }
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&rest[..8]);
+                    row.push(Value::Integer(i64::from_le_bytes(b)));
+                    pos += 9;
+                }
+                0x06 => {
+                    if rest.len() < 8 {
+                        ok = false;
+                        break;
+                    }
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&rest[..8]);
+                    row.push(Value::Real(f64::from_le_bytes(b)));
+                    pos += 9;
+                }
+                0x07 | 0x08 => match crate::types::value::decode_uvarint(rest) {
+                    Ok((len, n)) => {
+                        let len = len as usize;
+                        if rest.len() < n + len {
+                            ok = false;
+                            break;
+                        }
+                        let body = &rest[n..n + len];
+                        if tag == 0x07 {
+                            match crate::types::text::Text::from_utf8(body) {
+                                Ok(t) => row.push(Value::Text(t)),
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            row.push(Value::Blob(body.to_vec()));
+                        }
+                        pos += 1 + n + len;
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                },
+                0x09 => {
+                    // Alias marker at an unexpected position: NULL (same
+                    // as Value::decode).
+                    row.push(Value::Null);
+                    pos += 1;
+                }
+                0x0A => match crate::types::value::decode_uvarint(rest) {
+                    Ok((z, n)) => {
+                        let i = ((z >> 1) as i64) ^ -((z & 1) as i64);
+                        row.push(Value::Real(i as f64));
+                        pos += 1 + n;
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                },
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+            col += 1;
+        }
+        if ok && row.len() == n_cols {
             rows.push(row);
         }
         true
@@ -3695,6 +3825,20 @@ fn exec_aggregate_streaming_scan(
 
     if selective_eligible {
         // ==== Fully vectorized path: selective decode + direct indexing ====
+        // Per-agg decode positions + COUNT(*) flags resolved ONCE (was a
+        // `wanted.iter().position()` scan + Value clone per agg per row).
+        let agg_pos_gb: Vec<Option<usize>> = agg_col_indices
+            .iter()
+            .map(|widx| widx.and_then(|c| wanted.iter().position(|x| *x == c)))
+            .collect();
+        let agg_count_star_gb: Vec<bool> = aggregates.iter().map(|a| a.arg.is_none()).collect();
+        let key_pos_gb: Vec<usize> = key_col_indices
+            .iter()
+            .map(|k| {
+                k.and_then(|c| wanted.iter().position(|x| *x == c))
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
         let rowid_alias = table.rowid_alias;
         bt.scan_table_borrowed(|rowid, payload| {
             if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
@@ -3702,12 +3846,10 @@ fn exec_aggregate_streaming_scan(
             {
                 return true; // skip corrupt rows
             }
-            // Build the group key from the decoded slice. Map each group-by
-            // column index to its position in `wanted` (both sides are
-            // precomputed; the find is a tiny scan over a few entries).
+            // Build the group key from the decoded slice (positions
+            // precomputed above — direct index, no per-row search).
             key_buf.clear();
-            for kidx in key_col_indices.iter().map(|x| x.unwrap()) {
-                let pos = wanted.iter().position(|x| *x == kidx).unwrap_or(usize::MAX);
+            for &pos in key_pos_gb.iter() {
                 key_buf.push(if pos != usize::MAX && pos < sel_buf.len() {
                     sel_buf[pos].clone()
                 } else {
@@ -3718,23 +3860,20 @@ fn exec_aggregate_streaming_scan(
             if grouper.groups[gi].1.is_empty() {
                 grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
             }
-            for (i, agg) in aggregates.iter().enumerate() {
-                let arg_val = match agg_col_indices[i] {
-                    Some(aidx) => {
-                        let pos = wanted.iter().position(|x| *x == aidx).unwrap_or(usize::MAX);
-                        if pos != usize::MAX && pos < sel_buf.len() {
-                            sel_buf[pos].clone()
-                        } else {
-                            Value::Null
-                        }
+            for i in 0..aggregates.len() {
+                let arg_val: &Value = if agg_count_star_gb[i] {
+                    &COUNT_STAR_ARG // COUNT(*): constant placeholder, no evaluation
+                } else {
+                    match agg_pos_gb[i] {
+                        Some(pos) if pos < sel_buf.len() => &sel_buf[pos],
+                        _ => &Value::Null,
                     }
-                    None => Value::Integer(1), // COUNT(*)
                 };
                 update_agg_state(
                     &mut grouper.groups[gi].1[i],
                     agg_funcs[i],
-                    &arg_val,
-                    agg.distinct,
+                    arg_val,
+                    aggregates[i].distinct,
                 );
             }
             true
@@ -3993,28 +4132,581 @@ fn finish_group_result(
 /// shared so the fast path doesn't build a fresh Value per row.
 static COUNT_STAR_ARG: Value = Value::Integer(1);
 
-/// Vectorized fast path for `SELECT <aggregates> FROM t [WHERE pred]`
-/// (no GROUP BY). Key optimizations vs the generic streaming-scan path:
-///
-/// 1. **No HashMap of groups** — only one group, so we accumulate directly
-///    into a `Vec<AggState>`. Saves the per-row String key formatting
-///    (which was ~200 ns/row on a 4-column table — 4× Debug-formatted
-///    Values + a join("|") allocation).
-///
-/// 2. **Column index resolution upfront** — if every aggregate's arg is a
-///    bare `Expr::Column`, we resolve the column index ONCE before the
-///    scan, and during the scan we read `row_buf[idx]` directly (a Vec
-///    index, ~1 ns) instead of calling `eval_row` (which does name lookup
-///    + type coercion + Result wrapping, ~100 ns/row).
-///
-/// 3. **No per-row column-name formatting** — we only build the column-name
-///    Vec if we actually need it (filter predicate or non-Column aggregate
-///    args). For `SELECT SUM(x), COUNT(*) FROM t` (no predicate), we never
-///    build it.
-///
-/// Together these optimizations cut the per-row overhead by ~10x for the
-/// common OLAP case, bringing aggregate scan within ~2x of SQLite (from
-/// the previous ~6x gap).
+// Vectorized fast path for `SELECT <aggregates> FROM t [WHERE pred]`
+// (no GROUP BY). Key optimizations vs the generic streaming-scan path:
+//
+// 1. **No HashMap of groups** — only one group, so we accumulate directly
+//    into a `Vec<AggState>`. Saves the per-row String key formatting
+//    (which was ~200 ns/row on a 4-column table — 4× Debug-formatted
+//    Values + a join("|") allocation).
+//
+// 2. **Column index resolution upfront** — if every aggregate's arg is a
+//    bare `Expr::Column`, we resolve the column index ONCE before the
+//    scan, and during the scan we read `row_buf[idx]` directly (a Vec
+//    index, ~1 ns) instead of calling `eval_row` (which does name lookup
+//    + type coercion + Result wrapping, ~100 ns/row).
+//
+// 3. **No per-row column-name formatting** — we only build the column-name
+//    Vec if we actually need it (filter predicate or non-Column aggregate
+//    args). For `SELECT SUM(x), COUNT(*) FROM t` (no predicate), we never
+//    build it.
+//
+// Together these optimizations cut the per-row overhead by ~10x for the
+// common OLAP case, bringing aggregate scan within ~2x of SQLite (from
+// the previous ~6x gap).
+
+// ---------------------------------------------------------------------------
+// Fused typed-aggregate machine (no GROUP BY)
+// ---------------------------------------------------------------------------
+// The generic paths decode each row into `Value`s and dispatch through
+// `update_agg_state`'s enum per aggregate (~14 ns/aggregate/row). For the
+// hot OLAP shape — bare-column COUNT/SUM/MIN/MAX/AVG/TOTAL with an
+// optional `col <op> numeric-literal` filter — this machine decodes the
+// row's serial types INLINE (no Vec<Value>, no per-value Result, no
+// marker/perm machinery) and accumulates directly in typed slots.
+// Falls back to the generic paths on any shape/type it cannot reproduce
+// EXACTLY (distinct, text/blob values, NaN, params, non-column args).
+
+/// A numeric-only cell value (Copy — stack resident).
+#[derive(Clone, Copy)]
+enum NumVal {
+    Null,
+    I(i64),
+    F(f64),
+}
+
+impl NumVal {
+    #[inline]
+    fn as_f64(self) -> f64 {
+        match self {
+            NumVal::I(i) => i as f64,
+            NumVal::F(f) => f,
+            NumVal::Null => 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FusedOp {
+    CountStar,
+    CountCol,
+    Sum,
+    Total,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Clone, Copy)]
+enum FusedCmp {
+    Eq,
+    Neq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+struct FusedFilter {
+    col: usize,
+    lit: NumVal,
+    cmp: FusedCmp,
+}
+
+struct FusedAggSpec {
+    op: FusedOp,
+    /// Decoded-slot position of the argument (None for COUNT(*)).
+    slot: Option<usize>,
+}
+
+/// Maximum distinct argument/filter columns the fused machine handles
+/// (stack array). Wider shapes fall back to the generic paths.
+const FUSED_MAX_COLS: usize = 8;
+
+/// Resolve a bare column reference against `table` with the same
+/// alias-scoping rules the generic paths use.
+fn fused_resolve_col(expr: &Expr, table: &Table, prefix: &str) -> Option<usize> {
+    if let Expr::Column { table: ref_t, name } = expr {
+        let matches_t = ref_t
+            .as_ref()
+            .map(|t| {
+                if prefix == table.name {
+                    t == &table.name || t == prefix
+                } else {
+                    t == prefix
+                }
+            })
+            .unwrap_or(true);
+        if matches_t {
+            table.find_column(name)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Extract `col <op> numeric-literal` (either operand order) from a
+/// predicate. `None` = not a supported simple numeric comparison.
+fn fused_filter_of(pred: &Expr, table: &Table, prefix: &str) -> Option<FusedFilter> {
+    if let Expr::Binary { op, left, right } = pred {
+        let cmp = match op {
+            BinaryOp::Eq => FusedCmp::Eq,
+            BinaryOp::NotEq => FusedCmp::Neq,
+            BinaryOp::Lt => FusedCmp::Lt,
+            BinaryOp::LtEq => FusedCmp::LtEq,
+            BinaryOp::Gt => FusedCmp::Gt,
+            BinaryOp::GtEq => FusedCmp::GtEq,
+            _ => return None,
+        };
+        // Literal side must be numeric.
+        let lit_of = |e: &Expr| -> Option<NumVal> {
+            if let Expr::Literal(v) = e {
+                match v {
+                    Value::Integer(i) => Some(NumVal::I(*i)),
+                    Value::Real(f) => Some(NumVal::F(*f)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let (Some(col), Some(lit)) = (fused_resolve_col(left, table, prefix), lit_of(right)) {
+            return Some(FusedFilter { col, lit, cmp });
+        }
+        if let (Some(col), Some(lit)) = (fused_resolve_col(right, table, prefix), lit_of(left)) {
+            // Operand order swapped: mirror the comparison.
+            let cmp = match cmp {
+                FusedCmp::Lt => FusedCmp::Gt,
+                FusedCmp::LtEq => FusedCmp::GtEq,
+                FusedCmp::Gt => FusedCmp::Lt,
+                FusedCmp::GtEq => FusedCmp::LtEq,
+                other => other,
+            };
+            return Some(FusedFilter { col, lit, cmp });
+        }
+    }
+    None
+}
+
+/// Total encoded size of the value starting at `pos` (tag included), or
+/// None when truncated/unknown.
+#[inline]
+fn fused_value_size(buf: &[u8], pos: usize) -> Option<usize> {
+    let tag = *buf.get(pos)?;
+    Some(match tag {
+        0x00 | 0x01 | 0x09 => 1,
+        0x02 => 2,
+        0x03 => 3,
+        0x04 => 5,
+        0x05 | 0x06 => 9,
+        0x07 | 0x08 | 0x0A => {
+            // uvarint length (or zigzag payload for 0x0A) after the tag.
+            let mut i = pos + 1;
+            let mut shift = 0u32;
+            let mut len = 0u64;
+            while i < buf.len() {
+                let b = buf[i];
+                i += 1;
+                if shift >= 64 {
+                    return None;
+                }
+                len |= ((b & 0x7f) as u64) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    let total = (i - pos) as u64 + if tag == 0x0A { 0 } else { len };
+                    return usize::try_from(total)
+                        .ok()
+                        .filter(|&t| pos + t <= buf.len());
+                }
+            }
+            return None;
+        }
+        _ => return None,
+    })
+}
+
+/// Decode the value at `pos` as a numeric cell (tag included in the size).
+#[inline]
+fn fused_decode_num(buf: &[u8], pos: usize) -> Option<(NumVal, usize)> {
+    let tag = *buf.get(pos)?;
+    match tag {
+        0x00 => Some((NumVal::Null, 1)),
+        0x01 => Some((NumVal::I(0), 1)),
+        0x02 => Some((NumVal::I(*buf.get(pos + 1)? as i8 as i64), 2)),
+        0x03 => {
+            let b = buf.get(pos + 1..pos + 3)?;
+            Some((NumVal::I(i16::from_le_bytes([b[0], b[1]]) as i64), 3))
+        }
+        0x04 => {
+            let b = buf.get(pos + 1..pos + 5)?;
+            Some((
+                NumVal::I(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64),
+                5,
+            ))
+        }
+        0x05 => {
+            let b = buf.get(pos + 1..pos + 9)?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(b);
+            Some((NumVal::I(i64::from_le_bytes(a)), 9))
+        }
+        0x06 => {
+            let b = buf.get(pos + 1..pos + 9)?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(b);
+            Some((NumVal::F(f64::from_le_bytes(a)), 9))
+        }
+        0x0A => {
+            let (z, n) = crate::types::value::decode_uvarint(&buf[pos + 1..]).ok()?;
+            let i = ((z >> 1) as i64) ^ -((z & 1) as i64);
+            Some((NumVal::F(i as f64), 1 + n))
+        }
+        // Text / Blob / marker / unknown: the fused machine bails.
+        _ => None,
+    }
+}
+
+/// Try the fused machine. Returns Ok(None) when the shape (or a runtime
+/// value) is unsupported — the caller then uses the generic paths.
+fn try_fused_aggregate(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    alias: Option<&str>,
+    filter_predicate: Option<&Expr>,
+    aggregates: &[AggExpr],
+) -> Result<Option<ExecResult>> {
+    if aggregates.is_empty() {
+        return Ok(None);
+    }
+    let prefix = alias.unwrap_or(&table.name);
+
+    // ---- Shape checks -------------------------------------------------
+    let filter = match filter_predicate {
+        None => None,
+        Some(p) => match fused_filter_of(p, table, prefix) {
+            Some(f) => Some(f),
+            None => return Ok(None),
+        },
+    };
+
+    let mut specs: Vec<FusedAggSpec> = Vec::with_capacity(aggregates.len());
+    // (col, slot) pairs; slots assigned after dedup.
+    let mut wanted_cols: Vec<usize> = Vec::new();
+    if let Some(f) = &filter {
+        wanted_cols.push(f.col);
+    }
+    for agg in aggregates {
+        if agg.distinct {
+            return Ok(None);
+        }
+        let op = match AggFunc::from_name(&agg.func) {
+            AggFunc::Count => match &agg.arg {
+                None => FusedOp::CountStar,
+                Some(_) => FusedOp::CountCol,
+            },
+            AggFunc::Sum => FusedOp::Sum,
+            AggFunc::Total => FusedOp::Total,
+            AggFunc::Avg => FusedOp::Avg,
+            AggFunc::Min => FusedOp::Min,
+            AggFunc::Max => FusedOp::Max,
+            _ => return Ok(None),
+        };
+        let col = match &agg.arg {
+            None => None,
+            Some(arg) => match fused_resolve_col(arg, table, prefix) {
+                Some(c) => Some(c),
+                None => return Ok(None),
+            },
+        };
+        if let Some(c) = col {
+            if !wanted_cols.contains(&c) {
+                wanted_cols.push(c);
+            }
+        }
+        specs.push(FusedAggSpec { op, slot: None });
+    }
+    if wanted_cols.len() > FUSED_MAX_COLS {
+        return Ok(None);
+    }
+    wanted_cols.sort_unstable();
+    wanted_cols.dedup();
+    // Assign slots (position of each column in the decode buffer).
+    let slot_of = |col: usize| wanted_cols.iter().position(|&c| c == col);
+    for (agg, spec) in aggregates.iter().zip(specs.iter_mut()) {
+        if let Some(arg) = &agg.arg {
+            if let Some(c) = fused_resolve_col(arg, table, prefix) {
+                spec.slot = slot_of(c);
+            }
+        }
+    }
+    let filter_slot = filter.as_ref().and_then(|f| slot_of(f.col));
+
+    // ---- Typed accumulators -------------------------------------------
+    #[derive(Clone)]
+    struct FusedAcc {
+        count: u64,
+        i_sum: i64,
+        sum: f64,
+        sum_is_int: bool,
+        seen: bool,
+        min: Option<NumVal>,
+        max: Option<NumVal>,
+    }
+    let mut accs: Vec<FusedAcc> = specs
+        .iter()
+        .map(|_| FusedAcc {
+            count: 0,
+            i_sum: 0,
+            sum: 0.0,
+            sum_is_int: true,
+            seen: false,
+            min: None,
+            max: None,
+        })
+        .collect();
+
+    // Column -> slot lookup table (usize::MAX = not wanted).
+    let n_cols = table.n_columns();
+    let mut col_slot = vec![usize::MAX; n_cols];
+    for (slot, &col) in wanted_cols.iter().enumerate() {
+        col_slot[col] = slot;
+    }
+    let rowid_alias = table.rowid_alias;
+
+    let mut vals = [NumVal::Null; FUSED_MAX_COLS];
+    let mut bailed = false;
+
+    let root = ctx.table_root(table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    bt.scan_table_borrowed(|rowid, payload| {
+        // ---- inline serial walk: decode ONLY wanted numeric columns ----
+        let mut pos = 0usize;
+        let mut col = 0usize;
+        let mut filled = 0usize; // count of slots written this row
+        while pos < payload.len() && col < n_cols {
+            let slot = col_slot[col];
+            if slot == usize::MAX {
+                // Not wanted: skip the whole encoded value.
+                match fused_value_size(payload, pos) {
+                    Some(sz) => {
+                        pos += sz;
+                        col += 1;
+                        continue;
+                    }
+                    None => {
+                        bailed = true;
+                        return false;
+                    }
+                }
+            }
+            if Some(col) == rowid_alias {
+                // Rowid-alias column: value is the B+tree key.
+                vals[slot] = NumVal::I(rowid);
+                filled += 1;
+                pos += 1; // the 0x09 marker byte (or absent — short rows)
+                col += 1;
+                continue;
+            }
+            match fused_decode_num(payload, pos) {
+                Some((v, sz)) => {
+                    if let NumVal::F(f) = v {
+                        if f.is_nan() {
+                            // NaN ordering semantics live in Value::Ord —
+                            // reproduce them through the generic path.
+                            bailed = true;
+                            return false;
+                        }
+                    }
+                    vals[slot] = v;
+                    filled += 1;
+                    pos += sz;
+                    col += 1;
+                }
+                None => {
+                    // Text/Blob/truncated: the generic path handles these
+                    // (with text coercion semantics) — bail.
+                    bailed = true;
+                    return false;
+                }
+            }
+        }
+        // Short rows (ALTER TABLE ADD COLUMN): remaining wanted cols are NULL.
+        let _ = filled;
+
+        // ---- filter ----
+        if let (Some(f), Some(fslot)) = (&filter, filter_slot) {
+            let v = vals[fslot];
+            let pass = match (v, f.lit) {
+                (NumVal::I(a), NumVal::I(b)) => match f.cmp {
+                    FusedCmp::Eq => a == b,
+                    FusedCmp::Neq => a != b,
+                    FusedCmp::Lt => a < b,
+                    FusedCmp::LtEq => a <= b,
+                    FusedCmp::Gt => a > b,
+                    FusedCmp::GtEq => a >= b,
+                },
+                (NumVal::Null, _) | (_, NumVal::Null) => {
+                    // NULL filter semantics (SQL three-valued logic →
+                    // excluded): numeric compare with 0.0 would be WRONG.
+                    // The generic compiled predicate handles NULL; bail.
+                    bailed = true;
+                    false
+                }
+                (a, b) => {
+                    let (x, y) = (a.as_f64(), b.as_f64());
+                    match f.cmp {
+                        FusedCmp::Eq => x == y,
+                        FusedCmp::Neq => x != y,
+                        FusedCmp::Lt => x < y,
+                        FusedCmp::LtEq => x <= y,
+                        FusedCmp::Gt => x > y,
+                        FusedCmp::GtEq => x >= y,
+                    }
+                }
+            };
+            if !pass {
+                return true; // filtered out; nothing to accumulate
+            }
+        }
+
+        // ---- typed accumulation (mirrors update_agg_state exactly) ----
+        for (i, spec) in specs.iter().enumerate() {
+            let v = match spec.slot {
+                Some(s) => vals[s],
+                None => NumVal::I(1), // COUNT(*) placeholder (non-null)
+            };
+            let acc = &mut accs[i];
+            let non_null = !matches!(v, NumVal::Null);
+            if non_null {
+                acc.seen = true;
+            }
+            match spec.op {
+                FusedOp::CountStar | FusedOp::CountCol => {
+                    if non_null {
+                        acc.count += 1;
+                    }
+                }
+                FusedOp::Sum | FusedOp::Total => {
+                    if non_null {
+                        match v {
+                            NumVal::F(f) => {
+                                if acc.sum_is_int {
+                                    acc.sum = acc.i_sum as f64;
+                                }
+                                acc.sum_is_int = false;
+                                acc.sum += f;
+                            }
+                            NumVal::I(i) => {
+                                if acc.sum_is_int {
+                                    acc.i_sum = acc.i_sum.saturating_add(i);
+                                } else {
+                                    acc.sum += i as f64;
+                                }
+                            }
+                            NumVal::Null => {}
+                        }
+                    }
+                }
+                FusedOp::Avg => {
+                    if non_null {
+                        acc.count += 1;
+                        acc.sum += v.as_f64();
+                    }
+                }
+                FusedOp::Min => {
+                    if non_null {
+                        let replace = match acc.min {
+                            None => true,
+                            Some(m) => numval_lt(v, m),
+                        };
+                        if replace {
+                            acc.min = Some(v);
+                        }
+                    }
+                }
+                FusedOp::Max => {
+                    if non_null {
+                        let replace = match acc.max {
+                            None => true,
+                            Some(m) => numval_lt(m, v),
+                        };
+                        if replace {
+                            acc.max = Some(v);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    })?;
+
+    if bailed {
+        return Ok(None);
+    }
+
+    // ---- finalize (mirrors finalize_agg) --------------------------------
+    let mut out_row: Vec<Value> = Vec::with_capacity(aggregates.len());
+    for (agg, acc) in aggregates.iter().zip(accs.iter()) {
+        let v = match AggFunc::from_name(&agg.func) {
+            AggFunc::Count => Value::Integer(acc.count as i64),
+            AggFunc::Sum => {
+                if !acc.seen {
+                    Value::Null
+                } else if acc.sum_is_int {
+                    Value::Integer(acc.i_sum)
+                } else {
+                    Value::Real(acc.sum)
+                }
+            }
+            AggFunc::Total => Value::Real(if acc.sum_is_int {
+                acc.i_sum as f64
+            } else {
+                acc.sum
+            }),
+            AggFunc::Avg => {
+                if acc.count == 0 {
+                    Value::Null
+                } else {
+                    Value::Real((acc.sum / acc.count as f64 * 1e10).round() / 1e10)
+                }
+            }
+            AggFunc::Min => match acc.min {
+                Some(NumVal::I(i)) => Value::Integer(i),
+                Some(NumVal::F(f)) => Value::Real(f),
+                _ => Value::Null,
+            },
+            AggFunc::Max => match acc.max {
+                Some(NumVal::I(i)) => Value::Integer(i),
+                Some(NumVal::F(f)) => Value::Real(f),
+                _ => Value::Null,
+            },
+            _ => Value::Null,
+        };
+        out_row.push(v);
+    }
+    let out_cols: Vec<String> = aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("__agg_{}", i))
+        .collect();
+    Ok(Some(ExecResult {
+        columns: out_cols.into(),
+        rows: vec![out_row],
+    }))
+}
+
+/// Numeric ordering for Min/Max accumulation. Cross-type compares as f64
+/// (exactly Value::Ord's numeric path; NaN never reaches here).
+#[inline]
+fn numval_lt(a: NumVal, b: NumVal) -> bool {
+    match (a, b) {
+        (NumVal::I(x), NumVal::I(y)) => x < y,
+        _ => a.as_f64() < b.as_f64(),
+    }
+}
+
 fn exec_aggregate_no_group_by(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -4024,6 +4716,16 @@ fn exec_aggregate_no_group_by(
 ) -> Result<ExecResult> {
     let n_cols = table.n_columns();
     let prefix = alias.as_deref().unwrap_or(&table.name);
+
+    // Fused typed-aggregate machine first: bare-column numeric aggregates
+    // with an optional `col <op> literal` filter. Returns None for any
+    // shape it cannot reproduce exactly — then the generic paths below
+    // take over (identical results, slower decode/dispatch).
+    if let Some(res) =
+        try_fused_aggregate(ctx, &table, alias.as_deref(), filter_predicate, aggregates)?
+    {
+        return Ok(res);
+    }
 
     // Try to resolve each aggregate's arg as a bare Column index.
     // If ALL of them are Columns (or COUNT(*), which has no arg),
@@ -4142,17 +4844,17 @@ fn exec_aggregate_no_group_by(
                 }
                 saw_any_row = true;
                 for i in 0..aggregates.len() {
-                    let arg_val = if agg_pos[i] == usize::MAX {
-                        Value::Integer(1) // COUNT(*)
+                    let arg_val: &Value = if agg_pos[i] == usize::MAX {
+                        &COUNT_STAR_ARG // COUNT(*)
                     } else if agg_pos[i] < sel_buf.len() {
-                        sel_buf[agg_pos[i]].clone()
+                        &sel_buf[agg_pos[i]]
                     } else {
-                        Value::Null
+                        &Value::Null
                     };
                     update_agg_state(
                         &mut states[i],
                         agg_funcs[i],
-                        &arg_val,
+                        arg_val,
                         aggregates[i].distinct,
                     );
                 }
@@ -4206,6 +4908,16 @@ fn exec_aggregate_no_group_by(
         let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
         let mut full_row_buf: Vec<Value> = Vec::with_capacity(n_cols);
 
+        // Per-aggregate decode positions + COUNT(*) flags, resolved ONCE
+        // (the row loop below indexes directly — no per-row position scan).
+        let agg_pos: Vec<Option<usize>> = agg_col_indices
+            .iter()
+            .map(|widx| widx.and_then(|c| wanted.iter().position(|x| *x == c)))
+            .collect();
+        let agg_is_count_star: Vec<bool> = aggregates.iter().map(|a| a.arg.is_none()).collect();
+        // Scratch slot for the rare non-Column arg fallback (eval_row).
+        let mut scratch_arg: Vec<Value> = vec![Value::Null; aggregates.len()];
+
         let root = ctx.table_root(&table);
         let mut bt = Btree::new(ctx.pager, root, false);
         // Use scan_table_borrowed — bypasses Cell::decode's per-row Vec<u8>
@@ -4247,13 +4959,17 @@ fn exec_aggregate_no_group_by(
                 }
             }
             saw_any_row = true;
-            for (i, agg) in aggregates.iter().enumerate() {
-                let arg_val = if let Some(wanted_pos) = agg_col_indices[i]
-                    .as_ref()
-                    .and_then(|widx| wanted.iter().position(|x| x == widx))
-                {
-                    sel_buf[wanted_pos].clone()
-                } else if let Some(arg) = &agg.arg {
+            for i in 0..aggregates.len() {
+                // `agg_pos` / `agg_is_count_star` are precomputed ONCE above
+                // (was: a `wanted.iter().position()` linear scan per agg per
+                // row — for the 5-aggregate bench shape that was ~20 ns of
+                // pure per-row waste, and `sel_buf[pos].clone()` another
+                // Value copy per update; update_agg_state only borrows).
+                let arg_val: &Value = if agg_is_count_star[i] {
+                    &COUNT_STAR_ARG
+                } else if let Some(pos) = agg_pos[i] {
+                    &sel_buf[pos]
+                } else if let Some(arg) = &aggregates[i].arg {
                     let cols = wanted_names
                         .as_ref()
                         .expect("col_names built when not all are Column");
@@ -4265,13 +4981,19 @@ fn exec_aggregate_no_group_by(
                         }
                     }
                     match eval_row(arg, &full_row, cols, &params, &named_params) {
-                        Ok(v) => v,
-                        Err(_) => Value::Null,
+                        Ok(v) => scratch_arg[i] = v,
+                        Err(_) => scratch_arg[i] = Value::Null,
                     }
+                    &scratch_arg[i]
                 } else {
-                    Value::Integer(1)
+                    &COUNT_STAR_ARG
                 };
-                update_agg_state(&mut states[i], agg_funcs[i], &arg_val, agg.distinct);
+                update_agg_state(
+                    &mut states[i],
+                    agg_funcs[i],
+                    arg_val,
+                    aggregates[i].distinct,
+                );
             }
             true
         })?;
@@ -5098,6 +5820,7 @@ fn exec_plugin_aggregate(
     })
 }
 
+#[inline]
 fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bool) {
     // Only compute the distinct key if we're actually doing a DISTINCT
     // aggregate. For non-DISTINCT aggregates, this skips per-row hashing
@@ -5132,11 +5855,16 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
         AggFunc::Sum | AggFunc::Total => {
             if !v.is_null() {
                 if matches!(v, Value::Real(_)) {
+                    // Integer→float flip: sync `sum` from `int_sum` ONCE here
+                    // (was: a per-row f64 convert+store on the all-integer
+                    // hot path, only ever needed at this flip point).
+                    if state.sum_is_int {
+                        state.sum = state.int_sum as f64;
+                    }
                     state.sum_is_int = false;
                     state.sum += v.as_real();
                 } else if state.sum_is_int {
                     state.int_sum = state.int_sum.saturating_add(v.as_integer());
-                    state.sum = state.int_sum as f64;
                 } else {
                     state.sum += v.as_real();
                 }
@@ -5180,7 +5908,11 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
                 Value::Real(state.sum)
             }
         }
-        "total" => Value::Real(state.sum),
+        "total" => Value::Real(if state.sum_is_int {
+            state.int_sum as f64
+        } else {
+            state.sum
+        }),
         "avg" => {
             if state.count == 0 {
                 Value::Null
@@ -11345,4 +12077,126 @@ fn exec_delete(
         columns: Arc::from(vec!["deleted".to_string()]),
         rows: vec![vec![Value::Integer(deleted)]],
     })
+}
+
+#[cfg(test)]
+mod perf_probe_tests {
+    use super::ExecContext;
+    use crate::storage::btree::Btree;
+    use crate::storage::row_codec::decode_row_selective;
+    use crate::types::Value;
+    use crate::Database;
+
+    fn build_table(n: i64) -> Database {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+            [],
+        )
+        .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        let mut i = 1;
+        while i <= n {
+            let end = (i + 99).min(n);
+            let values: String = (i..=end)
+                .map(|j| format!("('name{}', {}, {})", j, j, j))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(
+                &format!("INSERT INTO t (name, val, score) VALUES {values}"),
+                [],
+            )
+            .unwrap();
+            i = end + 1;
+        }
+        db.execute("COMMIT", []).unwrap();
+        db
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_scan_breakdown() {
+        let db = build_table(10_000);
+        let rounds = 300;
+        let table = db.catalog.get_table("t").unwrap();
+        let n_cols = table.n_columns();
+
+        // Root resolution mirrors api.rs: shared maps (post-split roots)
+        // first, catalog table.root_page as the base.
+        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let shared = db.maps.read().clone();
+        let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+        let root = ctx.table_root(&table);
+
+        // (a) bare btree walk
+        let mut bt;
+        let mut cells = 0usize;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            bt = Btree::new(&db.pager, root, false);
+            bt.scan_table_borrowed(|_, _| {
+                cells += 1;
+                true
+            })
+            .unwrap();
+        }
+        let walk = t.elapsed().as_nanos() as f64 / rounds as f64 / 10_000.0;
+
+        // (b) walk + selective decode of val only
+        let wanted: Vec<usize> = vec![2];
+        let mut sel: Vec<Value> = Vec::new();
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            bt = Btree::new(&db.pager, root, false);
+            bt.scan_table_borrowed(|rowid, payload| {
+                let _ = decode_row_selective(
+                    payload,
+                    n_cols,
+                    &wanted,
+                    rowid,
+                    table.rowid_alias,
+                    &mut sel,
+                );
+                true
+            })
+            .unwrap();
+        }
+        let decode1 = t.elapsed().as_nanos() as f64 / rounds as f64 / 10_000.0;
+
+        // (c) walk + full decode_row
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            bt = Btree::new(&db.pager, root, false);
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            bt.scan_table_borrowed(|rowid, payload| {
+                if let Ok(r) =
+                    crate::storage::row_codec::decode_row(payload, n_cols, rowid, table.rowid_alias)
+                {
+                    rows.push(r);
+                }
+                true
+            })
+            .unwrap();
+        }
+        let full = t.elapsed().as_nanos() as f64 / rounds as f64 / 10_000.0;
+
+        // (d) public API shapes
+        for sql in [
+            "SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t",
+            "SELECT SUM(val), COUNT(*), AVG(score) FROM t WHERE val > 5000",
+            "SELECT * FROM t",
+        ] {
+            let _ = db.query(sql, []).unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                let _ = db.query(sql, []).unwrap();
+            }
+            let q = t.elapsed().as_nanos() as f64 / rounds as f64 / 10_000.0;
+            println!("query  {sql:<62} {q:7.1} ns/row");
+        }
+        println!("cells/scan = {cells} (first round)");
+        println!(
+            "walk-only = {walk:.1} ns/row   walk+seldecode(val) = {decode1:.1} ns/row   walk+decode_row(full) = {full:.1} ns/row"
+        );
+    }
 }

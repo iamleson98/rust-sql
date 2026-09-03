@@ -1668,17 +1668,20 @@ impl Database {
     /// clear error — use [`Self::open_with_codec`] (or register the codec
     /// and run `PRAGMA codec = <name>` before any other statement).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_inner(path, None)
+        Self::open_inner(path, None, false)
     }
 
     /// Shared constructor: `codec` is activated before the schema load.
+    /// `memory` pre-arms the pager's skip-fsync policy so a fresh temp-file
+    /// database never pays the header fsync during initialization.
     fn open_inner<P: AsRef<Path>>(
         path: P,
         codec: Option<std::sync::Arc<dyn crate::plugin::PageCodec>>,
+        memory: bool,
     ) -> Result<Self> {
         crate::engine_init();
         let path = path.as_ref().to_path_buf();
-        let pager = Pager::open(&path, DEFAULT_CACHE_PAGES)?;
+        let pager = Pager::open_opts(&path, DEFAULT_CACHE_PAGES, memory)?;
         if let Some(c) = &codec {
             pager.set_codec(Some(c.clone()))?;
         } else if let Some(required) = pager.required_codec() {
@@ -1740,7 +1743,7 @@ impl Database {
     ) -> Result<Self> {
         let codec = std::sync::Arc::new(codec);
         let codec2 = codec.clone();
-        let db = Self::open_inner(path, Some(codec))?;
+        let db = Self::open_inner(path, Some(codec), false)?;
         // Write the marker (idempotent; also validated against any
         // existing marker inside set_codec).
         db.pager.set_codec(Some(codec2))?;
@@ -1759,7 +1762,11 @@ impl Database {
         let path = PathBuf::from(":memory:");
         // Use a temp file under the hood — we don't support pure in-memory yet.
         let tmp = tempfile::NamedTempFile::new().map_err(Error::Io)?;
-        let mut db = Self::open(tmp.path())?;
+        // memory=true: skip_fsync is armed BEFORE the header write, so the
+        // initial flush inside `open` costs a plain write() — no fsync
+        // (which was 0.4-10 ms per open depending on OS/filesystem and
+        // dominated every open-per-iteration benchmark row).
+        let mut db = Self::open_inner(tmp.path(), None, true)?;
         db.path = path;
         db.pager.set_skip_fsync(true);
         // Lazy write-back: per-statement flushes skip file writes entirely;

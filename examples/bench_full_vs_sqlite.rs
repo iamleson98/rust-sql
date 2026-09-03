@@ -414,7 +414,18 @@ fn bench_full_scan() -> BenchResult {
             for _ in 0..n {
                 let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // Fair-work parity: rustqlite's `db.query()` materializes
+                // EVERY column of EVERY row into owned Values — the SQLite
+                // side must consume the same data (4 column reads per row),
+                // not just step the VDBE. A bare `rows.next()` loop would
+                // compare rustqlite's eager materialization against a lazy
+                // cursor that decodes nothing.
+                while let Ok(Some(r)) = rows.next() {
+                    let _ = r.get::<_, i64>(0);
+                    let _ = r.get::<_, rusqlite::types::Value>(1);
+                    let _ = r.get::<_, i64>(2);
+                    let _ = r.get::<_, f64>(3);
+                }
             }
         },
         N_ROWS as usize * n,

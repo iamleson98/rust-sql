@@ -606,6 +606,18 @@ impl Drop for Pager {
 impl Pager {
     /// Open or create a database file at the given path.
     pub fn open<P: AsRef<Path>>(path: P, cache_capacity: usize) -> Result<Self> {
+        Self::open_opts(path, cache_capacity, false)
+    }
+
+    /// Open with the durable-sync policy decided up front. `skip_sync`
+    /// pre-arms `skip_fsync` BEFORE `initialize_new_db` runs, so a fresh
+    /// `:memory:` database never pays the header fsync (~0.4 ms Linux CI,
+    /// ~1.5 ms macOS, ~10 ms Windows per open).
+    pub fn open_opts<P: AsRef<Path>>(
+        path: P,
+        cache_capacity: usize,
+        skip_sync: bool,
+    ) -> Result<Self> {
         let path = path.ref_to_path();
         let file = OpenOptions::new()
             .read(true)
@@ -629,7 +641,7 @@ impl Pager {
             cache_capacity,
             schema_cookie: AtomicU32::new(0),
             is_new: AtomicBool::new(false),
-            skip_fsync: AtomicBool::new(false),
+            skip_fsync: AtomicBool::new(skip_sync),
             foreign_keys_enabled: AtomicBool::new(false),
             locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
@@ -697,7 +709,13 @@ impl Pager {
         page0.dirty = true;
 
         self.write_file_at(0, &page0.data)?;
-        self.file.sync_all()?;
+        // Sync only for durable opens. `:memory:` databases (skip_fsync)
+        // are backed by a throwaway temp file that is deleted on drop —
+        // an fsync here costs ~0.4 ms on CI Linux, ~1.5 ms on macOS and
+        // ~10 ms on Windows per open, and buys nothing.
+        if !self.skip_fsync.load(Ordering::Acquire) {
+            self.file.sync_all()?;
+        }
         self.n_pages.store(1, Ordering::Release);
         self.page_size.store(page_size, Ordering::Release);
         self.schema_cookie.store(0, Ordering::Release);
