@@ -1,6 +1,9 @@
 //! I/O error testing — modeled on §3.2 of
 //! https://www.sqlite.org/testing.html
 //!
+//! (Unix-only: the fault levers below are POSIX permission/dir semantics.)
+#![cfg(unix)]
+//!
 //! SQLite simulates I/O errors "by inserting a new Virtual File System
 //! object that is specially rigged to simulate an I/O error after a set
 //! number of I/O operations ... In I/O error tests, after the I/O error

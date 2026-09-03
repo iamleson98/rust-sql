@@ -197,6 +197,24 @@ jobs:
           --timeout 2400
           -- cargo run --release --features sqlx --example bench_sqlx_native
 
+      # Runs ONLY when a gate above failed: per-component cost breakdowns
+      # (open/create/insert, pinned + unpinned) so perf losses can be
+      # attributed from the CI runner itself instead of guessed.
+      - name: Diagnose bench losses (Linux only, on failure)
+        if: failure() && runner.os == 'Linux'
+        run: |
+          cargo build --release --example probe_mv_breakdown --example probe_open_cost --example probe_mv_insert 2>&1 | tail -1
+          echo "===== probe_open_cost (open_in_memory vs SQLite) ====="
+          ./target/release/examples/probe_open_cost
+          echo "===== probe_mv_breakdown (unpinned) ====="
+          ./target/release/examples/probe_mv_breakdown
+          echo "===== probe_mv_breakdown (pinned, CPU 0) ====="
+          taskset -c 0 ./target/release/examples/probe_mv_breakdown || true
+          echo "===== probe_mv_insert (phase attribution) ====="
+          ./target/release/examples/probe_mv_insert
+          echo "===== bench_full_vs_sqlite (pinned, CPU 0) ====="
+          taskset -c 0 ./target/release/examples/bench_full_vs_sqlite 2>&1 | grep -E "ratio:|REMAINING|HEADLINE" | head -40 || true
+
       - name: Upload bench results and logs
         if: always()
         uses: actions/upload-artifact@v7

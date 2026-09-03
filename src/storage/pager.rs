@@ -1770,19 +1770,28 @@ impl Pager {
         Ok(())
     }
 
-    // Non-unix fallback: serialize through seek+read/write.
-    #[cfg(not(unix))]
+    // Windows: `FileExt::seek_read` / `seek_write` are the positioned-I/O
+    // equivalents of pread/pwrite (they take &self, so reads stay lock-free).
+    #[cfg(windows)]
     fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(offset))?;
-        Ok(file.read(buf)?)
+        use std::os::windows::fs::FileExt;
+        Ok(self.file.seek_read(buf, offset)?)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(buf)?;
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = self.file.seek_write(&buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                )));
+            }
+            done += n;
+        }
         Ok(())
     }
 }

@@ -5,19 +5,6 @@
 //! in CI before cargo test). Missing binaries skip their tests.
 
 use rustqlite::ffi::*;
-use rustqlite::Database;
-
-fn plugin_path(name: &str) -> Option<std::path::PathBuf> {
-    let candidates = [
-        format!("plugins/{name}"),
-        format!("../plugins/{name}"),
-        format!("../../plugins/{name}"),
-    ];
-    candidates
-        .into_iter()
-        .map(std::path::PathBuf::from)
-        .find(|p| p.exists())
-}
 
 // ---------------------------------------------------------------------------
 // rustqlite_* C API
@@ -162,144 +149,163 @@ fn ffi_libversion() {
 
 // ---------------------------------------------------------------------------
 // Dynamic extension loading (C / C++ / Zig / Rust .so plugins)
+// Gated on the `extension` feature: `Database::load_extension` only exists
+// with it, so no-default / oom-injection builds skip this module entirely.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn load_c_extension() {
-    let Some(so) = plugin_path("c/rot13.so") else {
-        eprintln!("skipping: plugins/c/rot13.so not built");
-        return;
-    };
-    let mut db = Database::open_in_memory().unwrap();
-    db.load_extension(&so, None).unwrap();
-    // Scalar function registered by the C plugin.
-    let rows = db.query("SELECT rot13('hello')", []).unwrap();
-    assert_eq!(rows[0][0].as_text(), "uryyb");
-    // Aggregate registered by the C plugin (sum of squares).
-    db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", [])
-        .unwrap();
-    let rows = db.query("SELECT sumsq(x) FROM t", []).unwrap();
-    assert_eq!(rows[0][0].as_real(), 14.0);
-    // Collation.
-    let rows = db.query("SELECT 'nop' < 'abc' COLLATE ROT13", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 1); // rot13('nop')='abc' < rot13('abc')='nop'
-                                            // Virtual table from the C plugin.
-    db.execute("CREATE VIRTUAL TABLE s USING series(5)", [])
-        .unwrap();
-    let rows = db.query("SELECT count(*) FROM s", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 6);
-}
+#[cfg(feature = "extension")]
+mod extension_loading {
+    use rustqlite::Database;
 
-#[test]
-fn load_cpp_extension() {
-    let Some(so) = plugin_path("cpp/example.so") else {
-        eprintln!("skipping: plugins/cpp/example.so not built");
-        return;
-    };
-    let mut db = Database::open_in_memory().unwrap();
-    db.load_extension(&so, None).unwrap();
-    // Scalar.
-    let rows = db.query("SELECT shout('hello')", []).unwrap();
-    assert_eq!(rows[0][0].as_text(), "HELLO!");
-    // Aggregate with std::deque state.
-    db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (2), (4), (9)", [])
-        .unwrap();
-    let rows = db.query("SELECT movavg(x) FROM t", []).unwrap();
-    assert!(
-        (rows[0][0].as_real() - 5.0).abs() < 1e-12,
-        "movavg = {}",
-        rows[0][0].as_real()
-    );
-    // Collation: numeric-aware ordering (2 < 10 numerically, but
-    // '10' < '2' in BINARY byte order).
-    let rows = db.query("SELECT '2' < '10' COLLATE NUMERIC", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 1);
-    let rows = db.query("SELECT '2' < '10'", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 0); // BINARY: '10' < '2'
-                                            // Writable vtab from C++.
-    db.execute("CREATE VIRTUAL TABLE kv USING kvstore()", [])
-        .unwrap();
-    db.execute("INSERT INTO kv (k, v) VALUES ('a', '1'), ('b', '2')", [])
-        .unwrap();
-    let rows = db.query("SELECT v FROM kv WHERE k = 'b'", []).unwrap();
-    assert_eq!(rows[0][0].as_text(), "2");
-    db.execute("UPDATE kv SET v = '20' WHERE k = 'b'", [])
-        .unwrap();
-    let rows = db.query("SELECT v FROM kv WHERE k = 'b'", []).unwrap();
-    assert_eq!(rows[0][0].as_text(), "20");
-    db.execute("DELETE FROM kv WHERE k = 'a'", []).unwrap();
-    let rows = db.query("SELECT count(*) FROM kv", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 1);
-}
+    fn plugin_path(name: &str) -> Option<std::path::PathBuf> {
+        let candidates = [
+            format!("plugins/{name}"),
+            format!("../plugins/{name}"),
+            format!("../../plugins/{name}"),
+        ];
+        candidates
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+    }
 
-#[test]
-fn load_zig_extension() {
-    let Some(so) = plugin_path("zig/librot13.so") else {
-        eprintln!("skipping: plugins/zig/librot13.so not built");
-        return;
-    };
-    let mut db = Database::open_in_memory().unwrap();
-    db.load_extension(&so, None).unwrap();
-    let rows = db.query("SELECT rot13('hello')", []).unwrap();
-    assert_eq!(rows[0][0].as_text(), "uryyb");
-    // Aggregate.
-    db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (1), (NULL), (3)", [])
-        .unwrap();
-    let rows = db.query("SELECT zcount(x) FROM t", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 2);
-    // Collation.
-    let rows = db.query("SELECT 'ba' < 'ab' COLLATE ZREVERSE", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 1); // reversed: 'ab' vs 'ba' → 'ab' < 'ba' → 'ba' sorts first → 'ba' < 'ab' = true
-                                            // Virtual table with args.
-    db.execute("CREATE VIRTUAL TABLE rng USING zrange(7)", [])
-        .unwrap();
-    let rows = db.query("SELECT count(*) FROM rng", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 7);
-}
+    #[test]
+    fn load_c_extension() {
+        let Some(so) = plugin_path("c/rot13.so") else {
+            eprintln!("skipping: plugins/c/rot13.so not built");
+            return;
+        };
+        let mut db = Database::open_in_memory().unwrap();
+        db.load_extension(&so, None).unwrap();
+        // Scalar function registered by the C plugin.
+        let rows = db.query("SELECT rot13('hello')", []).unwrap();
+        assert_eq!(rows[0][0].as_text(), "uryyb");
+        // Aggregate registered by the C plugin (sum of squares).
+        db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (1), (2), (3)", [])
+            .unwrap();
+        let rows = db.query("SELECT sumsq(x) FROM t", []).unwrap();
+        assert_eq!(rows[0][0].as_real(), 14.0);
+        // Collation.
+        let rows = db.query("SELECT 'nop' < 'abc' COLLATE ROT13", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 1); // rot13('nop')='abc' < rot13('abc')='nop'
+                                                // Virtual table from the C plugin.
+        db.execute("CREATE VIRTUAL TABLE s USING series(5)", [])
+            .unwrap();
+        let rows = db.query("SELECT count(*) FROM s", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 6);
+    }
 
-#[test]
-fn load_rust_extension() {
-    let Some(so) = plugin_path("rust/target/release/librustext.so") else {
-        eprintln!("skipping: plugins/rust/target/release/librustext.so not built");
-        return;
-    };
-    let mut db = Database::open_in_memory().unwrap();
-    db.load_extension(&so, None).unwrap();
-    // Variadic scalar: revsum(1,2,3) = 6 → reversed "6" = 6.
-    let rows = db.query("SELECT revsum(1, 2, 3)", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 6);
-    // revsum(12, 30) = 42 → "24".
-    let rows = db.query("SELECT revsum(12, 30)", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 24);
-    // Aggregate.
-    db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-    db.execute("INSERT INTO t (x) VALUES (2), (3), (4)", [])
-        .unwrap();
-    let rows = db.query("SELECT product(x) FROM t", []).unwrap();
-    assert_eq!(rows[0][0].as_real(), 24.0);
-    // vtab.
-    db.execute("CREATE VIRTUAL TABLE m USING mirror(5)", [])
-        .unwrap();
-    let rows = db.query("SELECT count(*) FROM m", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 5);
-    let rows = db.query("SELECT label FROM m WHERE n = 2", []).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].as_text(), "mirror-2");
-}
+    #[test]
+    fn load_cpp_extension() {
+        let Some(so) = plugin_path("cpp/example.so") else {
+            eprintln!("skipping: plugins/cpp/example.so not built");
+            return;
+        };
+        let mut db = Database::open_in_memory().unwrap();
+        db.load_extension(&so, None).unwrap();
+        // Scalar.
+        let rows = db.query("SELECT shout('hello')", []).unwrap();
+        assert_eq!(rows[0][0].as_text(), "HELLO!");
+        // Aggregate with std::deque state.
+        db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (2), (4), (9)", [])
+            .unwrap();
+        let rows = db.query("SELECT movavg(x) FROM t", []).unwrap();
+        assert!(
+            (rows[0][0].as_real() - 5.0).abs() < 1e-12,
+            "movavg = {}",
+            rows[0][0].as_real()
+        );
+        // Collation: numeric-aware ordering (2 < 10 numerically, but
+        // '10' < '2' in BINARY byte order).
+        let rows = db.query("SELECT '2' < '10' COLLATE NUMERIC", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 1);
+        let rows = db.query("SELECT '2' < '10'", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 0); // BINARY: '10' < '2'
+                                                // Writable vtab from C++.
+        db.execute("CREATE VIRTUAL TABLE kv USING kvstore()", [])
+            .unwrap();
+        db.execute("INSERT INTO kv (k, v) VALUES ('a', '1'), ('b', '2')", [])
+            .unwrap();
+        let rows = db.query("SELECT v FROM kv WHERE k = 'b'", []).unwrap();
+        assert_eq!(rows[0][0].as_text(), "2");
+        db.execute("UPDATE kv SET v = '20' WHERE k = 'b'", [])
+            .unwrap();
+        let rows = db.query("SELECT v FROM kv WHERE k = 'b'", []).unwrap();
+        assert_eq!(rows[0][0].as_text(), "20");
+        db.execute("DELETE FROM kv WHERE k = 'a'", []).unwrap();
+        let rows = db.query("SELECT count(*) FROM kv", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 1);
+    }
 
-#[test]
-fn load_extension_bad_path_and_entry() {
-    let mut db = Database::open_in_memory().unwrap();
-    let err = db
-        .load_extension("/nonexistent/plugin.so", None)
-        .unwrap_err();
-    assert!(err.to_string().contains("load_extension"));
-    // Valid file, missing entry point.
-    let dir = tempfile::tempdir().unwrap();
-    let fake = dir.path().join("fake.so");
-    std::fs::write(&fake, b"not a shared library").unwrap();
-    assert!(db.load_extension(&fake, None).is_err());
+    #[test]
+    fn load_zig_extension() {
+        let Some(so) = plugin_path("zig/librot13.so") else {
+            eprintln!("skipping: plugins/zig/librot13.so not built");
+            return;
+        };
+        let mut db = Database::open_in_memory().unwrap();
+        db.load_extension(&so, None).unwrap();
+        let rows = db.query("SELECT rot13('hello')", []).unwrap();
+        assert_eq!(rows[0][0].as_text(), "uryyb");
+        // Aggregate.
+        db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (1), (NULL), (3)", [])
+            .unwrap();
+        let rows = db.query("SELECT zcount(x) FROM t", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 2);
+        // Collation.
+        let rows = db.query("SELECT 'ba' < 'ab' COLLATE ZREVERSE", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 1); // reversed: 'ab' vs 'ba' → 'ab' < 'ba' → 'ba' sorts first → 'ba' < 'ab' = true
+                                                // Virtual table with args.
+        db.execute("CREATE VIRTUAL TABLE rng USING zrange(7)", [])
+            .unwrap();
+        let rows = db.query("SELECT count(*) FROM rng", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 7);
+    }
+
+    #[test]
+    fn load_rust_extension() {
+        let Some(so) = plugin_path("rust/target/release/librustext.so") else {
+            eprintln!("skipping: plugins/rust/target/release/librustext.so not built");
+            return;
+        };
+        let mut db = Database::open_in_memory().unwrap();
+        db.load_extension(&so, None).unwrap();
+        // Variadic scalar: revsum(1,2,3) = 6 → reversed "6" = 6.
+        let rows = db.query("SELECT revsum(1, 2, 3)", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 6);
+        // revsum(12, 30) = 42 → "24".
+        let rows = db.query("SELECT revsum(12, 30)", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 24);
+        // Aggregate.
+        db.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        db.execute("INSERT INTO t (x) VALUES (2), (3), (4)", [])
+            .unwrap();
+        let rows = db.query("SELECT product(x) FROM t", []).unwrap();
+        assert_eq!(rows[0][0].as_real(), 24.0);
+        // vtab.
+        db.execute("CREATE VIRTUAL TABLE m USING mirror(5)", [])
+            .unwrap();
+        let rows = db.query("SELECT count(*) FROM m", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 5);
+        let rows = db.query("SELECT label FROM m WHERE n = 2", []).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_text(), "mirror-2");
+    }
+
+    #[test]
+    fn load_extension_bad_path_and_entry() {
+        let mut db = Database::open_in_memory().unwrap();
+        let err = db
+            .load_extension("/nonexistent/plugin.so", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("load_extension"));
+        // Valid file, missing entry point.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake.so");
+        std::fs::write(&fake, b"not a shared library").unwrap();
+        assert!(db.load_extension(&fake, None).is_err());
+    }
 }

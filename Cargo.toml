@@ -41,6 +41,21 @@ path = "src/bin/server.rs"
 name = "bench_vs_sqlite"
 path = "examples/bench_vs_sqlite.rs"
 
+# Phase profile of the multi-VALUES INSERT path (parse/plan/exec split).
+[[example]]
+name = "probe_mv_insert"
+path = "examples/probe_mv_insert.rs"
+
+# Per-iteration breakdown of the multi-VALUES bench shape for both engines.
+[[example]]
+name = "probe_mv_breakdown"
+path = "examples/probe_mv_breakdown.rs"
+
+# open_in_memory() cost breakdown (tempfile vs open vs first statements).
+[[example]]
+name = "probe_open_cost"
+path = "examples/probe_open_cost.rs"
+
 # sqlx driver-vs-driver benchmark: native rustqlite driver vs sqlx-sqlite
 # (C SQLite) through the identical sqlx API.
 # Run: cargo run --release --example bench_sqlx_native --features sqlx

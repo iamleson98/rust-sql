@@ -32,6 +32,40 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Positioned exact-read that works on both Unix and Windows.
+/// - Unix: `FileExt::read_exact_at` (pread)
+/// - Windows: `FileExt::seek_read` (pread-equivalent; looped for exactness)
+/// - other platforms: seek+read (serialized, still correct)
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
+}
+
 /// WAL header is 32 bytes.
 pub const WAL_HEADER_SIZE: u32 = 32;
 /// Frame header is 24 bytes.
@@ -319,20 +353,18 @@ impl Wal {
     /// Read one frame's page data into `buf`. `offset` is a frame-header
     /// start previously returned by `append` or `committed_page_map`.
     pub fn read_frame_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
         if buf.len() != self.page_size as usize {
             return Err(Error::InvalidArgument(
                 "read_frame_at: wrong buffer size".to_string(),
             ));
         }
         let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
-        self.file.read_exact_at(&mut fh_buf, offset)?;
+        read_exact_at(&self.file, &mut fh_buf, offset)?;
         let fh = FrameHeader::decode(&fh_buf)?;
         if fh.salt1 != self.header.salt1 || fh.salt2 != self.header.salt2 {
             return Err(Error::corruption("WAL frame salt mismatch"));
         }
-        self.file
-            .read_exact_at(buf, offset + FRAME_HEADER_SIZE as u64)?;
+        read_exact_at(&self.file, buf, offset + FRAME_HEADER_SIZE as u64)?;
         Ok(())
     }
 

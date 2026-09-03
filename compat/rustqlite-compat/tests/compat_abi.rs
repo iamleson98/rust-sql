@@ -209,7 +209,7 @@ fn abi_lifecycle_open_close() {
 fn abi_libversion_shape() {
     let v = cstr(unsafe { sqlite3_libversion() });
     let parts: Vec<u32> = v.split('.').map(|p| p.parse().unwrap()).collect();
-    assert_eq!(parts.len() >= 3, true, "version must be X.Y.Z: {}", v);
+    assert!(parts.len() >= 3, "version must be X.Y.Z: {}", v);
     assert_eq!(unsafe { sqlite3_threadsafe() }, 1);
 }
 
@@ -219,7 +219,7 @@ fn abi_column_names_available_before_first_step() {
     exec(&db, "CREATE TABLE t (a INTEGER, b TEXT)");
     // Materialized plan (aggregate) — names must STILL be present at
     // prepare time (sqlx reads column_name before stepping).
-    let (mut stmt, _) = prepare(&db, "SELECT a, COUNT(*), b AS label FROM t GROUP BY b");
+    let (stmt, _) = prepare(&db, "SELECT a, COUNT(*), b AS label FROM t GROUP BY b");
     let n = unsafe { sqlite3_column_count(stmt.0) };
     assert_eq!(n, 3, "COUNT(*) included");
     let c0 = cstr(unsafe { sqlite3_column_name(stmt.0, 0) });
@@ -359,7 +359,7 @@ fn abi_changes_and_last_rowid() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
     for i in 1..=3 {
-        let (mut stmt, _) = prepare(&db, "INSERT INTO t (v) VALUES (?)");
+        let (stmt, _) = prepare(&db, "INSERT INTO t (v) VALUES (?)");
         unsafe { sqlite3_bind_int64(stmt.0, 1, i * 10) };
         let rc = unsafe { sqlite3_step(stmt.0) };
         assert_eq!(rc, SQLITE_DONE);
@@ -367,7 +367,7 @@ fn abi_changes_and_last_rowid() {
         assert_eq!(unsafe { sqlite3_last_insert_rowid(db.0) }, i);
     }
     assert_eq!(unsafe { sqlite3_total_changes(db.0) }, 3);
-    let (mut stmt, _) = prepare(&db, "UPDATE t SET v = v + 1 WHERE id <= 2");
+    let (stmt, _) = prepare(&db, "UPDATE t SET v = v + 1 WHERE id <= 2");
     unsafe { sqlite3_step(stmt.0) };
     assert_eq!(unsafe { sqlite3_changes(db.0) }, 2, "UPDATE changes = 2");
 }
@@ -379,12 +379,12 @@ fn abi_transaction_autocommit_states() {
     assert_eq!(unsafe { sqlite3_get_autocommit(db.0) }, 1, "autocommit on");
 
     // BEGIN via the prepared path (how sqlx does it).
-    let (mut begin, _) = prepare(&db, "BEGIN");
+    let (begin, _) = prepare(&db, "BEGIN");
     unsafe { sqlite3_step(begin.0) };
     assert_eq!(unsafe { sqlite3_get_autocommit(db.0) }, 0, "in transaction");
 
     // Nested BEGIN must fail like SQLite.
-    let (mut nested, _) = prepare(&db, "BEGIN");
+    let (nested, _) = prepare(&db, "BEGIN");
     let rc = unsafe { sqlite3_step(nested.0) };
     assert_eq!(rc, SQLITE_ERROR, "nested BEGIN error code");
     let msg = unsafe { cstr(sqlite3_errmsg(db.0)) };
@@ -394,7 +394,7 @@ fn abi_transaction_autocommit_states() {
         msg
     );
 
-    let (mut commit, _) = prepare(&db, "COMMIT");
+    let (commit, _) = prepare(&db, "COMMIT");
     unsafe { sqlite3_step(commit.0) };
     assert_eq!(
         unsafe { sqlite3_get_autocommit(db.0) },
@@ -413,7 +413,7 @@ fn abi_constraint_extended_error_codes() {
     exec(&db, "INSERT INTO u (email) VALUES ('a@b')");
 
     // UNIQUE violation -> 2067, message shape matches SQLite.
-    let (mut stmt, _) = prepare(&db, "INSERT INTO u (email) VALUES ('a@b')");
+    let (stmt, _) = prepare(&db, "INSERT INTO u (email) VALUES ('a@b')");
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(
         rc, SQLITE_CONSTRAINT_UNIQUE,
@@ -424,7 +424,7 @@ fn abi_constraint_extended_error_codes() {
     assert_eq!(unsafe { sqlite3_errcode(db.0) }, SQLITE_CONSTRAINT_UNIQUE);
 
     // NOT NULL violation -> 527.
-    let (mut stmt, _) = prepare(&db, "INSERT INTO u (id, email) VALUES (2, NULL)");
+    let (stmt, _) = prepare(&db, "INSERT INTO u (id, email) VALUES (2, NULL)");
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(
         rc, SQLITE_CONSTRAINT_NOTNULL,
@@ -458,7 +458,7 @@ fn abi_column_value_objects() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (a INTEGER, b TEXT)");
     exec(&db, "INSERT INTO t VALUES (42, 'hi')");
-    let (mut stmt, _) = prepare(&db, "SELECT a, b FROM t");
+    let (stmt, _) = prepare(&db, "SELECT a, b FROM t");
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(rc, SQLITE_ROW);
     let v0 = unsafe { sqlite3_column_value(stmt.0, 0) };
@@ -485,7 +485,7 @@ fn abi_column_types_and_int_coercion() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (i INTEGER, f REAL, s TEXT)");
     exec(&db, "INSERT INTO t VALUES (7, 2.5, 'txt')");
-    let (mut stmt, _) = prepare(&db, "SELECT i, f, s, NULL FROM t");
+    let (stmt, _) = prepare(&db, "SELECT i, f, s, NULL FROM t");
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(rc, SQLITE_ROW);
     assert_eq!(unsafe { sqlite3_column_type(stmt.0, 0) }, SQLITE_INTEGER);
@@ -498,7 +498,7 @@ fn abi_column_types_and_int_coercion() {
 fn abi_bind_text_and_null() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (s TEXT)");
-    let (mut stmt, _) = prepare(&db, "INSERT INTO t VALUES (?)");
+    let (stmt, _) = prepare(&db, "INSERT INTO t VALUES (?)");
     let val = CString::new("hello").unwrap();
     let rc = unsafe {
         sqlite3_bind_text64(
@@ -513,7 +513,7 @@ fn abi_bind_text_and_null() {
     assert_eq!(rc, SQLITE_OK);
     unsafe { sqlite3_step(stmt.0) };
     // NULL bind
-    let (mut stmt, _) = prepare(&db, "INSERT INTO t VALUES (?)");
+    let (stmt, _) = prepare(&db, "INSERT INTO t VALUES (?)");
     unsafe { sqlite3_bind_null(stmt.0, 1) };
     unsafe { sqlite3_step(stmt.0) };
     let (mut q, _) = prepare(&db, "SELECT COUNT(*), COUNT(s) FROM t");
@@ -586,14 +586,14 @@ fn abi_transaction_conflict_yields_busy_then_succeeds() {
     exec(&a, "UPDATE t SET x = 2");
 
     // B's BEGIN hits BUSY (timeout 150 ms).
-    let (mut stmt, _) = prepare(&b, "BEGIN");
+    let (stmt, _) = prepare(&b, "BEGIN");
     let rc = unsafe { sqlite3_step(stmt.0) };
-    assert_eq!(rc, 5, "SQLITE_BUSY while A holds the transaction");
+    assert_eq!(rc, SQLITE_BUSY, "SQLITE_BUSY while A holds the transaction");
 
     // A commits; B retries and succeeds (a successful BEGIN/COMMIT step
     // returns SQLITE_DONE — SQLITE_OK never comes out of sqlite3_step).
     exec(&a, "COMMIT");
-    let (mut stmt, _) = prepare(&b, "BEGIN");
+    let (stmt, _) = prepare(&b, "BEGIN");
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(rc, SQLITE_DONE);
     exec(&b, "COMMIT");
@@ -657,7 +657,7 @@ fn abi_pragmas_via_prepared_statements() {
     // (pragma_string). Verify write pragmas execute and read pragmas
     // return rows.
     let db = open_memory();
-    let (mut stmt, _) = prepare(&db, "PRAGMA foreign_keys = ON");
+    let (stmt, _) = prepare(&db, "PRAGMA foreign_keys = ON");
     let rc = unsafe { sqlite3_step(stmt.0) };
     assert_eq!(rc, SQLITE_DONE);
 
@@ -670,7 +670,7 @@ fn abi_pragmas_via_prepared_statements() {
     let rows = step_all_text(&mut q2);
     assert!(!rows.is_empty());
     let sz: i64 = rows[0][0].parse().unwrap();
-    assert!(sz >= 512 && sz <= 65536, "page_size in range: {}", sz);
+    assert!((512..=65536).contains(&sz), "page_size in range: {}", sz);
 }
 
 // ===========================================================================
@@ -692,7 +692,7 @@ fn abi_update_unique_violation_code_and_errmsg() {
 
     unsafe { sqlite3_extended_result_codes(db.0, 1) };
 
-    let (mut st, _) = prepare(&db, "UPDATE t SET v = 'a' WHERE id = 2");
+    let (st, _) = prepare(&db, "UPDATE t SET v = 'a' WHERE id = 2");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_CONSTRAINT_UNIQUE, "extended UNIQUE code");
     // errmsg must be byte-exact (no engine prefix) — sqlx pattern-matches it.
@@ -720,17 +720,17 @@ fn abi_update_atomic_abort_keeps_table_unchanged() {
     // First shift every value (unique — succeeds), then attempt a bulk
     // collapse to one value: row 2 conflicts, the statement aborts, and
     // NO row keeps the half-applied value.
-    let (mut st, _) = prepare(&db, "UPDATE t SET v = 'x' || id");
+    let (st, _) = prepare(&db, "UPDATE t SET v = 'x' || id");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_DONE, "x1/x2/x3 are distinct");
-    let (mut st2, _) = prepare(&db, "UPDATE t SET v = 'same'");
+    let (st2, _) = prepare(&db, "UPDATE t SET v = 'same'");
     let rc2 = unsafe { sqlite3_step(st2.0) };
     assert_eq!(
         rc2, SQLITE_CONSTRAINT_UNIQUE,
         "all rows collapse onto 'same'"
     );
     // Table unchanged after the abort.
-    let (mut st3, _) = prepare(&db, "SELECT COUNT(*) FROM t WHERE v IN ('x1','x2','x3')");
+    let (st3, _) = prepare(&db, "SELECT COUNT(*) FROM t WHERE v IN ('x1','x2','x3')");
     assert_eq!(unsafe { sqlite3_step(st3.0) }, SQLITE_ROW);
     let n = unsafe { sqlite3_column_int64(st3.0, 0) };
     assert_eq!(n, 3, "statement aborted atomically — no partial updates");
@@ -745,7 +745,7 @@ fn abi_update_or_ignore_via_step_and_changes() {
     );
     exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
 
-    let (mut st, _) = prepare(&db, "UPDATE OR IGNORE t SET v = 'a'");
+    let (st, _) = prepare(&db, "UPDATE OR IGNORE t SET v = 'a'");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_DONE, "OR IGNORE never errors on conflicts");
     // Only row 1 keeps 'a'... rows 2,3 skip; changes() = 1 (SQLite counts
@@ -753,7 +753,7 @@ fn abi_update_or_ignore_via_step_and_changes() {
     let changes = unsafe { sqlite3_changes(db.0) };
     assert_eq!(changes, 1, "changes() counts only applied rows");
 
-    let (mut st2, _) = prepare(&db, "SELECT COUNT(*) FROM t WHERE v = 'a'");
+    let (st2, _) = prepare(&db, "SELECT COUNT(*) FROM t WHERE v = 'a'");
     assert_eq!(unsafe { sqlite3_step(st2.0) }, SQLITE_ROW);
     let n = unsafe { sqlite3_column_int64(st2.0, 0) };
     assert_eq!(n, 1, "skipped rows keep their old values");
@@ -765,7 +765,7 @@ fn abi_update_rowid_move_via_step() {
     exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
     exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
 
-    let (mut st, _) = prepare(&db, "UPDATE t SET id = 10 WHERE id = 1");
+    let (st, _) = prepare(&db, "UPDATE t SET id = 10 WHERE id = 1");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_DONE);
 
@@ -780,7 +780,7 @@ fn abi_update_rowid_move_via_step() {
     );
 
     // Moving to a taken rowid: SQLITE_CONSTRAINT with t.id in the message.
-    let (mut st3, _) = prepare(&db, "UPDATE t SET id = 2 WHERE id = 10");
+    let (st3, _) = prepare(&db, "UPDATE t SET id = 2 WHERE id = 10");
     let rc = unsafe { sqlite3_step(st3.0) };
     assert_eq!(rc, SQLITE_CONSTRAINT_UNIQUE);
     let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
@@ -796,7 +796,7 @@ fn abi_update_null_to_rowid_alias_is_mismatch() {
     exec(&db, "INSERT INTO t VALUES (1, 'a')");
 
     unsafe { sqlite3_extended_result_codes(db.0, 1) };
-    let (mut st, _) = prepare(&db, "UPDATE t SET id = NULL WHERE id = 1");
+    let (st, _) = prepare(&db, "UPDATE t SET id = NULL WHERE id = 1");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_MISMATCH, "SQLite reports SQLITE_MISMATCH");
     let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
@@ -818,7 +818,7 @@ fn abi_update_fk_violation_extended_code() {
     exec(&db, "INSERT INTO c VALUES (1, 1)");
 
     unsafe { sqlite3_extended_result_codes(db.0, 1) };
-    let (mut st, _) = prepare(&db, "UPDATE c SET pid = 99 WHERE id = 1");
+    let (st, _) = prepare(&db, "UPDATE c SET pid = 99 WHERE id = 1");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_CONSTRAINT_FOREIGNKEY, "extended FK code");
     let msg = unsafe { CStr::from_ptr(sqlite3_errmsg(db.0)) }
@@ -837,7 +837,7 @@ fn abi_update_collated_unique_nocase() {
     exec(&db, "INSERT INTO s VALUES (1, 'Alpha'), (2, 'beta')");
 
     unsafe { sqlite3_extended_result_codes(db.0, 1) };
-    let (mut st, _) = prepare(&db, "UPDATE s SET tag = 'ALPHA' WHERE id = 2");
+    let (st, _) = prepare(&db, "UPDATE s SET tag = 'ALPHA' WHERE id = 2");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(
         rc, SQLITE_CONSTRAINT_UNIQUE,
