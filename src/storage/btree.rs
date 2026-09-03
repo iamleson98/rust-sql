@@ -4700,6 +4700,195 @@ impl<'a> Btree<'a> {
         Ok(())
     }
 
+    /// FUSED scan+patch: walk the rowid range handing each cell's payload
+    /// to the callback as a MUTABLE slice. Callback contract:
+    ///   - return `true`  → keep scanning (whether or not the row was
+    ///     patched; the caller tracks that in its own captured state);
+    ///   - return `false` → stop the walk entirely.
+    ///
+    /// A cell whose payload lives on overflow pages CANNOT be patched
+    /// through its local prefix — its rowid is pushed into
+    /// `fallback_rowids` and the callback is NOT called for it (the
+    /// caller processes those rows through the ordinary update path).
+    ///
+    /// Safety invariant: the caller may only OVERWRITE payload bytes with
+    /// SAME-SIZE content (the UPDATE patch path guarantees this — any
+    /// size change must go to the fallback path instead). Same-size
+    /// in-place writes never move cells, split leaves, or invalidate the
+    /// cell-pointer array, so the leaf iteration state stays valid
+    /// throughout the walk. Patched pages are marked dirty exactly like
+    /// every other in-cache page mutation.
+    pub fn scan_table_range_patch<F: FnMut(i64, &mut [u8]) -> bool>(
+        &mut self,
+        start: i64,
+        end: i64,
+        mut f: F,
+        fallback_rowids: &mut Vec<i64>,
+    ) -> Result<()> {
+        self.scan_range_subtree_patch(self.root, start, end, &mut f, fallback_rowids)?;
+        Ok(())
+    }
+
+    fn scan_range_subtree_patch<F: FnMut(i64, &mut [u8]) -> bool>(
+        &mut self,
+        page_id: PageId,
+        start: i64,
+        end: i64,
+        f: &mut F,
+        fallback_rowids: &mut Vec<i64>,
+    ) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let mut borrowed = page.lock();
+        prefetch_search_lines(&borrowed.data);
+        let pt = borrowed.page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                let n = borrowed.n_cells();
+                let psz = borrowed.data.len();
+                // Binary search for the first cell with rowid >= start
+                // (mirrors scan_range_subtree_borrowed).
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
+                        Some((rowid, _)) if rowid < start => lo = mid + 1,
+                        _ => hi = mid,
+                    }
+                }
+                let mut page_dirty = false;
+                let mut stop = false;
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    // Phase A: parse the cell header (rowid, payload span,
+                    // local length) under an immutable borrow that ENDS
+                    // before the mutable payload borrow begins.
+                    let parsed = {
+                        let buf = borrowed.cell_slice_checked(cell_ptr)?;
+                        let (rowid, n1) = varint::decode_signed(buf).ok_or_else(|| {
+                            Error::corruption("truncated leaf rowid in range_patch")
+                        })?;
+                        if rowid > end {
+                            // Cells are sorted: everything after is past
+                            // the range too — stop the whole walk.
+                            stop = true;
+                            None
+                        } else if rowid < start {
+                            None
+                        } else {
+                            let (plen, n2) = varint::decode(&buf[n1..]).ok_or_else(|| {
+                                Error::corruption("truncated payload len in range_patch")
+                            })?;
+                            let payload_start = n1 + n2;
+                            let plen_usize = plen as usize;
+                            let local_len = overflow_local_len_for(plen_usize, psz);
+                            Some((rowid, payload_start, local_len, plen_usize))
+                        }
+                    };
+                    if stop {
+                        break;
+                    }
+                    let Some((rowid, payload_start, local_len, plen_usize)) = parsed else {
+                        continue;
+                    };
+                    if local_len == plen_usize {
+                        // Local (non-overflow) payload: hand the mutable
+                        // region to the callback. NOTE: payload_start is
+                        // CELL-relative (parsed from the cell slice that
+                        // begins at cell_ptr) — the page-relative span is
+                        // [cell_ptr + payload_start, + plen_usize).
+                        let payload_start = cell_ptr + payload_start;
+                        if payload_start + plen_usize > psz {
+                            return Err(Error::corruption("truncated payload in range_patch"));
+                        }
+                        let payload = &mut borrowed.data[payload_start..payload_start + plen_usize];
+                        let keep = f(rowid, payload);
+                        // CONSERVATIVE dirty marking: the callback may have
+                        // patched bytes even when it asks to stop; a page
+                        // mutated without its dirty flag would silently
+                        // miss the next flush.
+                        page_dirty = true;
+                        if !keep {
+                            stop = true;
+                            break;
+                        }
+                    } else {
+                        // Overflow cell: the payload continues on overflow
+                        // pages — cannot be patched in place here.
+                        fallback_rowids.push(rowid);
+                    }
+                }
+                if page_dirty {
+                    borrowed.dirty = true;
+                }
+                drop(borrowed);
+                if page_dirty {
+                    // Same bookkeeping every other page mutation does: the
+                    // dirty flag for the flusher (set above, under the
+                    // guard), note_dirty for the O(dirty) flush set.
+                    self.pager.note_dirty(page_id);
+                }
+                Ok(!stop) // false = caller must not descend further right
+            }
+            PageType::InteriorTable => {
+                let n = borrowed.n_cells();
+                let right = borrowed.right_most_pointer();
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    let key = decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
+                        .ok_or_else(|| {
+                            Error::corruption("truncated interior cell in range_patch")
+                        })?;
+                    if key < start {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let mut children: Vec<PageId> = Vec::with_capacity((n - lo) as usize + 1);
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if let Some(child) =
+                        decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
+                    {
+                        children.push(child);
+                    }
+                }
+                if right != 0 {
+                    children.push(right);
+                }
+                drop(borrowed);
+                drop(page);
+                for child in children {
+                    if !self.scan_range_subtree_patch(child, start, end, f, fallback_rowids)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in range patch scan: {:?}",
+                pt
+            ))),
+        }
+    }
+
     /// Walk the rowid range [start, end] in order. Returns Ok(false) when
     /// the walk should STOP (a leaf's smallest rowid exceeded `end`, or the
     /// callback asked to stop) — the caller must not descend into further

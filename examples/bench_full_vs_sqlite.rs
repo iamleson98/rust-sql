@@ -382,7 +382,12 @@ fn bench_range_scan() -> BenchResult {
                     .prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100")
                     .unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // Fair-work parity: read the projected columns —
+                // rustqlite's materializing `query()` decodes them.
+                while let Some(row) = rows.next().unwrap() {
+                    let _name: String = row.get(0).unwrap();
+                    let _val: i64 = row.get(1).unwrap();
+                }
             }
         },
         n as usize,

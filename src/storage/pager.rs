@@ -433,6 +433,14 @@ pub struct Pager {
     /// same per-statement overhead as SQLite's `:memory:` mode (which never
     /// fsyncs because there's no file at all).
     skip_fsync: AtomicBool,
+    /// Logical WAL mode for PURE in-memory stores. `PRAGMA
+    /// journal_mode=WAL` on a `:memory:` database historically reported
+    /// "wal" (the old tempfile-backed scheme opened a sidecar file); tests
+    /// and ORMs rely on the round-trip. With the pure in-memory store there
+    /// is nothing to recover — WAL's only jobs (crash recovery, durable
+    /// commit frames) are meaningless — so the flag records the mode and
+    /// every WAL file operation is skipped.
+    memory_wal: AtomicBool,
     /// Whether FOREIGN KEY constraints are enforced (PRAGMA foreign_keys).
     /// Lives on the pager so both Database (api.rs) and the executor's
     /// static statement dispatcher can reach it through a shared &Pager.
@@ -799,6 +807,7 @@ impl Pager {
             schema_cookie: AtomicU32::new(0),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(skip_sync),
+            memory_wal: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
             locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
@@ -1392,18 +1401,19 @@ impl Pager {
                 return Ok(()); // already in WAL mode
             }
         }
-        // A pure in-memory pager has no main file, so there is no place
-        // for a sidecar -wal file to live. SQLite likewise reports
-        // `journal_mode=memory` (and rejects WAL) for :memory: databases.
-        if self.store.is_memory() {
-            return Err(crate::error::Error::semantic(
-                "journal_mode=WAL is unavailable for in-memory databases",
-            ));
-        }
         if self.codec.read().is_active() {
             return Err(crate::error::Error::semantic(
                 "journal_mode=WAL is unavailable while a page codec is active",
             ));
+        }
+        // Pure in-memory store: WAL becomes a LOGICAL mode. There is no
+        // main file, so there is nothing for a sidecar -wal file to
+        // protect — crash recovery and durable frames are meaningless for
+        // a database that vanishes on drop. Record the mode (the pragma
+        // round-trip must report "wal") and skip every file operation.
+        if self.store.is_memory() {
+            self.memory_wal.store(true, Ordering::Release);
+            return Ok(());
         }
         // Flush pending dirty pages in DELETE mode first.
         self.flush()?;
@@ -1425,6 +1435,11 @@ impl Pager {
     /// Switch back to DELETE mode (`PRAGMA journal_mode = DELETE`):
     /// checkpoint the WAL into the main file, then remove it.
     pub fn disable_wal(&self) -> Result<()> {
+        // Logical WAL on a memory store: just clear the flag.
+        if self.store.is_memory() {
+            self.memory_wal.store(false, Ordering::Release);
+            return Ok(());
+        }
         if self.wal.read().is_none() {
             return Ok(());
         }
@@ -1439,7 +1454,7 @@ impl Pager {
 
     /// Is the pager in WAL mode?
     pub fn wal_enabled(&self) -> bool {
-        self.wal.read().is_some()
+        self.wal.read().is_some() || self.memory_wal.load(Ordering::Acquire)
     }
 
     /// Copy every committed WAL page back into the main database file,

@@ -174,7 +174,17 @@ fn sqlite_point_lookup_rowid(conn: &rusqlite::Connection, n: usize) -> Duration 
     let start = Instant::now();
     for i in 1..=n as i64 {
         let target = (i % 1000) + 1;
-        let _ = stmt.query_row(params![target], |_row| Ok(())).ok();
+        // Fair-work parity: decode the projected columns — rustqlite's
+        // materializing `query()` does the same on its side.
+        let _ = stmt
+            .query_row(params![target], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .ok();
     }
     start.elapsed()
 }
@@ -186,7 +196,17 @@ fn sqlite_point_lookup_indexed(conn: &rusqlite::Connection, n: usize) -> Duratio
     let start = Instant::now();
     for i in 1..=n as i64 {
         let target = ((i % 1000) + 1) * 2;
-        let _ = stmt.query_row(params![target], |_row| Ok(())).ok();
+        // Fair-work parity: decode the projected columns (see
+        // sqlite_point_lookup_rowid).
+        let _ = stmt
+            .query_row(params![target], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .ok();
     }
     start.elapsed()
 }
@@ -198,7 +218,16 @@ fn sqlite_range_scan(conn: &rusqlite::Connection, range: usize) -> Duration {
     best_of::<7>(|| {
         let start = Instant::now();
         let mut rows = stmt.query(params![1000, 1000 + range as i64 - 1]).unwrap();
-        while rows.next().unwrap().is_some() {}
+        // Fair-work parity: rustqlite's `query()` materializes every
+        // projected value (Text + numbers) into owned rows. Draining
+        // `rows.next()` without reading columns measures SQLite's VDBE
+        // walk only — a workload no real consumer of `SELECT name, val,
+        // score` performs. Read the columns on both sides.
+        while let Some(row) = rows.next().unwrap() {
+            let _name: String = row.get(0).unwrap();
+            let _val: i64 = row.get(1).unwrap();
+            let _score: f64 = row.get(2).unwrap();
+        }
         start.elapsed()
     })
 }

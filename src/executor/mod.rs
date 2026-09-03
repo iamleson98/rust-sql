@@ -10643,6 +10643,15 @@ fn try_streaming_update(
         returning,
         fk_enforced,
     );
+    if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+        eprintln!(
+            "[dbg] streaming-update eligibility: patch_ctx={} compiled_all={} compiled_residual={} residual={:?}",
+            patch_ctx.is_some(),
+            compiled_assignments.iter().all(|c| c.is_some()),
+            compiled_residual.is_some(),
+            residual_pred.is_some()
+        );
+    }
 
     // Pre-compute which indexes might be touched by the SET assignments
     // BEFORE the scan — when any index column is assigned, the OLD payload
@@ -10683,6 +10692,10 @@ fn try_streaming_update(
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     // First constraint error encountered during the scan (if any).
     let mut first_error: Option<crate::error::Error> = None;
+    // Rows patched IN PLACE by the fused single-pass scan (see the
+    // RowidRange / Scan / merge-scan branches): these never enter
+    // `updates`, so the final count adds them explicitly.
+    let mut fused_patched: usize = 0;
 
     let mut bt = Btree::new(ctx.pager, root, false);
     if let Some(rowid) = lookup_rowid {
@@ -10795,40 +10808,134 @@ fn try_streaming_update(
         }
         Ok::<(), crate::error::Error>(())
     } else if matches!(src, StreamingSource::RowidRange { .. }) {
-        bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
-            let old_owned = if needs_old_payload {
-                Some(payload.to_vec())
-            } else {
-                None
+        // FUSED single-pass patch: when the payload-patch path is
+        // eligible and nothing downstream needs the collected write set
+        // (no index maintenance, no AFTER UPDATE triggers, no RETURNING),
+        // the scan itself patches cells IN PLACE — one header walk per
+        // row, zero payload copies, and phase 2's second table walk
+        // disappears entirely. Overflow-payload / size-change rows fall
+        // back to the ordinary collect path below.
+        if patch_ctx.is_some() && touched_indexes.is_empty() && !has_update_triggers {
+            #[allow(clippy::option_if_let_else)]
+            let Some(pc) = patch_ctx.as_mut() else {
+                unreachable!("eligibility checked is_some above")
             };
-            if let Err(e) = process_update_row(
-                ctx,
-                payload,
-                n_cols,
-                rowid,
-                &mut row_buf,
-                &mut new_row,
-                &mut payload_buf,
-                assignments,
-                col_names,
-                &params,
-                &named_params,
-                table,
-                residual_pred,
-                &mut updates,
-                &mut update_arena,
-                &mut returning_rows,
-                returning,
-                old_owned,
-                compiled_ref,
-                compiled_residual.as_ref(),
-                patch_ctx.as_mut(),
-            ) {
-                first_error = Some(e);
-                return false; // stop the scan
+            let mut not_fusable: Vec<i64> = Vec::new();
+            let mut overflow_fallback: Vec<i64> = Vec::new();
+            let mut fused_err: Option<crate::error::Error> = None;
+            bt.scan_table_range_patch(
+                range_start,
+                range_end,
+                |rowid, payload| match fused_patch_row(
+                    pc,
+                    &mut row_buf,
+                    payload,
+                    rowid,
+                    n_cols,
+                    table.rowid_alias,
+                    assignments,
+                    compiled_ref,
+                    compiled_residual.as_ref(),
+                    residual_pred,
+                    &params,
+                    &named_params,
+                    table,
+                ) {
+                    Some(true) => {
+                        fused_patched += 1;
+                        true
+                    }
+                    Some(false) => true,
+                    None => {
+                        not_fusable.push(rowid);
+                        true
+                    }
+                },
+                &mut overflow_fallback,
+            )?;
+            if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+                eprintln!(
+                    "[dbg] fused RowidRange: patched={} not_fusable={} overflow={}",
+                    fused_patched,
+                    not_fusable.len(),
+                    overflow_fallback.len()
+                );
             }
-            true
-        })
+            // Fallback rows (overflow payloads / size changes): the
+            // ordinary collect path, exactly as before.
+            for rowid in not_fusable.into_iter().chain(overflow_fallback) {
+                match bt.lookup_table(rowid)? {
+                    LookupResult::Found(payload) => {
+                        if let Err(e) = process_update_row(
+                            ctx,
+                            &payload,
+                            n_cols,
+                            rowid,
+                            &mut row_buf,
+                            &mut new_row,
+                            &mut payload_buf,
+                            assignments,
+                            col_names,
+                            &params,
+                            &named_params,
+                            table,
+                            residual_pred,
+                            &mut updates,
+                            &mut update_arena,
+                            &mut returning_rows,
+                            returning,
+                            None,
+                            compiled_ref,
+                            compiled_residual.as_ref(),
+                            None,
+                        ) {
+                            fused_err = Some(e);
+                            break;
+                        }
+                    }
+                    LookupResult::NotFound => {}
+                }
+            }
+            if let Some(e) = fused_err {
+                first_error = Some(e);
+            }
+            Ok::<(), crate::error::Error>(())
+        } else {
+            bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
+                let old_owned = if needs_old_payload {
+                    Some(payload.to_vec())
+                } else {
+                    None
+                };
+                if let Err(e) = process_update_row(
+                    ctx,
+                    payload,
+                    n_cols,
+                    rowid,
+                    &mut row_buf,
+                    &mut new_row,
+                    &mut payload_buf,
+                    assignments,
+                    col_names,
+                    &params,
+                    &named_params,
+                    table,
+                    residual_pred,
+                    &mut updates,
+                    &mut update_arena,
+                    &mut returning_rows,
+                    returning,
+                    old_owned,
+                    compiled_ref,
+                    compiled_residual.as_ref(),
+                    patch_ctx.as_mut(),
+                ) {
+                    first_error = Some(e);
+                    return false; // stop the scan
+                }
+                true
+            })
+        }
     } else if let StreamingSource::IndexRange {
         index, start, end, ..
     } = &src
@@ -10930,63 +11037,170 @@ fn try_streaming_update(
             };
             let mut ri = 0usize;
             let mut err: Option<crate::error::Error> = None;
-            bt.scan_table_range_borrowed(walk_lo, walk_hi, |rowid, payload| {
-                let is_match = if dense {
-                    let bit = (rowid - walk_lo) as u64;
-                    bitset[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
-                } else {
-                    while ri < rowids.len() && rowids[ri] < rowid {
+            // Fused membership+patch walk: same walk bounds / bitset /
+            // sorted-pointer membership as below, but members are patched
+            // IN PLACE (see the RowidRange branch for eligibility notes).
+            if patch_ctx.is_some() && touched_indexes.is_empty() && !has_update_triggers {
+                #[allow(clippy::option_if_let_else)]
+                let Some(pc) = patch_ctx.as_mut() else {
+                    unreachable!("eligibility checked is_some above")
+                };
+                let mut not_fusable: Vec<i64> = Vec::new();
+                let mut overflow_fallback: Vec<i64> = Vec::new();
+                bt.scan_table_range_patch(
+                    walk_lo,
+                    walk_hi,
+                    |rowid, payload| {
+                        let is_match = if dense {
+                            let bit = (rowid - walk_lo) as u64;
+                            bitset[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
+                        } else {
+                            while ri < rowids.len() && rowids[ri] < rowid {
+                                ri += 1;
+                            }
+                            if ri >= rowids.len() {
+                                return false; // all matches processed
+                            }
+                            rowids[ri] == rowid
+                        };
+                        if !is_match {
+                            if !dense && ri >= rowids.len() {
+                                return false;
+                            }
+                            return true;
+                        }
+                        if !dense {
+                            ri += 1;
+                        }
+                        match fused_patch_row(
+                            pc,
+                            &mut row_buf,
+                            payload,
+                            rowid,
+                            n_cols,
+                            table.rowid_alias,
+                            assignments,
+                            compiled_ref,
+                            compiled_residual.as_ref(),
+                            residual_pred,
+                            &params,
+                            &named_params,
+                            table,
+                        ) {
+                            Some(true) => {
+                                fused_patched += 1;
+                                true
+                            }
+                            Some(false) => true,
+                            None => {
+                                not_fusable.push(rowid);
+                                true
+                            }
+                        }
+                    },
+                    &mut overflow_fallback,
+                )?;
+                if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+                    eprintln!(
+                        "[dbg] fused merge-scan: patched={} not_fusable={} overflow={}",
+                        fused_patched,
+                        not_fusable.len(),
+                        overflow_fallback.len()
+                    );
+                }
+                // Fallback rows: ordinary collect path.
+                for rowid in not_fusable.into_iter().chain(overflow_fallback) {
+                    match bt.lookup_table(rowid)? {
+                        LookupResult::Found(payload) => {
+                            if let Err(e) = process_update_row(
+                                ctx,
+                                &payload,
+                                n_cols,
+                                rowid,
+                                &mut row_buf,
+                                &mut new_row,
+                                &mut payload_buf,
+                                assignments,
+                                col_names,
+                                &params,
+                                &named_params,
+                                table,
+                                residual_pred,
+                                &mut updates,
+                                &mut update_arena,
+                                &mut returning_rows,
+                                returning,
+                                None,
+                                compiled_ref,
+                                compiled_residual.as_ref(),
+                                None,
+                            ) {
+                                first_error = Some(e);
+                                break;
+                            }
+                        }
+                        LookupResult::NotFound => {}
+                    }
+                }
+            } else {
+                bt.scan_table_range_borrowed(walk_lo, walk_hi, |rowid, payload| {
+                    let is_match = if dense {
+                        let bit = (rowid - walk_lo) as u64;
+                        bitset[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
+                    } else {
+                        while ri < rowids.len() && rowids[ri] < rowid {
+                            ri += 1;
+                        }
+                        if ri >= rowids.len() {
+                            return false; // all matches processed
+                        }
+                        rowids[ri] == rowid
+                    };
+                    if !is_match {
+                        // Past the last wanted rowid: stop the walk early (the
+                        // range may over-cover).
+                        if !dense && ri >= rowids.len() {
+                            return false;
+                        }
+                        return true;
+                    }
+                    if !dense {
                         ri += 1;
                     }
-                    if ri >= rowids.len() {
-                        return false; // all matches processed
-                    }
-                    rowids[ri] == rowid
-                };
-                if !is_match {
-                    // Past the last wanted rowid: stop the walk early (the
-                    // range may over-cover).
-                    if !dense && ri >= rowids.len() {
+                    let old_owned = if needs_old_payload {
+                        Some(payload.to_vec())
+                    } else {
+                        None
+                    };
+                    if let Err(e) = process_update_row(
+                        ctx,
+                        payload,
+                        n_cols,
+                        rowid,
+                        &mut row_buf,
+                        &mut new_row,
+                        &mut payload_buf,
+                        assignments,
+                        col_names,
+                        &params,
+                        &named_params,
+                        table,
+                        residual_pred,
+                        &mut updates,
+                        &mut update_arena,
+                        &mut returning_rows,
+                        returning,
+                        old_owned,
+                        compiled_ref,
+                        compiled_residual.as_ref(),
+                        patch_ctx.as_mut(),
+                    ) {
+                        err = Some(e);
                         return false;
                     }
-                    return true;
-                }
-                if !dense {
-                    ri += 1;
-                }
-                let old_owned = if needs_old_payload {
-                    Some(payload.to_vec())
-                } else {
-                    None
-                };
-                if let Err(e) = process_update_row(
-                    ctx,
-                    payload,
-                    n_cols,
-                    rowid,
-                    &mut row_buf,
-                    &mut new_row,
-                    &mut payload_buf,
-                    assignments,
-                    col_names,
-                    &params,
-                    &named_params,
-                    table,
-                    residual_pred,
-                    &mut updates,
-                    &mut update_arena,
-                    &mut returning_rows,
-                    returning,
-                    old_owned,
-                    compiled_ref,
-                    compiled_residual.as_ref(),
-                    patch_ctx.as_mut(),
-                ) {
-                    err = Some(e);
-                    return false;
-                }
-                true
-            })?;
+                    true
+                })?;
+            }
             if let Some(e) = err {
                 first_error = Some(e);
             }
@@ -11035,40 +11249,123 @@ fn try_streaming_update(
         }
         Ok::<(), crate::error::Error>(())
     } else {
-        bt.scan_table_borrowed(|rowid, payload| {
-            let old_owned = if needs_old_payload {
-                Some(payload.to_vec())
-            } else {
-                None
+        // Full scan (optionally filtered). Fused single-pass patch when
+        // eligible (see the RowidRange branch for the conditions).
+        if patch_ctx.is_some() && touched_indexes.is_empty() && !has_update_triggers {
+            #[allow(clippy::option_if_let_else)]
+            let Some(pc) = patch_ctx.as_mut() else {
+                unreachable!("eligibility checked is_some above")
             };
-            if let Err(e) = process_update_row(
-                ctx,
-                payload,
-                n_cols,
-                rowid,
-                &mut row_buf,
-                &mut new_row,
-                &mut payload_buf,
-                assignments,
-                col_names,
-                &params,
-                &named_params,
-                table,
-                residual_pred,
-                &mut updates,
-                &mut update_arena,
-                &mut returning_rows,
-                returning,
-                old_owned,
-                compiled_ref,
-                compiled_residual.as_ref(),
-                patch_ctx.as_mut(),
-            ) {
-                first_error = Some(e);
-                return false; // stop the scan
+            let mut not_fusable: Vec<i64> = Vec::new();
+            let mut overflow_fallback: Vec<i64> = Vec::new();
+            bt.scan_table_range_patch(
+                i64::MIN,
+                i64::MAX,
+                |rowid, payload| match fused_patch_row(
+                    pc,
+                    &mut row_buf,
+                    payload,
+                    rowid,
+                    n_cols,
+                    table.rowid_alias,
+                    assignments,
+                    compiled_ref,
+                    compiled_residual.as_ref(),
+                    residual_pred,
+                    &params,
+                    &named_params,
+                    table,
+                ) {
+                    Some(true) => {
+                        fused_patched += 1;
+                        true
+                    }
+                    Some(false) => true,
+                    None => {
+                        not_fusable.push(rowid);
+                        true
+                    }
+                },
+                &mut overflow_fallback,
+            )?;
+            if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+                eprintln!(
+                    "[dbg] fused full-scan: patched={} not_fusable={} overflow={}",
+                    fused_patched,
+                    not_fusable.len(),
+                    overflow_fallback.len()
+                );
             }
-            true
-        })
+            for rowid in not_fusable.into_iter().chain(overflow_fallback) {
+                match bt.lookup_table(rowid)? {
+                    LookupResult::Found(payload) => {
+                        if let Err(e) = process_update_row(
+                            ctx,
+                            &payload,
+                            n_cols,
+                            rowid,
+                            &mut row_buf,
+                            &mut new_row,
+                            &mut payload_buf,
+                            assignments,
+                            col_names,
+                            &params,
+                            &named_params,
+                            table,
+                            residual_pred,
+                            &mut updates,
+                            &mut update_arena,
+                            &mut returning_rows,
+                            returning,
+                            None,
+                            compiled_ref,
+                            compiled_residual.as_ref(),
+                            None,
+                        ) {
+                            first_error = Some(e);
+                            break;
+                        }
+                    }
+                    LookupResult::NotFound => {}
+                }
+            }
+            Ok::<(), crate::error::Error>(())
+        } else {
+            bt.scan_table_borrowed(|rowid, payload| {
+                let old_owned = if needs_old_payload {
+                    Some(payload.to_vec())
+                } else {
+                    None
+                };
+                if let Err(e) = process_update_row(
+                    ctx,
+                    payload,
+                    n_cols,
+                    rowid,
+                    &mut row_buf,
+                    &mut new_row,
+                    &mut payload_buf,
+                    assignments,
+                    col_names,
+                    &params,
+                    &named_params,
+                    table,
+                    residual_pred,
+                    &mut updates,
+                    &mut update_arena,
+                    &mut returning_rows,
+                    returning,
+                    old_owned,
+                    compiled_ref,
+                    compiled_residual.as_ref(),
+                    patch_ctx.as_mut(),
+                ) {
+                    first_error = Some(e);
+                    return false; // stop the scan
+                }
+                true
+            })
+        }
     }?;
     let new_root = bt.root;
     ctx.set_table_root(&table.name, new_root);
@@ -11294,6 +11591,10 @@ fn try_streaming_update(
         updated += bulk_applied as i64;
         ctx.changes += bulk_applied as i64;
     }
+    // Rows patched in place by the fused single-pass scans never entered
+    // `updates` — count them here.
+    updated += fused_patched as i64;
+    ctx.changes += fused_patched as i64;
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
@@ -11309,19 +11610,108 @@ fn try_streaming_update(
     }))
 }
 
-/// Per-row processing for the streaming UPDATE: decode the payload into
-/// `row_buf`, apply the filter predicate, build the new row in `new_row`,
-/// enforce constraints, encode it into `payload_buf`, and push the
-/// (rowid, payload) tuple into `updates`. Buffers are reused across rows.
-#[allow(clippy::too_many_arguments)]
-/// Precomputed per-statement state for the UPDATE payload-patch fast path.
-/// When the table has no row constraints (no NOT NULL / CHECK / enforced
-/// FK) and every SET expression compiles, the new payload is built by
-/// COPYING the old payload bytes and patching only the assigned columns'
-/// regions — valid whenever each encoded new value keeps its size. This
-/// skips the full-row decode AND the full-row re-encode (~60-90 ns/row on
-/// a 4-column table). Any size change falls back to the generic path,
-/// which re-decodes the full row and re-encodes it.
+/// Fused in-place row patch for the single-pass UPDATE scan
+/// (`scan_table_range_patch`). Returns:
+///   `Some(true)`  — row patched in place (payload bytes written)
+///   `Some(false)` — row skipped (residual predicate filtered it out)
+///   `None`        — not fusable (size change / short payload / decode
+///                   failure): the caller must run the ordinary collect
+///                   path for this row.
+///
+/// Mirrors the patch branch of `process_update_row` but writes the new
+/// payload bytes INTO the cell's own storage (same-size only), skipping
+/// the update-arena copy and phase 2's second table walk entirely.
+fn fused_patch_row(
+    pc: &mut UpdatePatchCtx,
+    row_buf: &mut Vec<Value>,
+    payload: &mut [u8],
+    rowid: i64,
+    n_cols: usize,
+    alias: Option<usize>,
+    assignments: &[(usize, Expr)],
+    compiled: Option<&[Option<crate::executor::predicate::CompiledExpr>]>,
+    compiled_pred: Option<&crate::executor::predicate::CompiledPredicate>,
+    residual_pred: Option<&Expr>,
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+    table: &Arc<Table>,
+) -> Option<bool> {
+    let _ = named_params;
+    if !crate::storage::row_codec::row_column_regions_into(payload, n_cols, alias, &mut pc.regions)
+    {
+        return None; // short payload (older schema) — general path handles defaults
+    }
+    // Decode ONLY the wanted columns, directly from their regions.
+    row_buf.clear();
+    row_buf.resize(n_cols, Value::Null);
+    for &col in &pc.wanted {
+        if alias == Some(col) {
+            row_buf[col] = Value::Integer(rowid);
+        } else {
+            let (roff, rlen) = pc.regions[col];
+            match Value::decode(&payload[roff as usize..(roff + rlen) as usize]) {
+                Ok((v, _)) => row_buf[col] = v,
+                Err(_) => return None,
+            }
+        }
+    }
+    // Residual filter (compiled positional evaluation).
+    let keep = match (residual_pred, compiled_pred) {
+        (None, _) => true,
+        (Some(_), Some(cp)) => cp.eval(row_buf, IDENTITY_POSITIONS, params),
+        // Unreachable (UpdatePatchCtx::try_new guarantees a compiled
+        // residual whenever one exists) — but fall back rather than
+        // silently filtering.
+        (Some(_), None) => return None,
+    };
+    if !keep {
+        return Some(false);
+    }
+    // Stage the encoded new values.
+    pc.staging.clear();
+    pc.slot_regions.clear();
+    for (i, (col_idx, _)) in assignments.iter().enumerate() {
+        let v = match compiled.and_then(|c| c.get(i)) {
+            Some(Some(cexpr)) => cexpr.eval(row_buf, params),
+            // Eligibility guarantees Some — unreachable; fall back safely.
+            _ => return None,
+        };
+        let v = table.columns[*col_idx].affinity.coerce(v);
+        let off = pc.staging.len();
+        v.encode_into(&mut pc.staging);
+        pc.slot_regions.push((off, pc.staging.len() - off));
+    }
+    // Same-size in-place patch of the assigned regions. TWO PHASES —
+    // validate EVERY assigned region's size BEFORE writing ANY bytes: the
+    // payload is the LIVE cell storage, so a partial patch followed by a
+    // size-mismatch fallback would leave earlier columns written and the
+    // fallback row-decode would apply the SETs a second time (observed as
+    // patch_update_multi_assign's doubled values). The collect-path
+    // variant patches a COPY, so it could check-and-write inline; we
+    // cannot.
+    let mut all_sizes_match = true;
+    for (col, (_roff, rlen)) in pc.regions.iter().enumerate() {
+        if let Some(slot) = pc.assigned_slot.get(col).and_then(|s| *s) {
+            let (_soff, slen) = pc.slot_regions[slot];
+            if slen as u32 != *rlen {
+                all_sizes_match = false;
+                break;
+            }
+        }
+    }
+    if !all_sizes_match {
+        return None; // size change — general path (delete + insert)
+    }
+    for (col, (roff, rlen)) in pc.regions.iter().enumerate() {
+        if let Some(slot) = pc.assigned_slot.get(col).and_then(|s| *s) {
+            let (soff, slen) = pc.slot_regions[slot];
+            payload[*roff as usize..(*roff + *rlen) as usize]
+                .copy_from_slice(&pc.staging[soff..soff + slen]);
+        }
+    }
+    Some(true)
+}
+
 pub(crate) struct UpdatePatchCtx {
     /// Columns to decode: assigned + everything the SET/residual
     /// expressions reference (ascending, deduped).
@@ -11350,8 +11740,16 @@ impl UpdatePatchCtx {
         // RETURNING may project UNassigned columns — the patch path never
         // decodes them. No constraints (they'd read undecoded Nulls). Every
         // SET must compile (the AST walk needs the full row + col names).
+        // The rowid-alias column's nullability is EXEMPT from the check:
+        // callers guarantee no assignment targets it (a rowid reassignment
+        // bails to the general path before this), and its payload slot is
+        // the 1-byte rowid marker — never a decoded NULL.
         if returning.is_some()
-            || table.columns.iter().any(|c| !c.nullable)
+            || table
+                .columns
+                .iter()
+                .enumerate()
+                .any(|(i, c)| table.rowid_alias != Some(i) && !c.nullable)
             || !table.check_exprs.is_empty()
             || (fk_enforced && !table.foreign_keys.is_empty())
             || compiled.len() != assignments.len()
@@ -11383,6 +11781,11 @@ impl UpdatePatchCtx {
     }
 }
 
+/// Per-row processing for the streaming UPDATE: decode the payload into
+/// `row_buf`, apply the filter predicate, build the new row in `new_row`,
+/// enforce constraints, encode it into `payload_buf`, and push the
+/// (rowid, payload) tuple into `updates`. Buffers are reused across rows.
+#[allow(clippy::too_many_arguments)]
 fn process_update_row(
     fk_ctx: &ExecContext<'_>,
     payload: &[u8],
