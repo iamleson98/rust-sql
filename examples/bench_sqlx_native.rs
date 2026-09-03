@@ -386,6 +386,13 @@ async fn main() {
     }
 
     /// SQLite file DB in WAL mode with N connections, pre-seeded.
+    ///
+    /// `busy_timeout(60s)`: sqlx-sqlite defaults to 5 s, which the Windows
+    /// runners' WAL fsync latency can exceed under 8-connection write
+    /// contention (SQLITE_BUSY panics — the CI bench-gate died with
+    /// `database is locked` mid-benchmark on attempt, unrelated to
+    /// rustqlite). Waiting longer never HIDES cost: blocked time still
+    /// counts in SQLite's own wall-clock numbers.
     async fn sq_wal(n: u32, ddl: &'static str) -> (tempfile::TempDir, sqlx::SqlitePool) {
         let tmp = tempfile::tempdir().unwrap();
         use sqlx::sqlite::SqliteJournalMode;
@@ -395,7 +402,8 @@ async fn main() {
                 SqliteConnectOptions::new()
                     .filename(tmp.path().join("wal.db"))
                     .create_if_missing(true)
-                    .journal_mode(SqliteJournalMode::Wal),
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::from_secs(60)),
             )
             .await
             .unwrap();

@@ -140,7 +140,7 @@ fn main() {
         // SQLite equivalents for reference.
         let t = Instant::now();
         for _ in 0..200 {
-            let _ = sqlite
+            sqlite
                 .query_row(
                     "SELECT COUNT(*), AVG(b) FROM bench WHERE a BETWEEN -1 AND 9999999",
                     [],

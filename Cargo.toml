@@ -90,6 +90,13 @@ name = "probe_w7r"
 path = "examples/probe_w7r.rs"
 required-features = ["sqlx"]
 
+# sqlx-driver layer attribution (parse vs engine vs prepare-cache costs).
+# Run: cargo run --release --example probe_driver_layer --features sqlx
+[[example]]
+name = "probe_driver_layer"
+path = "examples/probe_driver_layer.rs"
+required-features = ["sqlx"]
+
 [dependencies]
 # HTTP server (tiny, no async runtime — keeps binary size small)
 tiny_http = "0.12"

@@ -407,22 +407,23 @@ fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<Pre
         // to the unfused path (full row materialization + AST-walk filter
         // per row: 150 ns/row vs 17 ns/row, measured in
         // examples/probe_mixed_reads.rs).
-        Expr::Unary { op, expr } if matches!(op, crate::sql::ast::UnaryOp::Neg) => {
-            match expr.as_ref() {
-                Expr::Literal(v @ (Value::Integer(_) | Value::Real(_))) => {
-                    let folded = match v {
-                        Value::Integer(i) if *i != i64::MIN => Value::Integer(-i),
-                        Value::Real(x) => Value::Real(-x),
-                        // i64::MIN: -MIN overflows; the parser emits
-                        // Literal(MIN) directly for it, so this is
-                        // unreachable in practice — decline to fold.
-                        _ => return None,
-                    };
-                    Some(PredValue::Literal(folded))
-                }
-                _ => None,
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(v @ (Value::Integer(_) | Value::Real(_))) => {
+                let folded = match v {
+                    Value::Integer(i) if *i != i64::MIN => Value::Integer(-i),
+                    Value::Real(x) => Value::Real(-x),
+                    // i64::MIN: -MIN overflows; the parser emits
+                    // Literal(MIN) directly for it, so this is
+                    // unreachable in practice — decline to fold.
+                    _ => return None,
+                };
+                Some(PredValue::Literal(folded))
             }
-        }
+            _ => None,
+        },
         Expr::Column { table: ref_t, name } => {
             let matches = ref_t
                 .as_ref()

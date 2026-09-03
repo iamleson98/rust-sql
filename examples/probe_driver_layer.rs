@@ -7,6 +7,7 @@
 //!   1. parser::parse cost for the exact bench INSERT statement
 //!   2. the full sqlx txn loop (same shape as bench_sqlx_native)
 //!   3. the engine-only equivalent loop (no sqlx layer)
+//!
 //! so the win from skipping the per-statement classify parse is measurable.
 //!
 //! Run: cargo run --release --features sqlx --example probe_driver_layer

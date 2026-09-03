@@ -369,16 +369,22 @@ fn read_throughput_scales_with_threads() {
         single_ops, n_threads, multi_ops, multi_ops / single_ops
     );
 
-    // The key assertion: multi-thread OPS is at least 35% of single-thread.
-    // If we were silently serializing on a write lock, multi would be ~12.5%
-    // of single (1/8 threads). 35% means we ARE running concurrently, even
-    // if not perfectly scaled (memory bandwidth / cache contention / a busy
-    // CI box can push a healthy run down to ~0.5x, so the threshold sits
-    // well above the serialized floor while staying load-tolerant).
+    // The key assertion: multi-thread OPS is a healthy multiple of the
+    // SERIALIZED floor (single / n_threads). If reads silently serialized
+    // on one lock, multi would sit AT the floor (~12.5% of single for 8
+    // threads); the threshold is 2x the floor (25%), so serialization is
+    // still detected with 2x margin while small CI runners pass: a
+    // windows-latest 2-vCPU runner reached only 0.32x single (8 threads,
+    // 4x oversubscription + shared-VM cache pressure) — a HEALTHY
+    // concurrent run, well above 0.25x, but below the old fixed 0.35x.
+    let floor = 2.0 / n_threads as f64;
     assert!(
-        multi_ops >= single_ops * 0.35,
-        "expected multi-thread throughput >= 0.35 × single-thread (concurrent), got multi={} single={} (ratio {})",
-        multi_ops, single_ops, multi_ops / single_ops
+        multi_ops >= single_ops * floor,
+        "expected multi-thread throughput >= {:.2} × single-thread (2x the serialized floor), got multi={} single={} (ratio {})",
+        floor,
+        multi_ops,
+        single_ops,
+        multi_ops / single_ops
     );
 }
 

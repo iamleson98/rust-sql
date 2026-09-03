@@ -1073,7 +1073,7 @@ async fn file_backed_pool_path_spellings_share_one_engine() {
 
     // Pool #1: file does NOT exist yet, path spelled through the symlink.
     let p1 = RustqlitePool::connect_with(
-        RustqliteConnectOptions::filename(&link.join("coh.db")).create_if_missing(true),
+        RustqliteConnectOptions::filename(link.join("coh.db")).create_if_missing(true),
     )
     .await
     .unwrap();
@@ -1091,7 +1091,7 @@ async fn file_backed_pool_path_spellings_share_one_engine() {
 
     // Pool #2: the REAL spelling, file now exists. Must land on the SAME
     // engine (canonical key), not a second engine with a private pager.
-    let p2 = RustqlitePool::connect_with(RustqliteConnectOptions::filename(&real.join("coh.db")))
+    let p2 = RustqlitePool::connect_with(RustqliteConnectOptions::filename(real.join("coh.db")))
         .await
         .unwrap();
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c")
