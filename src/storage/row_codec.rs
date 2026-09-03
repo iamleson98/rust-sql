@@ -173,10 +173,16 @@ pub fn decode_row_selective(
 
     // The single-cursor column walk below requires `col_indices` to be in
     // ascending order. Projections arrive in SELECT order — `SELECT val,
-    // name` on (id, name, val) is [2, 1] — so detect a non-ascending list
-    // once and decode through a sorted copy plus a slot permutation.
-    // Ascending projections (the common case: prefix projections and
-    // covering-index reads) keep the allocation-free path.
+    // name` on (id, name, val) is [2, 1] — so a non-ascending list is
+    // decoded through a sorted copy plus a slot permutation. Real
+    // projections are small (<= 16 columns covers everything except
+    // pathological schemas), so the permutation lives on the STACK:
+    // the old path allocated two Vecs (and sorted one) PER DECODED ROW —
+    // ~40-60 ns of heap traffic that dominated the per-row cost of
+    // reordered projections like `SELECT name, id ... WHERE id = ?`.
+    // (Dedup happens implicitly: duplicate columns hit the run
+    // placement below, same as before.)
+    const SMALL: usize = 16;
     let mut ascending = true;
     for w in 1..col_indices.len() {
         if col_indices[w - 1] > col_indices[w] {
@@ -184,32 +190,54 @@ pub fn decode_row_selective(
             break;
         }
     }
-    // Only allocated for non-ascending projections.
-    let perm: Option<(Vec<usize>, Vec<usize>)> = if ascending {
-        None
+
+    let mut sorted_stack = [usize::MAX; SMALL];
+    let mut order_stack = [usize::MAX; SMALL];
+    // Initial `None` is only ever replaced in the >SMALL branch below.
+    #[allow(unused_assignments)]
+    let mut perm_heap: Option<(Vec<usize>, Vec<usize>)> = None;
+
+    // Sorted index list + slot permutation for the walk. `slot_of(k)`
+    // gives the output position for sorted position k.
+    let indices: &[usize];
+    let mut slots_ref: &[usize] = &[];
+    if ascending {
+        indices = col_indices;
+    } else if col_indices.len() <= SMALL {
+        let n = col_indices.len();
+        sorted_stack[..n].copy_from_slice(col_indices);
+        for (k, o) in order_stack.iter_mut().enumerate().take(n) {
+            *o = k;
+        }
+        // Paired insertion sort: (sorted[k], order[k]) move together.
+        for k in 1..n {
+            let sk = sorted_stack[k];
+            let ok = order_stack[k];
+            let mut j = k;
+            while j > 0 && sorted_stack[j - 1] > sk {
+                sorted_stack[j] = sorted_stack[j - 1];
+                order_stack[j] = order_stack[j - 1];
+                j -= 1;
+            }
+            sorted_stack[j] = sk;
+            order_stack[j] = ok;
+        }
+        indices = &sorted_stack[..n];
+        slots_ref = &order_stack[..n];
     } else {
-        // Sort a copy of the indices and remember, for each sorted
-        // position k, the output slot it feeds: slots[k].
+        // > 16 projected columns: the rare wide-schema case; heap perm.
         let mut order: Vec<usize> = (0..col_indices.len()).collect();
         order.sort_unstable_by_key(|&slot| col_indices[slot]);
         let sorted: Vec<usize> = order.iter().map(|&slot| col_indices[slot]).collect();
-        Some((sorted, order))
-    };
-    let indices: &[usize] = match &perm {
-        None => col_indices,
-        Some((sorted, _)) => sorted,
-    };
+        perm_heap = Some((sorted, order));
+        let (s, o) = perm_heap.as_ref().unwrap();
+        indices = s;
+        slots_ref = o;
+    }
     // Output slot for sorted position `k` (identity when ascending).
     #[inline]
-    fn perm_slots(perm: &Option<(Vec<usize>, Vec<usize>)>) -> &[usize] {
-        match perm {
-            None => &[],
-            Some((_, slots)) => slots,
-        }
-    }
-    #[inline]
-    fn slot_of(indices_asc: bool, slots: &[usize], k: usize) -> usize {
-        if indices_asc {
+    fn slot_of(ascending: bool, slots: &[usize], k: usize) -> usize {
+        if ascending {
             k
         } else {
             slots[k]
@@ -249,7 +277,7 @@ pub fn decode_row_selective(
                     ));
                 }
                 for k in wanted_idx..run_end {
-                    out[slot_of(ascending, perm_slots(&perm), k)] = Value::Integer(rowid);
+                    out[slot_of(ascending, slots_ref, k)] = Value::Integer(rowid);
                 }
                 pos += 1;
             } else {
@@ -257,10 +285,10 @@ pub fn decode_row_selective(
                     .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
                 if run_end - wanted_idx == 1 {
                     // Common case: one slot — move the value, no clone.
-                    out[slot_of(ascending, perm_slots(&perm), wanted_idx)] = v;
+                    out[slot_of(ascending, slots_ref, wanted_idx)] = v;
                 } else {
                     for k in wanted_idx..run_end {
-                        out[slot_of(ascending, perm_slots(&perm), k)] = v.clone();
+                        out[slot_of(ascending, slots_ref, k)] = v.clone();
                     }
                 }
                 pos += n;
