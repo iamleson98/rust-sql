@@ -237,7 +237,12 @@ fn bench_point_lookup(c: &mut Criterion) {
                 .prepare("SELECT name, val FROM t WHERE id = ?1")
                 .unwrap();
             let mut rows = stmt.query(params![black_box(500)]).unwrap();
-            while rows.next().unwrap().is_some() {}
+            // Fair-work parity: read the projected columns — rustqlite's
+            // materializing `query()` decodes them.
+            while let Some(row) = rows.next().unwrap() {
+                let _name: String = row.get(0).unwrap();
+                let _val: i64 = row.get(1).unwrap();
+            }
         })
     });
 
@@ -269,7 +274,12 @@ fn bench_range_scan(c: &mut Criterion) {
                 .prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100")
                 .unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while rows.next().unwrap().is_some() {}
+            // Fair-work parity: read the projected columns (see
+            // rusqlite_prepared).
+            while let Some(row) = rows.next().unwrap() {
+                let _name: String = row.get(0).unwrap();
+                let _val: i64 = row.get(1).unwrap();
+            }
         })
     });
 
@@ -334,7 +344,17 @@ fn bench_join(c: &mut Criterion) {
                 )
                 .unwrap();
             let mut rows = stmt.query([]).unwrap();
-            while rows.next().unwrap().is_some() {}
+            // Fair-work parity: rustqlite's `query()` materializes all
+            // 1000 projected rows (4 values each). Draining `rows.next()`
+            // without reading columns measures only SQLite's VDBE walk.
+            let mut acc: i64 = 0;
+            while let Some(row) = rows.next().unwrap() {
+                acc = acc.wrapping_add(row.get::<_, i64>(0).unwrap());
+                acc = acc.wrapping_add(row.get::<_, i64>(1).unwrap());
+                acc = acc.wrapping_add(row.get::<_, i64>(2).unwrap());
+                acc = acc.wrapping_add(row.get::<_, i64>(3).unwrap());
+            }
+            black_box(acc);
         })
     });
 

@@ -312,7 +312,12 @@ jobs:
       # Runs ONLY when a gate above failed: per-component cost breakdowns
       # (open/create/insert, pinned + unpinned) so perf losses can be
       # attributed from the CI runner itself instead of guessed.
-      - name: Diagnose bench losses (Linux only, on failure)
+      - name: Diagnose bench losses (on failure)
+        if: failure()
+        run: |
+          echo "===== probe_point_shapes (rowid vs indexed vs gate-1 shape) ====="
+          cargo run --release --example probe_point_shapes 2>&1 | grep -E "shape" || true
+      - name: Diagnose bench losses (Linux only, extra probes)
         if: failure() && runner.os == 'Linux'
         run: |
           cargo build --release --example probe_mv_breakdown --example probe_open_cost --example probe_mv_insert 2>&1 | tail -1

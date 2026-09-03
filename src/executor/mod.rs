@@ -905,6 +905,12 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             condition,
             algorithm,
         } => {
+            if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+                eprintln!(
+                    "[dbg] execute: Plan::Join algo={:?} join={:?}",
+                    algorithm, join_type
+                );
+            }
             if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
                 exec_hash_join(ctx, left, right, *join_type, condition, None)
             } else {
@@ -6601,6 +6607,13 @@ fn exec_hash_join(
     // shape or value the fast path doesn't cover; the materialized path
     // below is then 100% in charge (same semantics, different cost
     // profile).
+    if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+        eprintln!(
+            "[dbg] hash-join: fused gate: projection={} join={:?}",
+            projection.is_some(),
+            join_type
+        );
+    }
     if projection.is_some()
         && matches!(
             join_type,

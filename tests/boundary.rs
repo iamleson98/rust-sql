@@ -374,6 +374,23 @@ fn text_and_blob_boundaries() {
 
 #[test]
 fn deep_nesting_errors_without_stack_overflow() {
+    // Windows test threads start with a 1 MB stack (Linux: 8 MB). The
+    // parser's recursion + the AST's recursive drop glue at the
+    // must-PARSE depths (400 nested parens / CASEs) exceed that, so the
+    // process aborts before the depth-limit logic ever gets to prove
+    // itself. Run the body on a thread with an explicit,
+    // platform-independent stack: the test then verifies the ENGINE's
+    // depth limiting (graceful errors, no abort), not the default
+    // platform thread stack.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(deep_nesting_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn deep_nesting_body() {
     let db = Database::open_in_memory().unwrap();
     // Parentheses: within the depth limit must parse; beyond it must
     // return a graceful parse error (SQLite's SQLITE_MAX_EXPR_DEPTH
