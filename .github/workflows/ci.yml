@@ -130,8 +130,12 @@ jobs:
       # redundancy of the old plain `cargo test` matrix.
       - name: cargo test (${{ matrix.config }})
         run: |
+          DOC_FLAGS=""
+          if [ "${{ runner.os }}" = "Linux" ] && [ "${{ matrix.config }}" = "default" ]; then
+            DOC_FLAGS="--doc"
+          fi
           case "${{ matrix.config }}" in
-            default)     cargo test --lib --tests ${{ runner.os == 'Linux' && '--doc' || '' }} ;;
+            default)     cargo test --lib --tests $DOC_FLAGS ;;
             sqlx)        cargo test --lib --tests --features sqlx ;;
             no-default)  cargo test --lib --tests --no-default-features ;;
           esac
@@ -212,7 +216,6 @@ jobs:
           -- cargo run --release --example bench_full_vs_sqlite
 
       - name: "Gate 2/4: bench_compare (20 workloads, times)"
-        if: ${ !cancelled() }
         run: >
           python .github/scripts/bench_gate.py
           --parser bench_compare
@@ -220,7 +223,6 @@ jobs:
           -- cargo run --release --example bench_compare
 
       - name: "Gate 3/4: criterion sqlite_comparison (8 paired scenarios)"
-        if: ${ !cancelled() }
         run: >
           python .github/scripts/bench_gate.py
           --parser criterion_sqlite_comparison
@@ -229,7 +231,6 @@ jobs:
           -- cargo bench --bench sqlite_comparison -- --noplot --sample-size 20 --warm-up-time 1 --measurement-time 2
 
       - name: "Gate 4/4: bench_sqlx_native (sqlx driver vs sqlx-sqlite)"
-        if: ${ !cancelled() }
         run: >
           python .github/scripts/bench_gate.py
           --parser bench_sqlx_native
