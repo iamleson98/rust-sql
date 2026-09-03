@@ -99,14 +99,24 @@ jobs:
   # --------------------------------------------------------------------- tests
   # Correctness in the fast dev profile (debuginfo off). LTO settings do not
   # apply to dev — that release-only env is intentionally gone.
+  #
+  # COST LAYOUT (private repo: Linux 1x, Windows 2x, macOS 10x minute
+  # multiplier — the macOS multiplier is the budget killer):
+  #   - Linux   : 3 parallel jobs (cheap, parallel = fast wall time) +
+  #               doc-tests once.
+  #   - Windows : ONE consolidated job, 3 configs sequentially sharing one
+  #               target dir / cache (one checkout, one dep compile).
+  #   - macOS   : same consolidation as Windows — at 10x this cuts the
+  #               per-run macOS bill by a third versus a 3-job matrix.
+  # Each consolidated job runs every config even if an earlier one failed,
+  # and reports a per-config summary at the end.
   test:
-    name: test (${{ matrix.os }}, ${{ matrix.config }})
-    runs-on: ${{ matrix.os }}
+    name: test (ubuntu-latest, ${{ matrix.config }})
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         config: [default, sqlx, no-default]
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -114,24 +124,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # Restore the build cache BEFORE any build step (incl. the plugin
-      # build below) so nothing pollutes or delays the cache key.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}-${{ matrix.config }}
+          shared-key: test-ubuntu-latest-${{ matrix.config }}
           cache-on-failure: true
       # Extension (.so plugin) tests: build C/C++/Rust plugins first
-      # (Zig is optional). Missing binaries make those tests skip — so
-      # Windows (no cc in bash) simply exercises fewer tests, never fails.
+      # (Zig is optional). Missing binaries make those tests skip.
       - name: Build extension plugins
-        if: runner.os != 'Windows'
         run: bash tests/build_plugins.sh
-      # Doc-tests run once (ubuntu, default features) instead of the 9x
-      # redundancy of the old plain `cargo test` matrix.
+      # Doc-tests run once (ubuntu, default features) instead of 9x
+      # redundancy in the old plain `cargo test` matrix.
       - name: cargo test (${{ matrix.config }})
         run: |
           DOC_FLAGS=""
-          if [ "${{ runner.os }}" = "Linux" ] && [ "${{ matrix.config }}" = "default" ]; then
+          if [ "${{ matrix.config }}" = "default" ]; then
             DOC_FLAGS="--doc"
           fi
           case "${{ matrix.config }}" in
@@ -139,6 +145,71 @@ jobs:
             sqlx)        cargo test --lib --tests --features sqlx ;;
             no-default)  cargo test --lib --tests --no-default-features ;;
           esac
+
+  test-windows:
+    name: test (windows-latest, all configs)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-windows-latest
+          cache-on-failure: true
+      # cc is not reliably available in bash here; the plugin tests skip.
+      - name: cargo test (default, sqlx, no-default)
+        run: |
+          FAIL=0
+          echo "::group::cargo test (default)"
+          cargo test --lib --tests || FAIL=1
+          echo "::endgroup::"
+          echo "::group::cargo test (sqlx)"
+          cargo test --lib --tests --features sqlx || FAIL=1
+          echo "::endgroup::"
+          echo "::group::cargo test (no-default)"
+          cargo test --lib --tests --no-default-features || FAIL=1
+          echo "::endgroup::"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "One or more feature configs failed on windows-latest."
+            exit 1
+          fi
+
+  test-macos:
+    name: test (macos-latest, all configs)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-macos-latest
+          cache-on-failure: true
+      - name: Build extension plugins
+        run: bash tests/build_plugins.sh
+      - name: cargo test (default, sqlx, no-default)
+        run: |
+          FAIL=0
+          echo "::group::cargo test (default)"
+          cargo test --lib --tests || FAIL=1
+          echo "::endgroup::"
+          echo "::group::cargo test (sqlx)"
+          cargo test --lib --tests --features sqlx || FAIL=1
+          echo "::endgroup::"
+          echo "::group::cargo test (no-default)"
+          cargo test --lib --tests --no-default-features || FAIL=1
+          echo "::endgroup::"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "One or more feature configs failed on macos-latest."
+            exit 1
+          fi
 
   # OOM fault injection: 532 allocation-failure points, each verified to
   # leave the baseline intact (SQLite's memsys fault-injection equivalent).
@@ -266,7 +337,7 @@ jobs:
   # ------------------------------------------------------------ aggregate OK
   ci-ok:
     name: ci-ok (all gates green)
-    needs: [fmt, clippy, test, test-oom, test-compat, bench-gate]
+    needs: [fmt, clippy, test, test-windows, test-macos, test-oom, test-compat, bench-gate]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
