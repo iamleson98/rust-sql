@@ -6,6 +6,7 @@
 
 pub mod btree;
 pub mod integrity;
+pub mod join_cache;
 pub mod mvcc;
 pub mod page;
 pub mod pager;

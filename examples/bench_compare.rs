@@ -566,6 +566,14 @@ fn rustqlite_point_lookup_rowid(db: &mut rustqlite::Database, n: usize) -> Durat
     // Use `?` placeholder so the statement cache can amortize parse+plan
     // across all N calls — mirrors SQLite's prepared-statement loop below.
     let sql = "SELECT name, val, score FROM t WHERE id = ?";
+    // Steady-state warmup: populate the statement cache (parse+plan) and
+    // absorb one-time costs (allocator settle after the insert storm,
+    // insert-chain break) BEFORE the timer starts — the exact convention
+    // every other harness in this file uses (SQLite prepares outside the
+    // timer). Without this, the first timed query pays a 200-400 µs
+    // allocator-wake sweep (see maybe_settle_allocator) that dominates
+    // the whole row on slower CI hardware.
+    let _ = db.query(sql, [Value::Integer(1)]).unwrap();
     let start = Instant::now();
     for i in 1..=n as i64 {
         let target = (i % 1000) + 1;

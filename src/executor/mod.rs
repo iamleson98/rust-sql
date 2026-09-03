@@ -6376,110 +6376,149 @@ fn try_fused_scan_hash_join(
     // 142 ns/insert) degrades to linear scans. Taking the TOP log2(cap)
     // bits of key * PHI spreads monotone keys uniformly (~5 ns/op, faster
     // than std's SipHash at ~15 ns/op).
-    let n_build = build.count;
-    let mut build_vals: Vec<Value> = Vec::with_capacity(n_build.saturating_mul(stride).max(1));
-    let mut chain: Vec<u32> = vec![u32::MAX; n_build];
-    // Capacity: next power of two >= 2 * n_build (load factor <= 0.5 —
-    // probe chains stay ~1.3 slots on average, and an empty slot always
-    // exists so the linear probe terminates).
-    let table_cap = (n_build.max(1)).next_power_of_two() << 1;
-    let table_mask = table_cap.wrapping_sub(1);
-    // Top-bits shift for multiplicative hashing (see the comment above).
-    let hash_shift = 64 - table_cap.trailing_zeros();
+    //
+    // The built state is MEMOIZED across statements (see
+    // storage/join_cache.rs): key (build root, wanted columns), validated
+    // against the pager's write epoch — the same advisory-cache pattern
+    // as the B+tree leaf hints. A repeated read-only join skips the
+    // build-side scan + decode + hash construction entirely.
     #[inline]
     fn key_slot(k: u64, shift: u32, mask: usize) -> usize {
         ((k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize) & mask
     }
-    // One (key, head) pair per slot — a single cache-line load per probe
-    // (two parallel arrays would cost two dependent loads). key == u64::MAX
-    // marks an empty slot; a real key can never be u64::MAX (order keys of
-    // finite doubles / |i| <= 2^53 integers never reach it, and NaN decodes
-    // as NULL which skips the build entirely).
-    #[derive(Clone, Copy)]
-    struct JoinSlot {
-        key: u64,
-        head: u32,
-    }
-    const EMPTY_SLOT: JoinSlot = JoinSlot {
-        key: u64::MAX,
-        head: u32::MAX,
+    use crate::storage::join_cache::{JoinBuildState, JoinSlot};
+    let join_epoch = pager.write_epoch();
+    let cache_key = (build.root, build_wanted.clone());
+    let cached: Option<std::sync::Arc<JoinBuildState>> = {
+        let jc = pager.join_build_cache().lock();
+        jc.get(&cache_key)
+            .filter(|st| st.epoch == join_epoch)
+            .cloned()
     };
-    let mut slots: Vec<JoinSlot> = vec![EMPTY_SLOT; table_cap];
-    let mut aborted = false;
-    let mut stored: usize = 0;
-    let mut buf: Vec<Value> = Vec::new();
-    let build_alias = build.table.rowid_alias;
+
+    let built: std::sync::Arc<JoinBuildState>;
+    // The probe side's rowid alias is needed by BOTH branches (the probe
+    // scan runs after the build/cache decision).
     let probe_alias = probe.table.rowid_alias;
-    {
-        let mut bt = Btree::new(pager, build.root, false);
-        bt.scan_table_borrowed(|rowid, payload| {
-            if crate::storage::row_codec::decode_row_selective_sorted(
-                payload,
-                build.n_cols,
-                &build_wanted,
-                rowid,
-                build_alias,
-                &mut buf,
-            )
-            .is_err()
-            {
-                return true; // corrupt row: skip (matches exec_scan)
-            }
-            let k = match buf.get(build_key_pos) {
-                Some(Value::Integer(i)) => {
-                    // Same 2^53 gate as the materialized path's u64_mode:
-                    // beyond it, i as f64 rounds and keys could collide.
-                    if i.unsigned_abs() > (1u64 << 53) {
+    if let Some(st) = cached {
+        built = st;
+    } else {
+        let n_build = build.count;
+        let mut build_vals: Vec<Value> = Vec::with_capacity(n_build.saturating_mul(stride).max(1));
+        let mut chain: Vec<u32> = vec![u32::MAX; n_build];
+        // Capacity: next power of two >= 2 * n_build (load factor <= 0.5 —
+        // probe chains stay ~1.3 slots on average, and an empty slot always
+        // exists so the linear probe terminates).
+        let table_cap = (n_build.max(1)).next_power_of_two() << 1;
+        let table_mask = table_cap.wrapping_sub(1);
+        // Top-bits shift for multiplicative hashing (see the build comment).
+        let hash_shift = 64 - table_cap.trailing_zeros();
+        // One (key, head) pair per slot — a single cache-line load per probe
+        // (two parallel arrays would cost two dependent loads). key == u64::MAX
+        // marks an empty slot; a real key can never be u64::MAX (order keys of
+        // finite doubles / |i| <= 2^53 integers never reach it, and NaN decodes
+        // as NULL which skips the build entirely).
+        let mut slots: Vec<JoinSlot> = vec![JoinBuildState::empty_slot(); table_cap];
+        let mut aborted = false;
+        let mut stored: usize = 0;
+        let mut buf: Vec<Value> = Vec::new();
+        let build_alias = build.table.rowid_alias;
+        {
+            let mut bt = Btree::new(pager, build.root, false);
+            bt.scan_table_borrowed(|rowid, payload| {
+                if crate::storage::row_codec::decode_row_selective_sorted(
+                    payload,
+                    build.n_cols,
+                    &build_wanted,
+                    rowid,
+                    build_alias,
+                    &mut buf,
+                )
+                .is_err()
+                {
+                    return true; // corrupt row: skip (matches exec_scan)
+                }
+                let k = match buf.get(build_key_pos) {
+                    Some(Value::Integer(i)) => {
+                        // Same 2^53 gate as the materialized path's u64_mode:
+                        // beyond it, i as f64 rounds and keys could collide.
+                        if i.unsigned_abs() > (1u64 << 53) {
+                            aborted = true;
+                            return false;
+                        }
+                        crate::types::value::double_order_key(*i as f64)
+                    }
+                    Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
+                    // NULL build keys never match anything (INNER join: skip);
+                    // TEXT/BLOB build keys need the byte-key path.
+                    Some(Value::Null) => return true,
+                    _ => {
                         aborted = true;
                         return false;
                     }
-                    crate::types::value::double_order_key(*i as f64)
-                }
-                Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                // NULL build keys never match anything (INNER join: skip);
-                // TEXT/BLOB build keys need the byte-key path.
-                Some(Value::Null) => return true,
-                _ => {
+                };
+                // count_rows under-counted (corrupt page metadata) or the
+                // tree grew mid-scan: fall back to the materialized path
+                // rather than indexing past the pre-sized buffers.
+                if stored >= n_build {
                     aborted = true;
                     return false;
                 }
-            };
-            // count_rows under-counted (corrupt page metadata) or the
-            // tree grew mid-scan: fall back to the materialized path
-            // rather than indexing past the pre-sized buffers.
-            if stored >= n_build {
-                aborted = true;
-                return false;
-            }
-            let ord = stored as u32;
-            stored += 1;
-            for v in buf.iter() {
-                build_vals.push(v.clone());
-            }
-            // Open-addressing insert: find the key's slot (match = bucket
-            // chain prepend; empty slot = new head). Load factor <= 0.5
-            // (table_cap >= 2 * n_build >= 2 * stored) guarantees an empty
-            // slot exists, so the probe always terminates.
-            let mut slot = key_slot(k, hash_shift, table_mask);
-            loop {
-                let existing = slots[slot].key;
-                if existing == u64::MAX {
-                    slots[slot] = JoinSlot { key: k, head: ord };
-                    break;
+                let ord = stored as u32;
+                stored += 1;
+                for v in buf.iter() {
+                    build_vals.push(v.clone());
                 }
-                if existing == k {
-                    chain[ord as usize] = slots[slot].head;
-                    slots[slot].head = ord;
-                    break;
+                // Open-addressing insert: find the key's slot (match = bucket
+                // chain prepend; empty slot = new head). Load factor <= 0.5
+                // (table_cap >= 2 * n_build >= 2 * stored) guarantees an empty
+                // slot exists, so the probe always terminates.
+                let mut slot = key_slot(k, hash_shift, table_mask);
+                loop {
+                    let existing = slots[slot].key;
+                    if existing == u64::MAX {
+                        slots[slot] = JoinSlot { key: k, head: ord };
+                        break;
+                    }
+                    if existing == k {
+                        chain[ord as usize] = slots[slot].head;
+                        slots[slot].head = ord;
+                        break;
+                    }
+                    slot = (slot + 1) & table_mask;
                 }
-                slot = (slot + 1) & table_mask;
-            }
-            true
-        })?;
+                true
+            })?;
+        }
+        if aborted {
+            return Ok(None);
+        }
+        // Freshly built: wrap and store in the cross-statement cache.
+        debug_assert_eq!(build_vals.len(), stored.saturating_mul(stride));
+        built = std::sync::Arc::new(JoinBuildState {
+            epoch: join_epoch,
+            n_build: stored,
+            stride,
+            build_vals,
+            slots,
+            chain,
+        });
+        crate::storage::join_cache::join_cache_insert(
+            &mut pager.join_build_cache().lock(),
+            cache_key,
+            built.clone(),
+        );
     }
-    if aborted {
-        return Ok(None);
-    }
+
+    // Shared borrows for the probe loop (the Arc keeps them alive).
+    let build_vals: &[Value] = &built.build_vals;
+    let slots: &[JoinSlot] = &built.slots;
+    let chain: &[u32] = &built.chain;
+    let table_cap = slots.len().max(2).next_power_of_two();
+    debug_assert_eq!(table_cap, slots.len());
+    let table_mask = table_cap.wrapping_sub(1);
+    // Top-bits shift for multiplicative hashing (see the build comment).
+    let hash_shift = 64 - table_cap.trailing_zeros();
 
     // ---- PROBE: stream scan + selective decode + emit -------------------
     let n_out = out_combined.len();

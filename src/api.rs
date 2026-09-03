@@ -2833,6 +2833,15 @@ impl Database {
             let dirty_delta = dirty_now.saturating_sub(dirty_before);
             self.note_alloc_burst(ctx.changes.unsigned_abs(), dirty_delta);
         }
+        // COMMIT is the natural quiescent point after a transaction's
+        // write storm: absorb mimalloc's deferred page wake HERE (see
+        // `maybe_settle_allocator`) so the first read after the
+        // transaction doesn't pay the 200-400 µs sweep inside its own
+        // timing. Non-COMMIT statements leave the existing read-path
+        // trigger in place.
+        if result.is_ok() && matches!(stmt_ref, Statement::Commit) {
+            self.maybe_settle_allocator();
+        }
         // Merge local overlay entries into the DETACHED maps (in place —
         // the statement is the sole owner, so make_mut never clones) and
         // attach them back to the Database. Merge regardless of `result`:

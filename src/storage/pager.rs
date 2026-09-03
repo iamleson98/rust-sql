@@ -544,6 +544,11 @@ pub struct Pager {
     /// plain `open()` of a coded file fails with a pointer to
     /// `Database::open_with_codec`.
     required_codec: Mutex<Option<String>>,
+    /// Cross-statement join-build cache (advisory, epoch-validated —
+    /// see `storage/join_cache.rs`). Hosted on the pager because the
+    /// executor has no Database handle, and the pager already owns the
+    /// write epoch that invalidates every advisory cache.
+    join_cache: Mutex<crate::storage::join_cache::JoinBuildCache>,
 }
 
 /// One SAVEPOINT level: the metadata snapshot plus page pre-images.
@@ -827,6 +832,7 @@ impl Pager {
             savepoint_depth: std::sync::atomic::AtomicUsize::new(0),
             codec: RwLock::new(crate::plugin::codec::CodecState::default()),
             required_codec: Mutex::new(None),
+            join_cache: Mutex::new(std::collections::HashMap::new()),
         };
 
         let file_size = pager.store.len()?;
@@ -1070,6 +1076,12 @@ impl Pager {
     /// split pages, or recycle pages must use the full `note_write`.
     pub fn note_write_in_place(&self) {
         self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Access the cross-statement join-build cache (advisory,
+    /// epoch-validated — see `storage/join_cache.rs`).
+    pub(crate) fn join_build_cache(&self) -> &Mutex<crate::storage::join_cache::JoinBuildCache> {
+        &self.join_cache
     }
 
     /// Current write version (see `write_version`). Readers compare this
