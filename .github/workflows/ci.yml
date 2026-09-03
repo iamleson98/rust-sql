@@ -8,8 +8,12 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# Group name carries a generation suffix so a zombie run stuck in `queued`
+# (e.g. waiting for a self-hosted runner that no longer exists) can never
+# starve fresh runs: bump -v2 to -v3 to move all future runs into a clean
+# group. cancel-in-progress still supersedes RUNNING older runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-v2
   cancel-in-progress: true
 
 permissions:
