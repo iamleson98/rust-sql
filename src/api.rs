@@ -143,6 +143,12 @@ pub struct Database {
     /// Snapshot taken at BEGIN, used by ROLLBACK to restore the pager's
     /// state to the pre-transaction point.
     pub(crate) txn_snapshot: Mutex<Option<crate::storage::pager::PagerSnapshot>>,
+    /// Maps (roots / max_rowids / index roots) captured at BEGIN, restored
+    /// by ROLLBACK. The begin-time maps describe the file state
+    /// `flush_before_snapshot` wrote; resetting to the catalog's
+    /// CREATE-time roots (the old behavior) misresolved any table whose
+    /// root moved in an EARLIER COMMITTED transaction.
+    pub(crate) txn_maps_snap: Mutex<Option<std::sync::Arc<crate::executor::StmtMaps>>>,
     /// SAVEPOINT support: bookkeeping-map snapshots aligned with the
     /// pager's savepoint stack (index i corresponds to pager savepoint i).
     /// ROLLBACK TO restores the maps Arc wholesale — root overrides and
@@ -1709,6 +1715,7 @@ impl Database {
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
+            txn_maps_snap: Mutex::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             maps: RwLock::new(empty_maps()),
@@ -1791,6 +1798,7 @@ impl Database {
             path: PathBuf::from(":memory:"),
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
+            txn_maps_snap: Mutex::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             maps: RwLock::new(empty_maps()),
@@ -2868,21 +2876,46 @@ impl Database {
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
         if result.is_ok() && ctx.rolled_back {
-            // ROLLBACK discarded in-transaction schema-row rewrites; reset
-            // the persisted-root map to the catalog's (CREATE-time) values,
-            // which match the rolled-back file. The shared root/max-rowid
-            // snapshots may also hold stale entries from the transaction —
-            // clear them so the next statement rescans.
-            let mut synced = self.schema_root_pages.lock();
-            synced.clear();
-            for (name, t) in self.catalog.all_tables() {
-                synced.insert(format!("table:{}", name), t.root_page);
-            }
-            for (name, i) in self.catalog.all_indexes() {
-                synced.insert(format!("index:{}", name), i.root_page);
-            }
-            *self.maps.get_mut() = empty_maps();
+            // ROLLBACK restored the file/pager to its BEGIN state (the
+            // `__begin__` savepoint's undo log, or the snapshot fallback).
+            // The maps must return to their BEGIN-time values — the live
+            // roots the file's schema rows name after every EARLIER
+            // COMMITTED split. The old reset to the catalog's CREATE-time
+            // roots was wrong for any table that split in an earlier
+            // committed transaction: reads resolved a stale leaf and saw
+            // only its rows.
+            let restored = self.txn_maps_snap.lock().take();
+            *self.maps.get_mut() = restored.unwrap_or_else(empty_maps);
             self.refresh_maps_flag();
+            // `schema_root_pages` mirrors "what the schema rows on disk
+            // say" — after rollback that is exactly the begin-time roots.
+            {
+                let mut synced = self.schema_root_pages.lock();
+                synced.clear();
+                let m = self.maps.read();
+                for (k, v) in m.roots.iter() {
+                    synced.insert(format!("table:{}", k), *v);
+                }
+                for (k, v) in m.index_roots.iter() {
+                    synced.insert(format!("index:{}", k), *v);
+                }
+            }
+            // Cached plans may embed mid-transaction roots/tables;
+            // rollback is rare, so invalidate cheaply and unconditionally.
+            self.invalidate_stmt_cache();
+        }
+        // Track the begin-time maps for the ROLLBACK restore above: BEGIN
+        // snapshots them, COMMIT/ROLLBACK releases the snapshot.
+        if result.is_ok() {
+            match stmt_ref {
+                Statement::Begin(_) => {
+                    *self.txn_maps_snap.lock() = Some(self.maps.read().clone());
+                }
+                Statement::Commit | Statement::Rollback(_) => {
+                    *self.txn_maps_snap.lock() = None;
+                }
+                _ => {}
+            }
         }
         // Persist any root-page moves (B+tree splits) to the schema rows so
         // a reopened database sees the full tree. Without this, every table
@@ -3562,6 +3595,7 @@ impl Database {
             self.pager.flush_before_snapshot()?;
             self.in_transaction.store(true, Ordering::Release);
             *self.txn_snapshot.lock() = Some(self.pager.snapshot());
+            *self.txn_maps_snap.lock() = Some(self.maps.read().clone());
             self.savepoint_txn.store(true, Ordering::Release);
         }
         self.pager.savepoint(name);
@@ -3600,6 +3634,7 @@ impl Database {
                     self.savepoint_txn.store(false, Ordering::Release);
                     self.in_transaction.store(false, Ordering::Release);
                     *self.txn_snapshot.lock() = None;
+                    *self.txn_maps_snap.lock() = None;
                     self.pager.flush()?;
                 }
                 Ok(())
@@ -4443,13 +4478,22 @@ impl Database {
                 // (so dirty pages stay in cache only, never reaching disk).
                 //
                 // In lazy write-back mode (in-memory DBs), flush() doesn't
-                // write dirty pages — but ROLLBACK restores by CLEARING the
-                // cache and reading pages back from the file, which requires
-                // the file to hold the pre-BEGIN state. So at BEGIN we force
-                // one real write-back of all dirty pages (BEGIN is rare
-                // compared to autocommit statements, so this is cheap
-                // amortized) and THEN take the snapshot.
+                // write dirty pages — but ROLLBACK may need the file to hold
+                // the pre-BEGIN state (the destructive restore path reads
+                // pages back from it). So at BEGIN we force one real
+                // write-back of all dirty pages (BEGIN is rare compared to
+                // autocommit statements, so this is cheap amortized) and
+                // THEN take the snapshot.
+                //
+                // The implicit `__begin__` savepoint journals every page
+                // modified by the transaction (undo pre-images captured at
+                // first fetch): plain ROLLBACK restores content
+                // non-destructively, and mid-transaction cache-eviction
+                // writes of pre-existing pages are correctly undone. This
+                // mirrors SQLite, where BEGIN/ROLLBACK is internally the
+                // outermost savepoint.
                 ctx.pager.flush_before_snapshot()?;
+                ctx.pager.savepoint("__begin__");
                 ctx.in_transaction = true;
                 ctx.txn_snapshot = Some(ctx.pager.snapshot());
                 Ok(())
@@ -4462,11 +4506,18 @@ impl Database {
                 Ok(())
             }
             Statement::Rollback(_) => {
-                // Restore the pager to the snapshot taken at BEGIN. Any
-                // active savepoints die with the transaction.
-                ctx.pager.clear_savepoints();
-                if let Some(snap) = ctx.txn_snapshot.take() {
-                    ctx.pager.rollback_to(&snap)?;
+                // Restore the pager to the transaction base. Prefer the
+                // savepoint undo log (non-destructive: pre-images are
+                // restored into the cache and re-dirtied, so even pages a
+                // mid-transaction eviction wrote to the file come back).
+                // The snapshot path (drop cache + truncate) remains as a
+                // fallback for flows that never pushed a savepoint.
+                let restored = ctx.pager.rollback_bottom_savepoint()?;
+                if !restored {
+                    ctx.pager.clear_savepoints();
+                    if let Some(snap) = ctx.txn_snapshot.take() {
+                        ctx.pager.rollback_to(&snap)?;
+                    }
                 }
                 ctx.in_transaction = false;
                 // Root overrides, index roots, and max_rowids cached during

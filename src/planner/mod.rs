@@ -1347,6 +1347,17 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
 /// so that `UPDATE t SET ... WHERE id = ?` doesn't fall through to a full
 /// table scan — a bug that previously made UPDATE-by-PK ~743x slower than
 /// SQLite.
+/// Compound-index candidate for `apply_where_for_scan`: the index whose
+/// prefix is equality-bound by the most conjuncts, the bound key
+/// expressions (in index column order), and the bound column names (for
+/// residual computation).
+struct IdxCandidate {
+    index: std::sync::Arc<crate::schema::Index>,
+    key_exprs: Vec<Expr>,
+    bound_cols: Vec<String>,
+    covered: usize,
+}
+
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
     if let Plan::Scan { table, alias, .. } = &plan {
         // Split AND-chains so we can pick the best access path per-conjunct.
@@ -1450,32 +1461,92 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                         predicate: combine_and(&other_conjuncts),
                     };
                 }
-                // Check if any index has this column as its first column.
-                for index in catalog.indexes_on_table(&table.name) {
-                    if let Some(first_col) = index.columns.first() {
-                        if first_col.name.eq_ignore_ascii_case(&col_name) {
-                            let other_conjuncts: Vec<Expr> = conjuncts
-                                .iter()
-                                .filter(|c| !exprs_equal_conjunct(c, conjunct))
-                                .cloned()
-                                .collect();
-                            let lookup = Plan::IndexLookup {
-                                table: table.clone(),
-                                alias: alias.clone(),
-                                index,
-                                key_exprs: vec![value_expr],
-                            };
-                            if other_conjuncts.is_empty() {
-                                return lookup;
-                            }
-                            return Plan::Filter {
-                                input: Box::new(lookup),
-                                predicate: combine_and(&other_conjuncts),
-                            };
+            }
+        }
+        // Compound-aware index selection: among all (equality conjunct,
+        // index) pairs where the index's FIRST column is equality-bound,
+        // pick the index whose PREFIX is bound by the MOST conjuncts —
+        // `WHERE d = ? AND a = ?` then seeks the compound index
+        // ida(d, a) with a two-column key instead of probing idd(d) and
+        // filtering ~100 matches per hit. Single-column indexes win only
+        // when no compound prefix covers more. (The executor's
+        // IndexLookup already builds multi-column order keys.)
+        let mut best: Option<IdxCandidate> = None;
+        for conjunct in &conjuncts {
+            let Some((col_name, value_expr)) = extract_eq_predicate(conjunct) else {
+                continue;
+            };
+            for index in catalog.indexes_on_table(&table.name) {
+                let Some(first_col) = index.columns.first() else {
+                    continue;
+                };
+                if !first_col.name.eq_ignore_ascii_case(&col_name) {
+                    continue;
+                }
+                // Bind index prefix columns 1.. from OTHER equality
+                // conjuncts, in INDEX column order.
+                let mut key_exprs = vec![value_expr.clone()];
+                let mut bound_cols = vec![first_col.name.to_ascii_lowercase()];
+                for ci in 1..index.columns.len() {
+                    let want = &index.columns[ci].name;
+                    let hit = conjuncts.iter().find_map(|oc| {
+                        if exprs_equal_conjunct(oc, conjunct) {
+                            return None;
                         }
+                        let (cn, ve) = extract_eq_predicate(oc)?;
+                        cn.eq_ignore_ascii_case(want).then_some(ve.clone())
+                    });
+                    match hit {
+                        Some(ve) => {
+                            key_exprs.push(ve);
+                            bound_cols.push(want.to_ascii_lowercase());
+                        }
+                        None => break,
                     }
                 }
+                let covered = key_exprs.len();
+                if best.as_ref().map_or(true, |c| covered > c.covered) {
+                    best = Some(IdxCandidate {
+                        index: index.clone(),
+                        key_exprs,
+                        bound_cols,
+                        covered,
+                    });
+                }
             }
+        }
+        if let Some(IdxCandidate {
+            index,
+            key_exprs,
+            bound_cols,
+            ..
+        }) = best
+        {
+            // Residual: conjuncts NOT consumed as index keys (an
+            // equality conjunct whose column is a bound prefix column was
+            // consumed; everything else survives as a Filter).
+            let other_conjuncts: Vec<Expr> = conjuncts
+                .iter()
+                .filter(|c| {
+                    extract_eq_predicate(c)
+                        .map(|(cn, _)| !bound_cols.contains(&cn.to_ascii_lowercase()))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            let lookup = Plan::IndexLookup {
+                table: table.clone(),
+                alias: alias.clone(),
+                index,
+                key_exprs,
+            };
+            if other_conjuncts.is_empty() {
+                return lookup;
+            }
+            return Plan::Filter {
+                input: Box::new(lookup),
+                predicate: combine_and(&other_conjuncts),
+            };
         }
         // No rowid/equality access path matched. Try an IndexRange from
         // conjuncts that are range predicates on the first column of some

@@ -3384,9 +3384,157 @@ fn sort_key(
     eval_row(expr, row, columns, params, named_params).unwrap_or(Value::Null)
 }
 
+/// Bounded top-N selection for `Limit(Sort(x))` (see exec_limit's fusion).
+/// `keep = offset + count` rows survive; the output window is
+/// `[offset .. keep]` of the selected prefix, matching the general path's
+/// sort-then-slice semantics exactly.
+fn exec_topn(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    term: &OrderTerm,
+    keep: usize,
+    offset: usize,
+) -> Result<ExecResult> {
+    let mut inner = execute(input, ctx)?;
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
+    let columns = &inner.columns;
+
+    // Ordinal validation (mirrors exec_sort).
+    let row_width = inner.rows.first().map_or(0, |r| r.len());
+    if row_width > 0 {
+        if let Expr::Literal(Value::Integer(k)) = &term.expr {
+            if *k >= 1 && (*k as usize) > row_width {
+                return Err(Error::semantic(format!(
+                    "{}st ORDER BY term out of range ({} output columns)",
+                    k, row_width
+                )));
+            }
+        }
+    }
+
+    if keep == 0 {
+        inner.rows.clear();
+        return Ok(inner);
+    }
+    if keep >= inner.rows.len() {
+        // The bound covers everything: a plain sort is the same result and
+        // avoids the selection machinery.
+        let rows = &mut inner.rows;
+        let term_expr = &term.expr;
+        let cols = &inner.columns;
+        let params: &[Value] = &ctx.params;
+        let named = &ctx.named_params;
+        rows.sort_by(|a, b| {
+            let va = sort_key(term_expr, a, cols, params, named);
+            let vb = sort_key(term_expr, b, cols, params, named);
+            let ord = if let Expr::Collate { collation, .. } = term_expr {
+                crate::plugin::lookup_collation(collation)
+                    .map(|c| crate::plugin::compare_collated(&va, &vb, c.as_ref()))
+                    .unwrap_or_else(|| va.cmp(&vb))
+            } else {
+                va.cmp(&vb)
+            };
+            if term.order == Order::Desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        if offset > 0 {
+            let drop = offset.min(inner.rows.len());
+            inner.rows.drain(..drop);
+        }
+        return Ok(inner);
+    }
+
+    // One key per row, extracted ONCE (the full sort evaluates the key
+    // expression twice per comparison — O(n log n) evals; this is O(n)).
+    // Bare-column / ordinal terms resolve to a row index up front — no
+    // per-row name lookup. Ambiguous bare names (more than one suffix
+    // match) keep the general eval so key semantics can never diverge
+    // from the full sort.
+    let row_width = inner.rows.first().map_or(0, |r| r.len());
+    let key_idx: Option<usize> = match &term.expr {
+        Expr::Literal(Value::Integer(k)) if *k >= 1 && (*k as usize) <= row_width => {
+            Some(*k as usize - 1)
+        }
+        Expr::Column { table: None, name } => {
+            let hits: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.rsplit('.').next() == Some(name.as_str()))
+                .map(|(i, _)| i)
+                .collect();
+            if hits.len() == 1 {
+                Some(hits[0])
+            } else {
+                None
+            }
+        }
+        Expr::Column {
+            table: Some(t),
+            name,
+        } => {
+            let qualified = format!("{t}.{name}");
+            columns.iter().position(|c| *c == qualified)
+        }
+        _ => None,
+    };
+    let keys: Vec<Value> = if let Some(i) = key_idx {
+        inner
+            .rows
+            .iter()
+            .map(|r| r.get(i).cloned().unwrap_or(Value::Null))
+            .collect()
+    } else {
+        inner
+            .rows
+            .iter()
+            .map(|r| sort_key(&term.expr, r, columns, params, named_params))
+            .collect()
+    };
+    let desc = term.order == Order::Desc;
+    let coll = match &term.expr {
+        Expr::Collate { collation, .. } => crate::plugin::lookup_collation(collation),
+        _ => None,
+    };
+    // Ties break by INPUT ROW ORDER (index ascending) — deterministic and
+    // matching SQLite's stable sorter for scan-sourced rows, so equal keys
+    // keep the rowid order on both ASC and DESC terms.
+    let cmp_idx = |a: &u32, b: &u32| -> std::cmp::Ordering {
+        let (ka, kb) = (&keys[*a as usize], &keys[*b as usize]);
+        let ord = match coll.as_deref() {
+            Some(c) => crate::plugin::compare_collated(ka, kb, c),
+            None => ka.cmp(kb),
+        };
+        let ord = if desc { ord.reverse() } else { ord };
+        ord.then(a.cmp(b))
+    };
+    let n = inner.rows.len();
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    // Partial selection: after `select_nth_unstable_by(keep - 1, ...)`, the
+    // element at index keep-1 is the keep-th smallest and idx[..keep] holds
+    // exactly the `keep` smallest keys (unordered; the returned head alone
+    // would exclude the pivot — the classic off-by-one).
+    idx.select_nth_unstable_by(keep - 1, cmp_idx);
+    idx[..keep].sort_unstable_by(cmp_idx);
+    let window: Vec<Row> = idx[offset.min(keep)..keep]
+        .iter()
+        .map(|&i| inner.rows[i as usize].clone())
+        .collect();
+    inner.rows = window;
+    Ok(inner)
+}
+
 // ============================================================================
 // Limit
-// ============================================================================
+// =========================================================================
+
+///  —
+/// the shapes  and  fuse into the
+/// bounded top-N selection.
+type TopnTarget<'a> = Option<(&'a Plan, &'a Vec<OrderTerm>, Option<&'a Vec<ProjectExpr>>)>;
 
 fn exec_limit(
     ctx: &mut ExecContext<'_>,
@@ -3394,6 +3542,53 @@ fn exec_limit(
     count: &Expr,
     offset: &Expr,
 ) -> Result<ExecResult> {
+    // TOP-N FUSION: `Limit(Sort(x))` with literal bounds and a SINGLE sort
+    // term keeps only the top (offset + count) rows via bounded partial
+    // selection — O(n) key extraction + O(n) selection + O(k log k) sort —
+    // instead of materializing and fully sorting the input (SQLite's
+    // sorter applies the same LIMIT bound). Multi-term sorts,
+    // non-literal bounds, or a bound beyond the cap keep the general path.
+    // Shape A: Limit(Sort(x)). Shape B: Limit(Project(Sort(x))) — the
+    // planner inserts Sort BELOW Project so ORDER BY can reference
+    // unprojected columns; the projection is 1:1, so fusing through it
+    // (top-N first, then project the survivors) yields identical rows.
+    // (sort input, terms, optional 1:1 projection to apply after top-N)
+    let topn_target: TopnTarget<'_> = match input {
+        Plan::Sort {
+            input: sort_input,
+            terms,
+        } if terms.len() == 1 => Some((sort_input, terms, None)),
+        Plan::Project {
+            input: inner,
+            columns,
+        } => match inner.as_ref() {
+            Plan::Sort {
+                input: sort_input,
+                terms,
+            } if terms.len() == 1 => Some((sort_input, terms, Some(columns))),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((sort_input, terms, projection)) = topn_target {
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+        if let (Ok(count_val), Ok(offset_val)) =
+            (evaluate(count, &eval_ctx), evaluate(offset, &eval_ctx))
+        {
+            let count_i = count_val.as_integer();
+            let offset_i = offset_val.as_integer().max(0);
+            if count_i >= 0 && offset_i <= (i64::MAX / 4) && count_i <= (1 << 20) {
+                let total = count_i.saturating_add(offset_i) as usize;
+                let res = exec_topn(ctx, sort_input, &terms[0], total, offset_i as usize)?;
+                if let Some(columns) = projection {
+                    return apply_projection(res, columns, ctx);
+                }
+                return Ok(res);
+            }
+        }
+    }
     // LIMIT PUSHDOWN: for `Limit(Filter(Scan))` and `Limit(Scan)`, stop the
     // scan as soon as `offset + count` rows have passed the filter instead
     // of materializing the whole table and truncating — the classic
@@ -12266,6 +12461,32 @@ fn try_streaming_delete(
     let mut deleted: i64 = 0;
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     let mut new_root = root;
+    // Maintenance-free bulk fast path: no indexes, no RETURNING, no
+    // triggers, no enforced FKs, and rowids collected in table order
+    // (range/full-scan sources — the IndexRange collector emits INDEX key
+    // order, not rowid order, and keeps the per-row loop). One sticky
+    // leaf instead of a root descent per row: sequential mass deletes
+    // drop from ~500 ns/row to ~40-80 ns/row.
+    let rowids_in_table_order = index_range.is_none();
+    if !need_row
+        && !ctx.pager.foreign_keys_enabled()
+        && rowids_in_table_order
+        && !has_delete_triggers
+    {
+        let mut bt = Btree::new(ctx.pager, new_root, false);
+        let n = bt.delete_rowids_inorder(&rowids)?;
+        new_root = bt.root;
+        ctx.set_table_root_lc(&table_name_lc, new_root);
+        deleted = n as i64;
+        ctx.changes += n as i64;
+        if !ctx.in_transaction && !ctx.deferred_flush {
+            ctx.pager.flush()?;
+        }
+        return Ok(Some(ExecResult {
+            columns: Arc::from(vec!["deleted".to_string()]),
+            rows: vec![vec![Value::Integer(deleted)]],
+        }));
+    }
     for rid in rowids {
         // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
         // row goes away. The old row is fetched first (needed for the key

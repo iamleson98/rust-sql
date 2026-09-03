@@ -212,6 +212,37 @@ jobs:
             exit 1
           fi
 
+  # ------------------------------------------------------------- TORTURE --
+  # Production torture matrix: 18 stress sections x 2 engines (rustqlite
+  # and SQLite) in ISOLATED CHILD PROCESSES (per-engine peak RSS), at
+  # reduced scale for CI. Covers what the bench gates do not: million-row
+  # scale, GROUP BY at 100k buckets, top-N ORDER BY, random-key insert
+  # fragmentation, wide rows, 64KB blobs, LIKE scans, 5000-literal IN
+  # lists, multi-index load, 2M-op sustained load with RSS trajectory
+  # (leak detection), file churn + space reclamation, 500k-row ROLLBACK,
+  # 8-reader/2-writer concurrency with lost-write checks, reopen cost, and
+  # a seeded differential hash (identical workload, both engines, final
+  # row hash must MATCH).
+  #
+  # FAILS on correctness CHECK failures only; perf vs SQLite is reported
+  # for tracking (the bench-gate jobs own the throughput contract).
+  torture:
+    name: torture (ubuntu, scale matrix)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: never
+      TORTURE_SCALE: "0.25"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-ubuntu-latest
+          cache-on-failure: true
+      - name: "Production torture matrix (18 sections x 2 engines)"
+        run: cargo run --release --example prod_torture
+
   # OOM fault injection: 532 allocation-failure points, each verified to
   # leave the baseline intact (SQLite's memsys fault-injection equivalent).
   # Uses its own allocator, so it must build without mimalloc.

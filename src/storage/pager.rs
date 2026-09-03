@@ -697,6 +697,26 @@ impl Pager {
         self.savepoint_depth.store(0, Ordering::Release);
     }
 
+    /// Roll the pager back to the OUTERMOST savepoint — the transaction
+    /// base for a plain BEGIN..ROLLBACK. Restores page content from the
+    /// undo pre-images (non-destructive: mid-transaction eviction writes
+    /// are undone in-cache, pages allocated by the transaction are
+    /// dropped, metadata rewinds). Returns false when no savepoint is
+    /// stacked (the caller falls back to the destructive snapshot
+    /// restore).
+    pub fn rollback_bottom_savepoint(&self) -> Result<bool> {
+        let bottom_name = {
+            let sp = self.savepoints.lock();
+            match sp.first() {
+                Some(level) => level.name.clone(),
+                None => return Ok(false),
+            }
+        };
+        let restored = self.rollback_savepoint(&bottom_name)?;
+        self.clear_savepoints();
+        Ok(restored.is_some())
+    }
+
     /// True when at least one savepoint is active.
     pub fn has_savepoints(&self) -> bool {
         self.savepoint_depth.load(Ordering::Acquire) > 0
@@ -1981,6 +2001,128 @@ impl Pager {
     fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
         self.store.write_all_at(offset, buf)?;
         Ok(())
+    }
+
+    /// Read one OVERFLOW page without the page cache: returns (next page
+    /// id, valid data byte count) and appends the page's data region to
+    /// `out`. Overflow chains are walked sequentially and almost never
+    /// revisited, so routing them through the LRU cache only thrashes it —
+    /// a 1000 x 64KB blob scan pushes ~16k pages through a 2048-slot
+    /// cache, evicting the actual tree pages. WAL-committed pages and
+    /// codec-encoded pages take the same paths as `get_page`.
+    ///
+    /// `cap` is the page's overflow capacity (page_size - 16); the caller
+    /// passes it so this stays a pure reader.
+    pub(crate) fn read_overflow_page_append(
+        &self,
+        id: PageId,
+        out: &mut Vec<u8>,
+    ) -> Result<(PageId, usize)> {
+        // 1. Cache hit: the cached page is authoritative (lazy write-back
+        // keeps committed-but-unflushed pages only in the cache).
+        {
+            let cache = self.cache.read();
+            if let Some(page_ref) = cache.get(id) {
+                let p = page_ref.lock();
+                if p.page_type()? != crate::storage::page::PageType::Overflow {
+                    return Err(Error::corruption(format!(
+                        "overflow chain hit non-overflow page {id}"
+                    )));
+                }
+                let next = p.overflow_next();
+                let data = p.overflow_data();
+                let take = data.len();
+                out.extend_from_slice(data);
+                return Ok((next, take));
+            }
+        }
+        // 2. Cache miss: raw sequential read — no Page allocation, no
+        // cache insert, no LRU/eviction churn for read-once pages. The
+        // store holds the current committed version here (evictions write
+        // dirty pages out; everything else flushed at commit). The page is
+        // read DIRECTLY into `out`'s tail (one copy instead of two).
+        let psz = self.page_size() as usize;
+        let served_from_wal = {
+            let wal_guard = self.wal.read();
+            match wal_guard.as_ref() {
+                Some(state) => state.map.contains_key(&id),
+                None => false,
+            }
+        };
+        if served_from_wal {
+            // WAL frame: the header + data layout differs from the main
+            // file page — take the buffered path.
+            let mut raw = vec![0u8; psz];
+            let offset = {
+                let wal_guard = self.wal.read();
+                wal_guard
+                    .as_ref()
+                    .and_then(|s| s.map.get(&id).copied())
+                    .unwrap_or(0)
+            };
+            let st = self.wal.read();
+            st.as_ref().unwrap().wal.read_frame_at(offset, &mut raw)?;
+            drop(st);
+            if raw[0] != crate::storage::page::PageType::Overflow as u8 {
+                return Err(Error::corruption(format!(
+                    "overflow chain hit non-overflow page {id}"
+                )));
+            }
+            let next = u32::from_be_bytes(raw[12..16].try_into().unwrap());
+            let take = psz - 16;
+            out.extend_from_slice(&raw[16..]);
+            return Ok((next, take));
+        }
+        let offset = id as u64 * psz as u64;
+        let codec_active = self.codec.read().is_active();
+        if !codec_active {
+            // Direct read into out's tail: [type..16) header region in a
+            // small stack buffer, data region straight into out.
+            let mut head = [0u8; 16];
+            let n = self.read_file_at(offset, &mut head)?;
+            if n != 16 {
+                return Err(Error::corruption(format!(
+                    "short read on overflow page {id}: {n} of 16 header bytes"
+                )));
+            }
+            if head[0] != crate::storage::page::PageType::Overflow as u8 {
+                return Err(Error::corruption(format!(
+                    "overflow chain hit non-overflow page {id}"
+                )));
+            }
+            let next = u32::from_be_bytes(head[12..16].try_into().unwrap());
+            let data_len = psz - 16;
+            let base = out.len();
+            out.resize(base + data_len, 0);
+            let n = self.read_file_at(offset + 16, &mut out[base..])?;
+            if n != data_len {
+                return Err(Error::corruption(format!(
+                    "short read on overflow page {id}: {n} of {data_len} bytes"
+                )));
+            }
+            Ok((next, data_len))
+        } else {
+            let mut raw = vec![0u8; psz];
+            let n = self.read_file_at(offset, &mut raw)?;
+            if n != psz {
+                return Err(Error::corruption(format!(
+                    "short read on overflow page {id}: {n} of {psz} bytes"
+                )));
+            }
+            let decoded = {
+                let cs = self.codec.read();
+                cs.decode_page(false, &raw, psz)?
+            };
+            if decoded[0] != crate::storage::page::PageType::Overflow as u8 {
+                return Err(Error::corruption(format!(
+                    "overflow chain hit non-overflow page {id}"
+                )));
+            }
+            let next = u32::from_be_bytes(decoded[12..16].try_into().unwrap());
+            let take = decoded.len() - 16;
+            out.extend_from_slice(&decoded[16..]);
+            Ok((next, take))
+        }
     }
 }
 

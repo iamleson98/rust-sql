@@ -829,3 +829,143 @@ fn regression_statement_dml_survives_btree_splits() {
         assert_eq!(rows[0][0], Value::Integer(3000), "reset path (tx={tx})");
     }
 }
+
+// ===========================================================================
+// ROLLBACK after COMMITTED splits (2026-09-03): a plain ROLLBACK restored
+// the pager by DROPPING the page cache + truncating to the BEGIN snapshot,
+// then reset the root bookkeeping to the catalog's CREATE-time roots. Two
+// defects: (a) committed data lived only in dirty cache pages (in-memory
+// lazy write-back), so the cache drop destroyed rows that the BEGIN-time
+// flush had not written; (b) even with the file intact, the root maps
+// pointed at the CREATE-time root page, which after earlier committed
+// splits was an ordinary leaf — reads saw only that leaf's rows. Fixed by
+// journaling the transaction with an implicit `__begin__` savepoint
+// (non-destructive undo) and restoring the BEGIN-time maps snapshot.
+// ===========================================================================
+
+#[test]
+fn regression_rollback_after_committed_splits_keeps_all_rows() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
+    // First transaction: enough rows to split the root multiple times.
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=10_000i64 {
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("name{i}").into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    let before = db
+        .query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM t", [])
+        .unwrap();
+    let row = before.first().cloned().unwrap();
+    assert_eq!(row[0], Value::Integer(10_000));
+    assert_eq!(row[1], Value::Integer(50_005_000));
+
+    // Second transaction: mutate, then roll back.
+    db.execute("BEGIN", []).unwrap();
+    for i in 10_001..=20_000i64 {
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("name{i}").into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("DELETE FROM t WHERE id > 5000", []).unwrap();
+    db.execute("ROLLBACK", []).unwrap();
+
+    let after = db
+        .query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM t", [])
+        .unwrap();
+    let row = after.first().cloned().unwrap();
+    assert_eq!(row[0], Value::Integer(10_000), "row count lost by ROLLBACK");
+    assert_eq!(
+        row[1],
+        Value::Integer(50_005_000),
+        "SUM corrupted by ROLLBACK"
+    );
+    assert_eq!(row[2], Value::Integer(1));
+    assert_eq!(row[3], Value::Integer(10_000));
+
+    // Rolled-back rows must be invisible; committed rows must be findable.
+    assert_eq!(
+        db.query("SELECT val FROM t WHERE id = 20000", [])
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.query("SELECT val FROM t WHERE id = 10000", [])
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The tree is still fully writable afterwards.
+    db.execute("BEGIN", []).unwrap();
+    for i in 20_001..=20_005i64 {
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("name{i}").into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(10_005));
+}
+
+#[test]
+fn regression_rollback_tiny_txn_after_splits() {
+    // Even a ONE-row transaction rolled back after committed splits used to
+    // destroy the table (the maps reset, not the pager, was the trigger).
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=1_000i64 {
+        db.execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(i)])
+            .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    for _ in 0..3 {
+        db.execute("BEGIN", []).unwrap();
+        db.execute("INSERT INTO t (val) VALUES (999999)", [])
+            .unwrap();
+        db.execute("ROLLBACK", []).unwrap();
+        let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(n[0][0], Value::Integer(1_000));
+    }
+    // Update-in-place + rollback with indexes (undo must restore pages
+    // shared by table and index trees).
+    db.execute("CREATE INDEX ival ON t(val)", []).unwrap();
+    db.execute("BEGIN", []).unwrap();
+    db.execute("UPDATE t SET val = val + 1000000", []).unwrap();
+    db.execute("ROLLBACK", []).unwrap();
+    let agg = db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+    assert_eq!(agg[0][0], Value::Integer(1_000));
+    assert_eq!(agg[0][1], Value::Integer(500_500));
+    // Index lookups still resolve the original values.
+    let hits = db
+        .query("SELECT COUNT(*) FROM t WHERE val = 500", [])
+        .unwrap();
+    assert_eq!(hits[0][0], Value::Integer(1));
+}

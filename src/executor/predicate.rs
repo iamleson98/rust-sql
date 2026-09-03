@@ -167,6 +167,30 @@ impl PredValue {
 // A shared NULL singleton for the borrow-unfriendly cases above.
 static NULL_VALUE: Value = Value::Null;
 #[inline]
+/// Linear IN membership over `vals` (the general path): returns
+/// (found, saw_null). Kept as a helper so the integer-set fast path can
+/// fall back to it for cross-type values (huge/NaN reals).
+fn in_linear(
+    v: &Value,
+    vals: &[PredValue],
+    row: &[Value],
+    positions: &[usize],
+    params: &[Value],
+) -> (bool, bool) {
+    let mut found = false;
+    let mut saw_null = matches!(v, Value::Null);
+    for cand in vals {
+        let c = cand.eval(row, positions, params);
+        if matches!(&*c, Value::Null) {
+            saw_null = true;
+        } else if apply_binary(BinaryOp::Eq, v, &c).is_truthy() {
+            found = true;
+            break;
+        }
+    }
+    (found, saw_null)
+}
+
 fn null_ref() -> &'static Value {
     &NULL_VALUE
 }
@@ -240,6 +264,15 @@ pub(crate) enum CompiledPredicate {
         col: usize,
         vals: Vec<PredValue>,
         negated: bool,
+        /// Prebuilt membership set when EVERY member is a compile-time
+        /// INTEGER literal — the big-IN fast path. A 5000-member
+        /// `id IN (...)` scan then pays one hash probe per row instead of
+        /// a 5000-element linear walk (SQLite builds the same ephemeral
+        /// structure for large IN lists). Integer-only: no collation or
+        /// affinity subtleties; mixed-type / param members keep the linear
+        /// path. `saw_null` is folded in (a literal NULL member can never
+        /// match under SQL IN semantics but poisons NOT IN).
+        int_set: Option<std::collections::HashSet<i64>>,
     },
     /// `col LIKE/GLOB pattern` / `NOT LIKE|GLOB ...` (literal or param
     /// pattern). `glob` selects the matcher: GLOB is case-sensitive with
@@ -394,23 +427,44 @@ impl CompiledPredicate {
                     && apply_binary(BinaryOp::LtEq, v, &h).is_truthy();
                 in_range != *negated
             }
-            CompiledPredicate::InList { col, vals, negated } => {
+            CompiledPredicate::InList {
+                col,
+                vals,
+                negated,
+                int_set,
+            } => {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 // SQL IN semantics: NULL never matches; NOT IN with any
                 // NULL member yields NULL (not true). We mirror eval's
                 // behavior conservatively: membership = any equality true;
                 // negation inverts truthiness only when no NULLs involved.
-                let mut found = false;
-                let mut saw_null = matches!(v, Value::Null);
-                for cand in vals {
-                    let c = cand.eval(row, positions, params);
-                    if matches!(&*c, Value::Null) {
-                        saw_null = true;
-                    } else if apply_binary(BinaryOp::Eq, v, &c).is_truthy() {
-                        found = true;
-                        break;
+                let (found, saw_null) = if let Some(set) = int_set {
+                    // All-integer-literal fast path: one probe. Reals match
+                    // numerically when exactly representable (1.0 in (1,2));
+                    // a real outside the exact range falls to the linear
+                    // path below for full cross-type semantics.
+                    match v {
+                        Value::Integer(i) => (set.contains(i), false),
+                        Value::Real(x) => {
+                            if x.is_finite()
+                                && x.fract() == 0.0
+                                && x.abs() < 9.007_199_254_740_992e15
+                            {
+                                (set.contains(&(*x as i64)), false)
+                            } else {
+                                in_linear(v, vals, row, positions, params)
+                            }
+                        }
+                        // NULL value: never a member; NOT IN yields NULL
+                        // (filtered) — saw_null = true mirrors the linear
+                        // path's initial condition.
+                        Value::Null => (false, true),
+                        // TEXT/BLOB never equals an integer member.
+                        _ => (false, false),
                     }
-                }
+                } else {
+                    in_linear(v, vals, row, positions, params)
+                };
                 if *negated {
                     if saw_null {
                         false // NOT IN with NULL members: never true
@@ -704,10 +758,33 @@ pub(crate) fn compile_predicate(
             for v in vals {
                 bound.push(bind_leaf(v, table, prefix)?);
             }
+            // All-integer-literal members: prebuilt membership set (the
+            // big-IN fast path — see the variant docs). Everything else
+            // (params, columns, arithmetic members, mixed types) keeps
+            // the linear walk with full cross-type semantics.
+            let int_set = if bound.len() > 1
+                && bound
+                    .iter()
+                    .all(|p| matches!(p, PredValue::Literal(Value::Integer(_))))
+            {
+                let mut s = std::collections::HashSet::with_capacity_and_hasher(
+                    bound.len() * 2,
+                    std::collections::hash_map::RandomState::new(),
+                );
+                for p in &bound {
+                    if let PredValue::Literal(Value::Integer(i)) = p {
+                        s.insert(*i);
+                    }
+                }
+                Some(s)
+            } else {
+                None
+            };
             Some(CompiledPredicate::InList {
                 col,
                 vals: bound,
                 negated: *negated,
+                int_set,
             })
         }
         Expr::Like {

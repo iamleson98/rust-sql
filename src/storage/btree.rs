@@ -1819,22 +1819,17 @@ impl<'a> Btree<'a> {
                     total, total
                 )));
             }
-            let page_ref = self.pager.get_page(cur)?;
-            let p = page_ref.lock();
-            let pt = p.page_type()?;
-            if pt != PageType::Overflow {
-                return Err(Error::corruption(format!(
-                    "overflow chain hit non-overflow page {} ({:?})",
-                    cur, pt
-                )));
-            }
-            let data = p.overflow_data();
-            if data.len() < take {
+            // Cache-bypassing sequential read (see
+            // Pager::read_overflow_page_append): overflow chains are
+            // read-once in scans; caching them evicts the live tree pages.
+            let before = out.len();
+            let (next, got) = self.pager.read_overflow_page_append(cur, &mut out)?;
+            if got < take {
                 return Err(Error::corruption("overflow page data region truncated"));
             }
-            out.extend_from_slice(&data[..take]);
+            out.truncate(before + take);
             remaining -= take;
-            cur = p.overflow_next();
+            cur = next;
         }
         if remaining != 0 {
             return Err(Error::corruption(format!(
@@ -3893,6 +3888,22 @@ impl<'a> Btree<'a> {
         let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
         match found_cell_idx {
             Some(idx) => {
+                // Removing this cell would leave the parent with zero
+                // cells. With a non-zero rightmost that is still routable
+                // (everything goes right), but with rightmost == 0 (a
+                // post-split interior) the whole subtree would become
+                // unreachable and descents would fall through to page 0.
+                // Keep the empty leaf linked instead — scans skip it.
+                if n_cells == 1 {
+                    let right = {
+                        let parent_ref = self.pager.get_page(parent_id)?;
+                        let r = parent_ref.lock().right_most_pointer();
+                        r
+                    };
+                    if right == 0 {
+                        return Ok(());
+                    }
+                }
                 // Remove the separator cell slot.
                 let parent_ref = self.pager.get_page(parent_id)?;
                 let mut borrowed = parent_ref.lock();
@@ -4083,6 +4094,9 @@ impl<'a> Btree<'a> {
                         }
                     };
                     drop(page);
+                    if next == 0 {
+                        return Ok(None);
+                    }
                     page_id = next;
                 }
                 _ => {
@@ -4093,6 +4107,187 @@ impl<'a> Btree<'a> {
                 }
             }
         }
+    }
+
+    /// Bulk in-order delete for the streaming DELETE fast path. `rowids`
+    /// MUST be strictly ascending (the range/scan collectors guarantee
+    /// this — they walk the table B+tree once in rowid order). A sticky
+    /// leaf plus live key bounds skips the root-to-leaf descent for every
+    /// row after the first: sequential mass deletes (`DELETE FROM t WHERE
+    /// id > K`) drop from ~500 ns/row (fresh descent each) to ~40-80
+    /// ns/row. Callers that need the deleted payloads (index maintenance,
+    /// RETURNING, triggers) keep the per-row path.
+    pub fn delete_rowids_inorder(&mut self, rowids: &[i64]) -> Result<u64> {
+        self.pager.note_write();
+        let mut deleted: u64 = 0;
+        let mut sticky: Option<PageId> = None;
+        let mut lo = i64::MIN;
+        let mut hi = i64::MAX;
+        let mut i = 0usize;
+        let mut spill_chains: Vec<PageId> = Vec::new();
+        while i < rowids.len() {
+            let rid = rowids[i];
+            // (Re)pin the sticky leaf for this rowid.
+            if sticky.is_none() || rid < lo || rid > hi {
+                let mut page_id = self.root;
+                loop {
+                    let page = self.pager.get_page(page_id)?;
+                    let pt = page.lock().page_type()?;
+                    match pt {
+                        PageType::LeafTable => break,
+                        PageType::InteriorTable => {
+                            let next = {
+                                let borrowed = page.lock();
+                                let n = borrowed.n_cells();
+                                let mut l: u16 = 0;
+                                let mut h: u16 = n;
+                                while l < h {
+                                    let mid = (l + h) / 2;
+                                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                                    let sep = decode_table_interior_key(
+                                        borrowed.cell_slice_checked(cell_ptr)?,
+                                    )
+                                    .ok_or_else(|| {
+                                        Error::corruption("truncated interior cell in bulk delete")
+                                    })?;
+                                    if rid <= sep {
+                                        h = mid;
+                                    } else {
+                                        l = mid + 1;
+                                    }
+                                }
+                                if l >= n {
+                                    borrowed.right_most_pointer()
+                                } else {
+                                    let cell_ptr = borrowed.cell_pointer(l) as usize;
+                                    decode_table_interior_child(
+                                        borrowed.cell_slice_checked(cell_ptr)?,
+                                    )
+                                    .unwrap_or_else(|| borrowed.right_most_pointer())
+                                }
+                            };
+                            drop(page);
+                            if next == 0 {
+                                // Unset rightmost on an emptied interior:
+                                // the rowid is not in this subtree (never
+                                // recurse into page 0 — the header/schema
+                                // page). Skip this rowid; the bounds
+                                // refresh below unpins the interior page.
+                                i += 1;
+                                break;
+                            }
+                            page_id = next;
+                        }
+                        _ => {
+                            return Err(Error::corruption(format!(
+                                "unexpected page type in bulk delete: {:?}",
+                                pt
+                            )))
+                        }
+                    }
+                }
+                sticky = Some(page_id);
+                match leaf_rowid_bounds(self.pager, page_id)? {
+                    Some((a, b)) => {
+                        lo = a;
+                        hi = b;
+                    }
+                    None => {
+                        // Empty leaf: the rowid cannot be here.
+                        i += 1;
+                        sticky = None;
+                        continue;
+                    }
+                }
+            }
+            let leaf = sticky.expect("sticky pinned above");
+            // Run of rowids that fall within the sticky leaf's bounds
+            // (rowids are ascending; the leaf partition guarantees they
+            // all live in THIS leaf).
+            // partition_point returns an index RELATIVE to rowids[i..] —
+            // convert to the absolute index before slicing.
+            let run_end = i + rowids[i..].partition_point(|&r| r <= hi);
+            if run_end == i {
+                // Defensive: no progress — force a re-descend.
+                sticky = None;
+                continue;
+            }
+            // WHOLE-LEAF fast case: the run covers every cell of the leaf
+            // (equal length + matching endpoints — the scan collected
+            // existing rowids, so equal cardinality in the bounds implies
+            // identity). One lock + one header write replaces n_cells
+            // binary searches + pointer-array memmoves. This is the
+            // dominant shape of mass range deletes: `DELETE WHERE id > K`.
+            let n_cells = {
+                let page = self.pager.get_page(leaf)?;
+                let n = page.lock().n_cells() as usize;
+                n
+            };
+            let run_len = run_end - i;
+            if run_len == n_cells && n_cells > 0 && rowids[i] == lo && rowids[run_end - 1] == hi {
+                // Spilled cells: free their overflow chains BEFORE the
+                // cells go away (the chain pages would otherwise be
+                // unreachable garbage). Same decode as delete_from_page.
+                {
+                    let page = self.pager.get_page(leaf)?;
+                    let borrowed = page.lock();
+                    let psz = borrowed.data.len();
+                    for ci in 0..n_cells {
+                        let cell_ptr = borrowed.cell_pointer(ci as u16) as usize;
+                        let Ok(buf) = borrowed.cell_slice_checked(cell_ptr) else {
+                            continue;
+                        };
+                        let Some((_, n_rid)) = varint::decode_signed(buf) else {
+                            continue;
+                        };
+                        let Some((plen, n_plen)) = varint::decode(&buf[n_rid..]) else {
+                            continue;
+                        };
+                        let local_len = overflow_local_len_for(plen as usize, psz);
+                        if local_len < plen as usize {
+                            let chain_off = n_rid + n_plen + local_len;
+                            if chain_off + 4 <= buf.len() {
+                                let chain = u32::from_be_bytes(
+                                    buf[chain_off..chain_off + 4].try_into().unwrap_or([0; 4]),
+                                );
+                                if chain != 0 {
+                                    spill_chains.push(chain);
+                                }
+                            }
+                        }
+                    }
+                }
+                for chain in spill_chains.drain(..) {
+                    self.free_overflow_chain(chain)?;
+                }
+                {
+                    let page = self.pager.get_page(leaf)?;
+                    let mut borrowed = page.lock();
+                    borrowed.set_n_cells(0);
+                    borrowed.dirty = true;
+                }
+                self.pager.note_dirty(leaf);
+                deleted += n_cells as u64;
+                sticky = None;
+                i = run_end;
+                continue;
+            }
+            // Partial run: per-cell deletes within this leaf.
+            for &r in &rowids[i..run_end] {
+                if self.delete_from_page(leaf, r)? {
+                    deleted += 1;
+                }
+            }
+            match leaf_rowid_bounds(self.pager, leaf)? {
+                Some((a, b)) => {
+                    lo = a;
+                    hi = b;
+                }
+                None => sticky = None,
+            }
+            i = run_end;
+        }
+        Ok(deleted)
     }
 
     fn delete_from_page(&mut self, page_id: PageId, rowid: i64) -> Result<bool> {
@@ -4243,6 +4438,11 @@ impl<'a> Btree<'a> {
                     }
                 };
                 drop(page);
+                if child_id == 0 {
+                    // Unset rightmost on an emptied interior: not found
+                    // (page 0 is the header/schema page, never a child).
+                    return Ok(false);
+                }
                 let deleted = self.delete_from_page(child_id, rowid)?;
                 if deleted {
                     // A leaf that just became empty is unlinked from this
@@ -4410,7 +4610,14 @@ impl<'a> Btree<'a> {
                             v.push(left_child);
                         }
                     }
-                    v.push(right);
+                    // 0 = "no rightmost child" (an interior page keeps
+                    // this after a split); descending into 0 would scan the
+                    // header/schema-root page and yield its row as a table
+                    // row. Range scans already guard this; these full-scan
+                    // and count paths must too.
+                    if right != 0 {
+                        v.push(right);
+                    }
                     v
                 };
                 drop(page);
@@ -4580,7 +4787,14 @@ impl<'a> Btree<'a> {
                             v.push(left_child);
                         }
                     }
-                    v.push(right);
+                    // 0 = "no rightmost child" (an interior page keeps
+                    // this after a split); descending into 0 would scan the
+                    // header/schema-root page and yield its row as a table
+                    // row. Range scans already guard this; these full-scan
+                    // and count paths must too.
+                    if right != 0 {
+                        v.push(right);
+                    }
                     v
                 };
                 drop(page);
@@ -4657,7 +4871,14 @@ impl<'a> Btree<'a> {
                             v.push(left_child);
                         }
                     }
-                    v.push(right);
+                    // 0 = "no rightmost child" (an interior page keeps
+                    // this after a split); descending into 0 would scan the
+                    // header/schema-root page and yield its row as a table
+                    // row. Range scans already guard this; these full-scan
+                    // and count paths must too.
+                    if right != 0 {
+                        v.push(right);
+                    }
                     v
                 };
                 drop(borrowed);
@@ -5711,7 +5932,14 @@ impl<'a> Btree<'a> {
                             v.push(c.left_child);
                         }
                     }
-                    v.push(right);
+                    // 0 = "no rightmost child" (an interior page keeps
+                    // this after a split); descending into 0 would scan the
+                    // header/schema-root page and yield its row as a table
+                    // row. Range scans already guard this; these full-scan
+                    // and count paths must too.
+                    if right != 0 {
+                        v.push(right);
+                    }
                     v
                 };
                 drop(page);
@@ -5732,6 +5960,32 @@ impl<'a> Btree<'a> {
 // fn child_key_safe(c: &Cell) -> i64 {
 //     c.key()
 // }
+
+/// First/last cell rowids of a table leaf (None when the leaf is empty).
+/// Used by `delete_rowids_inorder`'s sticky-leaf bounds.
+fn leaf_rowid_bounds(pager: &Pager, leaf: PageId) -> Result<Option<(i64, i64)>> {
+    let page = pager.get_page(leaf)?;
+    let borrowed = page.lock();
+    if borrowed.page_type()? != PageType::LeafTable {
+        return Ok(None);
+    }
+    let n = borrowed.n_cells() as usize;
+    if n == 0 {
+        return Ok(None);
+    }
+    let first = borrowed
+        .cell_slice_checked(borrowed.cell_pointer(0) as usize)
+        .ok()
+        .and_then(|c| varint::decode_signed(c).map(|(k, _)| k));
+    let last = borrowed
+        .cell_slice_checked(borrowed.cell_pointer((n - 1) as u16) as usize)
+        .ok()
+        .and_then(|c| varint::decode_signed(c).map(|(k, _)| k));
+    match (first, last) {
+        (Some(a), Some(b)) => Ok(Some((a, b))),
+        _ => Ok(None),
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -119,3 +119,59 @@ exact tie). All four closed:
   REALs, size-changing TEXT, int size-class boundaries (127→128,
   32767→32768), multi-assign, and NULL transitions. 1.14 ms (tie) →
   1.11 vs 1.14 ms.
+
+## 2. 2026-09-03 production-hardening sprint (torture matrix)
+
+A new `examples/prod_torture` matrix (18 sections x 2 engines in isolated
+child processes — per-engine peak RSS, `TORTURE_SCALE`-able, wired into CI)
+found and fixed three data-corruption bugs and four throughput gaps:
+
+### Correctness (all previously shipped broken)
+- **ROLLBACK destroyed committed data**: plain ROLLBACK dropped the whole
+  page cache + truncated to the BEGIN snapshot, then reset root maps to the
+  catalog's CREATE-time roots. In-memory DBs (lazy write-back) lost every
+  page never flushed at BEGIN, and any table that split in an EARLIER
+  COMMITTED transaction resolved a stale leaf after rollback (10k rows
+  became 186). Fixed: BEGIN pushes an implicit `__begin__` savepoint
+  (SQLite's own model — BEGIN/ROLLBACK is the outermost savepoint), plain
+  ROLLBACK restores page pre-images non-destructively (mid-transaction
+  eviction writes are undone), and the root maps return to their BEGIN-time
+  snapshot. Regression tests: `regression_rollback_*`.
+- **Phantom duplicate rows on every scan**: interior pages keep
+  `right_most_pointer == 0` after a split; every full-scan/count path
+  followed child 0 — the DB header page, which doubles as the schema root
+  — and yielded its row as a table row (500k inserts produced 500015 rows;
+  the differential torture caught the same off-by-one). Fixed: all
+  scan/count paths skip child 0 (range scans already did).
+- **Page-0 descent on emptied interiors**: delete-heavy workloads could
+  empty an interior page; descents then routed into page 0 (the schema
+  page) — panics and potential schema-row deletion. Fixed with descent
+  guards + a recycling guard that never empties an interior whose
+  rightmost is unset.
+
+### Throughput (torture scale, 1M rows unless noted)
+- `IN (5000 literals)`: **226x slower -> 3.3x faster** (prebuilt integer
+  membership set, SQLite's ephemeral-index equivalent).
+- `ORDER BY ... LIMIT k` over 1M rows: **4.4x slower -> 1.8x faster**
+  (top-N fusion: O(n) key extraction + bounded partial selection + tie
+  order matching SQLite's stable sorter; 20 shapes differentially
+  verified).
+- `LIKE '%x%'` scans: **4.8x slower -> parity** (byte-level ASCII-folded
+  matcher with classified shapes; no per-row allocations).
+- Compound index selection: `WHERE d=? AND a=?` **31us -> 5.6us** (the
+  planner now prefers the index whose PREFIX is bound by the most equality
+  conjuncts).
+- Mass `DELETE ... WHERE id > K`: **4x slower -> parity** (sequential
+  bulk delete with a sticky leaf + whole-leaf clears; overflow chains
+  freed).
+- Overflow-chain reads bypass the page cache (sequential read-once pages
+  no longer evict the live tree pages).
+
+### Known remaining gaps (tracked, not blocking)
+- Wide-row (2KB TEXT) and 64KB blob scans trail SQLite ~2-4x: the scan
+  materializes every overflow payload even for projections that never
+  read the column (needs overflow-aware selective decode — a callback-
+  contract change across the scan family).
+- Multi-index INSERT (5 indexes) trails ~20%.
+- Peak RSS on 1M-row workloads is ~2.5x SQLite (in-memory store image +
+  2048-page cache + mimalloc retention + transaction undo journal).
