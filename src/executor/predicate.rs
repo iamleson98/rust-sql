@@ -106,6 +106,29 @@ fn null_ref() -> &'static Value {
     &NULL_VALUE
 }
 
+/// Resolve a predicate operand to a raw `i64` when it is — or points at —
+/// an INTEGER. The dominant predicate shape over integer tables
+/// (`WHERE a BETWEEN ? AND ?`, `id = ?`) then compares raw ints in the
+/// fused scan loop instead of the generic Value machinery (NaN probe,
+/// collation dispatch, Value construction per comparison). NULL / REAL /
+/// TEXT / BLOB / arithmetic expressions return `None` and the caller
+/// takes the general path with full SQLite semantics.
+#[inline]
+fn pred_int(pv: &PredValue, row: &[Value], positions: &[usize], params: &[Value]) -> Option<i64> {
+    match pv {
+        PredValue::Literal(Value::Integer(i)) => Some(*i),
+        PredValue::Param(i) => match params.get(*i) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        },
+        PredValue::Col(i) => match positions.get(*i).and_then(|&p| row.get(p)) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A predicate compiled against a fixed column-position layout.
 #[derive(Clone, Debug)]
 pub(crate) enum CompiledPredicate {
@@ -194,6 +217,27 @@ impl CompiledPredicate {
     pub(crate) fn eval(&self, row: &[Value], positions: &[usize], params: &[Value]) -> bool {
         match self {
             CompiledPredicate::Cmp { lhs, op, rhs } => {
+                // Fast path: INTEGER <op> INTEGER. The generic path pays
+                // cmp_operand_missing + collation dispatch + Value
+                // construction per comparison (2 per BETWEEN row) — the
+                // dominant cost of the fused scan-filter loop. NULL,
+                // REAL, TEXT, BLOB operands decline and take the general
+                // path with full SQLite semantics.
+                if is_cmp_op(*op) {
+                    if let (Some(l), Some(r)) = (
+                        pred_int(lhs, row, positions, params),
+                        pred_int(rhs, row, positions, params),
+                    ) {
+                        return match op {
+                            BinaryOp::Eq => l == r,
+                            BinaryOp::NotEq => l != r,
+                            BinaryOp::Lt => l < r,
+                            BinaryOp::LtEq => l <= r,
+                            BinaryOp::Gt => l > r,
+                            _ => l >= r, // GtEq (is_cmp_op total)
+                        };
+                    }
+                }
                 let l = lhs.eval(row, positions, params);
                 let r = rhs.eval(row, positions, params);
                 apply_binary(*op, &l, &r).is_truthy()
@@ -215,6 +259,22 @@ impl CompiledPredicate {
                 hi,
                 negated,
             } => {
+                // Fast path: all-INTEGER BETWEEN (the dominant shape of
+                // integer range scans) — see the Cmp arm for rationale.
+                // NULL on any operand declines here and takes the general
+                // path, which filters the row out (SQL 3VL).
+                let v_i = match row.get(positions[*col]) {
+                    Some(Value::Integer(x)) => Some(*x),
+                    _ => None,
+                };
+                if let (Some(x), Some(lo_i), Some(hi_i)) = (
+                    v_i,
+                    pred_int(lo, row, positions, params),
+                    pred_int(hi, row, positions, params),
+                ) {
+                    let in_range = x >= lo_i && x <= hi_i;
+                    return in_range != *negated;
+                }
                 // SQL three-valued logic, mirroring the general path
                 // exactly: any NULL operand → result NULL → WHERE filters
                 // the row out (true for BETWEEN *and* NOT BETWEEN).
@@ -341,6 +401,28 @@ fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<Pre
     match e {
         Expr::Literal(v) => Some(PredValue::Literal(v.clone())),
         Expr::Parameter(p) => p.parse::<usize>().ok().map(PredValue::Param),
+        // `-10` parses as Unary(Neg, Literal(10)). Fold it so predicates
+        // with negative literal bounds (`a BETWEEN -10 AND -1`, `a > -5`)
+        // COMPILE — an unfolded bound made the whole predicate fall back
+        // to the unfused path (full row materialization + AST-walk filter
+        // per row: 150 ns/row vs 17 ns/row, measured in
+        // examples/probe_mixed_reads.rs).
+        Expr::Unary { op, expr } if matches!(op, crate::sql::ast::UnaryOp::Neg) => {
+            match expr.as_ref() {
+                Expr::Literal(v @ (Value::Integer(_) | Value::Real(_))) => {
+                    let folded = match v {
+                        Value::Integer(i) if *i != i64::MIN => Value::Integer(-i),
+                        Value::Real(x) => Value::Real(-x),
+                        // i64::MIN: -MIN overflows; the parser emits
+                        // Literal(MIN) directly for it, so this is
+                        // unreachable in practice — decline to fold.
+                        _ => return None,
+                    };
+                    Some(PredValue::Literal(folded))
+                }
+                _ => None,
+            }
+        }
         Expr::Column { table: ref_t, name } => {
             let matches = ref_t
                 .as_ref()

@@ -374,6 +374,86 @@ fn classify(stmt: &Ast) -> Kind {
     }
 }
 
+/// Hot-path statement classification WITHOUT a full parse.
+///
+/// `run_one` used to `parser::parse` EVERY statement just to pick an
+/// execution arm — ~1 µs of AST allocation (identifier Strings, expression
+/// trees) per INSERT/SELECT, pure overhead on the dominant bind-and-execute
+/// loop (measured in `examples/probe_driver_layer.rs`: parse 1.0 µs vs the
+/// engine's own 0.8 µs INSERT). The `Rows` and `Dml` arms never touch the
+/// AST at all, so statements whose first keyword unambiguously determines
+/// the arm skip the parse entirely; the engine's own statement cache
+/// (SQL text → compiled plan) still parses once on first sight.
+///
+/// Everything ambiguous — WITH-prefix CTEs (SELECT or INSERT?), EXPLAIN,
+/// PRAGMA (value vs read), BEGIN/COMMIT, DDL, comments-first scripts —
+/// falls back to the full parse, which cold statements can afford.
+enum HeadKind {
+    Rows,
+    Dml,
+    /// Not decidable from the head keyword: parse and `classify`.
+    NeedsParse,
+}
+
+fn classify_head(sql: &str) -> HeadKind {
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    // Skip whitespace and comments before the first token.
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < b.len() && b[i] == b'-' && b[i + 1] == b'-' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            continue;
+        }
+        break;
+    }
+    // Extract the leading keyword (ASCII letters only — SQL keywords).
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+        i += 1;
+    }
+    if i == start {
+        return HeadKind::NeedsParse; // starts with '(' VALUES-row, digit, ...
+    }
+    let kw = &b[start..i];
+    fn eq_ignore_case(a: &[u8], kw: &[u8]) -> bool {
+        if a.len() != kw.len() {
+            return false;
+        }
+        for k in 0..a.len() {
+            if !a[k].eq_ignore_ascii_case(&kw[k]) {
+                return false;
+            }
+        }
+        true
+    }
+    if eq_ignore_case(b"SELECT", kw) {
+        HeadKind::Rows
+    } else if eq_ignore_case(b"INSERT", kw)
+        || eq_ignore_case(b"REPLACE", kw)
+        || eq_ignore_case(b"UPDATE", kw)
+        || eq_ignore_case(b"DELETE", kw)
+    {
+        HeadKind::Dml
+    } else {
+        // WITH / EXPLAIN / PRAGMA / BEGIN / COMMIT / CREATE / ... — the
+        // full parse decides (and the Once arm needs the AST anyway).
+        HeadKind::NeedsParse
+    }
+}
+
 /// Which transaction-gate wait mode does this SQL need before execution?
 ///
 /// * `None` — no executable statements (blank/comment-only).
@@ -605,8 +685,23 @@ impl RustqliteConnection {
         values: &[EngineValue],
         limit_one: bool,
     ) -> Result<Vec<Either<RustqliteQueryResult, RustqliteRow>>, SqlxError> {
-        let ast = parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?;
-        let kind = classify(&ast);
+        // Hot-path classification: the head keyword decides the arm for
+        // SELECT / INSERT / UPDATE / DELETE / REPLACE without the ~1 µs
+        // AST parse (see classify_head). Only the Once arm needs the AST,
+        // so the parse happens there (or below when the head is ambiguous).
+        let mut parsed: Option<Ast> = None;
+        let kind = match classify_head(stmt_sql) {
+            HeadKind::Rows => Kind::Rows,
+            HeadKind::Dml => Kind::Dml,
+            HeadKind::NeedsParse => {
+                let ast = parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?;
+                let kind = classify(&ast);
+                if matches!(kind, Kind::Once) {
+                    parsed = Some(ast);
+                }
+                kind
+            }
+        };
 
         let mut logger = QueryLogger::new(script.clone(), self.log_settings.clone());
 
@@ -715,6 +810,15 @@ impl RustqliteConnection {
                 last_rowid = db.last_insert_rowid();
             }
             Kind::Once => {
+                // The AST for the Once arm: either parsed above (ambiguous
+                // head keyword classified as Once) or parsed now — cheap,
+                // control/DDL statements are never hot-loop statements.
+                let ast = match parsed {
+                    Some(ast) => ast,
+                    None => {
+                        parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?
+                    }
+                };
                 let mut db = self.acquire_write()?;
                 // A DEFERRED (sqlx) transaction that issues DDL or another
                 // once-class statement starts its engine-level transaction
@@ -1403,6 +1507,57 @@ impl SqlxConnectOptions for RustqliteConnectOptions {
     }
 }
 
+/// Stable registry key for a database path.
+///
+/// The registry maps every spelling of a path (raw, symlinked, Windows
+/// 8.3 short name, pre-creation) to ONE engine. The old key —
+/// `canonicalize(path)` with a raw-path fallback — was unstable across
+/// CONNECTION CREATION ORDER: connection #1 opens before the file exists,
+/// so canonicalize fails and the key is the raw spelling; connection #2
+/// opens after the engine created the file, canonicalize succeeds and
+/// resolves symlinks (/var → /private/var on macOS) and short names
+/// (RUNNER~1 on Windows) — two keys, TWO ENGINES on one file. The
+/// count-cache/epoch incoherence that produced `COUNT(*) = 0` while
+/// `SELECT *` saw every row (and the lost-write COUNT=9/10) came from
+/// exactly this, and it split pool connections across engines that then
+/// fought over the file.
+fn canonical_key(path: &std::path::Path) -> String {
+    // File exists: canonicalize resolves symlinks and short names.
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return normalize_key(c);
+    }
+    // File not yet created: canonicalize the PARENT (which exists) and
+    // join the file name — byte-identical to what canonicalize will
+    // return once the file exists, so connection #1 and every later
+    // connection agree on one engine.
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(cp) = std::fs::canonicalize(parent) {
+            return normalize_key(cp.join(name));
+        }
+    }
+    normalize_key(path.to_path_buf())
+}
+
+/// Fold a canonical path into a registry key string. On Windows,
+/// canonicalize returns `\\?\`-prefixed verbatim paths while raw fallback
+/// spellings are plain — normalize both to the plain form and fold case
+/// (NTFS is case-insensitive) so every spelling maps to one engine.
+#[cfg(windows)]
+fn normalize_key(p: std::path::PathBuf) -> String {
+    let mut s = p.to_string_lossy().replace('/', "\\");
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{rest}");
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = rest.to_string();
+    }
+    s.to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn normalize_key(p: std::path::PathBuf) -> String {
+    p.to_string_lossy().into_owned()
+}
+
 fn acquire_shared(options: &RustqliteConnectOptions) -> Result<Arc<SharedDb>, SqlxError> {
     let engine_err = |e: crate::error::Error| crate::sqlx_driver::error::engine_err(e);
 
@@ -1423,10 +1578,18 @@ fn acquire_shared(options: &RustqliteConnectOptions) -> Result<Arc<SharedDb>, Sq
             "memdb:shared".to_string()
         }
     } else {
-        std::fs::canonicalize(&options.filename)
-            .unwrap_or_else(|_| options.filename.clone())
-            .to_string_lossy()
-            .into_owned()
+        // The parent directory must exist BEFORE the key is computed:
+        // canonical_key's parent-join fallback needs a real directory to
+        // resolve, and create_dir_all here is idempotent with the open
+        // block below.
+        if !options.filename.as_os_str().is_empty() && options.create_if_missing {
+            if let Some(parent) = options.filename.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+        }
+        canonical_key(&options.filename)
     };
 
     let mut map = engines().lock().unwrap_or_else(|e| e.into_inner());

@@ -1032,6 +1032,95 @@ async fn multiple_concurrent_read_transactions() {
     }
 }
 
+/// Cross-path-spelling engine coherence: the shared-engine registry must
+/// map every spelling of a database path (raw, symlinked, pre-creation)
+/// to ONE engine. The original key — `canonicalize(path)` with a raw
+/// fallback — was computed BEFORE the file existed for connection #1
+/// (raw spelling) and AFTER creation for later connections (canonical:
+/// symlink-resolved on macOS `/var` → `/private/var`, long-path on
+/// Windows 8.3 names), so pools could end up with TWO engines on one
+/// file: the per-engine count cache then served `COUNT(*) = 0` while
+/// `SELECT *` saw every row (the macOS/Windows CI `file_backed_pool`
+/// failures). This test opens one pool through a SYMLINKED directory and
+/// a second through the REAL path: both must see each other's writes
+/// immediately.
+#[tokio::test]
+async fn file_backed_pool_path_spellings_share_one_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = tmp.path().join("link");
+    let linked = {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(&real, &link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    };
+    if !linked {
+        // Windows symlinks need developer mode; the canonical-key logic
+        // is still exercised by file_backed_pool on every platform.
+        eprintln!("symlink unavailable; skipping path-spelling coherence test");
+        return;
+    }
+
+    // Pool #1: file does NOT exist yet, path spelled through the symlink.
+    let p1 = RustqlitePool::connect_with(
+        RustqliteConnectOptions::filename(&link.join("coh.db")).create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&p1)
+        .await
+        .unwrap();
+    for i in 0..3 {
+        sqlx::query("INSERT INTO c (v) VALUES (?)")
+            .bind(format!("r{i}"))
+            .execute(&p1)
+            .await
+            .unwrap();
+    }
+
+    // Pool #2: the REAL spelling, file now exists. Must land on the SAME
+    // engine (canonical key), not a second engine with a private pager.
+    let p2 = RustqlitePool::connect_with(RustqliteConnectOptions::filename(&real.join("coh.db")))
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c")
+        .fetch_one(&p2)
+        .await
+        .unwrap();
+    assert_eq!(n, 3, "second pool must see the first pool's rows");
+
+    // Writes through pool #1 must be immediately visible to pool #2 —
+    // one shared engine, not two engines with private page caches.
+    sqlx::query("INSERT INTO c (v) VALUES ('more')")
+        .execute(&p1)
+        .await
+        .unwrap();
+    let n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c")
+        .fetch_one(&p2)
+        .await
+        .unwrap();
+    assert_eq!(n2, 4, "cross-pool write visibility broke (split engines)");
+
+    let n1: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c")
+        .fetch_one(&p1)
+        .await
+        .unwrap();
+    assert_eq!(n1, 4);
+    p1.close().await;
+    p2.close().await;
+}
+
 /// Diagnostic companion to `file_backed_pool`: the macOS CI runner has
 /// seen that test lose the LAST insert (COUNT=9 of 10, rows row0..row8)
 /// three runs in a row while every other platform passes. This test runs
