@@ -9339,6 +9339,85 @@ pub(crate) fn make_index_states(
         .collect()
 }
 
+// ============================================================================
+// Insert scratch cache (cross-statement buffer reuse)
+//
+// Single-row INSERT statements are the OLTP hot path, but each statement
+// rebuilt its whole working set: `make_index_states` (2 Vecs per index —
+// resolved columns + an order-key buffer), the full-width row buffer, the
+// payload encode buffer, and the lowercased table name. That is ~14-16
+// heap allocations per ROW for a 5-index table — the dominant remaining
+// gap vs SQLite on multi-index load, and the churn behind mimalloc's
+// retained pages in RSS-bound workloads.
+//
+// The scratch persists those buffers across same-shape statements on THIS
+// thread, validated cheaply per use: table identity (Arc address + name)
+// plus the resolved column list and the CURRENT index count (a CREATE/
+// DROP INDEX between statements changes the count and drops the scratch).
+// Roots are re-seeded from the ctx maps every statement (correctness
+// first: DDL, ROLLBACK, or a nested write between statements can move
+// them), while the validated B+tree append HINTS survive — the hint
+// mechanism re-validates the page itself.
+// ============================================================================
+
+/// Per-statement INSERT working set, reused across same-shape statements
+/// on this thread (see the block comment above).
+struct InsertScratch {
+    /// Identity + name in one refcount bump (no String clone per return).
+    table: Arc<Table>,
+    target_indices: Vec<usize>,
+    name_lc: String,
+    full_row: Vec<Value>,
+    payload_buf: Vec<u8>,
+    /// Column names for CHECK enforcement / RETURNING (empty when neither
+    /// is needed — allocated at most once per shape either way).
+    col_names: Vec<String>,
+    index_states: Vec<IndexMaintState>,
+}
+
+std::thread_local! {
+    static INSERT_SCRATCH: std::cell::RefCell<Option<InsertScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take the scratch when it matches this (table, target_indices, indexes)
+/// shape; `None` otherwise (the caller builds a fresh one). A mismatched
+/// scratch is dropped — never reused for a different table.
+fn take_insert_scratch(
+    table: &Arc<Table>,
+    target_indices: &[usize],
+    indexes: &[Arc<crate::schema::Index>],
+) -> Option<InsertScratch> {
+    INSERT_SCRATCH.with(|s| {
+        let mut slot = s.borrow_mut();
+        match slot.take() {
+            Some(sc) => {
+                let same_shape = Arc::ptr_eq(&sc.table, table)
+                    && sc.target_indices == target_indices
+                    && sc.index_states.len() == indexes.len()
+                    && sc
+                        .index_states
+                        .iter()
+                        .zip(indexes.iter())
+                        .all(|(st, idx)| Arc::ptr_eq(&st.idx, idx));
+                if same_shape {
+                    Some(sc)
+                } else {
+                    None // mismatched shape: dropped
+                }
+            }
+            None => None,
+        }
+    })
+}
+
+/// Return the scratch for the next same-shape statement.
+fn return_insert_scratch(sc: InsertScratch) {
+    INSERT_SCRATCH.with(|s| {
+        *s.borrow_mut() = Some(sc);
+    });
+}
+
 fn exec_insert(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -9393,35 +9472,47 @@ fn exec_insert(
 
     // Look up indexes on this table once, up front.
     let indexes = ctx.catalog().indexes_on_table(&table.name);
-    // Track current root for each index too (seeded from the override-aware
-    // roots — the catalog snapshot may be stale after earlier splits).
-    let mut index_states = make_index_states(ctx, &indexes, &table);
 
-    // Pre-compute the lower-cased table name ONCE — set_table_root and
-    // set_max_rowid both call to_ascii_lowercase() per call, which
-    // allocates a fresh String per row. For a 1k-row INSERT batch, that's
-    // 2k wasted String allocations.
-    let table_name_lc = table.name.to_ascii_lowercase();
-
-    // Reusable row + payload buffers. Hoisted outside the loop to avoid
-    // a per-row Vec allocation. full_row is sized to table.n_columns() and
-    // filled with NULL at the start of each iteration.
-    let n_cols = table.n_columns();
-    let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
-    let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
+    // INSERT SCRATCH: same-shape statements on this thread reuse the
+    // whole per-statement working set (index maintenance states with
+    // their key buffers, row/payload buffers, lowercased name, column
+    // names). Roots are re-seeded from the ctx maps every statement —
+    // DDL, ROLLBACK, or a nested write between statements can move them.
+    // A shape mismatch (different table, column list, or index count)
+    // drops the old scratch and rebuilds.
+    let (mut index_states, table_name_lc, mut full_row, mut payload_buf, col_names) =
+        match take_insert_scratch(&table, &target_indices, &indexes) {
+            Some(mut sc) => {
+                for st in sc.index_states.iter_mut() {
+                    st.root = ctx.index_root(&st.idx);
+                }
+                (
+                    sc.index_states,
+                    sc.name_lc,
+                    sc.full_row,
+                    sc.payload_buf,
+                    sc.col_names,
+                )
+            }
+            None => {
+                // Fresh working set (see the insert-scratch block comment).
+                let states = make_index_states(ctx, &indexes, &table);
+                let name_lc = table.name.to_ascii_lowercase();
+                let n_cols = table.n_columns();
+                let row: Vec<Value> = vec![Value::Null; n_cols];
+                let payload: Vec<u8> = Vec::with_capacity(n_cols * 8);
+                // Column names — needed only for CHECK constraints or
+                // RETURNING (NOT NULL checks are purely positional).
+                let cols: Vec<String> = if !table.check_exprs.is_empty() || returning.is_some() {
+                    table.columns.iter().map(|c| c.name.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                (states, name_lc, row, payload, cols)
+            }
+        };
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
-
-    // Column names — needed only for CHECK constraints or RETURNING
-    // (NOT NULL checks are purely positional, so the common case of a
-    // table with a NOT NULL PK but no CHECKs skips the per-statement
-    // Vec<String> allocation entirely).
-    let needs_col_names = !table.check_exprs.is_empty() || returning.is_some();
-    let col_names: Vec<String> = if needs_col_names {
-        table.columns.iter().map(|c| c.name.clone()).collect()
-    } else {
-        Vec::new()
-    };
 
     // RETURNING output buffer.
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
@@ -9712,6 +9803,17 @@ fn exec_insert(
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
+    // Persist the working set for the next same-shape statement on this
+    // thread (error paths above drop it — a fresh one is rebuilt there).
+    return_insert_scratch(InsertScratch {
+        table: table.clone(),
+        target_indices,
+        name_lc: table_name_lc,
+        full_row,
+        payload_buf,
+        col_names: col_names.clone(),
+        index_states,
+    });
     Ok(finish_insert_result(
         inserted,
         returning,
@@ -10045,18 +10147,35 @@ fn exec_insert_one_row(
     // The rowid may have been pre-assigned by the caller (for constraint
     // enforcement); `rowid_autogen_hint` says whether that happened.
     let rowid_was_autogenerated;
+    // An EXPLICIT rowid beyond `max_rowid` cannot collide with any
+    // existing row (rowids are a subset of integers up to max_rowid),
+    // so it is append-safe exactly like an auto-generated one: the
+    // lookup_table probe and the descent-per-row insert collapse into
+    // the pinned-rightmost-leaf append. Sequential bulk loads with
+    // explicit ids (the S12 multi-index shape) were paying TWO full
+    // descents per row for the table part alone.
+    let mut rowid_is_fresh_beyond_max = false;
     let rowid = if let Some(r) = explicit_rowid {
         // `INSERT INTO t (rowid, ...)` on a table without an INTEGER
         // PRIMARY KEY alias: the rowid is supplied positionally.
         rowid_was_autogenerated = false;
         if r > *max_rowid {
             *max_rowid = r;
+            rowid_is_fresh_beyond_max = true;
         }
         r
     } else if let Some(idx) = table.rowid_alias {
         match &full_row[idx] {
             Value::Integer(i) => {
                 rowid_was_autogenerated = rowid_autogen_hint;
+                // Explicit id beyond the current max: fresh by the same
+                // argument as the positional-rowid case (see the comment
+                // above) — and keep the caller's max_rowid current for
+                // the remaining rows of a multi-row VALUES batch.
+                if *i > *max_rowid {
+                    *max_rowid = *i;
+                    rowid_is_fresh_beyond_max = true;
+                }
                 *i
             }
             Value::Null => {
@@ -10269,7 +10388,9 @@ fn exec_insert_one_row(
         // a rowid (it might already exist), or when the conflict
         // resolution is REPLACE (we need to know whether to delete an
         // existing row first).
-        if rowid_was_autogenerated && on_conflict != ConflictResolution::Replace {
+        if (rowid_was_autogenerated || rowid_is_fresh_beyond_max)
+            && on_conflict != ConflictResolution::Replace
+        {
             old_payload_opt = None;
             // BTREE_APPEND fast path: for sequential auto-rowids,
             // skip the binary search per insert. Falls back to the

@@ -539,6 +539,13 @@ pub struct Pager {
     /// ROLLBACK TO <name> restores those bytes (in cache, marked dirty),
     /// drops pages allocated after the savepoint, and rewinds metadata.
     savepoints: Mutex<Vec<SavepointLevel>>,
+    /// MINIMUM `base.n_pages` across all stacked savepoint levels (u32::MAX
+    /// when none). A page id >= this can NEVER need a pre-image for any
+    /// level (all levels' bases are <= it), so `capture_savepoint_undo`
+    /// skips the lock + hash probe entirely — one relaxed atomic load.
+    /// Maintained at push (min never grows: a new level's base is the
+    /// CURRENT n_pages, >= every existing base) and pop/clear (recompute).
+    savepoint_min_base: std::sync::atomic::AtomicU32,
     /// Mirror of `savepoints.len()` for the get_page fast path (an atomic
     /// load when no savepoint is active — the common case — instead of a
     /// Mutex lock).
@@ -580,6 +587,11 @@ impl Pager {
             base: PagerSnapshot::capture(self),
             pages: std::collections::HashMap::default(),
         });
+        // A new level's base is the CURRENT n_pages (>= every existing
+        // base — pages only grow), so the min cannot shrink here; the
+        // store keeps the invariant explicit.
+        let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
+        self.savepoint_min_base.store(m, Ordering::Relaxed);
         self.savepoint_depth.store(sp.len(), Ordering::Release);
     }
 
@@ -695,6 +707,8 @@ impl Pager {
             .rposition(|s| s.name == name.to_ascii_lowercase())?;
         sp.truncate(idx);
         let remaining = sp.len();
+        let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
+        self.savepoint_min_base.store(m, Ordering::Relaxed);
         self.savepoint_depth.store(remaining, Ordering::Release);
         Some(remaining)
     }
@@ -703,6 +717,7 @@ impl Pager {
     pub fn clear_savepoints(&self) {
         let mut sp = self.savepoints.lock();
         sp.clear();
+        self.savepoint_min_base.store(u32::MAX, Ordering::Relaxed);
         self.savepoint_depth.store(0, Ordering::Release);
     }
 
@@ -736,6 +751,15 @@ impl Pager {
     /// insert paths) — the bytes at fetch time are the pre-mutation state
     /// because every mutation locks the page through get_page first.
     fn capture_savepoint_undo(&self, id: PageId, page: &PageRef) {
+        // Range fast path: pages allocated after EVERY level's base need
+        // no pre-image (see the loop below) — a bulk-INSERT transaction
+        // allocates all its leaves after BEGIN, so this one atomic load
+        // replaces a Mutex + HashMap probe + level scan on EVERY get_page
+        // of the write storm (~60-100 ns x 6+ pages/row on multi-index
+        // loads — the dominant per-row overhead vs SQLite).
+        if (id as u64) >= self.savepoint_min_base.load(Ordering::Relaxed) as u64 {
+            return;
+        }
         let mut sp = self.savepoints.lock();
         if sp.is_empty() {
             return;
@@ -876,6 +900,7 @@ impl Pager {
                 .checked_add(1)
                 .unwrap_or(0),
             savepoints: Mutex::new(Vec::new()),
+            savepoint_min_base: std::sync::atomic::AtomicU32::new(u32::MAX),
             savepoint_depth: std::sync::atomic::AtomicUsize::new(0),
             codec: RwLock::new(crate::plugin::codec::CodecState::default()),
             required_codec: Mutex::new(None),
