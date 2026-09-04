@@ -3355,6 +3355,28 @@ impl Database {
         &self.pager
     }
 
+    /// Live B+tree root page of a table or index (diagnostics/probes):
+    /// the bookkeeping map tracks root moves from splits, falling back to
+    /// the catalog's CREATE-time root. `None` when the object doesn't
+    /// exist.
+    pub fn live_root(&self, name: &str) -> Option<u32> {
+        let key = name.to_ascii_lowercase();
+        if self.maps_populated.load(Ordering::Acquire) {
+            let m = self.maps.read();
+            if let Some(r) = m.roots.get(&key) {
+                return Some(*r);
+            }
+            if let Some(r) = m.index_roots.get(&key) {
+                return Some(*r);
+            }
+        }
+        let cat = &self.catalog;
+        if let Some(t) = cat.get_table(name) {
+            return Some(t.root_page);
+        }
+        cat.get_index(name).map(|i| i.root_page)
+    }
+
     // ====================================================================
     // Plugin / extension registration (static, in-process)
     // ====================================================================

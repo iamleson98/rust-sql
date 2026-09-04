@@ -521,6 +521,142 @@ fn affinity_apply_opt(aff: Affinity, v: Value) -> Option<Value> {
     }
 }
 
+// ============================================================================
+// Overflow-aware lazy decode support
+// ============================================================================
+//
+// The scan family hands these helpers the PAGE-RESIDENT prefix of an
+// overflow cell (the "local" bytes). The layout walker computes every
+// column's byte span from that prefix alone — a projection can then skip
+// the wide columns' chain pages entirely, and a projected wide column can
+// be gathered DIRECTLY from its chain pages into the value's own buffer
+// (one copy instead of assemble-then-decode's two).
+
+/// Byte span of one column inside the FULL payload: `[off, off+len)`
+/// covers tag + body. `off` is an offset into the payload (the local
+/// prefix shares the payload's starting offset).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColSpan {
+    /// Offset of the value's TAG byte within the payload.
+    pub off: u32,
+    /// Total encoded bytes (tag + header + body).
+    pub len: u32,
+}
+
+impl ColSpan {
+    #[inline]
+    pub fn end(&self) -> usize {
+        self.off as usize + self.len as usize
+    }
+}
+
+/// Why a lazy decode could not proceed from the local prefix alone.
+#[derive(Debug)]
+pub enum LazyError {
+    /// The record header walk ran past the local prefix (a record with an
+    /// enormous tag run — pathological, but possible). The caller falls
+    /// back to full assembly.
+    HeaderPastLocal,
+    /// Structurally corrupt payload.
+    Corrupt(crate::error::Error),
+}
+
+/// Walk the value tags on the LOCAL prefix of a payload, laying out the
+/// byte spans of columns `0..=max_col` (the caller passes its highest
+/// wanted column index):
+/// - `Some(span)` — the column's tag AND length header are fully local.
+///   The BODY may still spill into the overflow chain (`span.end() >
+///   local.len()`): the caller decides whether to gather it.
+/// - `None` — the column position is past the encoded payload (short row:
+///   ALTER TABLE ADD COLUMN) → NULL.
+///
+/// `Err(HeaderPastLocal)` — a tag needed to continue the walk sits past
+/// the local prefix (a column positioned AFTER a spilled wide column).
+/// The caller must assemble the full payload to decode those columns.
+/// `Err(Corrupt)` — malformed tag/varint inside the local prefix.
+///
+/// Position arithmetic is exact: each span's length comes from the tag
+/// header (in local), so walking PAST a spilled body needs no body bytes —
+/// only the NEXT column's tag must be locally readable.
+pub fn column_spans_local(
+    local: &[u8],
+    total: usize,
+    n_cols_total: usize,
+    max_col: usize,
+) -> std::result::Result<Vec<Option<ColSpan>>, LazyError> {
+    let max_col = max_col.min(n_cols_total.saturating_sub(1));
+    let mut spans = Vec::with_capacity(max_col + 1);
+    let mut pos = 0usize;
+    for _col in 0..=max_col {
+        if pos >= total {
+            // Past the encoded payload: short row (NULL).
+            spans.push(None);
+            continue;
+        }
+        if pos >= local.len() {
+            // The tag for this column sits inside the overflow chain: the
+            // walk cannot continue locally. Only an error when a wanted
+            // column needs it (the caller's max_col is wanted-derived, so
+            // reaching here means one does).
+            return Err(LazyError::HeaderPastLocal);
+        }
+        let tag = local[pos];
+        // Body/header length from the tag (mirrors `value_encoded_len`).
+        let (hdr, body): (usize, usize) = match tag {
+            0x00 | 0x01 | 0x09 => (0, 0),
+            0x02 => (0, 1),
+            0x03 => (0, 2),
+            0x04 => (0, 4),
+            0x05 | 0x06 => (0, 8),
+            0x0A => {
+                let (_, n) =
+                    crate::types::value::decode_uvarint(&local[pos + 1..]).map_err(|_| {
+                        LazyError::Corrupt(crate::error::Error::corruption(
+                            "truncated varint in lazy layout walk",
+                        ))
+                    })?;
+                (n, 0)
+            }
+            0x07 | 0x08 => {
+                let (len, n) =
+                    crate::types::value::decode_uvarint(&local[pos + 1..]).map_err(|_| {
+                        LazyError::Corrupt(crate::error::Error::corruption(
+                            "truncated length varint in lazy layout walk",
+                        ))
+                    })?;
+                (n, len as usize)
+            }
+            _ => {
+                return Err(LazyError::Corrupt(crate::error::Error::corruption(
+                    format!("unknown value tag {tag:#x} in lazy layout walk"),
+                )))
+            }
+        };
+        // The tag + length header must be local for the span to be usable;
+        // the BODY may spill (that's the overflow case).
+        let header_end = pos + 1 + hdr;
+        if header_end > local.len() {
+            return Err(LazyError::HeaderPastLocal);
+        }
+        let len = 1 + hdr + body;
+        spans.push(Some(ColSpan {
+            off: pos as u32,
+            len: len as u32,
+        }));
+        pos += len;
+    }
+    Ok(spans)
+}
+
+/// Decode the single value occupying `bytes` (tag + body, contiguous).
+/// A gathered span's bytes are contiguous by construction; a local span's
+/// bytes are a subslice of the page-resident prefix.
+pub fn decode_span_value(bytes: &[u8]) -> crate::error::Result<Value> {
+    let (v, _) = Value::decode(bytes)
+        .map_err(|e| crate::error::Error::corruption(format!("lazy span decode: {}", e)))?;
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

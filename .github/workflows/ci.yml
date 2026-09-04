@@ -224,21 +224,41 @@ jobs:
   # a seeded differential hash (identical workload, both engines, final
   # row hash must MATCH).
   #
-  # FAILS on correctness CHECK failures only; perf vs SQLite is reported
-  # for tracking (the bench-gate jobs own the throughput contract).
+  # Runs on ALL THREE OSes (RSS is measured per-platform: /proc on Linux,
+  # mach_task_basic_info/getrusage on macOS, GetProcessMemoryInfo on
+  # Windows). Scale is tuned per-OS for the billing multipliers
+  # (Linux 1x, Windows 2x, macOS 10x).
+  #
+  # FAILS on correctness CHECK failures AND on time losses beyond
+  # TORTURE_TIME_TOLERANCE_PCT (default 15% — single-pass sections are
+  # noisier than the bench gates' best-of rounds; the bench-gate jobs own
+  # the tight 5% throughput contract). Memory is reported per section
+  # (tracked in GAP_ANALYSIS.md); set TORTURE_MEM_TOLERANCE_PCT to gate
+  # it too.
   torture:
-    name: torture (ubuntu, scale matrix)
-    runs-on: ubuntu-latest
+    name: torture (${{ matrix.os }}, scale matrix)
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            scale: "0.25"
+          - os: windows-latest
+            scale: "0.2"
+          - os: macos-latest
+            scale: "0.15"
     env:
       CARGO_TERM_COLOR: never
-      TORTURE_SCALE: "0.25"
+      TORTURE_SCALE: ${{ matrix.scale }}
+      TORTURE_TIME_TOLERANCE_PCT: "15"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: bench-ubuntu-latest
+          shared-key: bench-${{ matrix.os }}
           cache-on-failure: true
       - name: "Production torture matrix (18 sections x 2 engines)"
         run: cargo run --release --example prod_torture
@@ -374,7 +394,7 @@ jobs:
   # ------------------------------------------------------------ aggregate OK
   ci-ok:
     name: ci-ok (all gates green)
-    needs: [fmt, clippy, test, test-windows, test-macos, test-oom, test-compat, bench-gate]
+    needs: [fmt, clippy, test, test-windows, test-macos, test-oom, test-compat, torture, bench-gate]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -388,4 +408,4 @@ jobs:
           echo "${{ join(needs.*.result, ',') }}"
           exit 1
       - name: All green
-        run: echo "fmt + clippy + tests + beat-SQLite bench gates all green on Linux, Windows and macOS."
+        run: echo "fmt + clippy + tests + torture (3-OS, time-gated) + beat-SQLite bench gates all green on Linux, Windows and macOS."

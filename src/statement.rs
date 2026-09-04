@@ -43,7 +43,7 @@
 
 use crate::api::{Database, FastPath};
 use crate::error::{Error, Result};
-use crate::executor::{execute, ExecContext};
+use crate::executor::{bare_column_projection, execute, ExecContext};
 use crate::planner::plan::Plan;
 use crate::sql::ast::{Expr, Statement as AstStatement};
 use crate::types::{Row, Value};
@@ -53,6 +53,25 @@ use std::sync::Arc;
 
 /// Batch size for streaming drivers.
 const BATCH: usize = 64;
+
+/// Cap on the heap bytes materialized into ONE streaming batch (see
+/// `ProjectedScanDriver::next_batch`): keeps wide-row statements at a
+/// bounded live footprint instead of BATCH x row-size.
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+/// Approximate heap bytes owned by a materialized row (blob/text bodies).
+#[inline]
+fn row_heap_bytes(row: &[Value]) -> usize {
+    let mut n = 0usize;
+    for v in row {
+        n += match v {
+            Value::Blob(b) => b.len(),
+            Value::Text(t) => t.len(),
+            _ => 0,
+        };
+    }
+    n
+}
 
 /// The result of [`Statement::step`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -890,6 +909,30 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             Some(Box::new(FilterDriver::new(base, predicate.clone())))
         }
         Plan::Project { input, columns } => {
+            // FUSED: Project over a bare Scan with a bare-column
+            // projection — the scan decodes ONLY the projected columns
+            // (overflow-aware: wide TEXT/BLOB columns are gathered
+            // directly into the value's buffer, unprojected columns
+            // never touch their chain pages). Without this, the generic
+            // chain materializes FULL rows in the ScanDriver (including
+            // every wide column) and re-projects per batch.
+            if let Plan::Scan {
+                table,
+                alias: _,
+                index: None,
+                predicate: None,
+            } = input.as_ref()
+            {
+                if table.vtab.is_none() {
+                    if let Some((project, out_cols)) = bare_column_projection(columns, table) {
+                        return Some(Box::new(ProjectedScanDriver::new(
+                            table.clone(),
+                            project.unwrap_or_default(),
+                            out_cols,
+                        )));
+                    }
+                }
+            }
             let base = try_build_driver(input)?;
             Some(Box::new(ProjectDriver::new(base, columns.clone())))
         }
@@ -906,6 +949,98 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             )))
         }
         _ => None,
+    }
+}
+
+/// FUSED Project-over-Scan driver: the scan decodes ONLY the projected
+/// columns per row (the streaming twin of the executor's
+/// `exec_scan_projected` fusion), resumable across batches by rowid.
+/// Wide TEXT/BLOB columns spill to overflow chains: the walk gathers the
+/// projected column's byte range DIRECTLY into the value's own buffer
+/// (single copy), and unprojected columns never touch their chain pages.
+struct ProjectedScanDriver {
+    table: Arc<crate::schema::Table>,
+    columns: Arc<[String]>,
+    /// Wanted column indices, in the projection's output order.
+    project: Vec<usize>,
+    last_rowid: i64,
+    eof: bool,
+}
+
+impl ProjectedScanDriver {
+    fn new(table: Arc<crate::schema::Table>, project: Vec<usize>, out_cols: Arc<[String]>) -> Self {
+        Self {
+            table,
+            columns: out_cols,
+            project,
+            last_rowid: i64::MIN,
+            eof: false,
+        }
+    }
+}
+
+impl Driver for ProjectedScanDriver {
+    fn columns(&self) -> Arc<[String]> {
+        self.columns.clone()
+    }
+    fn next_batch(
+        &mut self,
+        db: &Database,
+        _params: &[Value],
+        _named: &HashMap<String, Value>,
+        budget: usize,
+    ) -> Result<Vec<Row>> {
+        if self.eof {
+            return Ok(Vec::new());
+        }
+        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let shared = db.maps.read().clone();
+        let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+        let root = ctx.table_root(&self.table);
+        let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
+        let n_cols = self.table.n_columns();
+        let rowid_alias = self.table.rowid_alias;
+        let wanted = self.project.clone();
+        let start = if self.last_rowid == i64::MIN {
+            i64::MIN
+        } else {
+            self.last_rowid + 1
+        };
+        let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
+        let mut last = self.last_rowid;
+        let mut hit_end = true;
+        let mut batch_bytes = 0usize;
+        bt.scan_table_range_selective(
+            start,
+            i64::MAX,
+            n_cols,
+            &wanted,
+            rowid_alias,
+            |rowid, row| {
+                if out.len() >= budget {
+                    hit_end = false;
+                    return false; // resume NEXT batch at this row
+                }
+                batch_bytes += row_heap_bytes(&row);
+                out.push(row);
+                // `last` tracks only PUSHED rows: a row stopped-on
+                // (budget/bytes cap) was NOT delivered, so the resume
+                // start (`last + 1`) must land ON it, not past it.
+                last = rowid;
+                if batch_bytes >= MAX_BATCH_BYTES {
+                    // Wide rows: 64 x 64 KB blobs = 4 MB of live allocations
+                    // per batch (fresh mimalloc pages each time — the freed
+                    // batch's pages are deferred). Cap the batch's LIVE
+                    // footprint; small rows never hit this.
+                    hit_end = false;
+                    return false;
+                }
+                true
+            },
+        )?;
+        self.eof = hit_end && out.len() < budget;
+        self.last_rowid = last;
+        Ok(out)
     }
 }
 

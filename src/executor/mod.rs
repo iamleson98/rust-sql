@@ -3622,6 +3622,185 @@ fn exec_topn(
     Ok(inner)
 }
 
+/// Total order for streaming top-N: key comparison (direction-aware)
+/// with ties broken by INPUT serial ASC — matching SQLite's stable
+/// sorter semantics for scan-sourced rows (equal keys keep rowid order
+/// on both ASC and DESC terms).
+#[inline]
+fn topn_total_cmp(a: &Value, ai: i64, b: &Value, bi: i64, desc: bool) -> std::cmp::Ordering {
+    let ord = a.cmp(b);
+    let ord = if desc { ord.reverse() } else { ord };
+    ord.then(ai.cmp(&bi))
+}
+
+/// Resolve an ORDER BY term of the streaming top-N fusion against the
+/// SCAN's table (not the output columns): a bare or table/alias-qualified
+/// column reference, including the rowid aliases (`rowid`/`_rowid_`/`oid`
+/// resolving to the INTEGER PRIMARY KEY column). `None` = not fusable.
+fn resolve_topn_key_col(expr: &Expr, table: &Table, alias: Option<&str>) -> Option<usize> {
+    let Expr::Column { table: ref_t, name } = expr else {
+        return None;
+    };
+    if let Some(t) = ref_t {
+        let name_ok = t == &table.name;
+        let alias_ok = alias.map(|a| a == t.as_str()).unwrap_or(false);
+        if !name_ok && !alias_ok {
+            return None;
+        }
+    }
+    if let Some(idx) = table.find_column(name) {
+        return Some(idx);
+    }
+    if let Some(a) = table.rowid_alias {
+        let lower = name.to_ascii_lowercase();
+        if lower == "rowid" || lower == "_rowid_" || lower == "oid" {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// One survivor of the streaming top-N selection.
+struct TopnSel {
+    key: Value,
+    serial: i64,
+    /// The row in `wanted`-column order (scan-selective contract).
+    row: Vec<Value>,
+}
+
+#[inline]
+fn cmp_sel(a: &TopnSel, b: &TopnSel, desc: bool) -> std::cmp::Ordering {
+    topn_total_cmp(&a.key, a.serial, &b.key, b.serial, desc)
+}
+
+/// Max-heap sift (parent worst-or-equal vs children) over `sel[..n]`.
+fn topn_sift_down(sel: &mut [TopnSel], mut i: usize, desc: bool) {
+    let n = sel.len();
+    loop {
+        let l = 2 * i + 1;
+        let r = l + 1;
+        let mut w = i;
+        if l < n && cmp_sel(&sel[l], &sel[w], desc) != std::cmp::Ordering::Less {
+            w = l;
+        }
+        if r < n && cmp_sel(&sel[r], &sel[w], desc) != std::cmp::Ordering::Less {
+            w = r;
+        }
+        if w == i {
+            return;
+        }
+        sel.swap(i, w);
+        i = w;
+    }
+}
+
+fn topn_sift_up(sel: &mut [TopnSel], mut i: usize, desc: bool) {
+    while i > 0 {
+        let p = (i - 1) / 2;
+        if cmp_sel(&sel[i], &sel[p], desc) == std::cmp::Ordering::Greater {
+            sel.swap(i, p);
+            i = p;
+        } else {
+            return;
+        }
+    }
+}
+
+/// STREAMING top-N: `ORDER BY <bare col> [DESC] LIMIT k OFFSET o` over a
+/// bare table scan, evaluated with BOUNDED memory — the scan feeds a
+/// `keep`-sized max-heap of survivors directly (O(n) key extraction,
+/// O(log keep) per replacement), never materializing the input rows.
+/// The materializing `exec_topn` path stays for expressions, collations,
+/// predicates, and large keeps.
+///
+/// The caller GUARANTEES the term resolves to a table column (checked in
+/// `exec_limit` before fusing).
+fn exec_topn_scan(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    key_col: usize,
+    desc: bool,
+    keep: usize,
+    offset: usize,
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+
+    // Wanted columns: the projection's columns plus the key column,
+    // sorted + deduped for the selective scan; `project_map` maps each
+    // OUTPUT position to its wanted position.
+    let mut wanted: Vec<usize> = match project {
+        Some(ps) => ps.to_vec(),
+        None => (0..n_cols).collect(),
+    };
+    if !wanted.contains(&key_col) {
+        wanted.push(key_col);
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    let project_map: Vec<usize> = match project {
+        Some(ps) => ps
+            .iter()
+            .map(|&p| wanted.iter().position(|&w| w == p).unwrap_or(0))
+            .collect(),
+        None => (0..wanted.len()).collect(),
+    };
+    let key_pos = wanted.iter().position(|&w| w == key_col).unwrap();
+
+    // LIMIT 0: nothing can survive — skip the walk entirely.
+    if keep == 0 {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
+    }
+
+    let root = ctx.table_root(table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+
+    // Bounded selection: a max-heap (worst survivor at the root) of at
+    // most `keep` rows in wanted-column order. A new row replaces the
+    // root only when it beats it under the total order.
+    let mut sel: Vec<TopnSel> = Vec::with_capacity(keep.min(4096));
+    bt.scan_table_selective(n_cols, &wanted, rowid_alias, |rowid, row| {
+        let key = row[key_pos].clone();
+        if sel.len() < keep {
+            let idx = sel.len();
+            sel.push(TopnSel {
+                key,
+                serial: rowid,
+                row,
+            });
+            topn_sift_up(&mut sel, idx, desc);
+        } else if topn_total_cmp(&key, rowid, &sel[0].key, sel[0].serial, desc)
+            == std::cmp::Ordering::Less
+        {
+            // Beats the worst survivor: replace the root and re-sift.
+            sel[0] = TopnSel {
+                key,
+                serial: rowid,
+                row,
+            };
+            topn_sift_down(&mut sel, 0, desc);
+        }
+        true
+    })?;
+
+    // Sort the survivors by the total order, then window [offset..keep).
+    sel.sort_by(|a, b| cmp_sel(a, b, desc));
+    let start = offset.min(sel.len());
+    let rows: Vec<Row> = sel[start..]
+        .iter()
+        .map(|s| project_map.iter().map(|&w| s.row[w].clone()).collect())
+        .collect();
+    Ok(ExecResult {
+        columns: out_cols,
+        rows,
+    })
+}
+
 // ============================================================================
 // Limit
 // =========================================================================
@@ -3676,6 +3855,55 @@ fn exec_limit(
             let offset_i = offset_val.as_integer().max(0);
             if count_i >= 0 && offset_i <= (i64::MAX / 4) && count_i <= (1 << 20) {
                 let total = count_i.saturating_add(offset_i) as usize;
+                // STREAMING TOP-N over a bare scan: fuse the bounded
+                // selection into the B+tree walk when the single ORDER BY
+                // term is a bare column of the (unindexed, unpredicated,
+                // non-vtab) scan's table and the keep is modest — the
+                // scan feeds a `keep`-sized heap directly, never
+                // materializing the input. Collations and expression
+                // terms keep the materializing path above.
+                if total <= 4096 {
+                    if let Plan::Scan {
+                        table,
+                        alias,
+                        index: None,
+                        predicate: None,
+                    } = sort_input
+                    {
+                        if table.vtab.is_none()
+                            && !matches!(&terms[0].expr, Expr::Collate { .. })
+                        {
+                            if let Some(key_col) =
+                                resolve_topn_key_col(&terms[0].expr, table, alias.as_deref())
+                            {
+                                let (project, out_cols) = match projection {
+                                    Some(columns) => {
+                                        match bare_column_projection(columns, table) {
+                                            Some((p, out)) => (p, out),
+                                            // Non-bare projection: the guard
+                                            // below falls back to exec_topn.
+                                            None => (None, scan_columns_static(table, alias)),
+                                        }
+                                    }
+                                    None => (None, scan_columns_static(table, alias)),
+                                };
+                                if projection.is_none() || project.is_some() {
+                                    let desc = terms[0].order == Order::Desc;
+                                    return exec_topn_scan(
+                                        ctx,
+                                        table,
+                                        key_col,
+                                        desc,
+                                        total,
+                                        offset_i as usize,
+                                        project.as_deref(),
+                                        out_cols,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 let res = exec_topn(ctx, sort_input, &terms[0], total, offset_i as usize)?;
                 if let Some(columns) = projection {
                     return apply_projection(res, columns, ctx);
@@ -3787,8 +4015,13 @@ struct AggState {
     int_sum: i64,
     min: Option<Value>,
     max: Option<Value>,
-    distinct: std::collections::HashSet<SqlValueKey>,
-    concat: String,
+    /// DISTINCT-aggregate key set. Rarely used — boxed so the hot
+    /// COUNT/SUM/MIN/MAX state stays compact (an inline HashSet costs
+    /// ~48 bytes in EVERY state; the Box costs 8, with one allocation
+    /// per DISTINCT aggregate per group instead).
+    distinct: Option<Box<std::collections::HashSet<SqlValueKey>>>,
+    /// GROUP_CONCAT accumulator. Rarely used — boxed (see `distinct`).
+    concat: Option<Box<String>>,
     seen_value: bool,
 }
 
@@ -3870,87 +4103,263 @@ impl AggFunc {
     }
 }
 
-/// Zero-allocation hash grouper for GROUP BY: buckets of group indices
-/// keyed by the SQL-semantic hash of the group key, with linear probing
-/// inside a bucket using SQL value equality.
+/// Append-only chunked array: fixed-capacity heap chunks, NEVER
+/// reallocated. A growing plain Vec reallocs through doubling
+/// generations, and the freed generations are exactly what mimalloc
+/// retains as abandoned segments (page purge is disabled for latency) —
+/// measured ~3x RSS amplification at 10k+ groups. Chunks sized ~64 KiB
+/// are one mimalloc page each: no realloc, no copy, no abandoned
+/// garbage, and the whole chunk returns when dropped.
+struct ChunkVec<T> {
+    chunks: Vec<Box<[T]>>,
+    len: usize,
+    chunk: usize,
+}
+
+impl<T: Clone> ChunkVec<T> {
+    #[allow(clippy::needless_pass_by_value)]
+    fn new(chunk: usize, _init: T) -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+            chunk,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> &T {
+        &self.chunks[i / self.chunk][i % self.chunk]
+    }
+
+    #[inline]
+    fn get_mut(&mut self, i: usize) -> &mut T {
+        &mut self.chunks[i / self.chunk][i % self.chunk]
+    }
+
+    fn push(&mut self, v: T, init: &T) {
+        if self.len == self.chunks.len() * self.chunk {
+            self.chunks.push(vec![init.clone(); self.chunk].into());
+        }
+        let ci = self.len / self.chunk;
+        let ei = self.len % self.chunk;
+        self.chunks[ci][ei] = v;
+        self.len += 1;
+    }
+}
+
+/// Zero-allocation hash grouper for GROUP BY: an open-addressing table of
+/// (key hash, group index) pairs with linear probing, keyed by the
+/// SQL-semantic hash of the group key.
 ///
 /// Replaces the previous scheme — `format!("{:?}")` per key value +
-/// `join("|")` per row + `HashMap<String, _>` + a separate `group_order`
-/// Vec of cloned Strings — which cost 2-4 heap allocations and several
-/// hundred ns PER ROW. This costs one hash per row and zero allocations
-/// after warmup (each bucket Vec amortizes), and preserves first-seen
-/// group order exactly like the old implementation.
-#[derive(Default)]
+/// `join("|")` per row + `HashMap<String, _>` + per-group
+/// `Vec<AggState>` — which cost 2-4 heap allocations per GROUP and
+/// several hundred ns PER ROW. This costs one hash per row and ZERO
+/// per-group allocations in the single-key shape (the overwhelmingly
+/// common `GROUP BY <expr>`): keys and aggregate states live in CHUNKED
+/// append-only arrays (see `ChunkVec` — chunked so no reallocation
+/// garbage is left for the allocator to retain). First-seen group order
+/// is preserved exactly like the old implementation.
+impl Default for HashGrouper {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            mask: 0,
+            keys_flat: None,
+            keys_multi: Vec::new(),
+            states: ChunkVec::new(128, AggState::default()),
+            n_aggs: 0,
+        }
+    }
+}
+
 struct HashGrouper {
-    buckets: HashMap<u64, Vec<usize>, crate::api::FxHashBuild>,
-    /// (key values, per-aggregate states) in first-seen order.
-    groups: Vec<(Vec<Value>, Vec<AggState>)>,
+    /// Open-addressing slots: (key hash, group index + 1); group index 0
+    /// marks an empty slot. Capacity is a power of two, `mask = cap - 1`,
+    /// growing at 75% load (rehash in place — group indices stay valid).
+    slots: Vec<(u64, u32)>,
+    mask: usize,
+    /// Single-key mode: the group key values in first-seen order.
+    keys_flat: Option<ChunkVec<Value>>,
+    /// Multi-key mode: per-group key Vecs in first-seen order.
+    keys_multi: Vec<Vec<Value>>,
+    /// Flat aggregate states: `gi * n_aggs + agg_idx`.
+    states: ChunkVec<AggState>,
+    n_aggs: usize,
 }
 
 impl HashGrouper {
-    /// Find or create the group for `key`, returning its index.
-    /// `key` is typically a reusable scratch buffer — its contents are
-    /// cloned only when a NEW group is created.
+    /// Prepare for `n_aggs` aggregates per group.
+    fn with_aggs(n_aggs: usize) -> Self {
+        Self {
+            n_aggs,
+            states: ChunkVec::new(128, AggState::default()),
+            ..Default::default()
+        }
+    }
+
+    #[inline]
+    fn group_count(&self) -> usize {
+        if let Some(k) = &self.keys_flat {
+            k.len()
+        } else {
+            self.keys_multi.len()
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.group_count()
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.group_count() == 0
+    }
+
+    /// Mutable aggregate state of group `gi`, aggregate `agg_idx`.
+    #[inline]
+    fn state(&mut self, gi: usize, agg_idx: usize) -> &mut AggState {
+        self.states.get_mut(gi * self.n_aggs + agg_idx)
+    }
+
+    /// Probe the table for a key with hash `h` matching `eq`; the group
+    /// index, or `None` on miss. `slots` is empty before the first group.
+    #[inline]
+    fn probe<F: Fn(usize) -> bool>(&self, h: u64, eq: F) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut slot = (h as usize) & self.mask;
+        loop {
+            let (sh, gi1) = self.slots[slot];
+            if gi1 == 0 {
+                return None;
+            }
+            let gi = (gi1 - 1) as usize;
+            if sh == h && eq(gi) {
+                return Some(gi);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    /// Insert a NEW group's slot (after its key/state rows were pushed).
+    fn insert_slot(&mut self, h: u64, gi: usize) {
+        if self.group_count() > self.mask * 3 / 4 {
+            self.rehash();
+        }
+        let mut slot = (h as usize) & self.mask;
+        while self.slots[slot].1 != 0 {
+            slot = (slot + 1) & self.mask;
+        }
+        self.slots[slot] = (h, (gi + 1) as u32);
+    }
+
+    fn rehash(&mut self) {
+        let n = self.group_count();
+        let new_cap = (self.slots.len() * 2).max(16).next_power_of_two();
+        self.slots = vec![(0u64, 0u32); new_cap];
+        self.mask = new_cap - 1;
+        // Re-insert every group by re-hashing its key.
+        for gi in 0..n {
+            let h = if let Some(keys) = &self.keys_flat {
+                let mut hasher = crate::api::FxHasher::default();
+                hash_sql_value(keys.get(gi), &mut hasher);
+                hasher.finish()
+            } else {
+                let mut hasher = crate::api::FxHasher::default();
+                for v in &self.keys_multi[gi] {
+                    hash_sql_value(v, &mut hasher);
+                }
+                hasher.finish()
+            };
+            let mut slot = (h as usize) & self.mask;
+            while self.slots[slot].1 != 0 {
+                slot = (slot + 1) & self.mask;
+            }
+            self.slots[slot] = (h, (gi + 1) as u32);
+        }
+    }
+
+    /// Find or create the group for `key` (multi-key mode), returning its
+    /// index. `key` is typically a reusable scratch buffer — its contents
+    /// are cloned only when a NEW group is created.
     fn intern(&mut self, key: &[Value]) -> usize {
-        // FxHash-style multiply-rotate hasher: ~5-10 ns for the typical
-        // 1-2 value key vs ~25-40 ns for SipHash (the previous
-        // `DefaultHasher`). The hash quality is more than sufficient for
-        // group interning — collisions cost one wasted values_sql_equal.
+        if self.n_aggs == 0 {
+            self.n_aggs = 1;
+        }
         let mut hasher = crate::api::FxHasher::default();
         for v in key {
             hash_sql_value(v, &mut hasher);
         }
         let h = hasher.finish();
-        if let Some(bucket) = self.buckets.get(&h) {
-            for &gi in bucket {
-                let (existing, _) = &self.groups[gi];
-                if existing.len() == key.len()
-                    && existing
-                        .iter()
-                        .zip(key.iter())
-                        .all(|(a, b)| crate::types::values_sql_equal(a, b))
-                {
-                    return gi;
-                }
-            }
+        if let Some(gi) = self.probe(h, |gi| {
+            let existing = &self.keys_multi[gi];
+            existing.len() == key.len()
+                && existing
+                    .iter()
+                    .zip(key.iter())
+                    .all(|(a, b)| crate::types::values_sql_equal(a, b))
+        }) {
+            return gi;
         }
         // New group.
-        let gi = self.groups.len();
-        self.groups.push((key.to_vec(), Vec::new()));
-        self.buckets.entry(h).or_default().push(gi);
+        let gi = self.keys_multi.len();
+        self.keys_multi.push(key.to_vec());
+        let init = AggState::default();
+        for _ in 0..self.n_aggs {
+            self.states.push(AggState::default(), &init);
+        }
+        self.insert_slot(h, gi);
         gi
     }
 
     /// Single-key variant: skips the key-slice machinery entirely (no
     /// `key_buf` Vec, no length header, one value hash + one direct
-    /// comparison). This is the overwhelmingly common `GROUP BY <expr>`
-    /// shape.
+    /// comparison) and stores keys in ONE flat chunked array — zero
+    /// per-group allocations and zero reallocation garbage. This is the
+    /// overwhelmingly common `GROUP BY <expr>` shape.
     fn intern_one(&mut self, key: &Value) -> usize {
+        if self.n_aggs == 0 {
+            self.n_aggs = 1;
+        }
         let mut hasher = crate::api::FxHasher::default();
         hash_sql_value(key, &mut hasher);
         let h = hasher.finish();
-        if let Some(bucket) = self.buckets.get(&h) {
-            for &gi in bucket {
-                let (existing, _) = &self.groups[gi];
-                if existing.len() == 1 && crate::types::values_sql_equal(&existing[0], key) {
-                    return gi;
-                }
-            }
+        if let Some(gi) = self.probe(h, |gi| {
+            crate::types::values_sql_equal(self.keys_flat.as_ref().unwrap().get(gi), key)
+        }) {
+            return gi;
         }
-        let gi = self.groups.len();
-        self.groups.push((vec![key.clone()], Vec::new()));
-        self.buckets.entry(h).or_default().push(gi);
+        let keys = self
+            .keys_flat
+            .get_or_insert_with(|| ChunkVec::new(512, Value::Null));
+        let gi = keys.len();
+        keys.push(key.clone(), &Value::Null);
+        let init = AggState::default();
+        for _ in 0..self.n_aggs {
+            self.states.push(AggState::default(), &init);
+        }
+        self.insert_slot(h, gi);
         gi
     }
 
-    /// Number of distinct groups so far.
-    fn len(&self) -> usize {
-        self.groups.len()
-    }
-
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+    /// The implicit single group of an aggregate query with no GROUP BY
+    /// (empty key) — appended only when NO row was ever interned.
+    fn push_implicit_group(&mut self) -> usize {
+        let gi = self.keys_multi.len();
+        self.keys_multi.push(Vec::new());
+        let init = AggState::default();
+        for _ in 0..self.n_aggs.max(1) {
+            self.states.push(AggState::default(), &init);
+        }
+        gi
     }
 }
 
@@ -3963,8 +4372,8 @@ impl Default for AggState {
             int_sum: 0,
             min: None,
             max: None,
-            distinct: std::collections::HashSet::new(),
-            concat: String::new(),
+            distinct: None,
+            concat: None,
             seen_value: false,
         }
     }
@@ -4108,8 +4517,8 @@ fn exec_aggregate_streaming_scan(
         Vec::new()
     };
 
-    let mut grouper = HashGrouper::default();
     let n_aggs = aggregates.len();
+    let mut grouper = HashGrouper::with_aggs(n_aggs);
 
     // Scratch buffers, reused across rows.
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
@@ -4153,9 +4562,6 @@ fn exec_aggregate_streaming_scan(
                 });
             }
             let gi = grouper.intern(&key_buf);
-            if grouper.groups[gi].1.is_empty() {
-                grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
-            }
             for i in 0..aggregates.len() {
                 let arg_val: &Value = if agg_count_star_gb[i] {
                     &COUNT_STAR_ARG // COUNT(*): constant placeholder, no evaluation
@@ -4166,7 +4572,7 @@ fn exec_aggregate_streaming_scan(
                     }
                 };
                 update_agg_state(
-                    &mut grouper.groups[gi].1[i],
+                    grouper.state(gi, i),
                     agg_funcs[i],
                     arg_val,
                     aggregates[i].distinct,
@@ -4286,14 +4692,11 @@ fn exec_aggregate_streaming_scan(
                     }
                     grouper.intern(&key_buf)
                 };
-                if grouper.groups[gi].1.is_empty() {
-                    grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
-                }
                 for (i, agg) in aggregates.iter().enumerate() {
                     if agg.arg.is_none() {
                         // COUNT(*): constant placeholder, no evaluation.
                         update_agg_state(
-                            &mut grouper.groups[gi].1[i],
+                            grouper.state(gi, i),
                             agg_funcs[i],
                             &COUNT_STAR_ARG,
                             false,
@@ -4306,7 +4709,7 @@ fn exec_aggregate_streaming_scan(
                         (None, None) => Value::Null,
                     };
                     update_agg_state(
-                        &mut grouper.groups[gi].1[i],
+                        grouper.state(gi, i),
                         agg_funcs[i],
                         &arg_val,
                         agg.distinct,
@@ -4357,9 +4760,6 @@ fn exec_aggregate_streaming_scan(
                 return true;
             }
             let gi = grouper.intern(&key_buf);
-            if grouper.groups[gi].1.is_empty() {
-                grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
-            }
             for (i, agg) in aggregates.iter().enumerate() {
                 let arg_val = match (&agg.arg, agg_col_indices[i]) {
                     (Some(_), Some(idx)) => row_buf[idx].clone(),
@@ -4372,7 +4772,7 @@ fn exec_aggregate_streaming_scan(
                     (None, _) => Value::Integer(1), // COUNT(*)
                 };
                 update_agg_state(
-                    &mut grouper.groups[gi].1[i],
+                    grouper.state(gi, i),
                     agg_funcs[i],
                     &arg_val,
                     agg.distinct,
@@ -4393,14 +4793,26 @@ fn finish_group_result(
     group_by: &[Expr],
     aggregates: &[AggExpr],
 ) -> Result<ExecResult> {
-    let mut out_rows = Vec::with_capacity(grouper.len());
-    for (key, states) in grouper.groups {
-        let mut row = key;
+    let n_groups = grouper.len();
+    let n_out = group_by.len() + aggregates.len();
+    let n_aggs = grouper.n_aggs;
+    let mut out_rows = Vec::with_capacity(n_groups);
+    for gi in 0..n_groups {
+        // Exact capacity: key width + one slot per aggregate (a Vec::new
+        // + push grows to a 128 B class — 2x the exact-capacity bytes at
+        // 10k+ groups).
+        let mut row: Vec<Value> = Vec::with_capacity(n_out.max(1));
+        if let Some(keys) = &grouper.keys_flat {
+            row.push(keys.get(gi).clone());
+        } else {
+            row.extend(grouper.keys_multi[gi].iter().cloned());
+        }
         for (i, agg) in aggregates.iter().enumerate() {
-            row.push(finalize_agg(&states[i], &agg.func));
+            row.push(finalize_agg(grouper.states.get(gi * n_aggs + i), &agg.func));
         }
         out_rows.push(row);
     }
+    drop(grouper);
 
     let mut out_cols = Vec::new();
     for (i, g) in group_by.iter().enumerate() {
@@ -6037,8 +6449,8 @@ fn exec_aggregate(
         })
         .collect();
 
-    let mut grouper = HashGrouper::default();
     let n_aggs = aggregates.len();
+    let mut grouper = HashGrouper::with_aggs(n_aggs);
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
 
     for row in &inner.rows {
@@ -6061,9 +6473,6 @@ fn exec_aggregate(
             continue;
         }
         let gi = grouper.intern(&key_buf);
-        if grouper.groups[gi].1.is_empty() {
-            grouper.groups[gi].1 = (0..n_aggs).map(|_| AggState::default()).collect();
-        }
         for (i, agg) in aggregates.iter().enumerate() {
             let arg_val = match (&agg.arg, agg_col_indices[i]) {
                 (Some(_), Some(idx)) => row[idx].clone(),
@@ -6071,7 +6480,7 @@ fn exec_aggregate(
                 (None, _) => Value::Integer(1),
             };
             update_agg_state(
-                &mut grouper.groups[gi].1[i],
+                grouper.state(gi, i),
                 agg_funcs[i],
                 &arg_val,
                 agg.distinct,
@@ -6084,20 +6493,27 @@ fn exec_aggregate(
     // COUNT=0, SUM=NULL, AVG=NULL, MIN=NULL, MAX=NULL). This handles the
     // common `SELECT COUNT(*) FROM empty_table` case.
     if group_by.is_empty() && grouper.is_empty() && !aggregates.is_empty() {
-        grouper.groups.push((
-            Vec::new(),
-            (0..n_aggs).map(|_| AggState::default()).collect(),
-        ));
+        grouper.push_implicit_group();
     }
 
-    let mut out_rows = Vec::with_capacity(grouper.len());
-    for (key, states) in grouper.groups {
-        let mut row = key;
-        for (i, agg) in aggregates.iter().enumerate() {
-            row.push(finalize_agg(&states[i], &agg.func));
+    let n_groups = grouper.len();
+    let n_out = group_by.len() + aggregates.len();
+    let n_aggs = grouper.n_aggs;
+    let mut out_rows = Vec::with_capacity(n_groups);
+    for gi in 0..n_groups {
+        // Exact capacity: key width + one slot per aggregate.
+        let mut row: Vec<Value> = Vec::with_capacity(n_out.max(1));
+        if let Some(keys) = &grouper.keys_flat {
+            row.push(keys.get(gi).clone());
+        } else {
+            row.extend(grouper.keys_multi[gi].iter().cloned());
+        }
+        for i in 0..aggregates.len() {
+            row.push(finalize_agg(grouper.states.get(gi * n_aggs + i), &aggregates[i].func));
         }
         out_rows.push(row);
     }
+    drop(grouper);
 
     let mut out_cols = Vec::new();
     for (i, g) in group_by.iter().enumerate() {
@@ -6343,7 +6759,12 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
     // entirely. The key is a `SqlValueKey` (a Value clone — free for
     // Integer/Real) instead of the old `format!("{:?}")` String, saving
     // a heap allocation per row for DISTINCT aggregates.
-    if distinct && !state.distinct.insert(SqlValueKey(v.clone())) {
+    if distinct
+        && !state
+            .distinct
+            .get_or_insert_with(Box::default)
+            .insert(SqlValueKey(v.clone()))
+    {
         return;
     }
     // Only mark "seen_value" for non-NULL inputs. This makes SUM of all
@@ -6403,10 +6824,13 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
             }
         }
         AggFunc::GroupConcat if !v.is_null() => {
-            if !state.concat.is_empty() {
-                state.concat.push(',');
+            let buf = state.concat.get_or_insert_with(|| {
+                Box::new(String::with_capacity(16))
+            });
+            if !buf.is_empty() {
+                buf.push(',');
             }
-            state.concat.push_str(&v.as_text());
+            buf.push_str(&v.as_text());
         }
         _ => {}
     }
@@ -6439,7 +6863,14 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
         }
         "min" => state.min.clone().unwrap_or(Value::Null),
         "max" => state.max.clone().unwrap_or(Value::Null),
-        "group_concat" => Value::Text(state.concat.clone().into()),
+        "group_concat" => Value::Text(
+            state
+                .concat
+                .as_deref()
+                .cloned()
+                .unwrap_or_default()
+                .into(),
+        ),
         _ => Value::Null,
     }
 }
@@ -8389,7 +8820,7 @@ const IDENTITY_POSITIONS: &[usize] = &{
 /// decode the full row in table order) and `Some(indices)` means decode only
 /// those table column indices. Returns None unless EVERY projection expr is
 /// a bare column of the table (or the single "*" pseudo-column).
-fn bare_column_projection(
+pub(crate) fn bare_column_projection(
     columns: &[ProjectExpr],
     table: &Table,
 ) -> Option<crate::types::ProjectionMapping> {

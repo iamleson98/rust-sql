@@ -395,8 +395,17 @@ impl Store {
         }
     }
 
-    fn is_memory(&self) -> bool {
+    pub fn is_memory(&self) -> bool {
         matches!(self, Store::Memory(_))
+    }
+}
+
+impl Pager {
+    /// True when the backing store is the in-memory image (a `:memory:`
+    /// database). In-memory payloads are this process's own encoder
+    /// output — the basis for trusted TEXT decoding in the scan family.
+    pub fn is_memory(&self) -> bool {
+        self.store.is_memory()
     }
 }
 
@@ -740,12 +749,30 @@ impl Pager {
         {
             return;
         }
+        // Pages allocated AFTER a level's base are DROPPED on rollback to
+        // that level (never restored — see `rollback_savepoint`'s
+        // `id >= base.n_pages` skip), so they need no pre-image. A bulk
+        // INSERT transaction allocates every leaf page after BEGIN: this
+        // check is the difference between a ~n_pages x 4 KB undo journal
+        // and ~0 for the entire write storm.
+        let mut needs_capture = false;
+        for level in sp.iter() {
+            if (id as u64) < level.base.n_pages as u64 {
+                needs_capture = true;
+                break;
+            }
+        }
+        if !needs_capture {
+            return;
+        }
         let bytes = {
             let b = page.lock();
             b.data.clone()
         };
         for level in sp.iter_mut() {
-            level.pages.entry(id).or_insert_with(|| bytes.clone());
+            if (id as u64) < level.base.n_pages as u64 {
+                level.pages.entry(id).or_insert_with(|| bytes.clone());
+            }
         }
     }
 }
@@ -1799,6 +1826,15 @@ impl Pager {
     /// file current.
     pub fn flush_before_snapshot(&self) -> Result<()> {
         if self.lazy_writeback.load(Ordering::Acquire) {
+            // CACHE-IS-THE-STORE (in-memory databases): the backing image
+            // is never consulted — reads always hit the unbounded cache and
+            // ROLLBACK restores through the `__begin__` savepoint's pre-
+            // images (captured at first fetch, non-destructive). Writing
+            // the image here would only grow RSS by a second full copy of
+            // the DB. File-backed lazy pagers keep the write-back.
+            if self.store.is_memory() {
+                return Ok(());
+            }
             // Temporarily disable lazy mode and run the real flush with the
             // dirty-count fast path bypassed: in lazy mode the count and the
             // dirty_pages set can diverge from the pages' actual .dirty
@@ -1872,6 +1908,16 @@ impl Pager {
     /// Evict pages from the cache until we're under capacity.
     /// Caller must hold the cache write lock.
     fn maybe_evict_locked(&self, cache: &mut PageCache) {
+        // CACHE-IS-THE-STORE (in-memory databases): never evict. The page
+        // cache IS the database image — the backing Vec is never read back
+        // (every page enters the cache at first touch and stays), so
+        // eviction buys nothing and costs a 4 KB write-back + a 4 KB
+        // re-read on the next visit. This is SQLite's own `:memory:`
+        // design: the pager array is the whole DB. It also caps RSS at
+        // DB size (no double image + cache representation).
+        if self.store.is_memory() {
+            return;
+        }
         // Safety bound: if every cached page is dirty and unwritable (or
         // lazy_writeback is off), the loop below would otherwise spin
         // forever moving dirty pages to the back. `attempts` caps it.
@@ -2122,6 +2168,102 @@ impl Pager {
             let take = decoded.len() - 16;
             out.extend_from_slice(&decoded[16..]);
             Ok((next, take))
+        }
+    }
+
+    /// Gather `payload[start..end]` from an overflow cell's chain into
+    /// `out` (appended), walking the chain under ONE cache read-lock for
+    /// the whole resident run: a 64 KB blob is 16 pages, and the generic
+    /// `get_page` per-page cost (RwLock + Arc clone + savepoint-depth
+    /// atomic) dominated the blob-scan gather. Chain pages hold
+    /// `payload[local_len..total]` sequentially; `page_pos` tracks the
+    /// current page's start offset within the payload.
+    ///
+    /// Cold (non-resident) pages — file-backed DBs with evicted chains,
+    /// WAL-committed frames, codec pages — fall back to
+    /// `read_overflow_page_append` one page at a time, re-acquiring the
+    /// cache guard for the next resident run.
+    pub(crate) fn gather_overflow_chain_range(
+        &self,
+        first: PageId,
+        local_len: usize,
+        start: usize,
+        end: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if start >= end || first == 0 {
+            return Ok(());
+        }
+        let cap = self.page_size() as usize - 16;
+        let max_pages = self.n_pages() as usize + 4;
+        let mut steps = 0usize;
+        let mut cur = first;
+        let mut page_pos = local_len;
+        'outer: loop {
+            // ONE read-guard for a maximal run of resident pages (lock
+            // order cache -> page matches get_page/evict, so holding it
+            // across page locks is safe).
+            let cache = self.cache.read();
+            loop {
+                steps += 1;
+                if steps > max_pages {
+                    return Err(Error::corruption(format!(
+                        "overflow chain cycle starting at page {first}"
+                    )));
+                }
+                if page_pos >= end {
+                    return Ok(());
+                }
+                let page_ref = match cache.get(cur) {
+                    Some(r) => r.clone(),
+                    None => {
+                        // Cold page: release the guard, use the generic
+                        // reader, then re-acquire for the next run.
+                        drop(cache);
+                        let mut sink = Vec::new();
+                        let (next, take) = self.read_overflow_page_append(cur, &mut sink)?;
+                        let p_end = page_pos + take;
+                        if p_end > start && page_pos < end {
+                            let from = (start.max(page_pos) - page_pos).min(sink.len());
+                            let to = (end.min(p_end) - page_pos).min(sink.len());
+                            if to > from {
+                                out.extend_from_slice(&sink[from..to]);
+                            }
+                        }
+                        if next == 0 {
+                            return Ok(());
+                        }
+                        page_pos += take;
+                        cur = next;
+                        continue 'outer;
+                    }
+                };
+                let (next, take) = {
+                    let p = page_ref.lock();
+                    if p.page_type()? != crate::storage::page::PageType::Overflow {
+                        return Err(Error::corruption(format!(
+                            "overflow chain hit non-overflow page {cur}"
+                        )));
+                    }
+                    let next = p.overflow_next();
+                    let data = p.overflow_data();
+                    let take = data.len().min(cap);
+                    let p_end = page_pos + take;
+                    if p_end > start && page_pos < end {
+                        let from = start.max(page_pos) - page_pos;
+                        let to = end.min(p_end) - page_pos;
+                        if to > from {
+                            out.extend_from_slice(&data[from..to]);
+                        }
+                    }
+                    (next, take)
+                };
+                if next == 0 {
+                    return Ok(());
+                }
+                page_pos += take;
+                cur = next;
+            }
         }
     }
 }

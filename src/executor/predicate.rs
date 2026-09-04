@@ -690,15 +690,13 @@ pub(crate) fn compile_predicate(
                 // dispatch. Non-Eq operators and non-TEXT literals keep
                 // the generic Cmp (cross-type coercion must stay exact).
                 if *op == BinaryOp::Eq {
-                    if let (PredValue::Col(c), PredValue::Literal(Value::Text(_))) = (&lhs, &rhs)
-                    {
+                    if let (PredValue::Col(c), PredValue::Literal(Value::Text(_))) = (&lhs, &rhs) {
                         return Some(CompiledPredicate::TextEq {
                             col: *c,
                             rhs: rhs.clone(),
                         });
                     }
-                    if let (PredValue::Literal(Value::Text(_)), PredValue::Col(c)) = (&lhs, &rhs)
-                    {
+                    if let (PredValue::Literal(Value::Text(_)), PredValue::Col(c)) = (&lhs, &rhs) {
                         return Some(CompiledPredicate::TextEq {
                             col: *c,
                             rhs: lhs.clone(),

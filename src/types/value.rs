@@ -4,11 +4,40 @@
 //! dynamic typing (with a few concessions for performance: integers
 //! use `i64`, floats use `f64`, blobs are `Vec<u8>`).
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::types::text::Text;
+
+// ---------------------------------------------------------------------------
+// Trusted-text decode mode
+//
+// In-memory stores' payloads are produced exclusively by this process's
+// own encoder (every Value::Text came from a `String`), so their TEXT
+// bodies are valid UTF-8 by construction. Re-validating on every decode
+// costs a full extra pass over the bytes — for 2 KB TEXT scans that is
+// 50-150 ns/row of pure redundancy. The scan family arms this thread-
+// local for the duration of a walk over an in-memory pager; file-backed
+// databases (which may be corrupt or hand-crafted) keep full validation.
+// ---------------------------------------------------------------------------
+
+std::thread_local! {
+    static TEXT_DECODE_TRUSTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm/disarm trusted TEXT decoding for THIS thread (the scan family
+/// saves + restores around each walk). Only arm for in-memory pagers.
+#[inline]
+pub fn set_text_decode_trusted(trusted: bool) {
+    TEXT_DECODE_TRUSTED.with(|t| t.set(trusted));
+}
+
+#[inline]
+pub fn text_decode_trusted() -> bool {
+    TEXT_DECODE_TRUSTED.with(|t| t.get())
+}
 
 /// A single SQL value.
 ///
@@ -514,19 +543,24 @@ impl Value {
                 // Small-string optimization: short payloads (the dominant
                 // OLTP case) decode INLINE — no heap allocation. Longer
                 // payloads spill to a heap String exactly as before.
-                // Storage-layer payloads were validated as UTF-8 on write,
-                // so skip re-validation here (unchecked decode): the old
-                // `from_utf8` walked the bytes twice (validate + copy).
-                // Corrupt files with invalid UTF-8 surface as a decode
-                // error at a higher layer, never as UB — Text only stores
-                // bytes and every reader treats them opaquely.
+                // Storage-layer payloads were validated as UTF-8 on write;
+                // validation here is a pure corrupt-FILE defense. In-memory
+                // pagers arm the trusted mode (payloads are this process's
+                // own encoder output), skipping the redundant pass.
                 let body = &rest[n..n + len];
-                if std::str::from_utf8(body).is_err() {
-                    return Err("invalid utf8 in text");
+                if text_decode_trusted() {
+                    // SAFETY: in-memory payloads were written by `encode`
+                    // from `String` values — valid UTF-8 by construction.
+                    let t = unsafe { Text::from_utf8_unchecked(body) };
+                    Ok((Value::Text(t), 1 + n + len))
+                } else {
+                    if std::str::from_utf8(body).is_err() {
+                        return Err("invalid utf8 in text");
+                    }
+                    // SAFETY: just validated above.
+                    let t = unsafe { Text::from_utf8_unchecked(body) };
+                    Ok((Value::Text(t), 1 + n + len))
                 }
-                // SAFETY: just validated above.
-                let t = unsafe { Text::from_utf8_unchecked(body) };
-                Ok((Value::Text(t), 1 + n + len))
             }
             0x08 => {
                 let (len, n) = decode_uvarint(rest)?;

@@ -69,9 +69,16 @@ fn tune_mimalloc() {
         // `mi_option_purge_delay` sits at enum position 15 in mimalloc.h
         // (eager_commit_delay = 14, use_numa_nodes = 16 bracket it); the
         // sys crate's bindings don't name it, so use the raw value.
+        // purge_delay (enum position 15): freed pages are madvise'd back
+        // to the OS after this delay (ms). -1 = never — the old setting,
+        // bought first-query latency but retained EVERY freed page in
+        // VmHWM (peak-RSS-bound workloads measured ~3x their live set).
+        // 0 = immediate: HWM tracks the LIVE set. The re-fault cost on
+        // reuse (~10 us per 64 KiB page) lands inside the write bursts
+        // that freed the pages in the first place.
         const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
-        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), -1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), 0);
     });
 }
 

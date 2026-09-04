@@ -55,6 +55,15 @@ fn n(v: usize) -> usize {
     ((v as f64 * scale()).max(1.0) as usize).max(1)
 }
 
+// ============================================================
+// Cross-platform RSS (peak + current), in MB
+// ============================================================
+// The child processes must report per-engine memory on EVERY CI OS:
+//   Linux   : /proc/self/status  (VmRSS / VmHWM, kB)
+//   macOS   : mach_task_basic_info (current) + getrusage (peak, bytes)
+//   Windows : GetProcessMemoryInfo (WorkingSet / PeakWorkingSet, bytes)
+
+#[cfg(target_os = "linux")]
 fn read_status_kb(field: &str) -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
@@ -70,12 +79,152 @@ fn read_status_kb(field: &str) -> u64 {
     0
 }
 
+#[cfg(target_os = "linux")]
+fn cur_rss_bytes() -> u64 {
+    read_status_kb("VmRSS:") * 1024
+}
+
+#[cfg(target_os = "linux")]
+fn peak_rss_bytes() -> u64 {
+    read_status_kb("VmHWM:") * 1024
+}
+
+#[cfg(target_os = "macos")]
+mod macmem {
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskBasicInfo {
+        suspend_count: i32,
+        virtual_size: u32,
+        resident_size: u32,
+    }
+    #[repr(C)]
+    struct RUsage {
+        utime_sec: i64,
+        utime_usec: i32,
+        stime_sec: i64,
+        stime_usec: i32,
+        maxrss: i64,
+        _pad: [i64; 14],
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    const RUSAGE_SELF: i32 = 0;
+
+    #[link(name = "System")]
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(target: u32, flavor: u32, info: *mut u8, count: *mut u32) -> i64;
+        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    }
+
+    pub fn cur_rss_bytes() -> u64 {
+        unsafe {
+            let mut info = TaskBasicInfo::default();
+            let mut count =
+                (std::mem::size_of::<TaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+            let kr = task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                &mut info as *mut _ as *mut u8,
+                &mut count,
+            );
+            if kr == 0 {
+                info.resident_size as u64
+            } else {
+                0
+            }
+        }
+    }
+
+    pub fn peak_rss_bytes() -> u64 {
+        unsafe {
+            let mut ru: RUsage = std::mem::zeroed();
+            if getrusage(RUSAGE_SELF, &mut ru) == 0 {
+                // macOS reports ru_maxrss in BYTES (Linux: kB).
+                ru.maxrss.max(0) as u64
+            } else {
+                0
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cur_rss_bytes() -> u64 {
+    macmem::cur_rss_bytes()
+}
+
+#[cfg(target_os = "macos")]
+fn peak_rss_bytes() -> u64 {
+    macmem::peak_rss_bytes()
+}
+
+#[cfg(target_os = "windows")]
+mod winmem {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    }
+    type Handle = *mut core::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        #[link_name = "K32GetProcessMemoryInfo"]
+        fn GetProcessMemoryInfo(
+            process: Handle,
+            memory_counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    fn counters() -> Option<ProcessMemoryCounters> {
+        unsafe {
+            let mut pmc: ProcessMemoryCounters = std::mem::zeroed();
+            pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc as *mut _, pmc.cb) != 0 {
+                Some(pmc)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn cur_rss_bytes() -> u64 {
+        counters().map(|c| c.WorkingSetSize as u64).unwrap_or(0)
+    }
+
+    pub fn peak_rss_bytes() -> u64 {
+        counters().map(|c| c.PeakWorkingSetSize as u64).unwrap_or(0)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cur_rss_bytes() -> u64 {
+    winmem::cur_rss_bytes()
+}
+
+#[cfg(target_os = "windows")]
+fn peak_rss_bytes() -> u64 {
+    winmem::peak_rss_bytes()
+}
+
 fn cur_rss_mb() -> f64 {
-    read_status_kb("VmRSS:") as f64 / 1024.0
+    cur_rss_bytes() as f64 / (1024.0 * 1024.0)
 }
 
 fn peak_rss_mb() -> f64 {
-    read_status_kb("VmHWM:") as f64 / 1024.0
+    peak_rss_bytes() as f64 / (1024.0 * 1024.0)
 }
 
 /// Emit a machine-parseable metric from a child.
@@ -599,9 +748,13 @@ fn s08_wide_rows(engine: Engine) {
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
             for _ in 0..iters {
-                let out = db.query("SELECT b FROM w", []).unwrap();
-                for row in &out {
-                    if let Value::Text(x) = &row[0] {
+                // Streaming (prepare/step): the same consume-one-row-at-a-
+                // time pattern the SQLite side uses — both engines keep
+                // one live row, so the comparison is scan+decode cost,
+                // not materialization-lifecycle cost.
+                let mut stmt = db.prepare("SELECT b FROM w").unwrap();
+                while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+                    if let Some(Value::Text(x)) = stmt.row().and_then(|r| r.first()) {
                         acc = acc.wrapping_add(x.len());
                     }
                 }
@@ -679,9 +832,10 @@ fn s09_blobs(engine: Engine) {
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
             for _ in 0..iters {
-                let out = db.query("SELECT data FROM z", []).unwrap();
-                for row in &out {
-                    if let Value::Blob(b) = &row[0] {
+                // Streaming: matches the SQLite side's prepare/next loop.
+                let mut stmt = db.prepare("SELECT data FROM z").unwrap();
+                while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+                    if let Some(Value::Blob(b)) = stmt.row().and_then(|r| r.first()) {
                         acc = acc.wrapping_add(b.len());
                     }
                 }
@@ -853,6 +1007,19 @@ fn s11_in_list(engine: Engine) {
     }
 }
 
+/// Bind + stream a prepared COUNT query, returning the first row's
+/// integer (0 when empty). Shared by the S12 lookup loops.
+fn count_bound(stmt: &mut rustqlite::Statement, vals: &[Value]) -> i64 {
+    stmt.bind_all(vals).unwrap();
+    let mut x = 0i64;
+    while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+        if let Some(Value::Integer(v)) = stmt.row().and_then(|r| r.first()) {
+            x = *v;
+        }
+    }
+    x
+}
+
 // ============================================================
 // S12 — 5 secondary indexes: load 100k + indexed lookups
 // ============================================================
@@ -897,27 +1064,31 @@ fn s12_multi_index(engine: Engine) {
             db.execute("COMMIT", []).unwrap();
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
+            // Prepared statements (the production pattern: parse once,
+            // bind per call) — matches the SQLite side's prepared+bound
+            // queries, so the section measures the ENGINE, not the parser.
+            let mut p_a = db.prepare("SELECT COUNT(*) FROM m WHERE a = ?").unwrap();
+            let mut p_b = db.prepare("SELECT COUNT(*) FROM m WHERE b = ?").unwrap();
+            let mut p_c = db.prepare("SELECT COUNT(*) FROM m WHERE c = ?").unwrap();
+            let mut p_d = db.prepare("SELECT COUNT(*) FROM m WHERE d = ?").unwrap();
+            let mut p_da = db
+                .prepare("SELECT COUNT(*) FROM m WHERE d = ? AND a = ?")
+                .unwrap();
             for _ in 0..lookups {
                 let a = (lcg(&mut seed) % 100_003) as i64;
                 let b = (lcg(&mut seed) % rows as u64) as f64 * 0.5 + 0.5;
                 let c = format!("c{}", (lcg(&mut seed) % rows as u64) as i64 + 1);
                 let d = (lcg(&mut seed) % 1000) as i64;
-                let queries = [
-                    format!("SELECT COUNT(*) FROM m WHERE a = {a}"),
-                    format!("SELECT COUNT(*) FROM m WHERE b = {b}"),
-                    format!("SELECT COUNT(*) FROM m WHERE c = '{c}'"),
-                    format!("SELECT COUNT(*) FROM m WHERE d = {d}"),
-                    format!("SELECT COUNT(*) FROM m WHERE d = {d} AND a = {a}"),
-                ];
-                for q in &queries {
-                    let out = db.query(q, []).unwrap();
-                    if let Some(row) = out.first() {
-                        if let Value::Integer(x) = &row[0] {
-                            acc = acc.wrapping_add(*x);
-                        }
-                    }
-                }
+                acc = acc.wrapping_add(count_bound(&mut p_a, &[Value::Integer(a)]));
+                acc = acc.wrapping_add(count_bound(&mut p_b, &[Value::Real(b)]));
+                acc = acc.wrapping_add(count_bound(&mut p_c, &[Value::Text(c.as_str().into())]));
+                acc = acc.wrapping_add(count_bound(&mut p_d, &[Value::Integer(d)]));
+                acc = acc.wrapping_add(count_bound(
+                    &mut p_da,
+                    &[Value::Integer(d), Value::Integer(a)],
+                ));
             }
+            drop((p_a, p_b, p_c, p_d, p_da));
             let lookup_ms = t.elapsed().as_secs_f64() * 1000.0;
             metric("sink", (acc % 1000) as f64);
             metric("insert_ms", insert_ms);
@@ -952,22 +1123,28 @@ fn s12_multi_index(engine: Engine) {
             conn.execute("COMMIT", []).unwrap();
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
+            let mut p_a = conn.prepare("SELECT COUNT(*) FROM m WHERE a = ?").unwrap();
+            let mut p_b = conn.prepare("SELECT COUNT(*) FROM m WHERE b = ?").unwrap();
+            let mut p_c = conn.prepare("SELECT COUNT(*) FROM m WHERE c = ?").unwrap();
+            let mut p_d = conn.prepare("SELECT COUNT(*) FROM m WHERE d = ?").unwrap();
+            let mut p_da = conn
+                .prepare("SELECT COUNT(*) FROM m WHERE d = ? AND a = ?")
+                .unwrap();
             for _ in 0..lookups {
                 let a = (lcg(&mut seed) % 100_003) as i64;
                 let b = (lcg(&mut seed) % rows as u64) as f64 * 0.5 + 0.5;
                 let c = format!("c{}", (lcg(&mut seed) % rows as u64) as i64 + 1);
                 let d = (lcg(&mut seed) % 1000) as i64;
-                let queries = [
-                    format!("SELECT COUNT(*) FROM m WHERE a = {a}"),
-                    format!("SELECT COUNT(*) FROM m WHERE b = {b}"),
-                    format!("SELECT COUNT(*) FROM m WHERE c = '{c}'"),
-                    format!("SELECT COUNT(*) FROM m WHERE d = {d}"),
-                    format!("SELECT COUNT(*) FROM m WHERE d = {d} AND a = {a}"),
-                ];
-                for q in &queries {
-                    let x: i64 = conn.query_row(q, [], |r| r.get(0)).unwrap_or(0);
-                    acc = acc.wrapping_add(x);
-                }
+                let x: i64 = p_a.query_row([a], |r| r.get(0)).unwrap_or(0);
+                acc = acc.wrapping_add(x);
+                let x: i64 = p_b.query_row([b], |r| r.get(0)).unwrap_or(0);
+                acc = acc.wrapping_add(x);
+                let x: i64 = p_c.query_row([c.as_str()], |r| r.get(0)).unwrap_or(0);
+                acc = acc.wrapping_add(x);
+                let x: i64 = p_d.query_row([d], |r| r.get(0)).unwrap_or(0);
+                acc = acc.wrapping_add(x);
+                let x: i64 = p_da.query_row([d, a], |r| r.get(0)).unwrap_or(0);
+                acc = acc.wrapping_add(x);
             }
             let lookup_ms = t.elapsed().as_secs_f64() * 1000.0;
             metric("sink", (acc % 1000) as f64);
@@ -1806,6 +1983,28 @@ fn verdict(rq: f64, sq: f64, lower_is_better: bool) -> String {
     }
 }
 
+/// Gating threshold: a section FAILS the run when rustqlite is more than
+/// `tolerance_pct` percent slower (or more-memory, when mem-gating) than
+/// SQLite. Single-pass sections are noisier than the bench gates' best-of
+/// rounds, so the default is looser; the bench-gate jobs own the tight
+/// throughput contract.
+fn env_tolerance(var: &str, default: f64) -> f64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(default)
+}
+
+/// True when `rq` is worse than `sq` by more than the tolerance percent
+/// (lower is better). n/a metrics never gate.
+fn gated(rq: f64, sq: f64, tolerance_pct: f64) -> bool {
+    if rq <= 0.0 || sq <= 0.0 || tolerance_pct < 0.0 {
+        return false;
+    }
+    rq > sq * (1.0 + tolerance_pct / 100.0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 4 && args[1] == "--child" {
@@ -1840,6 +2039,16 @@ fn main() {
     ];
 
     println!("== PRODUCTION TORTURE MATRIX (scale={:.2}) ==", scale());
+    let time_tol = env_tolerance("TORTURE_TIME_TOLERANCE_PCT", 15.0);
+    let mem_tol = env_tolerance("TORTURE_MEM_TOLERANCE_PCT", -1.0);
+    println!(
+        "gating: time > {time_tol:.0}% slower FAILs; mem {}",
+        if mem_tol < 0.0 {
+            "reported only (not gated)".to_string()
+        } else {
+            format!("> {mem_tol:.0}% more FAILs")
+        }
+    );
     let mut failures: Vec<String> = Vec::new();
     let mut losses: Vec<String> = Vec::new();
 
@@ -1865,12 +2074,22 @@ fn main() {
         let time_v = verdict(rq_time, sq_time, true);
         if time_v.contains("LOSS") {
             losses.push(format!("{id} {title} (time)"));
+            if gated(rq_time, sq_time, time_tol) {
+                failures.push(format!(
+                    "{id} {title}: rq {rq_time:.1}ms vs sq {sq_time:.1}ms (time > {time_tol:.0}% slower)"
+                ));
+            }
         }
         let rq_hwm = rq.get("hwm_mb");
         let sq_hwm = sq.get("hwm_mb");
         let mem_v = verdict(rq_hwm, sq_hwm, true);
         if mem_v.contains("LOSS") {
             losses.push(format!("{id} {title} (mem)"));
+            if gated(rq_hwm, sq_hwm, mem_tol) {
+                failures.push(format!(
+                    "{id} {title}: rq {rq_hwm:.0}MB vs sq {sq_hwm:.0}MB (mem > {mem_tol:.0}% more)"
+                ));
+            }
         }
         println!(
             "[TORTURE {id} {title:32}] rq {rq_time:8.1}ms {rq_hwm:5.0}MB | sq {sq_time:8.1}ms {sq_hwm:5.0}MB | time {time_v:10} | mem {mem_v:10}"
@@ -1887,6 +2106,13 @@ fn main() {
                 let v = verdict(rq.get(k), sq.get(k), true);
                 if v.contains("LOSS") {
                     losses.push(format!("{id} {title} ({k})"));
+                    if gated(rq.get(k), sq.get(k), time_tol) {
+                        failures.push(format!(
+                            "{id} {title} ({k}): rq {:.1}ms vs sq {:.1}ms (time > {time_tol:.0}% slower)",
+                            rq.get(k),
+                            sq.get(k)
+                        ));
+                    }
                 }
                 println!(
                     "    {id} {k:20}: rq {:8.1}ms | sq {:8.1}ms | {v}",
@@ -1949,11 +2175,11 @@ fn main() {
     }
 
     println!("\n== SUMMARY ==");
-    println!("correctness failures: {}", failures.len());
+    println!("gate failures: {}", failures.len());
     for f in &failures {
         println!("  FAIL {f}");
     }
-    println!("perf losses vs sqlite: {}", losses.len());
+    println!("perf losses vs sqlite (tracked): {}", losses.len());
     for l in &losses {
         println!("  LOSS {l}");
     }

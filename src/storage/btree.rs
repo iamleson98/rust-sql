@@ -13,6 +13,7 @@
 use crate::error::{Error, Result};
 use crate::storage::page::{PageId, PageType, PAGE_HEADER_SIZE};
 use crate::storage::pager::Pager;
+use crate::types::Value;
 
 /// A varint encoder/decoder compatible with SQLite (1-9 bytes, big-endian).
 pub mod varint {
@@ -1818,7 +1819,11 @@ impl<'a> Btree<'a> {
         // for a 64KB blob that's ~16 doublings of a ~32KB average = ~512KB
         // of memcpy per row (8x the payload itself).
         buf.clear();
-        buf.reserve(total.min(1 << 20).saturating_sub(buf.capacity().min(total.min(1 << 20))));
+        buf.reserve(
+            total
+                .min(1 << 20)
+                .saturating_sub(buf.capacity().min(total.min(1 << 20))),
+        );
         buf.extend_from_slice(local);
         let cap = self.overflow_page_capacity();
         let mut remaining = total - local.len();
@@ -4622,10 +4627,8 @@ impl<'a> Btree<'a> {
                         }
                         let cont = ASSEMBLE_BUF.with(|b| {
                             let mut buf = b.borrow_mut();
-                            self.assemble_overflow_payload_into(
-                                local, plen as u64, chain, &mut buf,
-                            )
-                            .map(|_| f(rowid, &buf))
+                            self.assemble_overflow_payload_into(local, plen as u64, chain, &mut buf)
+                                .map(|_| f(rowid, &buf))
                         })?;
                         if !cont {
                             return Ok(false);
@@ -4695,6 +4698,470 @@ impl<'a> Btree<'a> {
     /// ~2 binary searches per leaf page.
     pub fn count_rows_range(&mut self, start: i64, end: i64) -> Result<u64> {
         self.count_range_subtree(self.root, start, end)
+    }
+
+    // ================================================================
+    // OVERFLOW-AWARE SELECTIVE SCAN (the lazy payload contract)
+    // ================================================================
+
+    /// Append `payload[start..end]` (offsets into the FULL payload) to
+    /// `out`, gathering from the local prefix and the overflow chain ONLY
+    /// the pages that actually overlap the range. A projection that never
+    /// reads a wide column's bytes never walks the chain at all.
+    ///
+    /// `chain` is the first overflow page (0 when the payload is fully
+    /// local — then only `local` is consulted). Chain pages hold
+    /// `payload[local_len..total]` sequentially.
+    pub(crate) fn gather_payload_range_append(
+        &mut self,
+        local: &[u8],
+        total: usize,
+        chain: PageId,
+        start: usize,
+        end: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let end = end.min(total);
+        if start >= end {
+            return Ok(());
+        }
+        // Part served by the local prefix.
+        let local_part_end = end.min(local.len());
+        if start < local_part_end {
+            out.extend_from_slice(&local[start..local_part_end]);
+            if local_part_end == end {
+                return Ok(());
+            }
+        }
+        if chain == 0 {
+            // No chain: a range past the local prefix on a fully-local
+            // payload is a corrupt length header.
+            return Err(Error::corruption(format!(
+                "payload range [{}, {}) past local prefix with no overflow chain",
+                start, end
+            )));
+        }
+        // Chain part: ONE cache read-guard for the whole resident run
+        // (see Pager::gather_overflow_chain_range) instead of a
+        // `get_page` (RwLock + Arc clone + atomic) per chain page.
+        self.pager
+            .gather_overflow_chain_range(chain, local.len(), start, end, out)
+    }
+
+    /// Full-scan with the projection FUSED into the walk (the overflow-
+    /// aware selective decode). For every row the callback receives the
+    /// rowid plus an OWNED `Vec<Value>` holding exactly `wanted` columns
+    /// in the caller's order (duplicates included, rowid-alias
+    /// materialized, short rows NULL-padded).
+    ///
+    /// vs `scan_table_borrowed` + `decode_row_selective`:
+    /// - In-page rows: identical selective decode, zero assembly.
+    /// - Overflow rows: ONLY the wanted columns' byte ranges are gathered
+    ///   from the chain — `SELECT id FROM blobs` reads zero chain pages
+    ///   (the old contract assembled every 64 KB payload first), and a
+    ///   projected wide column is copied from its chain pages DIRECTLY
+    ///   into the value's own buffer (one copy, not assemble+copy).
+    ///
+    /// The walk hands each row to `f`; `false` stops the scan.
+    pub fn scan_table_selective<F>(
+        &mut self,
+        n_cols: usize,
+        wanted: &[usize],
+        rowid_alias: Option<usize>,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Vec<Value>) -> bool,
+    {
+        self.scan_table_range_selective(i64::MIN, i64::MAX, n_cols, wanted, rowid_alias, f)
+    }
+
+    /// Rowid-range variant of `scan_table_selective` (resumable streaming:
+    /// the statement driver resumes each batch at `last_rowid + 1`).
+    /// Inclusive bounds on both ends; cells sorted by rowid, so the first
+    /// rowid past `end` stops the walk.
+    pub fn scan_table_range_selective<F>(
+        &mut self,
+        start: i64,
+        end: i64,
+        n_cols: usize,
+        wanted: &[usize],
+        rowid_alias: Option<usize>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Vec<Value>) -> bool,
+    {
+        // Trusted TEXT decode for in-memory pagers (payloads are this
+        // process's own encoder output — see types::value). Saved +
+        // restored so nested scans on other pagers behave correctly.
+        let saved_trust = crate::types::value::text_decode_trusted();
+        let trusted = self.pager.is_memory();
+        if trusted != saved_trust {
+            crate::types::value::set_text_decode_trusted(trusted);
+        }
+        let r = self
+            .scan_range_subtree_selective(
+                self.root,
+                start,
+                end,
+                n_cols,
+                wanted,
+                rowid_alias,
+                &mut f,
+            )
+            .map(|_| ());
+        if trusted != saved_trust {
+            crate::types::value::set_text_decode_trusted(saved_trust);
+        }
+        r
+    }
+
+    fn scan_range_subtree_selective<F>(
+        &mut self,
+        page_id: PageId,
+        start: i64,
+        end: i64,
+        n_cols: usize,
+        wanted: &[usize],
+        rowid_alias: Option<usize>,
+        f: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(i64, Vec<Value>) -> bool,
+    {
+        let page = self.pager.get_page(page_id)?;
+        // ONE lock per page: type check + leaf/interior work under the
+        // same guard (the leaf cell loop borrows payload slices from it).
+        let borrowed = page.lock();
+        prefetch_search_lines(&borrowed.data);
+        let pt = borrowed.page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                let n = borrowed.n_cells();
+                let psz = borrowed.data.len();
+                // Binary search for the first cell with rowid >= start
+                // (mirrors scan_range_subtree_borrowed — resumable batches
+                // with `start = last_rowid + 1` skip the consumed prefix).
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
+                        Some((rowid, _)) if rowid < start => lo = mid + 1,
+                        _ => hi = mid,
+                    }
+                }
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    let buf = borrowed.cell_slice_checked(cell_ptr)?;
+                    let (rowid, n1) = varint::decode_signed(buf).ok_or_else(|| {
+                        Error::corruption("truncated leaf rowid in scan_selective")
+                    })?;
+                    if rowid > end {
+                        // Sorted: everything after is past the range too.
+                        return Ok(false);
+                    }
+                    let rest = &buf[n1..];
+                    let (plen, n2) = varint::decode(rest).ok_or_else(|| {
+                        Error::corruption("truncated leaf payload len in scan_selective")
+                    })?;
+                    let payload_start = n1 + n2;
+                    let plen = plen as usize;
+                    let local_len = overflow_local_len_for(plen, psz);
+                    if local_len == plen {
+                        // In-page payload: the existing selective decoder
+                        // directly over the page bytes (zero-copy slice).
+                        if payload_start
+                            .checked_add(plen)
+                            .map_or(true, |end| end > buf.len())
+                        {
+                            return Err(Error::corruption(
+                                "truncated leaf payload in scan_selective",
+                            ));
+                        }
+                        let payload = &buf[payload_start..payload_start + plen];
+                        let mut row: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
+                        if crate::storage::row_codec::decode_row_selective(
+                            payload,
+                            n_cols,
+                            wanted,
+                            rowid,
+                            rowid_alias,
+                            &mut row,
+                        )
+                        .is_ok()
+                        {
+                            if !f(rowid, row) {
+                                return Ok(false);
+                            }
+                        } else {
+                            // Corrupt in-page row: skip (mirrors the
+                            // borrowed-scan's decode_row error tolerance).
+                        }
+                    } else {
+                        // Overflow cell: decode wanted column ranges from
+                        // the local prefix; gather only what extends past.
+                        if local_len + 4 > buf.len() - payload_start {
+                            return Err(Error::corruption(
+                                "truncated overflow cell in scan_selective",
+                            ));
+                        }
+                        let local = &buf[payload_start..payload_start + local_len];
+                        let chain = u32::from_be_bytes(
+                            buf[payload_start + local_len..payload_start + local_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let row = self.decode_overflow_selective(
+                            local,
+                            plen,
+                            chain,
+                            n_cols,
+                            wanted,
+                            rowid,
+                            rowid_alias,
+                        );
+                        match row {
+                            Ok(row) => {
+                                if !f(rowid, row) {
+                                    return Ok(false);
+                                }
+                            }
+                            Err(crate::storage::row_codec::LazyError::HeaderPastLocal) => {
+                                // Pathological: the record header itself
+                                // spills past the local prefix. Fall back
+                                // to full assembly + the ordinary
+                                // selective decode (identical semantics).
+                                let mut full = Vec::new();
+                                self.assemble_overflow_payload_into(
+                                    local,
+                                    plen as u64,
+                                    chain,
+                                    &mut full,
+                                )?;
+                                let mut row: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
+                                if crate::storage::row_codec::decode_row_selective(
+                                    &full,
+                                    n_cols,
+                                    wanted,
+                                    rowid,
+                                    rowid_alias,
+                                    &mut row,
+                                )
+                                .is_ok()
+                                    && !f(rowid, row)
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                            Err(crate::storage::row_codec::LazyError::Corrupt(e)) => {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            PageType::InteriorTable => {
+                let n = borrowed.n_cells();
+                let right = borrowed.right_most_pointer();
+                // Binary search for the FIRST child whose separator >=
+                // start (children with separator < start hold only rowids
+                // < start): resumable batches skip the consumed prefix
+                // instead of re-locking every leaf below `start`.
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    let key = decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
+                        .ok_or_else(|| {
+                            Error::corruption("truncated interior cell in selective scan")
+                        })?;
+                    if key < start {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let mut children: Vec<PageId> = Vec::with_capacity((n - lo) as usize + 1);
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if let Some(child) =
+                        decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
+                    {
+                        children.push(child);
+                    }
+                }
+                // 0 = unset rightmost (post-split); descending into 0
+                // would scan the header/schema page (phantom rows).
+                if right != 0 {
+                    children.push(right);
+                }
+                drop(borrowed);
+                drop(page);
+                for child in children {
+                    if !self.scan_range_subtree_selective(
+                        child,
+                        start,
+                        end,
+                        n_cols,
+                        wanted,
+                        rowid_alias,
+                        f,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in scan_selective: {:?}",
+                pt
+            ))),
+        }
+    }
+
+    /// Decode the wanted columns of one OVERFLOW cell without assembling
+    /// the payload: walk the value tags on the local prefix, decode wanted
+    /// columns that fit locally, and gather (directly into the value's own
+    /// buffer) only the ranges that spill into the chain.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_overflow_selective(
+        &mut self,
+        local: &[u8],
+        total: usize,
+        chain: PageId,
+        n_cols: usize,
+        wanted: &[usize],
+        rowid: i64,
+        rowid_alias: Option<usize>,
+    ) -> std::result::Result<Vec<Value>, crate::storage::row_codec::LazyError> {
+        use crate::storage::row_codec::{column_spans_local, decode_span_value, LazyError};
+
+        // 1. Layout walk on the local prefix (spans up to the highest
+        //    wanted column; None = short-row column past the payload).
+        let max_col = wanted.iter().copied().max().unwrap_or(0);
+        let spans = column_spans_local(local, total, n_cols, max_col)?;
+
+        // 2. Resolve each output slot directly from its column's span —
+        //    no single-pass walk needed: the spans table gives O(1)
+        //    per-column lookups, duplicates re-decode locally (cheap),
+        //    and the SELECT order is preserved by construction.
+        let mut out: Vec<Value> = vec![Value::Null; wanted.len()];
+        for (slot, &col) in wanted.iter().enumerate() {
+            if col >= n_cols {
+                continue; // stays NULL (defensive: schema walk guarantees < n_cols)
+            }
+            if rowid_alias == Some(col) {
+                out[slot] = Value::Integer(rowid);
+                continue;
+            }
+            match spans.get(col).copied().flatten() {
+                None => {} // short row: NULL
+                Some(sp) if sp.end() <= local.len() => {
+                    // Fully local: decode straight from the page bytes.
+                    out[slot] = decode_span_value(&local[sp.off as usize..sp.end()])
+                        .map_err(LazyError::Corrupt)?;
+                }
+                Some(sp) => {
+                    // Spills into the chain: gather the byte range DIRECTLY
+                    // into the value's own buffer (single copy).
+                    out[slot] = self
+                        .decode_span_gathered(sp, local, total, chain)
+                        .map_err(LazyError::Corrupt)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode one value whose byte span spills into the overflow chain,
+    /// copying bytes DIRECTLY into the value's own buffer: for a 64 KB
+    /// blob this is ONE copy (chain pages -> the Vec backing the Value),
+    /// vs the old assemble-then-decode's two. Text and Blob bodies are
+    /// gathered page-by-page straight into the final allocation; the tag
+    /// + length header (always page-local) is parsed separately.
+    fn decode_span_gathered(
+        &mut self,
+        span: crate::storage::row_codec::ColSpan,
+        local: &[u8],
+        total: usize,
+        chain: PageId,
+    ) -> Result<Value> {
+        use crate::types::value::decode_uvarint;
+
+        let off = span.off as usize;
+        // The span's tag byte and length header are guaranteed local
+        // (`column_spans_local` only returns spans whose headers fit).
+        let tag = local[off];
+        let rest = &local[off + 1..];
+        match tag {
+            0x08 => {
+                // Blob: [tag][varint len][body]. Gather the body straight
+                // into the Value's own Vec — zero intermediate copies.
+                let (len, n) = decode_uvarint(rest)
+                    .map_err(|e| Error::corruption(format!("lazy blob header: {}", e)))?;
+                let body_start = off + 1 + n;
+                let body_end = body_start + len as usize;
+                if body_end > total {
+                    return Err(Error::corruption("lazy blob body past payload end"));
+                }
+                let mut v = Vec::with_capacity(len as usize);
+                self.gather_payload_range_append(
+                    local, total, chain, body_start, body_end, &mut v,
+                )?;
+                if v.len() != len as usize {
+                    return Err(Error::corruption("lazy blob gather short"));
+                }
+                Ok(Value::Blob(v))
+            }
+            0x07 => {
+                // Text: same single-copy gather, then UTF-8 validation
+                // (String::from_utf8 reuses the buffer — no second copy).
+                let (len, n) = decode_uvarint(rest)
+                    .map_err(|e| Error::corruption(format!("lazy text header: {}", e)))?;
+                let body_start = off + 1 + n;
+                let body_end = body_start + len as usize;
+                if body_end > total {
+                    return Err(Error::corruption("lazy text body past payload end"));
+                }
+                let mut v = Vec::with_capacity(len as usize);
+                self.gather_payload_range_append(
+                    local, total, chain, body_start, body_end, &mut v,
+                )?;
+                if v.len() != len as usize {
+                    return Err(Error::corruption("lazy text gather short"));
+                }
+                match String::from_utf8(v) {
+                    Ok(s) => Ok(Value::Text(s.into())),
+                    Err(_) => Err(Error::corruption("invalid utf8 in lazy text gather")),
+                }
+            }
+            _ => {
+                // Fixed-width value whose bytes straddle the boundary:
+                // gather the whole span and decode through the generic
+                // path (fixed types are <= 9 bytes; at most one chain
+                // page is touched).
+                let mut buf = Vec::with_capacity(span.len as usize);
+                self.gather_payload_range_append(local, total, chain, off, span.end(), &mut buf)?;
+                crate::storage::row_codec::decode_span_value(&buf)
+            }
+        }
     }
 
     fn count_range_subtree(&mut self, page_id: PageId, start: i64, end: i64) -> Result<u64> {
@@ -5249,10 +5716,8 @@ impl<'a> Btree<'a> {
                             }
                             let cont = ASSEMBLE_BUF_RANGE.with(|b| {
                                 let mut abuf = b.borrow_mut();
-                                self.assemble_overflow_payload_into(
-                                    local, plen, chain, &mut abuf,
-                                )
-                                .map(|_| f(rowid, &abuf))
+                                self.assemble_overflow_payload_into(local, plen, chain, &mut abuf)
+                                    .map(|_| f(rowid, &abuf))
                             })?;
                             if !cont {
                                 return Ok(false);

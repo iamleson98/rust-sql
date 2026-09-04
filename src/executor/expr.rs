@@ -1530,7 +1530,7 @@ fn memchr_contains(hay: &[u8], needle: &[u8]) -> bool {
                 if i > last {
                     return false;
                 }
-                if &hay[i + 1..i + n] == &needle[1..] {
+                if hay[i + 1..i + n] == needle[1..] {
                     return true;
                 }
                 i += 1;
