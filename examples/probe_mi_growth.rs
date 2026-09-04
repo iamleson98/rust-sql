@@ -12,6 +12,7 @@ fn cur_mb() -> f64 {
 }
 
 #[derive(Clone, Default)]
+#[allow(dead_code)] // layout probe: field sizes are the point
 struct St {
     a: i64,
     b: f64,
@@ -40,9 +41,7 @@ fn main() {
     // Pattern B: 10k separate Vec<St> of 1 element (the old grouper).
     let mut vs: Vec<Vec<St>> = Vec::with_capacity(10_000);
     for _ in 0..10_000 {
-        let mut s = Vec::new();
-        s.push(St::default());
-        vs.push(s);
+        vs.push(vec![St::default()]);
     }
     println!("10k x Vec<St>(1): {:.1}MB", cur_mb());
     drop(vs);
@@ -84,10 +83,7 @@ fn pattern_d() {
             slot = (slot + 1) & mask;
         }
         slots[slot] = (h, (gi + 1) as u32);
-        let mut row: Vec<i64> = Vec::with_capacity(3);
-        row.push(gi as i64);
-        row.push(1);
-        row.push(2);
+        let row: Vec<i64> = vec![gi as i64, 1, 2];
         rows.push(row);
     }
     println!(

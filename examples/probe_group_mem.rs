@@ -42,7 +42,7 @@ fn main() {
             stmt.bind(
                 2,
                 Value::Integer(
-                    i as i64 * 7
+                    i * 7
                         % std::env::var("PROBE_MOD")
                             .ok()
                             .and_then(|v| v.parse().ok())

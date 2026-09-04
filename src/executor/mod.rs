@@ -4000,6 +4000,7 @@ fn exec_limit(
 // ============================================================================
 
 #[derive(Clone, Debug)]
+#[allow(clippy::box_collection)] // deliberate: 48 B inline vs 8 B boxed
 struct AggState {
     count: i64,
     sum: f64,
@@ -6484,11 +6485,8 @@ fn exec_aggregate(
         } else {
             row.extend(grouper.keys_multi[gi].iter().cloned());
         }
-        for i in 0..aggregates.len() {
-            row.push(finalize_agg(
-                grouper.states.get(gi * n_aggs + i),
-                &aggregates[i].func,
-            ));
+        for (i, agg) in aggregates.iter().enumerate() {
+            row.push(finalize_agg(grouper.states.get(gi * n_aggs + i), &agg.func));
         }
         out_rows.push(row);
     }
