@@ -899,12 +899,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             } = &**input
             {
                 if let Some((project, out_cols)) = bare_column_projection(columns, table) {
-                    return exec_scan_projected(
-                        ctx,
-                        table.clone(),
-                        project.as_deref(),
-                        out_cols,
-                    );
+                    return exec_scan_projected(ctx, table.clone(), project.as_deref(), out_cols);
                 }
             }
             exec_project(ctx, input, columns)
@@ -2808,8 +2803,7 @@ fn exec_scan_projected(
             // index list through unchanged.
             bt.scan_table_borrowed(|rowid, payload| {
                 let mut row: Vec<Value> = Vec::with_capacity(idxs.len());
-                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
-                    .is_ok()
+                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok()
                 {
                     rows.push(row);
                 }
@@ -3870,9 +3864,7 @@ fn exec_limit(
                         predicate: None,
                     } = sort_input
                     {
-                        if table.vtab.is_none()
-                            && !matches!(&terms[0].expr, Expr::Collate { .. })
-                        {
+                        if table.vtab.is_none() && !matches!(&terms[0].expr, Expr::Collate { .. }) {
                             if let Some(key_col) =
                                 resolve_topn_key_col(&terms[0].expr, table, alias.as_deref())
                             {
@@ -4708,12 +4700,7 @@ fn exec_aggregate_streaming_scan(
                         (None, Some(c)) => c.eval(&wide, params),
                         (None, None) => Value::Null,
                     };
-                    update_agg_state(
-                        grouper.state(gi, i),
-                        agg_funcs[i],
-                        &arg_val,
-                        agg.distinct,
-                    );
+                    update_agg_state(grouper.state(gi, i), agg_funcs[i], &arg_val, agg.distinct);
                 }
                 true
             })?;
@@ -4771,12 +4758,7 @@ fn exec_aggregate_streaming_scan(
                     }
                     (None, _) => Value::Integer(1), // COUNT(*)
                 };
-                update_agg_state(
-                    grouper.state(gi, i),
-                    agg_funcs[i],
-                    &arg_val,
-                    agg.distinct,
-                );
+                update_agg_state(grouper.state(gi, i), agg_funcs[i], &arg_val, agg.distinct);
             }
             true
         })?;
@@ -5119,8 +5101,7 @@ fn payload_text_at(payload: &[u8], n_cols: usize, col: usize) -> Option<&[u8]> {
                 1 + n
             }
             0x07 | 0x08 => {
-                let (len, n) =
-                    crate::types::value::decode_uvarint(&payload[pos + 1..]).ok()?;
+                let (len, n) = crate::types::value::decode_uvarint(&payload[pos + 1..]).ok()?;
                 1 + n + len as usize
             }
             _ => return None,
@@ -6479,12 +6460,7 @@ fn exec_aggregate(
                 (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
                 (None, _) => Value::Integer(1),
             };
-            update_agg_state(
-                grouper.state(gi, i),
-                agg_funcs[i],
-                &arg_val,
-                agg.distinct,
-            );
+            update_agg_state(grouper.state(gi, i), agg_funcs[i], &arg_val, agg.distinct);
         }
     }
 
@@ -6509,7 +6485,10 @@ fn exec_aggregate(
             row.extend(grouper.keys_multi[gi].iter().cloned());
         }
         for i in 0..aggregates.len() {
-            row.push(finalize_agg(grouper.states.get(gi * n_aggs + i), &aggregates[i].func));
+            row.push(finalize_agg(
+                grouper.states.get(gi * n_aggs + i),
+                &aggregates[i].func,
+            ));
         }
         out_rows.push(row);
     }
@@ -6824,9 +6803,9 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
             }
         }
         AggFunc::GroupConcat if !v.is_null() => {
-            let buf = state.concat.get_or_insert_with(|| {
-                Box::new(String::with_capacity(16))
-            });
+            let buf = state
+                .concat
+                .get_or_insert_with(|| Box::new(String::with_capacity(16)));
             if !buf.is_empty() {
                 buf.push(',');
             }
@@ -6863,14 +6842,7 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
         }
         "min" => state.min.clone().unwrap_or(Value::Null),
         "max" => state.max.clone().unwrap_or(Value::Null),
-        "group_concat" => Value::Text(
-            state
-                .concat
-                .as_deref()
-                .cloned()
-                .unwrap_or_default()
-                .into(),
-        ),
+        "group_concat" => Value::Text(state.concat.as_deref().cloned().unwrap_or_default().into()),
         _ => Value::Null,
     }
 }
@@ -8761,10 +8733,7 @@ fn exec_rowid_range(
     // Vecs copied repeatedly). The width is an exact upper bound for
     // dense rowid ranges (the common case) and a harmless over-estimate
     // otherwise — capped so absurd ranges can't OOM.
-    let est = end
-        .saturating_sub(start)
-        .clamp(0, 1 << 20) as usize
-        + 1;
+    let est = end.saturating_sub(start).clamp(0, 1 << 20) as usize + 1;
     let mut rows: Vec<Row> = Vec::with_capacity(est.min(1 << 20));
     // `scan_table_range` is inclusive on both ends. For strict `>` / `<`
     // conjuncts, the planner kept a residual predicate that re-checks the
@@ -13079,13 +13048,18 @@ fn try_streaming_delete(
         Some((start_expr, end_expr)) => {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let lo = match start_expr {
-                Some(e) => evaluate(e, &eval_ctx).map(|v| v.as_integer()).unwrap_or(i64::MIN),
+                Some(e) => evaluate(e, &eval_ctx)
+                    .map(|v| v.as_integer())
+                    .unwrap_or(i64::MIN),
                 None => i64::MIN,
             };
             let hi = match end_expr {
-                Some(e) => evaluate(e, &eval_ctx).map(|v| v.as_integer()).unwrap_or(i64::MAX),
+                Some(e) => evaluate(e, &eval_ctx)
+                    .map(|v| v.as_integer())
+                    .unwrap_or(i64::MAX),
                 None => i64::MAX,
             };
             hi.saturating_sub(lo).clamp(0, 1 << 20) as usize + 1

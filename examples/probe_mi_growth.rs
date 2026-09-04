@@ -29,7 +29,11 @@ fn main() {
     for _ in 0..10_000 {
         v.push(St::default());
     }
-    println!("flat vec 10k x {}B: {:.1}MB", std::mem::size_of::<St>(), cur_mb());
+    println!(
+        "flat vec 10k x {}B: {:.1}MB",
+        std::mem::size_of::<St>(),
+        cur_mb()
+    );
     drop(v);
     println!("dropped: {:.1}MB", cur_mb());
 
