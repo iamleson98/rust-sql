@@ -55,11 +55,21 @@ fn drain_mimalloc_wake() {}
 
 #[cfg(feature = "mimalloc")]
 fn drain_mimalloc_wake() {
+    // 1. Wake the deferred-free queues (see the doc comment above).
     let mut sink: Vec<Vec<u8>> = Vec::with_capacity(512);
     for i in 0..512usize {
         sink.push(vec![0u8; (i % 16) * 8 + 8]);
     }
     drop(sink);
+    // 2. Return fully-freed pages to the OS (mi_collect force). With
+    //    purge_delay = -1 (never automatic — the per-allocation purge
+    //    timer checks cost ~25 ns/alloc, the UPDATE-by-PK regression),
+    //    this is the ONLY place pages go back. Called once per write
+    //    BURST (big-transaction COMMIT / auto-commit storm end), so the
+    //    collect's own cost amortizes inside the multi-ms transaction —
+    //    and a later read/scan phase's peak no longer stacks on the
+    //    write storm's retained pages (HWM = max phase, not sum).
+    unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
 /// Lightweight phase profiler (nanosecond accumulators). Zero-cost when

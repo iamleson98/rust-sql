@@ -239,6 +239,17 @@ jobs:
     name: torture (${{ matrix.os }}, scale matrix)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: never
+      TORTURE_SCALE: ${{ matrix.scale }}
+      TORTURE_TIME_TOLERANCE_PCT: "15"
+      # Lean mimalloc startup (see src/lib.rs's allocator docs): the
+      # default 1 GiB arena + THP materialize ~4 MB of RSS before the
+      # engine even runs — these two settings put the process at
+      # exactly-touched-pages granularity, which is what the memory
+      # columns of this matrix measure against SQLite (glibc).
+      MIMALLOC_ARENA_RESERVE: 64M
+      MIMALLOC_ALLOW_THP: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -249,10 +260,6 @@ jobs:
             scale: "0.2"
           - os: macos-latest
             scale: "0.15"
-    env:
-      CARGO_TERM_COLOR: never
-      TORTURE_SCALE: ${{ matrix.scale }}
-      TORTURE_TIME_TOLERANCE_PCT: "15"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -318,6 +325,10 @@ jobs:
       BENCH_TOLERANCE_PCT: "5"
       # Plain text only: the gate parses this job's stdout.
       CARGO_TERM_COLOR: never
+      # Lean mimalloc startup (see src/lib.rs's allocator docs) — matches
+      # the torture matrix's measurement environment.
+      MIMALLOC_ARENA_RESERVE: 64M
+      MIMALLOC_ALLOW_THP: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

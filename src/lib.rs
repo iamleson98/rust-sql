@@ -73,12 +73,33 @@ fn tune_mimalloc() {
         // to the OS after this delay (ms). -1 = never — the old setting,
         // bought first-query latency but retained EVERY freed page in
         // VmHWM (peak-RSS-bound workloads measured ~3x their live set).
-        // 0 = immediate: HWM tracks the LIVE set. The re-fault cost on
-        // reuse (~10 us per 64 KiB page) lands inside the write bursts
-        // that freed the pages in the first place.
+        // 25 ms = pages freed by an alloc-heavy query return to the OS
+        // once the query loop goes idle, but back-to-back iterations
+        // (best-of-N benchmark rounds, storm-then-read transitions well
+        // under 25 ms apart) still reuse them — immediate purging (0)
+        // re-faulted the entire working set on EVERY round (measured
+        // +0.5 ms/round on the join+GROUP BY bench).
+        // Raw enum positions from mimalloc.h (the sys crate's bindings
+        // only name the pre-v3 subset; purge_delay = 15 is bracketed by
+        // eager_commit_delay = 14 and use_numa_nodes = 16, allow_thp = 43
+        // by page_cross_thread_max_reclaim = 42 and minimal_purge_size).
         const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
-        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), 0);
+        const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
+        // Never purge automatically: the per-allocation purge-timer checks
+        // cost ~25 ns/alloc (measured as the UPDATE-by-PK regression), and
+        // freed pages return explicitly at write-burst boundaries instead
+        // (see `drain_mimalloc_wake`'s mi_collect).
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), -1);
+        // Transparent Huge Pages: the kernel backs the arena's first touch
+        // with 2 MiB huge pages, so a handful of touched bytes materialize
+        // megabytes of RSS (measured +3-4 MB at process start, plus the
+        // same amplification on every big allocation phase). Disabling THP
+        // puts RSS back at exactly-touched-pages granularity. Applies to
+        // segments committed after this point; for the initial arena too,
+        // set MIMALLOC_ARENA_RESERVE=64M (the lean-startup recipe).
+        libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_THP, 0);
+        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_ALLOW_THP), 0);
     });
 }
 

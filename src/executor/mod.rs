@@ -4106,16 +4106,18 @@ impl AggFunc {
 struct ChunkVec<T> {
     chunks: Vec<Box<[T]>>,
     len: usize,
-    chunk: usize,
+    /// Chunk entries = `1 << chunk_shift` (power of two: indexing is a
+    /// shift + mask, not two runtime divisions — the per-row state
+    /// access was the dominant cost of the join+GROUP BY regression).
+    chunk_shift: u32,
 }
 
 impl<T: Clone> ChunkVec<T> {
-    #[allow(clippy::needless_pass_by_value)]
-    fn new(chunk: usize, _init: T) -> Self {
+    fn new(chunk_shift: u32, _init: T) -> Self {
         Self {
             chunks: Vec::new(),
             len: 0,
-            chunk,
+            chunk_shift,
         }
     }
 
@@ -4125,21 +4127,28 @@ impl<T: Clone> ChunkVec<T> {
     }
 
     #[inline]
+    fn chunk(&self) -> usize {
+        1usize << self.chunk_shift
+    }
+
+    #[inline]
     fn get(&self, i: usize) -> &T {
-        &self.chunks[i / self.chunk][i % self.chunk]
+        &self.chunks[i >> self.chunk_shift][i & ((1 << self.chunk_shift) - 1)]
     }
 
     #[inline]
     fn get_mut(&mut self, i: usize) -> &mut T {
-        &mut self.chunks[i / self.chunk][i % self.chunk]
+        let mask = (1usize << self.chunk_shift) - 1;
+        &mut self.chunks[i >> self.chunk_shift][i & mask]
     }
 
     fn push(&mut self, v: T, init: &T) {
-        if self.len == self.chunks.len() * self.chunk {
-            self.chunks.push(vec![init.clone(); self.chunk].into());
+        let chunk = 1usize << self.chunk_shift;
+        if self.len == self.chunks.len() * chunk {
+            self.chunks.push(vec![init.clone(); chunk].into());
         }
-        let ci = self.len / self.chunk;
-        let ei = self.len % self.chunk;
+        let ci = self.len >> self.chunk_shift;
+        let ei = self.len & (chunk - 1);
         self.chunks[ci][ei] = v;
         self.len += 1;
     }
@@ -4165,7 +4174,7 @@ impl Default for HashGrouper {
             mask: 0,
             keys_flat: None,
             keys_multi: Vec::new(),
-            states: ChunkVec::new(128, AggState::default()),
+            states: ChunkVec::new(7, AggState::default()),
             n_aggs: 0,
         }
     }
@@ -4191,7 +4200,7 @@ impl HashGrouper {
     fn with_aggs(n_aggs: usize) -> Self {
         Self {
             n_aggs,
-            states: ChunkVec::new(128, AggState::default()),
+            states: ChunkVec::new(7, AggState::default()),
             ..Default::default()
         }
     }
@@ -4332,7 +4341,7 @@ impl HashGrouper {
         }
         let keys = self
             .keys_flat
-            .get_or_insert_with(|| ChunkVec::new(512, Value::Null));
+            .get_or_insert_with(|| ChunkVec::new(9, Value::Null));
         let gi = keys.len();
         keys.push(key.clone(), &Value::Null);
         let init = AggState::default();
