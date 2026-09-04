@@ -1784,6 +1784,24 @@ impl<'a> Btree<'a> {
         total: u64,
         first: PageId,
     ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.assemble_overflow_payload_into(local, total, first, &mut out)?;
+        Ok(out)
+    }
+
+    /// `assemble_overflow_payload` into a caller-provided buffer (cleared
+    /// first, capacity retained) — lets scans reuse one assembly buffer
+    /// across all overflow rows instead of malloc+free per row.
+    pub(crate) fn assemble_overflow_payload_into(
+        &mut self,
+        local: &[u8],
+        total: u64,
+        first: PageId,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        // Reborrow through a mutable local so the borrow checker sees
+        // disjoint uses (the loop below passes `&mut *buf` per call).
+        let buf = &mut *out;
         let total = total as usize;
         if total < local.len() {
             return Err(Error::corruption(format!(
@@ -1794,8 +1812,14 @@ impl<'a> Btree<'a> {
         }
         // Corrupt files can carry multi-exabyte length varints: clamp the
         // reservation (the walk below grows/validates the real length).
-        let mut out = Vec::with_capacity(total.min(1 << 20));
-        out.extend_from_slice(local);
+        // Reserve the FULL payload up front: the walk appends `total -
+        // local.len()` bytes across the chain, and without this each
+        // chain page triggers a realloc+memcpy of the growing buffer —
+        // for a 64KB blob that's ~16 doublings of a ~32KB average = ~512KB
+        // of memcpy per row (8x the payload itself).
+        buf.clear();
+        buf.reserve(total.min(1 << 20).saturating_sub(buf.capacity().min(total.min(1 << 20))));
+        buf.extend_from_slice(local);
         let cap = self.overflow_page_capacity();
         let mut remaining = total - local.len();
         let mut cur = first;
@@ -1822,12 +1846,12 @@ impl<'a> Btree<'a> {
             // Cache-bypassing sequential read (see
             // Pager::read_overflow_page_append): overflow chains are
             // read-once in scans; caching them evicts the live tree pages.
-            let before = out.len();
-            let (next, got) = self.pager.read_overflow_page_append(cur, &mut out)?;
+            let before = buf.len();
+            let (next, got) = self.pager.read_overflow_page_append(cur, buf)?;
             if got < take {
                 return Err(Error::corruption("overflow page data region truncated"));
             }
-            out.truncate(before + take);
+            buf.truncate(before + take);
             remaining -= take;
             cur = next;
         }
@@ -1838,7 +1862,7 @@ impl<'a> Btree<'a> {
                 total
             )));
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Make a leaf cell for (rowid, payload): in-page when it fits,
@@ -4584,9 +4608,26 @@ impl<'a> Btree<'a> {
                                 .try_into()
                                 .unwrap(),
                         );
-                        let assembled =
-                            self.assemble_overflow_payload(local, plen as u64, chain)?;
-                        if !f(rowid, &assembled) {
+                        // Reuse one assembly buffer across all overflow
+                        // rows in this scan: a 64KB blob scan otherwise
+                        // pays a 64KB malloc+free per row (~100 rows =
+                        // 6.4MB of allocator traffic + zeroing). The
+                        // callback receives the buffer's contents and
+                        // must NOT retain the slice (it is reused for
+                        // the next row) — the scan callbacks copy or
+                        // decode synchronously, so this is safe.
+                        thread_local! {
+                            static ASSEMBLE_BUF: std::cell::RefCell<Vec<u8>> =
+                                std::cell::RefCell::new(Vec::with_capacity(1 << 16));
+                        }
+                        let cont = ASSEMBLE_BUF.with(|b| {
+                            let mut buf = b.borrow_mut();
+                            self.assemble_overflow_payload_into(
+                                local, plen as u64, chain, &mut buf,
+                            )
+                            .map(|_| f(rowid, &buf))
+                        })?;
+                        if !cont {
                             return Ok(false);
                         }
                     }
@@ -5189,6 +5230,8 @@ impl<'a> Btree<'a> {
                             }
                         } else {
                             // Overflow cell: local prefix + chain head.
+                            // Same zero-copy assembly buffer as the full
+                            // scan path (see scan_subtree_borrowed).
                             if local_len + 4 > buf.len() - payload_start {
                                 return Err(Error::corruption(
                                     "truncated overflow cell in range_borrowed",
@@ -5200,8 +5243,18 @@ impl<'a> Btree<'a> {
                                     .try_into()
                                     .unwrap(),
                             );
-                            let assembled = self.assemble_overflow_payload(local, plen, chain)?;
-                            if !f(rowid, &assembled) {
+                            thread_local! {
+                                static ASSEMBLE_BUF_RANGE: std::cell::RefCell<Vec<u8>> =
+                                    std::cell::RefCell::new(Vec::with_capacity(1 << 16));
+                            }
+                            let cont = ASSEMBLE_BUF_RANGE.with(|b| {
+                                let mut abuf = b.borrow_mut();
+                                self.assemble_overflow_payload_into(
+                                    local, plen, chain, &mut abuf,
+                                )
+                                .map(|_| f(rowid, &abuf))
+                            })?;
+                            if !cont {
                                 return Ok(false);
                             }
                         }

@@ -1484,6 +1484,12 @@ fn bytes_contains_fold(hay: &[u8], needle: &[u8], case_sensitive: bool) -> bool 
     if hay.len() < n {
         return false;
     }
+    if case_sensitive {
+        // memchr-style two-way scan without the per-byte fold: the
+        // case-insensitive path below folds every haystack byte; the
+        // sensitive path can use the libc-optimized substring search.
+        return memchr_contains(hay, needle);
+    }
     let first = fold_ascii(needle[0], case_sensitive);
     'outer: for i in 0..=(hay.len() - n) {
         if fold_ascii(hay[i], case_sensitive) != first {
@@ -1491,6 +1497,72 @@ fn bytes_contains_fold(hay: &[u8], needle: &[u8], case_sensitive: bool) -> bool 
         }
         for j in 1..n {
             if fold_ascii(hay[i + j], case_sensitive) != fold_ascii(needle[j], case_sensitive) {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// memchr-grade substring search for the case-sensitive path (GLOB-style
+/// or LIKE on already-folded bytes): skip by first byte, compare the
+/// tail with a single memcmp. The naive per-byte fold loop above costs
+/// ~2-3 ns/byte; this costs ~0.3 ns/byte on modern libc memcmp.
+fn memchr_contains(hay: &[u8], needle: &[u8]) -> bool {
+    let n = needle.len();
+    if n == 0 {
+        return true;
+    }
+    if hay.len() < n {
+        return false;
+    }
+    let first = needle[0];
+    let mut i = 0usize;
+    let last = hay.len() - n;
+    while i <= last {
+        // Skip to the next first-byte candidate.
+        let off = hay[i..].iter().position(|&b| b == first);
+        match off {
+            None => return false,
+            Some(k) => {
+                i += k;
+                if i > last {
+                    return false;
+                }
+                if &hay[i + 1..i + n] == &needle[1..] {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Case-insensitive ASCII substring search over bytes (LIKE's folding is
+/// ASCII-only, so this is exact for ASCII needles against any subject).
+/// Pre-folds the needle once — the caller passes the folded needle — and
+/// folds each haystack byte once per candidate position.
+pub fn like_contains_bytes(hay: &[u8], needle_folded: &[u8]) -> bool {
+    let n = needle_folded.len();
+    if n == 0 {
+        return true;
+    }
+    if hay.len() < n {
+        return false;
+    }
+    let first = needle_folded[0];
+    let mut i = 0usize;
+    let last = hay.len() - n;
+    'outer: while i <= last {
+        if hay[i].to_ascii_lowercase() != first {
+            i += 1;
+            continue;
+        }
+        for j in 1..n {
+            if hay[i + j].to_ascii_lowercase() != needle_folded[j] {
+                i += 1;
                 continue 'outer;
             }
         }

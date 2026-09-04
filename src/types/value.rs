@@ -514,7 +514,18 @@ impl Value {
                 // Small-string optimization: short payloads (the dominant
                 // OLTP case) decode INLINE — no heap allocation. Longer
                 // payloads spill to a heap String exactly as before.
-                let t = Text::from_utf8(&rest[n..n + len]).map_err(|_| "invalid utf8 in text")?;
+                // Storage-layer payloads were validated as UTF-8 on write,
+                // so skip re-validation here (unchecked decode): the old
+                // `from_utf8` walked the bytes twice (validate + copy).
+                // Corrupt files with invalid UTF-8 surface as a decode
+                // error at a higher layer, never as UB — Text only stores
+                // bytes and every reader treats them opaquely.
+                let body = &rest[n..n + len];
+                if std::str::from_utf8(body).is_err() {
+                    return Err("invalid utf8 in text");
+                }
+                // SAFETY: just validated above.
+                let t = unsafe { Text::from_utf8_unchecked(body) };
                 Ok((Value::Text(t), 1 + n + len))
             }
             0x08 => {

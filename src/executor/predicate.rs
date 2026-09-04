@@ -283,6 +283,15 @@ pub(crate) enum CompiledPredicate {
         negated: bool,
         glob: bool,
     },
+    /// `col = 'text-literal'` — byte equality without Value construction.
+    /// Only built when the literal is TEXT (numeric literals keep the
+    /// generic Cmp so cross-type coercion stays exact).
+    TextEq { col: usize, rhs: PredValue },
+    /// `col LIKE '%needle%'` — pre-classified contains search. Only built
+    /// for ASCII needles with no other wildcards and no negation (NOT
+    /// LIKE keeps the general Like arm). The needle bytes are stored
+    /// inline (small) so per-row work is one substring search.
+    LikeSubstr { col: usize, needle: Vec<u8> },
 }
 
 /// Column indices referenced by the predicate (for building the selective
@@ -342,6 +351,11 @@ pub(crate) fn compiled_columns(p: &CompiledPredicate, out: &mut Vec<usize>) {
             }
         }
         CompiledPredicate::Like { col, .. } => out.push(*col),
+        CompiledPredicate::TextEq { col, rhs } => {
+            out.push(*col);
+            operand_columns(rhs, out);
+        }
+        CompiledPredicate::LikeSubstr { col, .. } => out.push(*col),
     }
 }
 
@@ -494,8 +508,38 @@ impl CompiledPredicate {
                 };
                 matched != *negated
             }
+            CompiledPredicate::TextEq { col, rhs } => {
+                // TEXT equality without Value construction: byte compare
+                // directly. Non-TEXT operands (INTEGER/REAL compare
+                // numerically in SQLite, e.g. 5 = '5') decline to the
+                // general path.
+                let l = row.get(positions[*col]).unwrap_or(null_ref());
+                let r = rhs.eval(row, positions, params);
+                match (l, &*r) {
+                    (Value::Text(a), Value::Text(b)) => a.as_bytes() == b.as_bytes(),
+                    _ => apply_binary(BinaryOp::Eq, l, &r).is_truthy(),
+                }
+            }
+            CompiledPredicate::LikeSubstr { col, needle } => {
+                // Pre-classified `%needle%` (ASCII needle, no other
+                // wildcards): byte-substring search with ASCII folding —
+                // no per-row pattern classification, no Value dispatch.
+                // Non-TEXT values decline (SQLite casts numerics to text
+                // for LIKE; the general path handles that).
+                let v = row.get(positions[*col]).unwrap_or(null_ref());
+                let Value::Text(t) = v else {
+                    let p = Value::Text(needle_text(needle));
+                    return crate::executor::expr::like_match(v, &p, None, false);
+                };
+                crate::executor::expr::like_contains_bytes(t.as_bytes(), needle)
+            }
         }
     }
+}
+
+/// Rebuild a Text from a leaked byte slice (LikeSubstr needle storage).
+fn needle_text(b: &[u8]) -> crate::types::text::Text {
+    crate::types::text::Text::new(unsafe { std::str::from_utf8_unchecked(b) })
 }
 
 /// Bind a leaf expression (literal / positional parameter / bare column).
@@ -640,6 +684,27 @@ pub(crate) fn compile_predicate(
             op if is_cmp_op(*op) => {
                 let lhs = bind_operand(left, table, prefix)?;
                 let rhs = bind_operand(right, table, prefix)?;
+                // TEXT `=` fast path: `col = 'literal'` (either side)
+                // with a TEXT literal compiles to byte equality — no
+                // per-row Value construction, NaN probes, or collation
+                // dispatch. Non-Eq operators and non-TEXT literals keep
+                // the generic Cmp (cross-type coercion must stay exact).
+                if *op == BinaryOp::Eq {
+                    if let (PredValue::Col(c), PredValue::Literal(Value::Text(_))) = (&lhs, &rhs)
+                    {
+                        return Some(CompiledPredicate::TextEq {
+                            col: *c,
+                            rhs: rhs.clone(),
+                        });
+                    }
+                    if let (PredValue::Literal(Value::Text(_)), PredValue::Col(c)) = (&lhs, &rhs)
+                    {
+                        return Some(CompiledPredicate::TextEq {
+                            col: *c,
+                            rhs: lhs.clone(),
+                        });
+                    }
+                }
                 // SQL comparison with NULL on either side is never true —
                 // handled by apply_binary's semantics, so pass through.
                 Some(CompiledPredicate::Cmp { lhs, op: *op, rhs })
@@ -832,6 +897,17 @@ pub(crate) fn compile_predicate(
             if matches!(pat, PredValue::Col(_)) {
                 return None; // column-vs-column LIKE: general path
             }
+            // `%needle%` fast path: LIKE (not GLOB), no negation, TEXT
+            // literal pattern of the exact shape `%<ascii-needle>%` with
+            // no other wildcards. Pre-classified once at plan time; the
+            // per-row work is a single byte-substring search.
+            if !glob && !negated {
+                if let PredValue::Literal(Value::Text(t)) = &pat {
+                    if let Some(needle) = classify_contains(t.as_bytes()) {
+                        return Some(CompiledPredicate::LikeSubstr { col, needle });
+                    }
+                }
+            }
             Some(CompiledPredicate::Like {
                 col,
                 pattern: pat,
@@ -841,6 +917,25 @@ pub(crate) fn compile_predicate(
         }
         _ => None,
     }
+}
+
+/// Classify a LIKE pattern as a plain `%needle%` contains search.
+/// Returns the ASCII-LOWERED needle bytes when the pattern is exactly
+/// `%` + ASCII needle + `%` with no other `%`/`_` inside and a non-empty
+/// needle. Lowering once at plan time means the per-row search folds
+/// only the haystack bytes.
+fn classify_contains(p: &[u8]) -> Option<Vec<u8>> {
+    if p.len() < 3 || p[0] != b'%' || p[p.len() - 1] != b'%' {
+        return None;
+    }
+    let needle = &p[1..p.len() - 1];
+    if needle.is_empty() || !needle.is_ascii() {
+        return None;
+    }
+    if needle.iter().any(|&b| b == b'%' || b == b'_') {
+        return None;
+    }
+    Some(needle.to_ascii_lowercase())
 }
 
 /// Column indices referenced by a compiled expression (for building the

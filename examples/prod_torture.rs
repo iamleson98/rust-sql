@@ -119,7 +119,16 @@ fn sq_mem() -> rusqlite::Connection {
 fn rq_file(name: &str) -> Database {
     let path = format!("{}/{}.rq.db", scratch(), name);
     let _ = std::fs::remove_file(&path);
-    Database::open(&path).unwrap()
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let mut db = Database::open(&path).unwrap();
+    // Durability parity with sq_file's `WAL + synchronous=OFF`: WAL mode
+    // batches the commit into sequential frame appends (no per-page
+    // scattered writes + header fsync), and synchronous=OFF skips the WAL
+    // fsync. Without this the comparison pits a fully-durable engine
+    // against a non-durable SQLite — a harness artifact, not an engine gap.
+    db.execute("PRAGMA journal_mode=WAL", []).unwrap();
+    db.execute("PRAGMA synchronous=OFF", []).unwrap();
+    db
 }
 
 fn sq_file(name: &str) -> rusqlite::Connection {

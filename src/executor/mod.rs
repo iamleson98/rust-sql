@@ -884,6 +884,29 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     Some(columns),
                 );
             }
+            // FUSED PATH: Project over a bare table Scan with a bare-column
+            // projection — decode ONLY the projected columns per row
+            // (selective decode), skipping un-referenced wide TEXT/BLOB
+            // columns entirely. Without this, `SELECT id FROM wide` pays a
+            // full-row decode (including the 2KB TEXT copy) per row before
+            // the projection throws the wide column away — ~6x slower than
+            // SQLite's zero-copy column reads on wide tables.
+            if let Plan::Scan {
+                table,
+                alias: _,
+                index: None,
+                predicate: None,
+            } = &**input
+            {
+                if let Some((project, out_cols)) = bare_column_projection(columns, table) {
+                    return exec_scan_projected(
+                        ctx,
+                        table.clone(),
+                        project.as_deref(),
+                        out_cols,
+                    );
+                }
+            }
             exec_project(ctx, input, columns)
         }
         Plan::Sort { input, terms } => exec_sort(ctx, input, terms),
@@ -2736,6 +2759,78 @@ fn exec_scan(
     Ok(ExecResult { columns, rows })
 }
 
+/// Project over a bare table Scan with the projection fused: decode ONLY
+/// the projected columns per row (selective decode). `project == None`
+/// means identity (SELECT *) — decode the full row. Wide TEXT/BLOB
+/// columns that aren't projected cost one length probe each instead of a
+/// full decode + copy.
+fn exec_scan_projected(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
+    if table.vtab.is_some() {
+        // Virtual tables have no B+tree payload to selective-decode;
+        // run the module scan, then project the materialized rows.
+        let full = vtab_exec::exec_scan_vtab(ctx, &table, None, None)?;
+        return match project {
+            Some(idxs) => {
+                let mut rows: Vec<Row> = Vec::with_capacity(full.rows.len());
+                for row in &full.rows {
+                    let mut out: Vec<Value> = Vec::with_capacity(idxs.len());
+                    for &c in idxs {
+                        out.push(row.get(c).cloned().unwrap_or(Value::Null));
+                    }
+                    rows.push(out);
+                }
+                Ok(ExecResult {
+                    columns: out_cols,
+                    rows,
+                })
+            }
+            None => Ok(ExecResult {
+                columns: out_cols,
+                rows: full.rows,
+            }),
+        };
+    }
+    let root = ctx.table_root(&table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let mut rows: Vec<Row> = Vec::new();
+    match project {
+        Some(idxs) => {
+            // The selective decoder handles ascending, non-ascending,
+            // AND duplicate projections internally (sorted walk + slot
+            // permutation + duplicate-run placement) — pass the original
+            // index list through unchanged.
+            bt.scan_table_borrowed(|rowid, payload| {
+                let mut row: Vec<Value> = Vec::with_capacity(idxs.len());
+                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
+                    .is_ok()
+                {
+                    rows.push(row);
+                }
+                true
+            })?;
+        }
+        None => {
+            bt.scan_table_borrowed(|rowid, payload| {
+                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    rows.push(row);
+                }
+                true
+            })?;
+        }
+    }
+    Ok(ExecResult {
+        columns: out_cols,
+        rows,
+    })
+}
+
 // ============================================================================
 // Values
 // ============================================================================
@@ -4424,6 +4519,204 @@ struct FusedAggSpec {
 /// (stack array). Wider shapes fall back to the generic paths.
 const FUSED_MAX_COLS: usize = 8;
 
+/// Zero-decode COUNT(*) over a TEXT filter: `COUNT(*) WHERE col = 'lit'`
+/// or `COUNT(*) WHERE col LIKE '%needle%'`. Returns `Ok(None)` when the
+/// shape is unsupported (caller falls through to the generic paths).
+/// Otherwise returns the count — payload bytes are never decoded into
+/// Values: the scan walks each row's serial layout with length probes,
+/// then byte-compares the filter column in place.
+///
+/// Correctness notes:
+/// - Only fires when the filter column is NOT the rowid alias (the alias
+///   column holds a 1-byte marker, not the value).
+/// - TEXT equality: SQLite compares TEXT byte-wise under BINARY collation
+///   (the default); a non-TEXT stored value never equals a TEXT literal
+///   (different type tags), so tag-check + byte compare is exact.
+/// - LIKE `%needle%`: ASCII needle, case-insensitive ASCII folding —
+///   exact per SQLite's LIKE semantics (non-ASCII bytes compare exactly,
+///   ASCII folds). Non-TEXT stored values are cast to text by SQLite for
+///   LIKE; a numeric payload can never contain the needle's bytes as a
+///   TEXT body... except via tag confusion — so non-TEXT tags decline
+///   (fall back per-row to like_match). The fallback is per-row, not
+///   whole-query: TEXT rows (the overwhelming majority) stay zero-decode.
+fn try_text_count(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    prefix: &str,
+    filter: Option<&Expr>,
+) -> Result<Option<i64>> {
+    use crate::sql::ast::LikeOp;
+    let pred = match filter {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    enum TextFilter<'a> {
+        Eq(&'a [u8]),
+        Contains(Vec<u8>),
+    }
+    let (col, tf): (usize, TextFilter<'_>) = match pred {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let (col_expr, lit_expr) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column { .. }, _) => (left.as_ref(), right.as_ref()),
+                (_, Expr::Column { .. }) => (right.as_ref(), left.as_ref()),
+                _ => return Ok(None),
+            };
+            let Expr::Column { table: ref_t, name } = col_expr else {
+                return Ok(None);
+            };
+            let in_scope = ref_t
+                .as_ref()
+                .map(|t| {
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
+                .unwrap_or(true);
+            if !in_scope {
+                return Ok(None);
+            }
+            let Some(col) = table.find_column(name) else {
+                return Ok(None);
+            };
+            let Expr::Literal(Value::Text(t)) = lit_expr else {
+                return Ok(None);
+            };
+            (col, TextFilter::Eq(t.as_bytes()))
+        }
+        Expr::Like {
+            op: LikeOp::Like,
+            expr,
+            pattern,
+            escape: None,
+            negated: false,
+        } => {
+            let Expr::Column { table: ref_t, name } = expr.as_ref() else {
+                return Ok(None);
+            };
+            let in_scope = ref_t
+                .as_ref()
+                .map(|t| {
+                    if prefix == table.name {
+                        t == &table.name || t == prefix
+                    } else {
+                        t == prefix
+                    }
+                })
+                .unwrap_or(true);
+            if !in_scope {
+                return Ok(None);
+            }
+            let Some(col) = table.find_column(name) else {
+                return Ok(None);
+            };
+            let Expr::Literal(Value::Text(t)) = pattern.as_ref() else {
+                return Ok(None);
+            };
+            let p = t.as_bytes();
+            if p.len() < 3 || p[0] != b'%' || p[p.len() - 1] != b'%' {
+                return Ok(None);
+            }
+            let needle = &p[1..p.len() - 1];
+            if needle.is_empty() || !needle.is_ascii() {
+                return Ok(None);
+            }
+            if needle.iter().any(|&b| b == b'%' || b == b'_') {
+                return Ok(None);
+            }
+            (col, TextFilter::Contains(needle.to_ascii_lowercase()))
+        }
+        _ => return Ok(None),
+    };
+    if table.rowid_alias == Some(col) {
+        return Ok(None);
+    }
+    let n_cols = table.n_columns();
+    let root = ctx.table_root(table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let mut count: i64 = 0;
+    let mut bailed = false;
+    bt.scan_table_borrowed(|_rowid, payload| {
+        match payload_text_at(payload, n_cols, col) {
+            Some(body) => {
+                let hit = match &tf {
+                    TextFilter::Eq(lit) => body == *lit,
+                    TextFilter::Contains(needle) => {
+                        crate::executor::expr::like_contains_bytes(body, needle)
+                    }
+                };
+                if hit {
+                    count += 1;
+                }
+            }
+            None => {
+                // Non-TEXT tag or truncated row: per-row fallback through
+                // the general LIKE/eq semantics (preserves numeric-cast
+                // and NULL behavior exactly).
+                bailed = true;
+                return false;
+            }
+        }
+        true
+    })?;
+    if bailed {
+        return Ok(None);
+    }
+    Ok(Some(count))
+}
+
+/// Borrow the TEXT body of column `col` from an encoded row payload
+/// without decoding any Value. Returns None for non-TEXT tags,
+/// truncated payloads, or short rows (missing column).
+fn payload_text_at(payload: &[u8], n_cols: usize, col: usize) -> Option<&[u8]> {
+    if col >= n_cols {
+        return None;
+    }
+    let mut pos = 0usize;
+    for c in 0..=col {
+        if pos >= payload.len() {
+            return None;
+        }
+        let tag = payload[pos];
+        if c == col {
+            if tag != 0x07 {
+                return None;
+            }
+            let rest = &payload[pos + 1..];
+            let (len, n) = crate::types::value::decode_uvarint(rest).ok()?;
+            let len = len as usize;
+            if rest.len() < n + len {
+                return None;
+            }
+            return Some(&rest[n..n + len]);
+        }
+        // Skip column c.
+        pos += match tag {
+            0x00 | 0x01 | 0x09 => 1,
+            0x02 => 2,
+            0x03 => 3,
+            0x04 => 5,
+            0x05 | 0x06 => 9,
+            0x0A => {
+                let (_, n) = crate::types::value::decode_uvarint(&payload[pos + 1..]).ok()?;
+                1 + n
+            }
+            0x07 | 0x08 => {
+                let (len, n) =
+                    crate::types::value::decode_uvarint(&payload[pos + 1..]).ok()?;
+                1 + n + len as usize
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
 /// Resolve a bare column reference against `table` with the same
 /// alias-scoping rules the generic paths use.
 fn fused_resolve_col(expr: &Expr, table: &Table, prefix: &str) -> Option<usize> {
@@ -4582,6 +4875,28 @@ fn try_fused_aggregate(
         return Ok(None);
     }
     let prefix = alias.unwrap_or(&table.name);
+
+    // ---- Zero-decode COUNT fast path: COUNT(*) with a TEXT equality or
+    // `%needle%` LIKE filter. The generic fused machine below bails on
+    // TEXT values (it only decodes numerics), falling back to full
+    // Value-decode + compare (~55 ns/row). This path walks the payload
+    // bytes directly: skip to the filter column via length probes, then
+    // byte-compare (equality) or substring-search (LIKE) WITHOUT
+    // decoding any Value or validating UTF-8. COUNT(*) needs no other
+    // columns, so non-filter columns cost one length probe each.
+    if aggregates.len() == 1
+        && aggregates[0].func == "count"
+        && aggregates[0].arg.is_none()
+        && !aggregates[0].distinct
+    {
+        if let Some(n) = try_text_count(ctx, table, prefix, filter_predicate)? {
+            let row: Vec<Value> = vec![Value::Integer(n)];
+            return Ok(Some(ExecResult {
+                columns: Arc::from(vec!["__agg_0".to_string()]),
+                rows: vec![row],
+            }));
+        }
+    }
 
     // ---- Shape checks -------------------------------------------------
     let filter = match filter_predicate {
@@ -8010,7 +8325,16 @@ fn exec_rowid_range(
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
     let n_cols = table.n_columns();
-    let mut rows: Vec<Row> = Vec::new();
+    // Pre-size from the range width: a 45k-row range that grows by
+    // doubling pays ~16 realloc+memcpy rounds on the row Vec (~45k row
+    // Vecs copied repeatedly). The width is an exact upper bound for
+    // dense rowid ranges (the common case) and a harmless over-estimate
+    // otherwise — capped so absurd ranges can't OOM.
+    let est = end
+        .saturating_sub(start)
+        .clamp(0, 1 << 20) as usize
+        + 1;
+    let mut rows: Vec<Row> = Vec::with_capacity(est.min(1 << 20));
     // `scan_table_range` is inclusive on both ends. For strict `>` / `<`
     // conjuncts, the planner kept a residual predicate that re-checks the
     // strict comparison; we apply it here so we don't accidentally include
@@ -8548,15 +8872,20 @@ impl IndexMaintState {
     /// Encode `row`'s index key into `buf` (cleared first) using the
     /// pre-resolved column positions — zero allocations, no name lookups.
     /// Collated index columns (NOCASE / RTRIM) fold their TEXT values so
-    /// the stored key matches probe keys.
+    /// the stored key matches probe keys. BINARY (the default) borrows
+    /// the value with no clone.
     #[inline]
     pub fn encode_key(&mut self, row: &[Value]) -> &[u8] {
         self.key_buf.clear();
         for (i, &pos) in self.cols.iter().enumerate() {
             if let Some(v) = row.get(pos) {
                 if let Some(ic) = self.idx.columns.get(i) {
-                    crate::plugin::collation_fold_key(&ic.collation, v)
-                        .encode_order_key_into(&mut self.key_buf);
+                    if ic.collation.eq_ignore_ascii_case("BINARY") {
+                        v.encode_order_key_into(&mut self.key_buf);
+                    } else {
+                        crate::plugin::collation_fold_key(&ic.collation, v)
+                            .encode_order_key_into(&mut self.key_buf);
+                    }
                 } else {
                     v.encode_order_key_into(&mut self.key_buf);
                 }
@@ -12311,7 +12640,28 @@ fn try_streaming_delete(
     let root = ctx.table_root(table);
 
     // ---- Phase 1: collect rowids to delete ----
-    let mut rowids: Vec<i64> = Vec::new();
+    // Pre-size from the range width when known (RowidRange): a 45k-row
+    // range that grows by doubling pays ~16 realloc rounds on the rowid
+    // Vec. The width is an exact upper bound for dense ranges, capped so
+    // absurd bounds can't OOM.
+    let est_rows: usize = match range {
+        Some((start_expr, end_expr)) => {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let lo = match start_expr {
+                Some(e) => evaluate(e, &eval_ctx).map(|v| v.as_integer()).unwrap_or(i64::MIN),
+                None => i64::MIN,
+            };
+            let hi = match end_expr {
+                Some(e) => evaluate(e, &eval_ctx).map(|v| v.as_integer()).unwrap_or(i64::MAX),
+                None => i64::MAX,
+            };
+            hi.saturating_sub(lo).clamp(0, 1 << 20) as usize + 1
+        }
+        None => 1024,
+    };
+    let mut rowids: Vec<i64> = Vec::with_capacity(est_rows.min(1 << 20));
     let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
     let mut first_error: Option<crate::error::Error> = None;
 
@@ -12395,6 +12745,11 @@ fn try_streaming_delete(
     } else if let Some((start_expr, end_expr)) = range {
         // RowidRange source: walk the range, decode each payload for the
         // residual predicate (ranges are inclusive on both ends).
+        // Compiled-residual fast path: `id > ?` / `id >= ?` style strict
+        // bounds compile to a positional integer comparison — no
+        // full-row decode, no col_names Vec, no AST walk per row. The
+        // residual only references the rowid column here in practice;
+        // anything else falls back to the general path below.
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
@@ -12406,25 +12761,62 @@ fn try_streaming_delete(
             Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
             None => i64::MAX,
         };
-        bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-            if let Some(pred) = residual_pred {
-                row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
-                {
-                    return true; // skip undecodable rows, keep walking
-                }
-                match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
-                    Ok(v) if v.is_truthy() => {}
-                    Ok(_) => return true,
-                    Err(e) => {
-                        first_error = Some(e);
-                        return false;
-                    }
+        // Strict-bound fast check: `id > v` excludes exactly rowid == v
+        // (the scan is inclusive; the residual only trims the boundary).
+        // `id < v` symmetrically. Any other residual shape uses eval_row.
+        let strict_gt: Option<i64> = match residual_pred {
+            Some(Expr::Binary {
+                op: BinaryOp::Gt,
+                left,
+                right,
+            }) => {
+                let is_id = |e: &Expr| {
+                    matches!(e, Expr::Column { name, .. } if {
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        table.rowid_alias.and_then(|i| table.columns.get(i)).map(|c| bare.eq_ignore_ascii_case(&c.name)).unwrap_or(false)
+                            || bare.eq_ignore_ascii_case("rowid")
+                    })
+                };
+                let bound_of = |e: &Expr| evaluate(e, &eval_ctx).ok().map(|v| v.as_integer());
+                if is_id(left) {
+                    bound_of(right)
+                } else if is_id(right) {
+                    bound_of(left)
+                } else {
+                    None
                 }
             }
-            rowids.push(rowid);
-            true
-        })?;
+            _ => None,
+        };
+        if let Some(b) = strict_gt {
+            bt.scan_table_range_borrowed(lo, hi, |rowid, _payload| {
+                if rowid != b {
+                    rowids.push(rowid);
+                }
+                true
+            })?;
+        } else {
+            bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+                if let Some(pred) = residual_pred {
+                    row_buf.clear();
+                    if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
+                        .is_err()
+                    {
+                        return true; // skip undecodable rows, keep walking
+                    }
+                    match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                        Ok(v) if v.is_truthy() => {}
+                        Ok(_) => return true,
+                        Err(e) => {
+                            first_error = Some(e);
+                            return false;
+                        }
+                    }
+                }
+                rowids.push(rowid);
+                true
+            })?;
+        }
     } else {
         // Full scan (optionally filtered): walk every cell.
         bt.scan_table_borrowed(|rowid, payload| {
