@@ -4127,11 +4127,6 @@ impl<T: Clone> ChunkVec<T> {
     }
 
     #[inline]
-    fn chunk(&self) -> usize {
-        1usize << self.chunk_shift
-    }
-
-    #[inline]
     fn get(&self, i: usize) -> &T {
         &self.chunks[i >> self.chunk_shift][i & ((1 << self.chunk_shift) - 1)]
     }
