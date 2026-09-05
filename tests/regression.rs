@@ -1118,3 +1118,51 @@ fn regression_streaming_limit_offset_range_batches() {
     }
     assert_eq!(ids2, (2996..=3000).collect::<Vec<i64>>());
 }
+
+// Regression: the schema btree (rooted at hybrid page 0) splits when the
+// schema outgrows one page; without re-pinning the root into page 0, a
+// reopen only saw the rows still under page 0 — silent data loss for
+// ~25+ object schemas (found by the schema-split probe, 2026-09-05).
+#[test]
+fn regression_schema_split_survives_reopen() {
+    let path = std::env::temp_dir().join("rq_regress_schema_split.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = rustqlite::Database::open(&path).unwrap();
+        for i in 0..300 {
+            db.execute(
+                &format!("CREATE TABLE t{i} (a INTEGER PRIMARY KEY, b TEXT, c REAL)"),
+                (),
+            )
+            .unwrap();
+        }
+        for i in 0..50 {
+            db.execute(&format!("CREATE INDEX ix{i} ON t{i} (b)"), ())
+                .unwrap();
+        }
+        db.execute("INSERT INTO t299 (b, c) VALUES ('x', 1.5)", ())
+            .unwrap();
+        let n = db.query("SELECT COUNT(*) FROM sqlite_master", []).unwrap();
+        assert_eq!(n[0][0], rustqlite::Value::Integer(350));
+    }
+    // Reopen: every object must come back.
+    let db = rustqlite::Database::open(&path).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM sqlite_master", []).unwrap();
+    assert_eq!(n[0][0], rustqlite::Value::Integer(350));
+    // The FIRST-created and LAST-created tables both resolve and serve.
+    let rows = db.query("SELECT b, c FROM t0 WHERE a = 1", []).unwrap();
+    assert_eq!(rows.len(), 0);
+    let rows = db.query("SELECT b, c FROM t299", []).unwrap();
+    assert_eq!(rows[0][0], rustqlite::Value::Text("x".into()));
+    assert_eq!(rows[0][1], rustqlite::Value::Real(1.5));
+    // Indexes on split schemas still work.
+    let rows = db.query("SELECT a FROM t299 WHERE b = 'x'", []).unwrap();
+    assert_eq!(rows.len(), 1);
+    // DDL continues to work after the split + reopen (schema tree grows
+    // further under the re-pinned root).
+    let mut db = db;
+    db.execute("CREATE TABLE t300_extra (a INT)", ()).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM sqlite_master", []).unwrap();
+    assert_eq!(n[0][0], rustqlite::Value::Integer(351));
+    let _ = std::fs::remove_file(&path);
+}

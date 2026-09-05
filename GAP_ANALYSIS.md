@@ -418,3 +418,33 @@ positional projection when a residual is present).
   which also reports appended bytes for length validation) — the old
   path paid 16 RwLock acquisitions per 64 KB blob (~15% of the scan on
   bandwidth-bound hardware).
+
+## 7. 2026-09-05 (V) — schema-split data-loss fix + page-level VACUUM
+
+**CRITICAL correctness fix: the schema btree's root could silently
+detach.** The schema table lives at hybrid page 0 (100-byte file header +
+btree header at offset 100); every reader hardcodes root 0. When a
+schema outgrew one page (~25+ objects), the split moved the root to a
+freshly allocated interior page and the mutation sites ignored
+`bt.root` — a reopen then saw only the rows still under page 0: silent
+DATA LOSS (a 350-object schema lost tables). Fix: `storage::vacuum::
+repin_schema_root` swaps the new interior root into page 0 (file header
+preserved, cell bytes at their absolute offsets) and page 0's old leaf
+into the allocated page, remapping the interior's child reference; all
+schema-tree mutation sites now run through `schema_tree_mutate`, which
+re-pins whenever a split moved the root. Regression test: 350 objects
+created, reopened, counted, and queried (first + last table + index).
+
+**VACUUM page-level fast path.** The row-level copy (temp-file DB,
+per-row SQL inserts — even inside one transaction) cost ~1.3 µs/row:
+S14's vacuum measured 137 ms vs SQLite's 6.4 ms. The new fast path
+(no active codec) mirrors SQLite's own VACUUM shape: every live tree
+page is copied into a fresh in-memory pager in post-order (children
+first), remapping interior children, right-most pointers, leaf overflow
+chain heads, and overflow next links; free pages are simply not walked
+(that IS the compaction); the schema rows are re-inserted with the
+remapped roots (through `schema_tree_mutate`, split-safe); one flush
+materializes the image. **S14 vacuum: 3.7 ms vs SQLite's 6.4 ms
+(1.7x WIN; was 22x LOSS).** Codec databases keep the row-level path
+(codec encode/decode must apply per page); the fast path declines on
+any copy error and falls back.

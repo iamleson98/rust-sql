@@ -601,6 +601,14 @@ pub struct Pager {
     /// by `CommittedViewGuard::drop` with a single write-epoch bump so
     /// the reader's advisory-cache state can never outlive its scope.
     committed_poison: std::sync::atomic::AtomicBool,
+    /// Cache of the BOTTOM savepoint's base.n_pages (the committed-view
+    /// bound) — 0 = no savepoint stack (committed == live). Maintained
+    /// inside the savepoints-lock critical sections so
+    /// `committed_bound()` is a single Acquire load: every armed
+    /// committed-view reader query used to take the savepoints Mutex,
+    /// contending with the writer's per-page undo capture (a lock convoy
+    /// with 7 reader threads on multicore boxes).
+    committed_bound_cache: std::sync::atomic::AtomicU32,
     /// Fast-path gate for the committed-view scope check in `get_page`:
     /// the scope COUNT below, loaded as a single Acquire load — zero (the
     /// overwhelming common case — no reader scope armed) skips the
@@ -742,6 +750,10 @@ impl Pager {
         let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
         self.savepoint_min_base.store(m, Ordering::Relaxed);
         self.savepoint_depth.store(sp.len(), Ordering::Release);
+        // Committed-view bound cache: the FIRST level is the txn base.
+        if let Some(base) = sp.first().map(|s| s.base.n_pages) {
+            self.committed_bound_cache.store(base, Ordering::Release);
+        }
     }
 
     /// ROLLBACK TO SAVEPOINT <name>: restore the pager to the savepoint's
@@ -777,6 +789,9 @@ impl Pager {
             });
             let keep_depth = sp.len();
             self.savepoint_depth.store(keep_depth, Ordering::Release);
+            // The bottom level never changes here (idx >= 0 re-pushed at
+            // idx), so the bound cache stays valid — except the idx == 0
+            // re-push, which keeps the same base. No update needed.
             (level.pages, level.base)
         };
         // Phase 2 (no savepoints lock): restore pre-images for pages that
@@ -872,6 +887,14 @@ impl Pager {
         let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
         self.savepoint_min_base.store(m, Ordering::Relaxed);
         self.savepoint_depth.store(remaining, Ordering::Release);
+        // Releasing the bottom level re-bases the committed view (the
+        // savepoint-txn COMMIT path — releasing the outermost savepoint
+        // commits, and clear_savepoints resets the cache; an inner
+        // release that pops to a new bottom needs the refresh).
+        match sp.first().map(|s| s.base.n_pages) {
+            Some(base) => self.committed_bound_cache.store(base, Ordering::Release),
+            None => self.committed_bound_cache.store(0, Ordering::Release),
+        }
         Some(remaining)
     }
 
@@ -881,6 +904,7 @@ impl Pager {
         sp.clear();
         self.savepoint_min_base.store(u32::MAX, Ordering::Relaxed);
         self.savepoint_depth.store(0, Ordering::Release);
+        self.committed_bound_cache.store(0, Ordering::Release);
     }
 
     /// Roll the pager back to the OUTERMOST savepoint — the transaction
@@ -1025,6 +1049,18 @@ impl Pager {
         Ok(pager)
     }
 
+    /// The memory store's backing image (post-flush): the full byte
+    /// sequence a file store would hold. VACUUM's page-level compact copy
+    /// materializes its result this way.
+    pub(crate) fn memory_store_image(&self) -> Result<Vec<u8>> {
+        match &self.store {
+            Store::Memory(m) => Ok(m.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            Store::File(_) => Err(Error::InvalidArgument(
+                "memory_store_image on a file-backed pager".into(),
+            )),
+        }
+    }
+
     /// Open a pure in-memory pager seeded from a COMPLETE database image
     /// (page 0 header + every live page — exactly the byte sequence a
     /// file store would hold on disk). `from_store` reads the header and
@@ -1093,6 +1129,7 @@ impl Pager {
             join_cache: Mutex::new(std::collections::HashMap::new()),
             committed_pages: RwLock::new(std::collections::HashMap::default()),
             committed_poison: std::sync::atomic::AtomicBool::new(false),
+            committed_bound_cache: std::sync::atomic::AtomicU32::new(0),
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
             application_id: std::sync::atomic::AtomicU32::new(0),
@@ -1792,12 +1829,16 @@ impl Pager {
 
     /// The committed n_pages bound of the open transaction: the base of
     /// the bottom (`__begin__`) savepoint, or the live page count when
-    /// no transaction is open (committed == live then).
+    /// no transaction is open (committed == live then). Single Acquire
+    /// load — maintained by the savepoint lifecycle methods (see
+    /// `committed_bound_cache`); the savepoints Mutex is never taken on
+    /// the reader path.
     pub fn committed_bound(&self) -> u32 {
-        let sp = self.savepoints.lock();
-        sp.first()
-            .map(|lvl| lvl.base.n_pages)
-            .unwrap_or_else(|| self.n_pages.load(Ordering::Acquire))
+        let b = self.committed_bound_cache.load(Ordering::Acquire);
+        if b != 0 {
+            return b;
+        }
+        self.n_pages.load(Ordering::Acquire)
     }
 
     /// Drop all committed-view materialized pages. Called at every

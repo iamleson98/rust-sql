@@ -223,7 +223,7 @@ pub struct Database {
     /// `flush_before_snapshot` wrote; resetting to the catalog's
     /// CREATE-time roots (the old behavior) misresolved any table whose
     /// root moved in an EARLIER COMMITTED transaction.
-    pub(crate) txn_maps_snap: Mutex<Option<std::sync::Arc<crate::executor::StmtMaps>>>,
+    pub(crate) txn_maps_snap: RwLock<Option<std::sync::Arc<crate::executor::StmtMaps>>>,
     /// SAVEPOINT support: bookkeeping-map snapshots aligned with the
     /// pager's savepoint stack (index i corresponds to pager savepoint i).
     /// ROLLBACK TO restores the maps Arc wholesale — root overrides and
@@ -1637,15 +1637,17 @@ fn rewrite_object_sql_column_refs(
     }
     // Apply schema-row rewrites.
     {
-        let mut bt = Btree::new(pager, 0, false);
-        for (rowid, row) in &schema_updates {
-            let payload = crate::storage::row_codec::encode_row(row);
-            let did = bt.update_table(*rowid, &payload).unwrap_or(false);
-            if !did {
-                bt.delete_table(*rowid)?;
-                bt.insert_table(*rowid, &payload)?;
+        schema_tree_mutate(pager, |bt| {
+            for (rowid, row) in &schema_updates {
+                let payload = crate::storage::row_codec::encode_row(row);
+                let did = bt.update_table(*rowid, &payload).unwrap_or(false);
+                if !did {
+                    bt.delete_table(*rowid)?;
+                    bt.insert_table(*rowid, &payload).map(|_| ())?;
+                }
             }
-        }
+            Ok(())
+        })?;
     }
     // Refresh catalog entries (re-parse from the new SQL).
     for (rowid, row) in &schema_updates {
@@ -1812,7 +1814,7 @@ impl Database {
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
-            txn_maps_snap: Mutex::new(None),
+            txn_maps_snap: RwLock::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             txn_owner_tid: AtomicU64::new(0),
@@ -1938,7 +1940,7 @@ impl Database {
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
-            txn_maps_snap: Mutex::new(None),
+            txn_maps_snap: RwLock::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             txn_owner_tid: AtomicU64::new(0),
@@ -2061,9 +2063,84 @@ impl Database {
         Ok(())
     }
 
-    /// Build the compacted image in a temp FILE database and read the
-    /// bytes back. The temp file is removed on both success and failure.
+    /// Build the compacted image. Two paths:
+    ///
+    /// - **Page-level** (no codec): every live tree page copied into a
+    ///   fresh in-memory pager with references remapped, schema rows
+    ///   re-inserted with the new roots, one materialize — SQLite's own
+    ///   VACUUM shape (pages, not rows). O(live bytes) with no per-row
+    ///   SQL work.
+    /// - **Row-level** (codec DBs): a temp FILE database + the SQL-level
+    ///   copy (codec encode/decode applies). O(rows).
     fn build_compact_image(&self) -> Result<Vec<u8>> {
+        if self.pager.active_page_codec().is_none() {
+            if let Some(image) = self.build_compact_image_pages()? {
+                return Ok(image);
+            }
+        }
+        self.build_compact_image_rows()
+    }
+
+    /// Page-level compact copy (see `build_compact_image`). Returns None
+    /// when the source has an object shape the copier declines (caller
+    /// falls back to the row-level path).
+    fn build_compact_image_pages(&self) -> Result<Option<Vec<u8>>> {
+        // 1. Read the schema rows (order + rowids preserved).
+        let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
+        {
+            let mut bt = Btree::new(&self.pager, 0, false);
+            bt.scan_table(|rowid, payload| {
+                if let Ok(row) = decode_row(payload, 5, 0, None) {
+                    rows.push((rowid, row));
+                }
+                true
+            })?;
+        }
+        // 2. Fresh in-memory target; write-back armed so `flush`
+        //    materializes the image into the store.
+        let tmp = Pager::open_memory(DEFAULT_CACHE_PAGES)?;
+        tmp.set_lazy_writeback(false);
+        // 3. Copy every object tree (roots from the schema rows).
+        let roots: Vec<u32> = rows
+            .iter()
+            .map(|(_, r)| {
+                crate::schema::decode_schema_row(r)
+                    .map(|(_, _, _, root, _)| root)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let map = match crate::storage::vacuum::compact_page_copy(&self.pager, &tmp, &roots) {
+            Ok(m) => m,
+            Err(e) => {
+                // Decline: the caller falls back to the row-level path.
+                let _ = e;
+                return Ok(None);
+            }
+        };
+        // 4. Re-insert the schema rows with remapped roots.
+        for (rowid, mut row) in rows {
+            if row.len() >= 4 {
+                if let Some((_, _, _, old_root, _)) = crate::schema::decode_schema_row(&row) {
+                    row[3] = Value::Integer(map.get(&old_root).copied().unwrap_or(0) as i64);
+                }
+            }
+            let payload = encode_row(&row);
+            schema_tree_mutate(&tmp, |bt| bt.insert_table(rowid, &payload).map(|_| ()))?;
+        }
+        // 5. Header fields + materialize.
+        tmp.set_user_version(self.pager.user_version())
+            .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum user_version: {e}"))))?;
+        tmp.set_application_id(self.pager.application_id())
+            .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum application_id: {e}"))))?;
+        tmp.flush()?;
+        let image = tmp.memory_store_image()?;
+        Ok(Some(image))
+    }
+
+    /// Row-level compact build in a temp FILE database (codec path /
+    /// fast-path fallback). The temp file is removed on both success and
+    /// failure.
+    fn build_compact_image_rows(&self) -> Result<Vec<u8>> {
         let tmp_path = std::env::temp_dir().join(format!(
             "rustqlite-vacuum-{}-{}.db",
             std::process::id(),
@@ -2104,7 +2181,28 @@ impl Database {
     /// only). Internal `sqlite_*` objects are rebuilt by the engine
     /// itself and skipped. Foreign keys stay OFF on the target (SQLite
     /// does the same during VACUUM), so copy order does not matter.
+    ///
+    /// The ENTIRE copy runs inside one transaction on the target: each
+    /// per-row autocommit INSERT would pay a full flush (+ fsync on real
+    /// files) — the file-backed VACUUM of a mid-size database took
+    /// seconds-to-minutes that way; one BEGIN/COMMIT bracket makes the
+    /// dirty pages ride a single write-back.
     fn vacuum_copy_into(&self, tmp: &mut Database) -> Result<()> {
+        tmp.execute("BEGIN", ())?;
+        let res = self.vacuum_copy_into_inner(tmp);
+        match res {
+            Ok(()) => tmp.execute("COMMIT", ())?,
+            Err(e) => {
+                // Best-effort rollback; the temp DB is discarded on
+                // failure anyway.
+                let _ = tmp.execute("ROLLBACK", ());
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn vacuum_copy_into_inner(&self, tmp: &mut Database) -> Result<()> {
         let mut tables = self.catalog.all_tables();
         tables.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, table) in tables {
@@ -3073,10 +3171,11 @@ impl Database {
             if row.len() >= 4 {
                 row[3] = Value::Integer(new_root as i64);
             }
-            let mut bt = Btree::new(&self.pager, 0, false);
-            bt.delete_table(old_rowid)?;
             let payload = encode_row(&row);
-            bt.insert_table(old_rowid, &payload)?;
+            schema_tree_mutate(&self.pager, |bt| {
+                bt.delete_table(old_rowid)?;
+                bt.insert_table(old_rowid, &payload).map(|_| ())
+            })?;
         }
         Ok(())
     }
@@ -3365,7 +3464,7 @@ impl Database {
             // roots was wrong for any table that split in an earlier
             // committed transaction: reads resolved a stale leaf and saw
             // only its rows.
-            let restored = self.txn_maps_snap.lock().take();
+            let restored = self.txn_maps_snap.write().take();
             *self.maps.get_mut() = restored.unwrap_or_else(empty_maps);
             self.refresh_maps_flag();
             // `schema_root_pages` mirrors "what the schema rows on disk
@@ -3393,7 +3492,7 @@ impl Database {
         if result.is_ok() {
             match stmt_ref {
                 Statement::Begin(_) => {
-                    *self.txn_maps_snap.lock() = Some(self.maps.read().clone());
+                    *self.txn_maps_snap.write() = Some(self.maps.read().clone());
                     self.txn_owner_tid.store(current_tid(), Ordering::Release);
                     self.txn_begin_epoch
                         .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
@@ -3401,7 +3500,7 @@ impl Database {
                     self.pager.clear_committed_view();
                 }
                 Statement::Commit | Statement::Rollback(_) => {
-                    *self.txn_maps_snap.lock() = None;
+                    *self.txn_maps_snap.write() = None;
                     self.txn_owner_tid.store(0, Ordering::Release);
                     self.pager.clear_committed_view();
                     if matches!(stmt_ref, Statement::Rollback(_)) {
@@ -3511,7 +3610,7 @@ impl Database {
     /// diverges from what `get_page` actually serves.
     pub(crate) fn read_maps(&self) -> Arc<crate::executor::StmtMaps> {
         if self.pager.committed_reads_armed() {
-            if let Some(m) = self.txn_maps_snap.lock().clone() {
+            if let Some(m) = self.txn_maps_snap.read().clone() {
                 return m;
             }
         }
@@ -4233,7 +4332,7 @@ impl Database {
             self.pager.flush_before_snapshot()?;
             self.in_transaction.store(true, Ordering::Release);
             *self.txn_snapshot.lock() = Some(self.pager.snapshot());
-            *self.txn_maps_snap.lock() = Some(self.maps.read().clone());
+            *self.txn_maps_snap.write() = Some(self.maps.read().clone());
             self.savepoint_txn.store(true, Ordering::Release);
             self.txn_owner_tid.store(current_tid(), Ordering::Release);
             self.txn_begin_epoch
@@ -4298,7 +4397,7 @@ impl Database {
                     self.savepoint_txn.store(false, Ordering::Release);
                     self.in_transaction.store(false, Ordering::Release);
                     *self.txn_snapshot.lock() = None;
-                    *self.txn_maps_snap.lock() = None;
+                    *self.txn_maps_snap.write() = None;
                     self.txn_owner_tid.store(0, Ordering::Release);
                     self.pager.clear_committed_view();
                     self.pager.flush()?;
@@ -5877,9 +5976,13 @@ impl Database {
                     }
                     true
                 })?;
-                for rowid in to_delete {
-                    bt.delete_table(rowid)?;
-                }
+                drop(bt);
+                schema_tree_mutate(ctx.pager, |bt| {
+                    for rowid in to_delete {
+                        bt.delete_table(rowid)?;
+                    }
+                    Ok(())
+                })?;
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -7338,12 +7441,15 @@ fn rewrite_trigger_tbl_names(pager: &Pager, old_table: &str, new_table: &str) ->
         }
         true
     })?;
-    for (rowid, row) in updates {
-        let payload = encode_row(&row);
-        bt.delete_table(rowid)?;
-        bt.insert_table(rowid, &payload)?;
-    }
-    Ok(())
+    drop(bt);
+    schema_tree_mutate(pager, |bt| {
+        for (rowid, row) in updates {
+            let payload = encode_row(&row);
+            bt.delete_table(rowid)?;
+            bt.insert_table(rowid, &payload).map(|_| ())?;
+        }
+        Ok(())
+    })
 }
 
 /// Rewrite `... ON <old> ...` → `... ON <new> ...` in a CREATE INDEX /
@@ -7394,15 +7500,33 @@ fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> R
         }
         true
     })?;
-    for (rowid, row) in updates {
-        let payload = encode_row(&row);
-        bt.delete_table(rowid)?;
-        bt.insert_table(rowid, &payload)?;
-    }
-    Ok(())
+    drop(bt);
+    schema_tree_mutate(pager, |bt| {
+        for (rowid, row) in updates {
+            let payload = encode_row(&row);
+            bt.delete_table(rowid)?;
+            bt.insert_table(rowid, &payload).map(|_| ())?;
+        }
+        Ok(())
+    })
 }
 
 /// Insert a row into the schema table (rooted at page 0).
+/// Mutate the schema btree (rooted at page 0) and RE-PIN the root into
+/// page 0 when the mutation split it off (see `storage::vacuum`).
+/// Without the re-pin, a schema that outgrows page 0 loses its root on
+/// reopen — every reader hardcodes root 0.
+fn schema_tree_mutate<T>(pager: &Pager, f: impl FnOnce(&mut Btree<'_>) -> Result<T>) -> Result<T> {
+    let mut bt = Btree::new(pager, 0, false);
+    let out = f(&mut bt)?;
+    let root = bt.root;
+    drop(bt);
+    if root != 0 {
+        crate::storage::vacuum::repin_schema_root(pager, root)?;
+    }
+    Ok(out)
+}
+
 fn insert_schema_row(pager: &Pager, row: &[Value]) -> Result<()> {
     // Find max rowid in the schema table.
     let mut max_rowid = 0i64;
@@ -7414,10 +7538,8 @@ fn insert_schema_row(pager: &Pager, row: &[Value]) -> Result<()> {
         true
     })?;
     let rowid = crate::executor::next_auto_rowid(pager, 0, max_rowid)?;
-    let row_vec: Vec<Value> = row.to_vec();
-    let payload = encode_row(&row_vec);
-    bt.insert_table(rowid, &payload)?;
-    Ok(())
+    let payload = encode_row(&row.to_vec());
+    schema_tree_mutate(pager, |bt| bt.insert_table(rowid, &payload).map(|_| ()))
 }
 
 /// Delete a schema row by (kind, name).

@@ -11,6 +11,7 @@ pub mod mvcc;
 pub mod page;
 pub mod pager;
 pub mod row_codec;
+pub mod vacuum;
 pub mod wal;
 
 pub use btree::{Btree, LookupResult};
