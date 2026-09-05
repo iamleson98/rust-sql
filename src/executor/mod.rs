@@ -8308,6 +8308,29 @@ fn exec_index_nested_loop_join(
         }
     });
     let mut key_buf: Vec<u8> = Vec::with_capacity(16);
+    // Output-slot plan for the fused selective path, PRECOMPUTED once:
+    // for each output position either an outer column index, or the
+    // decoded inner SLOT for that column (usize::MAX → NULL). The
+    // per-row `wanted.binary_search` (up to 2 searches per output row —
+    // a 50-row join paid 100 binary searches per query) collapses to a
+    // table lookup.
+    let fused_slots: Option<Vec<(bool, usize)>> = fused.as_ref().map(|(indices, _)| {
+        indices
+            .iter()
+            .map(|&i| {
+                if i < outer_width {
+                    (true, i)
+                } else {
+                    let inner_col = i - outer_width;
+                    let slot = fused_inner_cols
+                        .as_ref()
+                        .and_then(|w| w.binary_search(&inner_col).ok())
+                        .unwrap_or(usize::MAX);
+                    (false, slot)
+                }
+            })
+            .collect()
+    });
     // Reused rowid batch + decode buffer across outer rows (one malloc per
     // STATEMENT instead of one per outer row / per matched row).
     let mut rowids: Vec<i64> = Vec::new();
@@ -8378,25 +8401,19 @@ fn exec_index_nested_loop_join(
                     })?;
                     if found.is_some() {
                         let sel = &mut inner_vals;
-                        let (indices, _) = fused.as_ref().unwrap();
-                        let mut out: Row = Vec::with_capacity(indices.len());
-                        for &i in indices {
-                            if i < outer_width {
+                        let slots = fused_slots.as_ref().unwrap();
+                        let mut out: Row = Vec::with_capacity(slots.len());
+                        for &(is_outer, idx) in slots {
+                            if is_outer {
                                 // Outer row values are shared across all
                                 // matching inner rows — clone (the source
                                 // row outlives this iteration).
-                                out.push(outer_row[i].clone());
+                                out.push(outer_row[idx].clone());
+                            } else if idx != usize::MAX && idx < sel.len() {
+                                // Move out of the decoded row.
+                                out.push(std::mem::replace(&mut sel[idx], Value::Null));
                             } else {
-                                // Inner values: find the decoded slot for
-                                // this inner column (wanted is sorted+dedup'd).
-                                let inner_col = i - outer_width;
-                                match wanted.binary_search(&inner_col) {
-                                    Ok(slot) => {
-                                        // Move out of the decoded row.
-                                        out.push(std::mem::replace(&mut sel[slot], Value::Null));
-                                    }
-                                    Err(_) => out.push(Value::Null),
-                                }
+                                out.push(Value::Null);
                             }
                         }
                         out_rows.push(out);

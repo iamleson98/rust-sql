@@ -1057,6 +1057,13 @@ pub struct Btree<'a> {
     /// per-lookup overhead: stop probing until the access pattern
     /// changes (a struct-hint or TL hit resets the streak).
     tl_hint_miss_streak: u32,
+    /// CUMULATIVE full root descents made by THIS handle (never reset by
+    /// hint hits — unlike the streak above). Join inner fetches alternate
+    /// miss/hit/miss/hit across scattered keys, which keeps the streak
+    /// below the disable threshold forever; two root passes are enough
+    /// to know the access is repeated, so the root-children routing arms
+    /// after the second descent and every later one skips the root.
+    root_descents: u32,
     /// When armed (bulk mass-delete), every page freed by this handle is
     /// recorded so the operation can FILE-TAIL-TRUNCATE the contiguous
     /// freed suffix afterwards (SQLite's truncate-on-mass-delete: pages
@@ -1105,6 +1112,7 @@ impl<'a> Btree<'a> {
             table_leaf: None,
             index_leaf: None,
             tl_hint_miss_streak: 0,
+            root_descents: 0,
             collect_frees: false,
             freed_during_op: Vec::new(),
         }
@@ -1416,6 +1424,7 @@ impl<'a> Btree<'a> {
             table_leaf: None,
             index_leaf: None,
             tl_hint_miss_streak: 0,
+            root_descents: 0,
             collect_frees: false,
             freed_during_op: Vec::new(),
         })
@@ -1555,10 +1564,17 @@ impl<'a> Btree<'a> {
             }
         }
         // --- Full descent --------------------------------------------------
-        // Scattered mode (TL hint streak exhausted): route through the
-        // cached root-children map when available — skips the root page's
-        // lock + binary search on every descent.
-        let scattered = self.tl_hint_miss_streak >= TL_HINT_DISABLE_AT;
+        // Root-children ROUTING: once this handle has descended through
+        // the root twice, the root's (separator, child) set is recorded
+        // (one pass) and every subsequent descent enters the covering
+        // child directly — skipping the root's lock + binary search.
+        // Armed by the cumulative `root_descents` counter (NOT the miss
+        // streak: alternating miss/hit fetch patterns — join inner fanouts
+        // — reset the streak and would never arm) and bounded at two so
+        // single point lookups never pay the recording pass.
+        self.root_descents = self.root_descents.saturating_add(1);
+        let scattered = self.root_descents >= 2
+            || self.tl_hint_miss_streak >= TL_HINT_DISABLE_AT;
         let mut page_id = if scattered {
             root_child_page(self.root, rowid, epoch).unwrap_or(self.root)
         } else {
@@ -1658,12 +1674,12 @@ impl<'a> Btree<'a> {
                             lo = mid + 1;
                         }
                     }
-                    // Root-children routing record (scattered mode only):
+                    // Root-children routing record (armed mode only):
                     // one full pass over the root's separators arms the
                     // probe above for every subsequent descent in this
-                    // epoch. Point/single lookups (streak below threshold)
-                    // never reach this.
-                    if page_id == self.root && scattered {
+                    // epoch. Unarmed handles (first descent, single point
+                    // lookups) never reach this.
+                    if page_id == self.root && scattered && n > 0 {
                         let mut entries: Vec<(i64, PageId)> = Vec::with_capacity(n + 1);
                         for i in 0..n {
                             let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
