@@ -1573,8 +1573,7 @@ impl<'a> Btree<'a> {
         // — reset the streak and would never arm) and bounded at two so
         // single point lookups never pay the recording pass.
         self.root_descents = self.root_descents.saturating_add(1);
-        let scattered = self.root_descents >= 2
-            || self.tl_hint_miss_streak >= TL_HINT_DISABLE_AT;
+        let scattered = self.root_descents >= 2 || self.tl_hint_miss_streak >= TL_HINT_DISABLE_AT;
         let mut page_id = if scattered {
             root_child_page(self.root, rowid, epoch).unwrap_or(self.root)
         } else {

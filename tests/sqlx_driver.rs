@@ -1166,3 +1166,322 @@ async fn file_backed_pool_diagnostic() {
         pool.close().await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// WAL-grade committed-view read concurrency
+// ---------------------------------------------------------------------------
+
+/// Pool with a ZERO busy timeout: reads that would need to WAIT for a
+/// foreign transaction fail instantly — the only reads that succeed are
+/// the ones the engine serves from the committed view.
+async fn zero_timeout_pool() -> RustqlitePool {
+    let id = POOL_ID.fetch_add(1, Ordering::Relaxed);
+    RustqlitePool::connect_with(
+        RustqliteConnectOptions::shared_memory(format!("test-{id}"))
+            .busy_timeout(std::time::Duration::ZERO),
+    )
+    .await
+    .unwrap()
+}
+
+/// Reads during another connection's open WRITE transaction succeed
+/// INSTANTLY (zero busy timeout) and see the BEGIN-time committed state
+/// — WAL reader semantics. Before the committed view, these reads waited
+/// for the transaction (or failed BUSY at timeout zero).
+#[tokio::test]
+async fn committed_read_during_open_write_txn() {
+    let pool = zero_timeout_pool().await;
+    sqlx::raw_sql("CREATE TABLE cv (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO cv (v) VALUES ('seed')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut a = pool.acquire().await.unwrap();
+    let mut b = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO cv (v) VALUES ('uncommitted')")
+        .execute(&mut *a)
+        .await
+        .unwrap();
+
+    // Zero busy timeout + a dirty foreign transaction: the read MUST still
+    // succeed — served from the committed view, not the gate.
+    let t0 = std::time::Instant::now();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cv")
+        .fetch_one(&mut *b)
+        .await
+        .expect("committed-view read must not block on the open write txn");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(100),
+        "must be instant"
+    );
+    assert_eq!(
+        n, 1,
+        "reader sees BEGIN-time committed state, not uncommitted rows"
+    );
+
+    // Uncommitted value must be invisible.
+    let v: Option<String> = sqlx::query_scalar("SELECT v FROM cv WHERE id = 2")
+        .fetch_optional(&mut *b)
+        .await
+        .unwrap();
+    assert!(v.is_none(), "uncommitted insert invisible to readers");
+
+    // Commit makes it visible.
+    sqlx::query("COMMIT").execute(&mut *a).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cv")
+        .fetch_one(&mut *b)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "post-commit visibility");
+    drop(a);
+    drop(b);
+}
+
+/// ROLLBACK: the committed view state never leaks to readers.
+#[tokio::test]
+async fn committed_read_txn_rollback() {
+    let pool = zero_timeout_pool().await;
+    sqlx::raw_sql("CREATE TABLE cr (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO cr (v) VALUES ('keep')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut a = pool.acquire().await.unwrap();
+    let mut b = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
+    sqlx::query("UPDATE cr SET v = 'mutated'")
+        .execute(&mut *a)
+        .await
+        .unwrap();
+
+    let v: String = sqlx::query_scalar("SELECT v FROM cr WHERE id = 1")
+        .fetch_one(&mut *b)
+        .await
+        .expect("committed read during open txn");
+    assert_eq!(v, "keep", "reader sees the pre-image value");
+
+    sqlx::query("ROLLBACK").execute(&mut *a).await.unwrap();
+    let v: String = sqlx::query_scalar("SELECT v FROM cr WHERE id = 1")
+        .fetch_one(&mut *b)
+        .await
+        .unwrap();
+    assert_eq!(v, "keep", "rollback restored the committed value");
+    drop(a);
+    drop(b);
+}
+
+/// sqlx's Transaction API (deferred BEGIN, engine tx starts at the first
+/// write): readers during the write phase see the committed snapshot and
+/// never block.
+#[tokio::test]
+async fn committed_read_during_sqlx_transaction() {
+    let pool = zero_timeout_pool().await;
+    sqlx::raw_sql("CREATE TABLE tx (id INTEGER PRIMARY KEY, v INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for i in 1..=10i64 {
+        sqlx::query("INSERT INTO tx (v) VALUES (?)")
+            .bind(i)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let mut a = pool.acquire().await.unwrap();
+    let mut b = pool.acquire().await.unwrap();
+    let mut txn = a.begin().await.unwrap();
+    for i in 11..=20i64 {
+        sqlx::query("INSERT INTO tx (v) VALUES (?)")
+            .bind(i)
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+    }
+
+    // Reader during the open (deferred-started) write txn: instant, committed.
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tx")
+        .fetch_one(&mut *b)
+        .await
+        .expect("committed read inside another connection's transaction");
+    assert_eq!(n, 10, "BEGIN-time state");
+    let sum: i64 = sqlx::query_scalar("SELECT SUM(v) FROM tx")
+        .fetch_one(&mut *b)
+        .await
+        .unwrap();
+    assert_eq!(sum, 55, "BEGIN-time aggregate");
+
+    txn.commit().await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tx")
+        .fetch_one(&mut *b)
+        .await
+        .unwrap();
+    assert_eq!(n, 20);
+    drop(a);
+    drop(b);
+}
+
+/// Continuous reader THROUGHPUT while one long write transaction runs:
+/// many reads complete mid-transaction (none block, none see
+/// intermediate state). This is the read/write concurrency headline.
+#[tokio::test]
+async fn concurrent_reader_throughput_during_write_txn() {
+    let pool = mem_pool().await; // 5 s busy timeout
+    sqlx::raw_sql("CREATE TABLE rt (id INTEGER PRIMARY KEY, v INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for i in 1..=100i64 {
+        sqlx::query("INSERT INTO rt (v) VALUES (?)")
+            .bind(i)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let mut a = pool.acquire().await.unwrap();
+    let mut b = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
+
+    // Writer inserts in the background.
+    let writer = tokio::spawn(async move {
+        for i in 101..=600i64 {
+            sqlx::query("INSERT INTO rt (v) VALUES (?)")
+                .bind(i)
+                .execute(&mut *a)
+                .await
+                .unwrap();
+            // Interleave with the reader (single-threaded runtimes run a
+            // non-Pending task to completion otherwise).
+            if i % 25 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        sqlx::query("COMMIT").execute(&mut *a).await.unwrap();
+    });
+
+    // Reader hammers counts while the txn is open: every read must return
+    // the BEGIN-time snapshot (100) — no partial visibility, no waiting.
+    let t0 = std::time::Instant::now();
+    let mut reads = 0u32;
+    while !writer.is_finished() {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rt")
+            .fetch_one(&mut *b)
+            .await
+            .expect("read during open write txn");
+        assert!(
+            n == 100 || n == 600,
+            "reader saw intermediate count {n} — isolation violated"
+        );
+        reads += 1;
+        // The driver's committed-read path completes synchronously (no
+        // Pending → no runtime yield): force a yield so the spawned writer
+        // task gets scheduled on a current_thread runtime too.
+        tokio::task::yield_now().await;
+    }
+    writer.await.unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        reads >= 5,
+        "reader must have actually run mid-transaction ({reads} reads in {elapsed:?})"
+    );
+    drop(b);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rt")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 600);
+}
+
+/// DDL inside a transaction flips it to conservative gating: committed-
+/// view reconstruction is not guaranteed while the schema moves, so
+/// readers wait (rollback-journal semantics) instead.
+#[tokio::test]
+async fn ddl_txn_still_gates_readers() {
+    let pool = mem_pool_fast().await; // 150 ms busy timeout
+    sqlx::raw_sql("CREATE TABLE dg (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut a = pool.acquire().await.unwrap();
+    let mut b = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE dg2 (id INTEGER PRIMARY KEY)")
+        .execute(&mut *a)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO dg2 (id) VALUES (1)")
+        .execute(&mut *a)
+        .await
+        .unwrap();
+
+    // Reader during the DDL tx: waits the busy timeout, then BUSY.
+    let t0 = std::time::Instant::now();
+    let err = sqlx::query("SELECT COUNT(*) FROM dg")
+        .fetch_one(&mut *b)
+        .await
+        .expect_err("read during DDL txn must gate");
+    assert!(
+        err.to_string().contains("database is locked"),
+        "expected BUSY, got: {err}"
+    );
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(140),
+        "must have waited the busy timeout"
+    );
+    sqlx::query("ROLLBACK").execute(&mut *a).await.unwrap();
+    drop(a);
+    drop(b);
+}
+
+/// The transaction OWNER still reads its own uncommitted writes
+/// (read-your-own-writes), even when its task migrates threads.
+#[tokio::test]
+async fn txn_owner_reads_own_writes() {
+    let pool = mem_pool().await;
+    sqlx::raw_sql("CREATE TABLE ow (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut a = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *a).await.unwrap();
+    sqlx::query("INSERT INTO ow (v) VALUES ('mine')")
+        .execute(&mut *a)
+        .await
+        .unwrap();
+
+    // Owner read (same connection): uncommitted row VISIBLE.
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ow")
+        .fetch_one(&mut *a)
+        .await
+        .expect("owner read");
+    assert_eq!(n, 1, "owner reads its own uncommitted writes");
+
+    // Yield points migrate tasks between workers: the connection identity
+    // (not the thread) decides the view — still its own txn after yields.
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ow")
+            .fetch_one(&mut *a)
+            .await
+            .expect("owner read after yield");
+        assert_eq!(
+            n, 1,
+            "owner still reads its own writes after task migration"
+        );
+    }
+
+    sqlx::query("COMMIT").execute(&mut *a).await.unwrap();
+    drop(a);
+}

@@ -7308,12 +7308,23 @@ fn try_fused_scan_hash_join(
     }
     use crate::storage::join_cache::{JoinBuildState, JoinSlot};
     let join_epoch = pager.write_epoch();
+    // Committed-view readers NEVER consult or populate the cross-
+    // statement cache: their builds describe BEGIN-time bytes, and the
+    // epoch was not bumped by the reader — a live reader (e.g. the txn
+    // owner between statements) would consume a build that misses its
+    // own writes. The reader's scope-drop poison bump only applies AFTER
+    // the reader finishes; concurrent owner queries must stay safe.
+    let committed_read = pager.committed_reads_armed();
     let cache_key = (build.root, build_wanted.clone());
-    let cached: Option<std::sync::Arc<JoinBuildState>> = {
-        let jc = pager.join_build_cache().lock();
-        jc.get(&cache_key)
-            .filter(|st| st.epoch == join_epoch)
-            .cloned()
+    let cached: Option<std::sync::Arc<JoinBuildState>> = if committed_read {
+        None
+    } else {
+        {
+            let jc = pager.join_build_cache().lock();
+            jc.get(&cache_key)
+                .filter(|st| st.epoch == join_epoch)
+                .cloned()
+        }
     };
 
     let built: std::sync::Arc<JoinBuildState>;
@@ -7423,11 +7434,13 @@ fn try_fused_scan_hash_join(
             slots,
             chain,
         });
-        crate::storage::join_cache::join_cache_insert(
-            &mut pager.join_build_cache().lock(),
-            cache_key,
-            built.clone(),
-        );
+        if !committed_read {
+            crate::storage::join_cache::join_cache_insert(
+                &mut pager.join_build_cache().lock(),
+                cache_key,
+                built.clone(),
+            );
+        }
     }
 
     // Shared borrows for the probe loop (the Arc keeps them alive).

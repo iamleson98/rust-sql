@@ -590,6 +590,92 @@ pub struct Pager {
     /// executor has no Database handle, and the pager already owns the
     /// write epoch that invalidates every advisory cache.
     join_cache: Mutex<crate::storage::join_cache::JoinBuildCache>,
+    /// COMMITTED-VIEW READ CACHE (see `committed_view` below): pages
+    /// materialized for readers that run while a write transaction is
+    /// open on another thread. Never touched by the writer's live view;
+    /// cleared at every transaction boundary (BEGIN/COMMIT/ROLLBACK) by
+    /// `clear_committed_view()`.
+    committed_pages: Mutex<std::collections::HashMap<PageId, PageRef, PageIdHashBuild>>,
+    /// Set when a committed-view read served BEGIN-time bytes that differ
+    /// from the live cache (pre-images / their memoized copies). Retired
+    /// by `CommittedViewGuard::drop` with a single write-epoch bump so
+    /// the reader's advisory-cache state can never outlive its scope.
+    committed_poison: std::sync::atomic::AtomicBool,
+}
+
+// ---------------------------------------------------------------------------
+// COMMITTED-VIEW READS (WAL-grade read concurrency)
+// ---------------------------------------------------------------------------
+//
+// While a write transaction is open, the writer's uncommitted state lives
+// ONLY in the live page cache (the executor never flushes mid-transaction;
+// WAL spill frames are recorded in a separate `spilled` map, never in the
+// committed `map`). The last COMMITTED state of every page is therefore
+// always reconstructable from:
+//   1. the `__begin__` savepoint's undo pre-images (pages the writer
+//      fetched — and possibly mutated — since BEGIN), and
+//   2. the WAL committed-page map + main file (pages the writer never
+//      fetched — their live-cache copies are byte-identical to the
+//      committed state).
+// A reader on a thread that does NOT own the transaction arms a
+// COMMITTED-VIEW SCOPE (thread-local) around its statement; `get_page`
+// then serves the BEGIN-time state instead of the live one. Readers never
+// block on an open write transaction — SQLite-WAL reader semantics, but
+// with the version store in memory (pre-images) instead of WAL frames.
+//
+// Because the engine serializes statements behind a RwLock (readers hold
+// the read guard while the writer mutates only under the write guard),
+// no page bytes can change WHILE a committed-view reader executes — the
+// scope is quiescent by construction. The scope is thread-local, so the
+// WRITER thread (and the txn owner reading its own writes) is unaffected.
+
+thread_local! {
+    /// Armed committed-view scope: `(pager instance id, committed n_pages
+    /// bound)`. `None` on the fast path — one TLS load per `get_page`.
+    static COMMITTED_VIEW: std::cell::Cell<Option<(u64, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Hard cap on the committed-view materialization cache (pages). See
+/// `cache_committed_page`: bounds the extra footprint of concurrent
+/// committed-view readers to 4 MiB at the default 4 KiB page size.
+const COMMITTED_PAGES_CAP: usize = 1024;
+
+/// RAII guard returned by `Pager::arm_committed_view`: arms the
+/// thread-local scope for THIS pager and restores the previous value on
+/// drop (re-entrancy-safe — a nested arm restores the outer scope).
+///
+/// Drop also retires the epoch-poison signal: while the scope was armed,
+/// `get_page` served BEGIN-time bytes that can differ from the live
+/// cache. Every advisory read cache in the engine (TLS leaf hints,
+/// fast-path handle pins, join builds) is validated against the pager's
+/// write epoch — state a reader recorded from BEGIN-time bytes at epoch
+/// E would validate as "live at E" after the scope ends and serve stale
+/// first/last keys or stale pinned pages to LIVE readers. When the scope
+/// actually served writer-touched pages (pre-images), drop bumps the
+/// write epoch ONCE: every cache the reader populated is re-derived on
+/// next use. Readers that only touched never-fetched pages
+/// (byte-identical to live) leave the epoch — and every warm cache in
+/// the process — untouched.
+#[must_use]
+pub struct CommittedViewGuard<'a> {
+    prev: Option<(u64, u32)>,
+    pager: &'a Pager,
+}
+
+impl Drop for CommittedViewGuard<'_> {
+    fn drop(&mut self) {
+        COMMITTED_VIEW.with(|c| c.set(self.prev.take()));
+        if self.pager.committed_poison.swap(false, Ordering::AcqRel) {
+            self.pager.write_version.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// Read the armed scope without touching TLS state.
+#[inline]
+fn committed_scope() -> Option<(u64, u32)> {
+    COMMITTED_VIEW.with(|c| c.get())
 }
 
 /// One SAVEPOINT level: the metadata snapshot plus page pre-images.
@@ -945,6 +1031,8 @@ impl Pager {
             codec: RwLock::new(crate::plugin::codec::CodecState::default()),
             required_codec: Mutex::new(None),
             join_cache: Mutex::new(std::collections::HashMap::new()),
+            committed_pages: Mutex::new(std::collections::HashMap::default()),
+            committed_poison: std::sync::atomic::AtomicBool::new(false),
         };
 
         let file_size = pager.store.len()?;
@@ -1392,6 +1480,13 @@ impl Pager {
     ///    write lock to insert. Only one thread does the disk read; the other
     ///    waits on the write lock and then sees the page in cache.
     pub fn get_page(&self, id: PageId) -> Result<PageRef> {
+        // Committed-view scope (armed by a reader on a foreign thread while
+        // a write transaction is open): serve the BEGIN-time state.
+        if let Some((pid, bound)) = committed_scope() {
+            if pid == self.instance_id {
+                return self.get_page_committed(id, bound);
+            }
+        }
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         if id >= n_pages_val && id != 0 {
             return Err(Error::corruption(format!(
@@ -1508,6 +1603,178 @@ impl Pager {
             self.capture_savepoint_undo(id, &page_ref);
         }
         Ok(page_ref)
+    }
+
+    // -----------------------------------------------------------------
+    // committed-view read path
+    // -----------------------------------------------------------------
+
+    /// Arm the thread-local committed-view scope for THIS pager.
+    /// `bound` = committed n_pages (the transaction's BEGIN-time page
+    /// count). Callers must hold the engine read lock (or otherwise
+    /// exclude concurrent writer statements) for the scope's duration.
+    pub fn arm_committed_view(&self, bound: u32) -> CommittedViewGuard<'_> {
+        let prev = COMMITTED_VIEW.with(|c| c.replace(Some((self.instance_id, bound))));
+        CommittedViewGuard { prev, pager: self }
+    }
+
+    /// True while this thread has a committed-view scope armed for THIS
+    /// pager (read paths use this to skip read-side caches that are
+    /// keyed on the LIVE state, e.g. the table count cache).
+    #[inline]
+    pub fn committed_reads_armed(&self) -> bool {
+        match committed_scope() {
+            Some((pid, _)) => pid == self.instance_id,
+            None => false,
+        }
+    }
+
+    /// The committed n_pages bound of the open transaction: the base of
+    /// the bottom (`__begin__`) savepoint, or the live page count when
+    /// no transaction is open (committed == live then).
+    pub fn committed_bound(&self) -> u32 {
+        let sp = self.savepoints.lock();
+        sp.first()
+            .map(|lvl| lvl.base.n_pages)
+            .unwrap_or_else(|| self.n_pages.load(Ordering::Acquire))
+    }
+
+    /// Drop all committed-view materialized pages. Called at every
+    /// transaction boundary (BEGIN / COMMIT / ROLLBACK): after a boundary
+    /// the BEGIN-time state is either restored (rollback), superseded
+    /// (commit — the live cache is now the committed state), or
+    /// re-baselined (a new BEGIN).
+    pub fn clear_committed_view(&self) {
+        self.committed_pages.lock().clear();
+    }
+
+    /// Disarm any committed-view scope this thread holds for THIS pager
+    /// (writers clear it at `execute` entry — a leaked reader scope must
+    /// never serve BEGIN-time pages to a write path). Scoped guards
+    /// restore their own previous value on drop; this is the defensive
+    /// belt for scope-free callers.
+    pub fn disarm_reader_scope(&self) {
+        if let Some((pid, _)) = committed_scope() {
+            if pid == self.instance_id {
+                COMMITTED_VIEW.with(|c| c.set(None));
+            }
+        }
+    }
+
+    /// Serve page `id` from the BEGIN-time (committed) view while a
+    /// foreign write transaction is open. Never inserts into the live
+    /// cache and never consults the writer's dirty or spilled state.
+    fn get_page_committed(&self, id: PageId, bound: u32) -> Result<PageRef> {
+        // Pages allocated after BEGIN do not exist in the committed view.
+        if id >= bound && id != 0 {
+            return Err(Error::corruption(format!(
+                "page {} out of range in committed view (n_pages={})",
+                id, bound
+            )));
+        }
+        // Reader-side materialization cache: a hot leaf is read once and
+        // the PageRef reused (this is what keeps committed-view scans at
+        // live-cache speed — the 8 KiB pre-image copy is amortized to one
+        // per page per transaction). Entries derive from pre-images →
+        // they set the epoch-poison signal.
+        {
+            let cp = self.committed_pages.lock();
+            if let Some(pr) = cp.get(&id) {
+                self.committed_poison.store(true, Ordering::Release);
+                return Ok(Arc::clone(pr));
+            }
+        }
+        let psz = self.page_size();
+        // 1. The __begin__ savepoint's pre-image: the writer fetched this
+        //    page during the transaction (and may have mutated the live
+        //    copy) — the pre-image is exactly its BEGIN-time bytes.
+        {
+            let sp = self.savepoints.lock();
+            if let Some(bytes) = sp.first().and_then(|lvl| lvl.pages.get(&id)) {
+                let mut page = Page::new(id, psz);
+                page.data.copy_from_slice(bytes);
+                let pr: PageRef = Arc::new(Mutex::new(page));
+                self.cache_committed_page(id, &pr);
+                // BEGIN-time bytes ≠ live cache for writer-fetched pages:
+                // the scope's drop must retire advisory-cache state built
+                // from these bytes (single write-epoch bump).
+                self.committed_poison.store(true, Ordering::Release);
+                return Ok(pr);
+            }
+        }
+        // 2. Never touched by the writer this transaction: the committed
+        //    bytes are, in order: the live cache (in-memory stores never
+        //    write the backing image; evicted file-store pages live in
+        //    the WAL / main file).
+        // 3. Not fetched by the writer during THIS transaction (no
+        //    pre-image): every pre-existing-page mutation goes through
+        //    `get_page` (capture) — so the live cache's bytes ARE the
+        //    committed bytes. This covers in-memory stores (flush is a
+        //    no-op, the dirty set accumulates forever, the backing image
+        //    is never written) and file stores alike. The live PageRef is
+        //    shared with the writer, but the engine RwLock excludes
+        //    concurrent writer statements for the whole scope, and it is
+        //    NEVER memoized into committed_pages (the writer may dirty it
+        //    in a LATER statement; an alias would then serve
+        //    uncommitted bytes to a later reader).
+        if let Some(page_ref) = self.cache.read().get(id).cloned() {
+            return Ok(page_ref);
+        }
+        let mut page = Page::new(id, psz);
+        let mut served_from_wal = false;
+        {
+            let wal_guard = self.wal.read();
+            if let Some(state) = wal_guard.as_ref() {
+                if let Some(&offset) = state.map.get(&id) {
+                    state.wal.read_frame_at(offset, &mut page.data)?;
+                    served_from_wal = true;
+                }
+            }
+        }
+        if !served_from_wal {
+            let codec_active = self.codec.read().is_active();
+            if codec_active && id != 0 {
+                let offset = id as u64 * psz as u64;
+                let mut raw = vec![0u8; psz as usize];
+                let n = self.read_file_at(offset, &mut raw)?;
+                if n != psz as usize {
+                    return Err(Error::corruption(format!(
+                        "short read on page {}: {} of {} bytes",
+                        id, n, psz as usize
+                    )));
+                }
+                let decoded = {
+                    let cs = self.codec.read();
+                    cs.decode_page(id == 0, &raw, psz as usize)?
+                };
+                page.data.copy_from_slice(&decoded);
+            } else {
+                let offset = id as u64 * psz as u64;
+                let n = self.read_file_at(offset, &mut page.data)?;
+                if n != psz as usize {
+                    return Err(Error::corruption(format!(
+                        "short read on page {}: {} of {} bytes",
+                        id, n, psz as usize
+                    )));
+                }
+            }
+        }
+        let pr: PageRef = Arc::new(Mutex::new(page));
+        self.cache_committed_page(id, &pr);
+        Ok(pr)
+    }
+
+    /// Materialization-cache insert with a hard page cap: the committed
+    /// view must never grow the process's footprint beyond the readers'
+    /// working set. Below the cap, a hot page is copied ONCE per
+    /// transaction (scans then run at live-cache speed); at the cap, the
+    /// page is re-materialized per miss — slower, but the memory budget
+    /// holds (1k pages = 4 MiB at the default page size).
+    fn cache_committed_page(&self, id: PageId, pr: &PageRef) {
+        let mut cp = self.committed_pages.lock();
+        if cp.len() < COMMITTED_PAGES_CAP {
+            cp.insert(id, Arc::clone(pr));
+        }
     }
 
     /// Allocate a new page. Uses the freelist first, then extends the file.

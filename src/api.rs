@@ -28,6 +28,65 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+// ---------------------------------------------------------------------------
+// READ-VIEW IDENTITY (committed-view reads, WAL-grade concurrency)
+// ---------------------------------------------------------------------------
+
+// Per-thread stable id (0 is reserved for "no transaction owner").
+thread_local! {
+    static THREAD_ID: u64 = {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    };
+}
+
+#[inline]
+fn current_tid() -> u64 {
+    THREAD_ID.with(|t| *t)
+}
+
+/// Read-view preference for the CURRENT thread (thread-local):
+/// * `AUTO` — engine heuristic: a transaction owned by ANOTHER thread is
+///   read through the committed view; the owner's own reads see live
+///   (read-your-own-writes) state.
+/// * `LIVE` — force the live view even when the heuristic would arm the
+///   committed view. The sqlx driver sets this for the transaction
+///   OWNER's reads: async tasks migrate threads, so thread identity is
+///   not identity-of-connection there — the driver knows the connection
+///   and decides exactly.
+/// * `COMMITTED` — force the committed view for foreign-transaction
+///   reads regardless of thread identity (the driver's reader path).
+///
+/// Reset to AUTO by `Database::execute` (a writer must never read the
+/// BEGIN-time state) and by the driver's read-guard RAII wrapper.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadView {
+    Auto,
+    Live,
+    Committed,
+}
+
+thread_local! {
+    static READ_VIEW: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn read_view_pref() -> ReadView {
+    match READ_VIEW.with(|c| c.get()) {
+        1 => ReadView::Live,
+        2 => ReadView::Committed,
+        _ => ReadView::Auto,
+    }
+}
+
+fn set_read_view_pref(v: ReadView) {
+    let b = match v {
+        ReadView::Auto => 0,
+        ReadView::Live => 1,
+        ReadView::Committed => 2,
+    };
+    READ_VIEW.with(|c| c.set(b));
+}
+
 /// The maximum number of pages cached in memory for FILE-backed databases
 /// (512 pages x 4 KiB = 2 MiB — SQLite's own default cache_size of
 /// -2000 KiB). In-memory databases never evict (the cache IS the store),
@@ -173,6 +232,28 @@ pub struct Database {
     /// True when the open transaction was started by SAVEPOINT (not
     /// BEGIN) — releasing the outermost savepoint then COMMITS.
     savepoint_txn: AtomicBool,
+    /// Thread id (see `current_tid`) that owns the open write
+    /// transaction — the thread that executed BEGIN. READ entry points
+    /// (`query`, statement `step` on selects) compare it against the
+    /// CURRENT thread: a foreign thread arms the pager's committed-view
+    /// scope and reads the BEGIN-time state instead of the writer's
+    /// uncommitted pages (SQLite-WAL reader semantics). 0 = no txn.
+    txn_owner_tid: AtomicU64,
+    /// True when the open transaction performed DDL (CREATE/DROP/ALTER/
+    /// VACUUM/ATTACH). Committed-view readers only bypass the live page
+    /// cache — they do not snapshot the CATALOG — so schema changes
+    /// mid-transaction fall back to conservative behavior (readers wait
+    /// at the driver gate / read the live view as before). Data-only
+    /// transactions (the 99% case) get full non-blocking committed reads.
+    txn_has_ddl: AtomicBool,
+    /// Monotonic schema/roots epoch: bumped whenever cached plans could
+    /// embed state that a committed-view reader must not use (DDL, root
+    /// moves / splits mid-txn, cache invalidation, rollback). BEGIN
+    /// records `txn_begin_epoch`; a committed-view reader only trusts
+    /// cache entries stamped at or before it.
+    schema_epoch: AtomicU64,
+    /// `schema_epoch` at the moment BEGIN executed.
+    txn_begin_epoch: AtomicU64,
     /// Combined bookkeeping maps (table root overrides, index roots,
     /// max-rowid cache) behind ONE Arc — a query snapshot is a single
     /// read-lock + one refcount bump (previously three separate
@@ -1734,6 +1815,10 @@ impl Database {
             txn_maps_snap: Mutex::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
+            txn_owner_tid: AtomicU64::new(0),
+            txn_has_ddl: AtomicBool::new(false),
+            schema_epoch: AtomicU64::new(0),
+            txn_begin_epoch: AtomicU64::new(0),
             maps: RwLock::new(empty_maps()),
             maps_populated: AtomicBool::new(false),
             write_epoch: AtomicU64::new(0),
@@ -1817,6 +1902,10 @@ impl Database {
             txn_maps_snap: Mutex::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
+            txn_owner_tid: AtomicU64::new(0),
+            txn_has_ddl: AtomicBool::new(false),
+            schema_epoch: AtomicU64::new(0),
+            txn_begin_epoch: AtomicU64::new(0),
             maps: RwLock::new(empty_maps()),
             maps_populated: AtomicBool::new(false),
             write_epoch: AtomicU64::new(0),
@@ -2668,6 +2757,12 @@ impl Database {
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         profile::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A writer must never read the BEGIN-time (committed) state: a
+        // leaked read-view preference or pager scope on this thread is
+        // cleared here — `execute` takes `&mut`, so exclusive with every
+        // reader scope by construction.
+        set_read_view_pref(ReadView::Auto);
+        self.pager.disarm_reader_scope();
         // Write-epoch bump: `execute` is the gateway for every mutating
         // statement (DML, DDL, transaction control, fast-path inserts),
         // so ONE bump here invalidates the memoized COUNT(*) answers for
@@ -2921,17 +3016,43 @@ impl Database {
             self.invalidate_stmt_cache();
         }
         // Track the begin-time maps for the ROLLBACK restore above: BEGIN
-        // snapshots them, COMMIT/ROLLBACK releases the snapshot.
+        // snapshots them, COMMIT/ROLLBACK releases the snapshot. The same
+        // boundaries drive the committed-view read state: BEGIN records the
+        // owning thread (foreign-thread readers then serve the BEGIN-time
+        // state — WAL reader semantics), COMMIT/ROLLBACK end that view.
         if result.is_ok() {
             match stmt_ref {
                 Statement::Begin(_) => {
                     *self.txn_maps_snap.lock() = Some(self.maps.read().clone());
+                    self.txn_owner_tid.store(current_tid(), Ordering::Release);
+                    self.txn_begin_epoch
+                        .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
+                    self.txn_has_ddl.store(false, Ordering::Release);
+                    self.pager.clear_committed_view();
                 }
                 Statement::Commit | Statement::Rollback(_) => {
                     *self.txn_maps_snap.lock() = None;
+                    self.txn_owner_tid.store(0, Ordering::Release);
+                    self.pager.clear_committed_view();
+                    if matches!(stmt_ref, Statement::Rollback(_)) {
+                        // Pre-BEGIN state is restored — anything stamped
+                        // against the mid-transaction epoch is stale.
+                        self.schema_epoch.fetch_add(1, Ordering::Release);
+                    }
                 }
                 _ => {}
             }
+        }
+        // DDL (or any cache-invalidation event) inside an open
+        // transaction: committed-view readers must not try to read a
+        // schema that moved mid-transaction — they fall back to the
+        // conservative gate (drivers) / live view (raw API) until the
+        // transaction ends. Data-only transactions — the 99% case — keep
+        // full non-blocking committed reads.
+        if result.is_ok() && is_ddl && self.in_transaction.load(Ordering::Acquire) {
+            self.txn_has_ddl.store(true, Ordering::Release);
+            self.schema_epoch.fetch_add(1, Ordering::Release);
+            self.pager.clear_committed_view();
         }
         // Persist any root-page moves (B+tree splits) to the schema rows so
         // a reopened database sees the full tree. Without this, every table
@@ -2958,6 +3079,87 @@ impl Database {
         // commit / DDL): see `maybe_drain_after_burst`.
         self.maybe_drain_after_burst();
         result
+    }
+
+    // -------------------------------------------------------------------
+    // Committed-view reads (WAL-grade read concurrency)
+    // -------------------------------------------------------------------
+
+    /// Set the CURRENT thread's read-view preference (see [`ReadView`]).
+    /// The sqlx driver uses this to make foreign-transaction reads exact
+    /// (async tasks migrate threads, so the engine's thread heuristic is
+    /// not authoritative there); raw-API users sharing a
+    /// `Arc<RwLock<Database>>` can force `Live` for a transaction whose
+    /// statements hop threads.
+    pub fn set_read_view(&self, v: ReadView) {
+        set_read_view_pref(v);
+    }
+
+    /// Same as [`Self::set_read_view`], callable without a `Database`
+    /// value (the preference is thread-local, not engine-local). The
+    /// sqlx driver arms it around its engine calls.
+    pub(crate) fn set_read_view_public(v: ReadView) {
+        set_read_view_pref(v);
+    }
+
+    /// Base conditions for serving a committed-view read right now:
+    /// a write transaction is open, it is data-only (no DDL / savepoint
+    /// ops / cache invalidation since BEGIN — the epoch guard), and an
+    /// owner is recorded. Callers combine this with the thread/connection
+    /// identity decision (see `committed_read_active`).
+    pub fn committed_reads_available(&self) -> bool {
+        self.in_transaction.load(Ordering::Acquire)
+            && self.txn_owner_tid.load(Ordering::Acquire) != 0
+            && !self.txn_has_ddl.load(Ordering::Acquire)
+            && self.txn_begin_epoch.load(Ordering::Acquire)
+                == self.schema_epoch.load(Ordering::Acquire)
+    }
+
+    /// True when THIS thread's next read should run against the
+    /// BEGIN-time (committed) state: the base conditions hold and the
+    /// caller is not the transaction owner — either forced (`Committed`
+    /// preference, the driver's exact connection identity) or by the
+    /// thread heuristic (`Auto`: owner thread reads its own writes, any
+    /// other thread reads the committed snapshot).
+    #[inline]
+    fn committed_read_active(&self) -> bool {
+        match read_view_pref() {
+            ReadView::Live => false,
+            ReadView::Committed => self.committed_reads_available(),
+            ReadView::Auto => {
+                self.committed_reads_available()
+                    && self.txn_owner_tid.load(Ordering::Acquire) != current_tid()
+            }
+        }
+    }
+
+    /// Bookkeeping-maps snapshot for a READ: the BEGIN-time maps while a
+    /// committed-view read is armed on this thread (mid-transaction root
+    /// moves must not be visible), the live maps otherwise. Keyed on the
+    /// PAGER's armed scope (not the preference) so a decision never
+    /// diverges from what `get_page` actually serves.
+    pub(crate) fn read_maps(&self) -> Arc<crate::executor::StmtMaps> {
+        if self.pager.committed_reads_armed() {
+            if let Some(m) = self.txn_maps_snap.lock().clone() {
+                return m;
+            }
+        }
+        self.maps.read().clone()
+    }
+
+    /// Arm the pager's committed-view scope for this thread when a
+    /// committed read is active (SELECT-shaped statements only — a DML
+    /// statement through the `&self` query path must never touch the
+    /// BEGIN-time state). The returned guard keeps the scope armed for
+    /// its lifetime; `get_page` then serves BEGIN-time bytes.
+    pub(crate) fn committed_view_guard(
+        &self,
+        is_read: bool,
+    ) -> Option<crate::storage::pager::CommittedViewGuard<'_>> {
+        if !is_read || !self.committed_read_active() {
+            return None;
+        }
+        Some(self.pager.arm_committed_view(self.pager.committed_bound()))
     }
 
     /// Execute a query and return all rows.
@@ -3001,6 +3203,11 @@ impl Database {
                 None => Vec::new(),
             });
         }
+        // Committed-view decision for THIS statement: SELECT-shaped reads
+        // only (DML through the `&self` query path must never touch the
+        // BEGIN-time state). One arming covers every arm below — the RAII
+        // guard restores the thread scope on each early return.
+        let _cvg = self.committed_view_guard(matches!(cached.stmt.as_ref(), Statement::Select(_)));
         // WITH-clause statements: materialize CTEs, plan with them in
         // scope, execute — never cached (rows are recomputed per call).
         if let Statement::Select(sel) = cached.stmt.as_ref() {
@@ -3011,7 +3218,7 @@ impl Database {
                 } else {
                     None
                 };
-                let shared = self.maps.read().clone();
+                let shared = self.read_maps();
                 let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
                 ctx.in_transaction = in_txn;
@@ -3032,16 +3239,20 @@ impl Database {
         // over a rowid / index point lookup). Checked BEFORE the plan
         // Arc clone — the fast path never touches the plan, and the
         // refcount pair cost ~15 ns per OLTP query.
-        if let Some(fp) = &cached.fast_path {
-            // Bind straight from the caller's parameter storage when
-            // it's already contiguous (arrays/Vec) — no per-query Vec.
-            if let Some(slice) = params.as_slice() {
-                let rows = self.run_fast_path(fp, slice)?;
+        // Committed-view readers skip it: the cached fast path embeds
+        // LIVE roots (B+tree splits mid-transaction move them).
+        if !self.pager.committed_reads_armed() {
+            if let Some(fp) = &cached.fast_path {
+                // Bind straight from the caller's parameter storage when
+                // it's already contiguous (arrays/Vec) — no per-query Vec.
+                if let Some(slice) = params.as_slice() {
+                    let rows = self.run_fast_path(fp, slice)?;
+                    return Ok(rows);
+                }
+                let params_v: Vec<Value> = params.into_iter().collect();
+                let rows = self.run_fast_path(fp, &params_v)?;
                 return Ok(rows);
             }
-            let params_v: Vec<Value> = params.into_iter().collect();
-            let rows = self.run_fast_path(fp, &params_v)?;
-            return Ok(rows);
         }
         if let Some(plan) = cached.plan.clone() {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
@@ -3057,7 +3268,8 @@ impl Database {
             };
             // ONE read-lock + ONE refcount bump for all three bookkeeping
             // maps (was three separate `RwLock<Arc<HashMap>>` reads).
-            let shared = self.maps.read().clone();
+            // Committed-view reads take the BEGIN-time maps instead.
+            let shared = self.read_maps();
             let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -3117,10 +3329,13 @@ impl Database {
                     self.maps_populated.store(nonempty, Ordering::Release);
                 }
                 self.sync_schema_roots_inner()?;
-            } else if ctx.max_rowids_changed {
+            } else if ctx.max_rowids_changed && !self.pager.committed_reads_armed() {
                 // Pure SELECTs can still populate the max-rowid scan cache
                 // (used by the index-range merge-scan heuristic) — merge it
-                // back so repeated queries don't rescan.
+                // back so repeated queries don't rescan. Committed-view
+                // reads never merge: their BEGIN-time max-rowids would
+                // regress the live cache the writer's inserts allocate
+                // rowids from (duplicate-rowid corruption).
                 let mut m = self.maps.write();
                 let bk = Arc::make_mut(&mut *m);
                 bk.max_rowids.extend(ctx.max_rowids.drain());
@@ -3201,6 +3416,8 @@ impl Database {
                 rows,
             ));
         }
+        // Committed-view decision (see query()): SELECT-shaped reads only.
+        let _cvg = self.committed_view_guard(matches!(cached.stmt.as_ref(), Statement::Select(_)));
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -3209,7 +3426,7 @@ impl Database {
                 } else {
                     None
                 };
-                let shared = self.maps.read().clone();
+                let shared = self.read_maps();
                 let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
                 ctx.in_transaction = in_txn;
@@ -3225,18 +3442,21 @@ impl Database {
             }
         }
         if let Some(plan) = cached.plan.clone() {
-            // Pre-compiled point-lookup fast path (see query()).
-            if let Some(fp) = &cached.fast_path {
-                let owned;
-                let slice: &[Value] = match params.as_slice() {
-                    Some(s) => s,
-                    None => {
-                        owned = params.into_iter().collect::<Vec<Value>>();
-                        &owned
-                    }
-                };
-                let rows = self.run_fast_path(fp, slice)?;
-                return Ok((fp.output_columns().to_vec(), rows));
+            // Pre-compiled point-lookup fast path (see query()). Skipped
+            // for committed-view reads: it embeds LIVE roots.
+            if !self.pager.committed_reads_armed() {
+                if let Some(fp) = &cached.fast_path {
+                    let owned;
+                    let slice: &[Value] = match params.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            owned = params.into_iter().collect::<Vec<Value>>();
+                            &owned
+                        }
+                    };
+                    let rows = self.run_fast_path(fp, slice)?;
+                    return Ok((fp.output_columns().to_vec(), rows));
+                }
             }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -3246,7 +3466,8 @@ impl Database {
                 None
             };
             // ONE read-lock + ONE refcount bump (see query()).
-            let shared = self.maps.read().clone();
+            // Committed-view reads take the BEGIN-time maps instead.
+            let shared = self.read_maps();
             let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -3294,10 +3515,13 @@ impl Database {
                     self.maps_populated.store(nonempty, Ordering::Release);
                 }
                 self.sync_schema_roots_inner()?;
-            } else if ctx.max_rowids_changed {
+            } else if ctx.max_rowids_changed && !self.pager.committed_reads_armed() {
                 // Pure SELECTs can still populate the max-rowid scan cache
                 // (used by the index-range merge-scan heuristic) — merge it
-                // back so repeated queries don't rescan.
+                // back so repeated queries don't rescan. Committed-view
+                // reads never merge: their BEGIN-time max-rowids would
+                // regress the live cache the writer's inserts allocate
+                // rowids from (duplicate-rowid corruption).
                 let mut m = self.maps.write();
                 let bk = Arc::make_mut(&mut *m);
                 bk.max_rowids.extend(ctx.max_rowids.drain());
@@ -3635,6 +3859,20 @@ impl Database {
             *self.txn_snapshot.lock() = Some(self.pager.snapshot());
             *self.txn_maps_snap.lock() = Some(self.maps.read().clone());
             self.savepoint_txn.store(true, Ordering::Release);
+            self.txn_owner_tid.store(current_tid(), Ordering::Release);
+            self.txn_begin_epoch
+                .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
+            self.txn_has_ddl.store(false, Ordering::Release);
+            self.pager.clear_committed_view();
+        } else {
+            // SAVEPOINT ops inside an open transaction: the __begin__ undo
+            // log's shape can change (ROLLBACK TO / RELEASE may pop the
+            // bottom level), so committed-view reconstruction is no longer
+            // guaranteed — fall back to conservative gating until the
+            // transaction ends. Rare path; correctness first.
+            self.txn_has_ddl.store(true, Ordering::Release);
+            self.schema_epoch.fetch_add(1, Ordering::Release);
+            self.pager.clear_committed_view();
         }
         self.pager.savepoint(name);
         self.savepoint_maps.lock().push(self.maps.read().clone());
@@ -3644,6 +3882,12 @@ impl Database {
     /// ROLLBACK TO SAVEPOINT <name> — restore pager + bookkeeping maps to
     /// the savepoint; the transaction stays open.
     fn exec_rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        // Savepoint ops can pop the __begin__ undo level (see
+        // exec_savepoint): committed-view reconstruction is off until the
+        // transaction ends.
+        self.txn_has_ddl.store(true, Ordering::Release);
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+        self.pager.clear_committed_view();
         match self.pager.rollback_savepoint(name)? {
             Some(depth) => {
                 let mut maps_snaps = self.savepoint_maps.lock();
@@ -3662,6 +3906,12 @@ impl Database {
     /// above it without rolling back. Releasing the outermost savepoint of
     /// a savepoint-started transaction COMMITS.
     fn exec_release_savepoint(&mut self, name: &str) -> Result<()> {
+        // Savepoint ops can pop the __begin__ undo level (see
+        // exec_savepoint): committed-view reconstruction is off until the
+        // transaction ends.
+        self.txn_has_ddl.store(true, Ordering::Release);
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+        self.pager.clear_committed_view();
         match self.pager.release_savepoint(name) {
             Some(remaining) => {
                 self.savepoint_maps.lock().truncate(remaining);
@@ -3673,6 +3923,8 @@ impl Database {
                     self.in_transaction.store(false, Ordering::Release);
                     *self.txn_snapshot.lock() = None;
                     *self.txn_maps_snap.lock() = None;
+                    self.txn_owner_tid.store(0, Ordering::Release);
+                    self.pager.clear_committed_view();
                     self.pager.flush()?;
                 }
                 Ok(())
@@ -4229,17 +4481,25 @@ impl Database {
                 // writers are `&mut self` (exclusive with this `&self`
                 // read), so a cached (epoch, count) pair can never outlive
                 // the state it describes. Vtabs never reach this arm.
+                // Committed-view readers: a cached entry may describe the
+                // WRITER's uncommitted state (the writer's own reads
+                // populate it mid-transaction) — bypass both directions.
+                let committed = self.pager.committed_reads_armed();
                 let epoch = self.write_epoch.load(Ordering::Acquire);
                 let key = table.name.to_ascii_lowercase();
-                if let Some(&(e, n)) = self.table_count_cache.read().get(&key) {
-                    if e == epoch {
-                        return Ok(vec![vec![Value::Integer(n)]]);
+                if !committed {
+                    if let Some(&(e, n)) = self.table_count_cache.read().get(&key) {
+                        if e == epoch {
+                            return Ok(vec![vec![Value::Integer(n)]]);
+                        }
                     }
                 }
                 let root = table_root.unwrap_or(table.root_page);
                 let mut bt = Btree::new(&self.pager, root, false);
                 let n = bt.count_rows()? as i64;
-                self.table_count_cache.write().insert(key, (epoch, n));
+                if !committed {
+                    self.table_count_cache.write().insert(key, (epoch, n));
+                }
                 Ok(vec![vec![Value::Integer(n)]])
             }
             FastPath::IndexPoint {

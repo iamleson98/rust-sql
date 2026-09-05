@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased] — 2026-09-05 WAL-grade read concurrency (committed-view reads)
+
+### Concurrency (the headline)
+
+- **Readers never wait for an open write transaction** (SQLite-WAL
+  reader semantics, always on): a read from a non-owner thread/connection
+  while a foreign data-only write transaction is open serves the
+  BEGIN-time (last committed) state — reconstructed from the `__begin__`
+  savepoint's undo pre-images + the live cache for never-fetched pages +
+  the WAL committed map / main file. No WAL file, no frame copies, no
+  checkpoint; a capped (1024-page) reader-side materialization cache
+  keeps hot committed pages at live-cache speed and is cleared at every
+  transaction boundary. Measured with the new `concurrent_rw` bench: 8
+  reader threads sustain **106k point-lookup+count ops/s DURING a
+  20k-insert write transaction** (previously: readers blocked until
+  COMMIT). Owner keeps read-your-own-writes; DDL/savepoint transactions
+  conservatively fall back to gating (rollback-journal semantics);
+  writers still serialize with BUSY/busy-timeout.
+- **Advisory-cache poison control for committed readers**: the epoch
+  state a committed reader records from BEGIN-time bytes is retired by a
+  single write-epoch bump when its scope ends (only when it actually
+  served writer-touched pages); the join-build cache and COUNT(*)
+  memoization never consult/populate during an armed committed read;
+  max-rowid merge-backs are gated for committed readers (BEGIN-time max
+  rowid would regress the insert allocator). `tests/committed_view.rs`
+  (8 tests) + 6 new sqlx-driver concurrency tests cover isolation,
+  rollback, index reads, mid-transaction B+tree splits, cache
+  non-poisoning, DDL gating, owner semantics across task migration, and
+  file-backed parity.
+
 ## [Unreleased] — 2026-09-02 COUNT(*) memoization + zero-warning clippy pass
 
 ### Performance

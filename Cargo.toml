@@ -196,6 +196,10 @@ name = "insert"
 harness = false
 
 [[bench]]
+name = "concurrent_rw"
+harness = false
+
+[[bench]]
 name = "join"
 harness = false
 

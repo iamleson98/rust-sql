@@ -490,6 +490,30 @@ fn gate_mode_for(sql: &str) -> Option<bool> {
     }
 }
 
+/// Engine read guard with the thread's read-view preference armed by
+/// `acquire_read` (`Committed` for foreign-transaction committed-view
+/// reads, `Live` otherwise) and restored to `Auto` on drop. All driver
+/// engine calls run synchronously inside the guard's scope, so the
+/// thread-local preference never leaks across an await point.
+struct ReadGuardView<'a> {
+    guard: parking_lot::RwLockReadGuard<'a, Engine>,
+}
+
+impl std::ops::Deref for ReadGuardView<'_> {
+    type Target = Engine;
+    #[inline]
+    fn deref(&self) -> &Engine {
+        &self.guard
+    }
+}
+
+impl Drop for ReadGuardView<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        Engine::set_read_view_public(crate::api::ReadView::Auto);
+    }
+}
+
 impl RustqliteConnection {
     /// Open a connection with the given options (see
     /// [`RustqliteConnectOptions`]).
@@ -537,19 +561,34 @@ impl RustqliteConnection {
 
     // -- lock acquisition --------------------------------------------------
 
-    /// Acquire the engine read lock, waiting (up to the busy timeout)
-    /// while a foreign transaction with uncommitted writes is open so
-    /// readers never observe dirty state. Read-only foreign transactions
-    /// never block readers.
-    fn acquire_read(&self) -> Result<parking_lot::RwLockReadGuard<'_, Engine>, SqlxError> {
+    /// Acquire the engine read lock, with WAL-grade committed-view
+    /// passthrough: while a foreign transaction with uncommitted writes is
+    /// open, readers that can be served the BEGIN-time (committed) state
+    /// proceed WITHOUT waiting — the engine arms the committed view for
+    /// this thread (exact connection identity, thread-id heuristic
+    /// defeated). Foreign transactions with DDL/savepoints (or anything
+    /// that invalidates committed-view reconstruction) still wait for the
+    /// transaction to end, exactly like a rollback-journal SQLite. The
+    /// thread's read-view preference is restored when the guard drops.
+    fn acquire_read(&self) -> Result<ReadGuardView<'_>, SqlxError> {
         let deadline = std::time::Instant::now() + self.busy_timeout;
         loop {
             let db = self.shared.db.read();
-            if !self
+            let blocked = self
                 .shared
-                .foreign_tx_blocked(self.id, /* only_dirty: */ true)
-            {
-                return Ok(db);
+                .foreign_tx_blocked(self.id, /* only_dirty: */ true);
+            let committed = blocked && db.committed_reads_available();
+            if !blocked || committed {
+                if committed {
+                    Engine::set_read_view_public(crate::api::ReadView::Committed);
+                } else {
+                    // Exact identity: this connection is not the foreign
+                    // reader (no txn, or our own txn) — force the LIVE view
+                    // so the engine's thread heuristic can never serve a
+                    // migrated owner-task the BEGIN-time state.
+                    Engine::set_read_view_public(crate::api::ReadView::Live);
+                }
+                return Ok(ReadGuardView { guard: db });
             }
             drop(db);
             let remain = deadline.saturating_duration_since(std::time::Instant::now());
@@ -613,6 +652,21 @@ impl RustqliteConnection {
         };
         if !self.shared.foreign_tx_blocked(self.id, only_dirty) {
             return Ok(()); // fast path: nothing to wait for
+        }
+        // WAL-grade committed reads: a foreign dirty transaction whose
+        // BEGIN-time state the engine can reconstruct serves this reader
+        // WITHOUT waiting. The peek takes the engine read lock — which
+        // blocks at most one in-flight writer statement (engine calls
+        // are synchronous under the lock, never awaiting), so the async
+        // thread parks only for a bounded statement, not the txn.
+        if only_dirty {
+            let pass = {
+                let db = self.shared.db.read();
+                db.committed_reads_available()
+            };
+            if pass {
+                return Ok(());
+            }
         }
         gate::GateWait::new(
             Arc::clone(&self.shared),

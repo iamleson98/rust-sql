@@ -120,6 +120,12 @@ pub struct Statement<'a> {
     /// Post-execution map deltas (DML merge-back, mirrors query()).
     deltas: CtxDeltas,
     changes_at_start: i64,
+    /// Committed-view scope armed by `start()` for SELECT statements
+    /// that run while a foreign write transaction is open (WAL-grade
+    /// reads: the pager serves BEGIN-time pages, `read_maps` serves the
+    /// BEGIN-time bookkeeping). Held for the statement's lifetime so the
+    /// streaming drivers' `next_batch` calls stay inside the scope.
+    view_guard: Option<crate::storage::pager::CommittedViewGuard<'a>>,
 }
 
 #[derive(Default)]
@@ -198,6 +204,7 @@ impl<'a> Statement<'a> {
             done: false,
             deltas: CtxDeltas::default(),
             changes_at_start: db.total_changes(),
+            view_guard: None,
         })
     }
 
@@ -269,6 +276,10 @@ impl<'a> Statement<'a> {
         self.done = false;
         self.deltas = CtxDeltas::default();
         self.changes_at_start = self.db.total_changes();
+        // Drop the committed-view scope: a re-executed statement re-arms
+        // (or not) against the CURRENT transaction state at its next
+        // start().
+        self.view_guard = None;
     }
 
     /// Clear all bound parameters (back to NULL).
@@ -422,6 +433,16 @@ impl<'a> Statement<'a> {
             let _ = self.db.pager.flush();
         }
 
+        // Committed-view arming (SELECT statements only): while a
+        // foreign write transaction is open on this database, the pager
+        // serves BEGIN-time pages and `read_maps` the BEGIN-time
+        // bookkeeping — SQLite-WAL reader semantics. DML statements must
+        // keep reading the live view (read-your-own-writes / write
+        // targeting), so they never arm.
+        self.view_guard = self
+            .db
+            .committed_view_guard(matches!(self.stmt.as_ref(), AstStatement::Select(_)));
+
         // PRAGMA reads: single row for value pragmas, N rows for
         // table-valued pragmas (table_info etc.).
         if let AstStatement::Pragma(p) = self.stmt.as_ref() {
@@ -463,12 +484,16 @@ impl<'a> Statement<'a> {
             return Ok(());
         }
 
-        // Precompiled point/range fast paths: a handful of rows.
-        if let Some(fp) = self.fast_path.clone() {
-            let rows = self.db.run_fast_path_public(&fp, &self.params)?;
-            self.columns = Some(fp_output_columns(&fp));
-            self.stream = StreamState::Materialized(rows.into_iter());
-            return Ok(());
+        // Precompiled point/range fast paths: a handful of rows. Skipped
+        // when the committed view is armed — the cached fast path embeds
+        // LIVE roots (B+tree splits mid-transaction move them).
+        if self.fast_path.is_some() && !self.db.pager.committed_reads_armed() {
+            if let Some(fp) = self.fast_path.clone() {
+                let rows = self.db.run_fast_path_public(&fp, &self.params)?;
+                self.columns = Some(fp_output_columns(&fp));
+                self.stream = StreamState::Materialized(rows.into_iter());
+                return Ok(());
+            }
         }
 
         if let Some(plan) = self.plan.clone() {
@@ -515,7 +540,8 @@ impl<'a> Statement<'a> {
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.merge_dml_maps();
                 self.db.sync_schema_roots_public()?;
-            } else if self.deltas.max_rowids_changed {
+            } else if self.deltas.max_rowids_changed && !self.db.pager.committed_reads_armed() {
+                // Committed-view reads never merge (see query()).
                 self.merge_max_rowids();
             }
             if is_dml && !dml_has_returning {
@@ -535,7 +561,7 @@ impl<'a> Statement<'a> {
     fn exec_with_ctx<R>(&mut self, f: impl FnOnce(&mut ExecContext<'_>) -> Result<R>) -> Result<R> {
         let db = self.db;
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
-        let shared = db.maps.read().clone();
+        let shared = db.read_maps();
         let in_txn = db.in_transaction.load(std::sync::atomic::Ordering::Acquire);
         let txn_snap = if in_txn {
             db.txn_snapshot.lock().clone()
@@ -1011,7 +1037,7 @@ impl Driver for ProjectedScanDriver {
             return Ok(Vec::new());
         }
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
-        let shared = db.maps.read().clone();
+        let shared = db.read_maps();
         let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         let root = ctx.table_root(&self.table);
         let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
@@ -1108,7 +1134,7 @@ impl Driver for ScanDriver {
             return Ok(Vec::new());
         }
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
-        let shared = db.maps.read().clone();
+        let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
             ctx.bind_positional(p.clone());
@@ -1241,7 +1267,7 @@ impl Driver for FilteredScanDriver {
             return Ok(Vec::new());
         }
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
-        let shared = db.maps.read().clone();
+        let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
             ctx.bind_positional(p.clone());
@@ -1393,7 +1419,7 @@ impl Driver for RangeDriver {
             return Ok(Vec::new());
         }
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
-        let shared = db.maps.read().clone();
+        let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
             ctx.bind_positional(p.clone());

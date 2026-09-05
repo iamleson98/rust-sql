@@ -221,3 +221,80 @@ The truncate-on-mass-delete sprint (see CHANGELOG for the full list):
   section (shared CI runners swing a single sample 2x — SQLite's S09
   blob scan measured 5.9ms and 3.7ms across two consecutive runs of
   identical code).
+
+## 4. 2026-09-05 (II) — WAL-grade committed-view read concurrency
+
+**The feature: readers never wait for an open write transaction.** SQLite
+gives this only in WAL mode; this engine now gives it always, with the
+version store in memory (the `__begin__` savepoint's undo pre-images)
+instead of WAL frames — no WAL file, no frame copies on the read path, no
+checkpointing.
+
+### Semantics (SQLite-WAL reader model)
+
+- A read on a connection/thread that is NOT the transaction owner sees
+  the BEGIN-time (last committed) state while a write transaction is
+  open: uncommitted inserts/updates/deletes/index entries are invisible;
+  after COMMIT they appear atomically; after ROLLBACK they never did.
+- The transaction OWNER keeps read-your-own-writes (live view) —
+  including across async task migration (the sqlx driver decides by
+  CONNECTION identity, not thread identity).
+- DDL / SAVEPOINT statements inside a transaction flip it to
+  conservative gating (readers wait — rollback-journal semantics):
+  committed-view reconstruction is only guaranteed for data-only
+  transactions, which are the OLTP 99% case.
+- Writers still serialize (one writer at a time, BUSY + busy timeout)
+  — SQLite's own contract.
+
+### Implementation
+
+- **Engine** (`pager.rs` committed view): while a foreign data-only
+  transaction is open, `get_page` serves BEGIN-time bytes from (1) the
+  `__begin__` pre-images, (2) the live cache when the writer never
+  fetched the page this transaction (byte-identical to committed), (3)
+  the WAL committed map / main file. Materialized pages memoize in a
+  capped (1024-page / 4 MiB) reader-side cache, cleared at every
+  transaction boundary — zero footprint when no reader runs.
+- **Identity**: `BEGIN` records the owning thread id; other threads arm
+  the committed view via the thread heuristic. The sqlx driver forces
+  the exact view per CONNECTION (async tasks migrate threads), through
+  a thread-local `ReadView` preference (`Database::set_read_view`).
+- **Advisory-cache poison control**: caches a committed reader populates
+  from BEGIN-time bytes (leaf hints, fast-path pins, join builds) are
+  stamped with an epoch the reader never bumps — they would validate as
+  "live" after the scope ends. The scope's drop bumps the write epoch
+  ONCE when the reader actually served writer-touched pages, so the
+  reader's cache state can never outlive its scope. The join cache and
+  COUNT memo are additionally gated never to consult/populate while a
+  committed read is armed (the concurrent owner-query window), and
+  max-rowid merge-backs are gated (a BEGIN-time max rowid would regress
+  the insert allocator → duplicate rowids).
+- **Driver** (`sqlx_driver`): `acquire_read` passes foreign dirty
+  transactions straight through when the engine reports committed reads
+  available (the read executes against the committed view); the async
+  gate pre-wait does the same peek. Zero-busy-timeout pools now serve
+  reads during open write transactions instantly.
+
+### Measured (bench `concurrent_rw`: 1 writer txn of 20k inserts, N reader threads)
+
+| readers | reader ops DURING the txn | rate |
+|--------:|--------------------------:|-----:|
+| 2 | 2.4k | 48k ops/s |
+| 4 | 5.1k | 61k ops/s |
+| 8 | 6.0k | 106k ops/s |
+
+Before this change: 0 reader ops during the transaction (every reader
+waited at the gate for COMMIT). Single-thread benchmarks are unchanged
+(point lookup 171 ns vs SQLite's 1.65 µs; insert 6×; range scan 1.4×).
+
+### Tests
+
+- `tests/committed_view.rs` (8): engine-level isolation commit/rollback,
+  owner read-your-own-writes, UPDATE/DELETE pre-image visibility, index
+  lookups mid-txn, scans across mid-txn B+tree splits, max-rowid
+  non-poisoning, advisory-cache non-poisoning post-commit, 4-reader
+  stress, file-backed parity.
+- `tests/sqlx_driver.rs` (+6): zero-timeout read during open write txn,
+  rollback invisibility, sqlx `Transaction` (deferred) reads, reader
+  throughput during a write txn, DDL-txn gating fallback, owner reads
+  across task migration.
