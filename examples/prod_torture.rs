@@ -2098,9 +2098,7 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(2);
-    println!(
-        "best-of-{runs} child runs per engine per section (shared-runner noise guard)"
-    );
+    println!("best-of-{runs} child runs per engine per section (shared-runner noise guard)");
     let mut failures: Vec<String> = Vec::new();
     let mut losses: Vec<String> = Vec::new();
 
