@@ -53,6 +53,16 @@ use std::sync::Arc;
 
 /// Batch size for streaming drivers.
 const BATCH: usize = 64;
+/// Sequential scan drivers' ROW-SERVING pull width: each `next_batch`
+/// pays a root descent + resume binary search + ExecContext rebuild, so
+/// the top-level `step()` loop pulls this many rows per batch and serves
+/// them one at a time from its pending queue — 64-row batches paid the
+/// per-batch fixed cost ~16x more often. Widening happens ONLY at the
+/// top serving loop: the driver contract "next_batch returns AT MOST
+/// `budget` rows" stays intact for the LIMIT/OFFSET and Filter wrappers,
+/// whose row accounting depends on it. The MAX_BATCH_BYTES live-
+/// footprint cap still bounds wide rows inside each driver.
+const SCAN_BATCH_ROWS: usize = 1024;
 
 /// Cap on the heap bytes materialized into ONE streaming batch (see
 /// `ProjectedScanDriver::next_batch`): keeps wide-row statements at a
@@ -335,7 +345,14 @@ impl<'a> Statement<'a> {
                 let db = self.db;
                 let params = self.params.clone();
                 let named = self.named.clone();
-                let batch = drv.next_batch(db, &params, &named, BATCH)?;
+                // Pull WIDE batches for sequential scans: the driver stack
+                // clamps correctly (LimitDriver caps at limit_left,
+                // FilterDriver banks leftovers), and each batch amortizes
+                // the root descent + resume + ctx rebuild across 1024 rows
+                // instead of 64. Wrapper drivers still receive exact
+                // budgets from THEIR callers, so LIMIT/OFFSET accounting
+                // is unaffected.
+                let batch = drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS)?;
                 if batch.is_empty() {
                     self.done = true;
                     self.stream = StreamState::Exhausted;
@@ -1000,12 +1017,16 @@ impl Driver for ProjectedScanDriver {
         let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
         let n_cols = self.table.n_columns();
         let rowid_alias = self.table.rowid_alias;
-        let wanted = self.project.clone();
         let start = if self.last_rowid == i64::MIN {
             i64::MIN
         } else {
             self.last_rowid + 1
         };
+        // Sequential-scan widening lives at the TOP serving loop (`step`),
+        // not here: wrapper drivers (LIMIT/OFFSET, Filter) rely on this
+        // call returning AT MOST `budget` rows to keep their row
+        // accounting exact. Widening inside would make a base batch
+        // overshoot LimitDriver's offset/limit bookkeeping.
         let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
         let mut last = self.last_rowid;
         let mut hit_end = true;
@@ -1014,7 +1035,7 @@ impl Driver for ProjectedScanDriver {
             start,
             i64::MAX,
             n_cols,
-            &wanted,
+            &self.project,
             rowid_alias,
             |rowid, row| {
                 if out.len() >= budget {
@@ -1099,16 +1120,29 @@ impl Driver for ScanDriver {
         let n_cols = self.table.n_columns();
         let rowid_alias = self.table.rowid_alias;
         let predicate = self.predicate.as_ref();
-        let col_names: Vec<String> = self.columns.iter().cloned().collect();
-        let params_owned: Vec<Value> = params.to_vec();
+        // Predicate-eval scratch: only built when a predicate exists (a
+        // bare `SELECT *` scan pays no per-batch string Vec + params copy).
+        let col_names: Vec<String> = if predicate.is_some() {
+            self.columns.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let params_owned: Vec<Value> = if predicate.is_some() {
+            params.to_vec()
+        } else {
+            Vec::new()
+        };
         let start = if self.last_rowid == i64::MIN {
             i64::MIN
         } else {
             self.last_rowid + 1
         };
+        // Budget contract: wrapper drivers (LIMIT/OFFSET, Filter) count on
+        // AT MOST `budget` rows back; widening happens in `step()` only.
         let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
         let mut last = self.last_rowid;
         let mut hit_end = true;
+        let mut batch_bytes = 0usize;
         bt.scan_table_range_borrowed(start, i64::MAX, |rowid, payload| {
             if out.len() >= budget {
                 hit_end = false;
@@ -1126,7 +1160,20 @@ impl Driver for ScanDriver {
                         }
                     }
                 }
+                batch_bytes += row_heap_bytes(&row);
                 out.push(row);
+                // `last` tracks PUSHED rows BEFORE any stop: a byte-cap
+                // stop AFTER a push must resume past the pushed row.
+                last = last.max(rowid);
+                if batch_bytes >= MAX_BATCH_BYTES {
+                    // Wide rows: bound ONE batch's live footprint (see
+                    // ProjectedScanDriver) — 64 KB blobs x a wide top-level
+                    // pull would otherwise hold tens of MB in the pending
+                    // queue.
+                    hit_end = false;
+                    return false;
+                }
+                return true;
             }
             last = last.max(rowid);
             true
@@ -1386,11 +1433,23 @@ impl Driver for RangeDriver {
         let n_cols = self.table.n_columns();
         let rowid_alias = self.table.rowid_alias;
         let residual = self.residual.as_ref();
-        let col_names: Vec<String> = self.columns.iter().cloned().collect();
-        let params_owned: Vec<Value> = params.to_vec();
+        // Predicate scratch only when a residual exists (see ScanDriver).
+        let col_names: Vec<String> = if residual.is_some() {
+            self.columns.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let params_owned: Vec<Value> = if residual.is_some() {
+            params.to_vec()
+        } else {
+            Vec::new()
+        };
+        // Budget contract: wrapper drivers (LIMIT/OFFSET, Filter) count on
+        // AT MOST `budget` rows back; widening happens in `step()` only.
         let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
         let mut last = self.last_rowid;
         let mut hit_end = true;
+        let mut batch_bytes = 0usize;
         bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
             if out.len() >= budget {
                 hit_end = false;
@@ -1408,7 +1467,18 @@ impl Driver for RangeDriver {
                         }
                     }
                 }
+                batch_bytes += row_heap_bytes(&row);
                 out.push(row);
+                // `last` tracks PUSHED rows BEFORE any stop: a byte-cap
+                // stop AFTER a push must resume past the pushed row.
+                last = last.max(rowid);
+                if batch_bytes >= MAX_BATCH_BYTES {
+                    // Wide rows: bound ONE batch's live footprint (see
+                    // ProjectedScanDriver).
+                    hit_end = false;
+                    return false;
+                }
+                return true;
             }
             last = last.max(rowid);
             true

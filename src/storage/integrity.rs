@@ -155,7 +155,8 @@ pub fn integrity_check(
     }
 }
 
-/// Walk the freelist chain: count pages, detect cycles, verify bounds.
+/// Walk the TRUNK freelist: count trunk + leaf pages, detect cycles,
+/// verify bounds and entry-array shapes.
 fn check_freelist(pager: &Pager, p: &mut Problems) {
     let head = pager.freelist_head();
     let declared = pager.freelist_count() as usize;
@@ -175,7 +176,7 @@ fn check_freelist(pager: &Pager, p: &mut Problems) {
     let n_pages = pager.n_pages();
     let mut visited: HashSet<u32> = HashSet::new();
     let mut cur = head;
-    let mut walked = 0usize;
+    let mut walked = 0usize; // trunk pages + leaf entries
     while cur != 0 {
         if !visited.insert(cur) {
             p.push(format!("freelist is cyclic at page {}", cur));
@@ -188,26 +189,42 @@ fn check_freelist(pager: &Pager, p: &mut Problems) {
             ));
             return;
         }
-        // The first 4 bytes of a freelist page are the next-page pointer.
-        let next = match pager.get_page(cur) {
+        // Trunk header: [next_trunk (4B), K (4B), K leaf ids (4B each)].
+        let (next, k) = match pager.get_page(cur) {
             Ok(page) => {
                 let borrowed = page.lock();
-                u32::from_le_bytes(
+                let next = u32::from_le_bytes(
                     borrowed
                         .data
                         .get(..4)
                         .and_then(|s| s.try_into().ok())
                         .unwrap_or([0; 4]),
-                )
+                );
+                let k = u32::from_le_bytes(
+                    borrowed
+                        .data
+                        .get(4..8)
+                        .and_then(|s| s.try_into().ok())
+                        .unwrap_or([0; 4]),
+                ) as usize;
+                (next, k)
             }
             Err(e) => {
                 p.push(format!("freelist page {} unreadable: {}", cur, e));
                 return;
             }
         };
-        walked += 1;
-        // Guard: a corrupted count/chain combination can't walk past the
-        // whole file.
+        let cap = (pager.page_size() as usize).saturating_sub(8) / 4;
+        if k > cap {
+            p.push(format!(
+                "freelist trunk {} claims {} entries (capacity {})",
+                cur, k, cap
+            ));
+            return;
+        }
+        walked += 1 + k; // the trunk itself + its leaf entries
+                         // Guard: a corrupted count/chain combination can't walk past the
+                         // whole file.
         if walked > n_pages as usize {
             p.push("freelist walk exceeded page count".into());
             return;

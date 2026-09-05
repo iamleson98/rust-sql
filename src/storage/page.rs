@@ -38,14 +38,24 @@ pub const MIN_PAGE_SIZE: u32 = 512;
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// Magic header for the database file.
-/// On-disk format version. `RSQLDB03`: index order keys for TEXT/BLOB
+/// On-disk format version. `RSQLDB04`: the freelist switched from a
+/// per-page linked list (freeing a page wrote its 4 KB body: zero + next
+/// pointer) to SQLite's TRUNK format — freed pages are just 4-byte
+/// entries in a trunk page's array, so a mass delete reclaims thousands
+/// of pages with ~1 write per 1022 frees. `RSQLDB03` files are accepted
+/// read-only-compat: the legacy linked freelist is migrated to trunk
+/// format at open. `RSQLDB03`: index order keys for TEXT/BLOB
 /// switched from (length-prefix, bytes) to true lexicographic
 /// (bytes + NUL terminator) — index range scans and ORDER BY on text of
 /// differing lengths were wrong. Bumped to `RSQLDB02` with the compact row
 /// codec (size-classed integers, varint lengths, rowid-alias elision) —
 /// files written by v1 are rejected with a clear "unsupported format"
 /// error instead of silently decoding garbage.
-pub const DB_MAGIC: [u8; 8] = *b"RSQLDB03";
+pub const DB_MAGIC: [u8; 8] = *b"RSQLDB04";
+/// Previous format version, accepted at open and migrated in-place
+/// (legacy linked-list freelist → trunk freelist; magic rewritten on the
+/// next flush).
+pub const DB_MAGIC_V3: [u8; 8] = *b"RSQLDB03";
 
 /// Page 0 is special: it holds the database header (100 bytes) followed by
 /// the first B+tree page (typically the schema table's root).

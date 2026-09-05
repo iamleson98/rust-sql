@@ -498,6 +498,17 @@ pub struct Pager {
     /// turns flush() from O(10k) page-lock-acquire-and-check into O(2)
     /// HashSet lookups — a 5000× speedup on the per-statement overhead.
     dirty_pages: Mutex<PageIdSet>,
+    /// Truncation target armed by `truncate_tail` (0 = none): the new
+    /// n_pages bound after a mass-delete freed the file's tail. The
+    /// in-memory state shrinks immediately (cache / LRU / dirty set /
+    /// WAL map / freelist / n_pages); the physical `set_len` happens at
+    /// the next flush/checkpoint so the file length moves atomically
+    /// with the commit that writes the new header.
+    pending_truncate: std::sync::atomic::AtomicU32,
+    /// Run-once guard for the v3 → v4 freelist migration (the file bytes
+    /// keep the v3 magic until the next flush, so re-entry must not
+    /// re-interpret an already-trunk freelist as legacy-linked).
+    legacy_migrated: AtomicBool,
     /// Write-Ahead Log state. `None` = journal_mode=delete (writes go
     /// straight to the main file). `Some(...)` = journal_mode=wal: commits
     /// APPEND frames here, reads consult the committed-page map before the
@@ -676,6 +687,10 @@ impl Pager {
         }
         self.lru.lock().clear();
         // Phase 4: rewind mutable metadata + truncate the file if it grew.
+        // A tail truncation armed by an in-txn mass DELETE is part of the
+        // UNCOMMITTED work being undone — disarm it, or the next flush
+        // would shrink the file under the restored page count.
+        self.pending_truncate.store(0, Ordering::Release);
         self.n_pages.store(base.n_pages, Ordering::Release);
         self.freelist_head
             .store(base.freelist_head, Ordering::Release);
@@ -889,6 +904,8 @@ impl Pager {
             recursive_triggers_enabled: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
             last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
+            pending_truncate: std::sync::atomic::AtomicU32::new(0),
+            legacy_migrated: AtomicBool::new(false),
             dirty_count_approx: AtomicUsize::new(0),
             dirty_pages: Mutex::new(PageIdSet::default()),
             write_version: std::sync::atomic::AtomicU64::new(0),
@@ -913,6 +930,11 @@ impl Pager {
             pager.initialize_new_db()?;
         } else {
             pager.read_header()?;
+            // v3 files: the legacy linked-list freelist becomes trunk
+            // format here (one-time, in-cache; durable with the next
+            // flush alongside the v4 magic). Empty-freelist v3 files only
+            // need the magic byte rewrite.
+            pager.migrate_legacy_freelist()?;
             // Crash recovery: a leftover -wal file holds committed pages
             // newer than the main file. Opening it switches the pager to
             // WAL mode and makes those frames visible through the page map
@@ -932,6 +954,113 @@ impl Pager {
             }
         }
         Ok(pager)
+    }
+
+    /// One-time upgrade of a `RSQLDB03` file: convert the legacy
+    /// linked-list freelist (each freed page's first 4 bytes = next) into
+    /// the v4 trunk format, and rewrite the magic so the next flush
+    /// persists v4. Files with an empty freelist (the common case) only
+    /// pay the magic rewrite. Idempotent for v4 files (no-op).
+    fn migrate_legacy_freelist(&self) -> Result<()> {
+        // Read the magic from the RAW file bytes — NEVER via get_page:
+        // for codec-coded files the codec is not armed yet during `open`,
+        // and caching an undecoded page 0 would poison every later read
+        // of the schema root.
+        let mut magic8 = [0u8; 8];
+        let n = self.read_file_at(0, &mut magic8)?;
+        if n < 8 || magic8 != crate::storage::page::DB_MAGIC_V3 {
+            return Ok(()); // v4 (or new): nothing to migrate.
+        }
+        // Codec-coded v3 files: the freelist pages decode only through
+        // the active codec — defer the migration to codec activation
+        // (see `set_codec`). A plain v3 file has no codec marker.
+        if self.required_codec.lock().is_some() {
+            return Ok(());
+        }
+        self.migrate_legacy_freelist_inner()
+    }
+
+    /// The actual v3 → v4 conversion (caller verified the magic and the
+    /// codec state). Run-once: the raw file keeps the v3 magic until the
+    /// next flush, so a second call would misread the already-converted
+    /// trunks as legacy chain nodes.
+    fn migrate_legacy_freelist_inner(&self) -> Result<()> {
+        if self.legacy_migrated.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // Collect the legacy chain's page ids (cycle-guarded).
+        let count = self.freelist_count.load(Ordering::Acquire);
+        let mut legacy_ids: Vec<PageId> = Vec::new();
+        if count > 0 {
+            let mut cur = self.freelist_head.load(Ordering::Acquire);
+            let mut steps = count as usize + 4;
+            while cur != 0 && steps > 0 {
+                steps -= 1;
+                legacy_ids.push(cur);
+                let next = {
+                    let p = self.get_page(cur)?;
+                    let b = p.lock();
+                    u32::from_le_bytes(b.data[..4].try_into().unwrap_or([0; 4]))
+                };
+                cur = next;
+            }
+        }
+        // Rebuild: every legacy id becomes a trunk-format free page. Use
+        // the FIRST id as the new head trunk and batch the rest as its
+        // entries (splitting into further trunks when the array fills).
+        self.freelist_head.store(0, Ordering::Release);
+        self.freelist_count.store(0, Ordering::Release);
+        for &id in &legacy_ids {
+            // Direct trunk-format insert (mirrors free_page, minus the
+            // pre-image capture — the migration runs before any
+            // savepoints exist).
+            let head = self.freelist_head.load(Ordering::Acquire);
+            let psz = self.page_size() as usize;
+            let cap = (psz.saturating_sub(8)) / 4;
+            let mut became_trunk = true;
+            if head != 0 {
+                let trunk = self.get_page(head)?;
+                let k = {
+                    let b = trunk.lock();
+                    u32::from_le_bytes(b.data[4..8].try_into().unwrap_or([0; 4])) as usize
+                };
+                if k < cap {
+                    let off = 8 + k * 4;
+                    let mut b = trunk.lock();
+                    if off + 4 <= b.data.len() {
+                        b.data[off..off + 4].copy_from_slice(&id.to_le_bytes());
+                        b.data[4..8].copy_from_slice(&((k + 1) as u32).to_le_bytes());
+                        b.dirty = true;
+                        drop(b);
+                        self.note_dirty(head);
+                        became_trunk = false;
+                    }
+                }
+            }
+            if became_trunk {
+                let p = self.get_page(id)?;
+                let mut b = p.lock();
+                b.data.fill(0);
+                b.data[..4].copy_from_slice(&head.to_le_bytes());
+                b.data[4..8].copy_from_slice(&0u32.to_le_bytes());
+                b.dirty = true;
+                drop(b);
+                self.note_dirty(id);
+                self.freelist_head.store(id, Ordering::Release);
+            }
+            self.freelist_count.fetch_add(1, Ordering::AcqRel);
+        }
+        // Rewrite the magic in-cache (durable with the next flush). This
+        // is the FIRST get_page(0) of the migration — by now the caller
+        // has verified the file is codec-less (or the codec is armed).
+        {
+            let page0 = self.get_page(0)?;
+            let mut b = page0.lock();
+            b.data[..8].copy_from_slice(&crate::storage::page::DB_MAGIC);
+            b.dirty = true;
+        }
+        self.note_dirty(0);
+        Ok(())
     }
 
     /// Create a fresh database: write page 0 with the file header and an
@@ -983,7 +1112,12 @@ impl Pager {
                 n
             )));
         }
-        if FileHeader::magic(&header) != Some(&crate::storage::page::DB_MAGIC) {
+        let magic = FileHeader::magic(&header).copied();
+        // v3 (legacy linked-list freelist): accepted and migrated — the
+        // freelist rebuild happens in `migrate_legacy_freelist` (called
+        // from `open`); the magic itself upgrades on the next flush.
+        let is_v3 = magic == Some(crate::storage::page::DB_MAGIC_V3);
+        if magic != Some(crate::storage::page::DB_MAGIC) && !is_v3 {
             // Distinguish "not a rustqlite file" from "old format version"
             // so users get an actionable message.
             let m = FileHeader::magic(&header)
@@ -1327,18 +1461,68 @@ impl Pager {
     }
 
     /// Allocate a new page. Uses the freelist first, then extends the file.
+    ///
+    /// TRUNK FREELIST (v4 format, SQLite's design): the head trunk page
+    /// holds `[next_trunk (4B), K (4B), K leaf page numbers (4B each)]`.
+    /// Popping a leaf is ONE small write to the trunk (K -= 1) — the
+    /// freed page's 4 KB body is never written. When a trunk empties
+    /// (K == 0), the trunk page itself is handed out and the head moves
+    /// to `next_trunk` — O(1), no re-linking writes.
     pub fn allocate_page(&self) -> Result<PageId> {
         let current_free_count = self.freelist_count.load(Ordering::Acquire);
         if current_free_count > 0 {
-            // Pop a page from the freelist.
             let head = self.freelist_head.load(Ordering::Acquire);
+            if head == 0 {
+                return Err(Error::corruption(
+                    "freelist count > 0 but freelist head is 0 (corrupt freelist)",
+                ));
+            }
             let page = self.get_page(head)?;
-            let next = {
+            // Read the trunk header: next trunk + entry count.
+            let (next_trunk, k_entries) = {
                 let borrowed = page.lock();
-                u32::from_le_bytes(borrowed.data[..4].try_into().unwrap())
+                if borrowed.data.len() < 8 {
+                    return Err(Error::corruption(format!(
+                        "freelist trunk {} too small",
+                        head
+                    )));
+                }
+                (
+                    u32::from_le_bytes(borrowed.data[..4].try_into().unwrap()),
+                    u32::from_le_bytes(borrowed.data[4..8].try_into().unwrap()),
+                )
             };
-            let freed = head;
-            self.freelist_head.store(next, Ordering::Release);
+            let freed: PageId;
+            if k_entries > 0 {
+                // Pop the LAST leaf entry: one 4-byte write to the trunk.
+                let last = 8 + (k_entries as usize - 1) * 4;
+                let page = self.get_page(head)?;
+                let mut borrowed = page.lock();
+                if last + 4 > borrowed.data.len() {
+                    return Err(Error::corruption(format!(
+                        "freelist trunk {} entry {} out of range",
+                        head,
+                        k_entries - 1
+                    )));
+                }
+                freed = u32::from_le_bytes(borrowed.data[last..last + 4].try_into().unwrap());
+                borrowed.data[4..8].copy_from_slice(&(k_entries - 1).to_le_bytes());
+                borrowed.dirty = true;
+                drop(borrowed);
+                self.note_dirty(head);
+            } else {
+                // Empty trunk: the trunk page itself is the free page.
+                // Hand it out; the chain continues at next_trunk. (A lone
+                // empty trunk with next == 0 empties the freelist.)
+                freed = head;
+                self.freelist_head.store(next_trunk, Ordering::Release);
+                let page = self.get_page(head)?;
+                let mut borrowed = page.lock();
+                borrowed.data.fill(0);
+                borrowed.dirty = true;
+                drop(borrowed);
+                self.note_dirty(head);
+            }
             // Use fetch_sub to safely decrement without overflow.
             self.freelist_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
@@ -1350,8 +1534,10 @@ impl Pager {
                 })
                 .map_err(|_| Error::corruption("freelist underflow"))?;
 
-            // Clear the page before reuse.
+            // Clear the handed-out page before reuse (the recycled body
+            // may still hold the old tree's bytes in the cache or file).
             {
+                let page = self.get_page(freed)?;
                 let mut borrowed = page.lock();
                 borrowed.data.fill(0);
                 borrowed.dirty = true;
@@ -1378,24 +1564,254 @@ impl Pager {
         }
     }
 
-    /// Mark a page as freed (push it onto the freelist).
-    /// The page is added to the head of the freelist.
+    /// Mark a page as freed (record it on the trunk freelist).
+    ///
+    /// The freed page's BODY IS NEVER WRITTEN: it becomes a 4-byte entry
+    /// in the head trunk's array (SQLite's freelist design). Only when
+    /// the head trunk is full does the freed page itself become a new
+    /// trunk page (one write per ~1022 frees at 4 KiB pages). This is
+    /// what makes mass deletes cheap: freeing N pages costs O(N/1022)
+    /// page writes instead of N.
     pub fn free_page(&self, id: PageId) -> Result<()> {
         if id == 0 {
             return Err(Error::InvalidArgument("cannot free page 0".into()));
         }
-        let page = self.get_page(id)?;
-        let prev_head = self.freelist_head.load(Ordering::Acquire);
-        {
-            let mut borrowed = page.lock();
-            borrowed.data.fill(0);
-            borrowed.data[..4].copy_from_slice(&prev_head.to_le_bytes());
-            borrowed.dirty = true;
+        // Savepoint undo: capture the freed page's pre-image BEFORE any
+        // in-cache mutation below (rollback restores its old bytes even
+        // though the durable copy is never touched).
+        let page_ref = self.get_page(id)?;
+        let head = self.freelist_head.load(Ordering::Acquire);
+        let psz = self.page_size() as usize;
+        let trunk_cap = (psz.saturating_sub(8)) / 4;
+        let mut became_trunk = false;
+        if head != 0 {
+            let trunk_ref = self.get_page(head)?;
+            let k_entries = {
+                let borrowed = trunk_ref.lock();
+                u32::from_le_bytes(borrowed.data[4..8].try_into().unwrap_or([0; 4]))
+            };
+            if (k_entries as usize) < trunk_cap {
+                // Append the freed page id as a new leaf entry.
+                let off = 8 + k_entries as usize * 4;
+                let mut borrowed = trunk_ref.lock();
+                if off + 4 <= borrowed.data.len() {
+                    borrowed.data[off..off + 4].copy_from_slice(&id.to_le_bytes());
+                    borrowed.data[4..8].copy_from_slice(&(k_entries + 1).to_le_bytes());
+                    borrowed.dirty = true;
+                    drop(borrowed);
+                    self.note_dirty(head);
+                } else {
+                    became_trunk = true;
+                }
+            } else {
+                became_trunk = true;
+            }
+        } else {
+            became_trunk = true;
         }
-        self.freelist_head.store(id, Ordering::Release);
+        if became_trunk {
+            // The freed page becomes the new head trunk: [next = old
+            // head, K = 0]. This is the only body write, amortized over
+            // ~1022 subsequent frees.
+            {
+                let mut borrowed = page_ref.lock();
+                borrowed.data.fill(0);
+                borrowed.data[..4].copy_from_slice(&head.to_le_bytes());
+                borrowed.data[4..8].copy_from_slice(&0u32.to_le_bytes());
+                borrowed.dirty = true;
+            }
+            self.note_dirty(id);
+            self.freelist_head.store(id, Ordering::Release);
+        } else {
+            // Cache hygiene only: zero the in-cache copy so no code can
+            // read the freed page's stale bytes as live data. NOT dirty —
+            // the durable copy never changes for leaf entries.
+            let mut borrowed = page_ref.lock();
+            borrowed.data.fill(0);
+            borrowed.dirty = false;
+        }
         self.freelist_count.fetch_add(1, Ordering::AcqRel);
         self.note_write();
-        self.note_dirty(id);
+        Ok(())
+    }
+
+    /// Shrink the file by dropping a contiguous freed SUFFIX of pages.
+    ///
+    /// `freed` holds the page ids freed by the calling operation (bulk
+    /// mass-delete). The largest `k` with every page in `[k, n_pages)`
+    /// present in `freed` (and `k >= 1` — page 0 is the header/schema
+    /// root) is truncated away entirely: the pages leave the cache, the
+    /// LRU, the dirty set, the WAL committed map, and the freelist; no
+    /// WAL frames are ever written for them; `n_pages` drops. This is
+    /// SQLite's truncate-on-mass-delete optimization: `DELETE FROM t
+    /// WHERE id > K` over an append-inserted table reclaims the file's
+    /// tail outright instead of paying a freelist write + a 4 KB frame
+    /// per freed page.
+    ///
+    /// The physical `set_len` is deferred to the next flush/checkpoint
+    /// (`pending_truncate`) so the on-disk length moves with the commit
+    /// that records the new page count. ROLLBACK is covered twice: the
+    /// truncation floor never drops below the lowest active savepoint's
+    /// base (pages below it hold undo pre-images ROLLBACK must be able to
+    /// restore via `get_page`), and both rollback paths disarm the armed
+    /// truncate so a post-rollback flush cannot shrink the file back.
+    ///
+    /// Returns the new page bound (0 when no truncation applied).
+    pub fn truncate_tail(&self, freed: &[PageId]) -> Result<u32> {
+        if freed.is_empty() {
+            return Ok(0);
+        }
+        let set: PageIdSet = freed.iter().copied().collect();
+        let n = self.n_pages.load(Ordering::Acquire);
+        if n <= 1 {
+            return Ok(0);
+        }
+        let mut k = n;
+        while k > 1 && set.contains(&(k - 1)) {
+            k -= 1;
+        }
+        // SAVEPOINT FLOOR: never truncate below the lowest active
+        // savepoint's base n_pages. Pages below that bound were alive at
+        // BEGIN time and are logged in at least one undo map — ROLLBACK
+        // restores them through `get_page(id)`, which fails once n_pages
+        // has rewound past the id. Pages at or above the floor were
+        // allocated during the current transaction (no undo entries in
+        // ANY level), so dropping them is always rollback-safe. The
+        // un-truncated freed tail below the floor simply stays on the
+        // freelist — the standard, correct shape (same as SQLite without
+        // its truncate optimization).
+        let floor = self.savepoint_min_base.load(Ordering::Acquire);
+        if floor != u32::MAX && k < floor {
+            k = floor;
+        }
+        if k == n {
+            return Ok(0);
+        }
+
+        // --- scrub the TRUNK freelist: remove every entry >= k ---
+        // A freelist page can never be referenced by a live btree, so
+        // dropping all entries >= k is always sound. Trunk pages >= k are
+        // dropped whole (page + entries); trunk pages < k keep their
+        // entries < k (compacted in place); the chain is re-linked.
+        {
+            let mut cur = self.freelist_head.load(Ordering::Acquire);
+            let mut removed: u32 = 0;
+            let mut new_head: PageId = 0;
+            let mut prev_kept: PageId = 0;
+            // Cycle guard: the trunk chain can't be longer than the old
+            // page count; a corrupt file stops the walk.
+            let mut steps = (self.freelist_count.load(Ordering::Acquire) + n).max(1);
+            while cur != 0 && steps > 0 {
+                steps -= 1;
+                // (next_trunk, K) + the K leaf entries of this trunk.
+                let (next, k_entries, entries) = {
+                    let page = self.get_page(cur)?;
+                    let borrowed = page.lock();
+                    let next = u32::from_le_bytes(borrowed.data[..4].try_into().unwrap_or([0; 4]));
+                    let kn = u32::from_le_bytes(borrowed.data[4..8].try_into().unwrap_or([0; 4]))
+                        as usize;
+                    let kn = kn.min((borrowed.data.len().saturating_sub(8)) / 4);
+                    let entries: Vec<u32> = (0..kn)
+                        .map(|i| {
+                            u32::from_le_bytes(
+                                borrowed.data[8 + i * 4..12 + i * 4]
+                                    .try_into()
+                                    .unwrap_or([0; 4]),
+                            )
+                        })
+                        .collect();
+                    (next, kn, entries)
+                };
+                if cur >= k {
+                    // The whole trunk page is gone: it + its entries all
+                    // count as removed freelist pages.
+                    removed += 1 + k_entries as u32;
+                } else {
+                    let kept: Vec<u32> = entries.into_iter().filter(|&e| e < k).collect();
+                    removed += (k_entries - kept.len()) as u32;
+                    if kept.len() != k_entries {
+                        // Rewrite the compacted entry array + K.
+                        let page = self.get_page(cur)?;
+                        let mut borrowed = page.lock();
+                        borrowed.data[4..8].copy_from_slice(&(kept.len() as u32).to_le_bytes());
+                        for (i, e) in kept.iter().enumerate() {
+                            borrowed.data[8 + i * 4..12 + i * 4].copy_from_slice(&e.to_le_bytes());
+                        }
+                        borrowed.dirty = true;
+                        drop(borrowed);
+                        self.note_dirty(cur);
+                    }
+                    if new_head == 0 {
+                        new_head = cur;
+                    } else {
+                        // Re-link the previous kept trunk to this one.
+                        let page = self.get_page(prev_kept)?;
+                        let mut borrowed = page.lock();
+                        borrowed.data[..4].copy_from_slice(&cur.to_le_bytes());
+                        borrowed.dirty = true;
+                        drop(borrowed);
+                        self.note_dirty(prev_kept);
+                    }
+                    prev_kept = cur;
+                }
+                cur = next;
+            }
+            self.freelist_head.store(new_head, Ordering::Release);
+            if removed > 0 {
+                self.freelist_count.fetch_sub(removed, Ordering::AcqRel);
+            }
+        }
+
+        // --- drop [k, n) from the cache, LRU, dirty set, WAL map ---
+        {
+            let mut cache = self.cache.write();
+            let slots_len = cache.slots.len();
+            let dense_end = (n as usize).min(slots_len);
+            for idx in (k as usize)..dense_end {
+                cache.slots[idx] = None;
+            }
+            cache.count = cache.slots.iter().filter(|s| s.is_some()).count() + cache.overflow.len();
+            cache.overflow.retain(|&id, _| id < k);
+            self.lru.lock().retain(|&id| id < k);
+            let mut dp = self.dirty_pages.lock();
+            dp.retain(|&id| id < k);
+            self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+            let mut wal = self.wal.write();
+            if let Some(state) = wal.as_mut() {
+                state.map.retain(|&id, _| id < k);
+            }
+        }
+
+        // --- rewind the page count + arm the physical truncate ---
+        self.n_pages.store(k, Ordering::Release);
+        self.pending_truncate.store(k, Ordering::Release);
+        // Invalidate advisory caches (leaf hints may point at truncated
+        // pages; the epoch check re-fetches).
+        self.note_write();
+        // Memory stores: shrink the backing Vec now (it is only snapshot
+        // scratch — the cache is the store — so there is nothing to
+        // defer).
+        if self.store.is_memory() {
+            self.store.set_len(k as u64 * self.page_size() as u64)?;
+            self.pending_truncate.store(0, Ordering::Release);
+        }
+        Ok(k)
+    }
+
+    /// Apply the armed physical file truncation (called from the flush
+    /// paths, after the new header/page images are durable).
+    fn apply_pending_truncate(&self) -> Result<()> {
+        let k = self.pending_truncate.load(Ordering::Acquire);
+        if k == 0 {
+            return Ok(());
+        }
+        let want_len = k as u64 * self.page_size() as u64;
+        if let Ok(len) = self.store.len() {
+            if len > want_len {
+                self.store.set_len(want_len)?;
+            }
+        }
+        self.pending_truncate.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -1435,6 +1851,20 @@ impl Pager {
         {
             let mut cs = self.codec.write();
             cs.active = codec;
+        }
+        // Codec-coded v3 file: the deferred freelist migration now runs
+        // with the codec armed (the open-time pass skipped it — freelist
+        // pages decode only through the active codec). Raw-magic check
+        // first: a v4 file (or an already-migrated one) must not re-enter.
+        {
+            let mut magic8 = [0u8; 8];
+            let is_v3 = self
+                .read_file_at(0, &mut magic8)
+                .map(|n| n == 8 && magic8 == crate::storage::page::DB_MAGIC_V3)
+                .unwrap_or(false);
+            if is_v3 {
+                self.migrate_legacy_freelist_inner()?;
+            }
         }
         // Write / clear the marker on the in-cache page 0.
         let page0 = self.get_page(0)?;
@@ -1512,6 +1942,16 @@ impl Pager {
         // n_pages / freelist / schema_cookie must reflect committed state.
         if n > 0 {
             self.reload_header_from_committed()?;
+            // A pre-truncation crash can leave committed frames for pages
+            // beyond the committed n_pages (a tail truncation armed but
+            // never checkpointed). Drop them: get_page's bounds check
+            // makes them unreachable anyway, and a later checkpoint would
+            // transiently re-extend the file while writing them back.
+            let bound = self.n_pages.load(Ordering::Acquire);
+            let mut guard = self.wal.write();
+            if let Some(state) = guard.as_mut() {
+                state.map.retain(|&id, _| id < bound);
+            }
         }
         Ok(())
     }
@@ -1561,12 +2001,14 @@ impl Pager {
         }
         // Ensure the main file covers every page we just wrote (the file
         // may be shorter than the committed page count — new pages live
-        // only in the WAL until now).
+        // only in the WAL until now), and apply any armed mass-delete
+        // truncation (the file tail reclaims with the commit).
         let want_len = self.n_pages.load(Ordering::Acquire) as u64 * psz as u64;
         let cur_len = self.store.len()?;
-        if want_len > cur_len {
+        if want_len != cur_len {
             self.store.set_len(want_len)?;
         }
+        self.pending_truncate.store(0, Ordering::Release);
         if !self.skip_fsync.load(Ordering::Acquire) {
             self.store.sync_all()?;
         }
@@ -1670,6 +2112,15 @@ impl Pager {
                 .map(|s| s.wal.n_frames())
                 .unwrap_or(0)
         };
+        // A tail truncation does NOT force a checkpoint: the in-memory
+        // state (n_pages, WAL map, cache) is already consistent, the WAL
+        // holds no frames for truncated pages (scrubbed), and the file
+        // length reclaims at the next checkpoint/close. Forcing one here
+        // would copy the WHOLE accumulated WAL back to the main file
+        // inside the DELETE's measured time — SQLite doesn't checkpoint
+        // on mass delete either (its file keeps the high-water length
+        // until a later checkpoint; the committed page-0 frame carries
+        // the smaller n_pages).
         if frames >= WAL_AUTOCHECKPOINT_FRAMES {
             self.checkpoint_wal()?;
         }
@@ -1819,6 +2270,8 @@ impl Pager {
         if !self.skip_fsync.load(Ordering::Acquire) {
             self.store.sync_all()?;
         }
+        // Mass-delete tail truncation: shrink the file with the commit.
+        self.apply_pending_truncate()?;
         self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
     }
@@ -1904,7 +2357,9 @@ impl Pager {
         // skip a needed insert.
         self.last_noted_dirty.store(u32::MAX, Ordering::Release);
 
-        // 2. Restore mutable metadata.
+        // 2. Restore mutable metadata. Any armed tail truncation belonged
+        // to the rolled-back work — disarm it.
+        self.pending_truncate.store(0, Ordering::Release);
         self.n_pages.store(snap.n_pages, Ordering::Release);
         self.freelist_head
             .store(snap.freelist_head, Ordering::Release);

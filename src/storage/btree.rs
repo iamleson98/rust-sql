@@ -992,6 +992,12 @@ pub struct Btree<'a> {
     table_leaf: Option<StructTableHint>,
     /// Last index leaf visited by this handle (see `StructIndexHint`).
     index_leaf: Option<StructIndexHint>,
+    /// When armed (bulk mass-delete), every page freed by this handle is
+    /// recorded so the operation can FILE-TAIL-TRUNCATE the contiguous
+    /// freed suffix afterwards (SQLite's truncate-on-mass-delete: pages
+    /// never enter the freelist, the WAL, or the file).
+    collect_frees: bool,
+    freed_during_op: Vec<PageId>,
 }
 
 /// Result of inserting into a page: either the insert succeeded, or the
@@ -1029,6 +1035,16 @@ impl<'a> Btree<'a> {
             pinned_epoch: 0,
             table_leaf: None,
             index_leaf: None,
+            collect_frees: false,
+            freed_during_op: Vec::new(),
+        }
+    }
+
+    /// Record a page freed by this handle (when armed).
+    #[inline]
+    fn note_freed(&mut self, id: PageId) {
+        if self.collect_frees && id != 0 {
+            self.freed_during_op.push(id);
         }
     }
 
@@ -1309,6 +1325,8 @@ impl<'a> Btree<'a> {
             pinned_epoch: 0,
             table_leaf: None,
             index_leaf: None,
+            collect_frees: false,
+            freed_during_op: Vec::new(),
         })
     }
 
@@ -1772,6 +1790,7 @@ impl<'a> Btree<'a> {
                 p.overflow_next()
             };
             self.pager.free_page(cur)?;
+            self.note_freed(cur);
             cur = next;
         }
         Ok(())
@@ -3854,6 +3873,171 @@ impl<'a> Btree<'a> {
     //     Ok(InsertResult::Split { new_page: new_page_id, split_key })
     // }
 
+    /// Bulk-delete unlink cascade: remove `child`'s reference from its
+    /// parent (separator cell or rightmost pointer), free the child, and
+    /// — when the parent becomes fully childless (0 cells, rightmost 0)
+    /// — recurse upward through `path` (the descent's interior chain,
+    /// root → … → parent), freeing childless interiors too. When the
+    /// cascade empties the ROOT, the root page is converted in place to
+    /// an empty leaf (a valid empty tree, root id preserved for the
+    /// schema maps).
+    ///
+    /// This is the tail-reclaim half of SQLite's truncate-on-mass-delete:
+    /// without the cascade, emptied interior orphans and rightmost-guard
+    /// leaves sit at the file's highest page ids and block the
+    /// contiguity walk in `Pager::truncate_tail`.
+    ///
+    /// Safety: only ever frees pages that hold NO data and NO children —
+    /// an emptied leaf (n_cells == 0), or an interior with 0 cells AND
+    /// rightmost == 0. A childless interior covers an empty key range,
+    /// so removing the parent's pointer to it loses no keys; descents
+    /// already treat (0 cells, rightmost 0) as an empty subtree.
+    fn unlink_child_cascade(&mut self, path: &[PageId], leaf: PageId) -> Result<()> {
+        let mut child = leaf;
+        let mut depth = path.len();
+        loop {
+            if child == 0 || child == self.root {
+                // Root emptied as a LEAF (single-page tree) — a valid
+                // empty tree; nothing to unlink. Root emptied as an
+                // interior is handled by the in-place conversion below.
+                return Ok(());
+            }
+            let parent = if depth == 0 {
+                self.root
+            } else {
+                path[depth - 1]
+            };
+            // Remove the parent's reference to `child` (cell or
+            // rightmost). Returns whether the parent now references
+            // NOTHING for this subtree.
+            let parent_childless = self.unlink_child_reference(parent, child)?;
+            // Free the child (it is empty of data by construction).
+            self.pager.free_page(child)?;
+            self.note_freed(child);
+            if !parent_childless {
+                return Ok(());
+            }
+            if parent == self.root {
+                // The root lost its last child: convert it in place to an
+                // empty leaf — the canonical empty tree. (A 0-cell
+                // childless interior root would confuse the INSERT
+                // descent's null-child guard; an empty leaf root is what
+                // `Btree::create` produces and every path handles.)
+                let root_ref = self.pager.get_page(self.root)?;
+                let mut b = root_ref.lock();
+                b.init_leaf_table();
+                b.dirty = true;
+                drop(b);
+                self.pager.note_dirty(self.root);
+                return Ok(());
+            }
+            // Parent is a childless interior: continue the cascade with
+            // the parent as the child of ITS parent.
+            child = parent;
+            depth = depth.saturating_sub(1);
+        }
+    }
+
+    /// Remove `child`'s reference from `parent`: the separator cell that
+    /// points at it, or the rightmost pointer. Returns true when the
+    /// parent now covers NOTHING (0 cells and rightmost 0) — the caller
+    /// cascades. `child == self.root` is never passed here.
+    fn unlink_child_reference(&mut self, parent: PageId, child: PageId) -> Result<bool> {
+        let (n_cells, found_cell_idx, is_rightmost) = {
+            let parent_ref = self.pager.get_page(parent)?;
+            let borrowed = parent_ref.lock();
+            if borrowed.page_type()? != PageType::InteriorTable {
+                // Parent is the root-as-leaf (single-page tree): nothing
+                // to unlink; the leaf stays as the empty root.
+                return Ok(false);
+            }
+            let n = borrowed.n_cells();
+            let mut found = None;
+            for i in 0..n {
+                let cell_ptr = borrowed.cell_pointer(i) as usize;
+                if let Ok(Some(c)) = borrowed
+                    .cell_slice_checked(cell_ptr)
+                    .map(decode_table_interior_child)
+                {
+                    if c == child {
+                        found = Some(i as usize);
+                        break;
+                    }
+                }
+            }
+            (
+                n,
+                found,
+                found.is_none() && borrowed.right_most_pointer() == child,
+            )
+        };
+        if !is_rightmost && found_cell_idx.is_none() {
+            // No reference anywhere (an orphan from an earlier partial
+            // unlink): the page is unreferenced garbage — the caller
+            // frees it. The parent's coverage is unaffected.
+            return Ok(false);
+        }
+        let header_offset = if parent == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+        match found_cell_idx {
+            Some(idx) => {
+                // Remove the separator cell slot (memmove the pointer
+                // array). Removing the LAST cell of a rightmost==0
+                // interior is safe HERE because the caller cascades the
+                // now-childless parent away immediately.
+                let parent_ref = self.pager.get_page(parent)?;
+                let mut borrowed = parent_ref.lock();
+                let n_usize = n_cells as usize;
+                for i in idx..n_usize.saturating_sub(1) {
+                    let src = ptr_array_start + (i + 1) * 2;
+                    let dst = ptr_array_start + i * 2;
+                    let v = u16::from_be_bytes(
+                        borrowed.data[src..src + 2].try_into().unwrap_or([0; 2]),
+                    );
+                    borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
+                }
+                let new_n = n_cells.saturating_sub(1);
+                borrowed.set_n_cells(new_n);
+                borrowed.dirty = true;
+                drop(borrowed);
+                self.pager.note_dirty(parent);
+                let childless = new_n == 0 && {
+                    let p = self.pager.get_page(parent)?;
+                    let b = p.lock();
+                    b.right_most_pointer() == 0
+                };
+                Ok(childless)
+            }
+            None => {
+                // Rightmost child: the last cell's left_child becomes the
+                // new rightmost. With 0 cells, rightmost becomes 0 (the
+                // childless signal for the cascade).
+                let new_rightmost = {
+                    let parent_ref = self.pager.get_page(parent)?;
+                    let mut borrowed = parent_ref.lock();
+                    let mut r = 0u32;
+                    if n_cells > 0 {
+                        let last_idx = n_cells as usize - 1;
+                        let cell_ptr = borrowed.cell_pointer(last_idx as u16) as usize;
+                        if let Ok(buf) = borrowed.cell_slice_checked(cell_ptr) {
+                            r = decode_table_interior_child(buf).unwrap_or(0);
+                        }
+                        borrowed.set_n_cells(n_cells - 1);
+                        borrowed.dirty = true;
+                    }
+                    borrowed.set_right_most_pointer(r);
+                    r
+                };
+                self.pager.note_dirty(parent);
+                Ok(new_rightmost == 0 && n_cells <= 1)
+            }
+        }
+    }
+
     /// If `child_id` is a LEAF page with zero cells, unlink it from its
     /// parent `parent_id` and push it onto the pager freelist.
     ///
@@ -3871,9 +4055,9 @@ impl<'a> Btree<'a> {
     /// Interior children are never recycled (a 0-cell interior with a
     /// rightmost pointer is left in place — one page, bounded waste, and
     /// collapsing it requires full rebalancing).
-    fn maybe_recycle_empty_child(&mut self, parent_id: PageId, child_id: PageId) -> Result<()> {
+    fn maybe_recycle_empty_child(&mut self, parent_id: PageId, child_id: PageId) -> Result<bool> {
         if child_id == 0 || child_id == self.root {
-            return Ok(());
+            return Ok(false);
         }
         // Child must be an EMPTY leaf.
         {
@@ -3882,10 +4066,10 @@ impl<'a> Btree<'a> {
             match borrowed.page_type()? {
                 PageType::LeafTable | PageType::LeafIndex => {
                     if borrowed.n_cells() != 0 {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
-                _ => return Ok(()), // interior child — don't recycle
+                _ => return Ok(false), // interior child — don't recycle
             }
         }
         // Scan the parent for the cell referencing child_id.
@@ -3930,7 +4114,7 @@ impl<'a> Btree<'a> {
                         r
                     };
                     if right == 0 {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 // Remove the separator cell slot.
@@ -3950,7 +4134,7 @@ impl<'a> Btree<'a> {
                 // Child is the rightmost. The last cell's left_child becomes
                 // the new rightmost.
                 if n_cells == 0 {
-                    return Ok(()); // only child — keep the empty leaf
+                    return Ok(false); // only child — keep the empty leaf
                 }
                 let last_idx = n_cells as usize - 1;
                 let new_rightmost = {
@@ -3977,7 +4161,8 @@ impl<'a> Btree<'a> {
         // freelist; the next allocate_page pops it instead of growing the
         // file.
         self.pager.free_page(child_id)?;
-        Ok(())
+        self.note_freed(child_id);
+        Ok(true)
     }
 
     /// Delete a (rowid) from a table B+tree. Does not rebalance (we leave
@@ -4154,11 +4339,24 @@ impl<'a> Btree<'a> {
         let mut hi = i64::MAX;
         let mut i = 0usize;
         let mut spill_chains: Vec<PageId> = Vec::new();
+        // Interior path of the current sticky descent (root → … →
+        // sticky's parent): the whole-leaf unlink cascade frees childless
+        // interiors upward through it.
+        let mut path: Vec<PageId> = Vec::new();
+        // Arm the freed-page collector: every page this bulk delete
+        // unlinks + frees is a candidate for FILE-TAIL truncation (the
+        // append-insert then mass-delete-tail shape: pages were
+        // allocated in ascending order, so the freed suffix is exactly
+        // the file's tail).
+        self.collect_frees = true;
+        self.freed_during_op.clear();
         while i < rowids.len() {
             let rid = rowids[i];
             // (Re)pin the sticky leaf for this rowid.
             if sticky.is_none() || rid < lo || rid > hi {
                 let mut page_id = self.root;
+                // Full interior path root→…→parent (for the unlink cascade).
+                path.clear();
                 loop {
                     let page = self.pager.get_page(page_id)?;
                     let pt = page.lock().page_type()?;
@@ -4205,6 +4403,7 @@ impl<'a> Btree<'a> {
                                 i += 1;
                                 break;
                             }
+                            path.push(page_id);
                             page_id = next;
                         }
                         _ => {
@@ -4297,6 +4496,14 @@ impl<'a> Btree<'a> {
                 }
                 self.pager.note_dirty(leaf);
                 deleted += n_cells as u64;
+                // UNLINK + FREE the emptied leaf (SQLite's mass-delete
+                // shape): the parent's separator cell is removed, the page
+                // is freed, and — when the parent loses its LAST child —
+                // the cascade recurses upward freeing childless interiors
+                // so the file's tail pages all reclaim (tail truncation
+                // below). Without the cascade, emptied interior orphans
+                // sit above the freed leaves and block truncation.
+                self.unlink_child_cascade(&path, leaf)?;
                 sticky = None;
                 i = run_end;
                 continue;
@@ -4316,6 +4523,18 @@ impl<'a> Btree<'a> {
             }
             i = run_end;
         }
+        // FILE-TAIL TRUNCATION: if the freed pages form a contiguous suffix
+        // of the file (the append-insert + delete-tail shape — page ids
+        // grow monotonically with sequential inserts, so freed tail leaves
+        // are exactly the file's highest pages), drop them entirely: the
+        // file shrinks, no WAL frames are written for them, and they never
+        // pollute the freelist. This is SQLite's own truncate-on-mass-
+        // delete optimization.
+        if !self.freed_during_op.is_empty() {
+            let _k = self.pager.truncate_tail(&self.freed_during_op)?;
+        }
+        self.collect_frees = false;
+        self.freed_during_op.clear();
         Ok(deleted)
     }
 
@@ -4479,7 +4698,7 @@ impl<'a> Btree<'a> {
                     // future inserts reuse it instead of growing the file
                     // (mirrors SQLite's freelist; without it, delete-heavy
                     // churn grows the file forever).
-                    self.maybe_recycle_empty_child(page_id, child_id)?;
+                    let _ = self.maybe_recycle_empty_child(page_id, child_id)?;
                 }
                 Ok(deleted)
             }
@@ -5996,7 +6215,7 @@ impl<'a> Btree<'a> {
                 drop(page);
                 let deleted = self.delete_index_from_page(child_id, key, rowid)?;
                 if deleted {
-                    self.maybe_recycle_empty_child(page_id, child_id)?;
+                    let _ = self.maybe_recycle_empty_child(page_id, child_id)?;
                 }
                 Ok(deleted)
             }
@@ -6514,6 +6733,130 @@ mod tests {
     fn open_pager() -> Pager {
         let tmp = NamedTempFile::new().unwrap();
         Pager::open(tmp.path(), 256).unwrap()
+    }
+
+    // Temporary perf probe (not a correctness test): raw walk costs on an
+    // in-memory pager with 2KB-wide rows, mirroring torture S08.
+    #[test]
+    fn probe_wide_scan_costs() {
+        let iters = 3;
+        for &n_rows in &[3_750usize, 25_000usize] {
+            let pager = Pager::open_memory(2048).unwrap();
+            let mut bt = Btree::create(&pager, false).unwrap();
+            let mut payload: Vec<u8> = Vec::with_capacity(2050);
+            let wide: String = "WIDE-DATA-".repeat(200);
+            for i in 1..=n_rows as i64 {
+                // Row shape = (id INTEGER PRIMARY KEY [rowid marker],
+                // b TEXT) — encode_row_aliased handles the marker.
+                let row: Vec<Value> = vec![
+                    Value::Integer(i),
+                    Value::Text(crate::types::Text::new(&wide)),
+                ];
+                crate::storage::row_codec::encode_row_aliased_into(&row, Some(0), &mut payload);
+                bt.insert_table(i, &payload).unwrap();
+            }
+            let pages = pager.n_pages();
+            println!(
+                "n_rows={n_rows} pages={pages} misses_total={}",
+                pager.cache_misses()
+            );
+
+            // (1) count-only walk (no payload decode)
+            let t = std::time::Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                acc += bt.count_rows().unwrap();
+            }
+            let count_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // (2) borrowed scan, callback sees payload slice, no decode
+            let t = std::time::Instant::now();
+            let mut acc2 = 0usize;
+            for _ in 0..iters {
+                bt.scan_table_borrowed(|_rid, p| {
+                    acc2 = acc2.wrapping_add(p.len());
+                    true
+                })
+                .unwrap();
+            }
+            let walk_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // (3) selective decode: id only (rowid alias col 0)
+            let t = std::time::Instant::now();
+            let mut acc3 = 0i64;
+            for _ in 0..iters {
+                bt.scan_table_selective(2, &[0], Some(0), |rid, row| {
+                    acc3 = acc3.wrapping_add(rid);
+                    if let Some(Value::Integer(v)) = row.first() {
+                        acc3 = acc3.wrapping_add(*v);
+                    }
+                    true
+                })
+                .unwrap();
+            }
+            let sel_id_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // (4) selective decode: b (2KB text materialization)
+            let t = std::time::Instant::now();
+            let mut acc4 = 0usize;
+            for _ in 0..iters {
+                bt.scan_table_selective(2, &[1], None, |_rid, row| {
+                    if let Some(Value::Text(x)) = row.first() {
+                        acc4 = acc4.wrapping_add(x.len());
+                    }
+                    true
+                })
+                .unwrap();
+            }
+            let sel_b_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let per = |ms: f64| ms * 1e6 / (n_rows as f64 * iters as f64);
+            println!(
+                "  count={acc} acc2={acc2} acc3={acc3} acc4={acc4} | (1) count_rows: {:.1} ns/row | (2) borrowed walk: {:.1} ns/row | (3) sel id: {:.1} ns/row | (4) sel b(2KB): {:.1} ns/row",
+                per(count_ms), per(walk_ms), per(sel_id_ms), per(sel_b_ms)
+            );
+            drop(bt);
+            let _ = acc;
+        }
+    }
+
+    // Bulk mass-delete: unlinked leaves + file-tail truncation (S14 shape).
+    #[test]
+    fn probe_bulk_delete_truncate() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pager = Pager::open(tmp.path(), 2048).unwrap();
+        let mut bt = Btree::create(&pager, false).unwrap();
+        let n = 60_000i64;
+        let mut payload: Vec<u8> = Vec::with_capacity(64);
+        for i in 1..=n {
+            payload.clear();
+            Value::Integer(i).encode_into(&mut payload);
+            Value::Integer(i).encode_into(&mut payload);
+            bt.insert_table(i, &payload).unwrap();
+        }
+        let pages_before = pager.n_pages();
+        let rowids: Vec<i64> = ((n / 10 + 1)..=n).collect();
+        bt.delete_rowids_inorder(&rowids).unwrap();
+        let pages_after = pager.n_pages();
+        pager.flush().unwrap();
+        println!(
+            "pages {pages_before} -> {pages_after}, freelist_count={}, file_len={}",
+            pager.freelist_count(),
+            std::fs::metadata(tmp.path()).unwrap().len()
+        );
+        let mut cnt = 0u64;
+        bt.scan_table_borrowed(|_rid, _p| {
+            cnt += 1;
+            true
+        })
+        .unwrap();
+        println!("scan-after count = {cnt} (expect {})", n / 10);
+        assert_eq!(cnt, (n / 10) as u64);
+        // The tail should have truncated: far fewer pages than before.
+        assert!(
+            pages_after < pages_before / 2,
+            "expected major truncation: {pages_before} -> {pages_after}"
+        );
     }
 
     #[test]
