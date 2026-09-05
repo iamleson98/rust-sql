@@ -4006,8 +4006,13 @@ struct AggState {
     sum: f64,
     sum_is_int: bool,
     int_sum: i64,
-    min: Option<Value>,
-    max: Option<Value>,
+    /// BOXED: an inline `Option<Value>` costs 24+ bytes in EVERY state
+    /// (2 of them = ~half the struct) even for the overwhelmingly common
+    /// COUNT/SUM-only GROUP BY shapes; the Box costs 8 inline with one
+    /// allocation per group that actually takes a MIN/MAX. 25k groups:
+    /// ~2.8 MB -> ~1.6 MB of aggregate state.
+    min: Option<Box<Value>>,
+    max: Option<Box<Value>>,
     /// DISTINCT-aggregate key set. Rarely used — boxed so the hot
     /// COUNT/SUM/MIN/MAX state stays compact (an inline HashSet costs
     /// ~48 bytes in EVERY state; the Box costs 8, with one allocation
@@ -6795,13 +6800,13 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
             }
         }
         AggFunc::Min => {
-            if !v.is_null() && (state.min.is_none() || v < state.min.as_ref().unwrap()) {
-                state.min = Some(v.clone());
+            if !v.is_null() && (state.min.is_none() || v < state.min.as_deref().unwrap()) {
+                state.min = Some(Box::new(v.clone()));
             }
         }
         AggFunc::Max => {
-            if !v.is_null() && (state.max.is_none() || v > state.max.as_ref().unwrap()) {
-                state.max = Some(v.clone());
+            if !v.is_null() && (state.max.is_none() || v > state.max.as_deref().unwrap()) {
+                state.max = Some(Box::new(v.clone()));
             }
         }
         AggFunc::GroupConcat if !v.is_null() => {
@@ -6842,8 +6847,8 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
                 Value::Real((state.sum / state.count as f64 * 1e10).round() / 1e10)
             }
         }
-        "min" => state.min.clone().unwrap_or(Value::Null),
-        "max" => state.max.clone().unwrap_or(Value::Null),
+        "min" => state.min.as_deref().cloned().unwrap_or(Value::Null),
+        "max" => state.max.as_deref().cloned().unwrap_or(Value::Null),
         "group_concat" => Value::Text(state.concat.as_deref().cloned().unwrap_or_default().into()),
         _ => Value::Null,
     }

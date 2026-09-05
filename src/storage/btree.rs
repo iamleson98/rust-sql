@@ -877,6 +877,47 @@ thread_local! {
         std::cell::RefCell::new((0..TABLE_HINT_SLOTS).map(|_| None).collect());
 }
 
+/// Root-children ROUTING cache: for a scattered-access table (join inner
+/// fanouts, random probes), every full descent re-locks the root and
+/// re-runs its binary search — but the root's (separator, child) mapping
+/// is stable within a write epoch. Entries hold the FULL separator set
+/// (recorded in one pass, so a partition_point probe routes exactly like
+/// the root's own search would). Only armed in scattered mode (see
+/// `Btree::tl_hint_miss_streak`) so single point lookups never pay the
+/// recording pass.
+type RootChildrenMap = std::collections::HashMap<PageId, (u64, Vec<(i64, PageId)>)>;
+thread_local! {
+    static ROOT_CHILDREN: std::cell::RefCell<RootChildrenMap> =
+        std::cell::RefCell::new(std::collections::HashMap::default());
+}
+
+/// Probe the root-children routing for `rowid`: the first entry whose
+/// separator key >= rowid names the child the root's binary search would
+/// take (the last entry, (i64::MAX, rightmost), catches rowids past every
+/// separator). Epoch-guarded; None = not recorded (or stale).
+#[inline]
+fn root_child_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageId> {
+    ROOT_CHILDREN.with(|c| {
+        let m = c.borrow();
+        let (ep, entries) = m.get(&root)?;
+        if *ep != epoch {
+            return None;
+        }
+        let idx = entries.partition_point(|&(k, _)| k < rowid);
+        entries.get(idx).map(|&(_, p)| p)
+    })
+}
+
+/// Record the root's full (separator, child) routing under `epoch`.
+/// Replaces any previous mapping for this root (an epoch change means
+/// the old separators may no longer route correctly).
+#[inline]
+fn set_root_children(root: PageId, epoch: u64, entries: Vec<(i64, PageId)>) {
+    ROOT_CHILDREN.with(|c| {
+        c.borrow_mut().insert(root, (epoch, entries));
+    });
+}
+
 /// Struct-local TABLE leaf hint: the last leaf visited by THIS B+tree
 /// handle, with its exact [lo, hi] rowid bounds and the write epoch it
 /// was recorded under. A probe costs ~2 ns (borrow + two integer
@@ -992,6 +1033,12 @@ pub struct Btree<'a> {
     table_leaf: Option<StructTableHint>,
     /// Last index leaf visited by this handle (see `StructIndexHint`).
     index_leaf: Option<StructIndexHint>,
+    /// Consecutive thread-local hint-map misses on the table-lookup path.
+    /// After `TL_HINT_DISABLE_AT` misses in a row (scattered rowids —
+    /// join fanouts, random probes), the RefCell + slot probe is pure
+    /// per-lookup overhead: stop probing until the access pattern
+    /// changes (a struct-hint or TL hit resets the streak).
+    tl_hint_miss_streak: u32,
     /// When armed (bulk mass-delete), every page freed by this handle is
     /// recorded so the operation can FILE-TAIL-TRUNCATE the contiguous
     /// freed suffix afterwards (SQLite's truncate-on-mass-delete: pages
@@ -999,6 +1046,10 @@ pub struct Btree<'a> {
     collect_frees: bool,
     freed_during_op: Vec<PageId>,
 }
+
+/// After this many consecutive thread-local hint misses, the lookup path
+/// stops probing the shared hint map (see `tl_hint_miss_streak`).
+const TL_HINT_DISABLE_AT: u32 = 16;
 
 /// Result of inserting into a page: either the insert succeeded, or the
 /// page split and a separator needs to be propagated up.
@@ -1035,8 +1086,29 @@ impl<'a> Btree<'a> {
             pinned_epoch: 0,
             table_leaf: None,
             index_leaf: None,
+            tl_hint_miss_streak: 0,
             collect_frees: false,
             freed_during_op: Vec::new(),
+        }
+    }
+
+    /// Thread-local hint probe with access-pattern adaptation (see
+    /// `tl_hint_miss_streak`). Returns the hint on hit; on miss, counts
+    /// the streak and eventually stops paying the probe cost.
+    #[inline]
+    fn tl_table_hint(&mut self, rowid: i64, epoch: u64) -> Option<(PageRef, u32)> {
+        if self.tl_hint_miss_streak >= TL_HINT_DISABLE_AT {
+            return None;
+        }
+        match table_hint_page(self.root, rowid, epoch) {
+            Some(h) => {
+                self.tl_hint_miss_streak = 0;
+                Some(h)
+            }
+            None => {
+                self.tl_hint_miss_streak = self.tl_hint_miss_streak.saturating_add(1);
+                None
+            }
         }
     }
 
@@ -1325,6 +1397,7 @@ impl<'a> Btree<'a> {
             pinned_epoch: 0,
             table_leaf: None,
             index_leaf: None,
+            tl_hint_miss_streak: 0,
             collect_frees: false,
             freed_during_op: Vec::new(),
         })
@@ -1400,12 +1473,15 @@ impl<'a> Btree<'a> {
         // sequential rowids in 1-2 probes instead of log2(cells).
         let epoch = self.pager.write_epoch();
         'hint: {
-            let (page_ref, bias) = match self
-                .probe_struct_table_hint(rowid, epoch)
-                .or_else(|| table_hint_page(self.root, rowid, epoch))
-            {
-                Some(p) => p,
-                None => break 'hint,
+            let (page_ref, bias) = match self.probe_struct_table_hint(rowid, epoch) {
+                Some(h) => {
+                    self.tl_hint_miss_streak = 0;
+                    h
+                }
+                None => match self.tl_table_hint(rowid, epoch) {
+                    Some(h) => h,
+                    None => break 'hint,
+                },
             };
             let borrowed = page_ref.lock();
             prefetch_search_lines(&borrowed.data);
@@ -1461,7 +1537,15 @@ impl<'a> Btree<'a> {
             }
         }
         // --- Full descent --------------------------------------------------
-        let mut page_id = self.root;
+        // Scattered mode (TL hint streak exhausted): route through the
+        // cached root-children map when available — skips the root page's
+        // lock + binary search on every descent.
+        let scattered = self.tl_hint_miss_streak >= TL_HINT_DISABLE_AT;
+        let mut page_id = if scattered {
+            root_child_page(self.root, rowid, epoch).unwrap_or(self.root)
+        } else {
+            self.root
+        };
         loop {
             // Root pin: reuse the pinned Arc while no write has occurred
             // (saves a cache read-lock + refcount round-trip per seek).
@@ -1556,6 +1640,30 @@ impl<'a> Btree<'a> {
                             lo = mid + 1;
                         }
                     }
+                    // Root-children routing record (scattered mode only):
+                    // one full pass over the root's separators arms the
+                    // probe above for every subsequent descent in this
+                    // epoch. Point/single lookups (streak below threshold)
+                    // never reach this.
+                    if page_id == self.root && scattered {
+                        let mut entries: Vec<(i64, PageId)> = Vec::with_capacity(n + 1);
+                        for i in 0..n {
+                            let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
+                            if cell_ptr + 4 > borrowed.data.len() {
+                                break;
+                            }
+                            let child = u32::from_be_bytes(
+                                borrowed.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                            );
+                            if let Some((key, _)) =
+                                varint::decode_signed(&borrowed.data[cell_ptr + 4..])
+                            {
+                                entries.push((key, child));
+                            }
+                        }
+                        entries.push((i64::MAX, borrowed.right_most_pointer()));
+                        set_root_children(self.root, epoch, entries);
+                    }
                     drop(borrowed);
                     if next == 0 {
                         return Err(Error::corruption(format!(
@@ -1593,11 +1701,20 @@ impl<'a> Btree<'a> {
     pub fn lookup_table(&mut self, rowid: i64) -> Result<LookupResult> {
         // --- Hint probe: try the remembered leaf directly ---------------
         let epoch = self.pager.write_epoch();
-        if let Some((page_ref, bias)) = table_hint_page(self.root, rowid, epoch) {
-            if let Ok(Some(res)) = self.lookup_table_leaf(&page_ref, rowid, bias) {
-                return Ok(res);
+        {
+            let hinted = match self.probe_struct_table_hint(rowid, epoch) {
+                Some(h) => {
+                    self.tl_hint_miss_streak = 0;
+                    Some(h)
+                }
+                None => self.tl_table_hint(rowid, epoch),
+            };
+            if let Some((page_ref, bias)) = hinted {
+                if let Ok(Some(res)) = self.lookup_table_leaf(&page_ref, rowid, bias) {
+                    return Ok(res);
+                }
+                // fall through to the full descent on any miss
             }
-            // fall through to the full descent on any miss
         }
         // --- Full descent ------------------------------------------------
         let mut page_id = self.root;

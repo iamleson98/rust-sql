@@ -448,13 +448,19 @@ fn s03_group_by_buckets(engine: Engine) {
             let db = build_big_rq(rows);
             let t = Instant::now();
             for _ in 0..iters {
-                let out = db
-                    .query("SELECT val/10, COUNT(*) FROM t GROUP BY val/10", [])
+                // Streaming (prepare/step): the same consume-one-row-at-a-
+                // time pattern the SQLite side uses — the grouped OUTPUT is
+                // never materialized, so the memory column measures the
+                // aggregation state, not a result-set buffer.
+                let mut stmt = db
+                    .prepare("SELECT val/10, COUNT(*) FROM t GROUP BY val/10")
                     .unwrap();
-                acc = acc.wrapping_add(out.len() as i64);
-                for row in &out {
-                    if let Value::Integer(c) = &row[1] {
-                        acc = acc.wrapping_add(*c);
+                while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+                    acc = acc.wrapping_add(1);
+                    if let Some(r) = stmt.row() {
+                        if let Some(Value::Integer(c)) = r.get(1) {
+                            acc = acc.wrapping_add(*c);
+                        }
                     }
                 }
             }
