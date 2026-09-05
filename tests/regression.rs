@@ -969,3 +969,152 @@ fn regression_rollback_tiny_txn_after_splits() {
         .unwrap();
     assert_eq!(hits[0][0], Value::Integer(1));
 }
+
+// Truncate-on-mass-delete meets SAVEPOINTs: an in-transaction mass DELETE
+// frees committed pages below the savepoint base — the truncation floor
+// must stop at the base (pages below hold undo pre-images), and the
+// rolled-back state must be fully intact (content, count, integrity).
+#[test]
+fn regression_truncate_floor_respects_savepoint_base() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    // First txn: 3k rows committed across multiple leaves.
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=3_000i64 {
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    // In-txn: delete the committed tail (frees pre-BEGIN pages) + the
+    // in-txn growth, then ROLLBACK. Pre-fix this corrupted the pager
+    // (page out of range during the undo restore).
+    db.execute("BEGIN", []).unwrap();
+    for i in 3_001..=6_000i64 {
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
+    }
+    db.execute("DELETE FROM t WHERE id > 1000", []).unwrap();
+    let mid = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(mid[0][0], Value::Integer(1_000));
+    db.execute("ROLLBACK", []).unwrap();
+
+    let after = db
+        .query("SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM t", [])
+        .unwrap();
+    assert_eq!(after[0][0], Value::Integer(3_000), "count lost by ROLLBACK");
+    assert_eq!(after[0][1], Value::Integer(4_501_500));
+    assert_eq!(after[0][2], Value::Integer(1));
+    assert_eq!(after[0][3], Value::Integer(3_000));
+    let ic = db.query("PRAGMA integrity_check", []).unwrap();
+    assert_eq!(ic[0][0], Value::Text("ok".into()));
+
+    // The freed tail must be REUSABLE after the rollback: new inserts
+    // land without growth anomalies and every row is findable.
+    db.execute("BEGIN", []).unwrap();
+    for i in 3_001..=4_000i64 {
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(format!("w{i}").into())],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    let final_n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(final_n[0][0], Value::Integer(4_000));
+    let probe = db
+        .query("SELECT v FROM t WHERE id IN (1, 2500, 3500, 4000)", [])
+        .unwrap();
+    assert_eq!(probe.len(), 4);
+    let ic2 = db.query("PRAGMA integrity_check", []).unwrap();
+    assert_eq!(ic2[0][0], Value::Text("ok".into()));
+}
+
+// Named SAVEPOINT between the insert growth and the mass delete: the
+// ROLLBACK TO restores the mid-txn state exactly (the delete's
+// truncation floor respects the savepoint pushed at BEGIN, which is
+// lower than this named one).
+#[test]
+fn regression_rollback_to_savepoint_after_mass_delete() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=2_000i64 {
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Integer(i * 3)],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    db.execute("BEGIN", []).unwrap();
+    db.execute("SAVEPOINT sp", []).unwrap();
+    for i in 2_001..=4_000i64 {
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Integer(i * 3)],
+        )
+        .unwrap();
+    }
+    // Deletes both in-txn pages and (mostly) committed-txn pages.
+    db.execute("DELETE FROM t WHERE id > 500", []).unwrap();
+    let small = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(small[0][0], Value::Integer(500));
+    // Restore the named savepoint: 2k rows again (mid-txn state).
+    db.execute("ROLLBACK TO SAVEPOINT sp", []).unwrap();
+    let mid = db.query("SELECT COUNT(*), SUM(v) FROM t", []).unwrap();
+    assert_eq!(mid[0][0], Value::Integer(2_000));
+    assert_eq!(mid[0][1], Value::Integer(6_003_000));
+    // And a plain ROLLBACK afterwards returns to the committed base.
+    db.execute("ROLLBACK", []).unwrap();
+    let base = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(base[0][0], Value::Integer(2_000));
+    let ic = db.query("PRAGMA integrity_check", []).unwrap();
+    assert_eq!(ic[0][0], Value::Text("ok".into()));
+}
+
+// Streaming LIMIT/OFFSET over a range scan (the driver budget contract:
+// the base driver must never return more rows than its caller asked for,
+// or LimitDriver's offset accounting skips the wrong rows).
+#[test]
+fn regression_streaming_limit_offset_range_batches() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=3_000i64 {
+        db.execute(
+            "INSERT INTO t (id, x) VALUES (?, ?)",
+            [Value::Integer(i), Value::Integer(i * 2)],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    // OFFSET beyond several batch boundaries + LIMIT: rows 2006..2015.
+    let mut stmt = db
+        .prepare("SELECT id FROM t WHERE id BETWEEN 1 AND 3000 LIMIT 10 OFFSET 2005")
+        .unwrap();
+    let mut ids = Vec::new();
+    while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+        ids.push(stmt.column_int(0));
+    }
+    assert_eq!(ids, (2006..=2015).collect::<Vec<i64>>());
+
+    // OFFSET skip that itself spans multiple wide batches.
+    let mut stmt2 = db.prepare("SELECT id FROM t LIMIT 5 OFFSET 2995").unwrap();
+    let mut ids2 = Vec::new();
+    while let Ok(rustqlite::StepResult::Row) = stmt2.step() {
+        ids2.push(stmt2.column_int(0));
+    }
+    assert_eq!(ids2, (2996..=3000).collect::<Vec<i64>>());
+}

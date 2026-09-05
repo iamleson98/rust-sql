@@ -26,7 +26,7 @@ pub const ROWID_MARKER: u8 = 0x09;
 /// Encode a row into a byte vector (no rowid-alias elision — the schema
 /// table and other internal rows use this).
 pub fn encode_row(row: &Row) -> Vec<u8> {
-    let mut out = Vec::with_capacity(row.len() * 4);
+    let mut out = Vec::with_capacity(estimate_row_size(row));
     for v in row {
         v.encode_into(&mut out);
     }
@@ -69,9 +69,26 @@ pub fn encode_row_aliased_into(row: &Row, alias: Option<usize>, out: &mut Vec<u8
 /// Encode a row, eliding the rowid-alias column. Allocating convenience
 /// wrapper around `encode_row_aliased_into`.
 pub fn encode_row_aliased(row: &Row, alias: Option<usize>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(row.len() * 4);
+    let mut out = Vec::with_capacity(estimate_row_size(row));
     encode_row_aliased_into(row, alias, &mut out);
     out
+}
+
+/// Exact encoded payload size (sum of per-value sizes; the alias column
+/// collapses to its 1-byte marker, so the estimate is an upper bound
+/// there). Lets callers `Vec::with_capacity` ONCE: a 64 KB blob over the
+/// old `row.len() * 4` initial capacity paid a ~13-realloc doubling
+/// cascade (~128 KB extra memcpy) per insert.
+#[inline]
+fn estimate_row_size(row: &Row) -> usize {
+    let mut n = 0usize;
+    for v in row {
+        n += v.encoded_size();
+    }
+    // 16-byte floor: empty/tiny rows keep a little slack so the hot OLTP
+    // path doesn't allocate 4-6 byte buffers (mimalloc size classes make
+    // sub-16-byte allocations the same cost anyway).
+    n.max(16)
 }
 
 /// Fill `out[alias]` with `Integer(rowid)` — the rowid-alias column's

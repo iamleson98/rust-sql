@@ -283,6 +283,48 @@ impl Value {
     ///
     /// Typical OLTP row (small ints, short text) shrinks from 27-41 bytes
     /// to 6-20 bytes, directly closing the ~3.5x DB-file-size gap vs SQLite.
+    /// Exact encoded size of this value under `encode_into` (tag + length
+    /// header + body). A row's total estimate lets the row encoder
+    /// reserve once instead of doubling through a realloc cascade — a
+    /// 64 KB blob over an 8-byte initial capacity paid ~13 reallocs and
+    /// ~128 KB of extra memcpy per insert.
+    #[inline]
+    pub fn encoded_size(&self) -> usize {
+        match self {
+            Value::Null => 1,
+            Value::Integer(i) => {
+                if *i == 0 {
+                    1
+                } else if *i >= i8::MIN as i64 && *i <= i8::MAX as i64 {
+                    2
+                } else if *i >= i16::MIN as i64 && *i <= i16::MAX as i64 {
+                    3
+                } else if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                    5
+                } else {
+                    9
+                }
+            }
+            Value::Real(f) => {
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && f.abs() <= 9_007_199_254_740_992.0
+                    && !(*f == 0.0 && f.is_sign_negative())
+                {
+                    // 0x0A + zigzag varint (zigzag doubles the magnitude,
+                    // so a |value| < 2^62-ish stays <= 9 varint bytes).
+                    let i = *f as i64;
+                    let zigzag = ((i << 1) ^ (i >> 63)) as u64;
+                    1 + crate::types::value::uvarint_len(zigzag)
+                } else {
+                    9
+                }
+            }
+            Value::Text(s) => 1 + uvarint_len(s.len() as u64) + s.len(),
+            Value::Blob(b) => 1 + uvarint_len(b.len() as u64) + b.len(),
+        }
+    }
+
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             Value::Null => out.push(0x00),
@@ -583,6 +625,15 @@ impl Value {
             _ => Err("unknown value tag"),
         }
     }
+}
+
+/// Number of bytes `encode_uvarint` writes for `n` (1-9, LEB128-ish:
+/// 7 bits per byte with a continuation bit).
+#[inline]
+pub fn uvarint_len(n: u64) -> usize {
+    // Leading-zero-based table equivalent: (64 - lz) / 7 rounded up.
+    let bits = 64 - n.leading_zeros();
+    (bits as usize).div_ceil(7)
 }
 
 /// Encode a u64 as a LEB128 variable-length integer (1 byte for < 128,

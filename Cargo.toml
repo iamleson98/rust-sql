@@ -109,7 +109,7 @@ tempfile = "3"
 # Fast Mutex/RwLock (much faster than std::sync — futex-based, never poisoned).
 # Used by Pager cache (Arc<Mutex<Page>>) so Database becomes Send+Sync,
 # enabling true concurrent reads via Arc<RwLock<Database>>.
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 # Fast general-purpose allocator. The engine is allocation-intensive on hot
 # paths (row Vecs, statement ASTs, key buffers); mimalloc's thread-local
 # heaps cut small-allocation cost by 20-40% vs the system malloc, which

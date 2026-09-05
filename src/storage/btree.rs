@@ -11,7 +11,7 @@
 //! varint-encoded to keep small payloads compact.
 
 use crate::error::{Error, Result};
-use crate::storage::page::{PageId, PageType, PAGE_HEADER_SIZE};
+use crate::storage::page::{Page, PageId, PageType, PAGE_HEADER_SIZE};
 use crate::storage::pager::Pager;
 use crate::types::Value;
 
@@ -1737,29 +1737,39 @@ impl<'a> Btree<'a> {
 
     /// Write `payload[local_len..]` into a fresh chain of Overflow pages.
     /// Returns the first page id (0 only when nothing needed to spill).
+    ///
+    /// The whole chain is allocated in ONE bulk pager call (one cache
+    /// critical section + one LRU lock instead of one per page) and the
+    /// pages are filled through the handed-out PageRefs — no per-page
+    /// `get_page` round trip, no re-lock of the previous page to set its
+    /// next pointer (its guard is still held). A 64 KB blob = ~17 chain
+    /// pages; the old loop paid ~3 lock round trips per page.
     fn build_overflow_chain(&mut self, payload: &[u8], local_len: usize) -> Result<PageId> {
         let cap = self.overflow_page_capacity();
-        let mut rest = &payload[local_len..];
-        let mut first: PageId = 0;
-        let mut prev: PageId = 0;
-        while !rest.is_empty() {
-            let take = rest.len().min(cap);
-            let page_id = self.pager.allocate_page()?;
-            {
-                let page_ref = self.pager.get_page(page_id)?;
-                let mut p = page_ref.lock();
-                p.init_overflow();
-                p.overflow_data_mut()[..take].copy_from_slice(&rest[..take]);
+        let rest = &payload[local_len..];
+        if rest.is_empty() {
+            return Ok(0);
+        }
+        let npages = rest.len().div_ceil(cap);
+        let pages = self.pager.allocate_pages(npages)?;
+        let first = pages.first().map(|(id, _)| *id).unwrap_or(0);
+        let mut off = 0usize;
+        // Owned guard of the previous chain page, held across the loop
+        // boundary so `set_overflow_next` needs no second lock
+        // acquisition (an owned guard carries its Arc — no borrow tie to
+        // the loop binding).
+        let mut prev: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Page>> = None;
+        for (page_id, page_ref) in pages {
+            if let Some(mut pg) = prev.take() {
+                pg.set_overflow_next(page_id);
+                drop(pg);
             }
-            if prev == 0 {
-                first = page_id;
-            } else {
-                let page_ref = self.pager.get_page(prev)?;
-                let mut p = page_ref.lock();
-                p.set_overflow_next(page_id);
-            }
-            prev = page_id;
-            rest = &rest[take..];
+            let mut p = page_ref.lock_arc();
+            p.init_overflow();
+            let take = (rest.len() - off).min(cap);
+            p.overflow_data_mut()[..take].copy_from_slice(&rest[off..off + take]);
+            off += take;
+            prev = Some(p);
         }
         Ok(first)
     }
@@ -5366,9 +5376,23 @@ impl<'a> Btree<'a> {
                 if v.len() != len as usize {
                     return Err(Error::corruption("lazy text gather short"));
                 }
-                match String::from_utf8(v) {
-                    Ok(s) => Ok(Value::Text(s.into())),
-                    Err(_) => Err(Error::corruption("invalid utf8 in lazy text gather")),
+                // Trusted mode (in-memory pagers) skips the redundant
+                // validation pass — mirrors Value::decode's Text arm: the
+                // payloads are this process's own encoder output, written
+                // from String values (valid UTF-8 by construction). A
+                // 2 KB body otherwise pays a full validation scan per row.
+                if crate::types::value::text_decode_trusted() {
+                    // SAFETY: trusted mode is armed only for in-memory
+                    // pagers whose payloads this process encoded from
+                    // String values — valid UTF-8 by construction.
+                    Ok(Value::Text(
+                        unsafe { String::from_utf8_unchecked(v) }.into(),
+                    ))
+                } else {
+                    match String::from_utf8(v) {
+                        Ok(s) => Ok(Value::Text(s.into())),
+                        Err(_) => Err(Error::corruption("invalid utf8 in lazy text gather")),
+                    }
                 }
             }
             _ => {

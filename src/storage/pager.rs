@@ -1564,6 +1564,133 @@ impl Pager {
         }
     }
 
+    /// Bulk `allocate_page`: hands out `n` pages, returning the live
+    /// `PageRef` for each (no per-page `get_page` round trip). One
+    /// cache-write critical section + one LRU lock for the whole batch
+    /// instead of one of each per page — the overflow-chain writer (a
+    /// 64 KB blob = ~17 pages) previously paid ~17 lock round trips per
+    /// row. Freelist-reused pages are zeroed here exactly as in the
+    /// single-page path (recycled bodies may still hold old bytes).
+    pub fn allocate_pages(&self, n: usize) -> Result<Vec<(PageId, PageRef)>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<(PageId, PageRef)> = Vec::with_capacity(n);
+        // Phase 1: freelist pops (exact single-page semantics, batched).
+        for _ in 0..n {
+            let current_free_count = self.freelist_count.load(Ordering::Acquire);
+            if current_free_count == 0 {
+                break;
+            }
+            let head = self.freelist_head.load(Ordering::Acquire);
+            if head == 0 {
+                return Err(Error::corruption(
+                    "freelist count > 0 but freelist head is 0 (corrupt freelist)",
+                ));
+            }
+            let page = self.get_page(head)?;
+            let (next_trunk, k_entries) = {
+                let borrowed = page.lock();
+                if borrowed.data.len() < 8 {
+                    return Err(Error::corruption(format!(
+                        "freelist trunk {head} too small"
+                    )));
+                }
+                (
+                    u32::from_le_bytes(borrowed.data[..4].try_into().unwrap()),
+                    u32::from_le_bytes(borrowed.data[4..8].try_into().unwrap()),
+                )
+            };
+            let freed: PageId;
+            if k_entries > 0 {
+                let last = 8 + (k_entries as usize - 1) * 4;
+                let page = self.get_page(head)?;
+                let mut borrowed = page.lock();
+                if last + 4 > borrowed.data.len() {
+                    return Err(Error::corruption(format!(
+                        "freelist trunk {head} entry {} out of range",
+                        k_entries - 1
+                    )));
+                }
+                freed = u32::from_le_bytes(borrowed.data[last..last + 4].try_into().unwrap());
+                borrowed.data[4..8].copy_from_slice(&(k_entries - 1).to_le_bytes());
+                borrowed.dirty = true;
+                drop(borrowed);
+                self.note_dirty(head);
+            } else {
+                freed = head;
+                self.freelist_head.store(next_trunk, Ordering::Release);
+                let page = self.get_page(head)?;
+                let mut borrowed = page.lock();
+                borrowed.data.fill(0);
+                borrowed.dirty = true;
+                drop(borrowed);
+                self.note_dirty(head);
+            }
+            self.freelist_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                    if x > 0 {
+                        Some(x - 1)
+                    } else {
+                        None
+                    }
+                })
+                .map_err(|_| Error::corruption("freelist underflow"))?;
+            let page_ref = self.get_page(freed)?;
+            // Clear the handed-out page before reuse (the recycled body
+            // may still hold the old tree's bytes in the cache or file) —
+            // same contract as the single-page path.
+            {
+                let mut borrowed = page_ref.lock();
+                borrowed.data.fill(0);
+                borrowed.dirty = true;
+            }
+            self.note_dirty(freed);
+            out.push((freed, page_ref));
+        }
+        // Phase 2: the remainder comes from file growth, created and
+        // inserted under ONE cache-write lock.
+        let remaining = n - out.len();
+        if remaining > 0 {
+            let first_id = self.n_pages.fetch_add(remaining as u32, Ordering::AcqRel);
+            let psz = self.page_size();
+            let mut new_pages: Vec<(PageId, PageRef)> = Vec::with_capacity(remaining);
+            for i in 0..remaining {
+                let id = first_id + i as u32;
+                let mut page = Page::new(id, psz);
+                page.dirty = true;
+                new_pages.push((id, Arc::new(Mutex::new(page))));
+            }
+            {
+                let mut cache = self.cache.write();
+                self.maybe_evict_locked(&mut cache);
+                for (id, page_ref) in &new_pages {
+                    cache.insert(*id, page_ref.clone());
+                }
+            }
+            {
+                let mut lru = self.lru.lock();
+                for (id, _) in &new_pages {
+                    lru.push_back(*id);
+                }
+            }
+            out.extend(new_pages);
+        }
+        if !out.is_empty() {
+            self.note_write();
+            let mut dp = self.dirty_pages.lock();
+            for (id, _) in &out {
+                dp.insert(*id);
+            }
+            self.last_noted_dirty.store(
+                out.last().map(|(id, _)| *id).unwrap_or(u32::MAX),
+                Ordering::Release,
+            );
+            self.dirty_count_approx.store(dp.len(), Ordering::Release);
+        }
+        Ok(out)
+    }
+
     /// Mark a page as freed (record it on the trunk freelist).
     ///
     /// The freed page's BODY IS NEVER WRITTEN: it becomes a 4-byte entry
@@ -1994,10 +2121,17 @@ impl Pager {
         let mut ids: Vec<PageId> = state.map.keys().copied().collect();
         ids.sort_unstable();
         let mut buf = vec![0u8; psz as usize];
-        for id in ids {
+        // Header (page 0) goes LAST (crash safety — see
+        // flush_inner_delete's ordering contract): every other page is
+        // copied back before the n_pages-bearing header commit.
+        for id in ids.iter().copied().filter(|&id| id != 0) {
             let offset = state.map[&id];
             state.wal.read_frame_at(offset, &mut buf)?;
             self.write_file_at(id as u64 * psz as u64, &buf)?;
+        }
+        if let Some(&offset) = state.map.get(&0) {
+            state.wal.read_frame_at(offset, &mut buf)?;
+            self.write_file_at(0, &buf)?;
         }
         // Ensure the main file covers every page we just wrote (the file
         // may be shorter than the committed page count — new pages live
@@ -2189,17 +2323,28 @@ impl Pager {
         self.flush_inner_delete()
     }
 
-    /// DELETE-mode flush body: header refresh + scattered page writes +
+    /// DELETE-mode flush body: scattered page writes + header refresh +
     /// fsync.
+    ///
+    /// ORDERING CONTRACT (crash safety): the header — the only place the
+    /// committed `n_pages` lives — is written LAST, after every other
+    /// page and before the truncating `set_len`. A crash at ANY point
+    /// then leaves the file at least as long as the header claims
+    /// (extra tail bytes are ignored at open), never shorter; the
+    /// "file size < n_pages * page_size" corruption is unreachable. The
+    /// previous header-first order left a window (header written, new
+    /// pages not yet) that the OOM fault-injection suite hits.
     fn flush_inner_delete(&self) -> Result<()> {
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
         let freelist_count_val = self.freelist_count.load(Ordering::Acquire);
         let schema_cookie_val = self.schema_cookie.load(Ordering::Acquire);
 
-        // Update file header on page 0
-        let page0_in_cache = self.cache.read().contains_key(0);
+        // Refresh the in-cache page 0 header bytes now (they ride the
+        // dirty-page writes below); the physical write happens LAST.
         let psz = self.page_size();
+        let mut header_direct: Option<Vec<u8>> = None;
+        let page0_in_cache = self.cache.read().contains_key(0);
         if page0_in_cache {
             let page0 = self.cache.read().get(0).cloned();
             if let Some(page0) = page0 {
@@ -2208,12 +2353,13 @@ impl Pager {
                 borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
                 borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
                 borrowed.dirty = true;
-                // Mark page 0 as dirty in the dirty_pages set so it gets flushed below.
+                // Mark page 0 as dirty in the dirty_pages set so the
+                // header write below (OUT OF ORDER — last) finds it.
                 drop(borrowed);
                 self.dirty_pages.lock().insert(0);
             }
         } else {
-            // Page 0 not in cache — read, modify, write directly
+            // Page 0 not in cache — read + modify now, WRITE last.
             let mut header = vec![0u8; psz as usize];
             if self.codec.read().is_active() {
                 let mut raw = vec![0u8; psz as usize];
@@ -2229,16 +2375,17 @@ impl Pager {
             FileHeader::write(&mut header, psz, n_pages_val, schema_cookie_val);
             header[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
             header[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
-            self.codec_write_page(0, &header)?;
+            header_direct = Some(header);
         }
 
         // Flush dirty pages — use the dirty_pages set so this is O(dirty_count),
         // not O(cache_size). This is the key optimization: a 10k-page cache with
         // only 1-2 dirty pages per statement used to scan 10k page-locks per
         // flush; now we iterate only the dirty set (~1-2 entries).
+        // Page 0 is deliberately EXCLUDED here (it goes last).
         let dirty_ids: Vec<PageId> = {
             let mut set = self.dirty_pages.lock();
-            let ids = set.drain().collect::<Vec<_>>();
+            let ids = set.drain().filter(|&id| id != 0).collect::<Vec<_>>();
             // Reset the last-noted hint: the set was drained, so a page
             // re-dirtied after this flush MUST re-enter the set or its new
             // content would never reach the file (the hint fast-path
@@ -2256,9 +2403,23 @@ impl Pager {
             if let Some(page_ref) = page_ref {
                 let mut borrowed = page_ref.lock();
                 if borrowed.dirty {
-                    let offset = id as u64 * psz as u64;
                     self.codec_write_page(id, &borrowed.data)?;
-                    let _ = offset;
+                    borrowed.dirty = false;
+                }
+            }
+        }
+
+        // ---- header LAST: every other page is durable; NOW commit the
+        // new page count. A crash before this point leaves the old
+        // (smaller or equal) n_pages with a file that covers it. ----
+        if let Some(header) = &header_direct {
+            self.codec_write_page(0, header)?;
+        } else {
+            let page_ref = self.cache.read().get(0).cloned();
+            if let Some(page_ref) = page_ref {
+                let mut borrowed = page_ref.lock();
+                if borrowed.dirty {
+                    self.codec_write_page(0, &borrowed.data)?;
                     borrowed.dirty = false;
                 }
             }
