@@ -95,6 +95,17 @@ impl PageType {
         }
     }
 
+    /// TEMP DEBUG (remove before commit): capture a backtrace on the
+    /// first page-type corruption to locate the serving path.
+    #[cfg(debug_assertions)]
+    pub fn from_byte_dbg(b: u8, id: u32) -> Result<Self> {
+        if !matches!(b, 0x05 | 0x0D | 0x04 | 0x02 | 0x0A) {
+            eprintln!("PAGE-TYPE CORRUPTION: page {id} byte {b:#x}");
+            std::backtrace::Backtrace::force_capture();
+        }
+        Self::from_byte(b)
+    }
+
     pub fn is_leaf(&self) -> bool {
         matches!(self, PageType::LeafTable | PageType::LeafIndex)
     }

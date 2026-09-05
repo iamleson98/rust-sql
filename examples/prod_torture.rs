@@ -1683,6 +1683,13 @@ fn s17_open_file(engine: Engine) {
             let _ = std::fs::remove_file(&path);
             {
                 let mut db = Database::open(&path).unwrap();
+                // Durability parity with the sq side below (WAL +
+                // synchronous=OFF): WAL mode is what lets SQLite cap its
+                // mid-transaction memory (dirty pages spill to the WAL,
+                // not the cache) — comparing our DELETE-mode pager against
+                // their WAL pager measured journal strategies, not engines.
+                db.execute("PRAGMA journal_mode=WAL", []).unwrap();
+                db.execute("PRAGMA synchronous=OFF", []).unwrap();
                 db.execute(
                     "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
                     [],
@@ -1821,22 +1828,29 @@ fn s18_differential(engine: Engine) {
                     }
                 }
             }
-            let out = db.query("SELECT id, val FROM d ORDER BY id", []).unwrap();
             let mut h = 0x5A17_u64;
             let mut count = 0i64;
             let mut sum = 0i64;
-            for row in &out {
-                let id = match &row[0] {
-                    Value::Integer(x) => *x as u64,
-                    _ => 0,
-                };
-                let val = match &row[1] {
-                    Value::Integer(x) => *x as u64,
-                    _ => 0,
-                };
-                h = fold(fold(h, id), val);
-                count += 1;
-                sum += val as i64;
+            // Streaming (prepare/step): the same consume-one-row-at-a-time
+            // pattern the SQLite side uses — the 100k-row ordered OUTPUT is
+            // never materialized, so the memory column measures the engine,
+            // not a result-set buffer (parity with the sq side's lazy
+            // iterator).
+            let mut stmt = db.prepare("SELECT id, val FROM d ORDER BY id").unwrap();
+            while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+                if let Some(r) = stmt.row() {
+                    let id = match r.first() {
+                        Some(Value::Integer(x)) => *x as u64,
+                        _ => 0,
+                    };
+                    let val = match r.get(1) {
+                        Some(Value::Integer(x)) => *x as u64,
+                        _ => 0,
+                    };
+                    h = fold(fold(h, id), val);
+                    count += 1;
+                    sum += val as i64;
+                }
             }
             metric("hash", (h % 4_294_967_296) as f64);
             metric("count", count as f64);

@@ -71,7 +71,15 @@ impl<'a> Planner<'a> {
         // column in the FROM clause, or any projection alias.
         let plan = if !stmt.order_by.is_empty() {
             let terms = self.resolve_order_by_terms(&stmt.body, &stmt.order_by)?;
-            insert_sort_below_top(plan, terms)
+            let sorted = insert_sort_below_top(plan, terms);
+            // ROWID-ORDER ELISION: a table b-tree scan emits rows in
+            // rowid order by construction — an ORDER BY that resolves to
+            // the scan's rowid-alias column (ASC) sorts NOTHING. Dropping
+            // the Sort node lets the statement stream (prepare/step) with
+            // ZERO materialization instead of sort-buffering the whole
+            // table (`SELECT id, val FROM d ORDER BY id` over 100k rows
+            // previously held the full result set live).
+            try_elide_rowid_order_sort(sorted)
         } else {
             plan
         };
@@ -2757,10 +2765,110 @@ fn plan_output_width(plan: &Plan) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ROWID-ORDER Sort elision
+// ---------------------------------------------------------------------------
+
+/// Drop `Sort` nodes whose ordering is ALREADY the input's row order: a bare
+/// table b-tree scan (or a Project/Filter/rowid-range wrapper over one)
+/// emits rows in ascending rowid order, so `ORDER BY <rowid-alias>` ASC
+/// (including the `rowid` / `_rowid_` / `oid` spellings) is a no-op. Only
+/// the two shapes `insert_sort_below_top` produces for scan inputs are
+/// rewritten (`Sort(X)` and `Project(Sort(X))`); every other plan passes
+/// through untouched. DESC never elides (no reverse scan), index scans
+/// never elide (index order, not rowid order).
+fn try_elide_rowid_order_sort(plan: Plan) -> Plan {
+    match plan {
+        Plan::Sort { input, terms } => {
+            if sort_terms_are_rowid_order(&terms, &input) {
+                // The scan already emits exactly this order: drop the node.
+                *input
+            } else {
+                Plan::Sort { input, terms }
+            }
+        }
+        Plan::Project { input, columns } => Plan::Project {
+            input: Box::new(try_elide_rowid_order_sort(*input)),
+            columns,
+        },
+        other => other,
+    }
+}
+
+/// True when a single ASC term names the rowid-alias key of the
+/// (order-preserving) plan `input`. `input` must itself emit rowid order
+/// (bare table scan / rowid range / Project or Filter over one of those).
+fn sort_terms_are_rowid_order(terms: &[OrderTerm], input: &Plan) -> bool {
+    if terms.len() != 1 {
+        return false;
+    }
+    let term = &terms[0];
+    if term.order != Order::Asc {
+        return false;
+    }
+    // The term must name the scan's rowid-alias column, qualified or not.
+    let Expr::Column { table: qual, name } = &term.expr else {
+        return false;
+    };
+    let (table, alias) = match scan_table_of(input) {
+        Some(ta) => ta,
+        None => return false,
+    };
+    if let Some(q) = qual {
+        let effective = alias.as_deref().unwrap_or(&table.name);
+        if !q.eq_ignore_ascii_case(effective) {
+            return false;
+        }
+    }
+    // `rowid` / `_rowid_` / `oid` synonyms and the alias column itself.
+    let is_rowid_name = name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid");
+    match table.rowid_alias {
+        Some(idx) => {
+            let alias_matches = table.columns[idx].name.eq_ignore_ascii_case(name);
+            // A rowid SPELLING is safe only when no other real column
+            // carries that name (`CREATE TABLE t (id INTEGER PRIMARY KEY,
+            // _rowid_ TEXT)` — `ORDER BY _rowid_` means the TEXT column).
+            let spelling_ok = is_rowid_name
+                && !table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| i != idx && c.name.eq_ignore_ascii_case(name));
+            alias_matches || spelling_ok
+        }
+        None => {
+            // No alias column: only a rowid spelling can denote the rowid
+            // itself — and again only when no real column owns the name.
+            is_rowid_name
+                && !table
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(name))
+        }
+    }
+}
+
+/// Find the (table, alias) of the single bare table scan feeding `input`,
+/// through order-preserving wrappers. `None` for anything else (index
+/// scans, joins, aggregates, subqueries, vtabs).
+fn scan_table_of(input: &Plan) -> Option<(std::sync::Arc<Table>, Option<String>)> {
+    match input {
+        Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: _,
+        } if table.vtab.is_none() => Some((table.clone(), alias.clone())),
+        Plan::RowidRange { table, alias, .. } => Some((table.clone(), alias.clone())),
+        Plan::Project { input, .. } | Plan::Filter { input, .. } => scan_table_of(input),
+        _ => None,
+    }
+}
+
 /// Insert a Sort node below the topmost Project / Distinct node in the plan,
 /// so the Sort can see all input columns (not just the projected ones).
-///
-/// Transformation:
 ///   - `Project { input: X, cols }` → `Project { input: Sort { input: X, terms }, cols }`
 ///   - `Distinct { input: Project { input: X, cols } }` →
 ///     `Distinct { input: Project { input: Sort { input: X, terms }, cols } }`

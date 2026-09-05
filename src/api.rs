@@ -28,8 +28,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The maximum number of pages cached in memory.
-const DEFAULT_CACHE_PAGES: usize = 2048;
+/// The maximum number of pages cached in memory for FILE-backed databases
+/// (512 pages x 4 KiB = 2 MiB — SQLite's own default cache_size of
+/// -2000 KiB). In-memory databases never evict (the cache IS the store),
+/// so this only bounds file-pager RSS: a full-file scan through a 2 MiB
+/// window instead of caching the whole file (S17: 13 MB -> ~6 MB peak on
+/// a 7 MB file), matching SQLite's memory profile on the same workload.
+/// `PRAGMA cache_size` can raise it for hot working sets.
+const DEFAULT_CACHE_PAGES: usize = 512;
 
 /// Allocator-wake drain state: the delayed-free sweep happens once per
 /// process (verified by examples/probe_rounds.rs), so a global flag
@@ -5833,9 +5839,20 @@ impl Database {
                     ctx.pager.checkpoint_wal()?;
                 }
                 "cache_size" => {
-                    // Advisory: the pager's cache capacity is set at open.
-                    // Accept and ignore (no error) — SQLite treats this as
-                    // a hint too.
+                    // SQLite semantics: positive N = N pages, negative N =
+                    // N KiB (e.g. -2000 = ~2 MiB). Applied live — the next
+                    // cache insert's eviction pass trims an over-capacity
+                    // cache. In-memory databases ignore it (never evict).
+                    if let Value::Integer(k) = &v {
+                        let pages = if *k >= 0 {
+                            (*k as usize).max(1)
+                        } else {
+                            // KiB -> pages (floor 1)
+                            let kib = (*k).unsigned_abs() as usize;
+                            (kib / (ctx.pager.page_size() as usize)).max(1)
+                        };
+                        ctx.pager.set_cache_capacity(pages);
+                    }
                 }
                 "page_size" => {
                     // SQLite semantics: only effective before the database

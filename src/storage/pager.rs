@@ -262,6 +262,18 @@ pub struct WalState {
     pub wal: crate::storage::wal::Wal,
     /// Committed page-id → frame offset ("WAL-served reads" index).
     pub map: std::collections::HashMap<PageId, u64, PageIdHashBuild>,
+    /// MID-TRANSACTION SPILL index: page-id → frame offset of a dirty
+    /// page's newest version, written as an UNCOMMITTED frame so the
+    /// cache can drop it under pressure (SQLite's pager does exactly
+    /// this: dirty pages spill to the WAL, not the cache, which is what
+    /// keeps big write transactions' RSS bounded). The frames become
+    /// committed by the next COMMIT's trailing commit frame — no rewrite
+    /// needed; `map` absorbs these offsets at commit time. ROLLBACK
+    /// simply discards the map (recovery ignores trailing uncommitted
+    /// frames). `get_page` misses consult this BEFORE the committed map
+    /// (a spilled page's newest version is the spill frame, not the
+    /// committed one).
+    pub spilled: std::collections::HashMap<PageId, u64, PageIdHashBuild>,
 }
 
 /// Auto-checkpoint threshold: after a commit leaves this many frames in
@@ -426,8 +438,10 @@ pub struct Pager {
     cache: RwLock<PageCache>,
     /// LRU ordering: most recently used at the back.
     lru: Mutex<VecDeque<PageId>>,
-    /// Maximum number of pages to keep in the cache (immutable after open).
-    cache_capacity: usize,
+    /// Cache capacity in PAGES. Atomic: `PRAGMA cache_size` updates it
+    /// at runtime (positive = pages, negative = KiB per SQLite), while
+    /// the eviction pass reads it on every cache insert.
+    cache_capacity: AtomicUsize,
     /// Schema cookie, bumped on every schema change.
     schema_cookie: AtomicU32,
     /// True if this is a freshly created database (no header yet).
@@ -684,6 +698,15 @@ impl Pager {
             let mut dp = self.dirty_pages.lock();
             dp.retain(|&id| id < base.n_pages);
             self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+            // SPILL discipline: pages allocated after the savepoint's base
+            // are dropped — their uncommitted spill frames are dead work.
+            // Pages BELOW the base keep their entries: a page spilled
+            // before this savepoint (never re-fetched since) has its
+            // current state IN that frame; pages re-fetched during Phase
+            // 2's restore already left the spilled map at get_page time.
+            if let Some(state) = self.wal.write().as_mut() {
+                state.spilled.retain(|&id, _| id < base.n_pages);
+            }
         }
         self.lru.lock().clear();
         // Phase 4: rewind mutable metadata + truncate the file if it grew.
@@ -894,7 +917,7 @@ impl Pager {
             freelist_count: AtomicU32::new(0),
             cache: RwLock::new(PageCache::new()),
             lru: Mutex::new(VecDeque::new()),
-            cache_capacity,
+            cache_capacity: AtomicUsize::new(cache_capacity),
             schema_cookie: AtomicU32::new(0),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(skip_sync),
@@ -1402,56 +1425,83 @@ impl Pager {
             }
             let psz = self.page_size();
             let mut page = Page::new(id, psz);
+            // MID-TXN SPILL hit: this page's newest (uncommitted) version
+            // lives in a spill frame written when the cache dropped it
+            // under pressure. Re-cache it as DIRTY (it is mid-transaction
+            // state: a later COMMIT must re-emit it, a later ROLLBACK
+            // discards it) and un-spill it — the page is back under normal
+            // cache/dirty tracking; its old spill frame becomes dead (a
+            // newer frame for the same page always follows in the log).
+            let mut spilled_hit = false;
+            {
+                let mut wal_guard = self.wal.write();
+                if let Some(state) = wal_guard.as_mut() {
+                    if let Some(offset) = state.spilled.remove(&id) {
+                        state.wal.read_frame_at(offset, &mut page.data)?;
+                        spilled_hit = true;
+                    }
+                }
+            }
+            let dirty_on_insert = spilled_hit;
             // WAL-served read: pages committed to the WAL since the last
             // checkpoint are the newest version — read the frame, not the
             // (stale) main-file page. One read-lock + map probe; falls
             // through to the main file when absent.
-            let served_from_wal = {
-                let wal_guard = self.wal.read();
-                match wal_guard.as_ref() {
-                    Some(state) => {
-                        if let Some(&offset) = state.map.get(&id) {
-                            state.wal.read_frame_at(offset, &mut page.data)?;
-                            true
-                        } else {
-                            false
+            if !spilled_hit {
+                let served_from_wal = {
+                    let wal_guard = self.wal.read();
+                    match wal_guard.as_ref() {
+                        Some(state) => {
+                            if let Some(&offset) = state.map.get(&id) {
+                                state.wal.read_frame_at(offset, &mut page.data)?;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    }
+                };
+                if !served_from_wal {
+                    let codec_active = self.codec.read().is_active();
+                    if codec_active {
+                        let offset = id as u64 * psz as u64;
+                        let mut raw = vec![0u8; psz as usize];
+                        let n = self.read_file_at(offset, &mut raw)?;
+                        if n != psz as usize {
+                            return Err(Error::corruption(format!(
+                                "short read on page {}: {} of {} bytes",
+                                id, n, psz
+                            )));
+                        }
+                        let decoded = {
+                            let cs = self.codec.read();
+                            cs.decode_page(id == 0, &raw, psz as usize)?
+                        };
+                        page.data.copy_from_slice(&decoded);
+                    } else {
+                        let offset = id as u64 * psz as u64;
+                        let n = self.read_file_at(offset, &mut page.data)?;
+                        if n != psz as usize {
+                            return Err(Error::corruption(format!(
+                                "short read on page {}: {} of {} bytes",
+                                id, n, psz
+                            )));
                         }
                     }
-                    None => false,
                 }
-            };
-            if !served_from_wal {
-                let codec_active = self.codec.read().is_active();
-                if codec_active {
-                    let offset = id as u64 * psz as u64;
-                    let mut raw = vec![0u8; psz as usize];
-                    let n = self.read_file_at(offset, &mut raw)?;
-                    if n != psz as usize {
-                        return Err(Error::corruption(format!(
-                            "short read on page {}: {} of {} bytes",
-                            id, n, psz
-                        )));
-                    }
-                    let decoded = {
-                        let cs = self.codec.read();
-                        cs.decode_page(id == 0, &raw, psz as usize)?
-                    };
-                    page.data.copy_from_slice(&decoded);
-                } else {
-                    let offset = id as u64 * psz as u64;
-                    let n = self.read_file_at(offset, &mut page.data)?;
-                    if n != psz as usize {
-                        return Err(Error::corruption(format!(
-                            "short read on page {}: {} of {} bytes",
-                            id, n, psz
-                        )));
-                    }
-                }
+            }
+            if dirty_on_insert {
+                page.dirty = true;
             }
             let page_ref = Arc::new(Mutex::new(page));
             self.maybe_evict_locked(&mut cache);
             cache.insert(id, page_ref.clone());
             self.lru.lock().push_back(id);
+            if dirty_on_insert {
+                // Back under dirty tracking: the commit path must see it.
+                self.note_dirty(id);
+            }
             page_ref
         };
         if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
@@ -2079,7 +2129,11 @@ impl Pager {
             wal.committed_page_map()?.into_iter().collect();
         let n = wal.n_frames();
         let mut guard = self.wal.write();
-        *guard = Some(WalState { wal, map });
+        *guard = Some(WalState {
+            wal,
+            map,
+            spilled: Default::default(),
+        });
         drop(guard);
         // Reload the header through the WAL (page 0 may be newer there):
         // n_pages / freelist / schema_cookie must reflect committed state.
@@ -2132,6 +2186,14 @@ impl Pager {
         let Some(state) = guard.as_mut() else {
             return Ok(());
         };
+        // Mid-transaction spill frames must NOT reach the main file
+        // (they are uncommitted), and a WAL reset would invalidate their
+        // offsets. Checkpoints run at COMMIT end / close (spilled is
+        // empty by then); an explicit mid-txn PRAGMA wal_checkpoint
+        // defers to the next commit-time auto-checkpoint.
+        if !state.spilled.is_empty() {
+            return Ok(());
+        }
         let psz = self.page_size();
         // Sort page ids for sequential main-file writes.
         let mut ids: Vec<PageId> = state.map.keys().copied().collect();
@@ -2249,6 +2311,24 @@ impl Pager {
             }
             for (id, off) in &frame_offsets {
                 state.map.insert(*id, *off);
+            }
+            // Absorb the mid-txn SPILL frames: they sit in the log BEFORE
+            // this commit's trailing commit frame, so recovery replays
+            // them as part of this commit — register their offsets as the
+            // committed version. A spill frame is ALWAYS newer than any
+            // map entry from a PREVIOUS commit (the page was dirtied
+            // after that commit), so plain insert is the correct
+            // precedence; the only newer frames are THIS batch's, for
+            // pages that spilled and were then re-fetched and re-dirtied
+            // (they left `spilled` at get_page time, so the two sets are
+            // disjoint by construction — the guard below is defensive).
+            let batch_ids: std::collections::HashSet<PageId> =
+                frame_offsets.iter().map(|(id, _)| *id).collect();
+            let spilled: Vec<(PageId, u64)> = state.spilled.drain().collect();
+            for (id, off) in spilled {
+                if !batch_ids.contains(&id) {
+                    state.map.insert(id, off);
+                }
             }
         }
 
@@ -2525,6 +2605,13 @@ impl Pager {
         }
         self.lru.lock().clear();
         self.dirty_pages.lock().clear();
+        // BEGIN-level rollback: ALL uncommitted spill frames are dead work
+        // (recovery ignores trailing uncommitted frames; in-process, the
+        // next fetch of any of these pages must read the committed
+        // version — the map or the file).
+        if let Some(state) = self.wal.write().as_mut() {
+            state.spilled.clear();
+        }
         // Rollback RESTORES older page content — visible state changes, so
         // advisory caches (btree leaf hints) must be invalidated even
         // though no note_write ran for it.
@@ -2579,7 +2666,7 @@ impl Pager {
         // lazy_writeback is off), the loop below would otherwise spin
         // forever moving dirty pages to the back. `attempts` caps it.
         let mut attempts = cache.len();
-        while cache.len() >= self.cache_capacity && attempts > 0 {
+        while cache.len() >= self.cache_capacity.load(Ordering::Relaxed) && attempts > 0 {
             attempts -= 1;
             let evict_id = {
                 let mut lru = self.lru.lock();
@@ -2593,8 +2680,20 @@ impl Pager {
             };
             let should_evict = match cache.get(evict_id) {
                 Some(p) => {
-                    let mut pg = p.lock();
-                    if pg.dirty {
+                    // PIN GUARD: a strong count above 1 means btree/pager
+                    // code still holds this page in flight — a split
+                    // holding the leaf while allocating its sibling, an
+                    // overflow-chain guard, a patch loop. Evicting it now
+                    // would orphan every write the holder makes afterwards
+                    // (the spill frame would capture pre-write bytes and
+                    // the holder's Arc would drift from the cache). This
+                    // is SQLite's page pinning, expressed through the Arc.
+                    // Race-free: all clones flow through the cache locks,
+                    // and this whole check runs under the write lock.
+                    if Arc::strong_count(p) > 1 {
+                        false
+                    } else if p.lock().dirty {
+                        let mut pg = p.lock();
                         if self.lazy_writeback.load(Ordering::Acquire) {
                             // Lazy write-back: the page was never written by
                             // flush() — write it NOW, then it's safe to evict.
@@ -2607,8 +2706,40 @@ impl Pager {
                             } else {
                                 false
                             }
+                        } else if evict_id != 0 {
+                            // WAL SPILL: append the dirty page as an
+                            // UNCOMMITTED frame and drop it from the cache.
+                            // This is what bounds RSS during big write
+                            // transactions (SQLite's own pager design): the
+                            // newest version lives in the WAL, `get_page`
+                            // misses read it back through the `spilled`
+                            // index, and the frames become committed by the
+                            // next COMMIT's trailing commit frame.
+                            //
+                            // try_write: eviction holds the cache write
+                            // lock, and the commit path holds the WAL write
+                            // lock while probing the cache — a blocking
+                            // acquisition here is an ABBA deadlock. On a
+                            // rare contention miss the page stays cached
+                            // (pushed back) and a later pass retries.
+                            let guard = self.wal.try_write();
+                            if let Some(mut guard) = guard {
+                                if let Some(state) = guard.as_mut() {
+                                    match state.wal.append(evict_id, &pg.data, false) {
+                                        Ok(off) => {
+                                            state.spilled.insert(evict_id, off);
+                                            true
+                                        }
+                                        Err(_) => false,
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
                         } else {
-                            false
+                            false // page 0 (header): commit always rewrites it in-cache
                         }
                     } else {
                         true
@@ -2618,6 +2749,13 @@ impl Pager {
             };
             if should_evict {
                 cache.remove(evict_id);
+                if self.wal.read().is_some() {
+                    // The spilled page is no longer in the cache: take it
+                    // out of the dirty tracking so the commit batch's
+                    // cache probe doesn't wait on a page that isn't there
+                    // (its frame is already in the WAL).
+                    self.dirty_pages.lock().remove(&evict_id);
+                }
             } else {
                 // Move dirty page to the back and try the next one.
                 self.lru.lock().push_back(evict_id);
@@ -2688,7 +2826,15 @@ impl Pager {
     }
 
     pub fn cache_capacity(&self) -> usize {
-        self.cache_capacity
+        self.cache_capacity.load(Ordering::Relaxed)
+    }
+
+    /// `PRAGMA cache_size`: positive = page count, negative = KiB
+    /// (SQLite semantics; -2000 = 2000 KiB). Applied at runtime: the
+    /// NEXT cache insert's eviction pass trims an over-capacity cache.
+    /// In-memory databases ignore it (cache-is-the-store).
+    pub fn set_cache_capacity(&self, pages: usize) {
+        self.cache_capacity.store(pages.max(1), Ordering::Relaxed);
     }
 
     // ----- File I/O helpers: positioned I/O so multiple threads can
