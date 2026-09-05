@@ -10377,11 +10377,26 @@ fn exec_insert_one_row(
         }
     }
 
-    // Reuse the hoisted payload_buf. encode_row_aliased_into clears it first
-    // and elides the rowid-alias column to a 1-byte marker (its value lives
-    // in the B+tree cell key).
-    encode_row_aliased_into(full_row, table.rowid_alias, payload_buf);
-    let payload: &[u8] = payload_buf;
+    // SPILL DIRECT-WRITE: when the payload will overflow the leaf-cell
+    // max and the trailing column is a single huge BLOB/TEXT, hand the
+    // B+tree (small prefix, body slice) directly — the overflow chain is
+    // written straight from the Value's own buffer and the full payload
+    // never materializes in `payload_buf` (one full-body memcpy and its
+    // 64KB-class allocation saved per row on blob-table loads). Only
+    // taken on the append-safe path; every other shape (and any fast-
+    // path rejection: stale hint, full leaf, non-append rowid) encodes
+    // the full payload into `payload_buf` in-branch and takes the
+    // ordinary route.
+    let spill_shape = {
+        let psz = ctx.pager.page_size() as usize;
+        let max_cell = psz.saturating_sub(128);
+        crate::storage::row_codec::spill_tail_shape(full_row, table.rowid_alias, max_cell)
+    };
+
+    // The full payload is encoded LAZILY (per branch): the spill path
+    // only ever builds the small prefix. `encode_row_aliased_into`
+    // clears the buffer first and elides the rowid-alias column to a
+    // 1-byte marker (its value lives in the B+tree cell key).
     let old_payload_opt;
     {
         let mut bt = Btree::new(ctx.pager, *current_root, false);
@@ -10416,13 +10431,46 @@ fn exec_insert_one_row(
                 .take()
                 .filter(|(k, _)| *k == table_key)
                 .map(|(_, leaf)| leaf);
-            let new_hint = bt.insert_table_append_hinted(rowid, payload, hint)?;
+            let new_hint = if let Some((tail_col, _, _)) = spill_shape {
+                // Prefix into the (cleared, small) buffer; body straight
+                // from the Value. A rejected fast path returns None with
+                // nothing written — re-encode and take the buffered
+                // append below.
+                crate::storage::row_codec::encode_row_spill_prefix_into(
+                    full_row,
+                    table.rowid_alias,
+                    tail_col,
+                    payload_buf,
+                );
+                let body: &[u8] = match &full_row[tail_col] {
+                    Value::Blob(b) => b.as_slice(),
+                    Value::Text(t) => t.as_bytes(),
+                    _ => unreachable!("spill_tail_shape guarantees a trailing Blob/Text"),
+                };
+                match bt.insert_table_append_spilled(rowid, payload_buf, body, hint)? {
+                    Some(h) => Some(h),
+                    None => {
+                        encode_row_aliased_into(full_row, table.rowid_alias, payload_buf);
+                        let payload: &[u8] = payload_buf;
+                        bt.insert_table_append_hinted(rowid, payload, hint)?
+                    }
+                }
+            } else {
+                encode_row_aliased_into(full_row, table.rowid_alias, payload_buf);
+                let payload: &[u8] = payload_buf;
+                bt.insert_table_append_hinted(rowid, payload, hint)?
+            };
             if let Some(leaf) = new_hint {
                 ctx.table_append_hint = Some((table_key, leaf));
             } else {
                 ctx.table_append_hint = None;
             }
         } else {
+            // Buffered path: full payload encode (the spill fast path is
+            // append-only; conflict/REPLACE shapes need the contiguous
+            // bytes).
+            encode_row_aliased_into(full_row, table.rowid_alias, payload_buf);
+            let payload: &[u8] = payload_buf;
             // Single lookup_table call (was 2 before — redundant when
             // the rowid existed and we needed the old payload for the
             // REPLACE index cleanup path).

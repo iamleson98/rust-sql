@@ -37,6 +37,14 @@ pub fn encode_row(row: &Row) -> Vec<u8> {
 /// The buffer is cleared first (capacity retained).
 pub fn encode_row_into(row: &Row, out: &mut Vec<u8>) {
     out.clear();
+    // Exact up-front reservation: push-driven growth pays a realloc
+    // doubling cascade for wide rows (a 64 KB blob over a fresh small
+    // buffer = ~13 reallocs, ~2x the payload in extra memcpy).
+    let mut need = 0usize;
+    for v in row {
+        need += v.encoded_size();
+    }
+    out.reserve(need);
     for v in row {
         v.encode_into(out);
     }
@@ -48,6 +56,17 @@ pub fn encode_row_into(row: &Row, out: &mut Vec<u8>) {
 /// (9 bytes per row in the old fixed-width format).
 pub fn encode_row_aliased_into(row: &Row, alias: Option<usize>, out: &mut Vec<u8>) {
     out.clear();
+    // Exact up-front reservation (see encode_row_into): the alias column
+    // contributes its 1-byte marker, everything else its encoded_size.
+    let mut need = 0usize;
+    for (i, v) in row.iter().enumerate() {
+        need += if alias == Some(i) {
+            1
+        } else {
+            v.encoded_size()
+        };
+    }
+    out.reserve(need);
     match alias {
         Some(a) if a < row.len() => {
             for (i, v) in row.iter().enumerate() {
@@ -89,6 +108,104 @@ fn estimate_row_size(row: &Row) -> usize {
     // path doesn't allocate 4-6 byte buffers (mimalloc size classes make
     // sub-16-byte allocations the same cost anyway).
     n.max(16)
+}
+
+// ============================================================================
+// Spill direct-write shape (blob-table INSERT fast path)
+// ============================================================================
+//
+// A spilled cell's payload is `[local prefix][overflow chain]`. For the
+// canonical blob-table shape — small leading columns plus ONE trailing
+// huge BLOB/TEXT — the payload is exactly `[small prefix][huge body]`,
+// and the body is already contiguous in the source `Value`'s own
+// buffer. Detecting that shape lets the INSERT path hand the B+tree the
+// body slice directly: the overflow chain is written straight from the
+// value's storage and the full payload NEVER materializes in an
+// intermediate encode buffer (one full-body memcpy per row saved, plus
+// the buffer's allocation).
+
+/// Maximum prefix the direct-write path accepts (bytes): everything
+/// before the huge body must be genuinely small so the in-cell prefix
+/// write stays a single cheap copy and the shape check stays O(columns).
+pub const SPILL_MAX_PREFIX: usize = 512;
+
+/// Detect the direct-write spill shape: the row's encoded payload
+/// exceeds `max_cell` AND its LAST non-alias column is a single huge
+/// BLOB/TEXT whose body dominates the payload.
+///
+/// Returns `(tail_col, prefix_len, total)` where the full payload is
+/// exactly `[prefix][body]`: `prefix` = the encodings of all earlier
+/// columns (alias elided to its marker) + the huge column's
+/// tag-and-length varints, and `body` = the huge column's bytes
+/// (available as a slice from the `Value` itself).
+pub fn spill_tail_shape(
+    row: &Row,
+    alias: Option<usize>,
+    max_cell: usize,
+) -> Option<(usize, usize, usize)> {
+    let tail = row.len().checked_sub(1)?;
+    if alias == Some(tail) {
+        return None; // trailing column is the rowid marker — no body to hand off
+    }
+    let body = match &row[tail] {
+        Value::Blob(b) => b.len(),
+        Value::Text(t) => t.as_bytes().len(),
+        _ => return None,
+    };
+    // Conservative spill test: the body alone overflowing the in-cell
+    // max guarantees the payload spills (total >= body).
+    if body <= max_cell {
+        return None;
+    }
+    let mut total = 0usize;
+    for (i, v) in row.iter().enumerate() {
+        total += if alias == Some(i) {
+            1
+        } else {
+            v.encoded_size()
+        };
+    }
+    let prefix_len = total - body;
+    if prefix_len > SPILL_MAX_PREFIX {
+        return None; // many/wide leading columns: keep the buffered path
+    }
+    Some((tail, prefix_len, total))
+}
+
+/// Encode ONLY the payload prefix of a spill-shaped row: every column's
+/// encoding except the tail column's body, with the tail column reduced
+/// to its tag + length varints. Concatenating `[out][tail body]` yields
+/// exactly the full `encode_row_aliased` payload.
+pub fn encode_row_spill_prefix_into(
+    row: &Row,
+    alias: Option<usize>,
+    tail_col: usize,
+    out: &mut Vec<u8>,
+) {
+    use crate::types::value::encode_uvarint;
+    out.clear();
+    out.reserve(SPILL_MAX_PREFIX + 16);
+    for (i, v) in row.iter().enumerate() {
+        if alias == Some(i) {
+            out.push(ROWID_MARKER);
+            continue;
+        }
+        if i == tail_col {
+            match v {
+                Value::Blob(b) => {
+                    out.push(0x08);
+                    encode_uvarint(b.len() as u64, out);
+                }
+                Value::Text(t) => {
+                    out.push(0x07);
+                    encode_uvarint(t.as_bytes().len() as u64, out);
+                }
+                _ => v.encode_into(out),
+            }
+        } else {
+            v.encode_into(out);
+        }
+    }
 }
 
 /// Fill `out[alias]` with `Integer(rowid)` — the rowid-alias column's

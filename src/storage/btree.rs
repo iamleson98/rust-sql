@@ -107,6 +107,24 @@ pub mod varint {
     pub fn decode_signed(buf: &[u8]) -> Option<(i64, usize)> {
         decode(buf).map(|(v, n)| (v as i64, n))
     }
+
+    /// Encoded byte length of `v` under `encode`/`encode_signed` (1-9).
+    #[inline]
+    pub fn len_of(v: u64) -> usize {
+        if v <= 0x7F {
+            1
+        } else if v < (1u64 << 56) {
+            let mut n = 1;
+            let mut max = 0x7Fu64;
+            while v > max {
+                n += 1;
+                max = (max << 7) | 0x7F;
+            }
+            n
+        } else {
+            9
+        }
+    }
 }
 
 /// Deterministic LOCAL (in-cell) size for a table-leaf payload, as a
@@ -1867,7 +1885,18 @@ impl<'a> Btree<'a> {
         if rest.is_empty() {
             return Ok(0);
         }
-        let npages = rest.len().div_ceil(cap);
+        self.build_overflow_chain_rest(rest, cap)
+    }
+
+    /// Chain builder over the EXACT spill slice (all bytes past the local
+    /// prefix): the direct-write insert path already holds the payload as
+    /// `(small prefix, body slice)`, so the spill region is contiguous in
+    /// the source `Value`'s own buffer — pages are filled straight from
+    /// it, no intermediate payload materialization.
+    fn build_overflow_chain_rest(&mut self, rest: &[u8], cap: usize) -> Result<PageId> {
+        let rest_len = rest.len();
+        debug_assert!(!rest.is_empty());
+        let npages = rest_len.div_ceil(cap);
         // Fresh (growth) pages come UNZEROED — the fill below overwrites
         // every byte: [0, 16) by `init_overflow` (type + counts + next),
         // [16, 16+take) by the payload copy, and the LAST page's tail
@@ -1890,7 +1919,7 @@ impl<'a> Btree<'a> {
             }
             let mut p = page_ref.lock_arc();
             p.init_overflow();
-            let take = (rest.len() - off).min(cap);
+            let take = (rest_len - off).min(cap);
             p.overflow_data_mut()[..take].copy_from_slice(&rest[off..off + take]);
             if i == is_last_page && take < cap {
                 // Final page: zero the dead tail so no uninitialized (or
@@ -2135,6 +2164,158 @@ impl<'a> Btree<'a> {
         hint: Option<PageId>,
     ) -> Result<Option<PageId>> {
         self.insert_table_append_inner(rowid, payload, hint)
+    }
+
+    /// DIRECT-WRITE spilled append: like `insert_table_append_hinted`
+    /// but for a payload handed over as two parts — `[prefix][body]` —
+    /// where `body` is the trailing huge BLOB/TEXT column's bytes still
+    /// resident in the caller's `Value`. The overflow chain is filled
+    /// STRAIGHT from `body` and the leaf cell takes `prefix` + the
+    /// body's local head: the full payload never materializes in an
+    /// intermediate buffer (saves one full-body memcpy — and its
+    /// allocation — per row on blob-table loads).
+    ///
+    /// `Ok(None)` = could not take the fast path (hint stale, leaf full
+    /// / not a leaf, non-monotonic rowid): the caller re-encodes the
+    /// full payload and falls back to `insert_table_append_hinted` /
+    /// `insert_table`. No bytes were written in that case.
+    pub fn insert_table_append_spilled(
+        &mut self,
+        rowid: i64,
+        prefix: &[u8],
+        body: &[u8],
+        hint: Option<PageId>,
+    ) -> Result<Option<PageId>> {
+        self.pager.note_write();
+        let psz = self.pager.page_size() as usize;
+        let total = prefix.len() + body.len();
+        debug_assert!(total > self.max_cell_payload());
+        let local_len = overflow_local_len_for(total, psz);
+        debug_assert!(
+            local_len >= prefix.len(),
+            "spill local prefix {local_len} must cover the encoded prefix {}",
+            prefix.len()
+        );
+        let body_local = local_len - prefix.len();
+        let cell_size = varint::len_of(rowid as u64) + varint::len_of(total as u64) + local_len + 4;
+
+        // 1. Resolve the target leaf (hint or right-most walk).
+        let leaf_id = match self.spill_target_leaf(hint, rowid, cell_size)? {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+
+        // 2. Build the chain (NO leaf lock held while allocating — the
+        //    pager's allocation path takes the cache write lock, and an
+        //    evictor may hold cache-write while wanting THIS leaf's page
+        //    lock; lock order here is allocate-then-leaf).
+        let cap = self.overflow_page_capacity();
+        let chain = self.build_overflow_chain_rest(&body[body_local..], cap)?;
+
+        // 3. Write the cell into the leaf under one lock.
+        let wrote = {
+            let page = self.pager.get_page(leaf_id)?;
+            let mut borrowed = page.lock();
+            let ok = borrowed.page_type()? == PageType::LeafTable
+                && borrowed.free_space() >= cell_size as u32 + 2;
+            if !ok {
+                false
+            } else {
+                let mut rid_buf = [0u8; 9];
+                let n_rid = varint::encode_signed(rowid, &mut rid_buf);
+                let mut plen_buf = [0u8; 9];
+                let n_plen = varint::encode(total as u64, &mut plen_buf);
+                let n = borrowed.n_cells();
+                let new_content_start = borrowed
+                    .cell_content_start()
+                    .saturating_sub(cell_size as u32);
+                let off = new_content_start as usize;
+                let mut o = off;
+                if o + cell_size > borrowed.data.len() {
+                    false // corrupt content-start: bail (chain freed below)
+                } else {
+                    borrowed.data[o..o + n_rid].copy_from_slice(&rid_buf[..n_rid]);
+                    o += n_rid;
+                    borrowed.data[o..o + n_plen].copy_from_slice(&plen_buf[..n_plen]);
+                    o += n_plen;
+                    borrowed.data[o..o + prefix.len()].copy_from_slice(prefix);
+                    o += prefix.len();
+                    borrowed.data[o..o + body_local].copy_from_slice(&body[..body_local]);
+                    o += body_local;
+                    borrowed.data[o..o + 4].copy_from_slice(&chain.to_be_bytes());
+                    debug_assert_eq!(o + 4 - off, cell_size);
+                    borrowed.set_cell_content_start(new_content_start);
+                    let header_offset = if leaf_id == 0 {
+                        crate::storage::page::DB_HEADER_SIZE as usize
+                    } else {
+                        0
+                    };
+                    let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+                    let dst = ptr_array_start + n as usize * 2;
+                    borrowed.data[dst..dst + 2]
+                        .copy_from_slice(&(new_content_start as u16).to_be_bytes());
+                    borrowed.set_n_cells(n + 1);
+                    borrowed.dirty = true;
+                    true
+                }
+            }
+        };
+        if !wrote {
+            self.free_overflow_chain(chain)?;
+            return Ok(None);
+        }
+        self.pager.note_dirty(leaf_id);
+        Ok(Some(leaf_id))
+    }
+
+    /// Resolve + validate the target leaf for a spilled append: the
+    /// hinted leaf when it is a table leaf past the last rowid with room
+    /// for the (small) local cell, else the tree's right-most leaf under
+    /// the same tests. `Ok(None)` = no usable leaf (caller falls back).
+    fn spill_target_leaf(
+        &mut self,
+        hint: Option<PageId>,
+        rowid: i64,
+        cell_size: usize,
+    ) -> Result<Option<PageId>> {
+        let candidates: [Option<PageId>; 2] = [hint, None];
+        for cand in candidates.into_iter().flatten() {
+            if self.leaf_accepts_spill(cand, rowid, cell_size)? {
+                return Ok(Some(cand));
+            }
+        }
+        // No hint (or hint unusable): walk the right-most chain.
+        let leaf = self.right_most_leaf()?;
+        if self.leaf_accepts_spill(leaf, rowid, cell_size)? {
+            return Ok(Some(leaf));
+        }
+        Ok(None)
+    }
+
+    /// Cheap pre-validation of a leaf for a spilled append: table-leaf
+    /// type, rowid strictly past the last cell's key, and room for the
+    /// local cell bytes + pointer. Read-only — no state is touched.
+    fn leaf_accepts_spill(&self, leaf_id: PageId, rowid: i64, cell_size: usize) -> Result<bool> {
+        let page = self.pager.get_page(leaf_id)?;
+        let borrowed = page.lock();
+        if borrowed.page_type()? != PageType::LeafTable {
+            return Ok(false);
+        }
+        let n = borrowed.n_cells();
+        if n > 0 {
+            let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
+            if let Some((last_rowid, _)) =
+                varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
+            {
+                if rowid <= last_rowid {
+                    return Ok(false); // not an append
+                }
+            }
+        }
+        if borrowed.free_space() < cell_size as u32 + 2 {
+            return Ok(false); // needs a split — caller falls back
+        }
+        Ok(true)
     }
 
     fn insert_table_append_inner(
