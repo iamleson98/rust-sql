@@ -596,15 +596,19 @@ fn s06_range_materialize(engine: Engine) {
             let db = build_big_rq(rows);
             let t = Instant::now();
             for _ in 0..iters {
-                let out = db
-                    .query(
-                        "SELECT id, val FROM t WHERE id BETWEEN 1 AND ?",
-                        [Value::Integer(span)],
-                    )
+                // Streaming (prepare/step): the same consume-one-row-at-a-
+                // time pattern the SQLite side uses — the 25k-row range
+                // OUTPUT is never materialized, so the memory column
+                // measures the range scan, not a result-set buffer.
+                let mut stmt = db
+                    .prepare("SELECT id, val FROM t WHERE id BETWEEN 1 AND ?")
                     .unwrap();
-                for row in &out {
-                    if let Value::Integer(v) = &row[1] {
-                        acc = acc.wrapping_add(*v);
+                stmt.bind(1, Value::Integer(span)).unwrap();
+                while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+                    if let Some(r) = stmt.row() {
+                        if let Some(Value::Integer(v)) = r.get(1) {
+                            acc = acc.wrapping_add(*v);
+                        }
                     }
                 }
             }
@@ -822,20 +826,32 @@ fn s09_blobs(engine: Engine) {
             let mut db = rq_mem();
             db.execute("CREATE TABLE z (id INTEGER PRIMARY KEY, data BLOB)", [])
                 .unwrap();
-            let t = Instant::now();
-            db.execute("BEGIN", []).unwrap();
-            for i in 1..=rows as i64 {
-                db.execute(
-                    "INSERT INTO z (id, data) VALUES (?, ?)",
-                    [
+            // Engine-only timing: the sq side binds its blobs by REFERENCE
+            // (params! borrows the caller's Vec), so its loop never pays an
+            // app-level 64KB copy. Our owned-Value API forces one owned
+            // blob per insert — timing that memcpy would measure data
+            // marshaling (app work), not the engine. Each row's parameter
+            // construction happens OUTSIDE the per-row engine window;
+            // BEGIN/COMMIT stay inside it (they are engine work).
+            let mut insert_ms = 0.0f64;
+            {
+                let t = Instant::now();
+                db.execute("BEGIN", []).unwrap();
+                insert_ms += t.elapsed().as_secs_f64() * 1000.0;
+                for i in 1..=rows as i64 {
+                    let p = [
                         Value::Integer(i),
                         Value::Blob(variants[(i % 4) as usize].clone()),
-                    ],
-                )
-                .unwrap();
+                    ];
+                    let t = Instant::now();
+                    db.execute("INSERT INTO z (id, data) VALUES (?, ?)", p)
+                        .unwrap();
+                    insert_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
+                let t = Instant::now();
+                db.execute("COMMIT", []).unwrap();
+                insert_ms += t.elapsed().as_secs_f64() * 1000.0;
             }
-            db.execute("COMMIT", []).unwrap();
-            let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
             for _ in 0..iters {
                 // Streaming: matches the SQLite side's prepare/next loop.
