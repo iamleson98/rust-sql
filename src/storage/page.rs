@@ -151,6 +151,33 @@ impl Page {
         }
     }
 
+    /// A page with UNINITIALIZED data bytes. SAFETY CONTRACT: the caller
+    /// must overwrite EVERY byte before the page becomes observable
+    /// (cache-visible reads, WAL/file writes). Used by the overflow-chain
+    /// writer, which covers [0, 16) via `init_overflow`, [16, 16+take)
+    /// via the payload copy, and zeroes the final page's tail — a full
+    /// 4 KB calloc per chain page was pure waste (the copy immediately
+    /// overwrote it; 17 pages x 4 KB of memset per 64 KB blob insert).
+    // SAFETY (clippy::uninit_vec): the set_len exposes uninit bytes, but
+    // the only producer (`allocate_pages_opts(_, false)`) hands the page
+    // straight to `build_overflow_chain`, whose writes cover the full
+    // [0, page_size) range (header + payload + zeroed tail) before the
+    /// page id is published to any btree cell — no read of uninit bytes
+    /// is reachable.
+    #[allow(clippy::uninit_vec)]
+    pub fn new_uninit(id: PageId, page_size: u32) -> Self {
+        let mut data = Vec::with_capacity(page_size as usize);
+        // SAFETY: the capacity was just allocated; the bytes are uninit
+        // but every reader of this page goes through the overflow-chain
+        // writer's full-coverage writes (see the contract above).
+        unsafe { data.set_len(page_size as usize) };
+        Self {
+            id,
+            data,
+            dirty: false,
+        }
+    }
+
     pub fn page_size(&self) -> u32 {
         self.data.len() as u32
     }
@@ -286,6 +313,12 @@ impl Page {
     /// at offset 12, with payload bytes from offset 16.
     pub fn init_overflow(&mut self) {
         self.set_page_type(PageType::Overflow);
+        // Header bytes [1, 4) are reserved (nothing reads them, but the
+        // WAL/file write the whole page): zero them explicitly so the
+        // uninit-page contract (see Page::new_uninit) has FULL [0, 16)
+        // coverage — no allocator-scratch bytes ever reach the file.
+        let ho = self.header_offset() as usize;
+        self.data[ho + 1..ho + 4].fill(0);
         self.set_n_cells(0);
         self.set_cell_content_start(12);
         self.set_right_most_pointer(0);

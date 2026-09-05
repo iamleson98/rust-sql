@@ -1868,15 +1868,22 @@ impl<'a> Btree<'a> {
             return Ok(0);
         }
         let npages = rest.len().div_ceil(cap);
-        let pages = self.pager.allocate_pages(npages)?;
+        // Fresh (growth) pages come UNZEROED — the fill below overwrites
+        // every byte: [0, 16) by `init_overflow` (type + counts + next),
+        // [16, 16+take) by the payload copy, and the LAST page's tail
+        // [16+take, psz) by an explicit memset. A 4 KB calloc per chain
+        // page was pure waste (17 pages x memset per 64 KB blob insert).
+        // Freelist-recycled pages (if any) are still zeroed by the pager.
+        let pages = self.pager.allocate_pages_opts(npages, false)?;
         let first = pages.first().map(|(id, _)| *id).unwrap_or(0);
         let mut off = 0usize;
+        let is_last_page = pages.len() - 1;
         // Owned guard of the previous chain page, held across the loop
         // boundary so `set_overflow_next` needs no second lock
         // acquisition (an owned guard carries its Arc — no borrow tie to
         // the loop binding).
         let mut prev: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Page>> = None;
-        for (page_id, page_ref) in pages {
+        for (i, (page_id, page_ref)) in pages.into_iter().enumerate() {
             if let Some(mut pg) = prev.take() {
                 pg.set_overflow_next(page_id);
                 drop(pg);
@@ -1885,6 +1892,12 @@ impl<'a> Btree<'a> {
             p.init_overflow();
             let take = (rest.len() - off).min(cap);
             p.overflow_data_mut()[..take].copy_from_slice(&rest[off..off + take]);
+            if i == is_last_page && take < cap {
+                // Final page: zero the dead tail so no uninitialized (or
+                // allocator-scratch) bytes ever reach the WAL or file.
+                let data = p.overflow_data_mut();
+                data[take..].fill(0);
+            }
             off += take;
             prev = Some(p);
         }

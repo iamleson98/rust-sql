@@ -1564,14 +1564,22 @@ impl Pager {
         }
     }
 
+    /// Bulk `allocate_page` (zeroed fresh pages — see
+    /// `allocate_pages_opts` for the no-zero overflow-chain variant).
+    pub fn allocate_pages(&self, n: usize) -> Result<Vec<(PageId, PageRef)>> {
+        self.allocate_pages_opts(n, true)
+    }
+
     /// Bulk `allocate_page`: hands out `n` pages, returning the live
     /// `PageRef` for each (no per-page `get_page` round trip). One
     /// cache-write critical section + one LRU lock for the whole batch
     /// instead of one of each per page — the overflow-chain writer (a
     /// 64 KB blob = ~17 pages) previously paid ~17 lock round trips per
     /// row. Freelist-reused pages are zeroed here exactly as in the
-    /// single-page path (recycled bodies may still hold old bytes).
-    pub fn allocate_pages(&self, n: usize) -> Result<Vec<(PageId, PageRef)>> {
+    /// single-page path (recycled bodies may still hold old bytes);
+    /// `zeroed: false` skips the fresh-page calloc for callers that
+    /// overwrite every byte by construction (the overflow-chain writer).
+    pub fn allocate_pages_opts(&self, n: usize, zeroed: bool) -> Result<Vec<(PageId, PageRef)>> {
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -1657,7 +1665,15 @@ impl Pager {
             let mut new_pages: Vec<(PageId, PageRef)> = Vec::with_capacity(remaining);
             for i in 0..remaining {
                 let id = first_id + i as u32;
-                let mut page = Page::new(id, psz);
+                let mut page = if zeroed {
+                    Page::new(id, psz)
+                } else {
+                    // SAFETY (contract): the caller (overflow-chain
+                    // writer) overwrites every byte before the page is
+                    // read back or flushed. Single-writer model: no flush
+                    // can observe the page between here and the fill.
+                    Page::new_uninit(id, psz)
+                };
                 page.dirty = true;
                 new_pages.push((id, Arc::new(Mutex::new(page))));
             }

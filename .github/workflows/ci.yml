@@ -243,6 +243,10 @@ jobs:
       CARGO_TERM_COLOR: never
       TORTURE_SCALE: ${{ matrix.scale }}
       TORTURE_TIME_TOLERANCE_PCT: "15"
+      # Best-of-N child runs per engine per section: shared runners swing a
+      # single sample 2x (SQLite's S09 blob scan measured 5.9ms and 3.7ms
+      # across two consecutive runs of identical code). 3 samples.
+      TORTURE_RUNS: "3"
       # Lean mimalloc startup (see src/lib.rs's allocator docs): the
       # default 1 GiB arena + THP materialize ~4 MB of RSS before the
       # engine even runs — these two settings put the process at
