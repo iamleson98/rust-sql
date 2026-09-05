@@ -828,23 +828,27 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             // FUSED PATH: Project over a RowidRange / RowidLookup with
             // bare-column projections — decode ONLY the projected columns
             // per row (skipping e.g. the rowid marker and un-referenced
-            // wide text columns), with no second cloning pass.
+            // wide text columns), with no second cloning pass. A residual
+            // (strict `>` / `<` bounds) is handled inside the fused executor
+            // (full decode + pseudo-rowid evaluation, then positional
+            // projection) — `SELECT rowid, a WHERE rowid > ?` stays fused.
             if let Plan::RowidRange {
                 table,
                 alias: _,
                 start,
                 end,
-                residual: None,
+                residual,
             } = &**input
             {
                 if let Some((project, out_cols)) = bare_column_projection(columns, table) {
-                    return exec_rowid_range_projected(
+                    return exec_rowid_range_projected_impl(
                         ctx,
                         table.clone(),
                         start.as_ref(),
                         end.as_ref(),
                         project.as_deref(),
                         out_cols,
+                        residual.as_ref(),
                     );
                 }
             }
@@ -9486,33 +9490,54 @@ fn exec_rowid_range(
     // conjuncts, the planner kept a residual predicate that re-checks the
     // strict comparison; we apply it here so we don't accidentally include
     // the boundary.
-    // Use borrowed scan — skip per-row Cell::decode Vec<u8> allocation.
-    // decode_row itself still allocates a Vec<Value> per row (unavoidable
-    // without restructuring the API to return iterators), but the payload
-    // borrow eliminates one allocation per row.
+    //
+    // Residual evaluation runs against the decoded row joined with the
+    // ROWID PSEUDO-COLUMN: a residual like `rowid > 10` (the strict-bound
+    // shape the planner produces) references `rowid`, which is not a
+    // payload column. The rowid is appended to the row (and its name to
+    // the eval column list) for the evaluation only — the OUTPUT rows
+    // keep the table's declared column shape (SELECT * must not see it).
     let rowid_alias = table.rowid_alias;
+    let has_real_rowid_col = table.find_column("rowid").is_some();
+    let residual = residual.filter(|_| {
+        // WITHOUT ROWID tables have no rowid; a real "rowid" column
+        // shadows the pseudo name (find_column already resolved it in
+        // the row).
+        !table.without_rowid && !has_real_rowid_col
+    });
+    let eval_cols: Vec<String> = if residual.is_some() {
+        // Bare "rowid" — satisfies both `rowid` and qualified `t.rowid`
+        // references through the evaluator's exact + suffix matching.
+        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        v.push("rowid".to_string());
+        v
+    } else {
+        Vec::new()
+    };
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
+    let residual_expr = residual;
     bt.scan_table_range_borrowed(start, end, |rowid, payload| {
-        if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+        if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+            if let Some(res) = residual_expr {
+                row.push(Value::Integer(rowid));
+                let keep = eval_row(res, &row, &eval_cols, params, named_params)
+                    .map(|v| v.is_truthy())
+                    .unwrap_or(false);
+                if !keep {
+                    return true;
+                }
+                row.pop();
+            }
             rows.push(row);
         }
         true
     })?;
 
-    // Apply residual predicate (strict < / > bounds, or additional filters).
-    // Cached plain column names — one refcount bump, no per-query clones.
-    let columns: Arc<[String]> = table.col_names.clone();
-    if let Some(res) = residual {
-        let params: &[Value] = &ctx.params;
-        let named_params = &ctx.named_params;
-        rows.retain(
-            |row| match eval_row(res, row, &columns, params, named_params) {
-                Ok(v) => v.is_truthy(),
-                Err(_) => false,
-            },
-        );
-    }
-
-    Ok(ExecResult { columns, rows })
+    Ok(ExecResult {
+        columns: table.col_names.clone(),
+        rows,
+    })
 }
 
 /// Identity position table: `positions[i] == i` for every column index
@@ -9552,13 +9577,27 @@ pub(crate) fn bare_column_projection(
     for pe in columns {
         match &pe.expr {
             Expr::Column { name, .. } => {
-                let idx = table.find_column(name)?;
-                idxs.push(idx);
-                names.push(
-                    pe.alias
-                        .clone()
-                        .unwrap_or_else(|| table.columns[idx].name.clone()),
-                );
+                if let Some(idx) = table.find_column(name) {
+                    idxs.push(idx);
+                    names.push(
+                        pe.alias
+                            .clone()
+                            .unwrap_or_else(|| table.columns[idx].name.clone()),
+                    );
+                } else if !table.without_rowid
+                    && (name.eq_ignore_ascii_case("rowid")
+                        || name.eq_ignore_ascii_case("_rowid_")
+                        || name.eq_ignore_ascii_case("oid"))
+                {
+                    // Rowid pseudo-column (SQLite): the B+tree cell key.
+                    // Valid on every rowid table (WITH an INTEGER PRIMARY
+                    // KEY alias too — rowid is the alias); the selective
+                    // decoders fill the sentinel slot from the cell key.
+                    idxs.push(crate::storage::row_codec::ROWID_PROJ);
+                    names.push(pe.alias.clone().unwrap_or_else(|| name.clone()));
+                } else {
+                    return None;
+                }
             }
             _ => return None,
         }
@@ -9569,13 +9608,19 @@ pub(crate) fn bare_column_projection(
 /// RowidRange with the projection FUSED into the scan: each row decodes
 /// only the projected columns (selective decode) — no full-row decode, no
 /// second cloning pass. `project == None` decodes the full row and moves it.
-fn exec_rowid_range_projected(
+///
+/// With a `residual` (strict `>` / `<` bounds, extra predicates), rows are
+/// FULL-decoded (the residual may reference non-projected columns) and the
+/// pseudo-rowid is appended for the evaluation only; survivors are then
+/// projected positionally. The no-residual path keeps the selective decode.
+fn exec_rowid_range_projected_impl(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
     start_expr: Option<&Expr>,
     end_expr: Option<&Expr>,
     project: Option<&[usize]>,
     out_cols: Arc<[String]>,
+    residual: Option<&Expr>,
 ) -> Result<ExecResult> {
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
@@ -9593,17 +9638,63 @@ fn exec_rowid_range_projected(
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
     let mut rows: Vec<Row> = Vec::new();
+    // Residual evaluation context: the decoded row + the rowid pseudo-
+    // column (see `exec_rowid_range`). Same gating: no pseudo column on
+    // WITHOUT ROWID tables or tables with a real "rowid" column.
+    let has_real_rowid_col = table.find_column("rowid").is_some();
+    let residual = residual.filter(|_| !table.without_rowid && !has_real_rowid_col);
+    let eval_cols: Vec<String> = if residual.is_some() {
+        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        v.push("rowid".to_string());
+        v
+    } else {
+        Vec::new()
+    };
+    let params: &[Value] = &ctx.params;
+    let named_params = &ctx.named_params;
     bt.scan_table_range_borrowed(start, end, |rowid, payload| {
-        match project {
-            Some(idxs) => {
+        match (project, residual) {
+            (Some(idxs), None) => {
                 let mut row = Vec::with_capacity(idxs.len());
                 if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok()
                 {
                     rows.push(row);
                 }
             }
-            None => {
-                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+            (Some(idxs), Some(res)) => {
+                // Full decode (the residual may need non-projected
+                // columns), evaluate, then project positionally.
+                if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    full.push(Value::Integer(rowid));
+                    let keep = eval_row(res, &full, &eval_cols, params, named_params)
+                        .map(|v| v.is_truthy())
+                        .unwrap_or(false);
+                    if keep {
+                        full.pop();
+                        let mut row = Vec::with_capacity(idxs.len());
+                        for &p in idxs {
+                            if p == crate::storage::row_codec::ROWID_PROJ {
+                                row.push(Value::Integer(rowid));
+                            } else {
+                                row.push(full.get(p).cloned().unwrap_or(Value::Null));
+                            }
+                        }
+                        rows.push(row);
+                    }
+                }
+            }
+            (None, _) => {
+                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    if let Some(res) = residual {
+                        row.push(Value::Integer(rowid));
+                        let keep = eval_row(res, &row, &eval_cols, params, named_params)
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
+                        if !keep {
+                            return true;
+                        }
+                        row.pop();
+                    }
                     rows.push(row);
                 }
             }

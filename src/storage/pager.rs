@@ -595,7 +595,7 @@ pub struct Pager {
     /// open on another thread. Never touched by the writer's live view;
     /// cleared at every transaction boundary (BEGIN/COMMIT/ROLLBACK) by
     /// `clear_committed_view()`.
-    committed_pages: Mutex<std::collections::HashMap<PageId, PageRef, PageIdHashBuild>>,
+    committed_pages: RwLock<std::collections::HashMap<PageId, PageRef, PageIdHashBuild>>,
     /// Set when a committed-view read served BEGIN-time bytes that differ
     /// from the live cache (pre-images / their memoized copies). Retired
     /// by `CommittedViewGuard::drop` with a single write-epoch bump so
@@ -677,13 +677,25 @@ const COMMITTED_PAGES_CAP: usize = 1024;
 #[must_use]
 pub struct CommittedViewGuard<'a> {
     prev: Option<(u64, u32)>,
+    /// Per-thread advisory-cache generation at ARM time: the drop only
+    /// bumps the write epoch when this scope actually created durable
+    /// thread-local advisory state (hints). A read that merely probed
+    /// pages retires nothing — and skipping the bump keeps concurrent
+    /// committed-view readers from invalidating the process's hint state
+    /// on every query.
+    advisory_gen_at_arm: u64,
     pager: &'a Pager,
 }
 
 impl Drop for CommittedViewGuard<'_> {
     fn drop(&mut self) {
         COMMITTED_VIEW.with(|c| c.set(self.prev.take()));
-        if self.pager.committed_poison.swap(false, Ordering::AcqRel) {
+        let poisoned = self.pager.committed_poison.swap(false, Ordering::AcqRel);
+        if poisoned && crate::storage::btree::advisory_state_gen() != self.advisory_gen_at_arm {
+            // This scope served BEGIN-time pages AND built thread-local
+            // advisory state under those bytes — retire it (the state
+            // would otherwise validate against a LIVE epoch after the
+            // scope ends).
             self.pager.write_version.fetch_add(1, Ordering::Release);
         }
         // Lower the gate: the count IS the gate, and the decrement is a
@@ -1013,6 +1025,28 @@ impl Pager {
         Ok(pager)
     }
 
+    /// Open a pure in-memory pager seeded from a COMPLETE database image
+    /// (page 0 header + every live page — exactly the byte sequence a
+    /// file store would hold on disk). `from_store` reads the header and
+    /// re-arms page size / page count / freelist / schema cookie from
+    /// page 0, so the seeded pager is a faithful reopening of the image.
+    ///
+    /// VACUUM uses this to re-seed a `:memory:` database with its
+    /// compacted image (the compact build runs in a temp FILE database
+    /// so every durability path applies, then the bytes come home).
+    pub fn open_memory_from_image(image: Vec<u8>, cache_capacity: usize) -> Result<Self> {
+        if image.is_empty() {
+            return Err(Error::corruption(
+                "cannot seed a memory pager from an empty image",
+            ));
+        }
+        let store = Store::Memory(std::sync::Mutex::new(image));
+        let path = PathBuf::from(":memory:");
+        let pager = Self::from_store(store, path, cache_capacity, true)?;
+        pager.lazy_writeback.store(true, Ordering::Release);
+        Ok(pager)
+    }
+
     /// Shared constructor from an already-built backing store.
     fn from_store(
         store: Store,
@@ -1057,7 +1091,7 @@ impl Pager {
             codec: RwLock::new(crate::plugin::codec::CodecState::default()),
             required_codec: Mutex::new(None),
             join_cache: Mutex::new(std::collections::HashMap::new()),
-            committed_pages: Mutex::new(std::collections::HashMap::default()),
+            committed_pages: RwLock::new(std::collections::HashMap::default()),
             committed_poison: std::sync::atomic::AtomicBool::new(false),
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
@@ -1482,6 +1516,16 @@ impl Pager {
         self.write_version.load(Ordering::Relaxed)
     }
 
+    /// This pager's stable instance id (process-wide counter).
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// The active page codec, if any (for VACUUM's compact-target parity).
+    pub(crate) fn active_page_codec(&self) -> Option<std::sync::Arc<dyn crate::plugin::PageCodec>> {
+        self.codec.read().active.clone()
+    }
+
     /// Cache-invalidation epoch: packs (instance_id, write_version) so
     /// advisory caches can detect BOTH "content changed" and "this is a
     /// different database object than the one the cache was built for"
@@ -1700,7 +1744,11 @@ impl Pager {
         // the live path, while same-thread consumers see it in program
         // order.
         self.committed_scope_count.fetch_add(1, Ordering::AcqRel);
-        CommittedViewGuard { prev, pager: self }
+        CommittedViewGuard {
+            prev,
+            advisory_gen_at_arm: crate::storage::btree::advisory_state_gen(),
+            pager: self,
+        }
     }
 
     /// Decrement the scope count; true when it reached zero — the gate
@@ -1758,7 +1806,7 @@ impl Pager {
     /// (commit — the live cache is now the committed state), or
     /// re-baselined (a new BEGIN).
     pub fn clear_committed_view(&self) {
-        self.committed_pages.lock().clear();
+        self.committed_pages.write().clear();
     }
 
     /// Disarm any committed-view scope this thread holds for THIS pager
@@ -1799,7 +1847,7 @@ impl Pager {
         // per page per transaction). Entries derive from pre-images →
         // they set the epoch-poison signal.
         {
-            let cp = self.committed_pages.lock();
+            let cp = self.committed_pages.read();
             if let Some(pr) = cp.get(&id) {
                 self.committed_poison.store(true, Ordering::Release);
                 return Ok(Arc::clone(pr));
@@ -1892,7 +1940,7 @@ impl Pager {
     /// page is re-materialized per miss — slower, but the memory budget
     /// holds (1k pages = 4 MiB at the default page size).
     fn cache_committed_page(&self, id: PageId, pr: &PageRef) {
-        let mut cp = self.committed_pages.lock();
+        let mut cp = self.committed_pages.write();
         if cp.len() < COMMITTED_PAGES_CAP {
             cp.insert(id, Arc::clone(pr));
         }
@@ -3374,6 +3422,10 @@ impl Pager {
     /// WAL-committed frames, codec pages — fall back to
     /// `read_overflow_page_append` one page at a time, re-acquiring the
     /// cache guard for the next resident run.
+    ///
+    /// Returns the number of payload bytes appended to `out` (callers
+    /// that need length validation — e.g. the full-payload reassembly —
+    /// compare it against the requested range).
     pub(crate) fn gather_overflow_chain_range(
         &self,
         first: PageId,
@@ -3381,10 +3433,11 @@ impl Pager {
         start: usize,
         end: usize,
         out: &mut Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if start >= end || first == 0 {
-            return Ok(());
+            return Ok(0);
         }
+        let mut appended = 0usize;
         let cap = self.page_size() as usize - 16;
         let max_pages = self.n_pages() as usize + 4;
         let mut steps = 0usize;
@@ -3403,7 +3456,7 @@ impl Pager {
                     )));
                 }
                 if page_pos >= end {
-                    return Ok(());
+                    return Ok(appended);
                 }
                 let page_ref = match cache.get(cur) {
                     Some(r) => r.clone(),
@@ -3419,10 +3472,11 @@ impl Pager {
                             let to = (end.min(p_end) - page_pos).min(sink.len());
                             if to > from {
                                 out.extend_from_slice(&sink[from..to]);
+                                appended += to - from;
                             }
                         }
                         if next == 0 {
-                            return Ok(());
+                            return Ok(appended);
                         }
                         page_pos += take;
                         cur = next;
@@ -3445,12 +3499,13 @@ impl Pager {
                         let to = end.min(p_end) - page_pos;
                         if to > from {
                             out.extend_from_slice(&data[from..to]);
+                            appended += to - from;
                         }
                     }
                     (next, take)
                 };
                 if next == 0 {
-                    return Ok(());
+                    return Ok(appended);
                 }
                 page_pos += take;
                 cur = next;

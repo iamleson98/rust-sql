@@ -652,3 +652,196 @@ fn split_script_transaction_begin_unaffected() {
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[0], "BEGIN");
 }
+
+// ---------------------------------------------------------------------------
+// Rowid pseudo-column (SELECT list / range cursors)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rowid_pseudo_column_select() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t (a TEXT, b INT)", ()).unwrap();
+    db.execute(
+        "INSERT INTO t (rowid, a, b) VALUES (10, 'x', 1), (25, 'y', 2)",
+        (),
+    )
+    .unwrap();
+    let rows = db.query("SELECT rowid, a FROM t", ()).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(10));
+    assert_eq!(rows[1][0], Value::Integer(25));
+    // _rowid_ / oid spellings + alias
+    let rows = db
+        .query("SELECT _rowid_ AS r FROM t ORDER BY r", ())
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(10));
+    let rows = db.query("SELECT oid FROM t WHERE oid = 25", ()).unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn rowid_pseudo_column_range_cursor() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t (a TEXT)", ()).unwrap();
+    for i in 0..50i64 {
+        db.execute(
+            "INSERT INTO t (rowid, a) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
+    }
+    let rows = db
+        .query(
+            "SELECT a FROM t WHERE rowid > 10 ORDER BY rowid LIMIT 5",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0][0], Value::Text("v11".into()));
+    // Strict bound excludes the boundary row.
+    let rows = db
+        .query("SELECT rowid FROM t WHERE rowid >= 10 AND rowid <= 12", [])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    // Pseudo-rowid projection fused with a strict range residual.
+    let rows = db
+        .query("SELECT rowid, a FROM t WHERE rowid > 45 ORDER BY rowid", [])
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0][0], Value::Integer(46));
+}
+
+#[test]
+fn rowid_pseudo_with_alias_table() {
+    // INTEGER PRIMARY KEY table: rowid IS the alias value.
+    let mut db = mem();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (7, 'seven')", ()).unwrap();
+    let rows = db.query("SELECT rowid, id, a FROM t", ()).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(7));
+    assert_eq!(rows[0][1], Value::Integer(7));
+    let rows = db.query("SELECT a FROM t WHERE rowid = 7", ()).unwrap();
+    assert_eq!(rows[0][0], Value::Text("seven".into()));
+}
+
+// ---------------------------------------------------------------------------
+// VACUUM
+// ---------------------------------------------------------------------------
+
+fn vacuum_churn(db: &mut rustqlite::Database) {
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, f REAL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX iv ON t (v)", ()).unwrap();
+    db.execute("CREATE INDEX isum ON t (id + f)", ()).unwrap();
+    for i in 1..=500i64 {
+        db.execute(
+            "INSERT INTO t (v, f) VALUES (?, ?)",
+            [Value::Text(format!("row{i}").into()), Value::Real(i as f64)],
+        )
+        .unwrap();
+    }
+    db.execute("DELETE FROM t WHERE id <= 400", []).unwrap();
+}
+
+#[test]
+fn vacuum_in_memory_compacts_and_preserves() {
+    let mut db = mem();
+    vacuum_churn(&mut db);
+    let pages_before: i64 = db.query("PRAGMA page_count", []).unwrap()[0][0].as_integer();
+    db.execute("VACUUM", []).unwrap();
+    let pages_after: i64 = db.query("PRAGMA page_count", []).unwrap()[0][0].as_integer();
+    assert!(
+        pages_after < pages_before,
+        "{pages_after} !< {pages_before}"
+    );
+    // Rowids, values, and all three indexes intact.
+    let rows = db
+        .query("SELECT id, v, f FROM t WHERE v = 'row500'", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(500));
+    assert_eq!(rows[0][2], Value::Real(500.0));
+    let n = db
+        .query("SELECT COUNT(*) FROM t WHERE v > 'row4'", [])
+        .unwrap();
+    assert_eq!(n[0][0], Value::Integer(100));
+    // rowid generation continues past the vacuumed state.
+    db.execute("INSERT INTO t (v, f) VALUES ('new', 1.5)", [])
+        .unwrap();
+    let rows = db.query("SELECT id FROM t WHERE v = 'new'", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(501));
+}
+
+#[test]
+fn vacuum_file_backed_compacts_and_reopens() {
+    let path = std::env::temp_dir().join("rq_vacuum_file_test.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = rustqlite::Database::open(&path).unwrap();
+        vacuum_churn(&mut db);
+        let before = std::fs::metadata(&path).unwrap().len();
+        db.execute("VACUUM", []).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "file {after} !< {before}");
+        // Same handle keeps working.
+        let rows = db.query("SELECT id FROM t WHERE v = 'row499'", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(499));
+    }
+    // Fresh open from disk: compact state is durable.
+    let db = rustqlite::Database::open(&path).unwrap();
+    let rows = db
+        .query("SELECT id, v FROM t WHERE v = 'row500'", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(500));
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(100));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn vacuum_into_writes_standalone_copy() {
+    let mut db = mem();
+    vacuum_churn(&mut db);
+    let into = std::env::temp_dir().join("rq_vacuum_into_test.db");
+    let _ = std::fs::remove_file(&into);
+    let sql = format!("VACUUM INTO '{}'", into.display());
+    db.execute(sql.as_str(), []).unwrap();
+    // Source untouched.
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(100));
+    // Target is a complete standalone database.
+    let tgt = rustqlite::Database::open(&into).unwrap();
+    let rows = tgt
+        .query("SELECT id, v FROM t WHERE v = 'row498'", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(498));
+    let n = tgt.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(100));
+    let _ = std::fs::remove_file(&into);
+}
+
+#[test]
+fn vacuum_refused_inside_transaction() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t (a INT)", ()).unwrap();
+    db.execute("BEGIN", []).unwrap();
+    let e = db.execute("VACUUM", []).unwrap_err();
+    assert!(e.to_string().contains("transaction"), "got: {e}");
+    db.execute("COMMIT", []).unwrap();
+    db.execute("VACUUM", []).unwrap();
+}
+
+#[test]
+fn vacuum_into_refuses_existing_file() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t (a INT)", ()).unwrap();
+    let into = std::env::temp_dir().join("rq_vacuum_exists_test.db");
+    let _ = std::fs::remove_file(&into);
+    std::fs::write(&into, b"x").unwrap();
+    let sql = format!("VACUUM INTO '{}'", into.display());
+    let e = db.execute(sql.as_str(), []).unwrap_err();
+    assert!(e.to_string().contains("existing"), "got: {e}");
+    let _ = std::fs::remove_file(&into);
+}

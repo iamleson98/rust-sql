@@ -1893,10 +1893,49 @@ impl Database {
         for (name, i) in catalog.all_indexes() {
             schema_root_pages.insert(format!("index:{}", name), i.root_page);
         }
-        Ok(Self {
+        Ok(Self::from_pager_and_catalog(
             pager,
             catalog,
-            path: PathBuf::from(":memory:"),
+            PathBuf::from(":memory:"),
+        ))
+    }
+
+    /// Open an in-memory database seeded from a complete database image
+    /// (the byte sequence a file store holds on disk: page 0 header +
+    /// every live page). The image is copied into the pager's memory
+    /// store; the header re-arms page size, page count, freelist, and
+    /// schema cookie.
+    ///
+    /// This is the public seam for VACUUM results on `:memory:`
+    /// databases and for snapshot restore flows.
+    pub fn open_in_memory_with_image(image: Vec<u8>) -> Result<Self> {
+        crate::engine_init();
+        let pager = Pager::open_memory_from_image(image, DEFAULT_CACHE_PAGES)?;
+        let mut catalog = Catalog::new();
+        catalog.schema_cookie = pager.schema_cookie();
+        load_schema(&pager, &mut catalog)?;
+        Ok(Self::from_pager_and_catalog(
+            pager,
+            catalog,
+            PathBuf::from(":memory:"),
+        ))
+    }
+
+    /// Shared `Database` assembly from a live pager + loaded catalog.
+    /// `open_inner` (codec paths) and the memory constructors all end
+    /// here; VACUUM re-seeding reuses it for the replacement instance.
+    fn from_pager_and_catalog(pager: Pager, catalog: Catalog, path: PathBuf) -> Self {
+        let mut schema_root_pages = HashMap::new();
+        for (name, t) in catalog.all_tables() {
+            schema_root_pages.insert(format!("table:{}", name), t.root_page);
+        }
+        for (name, i) in catalog.all_indexes() {
+            schema_root_pages.insert(format!("index:{}", name), i.root_page);
+        }
+        Self {
+            pager,
+            catalog,
+            path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
             txn_maps_snap: Mutex::new(None),
@@ -1925,7 +1964,310 @@ impl Database {
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
-        })
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // VACUUM
+    // ------------------------------------------------------------------
+
+    /// Execute `VACUUM` / `VACUUM INTO 'file'` (SQLite semantics):
+    /// rebuild the database into a fresh, fully compact image — every
+    /// page live, no freelist, no tail fragmentation — then either write
+    /// it to `INTO` (self untouched) or replace this database's state
+    /// in place.
+    ///
+    /// The compact build runs in a temporary FILE database (so every
+    /// durability path — flush ordering, freelist allocation, codec —
+    /// applies exactly as in a real file), streaming every table's rows
+    /// (rowids preserved, BLOBs intact), replaying index/view/trigger
+    /// DDL (indexes backfill from the copied rows), and carrying
+    /// `user_version` / `application_id` over. In-place replacement
+    /// then re-seeds a `:memory:` database from the image bytes, or
+    /// rewrites the file and reopens it.
+    fn execute_vacuum(&mut self, v: &VacuumStatement) -> Result<()> {
+        if let Some(schema) = &v.schema {
+            if !schema.eq_ignore_ascii_case("main") {
+                return Err(Error::semantic(format!(
+                    "unknown database: {schema} (only the main database can be vacuumed)"
+                )));
+            }
+        }
+        if self.in_transaction.load(Ordering::Acquire) || self.pager.has_savepoints() {
+            return Err(Error::semantic("cannot VACUUM from within a transaction"));
+        }
+        // Make the source's committed state fully durable before the
+        // rebuild reads it (flush dirty pages; checkpoint any WAL).
+        self.break_insert_chain();
+        self.pager.flush()?;
+        self.pager.checkpoint_wal()?;
+
+        let image = self.build_compact_image()?;
+
+        // VACUUM INTO 'file': SQLite refuses to overwrite.
+        if let Some(into) = &v.into {
+            let p = std::path::Path::new(into);
+            if p.exists() {
+                return Err(Error::semantic(format!(
+                    "cannot VACUUM INTO existing file: {into}"
+                )));
+            }
+            std::fs::write(p, &image).map_err(|e| {
+                Error::Io(std::io::Error::other(format!("vacuum into {into}: {e}")))
+            })?;
+            return Ok(());
+        }
+
+        // In-place: re-seed self from the compact image.
+        // Connection-scoped bookkeeping (last_insert_rowid) survives the
+        // swap — VACUUM must not clobber it (SQLite keeps the value).
+        let keep_rowid = self.last_rowid.load(Ordering::Acquire);
+        if self.pager.is_memory() {
+            let mut new = Self::open_in_memory_with_image(image)?;
+            new.path = self.path.clone();
+            // Codec parity is meaningless for the pure memory store's
+            // decode side (the image was encoded through the source's
+            // codec, and memory reads go through the cached decoded
+            // pages) — but keep the codec ACTIVE so the state matches.
+            if let Some(c) = self.pager.active_page_codec() {
+                let _ = new.pager.set_codec(Some(c));
+            }
+            new.last_rowid.store(keep_rowid, Ordering::Release);
+            *self = new;
+        } else {
+            let path = self.path.clone();
+            let codec = self.pager.active_page_codec();
+            std::fs::write(&path, &image).map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "vacuum rewrite {path:?}: {e}"
+                )))
+            })?;
+            // Reopen through the normal constructors (codec-aware).
+            let mut new = match codec {
+                Some(c) => {
+                    let pager = Pager::open_opts(&path, DEFAULT_CACHE_PAGES, false)?;
+                    pager.set_codec(Some(c))?;
+                    let mut catalog = Catalog::new();
+                    catalog.schema_cookie = pager.schema_cookie();
+                    load_schema(&pager, &mut catalog)?;
+                    Self::from_pager_and_catalog(pager, catalog, path.clone())
+                }
+                None => Self::open(&path)?,
+            };
+            new.path = path;
+            new.last_rowid.store(keep_rowid, Ordering::Release);
+            *self = new;
+        }
+        Ok(())
+    }
+
+    /// Build the compacted image in a temp FILE database and read the
+    /// bytes back. The temp file is removed on both success and failure.
+    fn build_compact_image(&self) -> Result<Vec<u8>> {
+        let tmp_path = std::env::temp_dir().join(format!(
+            "rustqlite-vacuum-{}-{}.db",
+            std::process::id(),
+            self.pager.instance_id()
+        ));
+        let _ = std::fs::remove_file(&tmp_path);
+        let build = (|| -> Result<Vec<u8>> {
+            let mut tmp = Database::open(&tmp_path)?;
+            if let Some(c) = self.pager.active_page_codec() {
+                tmp.pager.set_codec(Some(c))?;
+            }
+            self.vacuum_copy_into(&mut tmp)?;
+            tmp.pager
+                .set_user_version(self.pager.user_version())
+                .map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("vacuum user_version: {e}")))
+                })?;
+            tmp.pager
+                .set_application_id(self.pager.application_id())
+                .map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("vacuum application_id: {e}")))
+                })?;
+            tmp.pager.flush()?;
+            drop(tmp);
+            std::fs::read(&tmp_path)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum read back: {e}"))))
+        })();
+        let _ = std::fs::remove_file(&tmp_path);
+        // Remove the temp WAL sidecar too, if one appeared.
+        let _ = std::fs::remove_file(format!("{}-wal", tmp_path.display()));
+        build
+    }
+
+    /// Copy the whole schema + every table's rows into `tmp` (the
+    /// compact target). Tables first (rowids preserved), then indexes
+    /// (CREATE INDEX backfills from the copied rows — including
+    /// expression and partial indexes), then views and triggers (DDL
+    /// only). Internal `sqlite_*` objects are rebuilt by the engine
+    /// itself and skipped. Foreign keys stay OFF on the target (SQLite
+    /// does the same during VACUUM), so copy order does not matter.
+    fn vacuum_copy_into(&self, tmp: &mut Database) -> Result<()> {
+        let mut tables = self.catalog.all_tables();
+        tables.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, table) in tables {
+            if name.eq_ignore_ascii_case("sqlite_master")
+                || name.eq_ignore_ascii_case("sqlite_schema")
+                || name.starts_with("sqlite_")
+                || table.create_sql.is_empty()
+            {
+                continue;
+            }
+            tmp.execute(table.create_sql.as_str(), ())?;
+            self.vacuum_copy_table(tmp, &table)?;
+        }
+        let mut indexes = self.catalog.all_indexes();
+        indexes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, ix) in indexes {
+            // Implicit PK/UNIQUE indexes are recreated by the CREATE
+            // TABLE replay; explicit ones replay their DDL and backfill.
+            if name.starts_with("sqlite_autoindex_") || ix.create_sql.is_empty() {
+                continue;
+            }
+            tmp.execute(ix.create_sql.as_str(), ())?;
+        }
+        for (_, view) in self.catalog.all_views() {
+            if !view.create_sql.is_empty() {
+                tmp.execute(view.create_sql.as_str(), ())?;
+            }
+        }
+        for (_, trg) in self.catalog.all_triggers() {
+            if !trg.create_sql.is_empty() {
+                tmp.execute(trg.create_sql.as_str(), ())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy one table's rows into the compact target, preserving
+    /// rowids. Reads run in rowid-cursor batches (`WHERE rowid > ? ORDER
+    /// BY rowid LIMIT n`) — bounded memory on million-row tables.
+    fn vacuum_copy_table(&self, tmp: &mut Database, table: &Arc<Table>) -> Result<()> {
+        const BATCH: i64 = 2000;
+        // Stored (non-generated) columns only.
+        let insert_cols: Vec<&str> = table
+            .columns
+            .iter()
+            .filter(|c| c.generated.is_none())
+            .map(|c| c.name.as_str())
+            .collect();
+        if insert_cols.is_empty() {
+            return Ok(());
+        }
+        let q = |s: &str| -> String { format!("\"{}\"", s.replace('"', "\"\"")) };
+        let col_list = insert_cols
+            .iter()
+            .map(|c| q(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target = q(&table.name);
+
+        if table.without_rowid {
+            // Key-in-row: plain copy of the stored columns; the declared
+            // PK (among them) IS the cell key, so values come across
+            // exactly.
+            let select_sql = format!("SELECT {col_list} FROM {target}");
+            let placeholders = insert_cols
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_sql = format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
+            let rows = self.query(select_sql.as_str(), ())?;
+            for row in rows {
+                tmp.execute(insert_sql.as_str(), row)?;
+            }
+            return Ok(());
+        }
+
+        // Rowid table. With an INTEGER PRIMARY KEY alias the alias column
+        // (among insert_cols) carries the rowid; otherwise the explicit
+        // `rowid` INSERT target binds it.
+        match table.rowid_alias {
+            Some(ai) => {
+                let alias = table.columns[ai].name.clone();
+                // Position of the alias column within the SELECT's
+                // column list (stored columns in declaration order).
+                let alias_pos = insert_cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&alias))
+                    .expect("alias column is a stored column");
+                let select_sql = format!(
+                    "SELECT {col_list} FROM {target} WHERE {} > ? ORDER BY {} LIMIT {BATCH}",
+                    q(&alias),
+                    q(&alias)
+                );
+                let first_sql = format!(
+                    "SELECT {col_list} FROM {target} ORDER BY {} LIMIT {BATCH}",
+                    q(&alias)
+                );
+                let placeholders = insert_cols
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let insert_sql =
+                    format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
+                let mut cursor: Option<i64> = None;
+                loop {
+                    let rows = match cursor {
+                        Some(c) => self.query(select_sql.as_str(), vec![Value::Integer(c)])?,
+                        None => self.query(first_sql.as_str(), ())?,
+                    };
+                    let n = rows.len();
+                    if n == 0 {
+                        break;
+                    }
+                    // The next cursor: the LAST row's alias value.
+                    let mut next_cursor = cursor.unwrap_or(i64::MIN);
+                    if let Some(Value::Integer(last)) = rows[n - 1].get(alias_pos) {
+                        next_cursor = *last;
+                    }
+                    for row in rows {
+                        tmp.execute(insert_sql.as_str(), row)?;
+                    }
+                    if n < BATCH as usize {
+                        break;
+                    }
+                    cursor = Some(next_cursor);
+                }
+                Ok(())
+            }
+            None => {
+                let select_sql = format!(
+                    "SELECT rowid, {col_list} FROM {target} WHERE rowid > ? ORDER BY rowid LIMIT {BATCH}"
+                );
+                let placeholders = std::iter::once("?")
+                    .chain(insert_cols.iter().map(|_| "?"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let insert_sql =
+                    format!("INSERT INTO {target} (rowid, {col_list}) VALUES ({placeholders})");
+                let mut cursor = i64::MIN;
+                loop {
+                    let rows = self.query(select_sql.as_str(), vec![Value::Integer(cursor)])?;
+                    let n = rows.len();
+                    if n == 0 {
+                        break;
+                    }
+                    let mut last_rowid = cursor;
+                    for row in rows {
+                        // row[0] = rowid (pseudo-column), row[1..] = cols.
+                        if let Some(Value::Integer(r)) = row.first() {
+                            last_rowid = *r;
+                        }
+                        tmp.execute(insert_sql.as_str(), row)?;
+                    }
+                    if n < BATCH as usize {
+                        break;
+                    }
+                    cursor = last_rowid;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Set the statement cache capacity. A larger cache uses more memory but
@@ -2828,6 +3170,14 @@ impl Database {
         let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
         profile::span(t_cache, &profile::CACHE_NS);
+        // VACUUM rebuilds (and REPLACES) this Database: intercept before
+        // any ctx borrows self, and before the txn hooks run (VACUUM is
+        // refused inside a transaction anyway).
+        if let Statement::Vacuum(v) = cached.stmt.as_ref() {
+            let v = v.clone();
+            drop(cached);
+            return self.execute_vacuum(&v);
+        }
         // WITH-clause SELECT via the execute path: same CTE machinery as
         // query(); the result rows are simply discarded.
         if let Statement::Select(sel) = cached.stmt.as_ref() {

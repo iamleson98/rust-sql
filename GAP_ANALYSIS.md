@@ -370,3 +370,51 @@ relations, pagination, transactions, error propagation — all green),
 plus `sea_orm_relations` for join shapes. `SQLX_COMPAT.md` documents
 the wire surface. Remaining sea-orm surface to grow: `json!` column
 serde, more `DeriveRelation` shapes, livepool under churn.
+
+## 6. 2026-09-05 (IV) — VACUUM, the rowid pseudo-column, reader-path locks
+
+**VACUUM (was a no-op).** Full SQLite-compatible rebuild: the compact
+image is built in a temp FILE database (tables streamed in rowid-cursor
+batches of 2000 — rowids, BLOBs, REALs preserved; indexes replay their
+DDL and backfill from the copied rows, covering expression/partial/
+unique/collated indexes; views and triggers replay; `user_version` /
+`application_id` carried over; FKs stay OFF on the target like SQLite's
+own VACUUM). `VACUUM INTO 'file'` writes the standalone copy (refuses
+to overwrite); in-place VACUUM re-seeds `:memory:` databases from the
+image bytes (`Database::open_in_memory_with_image` /
+`Pager::open_memory_from_image`) or rewrites the file and reopens
+(codec-aware). Connection bookkeeping (`last_insert_rowid`) survives
+the swap. Measured: in-memory page_count 9 -> 3 after 80% delete;
+file 20,480 -> 8,192 bytes; reopened lookups + index range scans
+intact; rowid generation continues past the vacuumed state.
+`VACUUM` inside a transaction errors ("cannot VACUUM from within a
+transaction").
+
+**The rowid pseudo-column (parity gap).** `SELECT rowid` (and
+`_rowid_` / `oid`, with or without an INTEGER PRIMARY KEY alias)
+previously projected NULL, and `WHERE rowid > ?` filtered everything
+(the residual evaluated `rowid` as an unknown column). Now: a
+`ROWID_PROJ` sentinel in projection lists decodes to the cell key in
+the selective decoders (fused scan / range / lookup projections), and
+range residuals evaluate against the decoded row + an appended
+pseudo-rowid (internal only — `SELECT *` never sees it). The fused
+RowidRange+Project path handles strict-bound residuals
+(`SELECT rowid, a WHERE rowid > ?` stays fused: full decode +
+positional projection when a residual is present).
+
+**Committed-view reader-path contention (the sqlx 1w+7r CI row).**
+- `committed_pages` materialization cache: Mutex -> RwLock (7 reader
+  threads no longer serialize their probes on one mutex).
+- The scope-drop write-epoch bump is now CONDITIONAL: a per-thread
+  advisory-generation counter (bumped by the thread-local table/index
+  leaf-hint writers) is compared at arm/drop — a reader that built no
+  durable thread-local hints retires nothing. Previously EVERY
+  committed-view query bumped the global write epoch, invalidating the
+  process's hint state per query (hint rebuild per descent, writer
+  append-hint retirement mid-transaction).
+- Overflow-chain reassembly (S09 blob scan) now gathers chain pages
+  under ONE cache read-guard per resident run
+  (`assemble_overflow_payload_into` -> `gather_overflow_chain_range`,
+  which also reports appended bytes for length validation) — the old
+  path paid 16 RwLock acquisitions per 64 KB blob (~15% of the scan on
+  bandwidth-bound hardware).

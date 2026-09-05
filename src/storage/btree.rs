@@ -717,6 +717,28 @@ thread_local! {
             epoch: u64::MAX, // force clear on first use
             indexes: HintMap::default(),
         });
+
+    /// Monotonic per-thread generation of thread-local advisory-cache
+    /// writes (table/index leaf hints). The committed-view scope compares
+    /// it at arm and drop: a reader that created NO durable advisory
+    /// state during its scope needs NO write-epoch bump on exit — the
+    /// bump exists only to retire THIS thread's BEGIN-time-stamped
+    /// hints, and absent state needs no retirement. Without it, every
+    /// concurrent committed-view reader invalidated the WHOLE process's
+    /// hint state on every query (hint rebuild per descent + writer
+    /// append-hint retirement mid-transaction).
+    static ADVISORY_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the per-thread advisory-write generation (see ADVISORY_GEN).
+#[inline]
+pub(crate) fn advisory_state_gen() -> u64 {
+    ADVISORY_GEN.with(|c| c.get())
+}
+
+#[inline]
+fn advisory_state_touched() {
+    ADVISORY_GEN.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// Clear the hint cache when the epoch moved (any write, rollback, or a
@@ -782,6 +804,7 @@ fn set_table_hint(
     // the bucket-straddling-leaf-boundary case without thrashing: both
     // leaves of the straddle live in the pair.
     TABLE_HINTS.with(|c| {
+        advisory_state_touched();
         let mut slots = c.borrow_mut();
         let pair = table_hint_pair(probed_rowid);
         // same page already present? refresh in place.
@@ -987,6 +1010,7 @@ fn index_hint_page(root: PageId, key: &[u8], epoch: u64) -> Option<(PageRef, u32
 /// the entry still lives under this epoch).
 #[inline]
 fn bump_index_hint_cell(root: PageId, cell: u32, epoch: u64) {
+    let mut touched = false;
     LEAF_HINTS.with(|c| {
         let mut c = c.borrow_mut();
         if c.epoch != epoch {
@@ -994,12 +1018,17 @@ fn bump_index_hint_cell(root: PageId, cell: u32, epoch: u64) {
         }
         if let Some(h) = c.indexes.get_mut(&root) {
             h.last_cell = cell;
+            touched = true;
         }
     });
+    if touched {
+        advisory_state_touched();
+    }
 }
 
 /// Record the index-leaf hint for `root`.
 fn set_index_hint(root: PageId, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64) {
+    advisory_state_touched();
     LEAF_HINTS.with(|c| {
         let mut c = c.borrow_mut();
         if c.epoch != epoch {
@@ -2028,45 +2057,18 @@ impl<'a> Btree<'a> {
                 .saturating_sub(buf.capacity().min(total.min(1 << 20))),
         );
         buf.extend_from_slice(local);
-        let cap = self.overflow_page_capacity();
-        let mut remaining = total - local.len();
-        let mut cur = first;
-        let max_pages = self.pager.n_pages() as usize + 4;
-        let mut steps = 0usize;
-        while cur != 0 {
-            steps += 1;
-            if steps > max_pages {
-                return Err(Error::corruption(format!(
-                    "overflow chain cycle starting at page {first}"
-                )));
-            }
-            // The number of VALID bytes on this page is deterministic:
-            // every page except the last is full; the last carries the
-            // remainder. (Pages are not zeroed on allocation — never read
-            // past `take`.)
-            let take = remaining.min(cap);
-            if take == 0 {
-                return Err(Error::corruption(format!(
-                    "overflow chain longer than payload ({} > {})",
-                    total, total
-                )));
-            }
-            // Cache-bypassing sequential read (see
-            // Pager::read_overflow_page_append): overflow chains are
-            // read-once in scans; caching them evicts the live tree pages.
-            let before = buf.len();
-            let (next, got) = self.pager.read_overflow_page_append(cur, buf)?;
-            if got < take {
-                return Err(Error::corruption("overflow page data region truncated"));
-            }
-            buf.truncate(before + take);
-            remaining -= take;
-            cur = next;
-        }
-        if remaining != 0 {
+        // Chain part: batched under ONE cache read-guard per resident run
+        // (the per-page `read_overflow_page_append` walked 16 RwLock
+        // acquisitions per 64KB blob — the lock overhead was ~15% of the
+        // scan on bandwidth-bound hardware).
+        let want = total - local.len();
+        let got =
+            self.pager
+                .gather_overflow_chain_range(first, local.len(), local.len(), total, buf)?;
+        if got != want {
             return Err(Error::corruption(format!(
                 "overflow chain shorter than payload ({} < {})",
-                total - remaining,
+                local.len() + got,
                 total
             )));
         }
@@ -5299,8 +5301,10 @@ impl<'a> Btree<'a> {
         // Chain part: ONE cache read-guard for the whole resident run
         // (see Pager::gather_overflow_chain_range) instead of a
         // `get_page` (RwLock + Arc clone + atomic) per chain page.
-        self.pager
-            .gather_overflow_chain_range(chain, local.len(), start, end, out)
+        let _ = self
+            .pager
+            .gather_overflow_chain_range(chain, local.len(), start, end, out)?;
+        Ok(())
     }
 
     /// Full-scan with the projection FUSED into the walk (the overflow-

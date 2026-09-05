@@ -278,6 +278,14 @@ pub fn apply_affinities(row: &mut Row, affinities: &[Affinity]) {
     }
 }
 
+/// Sentinel `col_indices` entry meaning "the rowid pseudo-column"
+/// (`SELECT rowid` / `_rowid_` / `oid`): the value is the B+tree cell
+/// key, not a payload column, so the selective decoders fill those
+/// slots with `Integer(rowid)` after the payload walk. Sorting places
+/// it after every real column (usize::MAX), so the walk naturally
+/// skips past all payload columns first.
+pub const ROWID_PROJ: usize = usize::MAX;
+
 /// Decode only a subset of columns from a row payload.
 ///
 /// `col_indices` is a sorted list of column indices to extract (e.g.
@@ -287,6 +295,8 @@ pub fn apply_affinities(row: &mut Row, affinities: &[Affinity]) {
 ///
 /// If the rowid-alias column is among `col_indices`, its slot is filled
 /// with `Integer(rowid)` (the payload holds only a marker byte there).
+/// A `ROWID_PROJ` sentinel entry decodes to `Integer(rowid)` as well
+/// (the pseudo-column; the same value the alias column would carry).
 ///
 /// Cost: O(K + N_skip) where K = number of wanted columns and N_skip is
 /// the total encoded bytes of the skipped columns.
@@ -384,6 +394,15 @@ pub fn decode_row_selective(
     let mut pos = 0usize;
     let mut col = 0usize;
     let mut wanted_idx = 0usize;
+
+    // Pseudo-rowid slots (ROWID_PROJ sentinel): the sentinel sorts past
+    // every payload column, so the walk below never targets it (and must
+    // not try: it is not a payload column) — fill it up front instead.
+    for (k, &ci) in indices.iter().enumerate() {
+        if ci == ROWID_PROJ {
+            out[slot_of(ascending, slots_ref, k)] = Value::Integer(rowid);
+        }
+    }
 
     while pos < buf.len() && col < n_cols_total && wanted_idx < indices.len() {
         // Advance `wanted_idx` past any indices < col.
@@ -494,10 +513,18 @@ pub fn decode_row_selective_sorted(
     out: &mut Vec<Value>,
 ) -> Result<()> {
     debug_assert!(col_indices.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(!col_indices[..col_indices.len() - 1].contains(&ROWID_PROJ));
     out.clear();
     out.resize(col_indices.len(), Value::Null);
     if col_indices.is_empty() {
         return Ok(());
+    }
+    // Pseudo-rowid slot: the cell key, not a payload column.
+    if col_indices[col_indices.len() - 1] == ROWID_PROJ {
+        out[col_indices.len() - 1] = Value::Integer(rowid);
+        if col_indices.len() == 1 {
+            return Ok(());
+        }
     }
     let mut pos = 0usize;
     let mut wi = 0usize; // index into col_indices of the next wanted column
