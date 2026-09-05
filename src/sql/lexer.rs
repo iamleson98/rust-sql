@@ -624,6 +624,7 @@ pub const KEYWORDS: &[&str] = &[
     "EXPLAIN",
     "FAIL",
     "FILTER",
+    "FIRST",
     "FOLLOWING",
     "FOR",
     "FOREIGN",
@@ -649,6 +650,7 @@ pub const KEYWORDS: &[&str] = &[
     "ISNULL",
     "JOIN",
     "KEY",
+    "LAST",
     "LEFT",
     "LIKE",
     "LIMIT",
@@ -694,6 +696,7 @@ pub const KEYWORDS: &[&str] = &[
     "SELECT",
     "SET",
     "STORED",
+    "STRICT",
     "TABLE",
     "TEMP",
     "TEMPORARY",
@@ -735,6 +738,17 @@ mod tests {
         assert_eq!(toks[2], Token::Keyword("FROM"));
         assert_eq!(toks[3], Token::Ident("users".into()));
         assert_eq!(toks[4], Token::Eof);
+    }
+
+    #[test]
+    fn keywords_table_is_sorted() {
+        // `is_keyword` binary-searches KEYWORDS; a misplaced entry silently
+        // de-classifies its neighbors into identifiers (a real regression:
+        // FIRST inserted after FOREIGN made FOR/FOLLOWING parse as idents).
+        assert!(
+            KEYWORDS.windows(2).all(|w| w[0] < w[1]),
+            "KEYWORDS must be strictly sorted for the binary search"
+        );
     }
 
     #[test]

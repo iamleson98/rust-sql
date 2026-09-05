@@ -19,6 +19,21 @@ fn alias_of(alias: &Option<String>, table: &str) -> String {
 
 fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
     match plan {
+        Plan::TableFunction { name, args, alias } => {
+            let a = alias_of(alias, name);
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!(
+                    "SCAN {} AS FUNCTION {} ({} argument{})",
+                    a,
+                    name,
+                    args.len(),
+                    if args.len() == 1 { "" } else { "s" }
+                ),
+            );
+        }
         Plan::Scan {
             table,
             alias,

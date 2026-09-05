@@ -43,7 +43,7 @@ pub mod baker {
 }
 
 use sea_orm::sea_query::SqliteQueryBuilder;
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Schema, Set, Statement, TransactionTrait};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Schema, Set, TransactionTrait};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

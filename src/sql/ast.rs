@@ -26,6 +26,9 @@ pub enum Statement {
     Detach(DetachStatement),
     Vacuum(VacuumStatement),
     Alter(AlterStatement),
+    /// ANALYZE / REINDEX — accepted grammar, catalog no-ops (the planner
+    /// has no statistics-driven cost model to feed).
+    NoOp,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +40,8 @@ pub enum CreateStatement {
         constraints: Vec<TableConstraint>,
         without_rowid: bool,
         strict: bool,
+        /// CREATE TABLE t AS SELECT ... — materialize this query.
+        as_select: Option<Box<SelectStatement>>,
     },
     Index {
         unique: bool,
@@ -157,6 +162,10 @@ pub struct IndexedColumn {
     pub name: String,
     pub order: Order,
     pub collation: Option<String>,
+    /// Expression index (SQLite 3.9+): the key is computed from this
+    /// expression per row instead of a plain column value. `name` then
+    /// holds the rendered expression text (display / round-trip).
+    pub expr: Option<Box<Expr>>,
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +334,14 @@ pub enum TableExpression {
         join_type: JoinType,
         constraint: JoinConstraint,
     },
+    /// Table-valued function in FROM: `json_each(x)`, `json_tree(x)`,
+    /// `pragma_table_info('t')`, ... Evaluated at execution time so
+    /// arguments may be bound parameters.
+    Function {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +447,11 @@ pub struct UpdateStatement {
     pub from: Option<TableExpression>,
     pub where_clause: Option<Expr>,
     pub returning: Option<Vec<ResultColumn>>,
+    /// `UPDATE ... ORDER BY <terms>` (SQLITE_ENABLE_UPDATE_DELETE_LIMIT).
+    pub order_by: Vec<OrderTerm>,
+    /// `UPDATE ... LIMIT <expr>` — applied to the MATCHED rows, after
+    /// WHERE and before the SET rewrite.
+    pub limit: Option<Expr>,
 }
 
 #[derive(Clone, Debug)]

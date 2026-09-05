@@ -99,10 +99,7 @@ fn run(n_readers: usize) -> (Duration, usize) {
     }
     let elapsed = t0.elapsed();
     stop.store(true, Ordering::Release);
-    let total: usize = reader_handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .sum();
+    let total: usize = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
     (elapsed, total)
 }
 

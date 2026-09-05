@@ -408,25 +408,55 @@ impl<'a> Planner<'a> {
         }
 
         let has_windows = self.expr_list_has_windows(&s.columns);
+        let mut collected_windows: Option<Vec<WindowExpr>> = None;
         if has_windows {
             let windows = self.collect_windows(&s.columns, &s.window)?;
             plan = Plan::Window {
                 input: Box::new(plan),
-                windows,
+                windows: windows.clone(),
             };
+            collected_windows = Some(windows);
         }
 
         // Project FIRST, then DISTINCT. SQLite semantics: DISTINCT applies
         // to the projected columns, not the underlying row. If we put
         // Distinct before Project, the full row (including the rowid alias)
         // would be the dedup key, and every row would be unique.
+        //
+        // WINDOW columns: `exec_window` appends one column per window
+        // expression (named `__win_N`) to its output. The projection must
+        // reference those columns instead of re-evaluating the function
+        // call as a plain scalar (unknown function -> NULL). Rewrite every
+        // window call in the projected expressions to a column reference;
+        // the output NAME stays the user alias or the pretty display.
+        let project_columns: Vec<ProjectExpr> = s
+            .columns
+            .iter()
+            .map(|c| self.result_column_to_project(c))
+            .collect::<Result<_>>()?;
+        let project_columns = match &collected_windows {
+            Some(windows) if !windows.is_empty() => project_columns
+                .into_iter()
+                .map(|mut pe| {
+                    pe.expr = rewrite_window_refs(&pe.expr, windows);
+                    if pe.alias.is_none() {
+                        // Bare window column: keep the pretty display name.
+                        if let Expr::Column { name, .. } = &pe.expr {
+                            if let Some(rest) = name.strip_prefix("__win_") {
+                                if let Ok(idx) = rest.parse::<usize>() {
+                                    pe.alias = Some(windows[idx].display_name.clone());
+                                }
+                            }
+                        }
+                    }
+                    pe
+                })
+                .collect(),
+            _ => project_columns,
+        };
         plan = Plan::Project {
             input: Box::new(plan),
-            columns: s
-                .columns
-                .iter()
-                .map(|c| self.result_column_to_project(c))
-                .collect::<Result<_>>()?,
+            columns: project_columns,
         };
 
         if s.distinct {
@@ -614,6 +644,11 @@ impl<'a> Planner<'a> {
                     plan: Box::new(inner),
                 })
             }
+            TableExpression::Function { name, args, alias } => Ok(Plan::TableFunction {
+                name: name.clone(),
+                args: args.clone(),
+                alias: alias.clone(),
+            }),
             TableExpression::Join {
                 left,
                 right,
@@ -800,6 +835,10 @@ pub fn rewrite_aggregates_and_groups(
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
                 // The aggregate's INPUT expression: `None` for star / no-arg
                 // calls (COUNT(*)), otherwise the first argument.
+                // json_group_object(k, v) carries the SAME synthesized
+                // fragment as `collect_aggregates_rec` so the structural
+                // match below succeeds.
+                let synthesized: Option<Expr>;
                 let call_arg: Option<&Expr> = if args.is_empty()
                     || args
                         .first()
@@ -807,6 +846,15 @@ pub fn rewrite_aggregates_and_groups(
                         .unwrap_or(false)
                 {
                     None
+                } else if name.eq_ignore_ascii_case("json_group_object") && args.len() == 2 {
+                    synthesized = Some(Expr::Function {
+                        name: "__json_object_frag".into(),
+                        distinct: false,
+                        args: args.clone(),
+                        over: None,
+                        filter: None,
+                    });
+                    synthesized.as_ref()
                 } else {
                     args.first()
                 };
@@ -1024,9 +1072,101 @@ pub fn expr_has_aggregate(e: &Expr) -> bool {
 }
 
 /// Check if an expression contains a window function call.
+/// Replace every window-function call in `e` whose structural key matches
+/// `windows[i].expr_key` with a column reference to `__win_{i}` (the
+/// column `exec_window` appends). Recurses through all sub-expressions.
+pub(crate) fn rewrite_window_refs(e: &Expr, windows: &[WindowExpr]) -> Expr {
+    let key = format!("{:?}", e);
+    if let Some(i) = windows.iter().position(|w| w.expr_key == key) {
+        return Expr::Column {
+            table: None,
+            name: format!("__win_{i}"),
+        };
+    }
+    // Recurse: rebuild the expression with rewritten children.
+    match e {
+        Expr::Binary { left, right, op } => Expr::Binary {
+            left: Box::new(rewrite_window_refs(left, windows)),
+            right: Box::new(rewrite_window_refs(right, windows)),
+            op: *op,
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+        },
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            over,
+            filter,
+        } => {
+            // The whole call with `over` matched above (or not); rewrite
+            // the ARGUMENTS of non-window calls only.
+            if over.is_some() {
+                e.clone()
+            } else {
+                Expr::Function {
+                    name: name.clone(),
+                    distinct: *distinct,
+                    args: args
+                        .iter()
+                        .map(|a| rewrite_window_refs(a, windows))
+                        .collect(),
+                    over: None,
+                    filter: filter.clone(),
+                }
+            }
+        }
+        Expr::Cast { expr, type_name } => Expr::Cast {
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+            type_name: type_name.clone(),
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+            collation: collation.clone(),
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|b| Box::new(rewrite_window_refs(b, windows))),
+            whens: whens
+                .iter()
+                .map(|(c, v)| {
+                    (
+                        rewrite_window_refs(c, windows),
+                        rewrite_window_refs(v, windows),
+                    )
+                })
+                .collect(),
+            else_: else_
+                .as_ref()
+                .map(|x| Box::new(rewrite_window_refs(x, windows))),
+        },
+        Expr::Row(items) => Expr::Row(
+            items
+                .iter()
+                .map(|x| rewrite_window_refs(x, windows))
+                .collect(),
+        ),
+        _ => e.clone(),
+    }
+}
+
 pub fn expr_has_window(e: &Expr) -> bool {
     match e {
         Expr::Function { over: Some(_), .. } => true,
+        // A window call nested in a scalar function's arguments
+        // (`round(percent_rank() OVER (...), 4)`) still needs the Window
+        // operator — recurse through the arguments (and FILTER).
+        Expr::Function { args, filter, .. } => {
+            args.iter().any(expr_has_window)
+                || filter.as_ref().map(|f| expr_has_window(f)).unwrap_or(false)
+        }
         Expr::Binary { left, right, .. } => expr_has_window(left) || expr_has_window(right),
         Expr::Unary { expr, .. } => expr_has_window(expr),
         Expr::Between {
@@ -1080,7 +1220,9 @@ pub fn is_aggregate_fn(name: &str) -> bool {
 pub fn is_aggregate_call(name: &str, n_args: usize) -> bool {
     let lc = name.to_ascii_lowercase();
     match lc.as_str() {
-        "count" | "sum" | "avg" | "total" | "group_concat" => true,
+        "count" | "sum" | "avg" | "total" | "group_concat" | "string_agg" => true,
+        "json_group_array" => n_args == 1,
+        "json_group_object" => n_args == 2,
         "min" | "max" => n_args <= 1,
         _ => crate::plugin::lookup_aggregate(&lc).is_some(),
     }
@@ -1141,11 +1283,43 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
             // polymorphic min/max distinction is respected: MAX(col) is
             // an aggregate (1 arg), MAX(1, 5, 3) is a scalar call (3 args).
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
+                let fname = name.to_ascii_lowercase();
                 let arg = if args.is_empty()
                     || (args.len() == 1
                         && matches!(&args[0], Expr::Column { name, .. } if name == "*"))
                 {
                     None
+                } else if (fname == "group_concat" || fname == "string_agg") && args.len() == 2 {
+                    // group_concat(x, sep): the separator must be constant
+                    // (SQLite's own constraint in windowed form; the
+                    // non-windowed form evaluates it once per group —
+                    // literal separators cover the practical universe).
+                    let sep = match &args[1] {
+                        Expr::Literal(Value::Text(t)) => Some(t.to_string()),
+                        Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
+                        Expr::Literal(Value::Real(r)) => Some(r.to_string()),
+                        _ => None,
+                    };
+                    out.push(AggExpr {
+                        func: fname,
+                        arg: Some(args[0].clone()),
+                        sep,
+                        distinct: *distinct,
+                        alias: alias.clone(),
+                        display_name: aggregate_display_name(name, *distinct, args),
+                    });
+                    return;
+                } else if fname == "json_group_object" && args.len() == 2 {
+                    // Two-argument aggregate: accumulate the per-row
+                    // `"key":value` fragment (a hidden scalar that the
+                    // accumulator joins with ','); finalize wraps in {}.
+                    Some(Expr::Function {
+                        name: "__json_object_frag".into(),
+                        distinct: false,
+                        args: args.clone(),
+                        over: None,
+                        filter: None,
+                    })
                 } else {
                     // MAX(x) / MIN(x) / SUM(x): the single argument is the
                     // aggregate input; multi-arg calls (e.g. MAX(1,5,3))
@@ -1153,8 +1327,9 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     Some(args[0].clone())
                 };
                 out.push(AggExpr {
-                    func: name.to_ascii_lowercase(),
+                    func: fname,
                     arg,
+                    sep: None,
                     distinct: *distinct,
                     alias: alias.clone(),
                     display_name: aggregate_display_name(name, *distinct, args),
@@ -1256,20 +1431,24 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
                 {
                     None
                 } else {
-                    // MAX(x) / MIN(x) / SUM(x): the single argument is the
-                    // aggregate input; multi-arg calls (e.g. MAX(1,5,3))
-                    // also use the first argument.
                     Some(args[0].clone())
+                };
+                let extra_args: Vec<Expr> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
                 };
                 out.push(WindowExpr {
                     func: name.to_ascii_lowercase(),
                     arg,
+                    extra_args,
                     distinct: *distinct,
                     partition_by,
                     order_by,
                     frame,
                     alias: alias.clone(),
                     display_name: aggregate_display_name(name, *distinct, args),
+                    expr_key: format!("{:?}", e),
                 });
                 return;
             }
@@ -2718,6 +2897,11 @@ fn plan_output_width(plan: &Plan) -> usize {
             let _ = rows;
             columns.len()
         }
+        // Table-valued functions have a fixed output schema per family
+        // (json_each/json_tree: 8 columns; pragma_*: 3-8). A stable upper
+        // bound keeps Join slot-offset math conservative without binding
+        // the executor to this estimate.
+        Plan::TableFunction { .. } => 8,
         Plan::Scan { table, .. } => table.n_columns(),
         Plan::RowidLookup { table, .. } => table.n_columns(),
         Plan::RowidIn { table, .. } => table.n_columns(),
@@ -2952,6 +3136,7 @@ fn collect_scope_rec(
             }
         }
         TableExpression::Subquery { .. } => {}
+        TableExpression::Function { .. } => {}
         TableExpression::Join { left, right, .. } => {
             collect_scope_rec(catalog, left, out);
             collect_scope_rec(catalog, right, out);

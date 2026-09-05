@@ -94,7 +94,7 @@ fn main() {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let item_ids: Vec<i64> = order_ids.iter().flat_map(|o| (*o..*o + 5)).collect();
+    let item_ids: Vec<i64> = order_ids.iter().flat_map(|o| *o..*o + 5).collect();
     let qi = format!(
         "SELECT name, price FROM items WHERE id IN ({})",
         item_ids

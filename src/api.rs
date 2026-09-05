@@ -2757,6 +2757,26 @@ impl Database {
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         profile::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Per-connection snapshot for the SQL function
+        // `last_insert_rowid()` (SQLite: the value is per-connection; the
+        // evaluator reads the TLS, which every statement entry refreshes).
+        crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        // Multi-statement scripts (sqlite3_exec semantics): a `;`-separated
+        // script with NO bound parameters runs each statement through the
+        // full single-statement machinery in order, stopping at the first
+        // error. Parameterized calls keep the single-statement contract
+        // (bindings are per-statement; splitting would rebind them) —
+        // iterator-backed params (as_slice() == None) are conservatively
+        // treated as parameterized.
+        if let Some([]) = params.as_slice() {
+            let parts = crate::sql::parser::split_script(sql);
+            if parts.len() > 1 {
+                for part in &parts {
+                    self.execute(part.as_str(), ())?;
+                }
+                return Ok(());
+            }
+        }
         // A writer must never read the BEGIN-time (committed) state: a
         // leaked read-view preference or pager scope on this thread is
         // cleared here — `execute` takes `&mut`, so exclusive with every
@@ -3098,6 +3118,7 @@ impl Database {
     /// Same as [`Self::set_read_view`], callable without a `Database`
     /// value (the preference is thread-local, not engine-local). The
     /// sqlx driver arms it around its engine calls.
+    #[cfg(feature = "sqlx")]
     pub(crate) fn set_read_view_public(v: ReadView) {
         set_read_view_pref(v);
     }
@@ -3172,6 +3193,8 @@ impl Database {
     /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
     /// the duration of the query — a SELECT never writes them back.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
+        // Per-connection snapshot for `last_insert_rowid()` (see execute).
+        crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
         // A hot INSERT chain owns the table's live root / max-rowid while
         // the shared maps hold stale values — break (flush) it before this
         // read consults the maps.
@@ -3541,7 +3564,10 @@ impl Database {
     }
 
     /// Set the last inserted rowid (internal: called by the statement
-    /// layer's ExecContext write-back).
+    /// layer's ExecContext write-back). Every insert path funnels through
+    /// here, so the thread-local that backs the SQL function
+    /// `last_insert_rowid()` is kept in lockstep — the SQL function and
+    /// the C-API accessor always observe the same value.
     pub(crate) fn set_last_insert_rowid(&self, rowid: i64) {
         if rowid != 0 {
             self.last_rowid.store(rowid, Ordering::Release);
@@ -4719,6 +4745,33 @@ impl Database {
                 (idx, expr.clone())
             })
             .collect();
+        // ORDER BY / LIMIT on the matched rows. With `UPDATE ... FROM`
+        // the WHERE spans both sides and matching happens in the executor,
+        // so a row-level limit cannot be applied on the scan — reject the
+        // combination (rare; SQLite documents the same limitation notes
+        // for UPDATE...FROM interactions).
+        if upd.from.is_some() && (!upd.order_by.is_empty() || upd.limit.is_some()) {
+            return Err(Error::semantic(
+                "ORDER BY / LIMIT not supported with UPDATE ... FROM",
+            ));
+        }
+        let source = if !upd.order_by.is_empty() {
+            crate::planner::plan::Plan::Sort {
+                input: Box::new(source),
+                terms: upd.order_by.clone(),
+            }
+        } else {
+            source
+        };
+        let source = if let Some(l) = &upd.limit {
+            crate::planner::plan::Plan::Limit {
+                input: Box::new(source),
+                count: l.clone(),
+                offset: crate::sql::ast::Expr::Literal(crate::types::Value::Integer(0)),
+            }
+        } else {
+            source
+        };
         Ok(crate::planner::plan::Plan::Update {
             table,
             source: Box::new(source),
@@ -4753,6 +4806,25 @@ impl Database {
         } else {
             scan
         };
+        // ORDER BY / LIMIT apply to the MATCHED rows (after WHERE), not
+        // the raw scan — SQLite's ENABLE_UPDATE_DELETE_LIMIT semantics.
+        let source = if !del.order_by.is_empty() {
+            crate::planner::plan::Plan::Sort {
+                input: Box::new(source),
+                terms: del.order_by.clone(),
+            }
+        } else {
+            source
+        };
+        let source = if let Some(l) = &del.limit {
+            crate::planner::plan::Plan::Limit {
+                input: Box::new(source),
+                count: l.clone(),
+                offset: crate::sql::ast::Expr::Literal(crate::types::Value::Integer(0)),
+            }
+        } else {
+            source
+        };
         Ok(crate::planner::plan::Plan::Delete {
             table,
             source: Box::new(source),
@@ -4770,6 +4842,11 @@ impl Database {
             Statement::Create(c) => Self::execute_create(c.clone(), ctx, catalog, original_sql),
             Statement::Drop(d) => Self::execute_drop(d.clone(), ctx, catalog),
             Statement::Begin(_) => {
+                if ctx.in_transaction {
+                    return Err(Error::semantic(
+                        "cannot start a transaction within a transaction",
+                    ));
+                }
                 // Snapshot the pager's mutable state NOW so ROLLBACK can
                 // restore to this point. We also flip in_transaction so the
                 // executor's INSERT/UPDATE/DELETE skip per-statement flushes
@@ -4831,6 +4908,7 @@ impl Database {
             Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
+            Statement::NoOp => Ok(()),
             Statement::Explain(_) => Ok(()),
             // Savepoint statements are intercepted in execute() (they need
             // &self for the bookkeeping-map snapshots); reaching this arm
@@ -4874,6 +4952,7 @@ impl Database {
                 without_rowid,
                 strict,
                 if_not_exists,
+                as_select,
             } => {
                 // Tables and views share one namespace (see the View arm).
                 if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some()
@@ -4883,11 +4962,101 @@ impl Database {
                     }
                     return Err(Error::AlreadyExists(format!("table: {}", name.name)));
                 }
+                // CREATE TABLE ... AS SELECT: materialize the source query
+                // NOW (the target does not exist yet, so the select sees
+                // the pre-create catalog), derive the column list from the
+                // result set, create the table, and insert the rows.
+                // SQLite semantics: CTAS tables carry no constraints; a
+                // declared column-name list renames the result columns and
+                // must match the select's width.
+                let mut columns = columns;
+                let mut ctas_rows: Vec<crate::types::Row> = Vec::new();
+                if let Some(select) = &as_select {
+                    let res = {
+                        let mut planner = Planner::new(catalog);
+                        let sel_plan = planner.plan_select(select)?;
+                        execute(&sel_plan, ctx)?
+                    };
+                    let width = res.columns.len();
+                    if !columns.is_empty() && columns.len() != width {
+                        return Err(Error::semantic(format!(
+                            "table {} has {} columns but {} values were supplied",
+                            name.name,
+                            columns.len(),
+                            width
+                        )));
+                    }
+                    // Column names: the declared list wins; otherwise the
+                    // select's output names (a star select resolves to the
+                    // source-table column names).
+                    if columns.is_empty() {
+                        columns = res
+                            .columns
+                            .iter()
+                            .map(|n| crate::sql::ast::ColumnDef {
+                                name: n.clone(),
+                                type_name: String::new(),
+                                constraints: Vec::new(),
+                            })
+                            .collect();
+                    }
+                    // Affinity inference from the materialized values.
+                    // SQLite derives CTAS affinity from the select's
+                    // expression affinity; value-kind inference is the
+                    // runtime equivalent and matches for the shapes that
+                    // matter (`SELECT *` keeps the source column kinds,
+                    // all-NULL columns get no affinity).
+                    for (ci, col) in columns.iter_mut().enumerate() {
+                        if !col.type_name.is_empty() {
+                            continue;
+                        }
+                        for r in &res.rows {
+                            match r.get(ci) {
+                                Some(crate::types::Value::Integer(_)) => {
+                                    col.type_name = "INTEGER".into();
+                                }
+                                Some(crate::types::Value::Real(_)) => {
+                                    col.type_name = "REAL".into();
+                                }
+                                Some(crate::types::Value::Text(_)) => {
+                                    col.type_name = "TEXT".into();
+                                }
+                                Some(crate::types::Value::Blob(_)) => {
+                                    col.type_name = "BLOB".into();
+                                }
+                                _ => continue,
+                            }
+                            break;
+                        }
+                    }
+                    ctas_rows = res.rows;
+                }
                 let root_page = ctx.pager.allocate_page()?;
                 {
                     let page = ctx.pager.get_page(root_page)?;
                     page.lock().init_leaf_table();
                 }
+                // CTAS persists a NORMALIZED column-list DDL (SQLite does
+                // the same): reopening re-parses a plain CREATE TABLE
+                // instead of re-running the query, so the derived
+                // columns round-trip.
+                let create_sql: String = if as_select.is_some() {
+                    let mut sql = format!("CREATE TABLE \"{}\"(", name.name);
+                    for (i, col) in columns.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&format!("\"{}\"", col.name.replace('"', "\"\"")));
+                        if !col.type_name.is_empty() {
+                            sql.push(' ');
+                            sql.push_str(&col.type_name);
+                        }
+                    }
+                    sql.push(')');
+                    sql
+                } else {
+                    original_sql.to_string()
+                };
                 let table = build_table(
                     &name.name,
                     &columns,
@@ -4895,7 +5064,7 @@ impl Database {
                     root_page,
                     without_rowid,
                     strict,
-                    original_sql,
+                    &create_sql,
                 )?;
                 let schema_row = crate::schema::encode_schema_row(
                     "table",
@@ -4940,6 +5109,7 @@ impl Database {
                             name: col.name.clone(),
                             order: crate::sql::ast::Order::Asc,
                             collation: collate,
+                            expr: None,
                         }]);
                     }
                 }
@@ -5012,6 +5182,32 @@ impl Database {
                     );
                     insert_schema_row(ctx.pager, &schema_row)?;
                     catalog.add_index(index);
+                }
+                // CTAS: the materialized result rows become INSERT VALUES
+                // literals. Executing through the normal insert path gives
+                // correct rowid assignment, index maintenance, and
+                // transaction semantics for free.
+                if !ctas_rows.is_empty() {
+                    let table_arc = catalog
+                        .get_table(&name.name)
+                        .ok_or_else(|| Error::NotFound(format!("table: {}", name.name)))?;
+                    let values: Vec<Vec<crate::sql::ast::Expr>> = ctas_rows
+                        .iter()
+                        .map(|r| {
+                            r.iter()
+                                .map(|v| crate::sql::ast::Expr::Literal(v.clone()))
+                                .collect()
+                        })
+                        .collect();
+                    let ins_plan = crate::planner::plan::Plan::Insert {
+                        table: table_arc,
+                        source: Box::new(crate::planner::plan::Plan::Values { rows: values }),
+                        columns: None,
+                        on_conflict: crate::sql::ast::ConflictResolution::Abort,
+                        upsert: None,
+                        returning: None,
+                    };
+                    execute(&ins_plan, ctx)?;
                 }
                 ctx.pager.flush()?;
                 Ok(())
@@ -6114,6 +6310,16 @@ impl Database {
                         ctx.pager.set_cache_capacity(pages);
                     }
                 }
+                "user_version" => {
+                    if let Value::Integer(i) = &v {
+                        let _ = ctx.pager.set_user_version(*i as u32);
+                    }
+                }
+                "application_id" => {
+                    if let Value::Integer(i) = &v {
+                        let _ = ctx.pager.set_application_id(*i as u32);
+                    }
+                }
                 "page_size" => {
                     // SQLite semantics: only effective before the database
                     // has content (or after VACUUM, which we don't have).
@@ -6552,8 +6758,8 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         } else {
             "normal".into()
         }),
-        "user_version" => Value::Integer(0),
-        "application_id" => Value::Integer(0),
+        "user_version" => Value::Integer(pager.user_version() as i64),
+        "application_id" => Value::Integer(pager.application_id() as i64),
         "auto_vacuum" => Value::Integer(0),
         "encoding" => Value::Text("UTF-8".into()),
         _ => return None,
@@ -6582,7 +6788,7 @@ fn value_as_expr(v: &crate::sql::ast::PragmaValue) -> &crate::sql::ast::Expr {
 
 /// Minimal Expr → SQL text renderer (enough for DEFAULT / CHECK clauses
 /// replayed through ALTER TABLE ADD COLUMN's schema rewrite).
-fn expr_to_sql(e: &Expr) -> String {
+pub(crate) fn expr_to_sql(e: &Expr) -> String {
     use crate::sql::ast::Expr as E;
     match e {
         E::Literal(v) => match v {
@@ -6889,6 +7095,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     // sqlite_master / sqlite_schema: a queryable view over this very
     // B+tree (page 0). Registered FIRST so nothing shadows it.
     catalog.add_table(crate::schema::sqlite_master_table());
+    catalog.add_table(crate::schema::sqlite_schema_table());
     let mut bt = Btree::new(pager, 0, false);
     let mut entries = Vec::new();
     bt.scan_table(|_rowid, payload| {
@@ -7094,6 +7301,7 @@ fn rebuild_implicit_indexes(
                 name: col.name.clone(),
                 order: crate::sql::ast::Order::Asc,
                 collation: collate,
+                expr: None,
             }]);
         }
     }

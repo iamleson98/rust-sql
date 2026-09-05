@@ -655,17 +655,46 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(Value::Null) | None => Value::Null,
             Some(v) => Value::Text(v.as_text().to_uppercase().into()),
         },
-        "trim" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().trim().to_string().into()),
+        // TRIM(x) / TRIM(x, chars) — strip (chars, default whitespace)
+        // from both ends / left / right. The char set is UTF-8 code points.
+        "trim" => match (args.first(), args.get(1)) {
+            (Some(Value::Null) | None, _) => Value::Null,
+            (Some(v), None) => Value::Text(v.as_text().trim().to_string().into()),
+            (Some(v), Some(cs)) if !cs.is_null() => {
+                let set: Vec<char> = cs.as_text().chars().collect();
+                let s: String = v.as_text().chars().collect();
+                Value::Text(s.trim_matches(|c| set.contains(&c)).to_string().into())
+            }
+            (Some(v), Some(_)) => Value::Text(v.as_text().trim().to_string().into()),
         },
-        "ltrim" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().trim_start().to_string().into()),
+        "ltrim" => match (args.first(), args.get(1)) {
+            (Some(Value::Null) | None, _) => Value::Null,
+            (Some(v), None) => Value::Text(v.as_text().trim_start().to_string().into()),
+            (Some(v), Some(cs)) if !cs.is_null() => {
+                let set: Vec<char> = cs.as_text().chars().collect();
+                let s: String = v.as_text().chars().collect();
+                Value::Text(
+                    s.trim_start_matches(|c| set.contains(&c))
+                        .to_string()
+                        .into(),
+                )
+            }
+            (Some(v), Some(_)) => Value::Text(v.as_text().trim_start().to_string().into()),
         },
-        "rtrim" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().trim_end().to_string().into()),
+        "rtrim" => match (args.first(), args.get(1)) {
+            (Some(Value::Null) | None, _) => Value::Null,
+            (Some(v), None) => Value::Text(v.as_text().trim_end().to_string().into()),
+            (Some(v), Some(cs)) if !cs.is_null() => {
+                let set: Vec<char> = cs.as_text().chars().collect();
+                let s: String = v.as_text().chars().collect();
+                Value::Text(s.trim_end_matches(|c| set.contains(&c)).to_string().into())
+            }
+            (Some(v), Some(_)) => Value::Text(v.as_text().trim_end().to_string().into()),
+        },
+        // LIKELY(x) / UNLIKELY(x) — query-planner no-ops, identity.
+        "likely" | "unlikely" => match args.first() {
+            Some(v) => v.clone(),
+            None => Value::Null,
         },
         "replace" => {
             if args.len() == 3 && args.iter().all(|v| !v.is_null()) {
@@ -779,6 +808,36 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     .collect(),
             )
         }
+        // __JSON_OBJECT_FRAG(k, v) — hidden scalar feeding
+        // json_group_object's accumulator: `"k":v` (JSON-quoted).
+        "__json_object_frag" => {
+            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
+                let k = crate::executor::json::json_quote_value(&args[0]);
+                let v = crate::executor::json::json_quote_value(&args[1]);
+                Value::Text(format!("{k}:{v}").into())
+            } else {
+                Value::Null
+            }
+        }
+        // UNHEX(x) — hex string -> blob; NULL on invalid hex or odd length.
+        "unhex" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let s = v.as_text();
+                if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    Value::Null
+                } else {
+                    let mut out = Vec::with_capacity(s.len() / 2);
+                    let bytes = s.as_bytes();
+                    for pair in bytes.chunks(2) {
+                        let hi = (pair[0] as char).to_digit(16).unwrap_or(0) as u8;
+                        let lo = (pair[1] as char).to_digit(16).unwrap_or(0) as u8;
+                        out.push((hi << 4) | lo);
+                    }
+                    Value::Blob(out)
+                }
+            }
+        },
         "hex" => {
             // BLOB input hexes the RAW bytes (as_text lossy-converts
             // invalid UTF-8, which corrupted 0xff into U+FFFD).
@@ -812,7 +871,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         "current_date" | "current_time" | "current_timestamp" => {
             crate::executor::datetime::call_datetime_function(&fname, args)
         }
-        "last_insert_rowid" => Value::Integer(0), // overridden by executor
+        "last_insert_rowid" => Value::Integer(crate::executor::change_counters::conn_rowid()),
         "changes" => Value::Integer(crate::executor::change_counters::last()),
         "total_changes" => Value::Integer(crate::executor::change_counters::total()),
         "sqlite_version" => Value::Text(SQLITE_COMPAT_VERSION.into()),
@@ -838,7 +897,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         }
         // PRINTF — minimal SQLite printf implementation. Supports %d, %s,
         // %f, %x, %c, %% substitutions. NULL format returns NULL.
-        "printf" => {
+        "printf" | "format" => {
             if args.is_empty() || args[0].is_null() {
                 return Ok(Value::Null);
             }
@@ -851,47 +910,140 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     out.push(c);
                     continue;
                 }
-                // Consume format spec until a conversion char.
-                let mut spec = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next.is_ascii_alphabetic() && "diouxXeEfFgGcs%".contains(next) {
+                // ---- parse: % [flags] [width] [.prec] conv ----
+                let mut minus = false;
+                let mut plus = false;
+                let mut space = false;
+                let mut alt = false;
+                let mut zero = false;
+                loop {
+                    match chars.peek() {
+                        Some('-') => {
+                            minus = true;
+                            chars.next();
+                        }
+                        Some('+') => {
+                            plus = true;
+                            chars.next();
+                        }
+                        Some(' ') => {
+                            space = true;
+                            chars.next();
+                        }
+                        Some('#') => {
+                            alt = true;
+                            chars.next();
+                        }
+                        Some('0') => {
+                            zero = true;
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                let mut width = 0usize;
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        width = width
+                            .saturating_mul(10)
+                            .saturating_add(d as usize - '0' as usize);
                         chars.next();
-                        spec.push(next);
+                    } else {
                         break;
                     }
-                    chars.next();
-                    spec.push(next);
                 }
-                if spec.is_empty() {
+                let mut prec: Option<usize> = None;
+                if chars.peek() == Some(&'.') {
+                    chars.next();
+                    let mut p = 0usize;
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() {
+                            p = p
+                                .saturating_mul(10)
+                                .saturating_add(d as usize - '0' as usize);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    prec = Some(p);
+                }
+                let conv = match chars.next() {
+                    Some(ch) => ch,
+                    None => {
+                        out.push('%');
+                        break;
+                    }
+                };
+                if conv == '%' {
                     out.push('%');
                     continue;
                 }
-                let conv = spec.chars().last().unwrap();
                 let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
                 arg_idx += 1;
-                match conv {
-                    '%' => out.push('%'),
-                    'd' | 'i' => out.push_str(&arg.as_integer().to_string()),
-                    'u' => out.push_str(&(arg.as_integer() as u64).to_string()),
-                    'x' => out.push_str(&format!("{:x}", arg.as_integer() as u64)),
-                    'X' => out.push_str(&format!("{:X}", arg.as_integer() as u64)),
-                    'o' => out.push_str(&format!("{:o}", arg.as_integer() as u64)),
-                    'f' | 'F' => out.push_str(&format!("{:.*}", 6, arg.as_real())),
-                    'e' | 'E' => out.push_str(&format!("{:e}", arg.as_real())),
-                    'g' | 'G' => out.push_str(&format!("{}", arg.as_real())),
-                    's' => out.push_str(&arg.as_text()),
-                    'c' => {
-                        let n = arg.as_integer() as u32;
-                        if let Some(ch) = char::from_u32(n) {
-                            out.push(ch);
+                // Raw conversion (no width yet).
+                let (raw, numeric): (String, bool) = match conv {
+                    'd' | 'i' => {
+                        let i = arg.as_integer();
+                        let mut s = i.abs().to_string();
+                        if i < 0 {
+                            s.insert(0, '-');
+                        } else if plus {
+                            s.insert(0, '+');
+                        } else if space {
+                            s.insert(0, ' ');
                         }
+                        (s, true)
+                    }
+                    'u' => (format!("{}", arg.as_integer() as u64), true),
+                    'x' => (format!("{:x}", arg.as_integer() as u64), true),
+                    'X' => (format!("{:X}", arg.as_integer() as u64), true),
+                    'o' => (format!("{:o}", arg.as_integer() as u64), true),
+                    'f' | 'F' => {
+                        let p = prec.unwrap_or(6);
+                        (format!("{:.*}", p, arg.as_real()), true)
+                    }
+                    'e' => {
+                        let p = prec.unwrap_or(6);
+                        (format!("{:.*e}", p, arg.as_real()), true)
+                    }
+                    'E' => {
+                        let p = prec.unwrap_or(6);
+                        (format!("{:.*e}", p, arg.as_real()).to_uppercase(), true)
+                    }
+                    'g' | 'G' => {
+                        let r = arg.as_real();
+                        let s = match prec {
+                            Some(p) => format!("{:.*}", p, r),
+                            None => format!("{r}"),
+                        };
+                        (s, true)
+                    }
+                    's' => {
+                        let s = arg.as_text();
+                        let s: String = match prec {
+                            Some(p) => s.chars().take(p).collect(),
+                            None => s.to_string(),
+                        };
+                        (s, false)
+                    }
+                    'c' => {
+                        let ch = if let Value::Integer(n) = &arg {
+                            char::from_u32(*n as u32)
+                        } else {
+                            arg.as_text().chars().next()
+                        };
+                        (ch.map(|c| c.to_string()).unwrap_or_default(), false)
                     }
                     _ => {
                         // Unknown conversion: emit verbatim.
                         out.push('%');
-                        out.push_str(&spec);
+                        out.push(conv);
+                        continue;
                     }
-                }
+                };
+                let _ = alt;
+                out.push_str(&apply_printf_width(raw, minus, zero && numeric, width));
             }
             Value::Text(out.into())
         }
@@ -939,14 +1091,106 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 }
             }
         },
-        // POWER(x, y) — x^y.
-        "power" => {
+        // POWER(x, y) / POW(x, y) — x^y.
+        "power" | "pow" => {
             if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
                 Value::Real(args[0].as_real().powf(args[1].as_real()))
             } else {
                 Value::Null
             }
         }
+        // MOD(x, y) — remainder (integer flavor preserved).
+        "mod" => {
+            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
+                let y = args[1].as_real();
+                if y == 0.0 {
+                    Value::Null
+                } else if let (Value::Integer(a), Value::Integer(b)) = (&args[0], &args[1]) {
+                    Value::Integer(a.wrapping_rem(*b))
+                } else {
+                    Value::Real(args[0].as_real() % y)
+                }
+            } else {
+                Value::Null
+            }
+        }
+        // Trigonometry (SQLite's MATH functions extension — always on here).
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+        | "acosh" | "atanh" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let x = v.as_real();
+                let r = match fname.as_str() {
+                    "sin" => x.sin(),
+                    "cos" => x.cos(),
+                    "tan" => x.tan(),
+                    "asin" => x.asin(),
+                    "acos" => x.acos(),
+                    "atan" => x.atan(),
+                    "sinh" => x.sinh(),
+                    "cosh" => x.cosh(),
+                    "tanh" => x.tanh(),
+                    "asinh" => x.asinh(),
+                    "acosh" => x.acosh(),
+                    _ => x.atanh(),
+                };
+                Value::Real(r)
+            }
+        },
+        "atan2" => {
+            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
+                Value::Real(args[0].as_real().atan2(args[1].as_real()))
+            } else {
+                Value::Null
+            }
+        }
+        // DEGREES(x) / RADIANS(x).
+        "degrees" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(v.as_real().to_degrees()),
+        },
+        "radians" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(v.as_real().to_radians()),
+        },
+        // Cotangent / secant / cosecant (SQLite math extension).
+        "cot" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let t = v.as_real().tan();
+                if t == 0.0 {
+                    Value::Null
+                } else {
+                    Value::Real(1.0 / t)
+                }
+            }
+        },
+        "sec" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Real(1.0 / v.as_real().cos()),
+        },
+        "csc" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let s = v.as_real().sin();
+                if s == 0.0 {
+                    Value::Null
+                } else {
+                    Value::Real(1.0 / s)
+                }
+            }
+        },
+        "log2" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let x = v.as_real();
+                if x <= 0.0 {
+                    Value::Null
+                } else {
+                    Value::Real(x.log2())
+                }
+            }
+        },
         // SQRT(x).
         "sqrt" => match args.first() {
             Some(Value::Null) | None => Value::Null,
@@ -1012,18 +1256,6 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Real(x.log10())
             }
         }
-        // LOG2(x) — base-2 log.
-        "log2" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => {
-                let x = v.as_real();
-                if x <= 0.0 {
-                    Value::Null
-                } else {
-                    Value::Real(x.log2())
-                }
-            }
-        },
         // ABS already defined above.
         // ZEROBLOB(n) — n zero bytes.
         "zeroblob" => {
@@ -1727,6 +1959,29 @@ fn glob_match_chars(s: &[char], si: usize, p: &[char], pi: usize) -> bool {
                 false
             }
         }
+    }
+}
+
+/// printf width/padding: left-align with spaces, or zero-pad numerics
+/// (sign before the zeros, C semantics).
+fn apply_printf_width(raw: String, minus: bool, zero: bool, width: usize) -> String {
+    let len = raw.chars().count();
+    if len >= width || width == 0 {
+        return raw;
+    }
+    let pad = " ".repeat(width - len);
+    if minus {
+        format!("{raw}{pad}")
+    } else if zero {
+        // Zero-pad after a leading sign.
+        let (sign, digits) = match raw.strip_prefix('-') {
+            Some(d) => ("-", d.to_string()),
+            None => ("", raw.clone()),
+        };
+        let zeros = "0".repeat(width - len);
+        format!("{sign}{zeros}{digits}")
+    } else {
+        format!("{pad}{raw}")
     }
 }
 

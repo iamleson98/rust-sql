@@ -175,6 +175,15 @@ pub enum Plan {
         rows: std::sync::Arc<Vec<Row>>,
         columns: Arc<[String]>,
     },
+    /// Table-valued function in FROM (`json_each`, `json_tree`,
+    /// `pragma_table_info`, ...). Arguments are evaluated at EXECUTION
+    /// time (bound parameters work); the row set is produced by
+    /// `executor::tableval`.
+    TableFunction {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+    },
     /// Distinct.
     Distinct {
         input: Box<Plan>,
@@ -260,6 +269,8 @@ pub struct UpdateFrom {
 pub struct AggExpr {
     pub func: String,
     pub arg: Option<Expr>,
+    /// Constant separator for the 2-arg group_concat/string_agg form.
+    pub sep: Option<String>,
     pub distinct: bool,
     pub alias: Option<String>,
     /// Original expression text for output column naming.
@@ -270,11 +281,18 @@ pub struct AggExpr {
 #[derive(Clone, Debug)]
 pub struct WindowExpr {
     pub func: String,
+    /// First argument (the aggregate input / lag-lead value / nth value).
     pub arg: Option<Expr>,
+    /// Remaining arguments (lag/lead offset + default, nth_value n).
+    pub extra_args: Vec<Expr>,
     pub distinct: bool,
     pub partition_by: Vec<Expr>,
     pub order_by: Vec<OrderTerm>,
     pub frame: Option<crate::sql::ast::WindowFrame>,
     pub alias: Option<String>,
     pub display_name: String,
+    /// Canonical structural key of the whole function expression (used by
+    /// the projection rewrite to replace the window call with a reference
+    /// to the window column `__win_N` that `exec_window` appends).
+    pub expr_key: String,
 }

@@ -344,6 +344,9 @@ impl<'a> Statement<'a> {
             // while the shared maps hold stale values — break (flush) it
             // before `start()` snapshots the maps for this statement.
             self.db.break_insert_chain();
+            // Per-connection snapshot for `last_insert_rowid()` (see
+            // Database::execute).
+            crate::executor::change_counters::note_conn_rowid(self.db.last_insert_rowid());
             self.start()?;
         }
         // Serve one buffered row.

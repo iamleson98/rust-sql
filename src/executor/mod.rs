@@ -16,6 +16,7 @@ pub(crate) mod explain;
 pub mod expr;
 pub mod json;
 pub(crate) mod predicate;
+pub(crate) mod tableval;
 pub(crate) mod triggers;
 pub(crate) mod vtab_exec;
 
@@ -768,6 +769,7 @@ pub mod change_counters {
     thread_local! {
         static LAST: Cell<i64> = const { Cell::new(0) };
         static TOTAL: Cell<i64> = const { Cell::new(0) };
+        static LAST_ROWID: Cell<i64> = const { Cell::new(0) };
     }
     /// Record a completed statement's change count.
     pub fn record(changes: i64) {
@@ -782,12 +784,27 @@ pub mod change_counters {
     pub fn total() -> i64 {
         TOTAL.with(|t| t.get())
     }
+    /// Rowid of the most recent successful INSERT on the CURRENT
+    /// connection (SQLite's `last_insert_rowid()` is per-connection, so
+    /// the api layer snapshots the connection's atomic into this TLS at
+    /// every statement entry — cross-connection interleaves on one
+    /// thread each observe their own value).
+    pub fn note_conn_rowid(rowid: i64) {
+        LAST_ROWID.with(|r| r.set(rowid));
+    }
+    /// The current connection's most recent insert rowid (0 = none).
+    pub fn conn_rowid() -> i64 {
+        LAST_ROWID.with(|r| r.get())
+    }
 }
 
 pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     match plan {
         Plan::Scan { table, alias, .. } => exec_scan(ctx, table.clone(), alias.clone()),
         Plan::Values { rows } => exec_values(ctx, rows),
+        Plan::TableFunction { name, args, alias } => {
+            tableval::exec_table_function(ctx, name, args, alias.as_ref())
+        }
         Plan::Filter { input, predicate } => exec_filter(ctx, input, predicate),
         Plan::Project { input, columns } => {
             // FUSED PATH: Project over a Hash Join. The join can emit the
@@ -1686,6 +1703,11 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
     fn exprs_in_plan<'a>(p: &'a Plan, out: &mut Vec<&'a Expr>) {
         match p {
             Plan::CteRows { .. } => {}
+            Plan::TableFunction { args, .. } => {
+                for a in args {
+                    out.push(a);
+                }
+            }
             Plan::Scan { predicate, .. } => {
                 if let Some(e) = predicate.as_ref() {
                     out.push(e);
@@ -1861,6 +1883,11 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
 fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) -> Result<()> {
     match plan {
         Plan::CteRows { .. } => {}
+        Plan::TableFunction { args, .. } => {
+            for a in args.iter_mut() {
+                rewrite_expr_in_place(a, ctx)?;
+            }
+        }
         Plan::Scan { predicate, .. } => {
             if let Some(p) = predicate.as_mut() {
                 rewrite_expr_in_place(p, ctx)?;
@@ -2176,6 +2203,11 @@ fn rewrite_table_expression_subqueries(
 ) -> Result<()> {
     match te {
         TableExpression::Table { .. } => {}
+        TableExpression::Function { args, .. } => {
+            for a in args.iter_mut() {
+                rewrite_expr_in_place(a, ctx)?;
+            }
+        }
         TableExpression::Subquery { select, .. } => {
             rewrite_select_subqueries(select, ctx)?;
         }
@@ -2314,6 +2346,7 @@ fn collect_table_expression_sources(
     source_tables: &mut Vec<Arc<Table>>,
 ) {
     match te {
+        TableExpression::Function { .. } => {}
         TableExpression::Table { name, alias, .. } => {
             sources.insert(
                 alias
@@ -2388,6 +2421,11 @@ fn collect_body_refs(body: &SelectBody, out: &mut Vec<(Option<String>, String)>)
 fn collect_table_expression_refs(te: &TableExpression, out: &mut Vec<(Option<String>, String)>) {
     match te {
         TableExpression::Table { .. } => {}
+        TableExpression::Function { args, .. } => {
+            for a in args {
+                collect_expr_refs(a, out);
+            }
+        }
         TableExpression::Subquery { select, .. } => {
             collect_body_refs(&select.body, out);
             for t in &select.order_by {
@@ -4020,6 +4058,9 @@ struct AggState {
     distinct: Option<Box<std::collections::HashSet<SqlValueKey>>>,
     /// GROUP_CONCAT accumulator. Rarely used — boxed (see `distinct`).
     concat: Option<Box<String>>,
+    /// GROUP_CONCAT separator (group_concat(x, sep)). Boxed + optional:
+    /// the hot COUNT/SUM state never pays for it.
+    concat_sep: Option<Box<String>>,
     seen_value: bool,
 }
 
@@ -4083,6 +4124,8 @@ enum AggFunc {
     Min,
     Max,
     GroupConcat,
+    JsonGroupArray,
+    JsonGroupObject,
     Other,
 }
 
@@ -4095,7 +4138,9 @@ impl AggFunc {
             "avg" => AggFunc::Avg,
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
-            "group_concat" => AggFunc::GroupConcat,
+            "group_concat" | "string_agg" => AggFunc::GroupConcat,
+            "json_group_array" => AggFunc::JsonGroupArray,
+            "json_group_object" => AggFunc::JsonGroupObject,
             _ => AggFunc::Other,
         }
     }
@@ -4376,6 +4421,7 @@ impl Default for AggState {
             max: None,
             distinct: None,
             concat: None,
+            concat_sep: None,
             seen_value: false,
         }
     }
@@ -4578,6 +4624,7 @@ fn exec_aggregate_streaming_scan(
                     agg_funcs[i],
                     arg_val,
                     aggregates[i].distinct,
+                    agg_sep_at(aggregates, i),
                 );
             }
             true
@@ -4702,6 +4749,7 @@ fn exec_aggregate_streaming_scan(
                             agg_funcs[i],
                             &COUNT_STAR_ARG,
                             false,
+                            agg_sep_at(aggregates, i),
                         );
                         continue;
                     }
@@ -4710,7 +4758,13 @@ fn exec_aggregate_streaming_scan(
                         (None, Some(c)) => c.eval(&wide, params),
                         (None, None) => Value::Null,
                     };
-                    update_agg_state(grouper.state(gi, i), agg_funcs[i], &arg_val, agg.distinct);
+                    update_agg_state(
+                        grouper.state(gi, i),
+                        agg_funcs[i],
+                        &arg_val,
+                        agg.distinct,
+                        agg_sep_at(aggregates, i),
+                    );
                 }
                 true
             })?;
@@ -4768,7 +4822,13 @@ fn exec_aggregate_streaming_scan(
                     }
                     (None, _) => Value::Integer(1), // COUNT(*)
                 };
-                update_agg_state(grouper.state(gi, i), agg_funcs[i], &arg_val, agg.distinct);
+                update_agg_state(
+                    grouper.state(gi, i),
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                    agg_sep_at(aggregates, i),
+                );
             }
             true
         })?;
@@ -5775,6 +5835,7 @@ fn exec_aggregate_no_group_by(
                         agg_funcs[i],
                         arg_val,
                         aggregates[i].distinct,
+                        agg_sep_at(aggregates, i),
                     );
                 }
                 true
@@ -5912,6 +5973,7 @@ fn exec_aggregate_no_group_by(
                     agg_funcs[i],
                     arg_val,
                     aggregates[i].distinct,
+                    agg_sep_at(aggregates, i),
                 );
             }
             true
@@ -5954,7 +6016,13 @@ fn exec_aggregate_no_group_by(
                 } else {
                     Value::Integer(1)
                 };
-                update_agg_state(&mut states[i], agg_funcs[i], &arg_val, agg.distinct);
+                update_agg_state(
+                    &mut states[i],
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                    agg_sep_at(aggregates, i),
+                );
             }
             true
         })?;
@@ -6470,7 +6538,13 @@ fn exec_aggregate(
                 (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
                 (None, _) => Value::Integer(1),
             };
-            update_agg_state(grouper.state(gi, i), agg_funcs[i], &arg_val, agg.distinct);
+            update_agg_state(
+                grouper.state(gi, i),
+                agg_funcs[i],
+                &arg_val,
+                agg.distinct,
+                agg_sep_at(aggregates, i),
+            );
         }
     }
 
@@ -6669,7 +6743,13 @@ fn exec_plugin_aggregate(
                 (None, _) => Value::Integer(1),
             };
             match &mut grouper.groups[gi].1[i] {
-                Slot::Builtin(st) => update_agg_state(st, agg_funcs[i], &arg_val, agg.distinct),
+                Slot::Builtin(st) => update_agg_state(
+                    st,
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                    agg_sep_at(aggregates, i),
+                ),
                 Slot::Plugin { func, state } => {
                     if !func.arity().accepts(agg.arg.is_some() as usize) {
                         return Err(Error::semantic(format!(
@@ -6738,8 +6818,19 @@ fn exec_plugin_aggregate(
     })
 }
 
+/// Per-aggregate constant separator (group_concat(x, sep)) if any.
 #[inline]
-fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bool) {
+fn agg_sep_at(aggregates: &[AggExpr], i: usize) -> Option<&str> {
+    aggregates.get(i).and_then(|a| a.sep.as_deref())
+}
+
+fn update_agg_state(
+    state: &mut AggState,
+    func: AggFunc,
+    v: &Value,
+    distinct: bool,
+    sep: Option<&str>,
+) {
     // Only compute the distinct key if we're actually doing a DISTINCT
     // aggregate. For non-DISTINCT aggregates, this skips per-row hashing
     // entirely. The key is a `SqlValueKey` (a Value clone — free for
@@ -6814,6 +6905,39 @@ fn update_agg_state(state: &mut AggState, func: AggFunc, v: &Value, distinct: bo
                 .concat
                 .get_or_insert_with(|| Box::new(String::with_capacity(16)));
             if !buf.is_empty() {
+                let sep = state
+                    .concat_sep
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .or_else(|| sep.map(|s| s.to_string()));
+                if let Some(s) = sep {
+                    // Cache for the NEXT row (state is per-group).
+                    state.concat_sep = Some(Box::new(s.clone()));
+                    buf.push_str(&s);
+                } else {
+                    buf.push(',');
+                }
+            }
+            buf.push_str(&v.as_text());
+        }
+        // JSON_GROUP_ARRAY(x): [v1, v2, ...] — JSON-quoted elements.
+        AggFunc::JsonGroupArray if !v.is_null() => {
+            let buf = state
+                .concat
+                .get_or_insert_with(|| Box::new(String::with_capacity(16)));
+            if !buf.is_empty() {
+                buf.push(',');
+            }
+            buf.push_str(crate::executor::json::json_quote_value(v).as_str());
+        }
+        // JSON_GROUP_OBJECT(k, v): the planner feeds the accumulator the
+        // per-row `"key":value` fragment (see __json_object_frag); join
+        // with ',' and let finalize wrap in {}.
+        AggFunc::JsonGroupObject if !v.is_null() => {
+            let buf = state
+                .concat
+                .get_or_insert_with(|| Box::new(String::with_capacity(16)));
+            if !buf.is_empty() {
                 buf.push(',');
             }
             buf.push_str(&v.as_text());
@@ -6849,7 +6973,19 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
         }
         "min" => state.min.as_deref().cloned().unwrap_or(Value::Null),
         "max" => state.max.as_deref().cloned().unwrap_or(Value::Null),
-        "group_concat" => Value::Text(state.concat.as_deref().cloned().unwrap_or_default().into()),
+        "group_concat" | "string_agg" => {
+            Value::Text(state.concat.as_deref().cloned().unwrap_or_default().into())
+        }
+        "json_group_array" => Value::Text(
+            format!("[{}]", state.concat.as_deref().cloned().unwrap_or_default()).into(),
+        ),
+        "json_group_object" => Value::Text(
+            format!(
+                "{{{}}}",
+                state.concat.as_deref().cloned().unwrap_or_default()
+            )
+            .into(),
+        ),
         _ => Value::Null,
     }
 }
@@ -6868,142 +7004,716 @@ fn exec_window(
     let named_params = &ctx.named_params;
     let n_rows = inner.rows.len();
 
-    // For each window, compute values for each row.
+    // One appended column per window expression: `__win_{w_idx}`.
     let mut extra_cols: Vec<Vec<Value>> = vec![Vec::new(); n_rows];
 
     for (w_idx, w) in windows.iter().enumerate() {
-        // Group rows by partition key, preserving original order.
-        let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
-        let mut partition_map: HashMap<String, usize> = HashMap::new();
-        for (i, row) in inner.rows.iter().enumerate() {
-            let key: Vec<Value> = w
-                .partition_by
-                .iter()
-                .map(|e| eval_row(e, row, &inner.columns, params, named_params))
-                .collect::<Result<_>>()?;
-            let key_str = key
-                .iter()
-                .map(|v| format!("{:?}", v))
-                .collect::<Vec<_>>()
-                .join("|");
-            if let Some(&idx) = partition_map.get(&key_str) {
-                partitions[idx].1.push(i);
-            } else {
-                partition_map.insert(key_str, partitions.len());
-                partitions.push((key, vec![i]));
-            }
-        }
-
-        for (_key, indices) in &partitions {
-            let mut sorted_indices = indices.clone();
-            if !w.order_by.is_empty() {
-                sorted_indices.sort_by(|a, b| {
-                    let va = eval_row(
-                        &w.order_by[0].expr,
-                        &inner.rows[*a],
-                        &inner.columns,
-                        params,
-                        named_params,
-                    )
-                    .unwrap_or(Value::Null);
-                    let vb = eval_row(
-                        &w.order_by[0].expr,
-                        &inner.rows[*b],
-                        &inner.columns,
-                        params,
-                        named_params,
-                    )
-                    .unwrap_or(Value::Null);
-                    let ord = va.cmp(&vb);
-                    if w.order_by[0].order == Order::Desc {
-                        ord.reverse()
-                    } else {
-                        ord
-                    }
-                });
-            }
-
-            let mut row_num;
-            let mut rank = 0i64;
-            let mut dense_rank = 0i64;
-            let mut prev_key: Option<Vec<Value>> = None;
-            let mut count_in_rank = 0i64;
-            for (pos_in_partition, &row_idx) in sorted_indices.iter().enumerate() {
-                row_num = (pos_in_partition + 1) as i64;
-                let row = &inner.rows[row_idx];
-                let key: Vec<Value> = w
-                    .order_by
-                    .iter()
-                    .map(|t| eval_row(&t.expr, row, &inner.columns, params, named_params))
-                    .collect::<Result<_>>()?;
-                if prev_key.as_ref() != Some(&key) {
-                    rank += count_in_rank + 1;
-                    count_in_rank = 0;
-                    dense_rank += 1;
-                }
-                count_in_rank += 1;
-                prev_key = Some(key);
-
-                let val = compute_window_value(
-                    w,
-                    row_num,
-                    rank,
-                    dense_rank,
-                    row,
-                    &inner.columns,
-                    params,
-                    named_params,
-                )?;
-                if extra_cols[row_idx].is_empty() {
-                    extra_cols[row_idx] = vec![Value::Null; windows.len()];
-                }
-                extra_cols[row_idx][w_idx] = val;
-            }
-        }
+        exec_one_window(
+            w,
+            w_idx,
+            &inner.rows,
+            &inner.columns,
+            params,
+            named_params,
+            &mut extra_cols,
+        )?;
     }
 
-    // Append window columns to each row.
+    // Append the window columns and name them `__win_N`; the projection
+    // above rewrites each window call to a reference by that name (see
+    // `rewrite_window_refs`), and renames the OUTPUT column to the user
+    // alias / pretty display.
     for (i, row) in inner.rows.iter_mut().enumerate() {
-        if !extra_cols[i].is_empty() {
-            row.append(&mut extra_cols[i]);
+        if windows.is_empty() {
+            break;
         }
+        let mut tail = vec![Value::Null; windows.len()];
+        let src_row = &extra_cols[i];
+        for (t, s) in tail.iter_mut().zip(src_row.iter()) {
+            *t = s.clone();
+        }
+        row.append(&mut tail);
     }
-
-    // Build column names: original + window aliases.
     let mut out_cols: Vec<String> = inner.columns.to_vec();
-    for w in windows {
-        out_cols.push(w.alias.clone().unwrap_or_else(|| w.display_name.clone()));
+    for w_idx in 0..windows.len() {
+        out_cols.push(format!("__win_{w_idx}"));
     }
     inner.columns = out_cols.into();
 
     Ok(inner)
 }
 
-fn compute_window_value(
+/// Evaluate one window expression over the full input row set.
+fn exec_one_window(
     w: &WindowExpr,
-    row_num: i64,
-    rank: i64,
-    dense_rank: i64,
-    row: &Row,
-    column_names: &[String],
+    w_idx: usize,
+    rows: &[Row],
+    columns: &[String],
     params: &[Value],
     named_params: &HashMap<String, Value>,
-) -> Result<Value> {
-    let eval_ctx = EvalContext::new(row, column_names, params, named_params);
-    match w.func.as_str() {
-        "row_number" => Ok(Value::Integer(row_num)),
-        "rank" => Ok(Value::Integer(rank)),
-        "dense_rank" => Ok(Value::Integer(dense_rank)),
-        "percent_rank" | "cume_dist" => Ok(Value::Real(0.0)),
-        "sum" | "avg" | "min" | "max" | "count" => {
-            if let Some(arg) = &w.arg {
-                evaluate(arg, &eval_ctx)
-            } else {
-                Ok(Value::Integer(row_num))
+    extra_cols: &mut [Vec<Value>],
+) -> Result<()> {
+    // (Rows are pre-sized by exec_window: every row gets `windows.len()`
+    // NULL columns before any window computes.)
+    // ---- 1. Partition (first-appearance buckets, input order) ----
+    let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    let mut partition_map: HashMap<String, usize> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let key: Vec<Value> = w
+            .partition_by
+            .iter()
+            .map(|e| eval_row(e, row, columns, params, named_params))
+            .collect::<Result<_>>()?;
+        let key_str = key
+            .iter()
+            .map(|v| format!("{:?}", v))
+            .collect::<Vec<_>>()
+            .join("|");
+        if let Some(&idx) = partition_map.get(&key_str) {
+            partitions[idx].1.push(i);
+        } else {
+            partition_map.insert(key_str, partitions.len());
+            partitions.push((key, vec![i]));
+        }
+    }
+
+    let is_offset_func = matches!(
+        w.func.as_str(),
+        "lag"
+            | "lead"
+            | "ntile"
+            | "row_number"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+    );
+
+    for (_key, indices) in &partitions {
+        let np = indices.len();
+        // ---- 2. Sort the partition by ORDER BY (multi-key, per-term
+        //         direction, SQLite value ordering; NULLs smallest). ----
+        let mut sorted: Vec<usize> = indices.clone();
+        if !w.order_by.is_empty() {
+            // Pre-evaluate every order key for every row in this partition.
+            let mut key_cache: HashMap<usize, Vec<Value>> = HashMap::with_capacity(np);
+            for &ri in indices {
+                let vals: Vec<Value> = w
+                    .order_by
+                    .iter()
+                    .map(|t| eval_row(&t.expr, &rows[ri], columns, params, named_params))
+                    .collect::<Result<_>>()?;
+                key_cache.insert(ri, vals);
+            }
+            sorted.sort_by(|&a, &b| {
+                let ka = &key_cache[&a];
+                let kb = &key_cache[&b];
+                for (i, t) in w.order_by.iter().enumerate() {
+                    let mut ord = ka[i].cmp(&kb[i]);
+                    if t.order == Order::Desc {
+                        ord = ord.reverse();
+                    }
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // ---- 3. Pre-evaluate the aggregate/offset argument per row. ----
+        let arg_vals: Vec<Option<Value>> = if w.arg.is_some() || is_offset_func {
+            let mut v = Vec::with_capacity(np);
+            for &ri in sorted.iter() {
+                if let Some(arg) = &w.arg {
+                    v.push(Some(eval_row(
+                        arg,
+                        &rows[ri],
+                        columns,
+                        params,
+                        named_params,
+                    )?));
+                } else {
+                    v.push(None);
+                }
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
+        // ---- 4. Peer groups over the ORDER BY keys. ----
+        // peer_start[p] / peer_end[p] (exclusive) in SORTED position space.
+        let order_key = |p: usize| -> Vec<Value> {
+            if w.order_by.is_empty() {
+                return Vec::new();
+            }
+            let ri = sorted[p];
+            w.order_by
+                .iter()
+                .map(|t| eval_row(&t.expr, &rows[ri], columns, params, named_params))
+                .collect::<Result<_>>()
+                .unwrap_or_default()
+        };
+        // Evaluate keys once per sorted position.
+        let mut keys: Vec<Vec<Value>> = Vec::with_capacity(np);
+        if !w.order_by.is_empty() {
+            for p in 0..np {
+                keys.push(order_key(p));
             }
         }
-        "lag" | "lead" | "first_value" | "last_value" | "nth_value" => Ok(Value::Null),
+        let mut peer_start: Vec<usize> = vec![0; np];
+        let mut peer_end: Vec<usize> = vec![np; np];
+        if !w.order_by.is_empty() {
+            let mut s = 0usize;
+            while s < np {
+                let mut e = s + 1;
+                while e < np && keys[e] == keys[s] {
+                    e += 1;
+                }
+                for p in s..e {
+                    peer_start[p] = s;
+                    peer_end[p] = e;
+                }
+                s = e;
+            }
+        }
+
+        // ---- 5. Frame bounds per sorted position (inclusive index range
+        //         in sorted-partition space), with EXCLUDE applied. ----
+        for p in 0..np {
+            let val = compute_window_at(
+                w,
+                p,
+                np,
+                &sorted,
+                &arg_vals,
+                &keys,
+                (peer_start[p], peer_end[p]),
+            )?;
+            let ri = sorted[p];
+            if extra_cols[ri].len() < w_idx + 1 {
+                extra_cols[ri].resize(w_idx + 1, Value::Null);
+            }
+            extra_cols[ri][w_idx] = val;
+        }
+    }
+    Ok(())
+}
+
+/// Compute the frame [fs, fe] (inclusive, sorted positions) for row `p`.
+fn resolve_frame(
+    w: &WindowExpr,
+    p: usize,
+    np: usize,
+    keys: &[Vec<Value>],
+    peer: (usize, usize),
+) -> (usize, usize) {
+    let empty_frame = (p + 1, p); // fs > fe => empty
+    let frame = match &w.frame {
+        None => {
+            // Default: ORDER BY present -> RANGE UNBOUNDED PRECEDING ..
+            // CURRENT ROW (peers included); absent -> whole partition.
+            if w.order_by.is_empty() {
+                (0, np.saturating_sub(1))
+            } else {
+                (0, peer.1.saturating_sub(1))
+            }
+        }
+        Some(f) => {
+            let kind = f.kind;
+            let start = match f.start.as_ref() {
+                FrameBound::UnboundedPreceding => 0usize,
+                FrameBound::CurrentRow => match kind {
+                    FrameKind::Rows => p,
+                    _ => peer.0, // RANGE / GROUPS: CURRENT ROW start = first peer
+                },
+                FrameBound::Preceding(e) => match kind {
+                    FrameKind::Rows => p.saturating_sub(eval_frame_offset(e)),
+                    FrameKind::Groups => groups_back(p, keys, eval_frame_offset(e)),
+                    FrameKind::Range => {
+                        // RANGE <k> PRECEDING (single numeric key only).
+                        range_preceding_start(w, keys, p, e, peer)
+                    }
+                },
+                FrameBound::Following(e) => match kind {
+                    FrameKind::Rows => (p + eval_frame_offset(e)).min(np.saturating_sub(1)),
+                    FrameKind::Groups => groups_fwd(p, keys, eval_frame_offset(e), np),
+                    FrameKind::Range => range_following_start(w, keys, p, e, np, peer),
+                },
+                FrameBound::UnboundedFollowing => 0, // invalid as start; clamp
+            };
+            let end = match f.end.as_ref() {
+                None => match kind {
+                    FrameKind::Rows => p,
+                    _ => peer.1.saturating_sub(1), // default end = CURRENT ROW
+                },
+                Some(b) => match b.as_ref() {
+                    FrameBound::UnboundedPreceding => 0,
+                    FrameBound::Preceding(e) => match kind {
+                        FrameKind::Rows => p.saturating_sub(eval_frame_offset(e)),
+                        FrameKind::Groups => groups_back(p, keys, eval_frame_offset(e)),
+                        FrameKind::Range => {
+                            let s = range_preceding_start(w, keys, p, e, peer);
+                            s.min(np.saturating_sub(1))
+                        }
+                    },
+                    FrameBound::CurrentRow => match kind {
+                        FrameKind::Rows => p,
+                        _ => peer.1.saturating_sub(1),
+                    },
+                    FrameBound::Following(e) => match kind {
+                        FrameKind::Rows => (p + eval_frame_offset(e)).min(np.saturating_sub(1)),
+                        FrameKind::Groups => groups_fwd(p, keys, eval_frame_offset(e), np),
+                        FrameKind::Range => {
+                            range_following_end(w, keys, p, e, np, peer).min(np.saturating_sub(1))
+                        }
+                    },
+                    FrameBound::UnboundedFollowing => np.saturating_sub(1),
+                },
+            };
+            (start.min(end), end)
+        }
+    };
+    let _ = empty_frame;
+    frame
+}
+
+/// Evaluate a frame offset expression to a row/offset count.
+fn eval_frame_offset(e: &Expr) -> usize {
+    // Constant expressions only (SQLite requires constants); fall back to 0.
+    if let Expr::Literal(Value::Integer(i)) = e {
+        (*i).max(0) as usize
+    } else if let Expr::Literal(Value::Real(r)) = e {
+        r.floor().max(0.0) as usize
+    } else if let Expr::Unary { op, expr } = e {
+        if matches!(op, crate::sql::ast::UnaryOp::Neg) {
+            let _ = expr;
+            0
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+/// GROUPS <k> PRECEDING: first row of the peer group k groups before the
+/// row's group.
+fn groups_back(p: usize, keys: &[Vec<Value>], k: usize) -> usize {
+    if keys.is_empty() || k == 0 {
+        return p;
+    }
+    // Walk back over k group boundaries.
+    let mut group_starts: Vec<usize> = Vec::new();
+    let mut prev: Option<&Vec<Value>> = None;
+    for (i, key) in keys.iter().enumerate() {
+        if prev.map(|pv| pv != key).unwrap_or(true) {
+            group_starts.push(i);
+        }
+        prev = Some(key);
+    }
+    let my_group = group_starts.partition_point(|&g| g <= p) - 1;
+    let target = my_group.saturating_sub(k);
+    group_starts.get(target).copied().unwrap_or(0)
+}
+
+/// GROUPS <k> FOLLOWING: first row of the peer group k groups after the
+/// row's group.
+fn groups_fwd(p: usize, keys: &[Vec<Value>], k: usize, np: usize) -> usize {
+    if keys.is_empty() || k == 0 {
+        return p;
+    }
+    let mut group_starts: Vec<usize> = Vec::new();
+    let mut prev: Option<&Vec<Value>> = None;
+    for (i, key) in keys.iter().enumerate() {
+        if prev.map(|pv| pv != key).unwrap_or(true) {
+            group_starts.push(i);
+        }
+        prev = Some(key);
+    }
+    let my_group = group_starts.partition_point(|&g| g <= p) - 1;
+    let target = my_group + k;
+    group_starts
+        .get(target)
+        .copied()
+        .unwrap_or(np.saturating_sub(1))
+}
+
+/// RANGE <k> PRECEDING start: first row whose key is within k of the
+/// current key (single numeric order key; ASC/DESC aware).
+fn range_preceding_start(
+    w: &WindowExpr,
+    keys: &[Vec<Value>],
+    p: usize,
+    e: &Expr,
+    peer: (usize, usize),
+) -> usize {
+    if w.order_by.len() != 1 {
+        return peer.0; // not a single key: peers (SQLite errors; be lenient)
+    }
+    let k = eval_frame_offset(e);
+    let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
+        Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
+        Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
+        _ => return peer.0,
+    };
+    let limit = if desc { num + k as f64 } else { num - k as f64 };
+    // First position with key within the limit.
+    let mut s = 0usize;
+    while s < p {
+        let within = match keys[s].first() {
+            Some(Value::Integer(i)) => {
+                let v = *i as f64;
+                if desc {
+                    v <= limit
+                } else {
+                    v >= limit
+                }
+            }
+            Some(Value::Real(r)) => {
+                let v = *r;
+                if desc {
+                    v <= limit
+                } else {
+                    v >= limit
+                }
+            }
+            _ => false,
+        };
+        if within {
+            break;
+        }
+        s += 1;
+    }
+    s
+}
+
+/// RANGE <k> FOLLOWING start.
+fn range_following_start(
+    w: &WindowExpr,
+    keys: &[Vec<Value>],
+    p: usize,
+    e: &Expr,
+    np: usize,
+    peer: (usize, usize),
+) -> usize {
+    if w.order_by.len() != 1 {
+        return peer.1.saturating_sub(1);
+    }
+    let k = eval_frame_offset(e);
+    let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
+        Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
+        Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
+        _ => return peer.1.saturating_sub(1),
+    };
+    let limit = if desc { num - k as f64 } else { num + k as f64 };
+    let mut s = p;
+    while s < np {
+        let within = match keys[s].first() {
+            Some(Value::Integer(i)) => {
+                let v = *i as f64;
+                if desc {
+                    v >= limit
+                } else {
+                    v <= limit
+                }
+            }
+            Some(Value::Real(r)) => {
+                let v = *r;
+                if desc {
+                    v >= limit
+                } else {
+                    v <= limit
+                }
+            }
+            _ => false,
+        };
+        if within {
+            break;
+        }
+        s += 1;
+    }
+    s
+}
+
+/// RANGE <k> FOLLOWING end (last position within limit).
+fn range_following_end(
+    w: &WindowExpr,
+    keys: &[Vec<Value>],
+    p: usize,
+    e: &Expr,
+    np: usize,
+    peer: (usize, usize),
+) -> usize {
+    if w.order_by.len() != 1 {
+        return peer.1.saturating_sub(1);
+    }
+    let k = eval_frame_offset(e);
+    let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
+        Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
+        Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
+        _ => return peer.1.saturating_sub(1),
+    };
+    let limit = if desc { num - k as f64 } else { num + k as f64 };
+    let mut e2 = np.saturating_sub(1);
+    loop {
+        let within = match keys.get(e2).and_then(|kk| kk.first()) {
+            Some(Value::Integer(i)) => {
+                let v = *i as f64;
+                if desc {
+                    v >= limit
+                } else {
+                    v <= limit
+                }
+            }
+            Some(Value::Real(r)) => {
+                let v = *r;
+                if desc {
+                    v >= limit
+                } else {
+                    v <= limit
+                }
+            }
+            _ => false,
+        };
+        if within || e2 == 0 {
+            break;
+        }
+        e2 -= 1;
+    }
+    e2
+}
+
+/// Compute the window value for one row at sorted position `p`.
+#[allow(clippy::too_many_arguments)]
+fn compute_window_at(
+    w: &WindowExpr,
+    p: usize,
+    np: usize,
+    _sorted: &[usize],
+    arg_vals: &[Option<Value>],
+    keys: &[Vec<Value>],
+    peer: (usize, usize),
+) -> Result<Value> {
+    let val_of = |pos: usize| -> Value {
+        arg_vals
+            .get(pos)
+            .and_then(|v| v.clone())
+            .unwrap_or(Value::Null)
+    };
+    match w.func.as_str() {
+        "row_number" => Ok(Value::Integer(p as i64 + 1)),
+        "rank" => Ok(Value::Integer(peer.0 as i64 + 1)),
+        "dense_rank" => {
+            // Count distinct peer groups up to and including this row's.
+            let mut dn = 0i64;
+            let mut prev: Option<&Vec<Value>> = None;
+            for (_, key) in keys.iter().enumerate().take(p + 1) {
+                if prev.map(|pv| pv != key).unwrap_or(true) {
+                    dn += 1;
+                }
+                prev = Some(key);
+            }
+            Ok(Value::Integer(dn))
+        }
+        "percent_rank" => {
+            if np <= 1 {
+                Ok(Value::Real(0.0))
+            } else {
+                Ok(Value::Real(peer.0 as f64 / (np - 1) as f64))
+            }
+        }
+        "cume_dist" => Ok(Value::Real(peer.1 as f64 / np as f64)),
+        "ntile" => {
+            // arg = bucket count (constant).
+            let k = match w.extra_args.first() {
+                Some(Expr::Literal(Value::Integer(i))) => *i,
+                _ => match arg_vals.first() {
+                    Some(Some(Value::Integer(i))) => *i,
+                    _ => return Ok(Value::Null),
+                },
+            };
+            if k < 1 {
+                return Ok(Value::Null);
+            }
+            let k = k as usize;
+            let base = np / k;
+            let rem = np % k;
+            // first `rem` buckets have base+1 rows.
+            let mut bucket = 0usize;
+            let mut acc = 0usize;
+            for b in 0..k {
+                let size = base + if b < rem { 1 } else { 0 };
+                if p < acc + size {
+                    bucket = b;
+                    break;
+                }
+                acc += size;
+            }
+            Ok(Value::Integer(bucket as i64 + 1))
+        }
+        "lag" | "lead" => {
+            let off = match w.extra_args.first() {
+                Some(Expr::Literal(Value::Integer(i))) => *i,
+                _ => 1,
+            };
+            let off = if off < 0 { 0 } else { off as usize };
+            let target = if w.func == "lag" {
+                p.checked_sub(off)
+            } else {
+                Some(p + off).filter(|&t| t < np)
+            };
+            match target {
+                Some(t) => Ok(val_of(t)),
+                None => match w.extra_args.get(1) {
+                    // Constant default (SQLite: must be constant).
+                    Some(Expr::Literal(lit)) => Ok(lit.clone()),
+                    _ => Ok(Value::Null),
+                },
+            }
+        }
+        "first_value" | "last_value" | "nth_value" => {
+            let (fs, fe) = resolve_frame(w, p, np, keys, peer);
+            if fs > fe {
+                return Ok(Value::Null);
+            }
+            match w.func.as_str() {
+                "first_value" => Ok(val_of(fs)),
+                "last_value" => Ok(val_of(fe)),
+                _ => {
+                    let n = match w.extra_args.first() {
+                        Some(Expr::Literal(Value::Integer(i))) => *i,
+                        _ => return Ok(Value::Null),
+                    };
+                    if n < 1 {
+                        return Ok(Value::Null);
+                    }
+                    let pos = fs + (n as usize) - 1;
+                    if pos > fe {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(val_of(pos))
+                    }
+                }
+            }
+        }
+        // Aggregates over the frame.
+        "sum" | "total" | "avg" | "count" | "min" | "max" | "group_concat" | "string_agg" => {
+            let (fs, fe) = resolve_frame(w, p, np, keys, peer);
+            // EXCLUDE handling (subset of SQLite).
+            let in_frame = |pos: usize| -> bool {
+                if fs > fe {
+                    return false;
+                }
+                let inside = pos >= fs && pos <= fe;
+                if !inside {
+                    return false;
+                }
+                match w.frame.as_ref().map(|f| f.exclude) {
+                    Some(FrameExclude::CurrentRow) => pos != p,
+                    Some(FrameExclude::Group) => pos < peer.0 || pos >= peer.1,
+                    Some(FrameExclude::Ties) => pos == p,
+                    _ => true,
+                }
+            };
+            let mut sum = 0.0f64;
+            let mut isum = 0i64;
+            let mut int_exact = true;
+            let mut count = 0i64;
+            let mut total_count = 0i64;
+            let mut min: Option<Value> = None;
+            let mut max: Option<Value> = None;
+            let mut parts: Vec<String> = Vec::new();
+            for pos in fs..=fe.max(fs) {
+                if !in_frame(pos) {
+                    continue;
+                }
+                total_count += 1;
+                let v = val_of(pos);
+                if !matches!(v, Value::Null) {
+                    count += 1;
+                    match &v {
+                        Value::Integer(i) => {
+                            isum += i;
+                            sum += *i as f64;
+                        }
+                        Value::Real(r) => {
+                            int_exact = false;
+                            sum += r;
+                        }
+                        other => {
+                            int_exact = false;
+                            sum += value_as_f64(other);
+                        }
+                    }
+                    match &min {
+                        None => min = Some(v.clone()),
+                        Some(m) => {
+                            if v < *m {
+                                min = Some(v.clone())
+                            }
+                        }
+                    }
+                    match &max {
+                        None => max = Some(v.clone()),
+                        Some(m) => {
+                            if v > *m {
+                                max = Some(v.clone())
+                            }
+                        }
+                    }
+                    parts.push(match &v {
+                        Value::Text(t) => t.to_string(),
+                        other => format!("{other:?}"),
+                    });
+                }
+            }
+            match w.func.as_str() {
+                "count" => Ok(Value::Integer(if w.arg.is_none() {
+                    total_count
+                } else {
+                    count
+                })),
+                "sum" => {
+                    if count == 0 {
+                        Ok(Value::Null)
+                    } else if int_exact {
+                        Ok(Value::Integer(isum))
+                    } else {
+                        Ok(Value::Real(sum))
+                    }
+                }
+                "total" => Ok(Value::Real(sum)),
+                "avg" => {
+                    if count == 0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Real(sum / count as f64))
+                    }
+                }
+                "min" => Ok(min.unwrap_or(Value::Null)),
+                "max" => Ok(max.unwrap_or(Value::Null)),
+                _ => {
+                    // group_concat / string_agg over the frame.
+                    if parts.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Text(parts.join(",").into()))
+                    }
+                }
+            }
+        }
         _ => Ok(Value::Null),
+    }
+}
+
+fn value_as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Integer(i) => *i as f64,
+        Value::Real(r) => *r,
+        Value::Text(t) => t.to_string().parse().unwrap_or(0.0),
+        _ => 0.0,
     }
 }
 
@@ -9295,9 +10005,16 @@ fn exec_index_range(
 pub(crate) struct IndexMaintState {
     pub idx: Arc<crate::schema::Index>,
     pub root: u32,
-    /// Resolved column positions (`usize::MAX` = column dropped/renamed;
-    /// contributes nothing to the key, mirroring `encode_index_key`).
+    /// Resolved column positions (`usize::MAX` = expression index key or
+    /// a dropped/renamed column; expression keys evaluate per row via
+    /// `col_names`, dropped columns contribute a NULL component — both
+    /// byte-identical to what `encode_index_key` produced at CREATE
+    /// INDEX backfill time).
     pub cols: Vec<usize>,
+    /// Table column names, set ONLY when this index has an expression
+    /// key column (the per-row `eval_row` needs them); plain-column
+    /// indexes pay nothing.
+    pub col_names: Option<std::sync::Arc<[String]>>,
     /// Pinned right-most index leaf from the previous append in this
     /// statement (see `insert_index_append_hinted`).
     pub hint: Option<PageId>,
@@ -9315,17 +10032,37 @@ impl IndexMaintState {
     pub fn encode_key(&mut self, row: &[Value]) -> &[u8] {
         self.key_buf.clear();
         for (i, &pos) in self.cols.iter().enumerate() {
-            if let Some(v) = row.get(pos) {
-                if let Some(ic) = self.idx.columns.get(i) {
-                    if ic.collation.eq_ignore_ascii_case("BINARY") {
-                        v.encode_order_key_into(&mut self.key_buf);
-                    } else {
-                        crate::plugin::collation_fold_key(&ic.collation, v)
-                            .encode_order_key_into(&mut self.key_buf);
+            let ic = match self.idx.columns.get(i) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Expression index key (SQLite 3.9+): evaluate per row. MUST
+            // stay byte-identical to `encode_index_key` — CREATE INDEX
+            // backfilled the existing rows with that encoder, and probe
+            // keys that disagree produce phantom conflicts (an empty or
+            // divergent key prefix-matches the wrong cells).
+            let expr_value;
+            let v: &Value = if pos == usize::MAX {
+                match (&ic.expr, &self.col_names) {
+                    (Some(e), Some(names)) => {
+                        let named: HashMap<String, Value> = HashMap::new();
+                        expr_value = eval_row(e, row, names, &[], &named).unwrap_or(Value::Null);
+                        &expr_value
                     }
-                } else {
-                    v.encode_order_key_into(&mut self.key_buf);
+                    // Dropped/renamed column (no expression): a NULL key
+                    // component, exactly like `encode_index_key`.
+                    _ => &Value::Null,
                 }
+            } else if let Some(v) = row.get(pos) {
+                v
+            } else {
+                &Value::Null
+            };
+            if ic.collation.eq_ignore_ascii_case("BINARY") {
+                v.encode_order_key_into(&mut self.key_buf);
+            } else {
+                crate::plugin::collation_fold_key(&ic.collation, v)
+                    .encode_order_key_into(&mut self.key_buf);
             }
         }
         &self.key_buf
@@ -9367,10 +10104,18 @@ pub(crate) fn make_index_states(
                 .iter()
                 .map(|c| table.find_column(&c.name).unwrap_or(usize::MAX))
                 .collect();
+            // Expression-key indexes evaluate their keys per row and need
+            // the table's column names for name resolution.
+            let col_names = idx
+                .columns
+                .iter()
+                .any(|c| c.expr.is_some())
+                .then(|| table.col_names.clone());
             IndexMaintState {
                 idx: idx.clone(),
                 root: ctx.index_root(idx),
                 cols,
+                col_names,
                 hint: None,
                 key_buf: Vec::with_capacity(16),
             }
@@ -10162,6 +10907,55 @@ pub fn fast_insert_single_row(
     }
 }
 
+/// STRICT-table type check (SQLite 3.37+ semantics, executed at every
+/// write site). NULL always passes; INT/INTEGER accepts only integers,
+/// TEXT only text, BLOB only blobs, ANY anything; a REAL column accepts
+/// integers and floats, converting integers to REAL on store (observed:
+/// `INSERT INTO t(a REAL) VALUES (5)` yields typeof='real'). Values of
+/// the wrong kind error with SQLite's exact message shape.
+pub(crate) fn validate_strict_row(table: &Table, row: &mut [Value]) -> Result<()> {
+    if !table.strict {
+        return Ok(());
+    }
+    for (i, col) in table.columns.iter().enumerate() {
+        if col.generated.is_some() {
+            continue;
+        }
+        let declared = col.declared_type.trim().to_ascii_uppercase();
+        let v = match row.get_mut(i) {
+            Some(v) => v,
+            None => continue,
+        };
+        let kind = match v {
+            Value::Null => "NULL",
+            Value::Integer(_) => "INTEGER",
+            Value::Real(_) => "REAL",
+            Value::Text(_) => "TEXT",
+            Value::Blob(_) => "BLOB",
+        };
+        let allowed = match v {
+            Value::Null => true,
+            Value::Integer(_) => matches!(declared.as_str(), "INT" | "INTEGER" | "REAL" | "ANY"),
+            Value::Real(_) => matches!(declared.as_str(), "REAL" | "ANY"),
+            Value::Text(_) => matches!(declared.as_str(), "TEXT" | "ANY"),
+            Value::Blob(_) => matches!(declared.as_str(), "BLOB" | "ANY"),
+        };
+        if !allowed {
+            return Err(Error::semantic(format!(
+                "cannot store {} value in {} column {}.{} (type mismatch)",
+                kind, declared, table.name, col.name
+            )));
+        }
+        // REAL column storing an integer: convert (SQLite stores 5 as 5.0).
+        if declared == "REAL" {
+            if let Value::Integer(x) = *v {
+                *v = Value::Real(x as f64);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn exec_insert_one_row(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -10185,6 +10979,7 @@ fn exec_insert_one_row(
     //
     // The rowid may have been pre-assigned by the caller (for constraint
     // enforcement); `rowid_autogen_hint` says whether that happened.
+    validate_strict_row(table, full_row)?;
     let rowid_was_autogenerated;
     // An EXPLICIT rowid beyond `max_rowid` cannot collide with any
     // existing row (rowids are a subset of integers up to max_rowid),
@@ -10307,13 +11102,10 @@ fn exec_insert_one_row(
         }
         // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
         // with ANY NULL among the indexed columns is exempt from the
-        // uniqueness check, so multiple NULL rows coexist.
-        if st.idx.columns.iter().any(|c| {
-            table
-                .find_column(&c.name)
-                .map(|p| full_row.get(p).map(|v| v.is_null()).unwrap_or(false))
-                .unwrap_or(false)
-        }) {
+        // uniqueness check, so multiple NULL rows coexist. Expression
+        // keys count too: a row whose expression evaluates to NULL is
+        // exempt (`index_key_has_null` evaluates them).
+        if index_key_has_null(&st.idx, table, full_row) {
             continue;
         }
         // Any REPLACE/UPSERT path below mutates the index trees, so the
@@ -10734,14 +11526,19 @@ pub(crate) fn encode_index_key(
 ) -> Vec<u8> {
     let mut key_bytes = Vec::new();
     for col in &index.columns {
-        if let Some(pos) = table.find_column(&col.name) {
-            if let Some(v) = row.get(pos) {
-                // Collated index: fold TEXT keys through the column's
-                // collation so probe keys and stored keys agree.
-                crate::plugin::collation_fold_key(&col.collation, v)
-                    .encode_order_key_into(&mut key_bytes);
-            }
-        }
+        // Expression index key: evaluate per row (SQLite 3.9+). The
+        // expression references columns by bare name; no params.
+        let v = if let Some(e) = &col.expr {
+            let named: HashMap<String, Value> = HashMap::new();
+            eval_row(e, row, &table.col_names, &[], &named).unwrap_or(Value::Null)
+        } else if let Some(pos) = table.find_column(&col.name) {
+            row.get(pos).cloned().unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        // Collated index: fold TEXT keys through the column's
+        // collation so probe keys and stored keys agree.
+        crate::plugin::collation_fold_key(&col.collation, &v).encode_order_key_into(&mut key_bytes);
     }
     key_bytes
 }
@@ -10764,6 +11561,12 @@ pub(crate) struct UpdateConflictPlan {
 /// True when any indexed column of `row` is NULL (UNIQUE-exempt).
 fn index_key_has_null(index: &crate::schema::Index, table: &Table, row: &[Value]) -> bool {
     index.columns.iter().any(|c| {
+        if let Some(e) = &c.expr {
+            let named: HashMap<String, Value> = HashMap::new();
+            return eval_row(e, row, &table.col_names, &[], &named)
+                .map(|v| v.is_null())
+                .unwrap_or(true);
+        }
         table
             .find_column(&c.name)
             .map(|p| row.get(p).map(|v| v.is_null()).unwrap_or(false))
@@ -11272,6 +12075,9 @@ fn exec_update(
                 return Err(Error::constraint("datatype mismatch"));
             }
         }
+        // STRICT tables: reject type-mismatched SET values (and fold
+        // integers into REAL columns) before any constraint machinery.
+        validate_strict_row(&table, &mut new_row)?;
         // NOT NULL + CHECK constraints on the updated row.
         enforce_row_constraints(&table, &new_row, &col_names, &ctx.params, &ctx.named_params)?;
         // Child-side FK: the new values must reference existing parents.
@@ -11497,6 +12303,7 @@ fn exec_update_from(
                 return Err(Error::constraint("datatype mismatch"));
             }
         }
+        validate_strict_row(table, &mut new_row)?;
         enforce_row_constraints(table, &new_row, &plain_cols, &ctx.params, &ctx.named_params)?;
         // Child-side FK: the new values must reference existing parents.
         enforce_child_fks(ctx, table, &new_row)?;
@@ -11844,12 +12651,36 @@ fn try_streaming_update(
     let touched_indexes: Vec<&Arc<crate::schema::Index>> = indexes
         .iter()
         .filter(|idx| {
+            let idx_touched = |e: &crate::sql::ast::Expr| {
+                // Collect the columns the expression references and see
+                // whether any of them is assigned. (a + b) changes when
+                // either a or b does; a partial index's WHERE clause can
+                // move a row in or out of the index.
+                let mut refs = Vec::new();
+                collect_expr_refs(e, &mut refs);
+                refs.iter().any(|(_, name)| {
+                    table
+                        .find_column(name)
+                        .map(|col_idx| assignments.iter().any(|(a_idx, _)| *a_idx == col_idx))
+                        .unwrap_or(false)
+                })
+            };
             idx.columns.iter().any(|c| {
-                table
-                    .find_column(&c.name)
-                    .map(|col_idx| assignments.iter().any(|(a_idx, _)| *a_idx == col_idx))
-                    .unwrap_or(false)
-            })
+                if let Some(col_idx) = table.find_column(&c.name) {
+                    if assignments.iter().any(|(a_idx, _)| *a_idx == col_idx) {
+                        return true;
+                    }
+                }
+                // Expression index key (SQLite 3.9+): the stored key is
+                // derived from columns the expression references — an
+                // assignment to ANY of them changes the key.
+                if let Some(e) = &c.expr {
+                    if idx_touched(e) {
+                        return true;
+                    }
+                }
+                false
+            }) || idx.partial_expr.as_ref().is_some_and(idx_touched)
         })
         .collect();
     // AFTER UPDATE triggers need the OLD row too — stash old payloads
@@ -11905,6 +12736,7 @@ fn try_streaming_update(
                     let aff = table.columns[*col_idx].affinity;
                     new_row[*col_idx] = aff.coerce(v);
                 }
+                validate_strict_row(table, &mut new_row)?;
                 enforce_row_constraints(table, &new_row, col_names, &params, &named_params)?;
                 enforce_child_fks(ctx, table, &new_row)?;
                 payload_buf.clear();
@@ -13133,6 +13965,8 @@ fn process_update_row(
         let aff = table.columns[*col_idx].affinity;
         new_row[*col_idx] = aff.coerce(v);
     }
+    // STRICT tables: validate before the rewrite below mutates the tree.
+    validate_strict_row(table, new_row)?;
     // NOT NULL + CHECK constraints on the updated row.
     enforce_row_constraints(table, new_row, col_names, params, named_params)?;
     // FOREIGN KEY (child side): the updated row's FK values must reference

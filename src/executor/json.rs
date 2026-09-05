@@ -468,6 +468,43 @@ pub fn json_to_sql(j: &Json) -> Value {
     }
 }
 
+/// JSON-quote a SQL value for embedding in a JSON document text
+/// (json_group_array / json_group_object accumulation).
+pub fn json_quote_value(v: &Value) -> String {
+    match v {
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => {
+            if r.is_finite() {
+                format!("{}", r)
+            } else {
+                "null".to_string()
+            }
+        }
+        Value::Null => "null".to_string(),
+        Value::Text(t) => {
+            let s = t.to_string();
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => {
+                        out.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+        Value::Blob(_) => "null".to_string(),
+    }
+}
+
 /// SQL value → JSON node (json_quote semantics).
 pub fn sql_to_json(v: &Value) -> Json {
     match v {

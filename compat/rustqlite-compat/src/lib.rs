@@ -1411,7 +1411,11 @@ unsafe fn prepare_impl(
         StmtKind::Select | StmtKind::Dml { .. } => {
             let eng_stmt = {
                 let rd = engine.db.read();
-                match rd.prepare(&stmt_text) {
+                // Bind to a local first: using the `match` as the block's
+                // tail expression keeps the `Result` temporary alive until
+                // after `rd` drops (E0597 on newer rustc); a `let` statement
+                // drops the scrutinee temporary before the guard does.
+                let erased = match rd.prepare(&stmt_text) {
                     Ok(s) => {
                         // Lifetime-erasure happens under the guard: the
                         // Database lives in the Arc'd RwLock, so the
@@ -1420,7 +1424,8 @@ unsafe fn prepare_impl(
                         erased
                     }
                     Err(e) => return set_conn_err(conn, &e),
-                }
+                };
+                erased
             };
             // Prepare-time column names (sqlx reads column_count /
             // column_name BEFORE the first step):

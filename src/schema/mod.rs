@@ -152,6 +152,10 @@ pub struct IndexColumn {
     pub name: String,
     pub order: Order,
     pub collation: String,
+    /// Expression index key (SQLite 3.9+): when set, the key value is
+    /// evaluated from this expression per row instead of reading the
+    /// named column. `name` holds the rendered expression text.
+    pub expr: Option<crate::sql::ast::Expr>,
 }
 
 impl Index {
@@ -539,6 +543,27 @@ pub fn build_table(
     }
 
     for (i, col) in columns.iter().enumerate() {
+        // STRICT tables: the declared type must be exactly one of SQLite's
+        // six strict names (no affinity coercion rules apply inside them).
+        // Generated columns are exempt (their type is the expression's).
+        if strict
+            && !col
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::GeneratedAs { .. }))
+        {
+            let t = col.type_name.trim().to_ascii_uppercase();
+            let ok = matches!(
+                t.as_str(),
+                "INT" | "INTEGER" | "TEXT" | "REAL" | "BLOB" | "ANY"
+            );
+            if !ok {
+                return Err(Error::semantic(format!(
+                    "unknown datatype for {}.{}: \"{}\"",
+                    name, col.name, col.type_name
+                )));
+            }
+        }
         let affinity = if col.type_name.is_empty() {
             Affinity::Blob
         } else {
@@ -738,6 +763,17 @@ pub fn default_conflict_resolution(or: Option<ConflictResolution>) -> ConflictRe
 pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<IndexColumn>> {
     let mut out = Vec::with_capacity(cols.len());
     for c in cols {
+        // Expression index: no column resolution — the key comes from the
+        // expression. Collation may still be explicit (BINARY default).
+        if let Some(e) = &c.expr {
+            out.push(IndexColumn {
+                name: c.name.clone(),
+                order: c.order,
+                collation: c.collation.clone().unwrap_or_else(|| "BINARY".to_string()),
+                expr: Some((**e).clone()),
+            });
+            continue;
+        }
         if table.find_column(&c.name).is_none() {
             return Err(Error::semantic(format!(
                 "column {} not found in table {}",
@@ -757,6 +793,7 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
             name: c.name.clone(),
             order: c.order,
             collation: c.collation.clone().unwrap_or(inherited),
+            expr: None,
         });
     }
     Ok(out)
@@ -845,6 +882,19 @@ pub fn sqlite_master_table() -> Table {
         ),
         vtab: None,
     }
+}
+
+/// `sqlite_schema` — SQLite's alternate spelling of sqlite_master (same
+/// B+tree, same columns). Registered alongside the master name.
+pub fn sqlite_schema_table() -> Table {
+    let mut t = sqlite_master_table();
+    t.name = "sqlite_schema".to_string();
+    t.qualified_col_names = std::sync::Arc::from(
+        (0..t.columns.len())
+            .map(|i| format!("sqlite_schema.{}", t.columns[i].name))
+            .collect::<Vec<String>>(),
+    );
+    t
 }
 
 /// Decode a schema row.

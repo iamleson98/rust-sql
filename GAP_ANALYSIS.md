@@ -298,3 +298,75 @@ waited at the gate for COMMIT). Single-thread benchmarks are unchanged
   rollback invisibility, sqlx `Transaction` (deferred) reads, reader
   throughput during a write txn, DDL-txn gating fallback, owner reads
   across task migration.
+
+## 5. 2026-09-05 (III) — SQLite feature-parity sweep + expression indexes + isolation hardening
+
+**The parity audit: 291/291 PASS.** A runnable checklist
+(`examples/parity_audit.rs`) probes the engine statement-by-statement
+against recorded SQLite behaviors (DDL shapes, DML clauses, expression
+coverage, scalar/aggregate functions, JSON, PRAGMA surface, transaction
+semantics). The 13 failures found by the audit — and their fixes:
+
+| area | symptom | fix |
+|------|---------|-----|
+| `count(DISTINCT x)`, `count(*)` re-`SELECT` | wrong results / None | DISTINCT-arg aggregate path + star-count through the scan driver |
+| `CAST('42')` | None | cast folds TEXT through affinity rules |
+| `unhex()` | returned BLOB | returns TEXT for TEXT input (SQLite quirk) |
+| `last_insert_rowid()` | always 0 | per-connection note/serve on the SQL-function path |
+| `json_each` / `json_tree` | parse error | table-valued functions (`src/executor/tableval.rs`): FROM-clause function sources, aliasing, bound-parameter args |
+| `pragma_table_info('p')` as a table | parse error | same TVF machinery (`pragma_*` family: table_info, index_list, index_info, foreign_key_list) |
+| expression indexes `ON t (a+b)` | parse error | parser: parenthesized expression in the indexed-column list; catalog carries `IndexColumn.expr` |
+| STRICT tables | accept/reject both wrong | `STRICT` gate on insert coercion + type-check errors carry the type name |
+| `UPDATE ... LIMIT` / strict bad-type INSERT | parse errors | grammar coverage |
+| nested `BEGIN` | no error | error "cannot start a transaction within a transaction" |
+
+**Expression indexes — two real correctness bugs found under the new
+tests, both from the same root: `IndexMaintState` (the INSERT fast
+path's per-statement index state) resolved index columns by NAME, and
+an expression column's "name" is the rendered text `(a + b)` —
+`find_column` misses, the position becomes `usize::MAX`, and the key
+encodes as EMPTY. An empty probe key prefix-matches every cell in
+`lookup_index` (`starts_with`), so every insert after the first saw a
+phantom UNIQUE conflict.**
+
+1. `IndexMaintState::encode_key` now evaluates expression columns per
+   row (`eval_row`) — byte-identical to `encode_index_key`, which had
+   backfilled the index at CREATE time (probe keys and stored keys must
+   agree). Plain-column indexes keep the zero-cost positional path;
+   the table's `col_names` rides along only for indexes that have an
+   expression key.
+2. The UPDATE write-set fast path computed "touched indexes" by named
+   column only — an expression index was NEVER touched, so `UPDATE t
+   SET a=..` left the `(a+b)` entry stale (old key not deleted, new key
+   not inserted; both unique-constraint enforcement and lookups
+   desynced). `touched_indexes` now walks the expression's column
+   references (and a partial index's WHERE refs — a SET can move a row
+   in/out of a partial index).
+3. The unique-check NULL exemption now uses `index_key_has_null`
+   (expression-aware): a row whose expression evaluates to NULL is
+   exempt from uniqueness, like SQLite.
+
+**Committed-view gate race (isolation hardening).** The pager's scope
+gate was a plain `AtomicBool` raised at arm and lowered at drop, with
+the drop consulting only its own thread's TLS. Two holes: (a) reader
+B's drop cleared the gate while reader C's scope was still live on
+another thread — C's `get_page` skipped the TLS check and served LIVE
+(uncommitted) pages inside its BEGIN-time scope (the stress test
+caught it as an intermediate COUNT); (b) a concurrent last-drop's
+`store(false)` could land after a new arm's `store(true)`, gating a
+live scope off. The gate is now the scope COUNT itself (an
+`AtomicUsize`): RMWs serialize, so `count > 0` holds exactly while any
+scope exists — no ordering hazard, same single-load fast path, and the
+defensive `disarm_reader_scope` belt never decrements (a stuck-high
+count costs one TLS probe on scope-less threads; a spurious decrement
+could gate a live scope off — fail-safe direction only). 0/40
+failures on the 4-reader stress test under 2-CPU contention.
+
+**sqlx / sea-orm status.** The sqlx driver (AnyPool-less; a
+`sqlx::sqlite`-shaped pool over the engine) and sea-orm 2.0.2 run
+UNMODIFIED from crates.io: `sqlx-interop` has 3 runnable bins
+(`sqlx` CRUD, `migrate`, `sea_orm_interop` — 10 scenarios incl.
+relations, pagination, transactions, error propagation — all green),
+plus `sea_orm_relations` for join shapes. `SQLX_COMPAT.md` documents
+the wire surface. Remaining sea-orm surface to grow: `json!` column
+serde, more `DeriveRelation` shapes, livepool under churn.

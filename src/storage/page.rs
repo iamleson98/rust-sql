@@ -428,7 +428,25 @@ impl FileHeader {
         buf[36..40].copy_from_slice(&(2048u32).to_le_bytes()); // cache hint
         buf[40..48].copy_from_slice(&0u64.to_le_bytes()); // largest root page
         buf[48..52].copy_from_slice(&1u32.to_le_bytes()); // encoding=UTF8
-                                                          // remainder is zeros (already zeroed in fresh page)
+                                                          // user_version / application_id are set by their PRAGMA writers
+                                                          // (bytes 60..64 / 68..72 — same offsets as SQLite's header layout);
+                                                          // fresh pages default both to 0 (the buffer is zeroed).
+    }
+
+    pub fn user_version(buf: &[u8]) -> u32 {
+        u32::from_le_bytes(buf[60..64].try_into().unwrap())
+    }
+
+    pub fn set_user_version(buf: &mut [u8], v: u32) {
+        buf[60..64].copy_from_slice(&v.to_le_bytes());
+    }
+
+    pub fn application_id(buf: &[u8]) -> u32 {
+        u32::from_le_bytes(buf[68..72].try_into().unwrap())
+    }
+
+    pub fn set_application_id(buf: &mut [u8], v: u32) {
+        buf[68..72].copy_from_slice(&v.to_le_bytes());
     }
 
     pub fn magic(buf: &[u8]) -> Option<&[u8; 8]> {

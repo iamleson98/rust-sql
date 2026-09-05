@@ -124,6 +124,47 @@ impl Parser {
                 "ATTACH" => self.parse_attach(),
                 "DETACH" => self.parse_detach(),
                 "VACUUM" => self.parse_vacuum(),
+                "ANALYZE" => {
+                    // ANALYZE [schema.] [table|index]... — statistics
+                    // collection. The planner is index-cost-model-free
+                    // (it always uses the applicable index), so this is a
+                    // catalog no-op that accepts the full grammar.
+                    self.advance();
+                    let mut target: Option<String> = None;
+                    if !self.peek().is_punct(';') && !matches!(self.peek().token, Token::Eof) {
+                        if self.peek().is_keyword("DATABASE") {
+                            // ANALYZE DATABASE name — accepted, no-op.
+                            self.advance();
+                            let _ = self.parse_ident_or_keyword()?;
+                        } else {
+                            let first = self.parse_ident_or_keyword()?;
+                            if self.peek().is_punct('.') {
+                                self.advance();
+                                target = Some(self.parse_ident_or_keyword()?);
+                            } else {
+                                target = Some(first);
+                            }
+                        }
+                    }
+                    let _ = target;
+                    Ok(Statement::NoOp)
+                }
+                "REINDEX" => {
+                    // REINDEX [collation | table | index]... — rebuilds
+                    // indexes. B+tree indexes are built page-identically on
+                    // insert; rebuilding is a no-op that accepts the
+                    // grammar.
+                    self.advance();
+                    if !self.peek().is_punct(';') && !matches!(self.peek().token, Token::Eof) {
+                        let first = self.parse_ident_or_keyword()?;
+                        if self.peek().is_punct('.') {
+                            self.advance();
+                            let _ = self.parse_ident_or_keyword()?;
+                        }
+                        let _ = first;
+                    }
+                    Ok(Statement::NoOp)
+                }
                 _ => Err(Error::parse(
                     t.line,
                     t.col,
@@ -181,6 +222,12 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.advance(); // CREATE
+                        // TEMP / TEMPORARY (and SQL-standard GLOBAL/LOCAL, which SQLite
+                        // accepts and ignores for temp objects). Temp objects live in the
+                        // same catalog with temp semantics — the executor already treats
+                        // them uniformly.
+        let _temp = self.consume_keyword("TEMP") || self.consume_keyword("TEMPORARY");
+        let _global = self.consume_keyword("GLOBAL") || self.consume_keyword("LOCAL");
         let unique = self.consume_keyword("UNIQUE");
         if unique || self.peek().is_keyword("INDEX") {
             return self.parse_create_index(unique);
@@ -219,6 +266,21 @@ impl Parser {
             false
         };
         let name = self.parse_table_name()?;
+        // CREATE TABLE t AS SELECT — materialize the query's result as a
+        // new table (column names/types from the result rows).
+        if self.peek().is_keyword("AS") {
+            self.advance();
+            let select = self.parse_select()?;
+            return Ok(Statement::Create(CreateStatement::Table {
+                if_not_exists,
+                name,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                without_rowid: false,
+                strict: false,
+                as_select: Some(Box::new(select)),
+            }));
+        }
         self.expect_punct('(')?;
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
@@ -240,6 +302,31 @@ impl Parser {
             }
         }
         self.expect_punct(')')?;
+        // CREATE TABLE t(a, b, ...) AS SELECT — the declared column list
+        // renames the select's result columns (types carry affinity).
+        // SQLite forbids constraints on CTAS columns.
+        if self.peek().is_keyword("AS") {
+            self.advance();
+            let select = self.parse_select()?;
+            let ctas_err = "constraints are not allowed on a table created by CREATE TABLE AS";
+            if !constraints.is_empty() {
+                return Err(crate::error::Error::semantic(ctas_err));
+            }
+            for col in &columns {
+                if !col.constraints.is_empty() {
+                    return Err(crate::error::Error::semantic(ctas_err));
+                }
+            }
+            return Ok(Statement::Create(CreateStatement::Table {
+                if_not_exists,
+                name,
+                columns,
+                constraints: Vec::new(),
+                without_rowid: false,
+                strict: false,
+                as_select: Some(Box::new(select)),
+            }));
+        }
         let mut without_rowid = false;
         let mut strict = false;
         while !matches!(self.peek().token, Token::Eof | Token::Punct(';')) {
@@ -266,6 +353,7 @@ impl Parser {
             constraints,
             without_rowid,
             strict,
+            as_select: None,
         }))
     }
 
@@ -447,6 +535,23 @@ impl Parser {
                 }
                 self.expect_punct(')')?;
             }
+            // MATCH <name> / [NOT] DEFERRABLE [INITIALLY ...]: accepted and
+            // advisory (SQLite documents MATCH as parsed-and-ignored; the
+            // engine enforces the simple case unconditionally).
+            if self.peek().is_keyword("MATCH") {
+                self.advance();
+                let _ = self.parse_ident_or_keyword()?;
+            }
+            if self.peek().is_keyword("DEFERRABLE") || self.peek().is_keyword("NOT") {
+                if self.peek().is_keyword("NOT") {
+                    self.advance();
+                }
+                self.expect_keyword("DEFERRABLE")?;
+                if self.peek().is_keyword("INITIALLY") {
+                    self.advance();
+                    let _ = self.parse_ident_or_keyword()?;
+                }
+            }
             let on_delete = self.parse_fk_action("ON DELETE")?;
             let on_update = self.parse_fk_action("ON UPDATE")?;
             Ok(ColumnConstraint::References {
@@ -473,15 +578,22 @@ impl Parser {
             };
             Ok(ColumnConstraint::GeneratedAs { expr, stored })
         } else if t.is_keyword("AS") {
-            // Column alias AS expr (without GENERATED)
+            // Column alias AS expr (without GENERATED) — `b AS (a * 2)
+            // [STORED | VIRTUAL]` per SQLite's bare-generated-column form.
             self.advance();
             self.expect_punct('(')?;
             let expr = self.parse_expr()?;
             self.expect_punct(')')?;
-            Ok(ColumnConstraint::GeneratedAs {
-                expr,
-                stored: false,
-            })
+            let stored = if self.peek().is_keyword("STORED") {
+                self.advance();
+                true
+            } else if self.peek().is_keyword("VIRTUAL") {
+                self.advance();
+                false
+            } else {
+                false
+            };
+            Ok(ColumnConstraint::GeneratedAs { expr, stored })
         } else {
             Err(Error::parse(
                 t.line,
@@ -577,6 +689,20 @@ impl Parser {
                 ref_columns = self.parse_ident_list()?;
                 self.expect_punct(')')?;
             }
+            if self.peek().is_keyword("MATCH") {
+                self.advance();
+                let _ = self.parse_ident_or_keyword()?;
+            }
+            if self.peek().is_keyword("DEFERRABLE") || self.peek().is_keyword("NOT") {
+                if self.peek().is_keyword("NOT") {
+                    self.advance();
+                }
+                self.expect_keyword("DEFERRABLE")?;
+                if self.peek().is_keyword("INITIALLY") {
+                    self.advance();
+                    let _ = self.parse_ident_or_keyword()?;
+                }
+            }
             let on_delete = self.parse_fk_action("ON DELETE")?;
             let on_update = self.parse_fk_action("ON UPDATE")?;
             Ok(TableConstraint::ForeignKey {
@@ -610,7 +736,36 @@ impl Parser {
     }
 
     fn parse_indexed_column(&mut self) -> Result<IndexedColumn> {
-        let name = self.parse_ident()?;
+        // An index key is either a bare column reference (with optional
+        // COLLATE / ASC / DESC) or an EXPRESSION (SQLite 3.9+ expression
+        // indexes: `(a + b)`, `lower(name)`, ...). Parse an expression —
+        // it subsumes the bare-column case — then classify:
+        //   * `Column`                       → plain column
+        //   * `Collate { Column }`           → plain column + collation
+        //     (the index-column grammar's COLLATE, not an expr wrapper)
+        //   * anything else                  → expression index
+        let parsed = self.parse_expr()?;
+        let (name, collation, expr) = match parsed {
+            crate::sql::ast::Expr::Column {
+                table: None, name, ..
+            } => (name, None, None),
+            crate::sql::ast::Expr::Collate {
+                expr: inner,
+                collation,
+            } => match *inner {
+                crate::sql::ast::Expr::Column {
+                    table: None, name, ..
+                } => (name, Some(collation), None),
+                other => {
+                    let wrapped = crate::sql::ast::Expr::Collate {
+                        expr: Box::new(other),
+                        collation,
+                    };
+                    (format_expr_text(&wrapped), None, Some(Box::new(wrapped)))
+                }
+            },
+            other => (format_expr_text(&other), None, Some(Box::new(other))),
+        };
         let mut order = Order::Asc;
         if self.peek().is_keyword("ASC") {
             self.advance();
@@ -618,16 +773,22 @@ impl Parser {
             order = Order::Desc;
             self.advance();
         }
-        let collation = if self.peek().is_keyword("COLLATE") {
-            self.advance();
-            Some(self.parse_ident()?)
-        } else {
-            None
+        let collation = match collation {
+            Some(c) => Some(c),
+            None => {
+                if self.peek().is_keyword("COLLATE") {
+                    self.advance();
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                }
+            }
         };
         Ok(IndexedColumn {
             name,
             order,
             collation,
+            expr,
         })
     }
 
@@ -1144,6 +1305,22 @@ impl Parser {
         } else {
             None
         };
+        // UPDATE ... ORDER BY ... / LIMIT ... (SQLite's
+        // SQLITE_ENABLE_UPDATE_DELETE_LIMIT build; DELETE already parses
+        // the same suffix). Applied to the matched rows.
+        let order_by = if self.peek().is_keyword("ORDER") {
+            self.advance();
+            self.expect_keyword("BY")?;
+            self.parse_order_terms()?
+        } else {
+            Vec::new()
+        };
+        let limit = if self.peek().is_keyword("LIMIT") {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         Ok(Statement::Update(UpdateStatement {
             or,
             table,
@@ -1152,6 +1329,8 @@ impl Parser {
             from,
             where_clause,
             returning,
+            order_by,
+            limit,
         }))
     }
 
@@ -1468,16 +1647,18 @@ impl Parser {
         let (limit, offset) = if self.peek().is_keyword("LIMIT") {
             self.advance();
             let l = self.parse_expr()?;
-            let o = if self.peek().is_keyword("OFFSET") {
+            if self.peek().is_keyword("OFFSET") {
                 self.advance();
-                Some(self.parse_expr()?)
+                (Some(l), Some(self.parse_expr()?))
             } else if self.peek().is_punct(',') {
+                // SQLite: LIMIT <offset>, <count> — the FIRST expression is
+                // the offset, the second the count.
                 self.advance();
-                Some(l.clone())
+                let count = self.parse_expr()?;
+                (Some(count), Some(l))
             } else {
-                None
-            };
-            (Some(l), o)
+                (Some(l), None)
+            }
         } else {
             (None, None)
         };
@@ -1805,6 +1986,41 @@ impl Parser {
             }
         }
         let (schema, name) = self.parse_qualified_name()?;
+        // Table-valued function: `json_each(x)`, `pragma_table_info('t')`
+        // — a bare (unqualified) name directly followed by an argument
+        // list. Schema-qualified names are not function calls.
+        if schema.is_none() && self.peek().is_punct('(') {
+            self.advance();
+            let mut args = Vec::new();
+            if !self.peek().is_punct(')') {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if self.peek().is_punct(',') {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(')')?;
+            let fn_alias = if self.peek().is_keyword("AS") {
+                self.advance();
+                Some(self.parse_ident()?)
+            } else if let Token::Ident(_) = &self.peek().token {
+                if !is_clause_keyword(&self.peek().token) {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            return Ok(TableExpression::Function {
+                name,
+                args,
+                alias: fn_alias,
+            });
+        }
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -2595,6 +2811,24 @@ impl Parser {
                             return self.parse_function_call(name);
                         }
                     }
+                    // SQLite's %fallback-ID rule: non-reserved keywords are
+                    // legal identifiers (column names) in expression
+                    // position — `SELECT key FROM json_each(...)` and
+                    // `SELECT end FROM t` parse in SQLite. Reserved words
+                    // (WHERE, ORDER, GROUP, TABLE, ...) stay errors.
+                    if keyword_is_fallback_ident(k) {
+                        let name = k.to_ascii_lowercase();
+                        self.advance();
+                        if self.peek().is_punct('.') {
+                            self.advance();
+                            let col = self.parse_ident_or_keyword()?;
+                            return Ok(Expr::Column {
+                                table: Some(name),
+                                name: col,
+                            });
+                        }
+                        return Ok(Expr::Column { table: None, name });
+                    }
                     Err(Error::parse(
                         line,
                         col,
@@ -3026,6 +3260,133 @@ pub fn parse(src: &str) -> Result<Statement> {
     Parser::new(src)?.parse()
 }
 
+/// Split a `;`-separated SQL script into its statement texts
+/// (sqlite3_exec semantics: each part is executed in order). Handles
+/// string literals, blob literals, quoted identifiers (double-quote,
+/// backtick, bracket), both comment styles, and — critically —
+/// `CREATE TRIGGER ... BEGIN stmt; stmt; END` bodies: the `;` inside a
+/// trigger body does NOT split; the statement ends at the block's END.
+/// Empty parts (trailing/duplicated semicolons) are dropped.
+pub fn split_script(src: &str) -> Vec<String> {
+    let b = src.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let n = b.len();
+    // Word-level state for trigger-body detection: `CREATE` followed by
+    // `TRIGGER` within the current statement arms block scanning; the
+    // body's `BEGIN ... END` region then suppresses `;` splitting.
+    let mut prev_word: Option<String> = None;
+    let mut in_trigger_block = false;
+    let mut block_depth = 0usize;
+    while i < n {
+        let c = b[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let w_start = i;
+            while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = src[w_start..i].to_ascii_uppercase();
+            if let Some(pw) = &prev_word {
+                if pw == "CREATE" && word == "TRIGGER" {
+                    in_trigger_block = true; // armed until END closes the body
+                }
+            }
+            if in_trigger_block || block_depth > 0 {
+                if word == "BEGIN" {
+                    block_depth += 1;
+                } else if word == "END" && block_depth > 0 {
+                    block_depth -= 1;
+                    if block_depth == 0 {
+                        in_trigger_block = false;
+                    }
+                }
+            }
+            prev_word = Some(word);
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            // Whitespace does not break the CREATE-TRIGGER word pair
+            // (`CREATE   TRIGGER` still arms the body scan).
+            i += 1;
+            continue;
+        }
+        prev_word = None;
+        match c {
+            b'\'' => {
+                // Text literal (also the tail of an x'..' blob literal —
+                // the same skip rule applies).
+                i += 1;
+                while i < n {
+                    if b[i] == b'\'' {
+                        if i + 1 < n && b[i + 1] == b'\'' {
+                            i += 2; // escaped ''
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' | b'`' => {
+                let q = b[i];
+                i += 1;
+                while i < n {
+                    if b[i] == q {
+                        if i + 1 < n && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                while i < n && b[i] != b']' {
+                    i += 1;
+                }
+                if i < n {
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < n && b[i + 1] == b'-' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            b';' => {
+                if !in_trigger_block && block_depth == 0 {
+                    let part = &src[start..i];
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        out.push(trimmed.to_string());
+                    }
+                    start = i + 1;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < n {
+        let part = src[start..].trim();
+        if !part.is_empty() {
+            out.push(part.to_string());
+        }
+    }
+    out
+}
+
 /// Pragma-value keywords: bare words accepted where an expression is
 /// normally expected (`PRAGMA journal_mode = WAL`). Returns the canonical
 /// uppercase spelling.
@@ -3041,6 +3402,90 @@ fn keyword_text(t: &crate::sql::lexer::Token) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Render an index-key expression back to SQL text (the display name of
+/// an expression index column; also the text SQLite shows in
+/// `sqlite_master.sql`). Reuses the api-level renderer so both stay in
+/// sync with the AST.
+fn format_expr_text(e: &crate::sql::ast::Expr) -> String {
+    format!("({})", crate::api::expr_to_sql(e))
+}
+
+/// SQLite's `%fallback ID` rule: these keywords double as plain
+/// identifiers (usable as column/table/alias names in expression
+/// position). Mirrors the list in SQLite's grammar (parse.y), minus
+/// keywords our parser routes through dedicated expression heads
+/// (NULL, CAST, CASE, EXISTS, RAISE, NOT, LIKE-family infix).
+fn keyword_is_fallback_ident(k: &str) -> bool {
+    matches!(
+        k,
+        "ABORT"
+            | "ACTION"
+            | "AFTER"
+            | "ANALYZE"
+            | "ASC"
+            | "ATTACH"
+            | "BEFORE"
+            | "BEGIN"
+            | "BY"
+            | "CASCADE"
+            | "CONFLICT"
+            | "DATABASE"
+            | "DEFERRED"
+            | "DESC"
+            | "DETACH"
+            | "DO"
+            | "EACH"
+            | "END"
+            | "EXCLUSIVE"
+            | "EXPLAIN"
+            | "FAIL"
+            | "FOR"
+            | "IGNORE"
+            | "IMMEDIATE"
+            | "INITIALLY"
+            | "INSTEAD"
+            | "KEY"
+            | "MATCH"
+            | "NO"
+            | "OF"
+            | "OFFSET"
+            | "PLAN"
+            | "QUERY"
+            | "RECURSIVE"
+            | "RELEASE"
+            | "REPLACE"
+            | "RESTRICT"
+            | "ROLLBACK"
+            | "ROW"
+            | "ROWS"
+            | "SAVEPOINT"
+            | "TEMP"
+            | "TRIGGER"
+            | "VACUUM"
+            | "VIEW"
+            | "VIRTUAL"
+            | "WITH"
+            | "WITHOUT"
+            | "NULLS"
+            | "FIRST"
+            | "LAST"
+            | "FOLLOWING"
+            | "PARTITION"
+            | "PRECEDING"
+            | "RANGE"
+            | "UNBOUNDED"
+            | "EXCLUDE"
+            | "GROUPS"
+            | "OTHERS"
+            | "TIES"
+            | "GENERATED"
+            | "ALWAYS"
+            | "MATERIALIZED"
+            | "REINDEX"
+            | "RENAME"
+    )
 }
 
 #[cfg(test)]

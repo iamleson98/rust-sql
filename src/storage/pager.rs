@@ -601,6 +601,23 @@ pub struct Pager {
     /// by `CommittedViewGuard::drop` with a single write-epoch bump so
     /// the reader's advisory-cache state can never outlive its scope.
     committed_poison: std::sync::atomic::AtomicBool,
+    /// Fast-path gate for the committed-view scope check in `get_page`:
+    /// the scope COUNT below, loaded as a single Acquire load — zero (the
+    /// overwhelming common case — no reader scope armed) skips the
+    /// thread-local scope read entirely; one atomic load in L1 replaces a
+    /// TLS access per page fetch. Windows TLS access is a TEB/FLS round
+    /// trip — the per-`get_page` TLS probe measurably regressed join-heavy
+    /// queries on CI hardware, which motivated the gate. The count is the
+    /// SOLE authority (no separate bool): a bool raised in `arm` and
+    /// lowered in `drop` has an interleaving where a concurrent last
+    /// drop's store(false) lands AFTER a new arm's store(true), leaving a
+    /// live scope gated off. RMW operations on the counter serialize, so
+    /// count > 0 holds whenever any scope exists — no ordering hazard.
+    committed_scope_count: std::sync::atomic::AtomicUsize,
+    /// PRAGMA user_version / application_id — persisted at the SQLite
+    /// header offsets (60..64 / 68..72) inside page 0.
+    user_version: std::sync::atomic::AtomicU32,
+    application_id: std::sync::atomic::AtomicU32,
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +686,15 @@ impl Drop for CommittedViewGuard<'_> {
         if self.pager.committed_poison.swap(false, Ordering::AcqRel) {
             self.pager.write_version.fetch_add(1, Ordering::Release);
         }
+        // Lower the gate: the count IS the gate, and the decrement is a
+        // serialized RMW — once it lands, every thread's gate load sees
+        // the new count atomically. Checking only this thread's TLS
+        // ("did my drop leave this pager armed on THIS thread?") is
+        // wrong with concurrent readers: reader B's drop would clear the
+        // gate while reader C's scope is still live, and C's get_page
+        // would serve live pages inside its committed scope (isolation
+        // violation).
+        self.pager.scope_count_dec();
     }
 }
 
@@ -1033,6 +1059,9 @@ impl Pager {
             join_cache: Mutex::new(std::collections::HashMap::new()),
             committed_pages: Mutex::new(std::collections::HashMap::default()),
             committed_poison: std::sync::atomic::AtomicBool::new(false),
+            committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
+            user_version: std::sync::atomic::AtomicU32::new(0),
+            application_id: std::sync::atomic::AtomicU32::new(0),
         };
 
         let file_size = pager.store.len()?;
@@ -1270,6 +1299,10 @@ impl Pager {
         self.freelist_head.store(freelist_head, Ordering::Release);
         self.freelist_count.store(freelist_count, Ordering::Release);
         self.schema_cookie.store(schema_cookie, Ordering::Release);
+        self.user_version
+            .store(FileHeader::user_version(&header), Ordering::Release);
+        self.application_id
+            .store(FileHeader::application_id(&header), Ordering::Release);
 
         // Verify file size matches the claimed page count.
         let actual_size = self.store.len()?;
@@ -1365,6 +1398,47 @@ impl Pager {
 
     pub fn schema_cookie(&self) -> u32 {
         self.schema_cookie.load(Ordering::Acquire)
+    }
+
+    /// PRAGMA user_version — the 32-bit value at header bytes 60..64.
+    /// Persisted by patching page 0 IN PLACE (the cached page owns the
+    /// header; the next flush writes it out with every other dirty page).
+    pub fn set_user_version(&self, v: u32) -> Result<()> {
+        self.user_version.store(v, Ordering::Release);
+        self.patch_header_u32(60, v)
+    }
+
+    pub fn user_version(&self) -> u32 {
+        self.user_version.load(Ordering::Acquire)
+    }
+
+    /// PRAGMA application_id — header bytes 68..72.
+    pub fn set_application_id(&self, v: u32) -> Result<()> {
+        self.application_id.store(v, Ordering::Release);
+        self.patch_header_u32(68, v)
+    }
+
+    pub fn application_id(&self) -> u32 {
+        self.application_id.load(Ordering::Acquire)
+    }
+
+    /// Patch a 4-byte little-endian field inside page 0's file header,
+    /// marking the page dirty so the next flush persists it. The backing
+    /// image is patched with a DIRECT 4-byte write as well (a full flush
+    /// could drag other mid-transaction dirty pages into the committed
+    /// image — the byte patch cannot).
+    fn patch_header_u32(&self, offset: usize, v: u32) -> Result<()> {
+        let page = self.get_page(0)?;
+        {
+            let mut p = page.lock();
+            let bytes = v.to_le_bytes();
+            p.data[offset..offset + 4].copy_from_slice(&bytes);
+            p.dirty = true;
+        }
+        self.note_dirty(0);
+        let bytes = v.to_le_bytes();
+        self.write_file_at(offset as u64, &bytes)?;
+        Ok(())
     }
 
     /// Notify the pager that a mutating operation just happened (or is
@@ -1481,10 +1555,15 @@ impl Pager {
     ///    waits on the write lock and then sees the page in cache.
     pub fn get_page(&self, id: PageId) -> Result<PageRef> {
         // Committed-view scope (armed by a reader on a foreign thread while
-        // a write transaction is open): serve the BEGIN-time state.
-        if let Some((pid, bound)) = committed_scope() {
-            if pid == self.instance_id {
-                return self.get_page_committed(id, bound);
+        // a write transaction is open): serve the BEGIN-time state. The
+        // per-pager atomic gate keeps the common (scope-less) path to a
+        // single relaxed load — TLS is consulted only while some scope is
+        // armed somewhere in the process.
+        if self.committed_scope_count.load(Ordering::Acquire) > 0 {
+            if let Some((pid, bound)) = committed_scope() {
+                if pid == self.instance_id {
+                    return self.get_page_committed(id, bound);
+                }
             }
         }
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
@@ -1615,14 +1694,48 @@ impl Pager {
     /// exclude concurrent writer statements) for the scope's duration.
     pub fn arm_committed_view(&self, bound: u32) -> CommittedViewGuard<'_> {
         let prev = COMMITTED_VIEW.with(|c| c.replace(Some((self.instance_id, bound))));
+        // Raise the gate: the RMW makes the scope visible to every
+        // thread's gate load atomically — foreign threads that see the
+        // count > 0 fall through to their own (empty) TLS scope and take
+        // the live path, while same-thread consumers see it in program
+        // order.
+        self.committed_scope_count.fetch_add(1, Ordering::AcqRel);
         CommittedViewGuard { prev, pager: self }
+    }
+
+    /// Decrement the scope count; true when it reached zero — the gate
+    /// is the count itself, so there is nothing else to lower. Saturating
+    /// (never wraps below zero): a defensive `disarm_reader_scope`
+    /// racing a still-live guard's own drop must not poison the count for
+    /// the process lifetime.
+    fn scope_count_dec(&self) -> bool {
+        let mut cur = self.committed_scope_count.load(Ordering::Acquire);
+        loop {
+            if cur == 0 {
+                return false;
+            }
+            match self.committed_scope_count.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return cur == 1,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// True while this thread has a committed-view scope armed for THIS
     /// pager (read paths use this to skip read-side caches that are
-    /// keyed on the LIVE state, e.g. the table count cache).
+    /// keyed on the LIVE state, e.g. the table count cache). Gated by the
+    /// per-pager atomic so the TLS is touched only while a scope is (or
+    /// was) armed.
     #[inline]
     pub fn committed_reads_armed(&self) -> bool {
+        if self.committed_scope_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         match committed_scope() {
             Some((pid, _)) => pid == self.instance_id,
             None => false,
@@ -1657,6 +1770,14 @@ impl Pager {
         if let Some((pid, _)) = committed_scope() {
             if pid == self.instance_id {
                 COMMITTED_VIEW.with(|c| c.set(None));
+                // Deliberately NO count decrement: this is the defensive
+                // belt, and the pairing arm's guard may still drop later
+                // and decrement itself. A spurious extra decrement could
+                // zero the count while another live scope exists — gating
+                // it off and serving LIVE pages inside it. A stuck-high
+                // count (the true-leak case) only costs one TLS probe per
+                // get_page on scope-less threads: fail-safe, never
+                // isolation-breaking.
             }
         }
     }
