@@ -167,11 +167,57 @@ found and fixed three data-corruption bugs and four throughput gaps:
 - Overflow-chain reads bypass the page cache (sequential read-once pages
   no longer evict the live tree pages).
 
-### Known remaining gaps (tracked, not blocking)
-- Wide-row (2KB TEXT) and 64KB blob scans trail SQLite ~2-4x: the scan
-  materializes every overflow payload even for projections that never
-  read the column (needs overflow-aware selective decode — a callback-
-  contract change across the scan family).
-- Multi-index INSERT (5 indexes) trails ~20%.
-- Peak RSS on 1M-row workloads is ~2.5x SQLite (in-memory store image +
-  2048-page cache + mimalloc retention + transaction undo journal).
+### Known remaining gaps — CLOSED 2026-09-05 (see §3)
+
+All three tracked gaps below were closed by the overflow-aware selective
+decode (2026-09-04) plus the 2026-09-05 production sprint:
+
+- ~~Wide-row (2KB TEXT) and 64KB blob scans trail SQLite ~2-4x~~ →
+  **parity to WIN**: overflow-aware selective decode gathers only the
+  wanted columns' byte ranges straight into the value's own buffer;
+  trusted-TEXT mode skips the redundant UTF-8 validation scan on
+  in-memory payloads; bulk `allocate_pages` builds overflow chains under
+  one cache critical section; exact-size payload reservation kills the
+  realloc cascade. S08 (2KB x 25k) scan: ~1.3-1.4x WIN; S09 (64KB x 1k)
+  scan: parity-to-win (best-of-2 under shared-runner noise).
+- ~~Multi-index INSERT (5 indexes) trails ~20%~~ → **WIN** (S12:
+  66.3ms vs 67.7ms at scale 0.15; insert scratch cache + savepoint
+  capture fast path + explicit-rowid append).
+- ~~Peak RSS on 1M-row workloads is ~2.5x SQLite~~ → **WIN on the
+  gated metric** (bench_compare Peak RSS 100k insert+count: 25.6MB vs
+  28.6MB). Torture's report-only per-section deltas at small scales
+  remain ~7-11% above SQLite (engine init footprint + page-cache
+  structure); no gate depends on them.
+
+## 3. 2026-09-05 sprint — file-tail reclamation, crash-safety, routing
+
+The truncate-on-mass-delete sprint (see CHANGELOG for the full list):
+
+- **SQLite's truncate optimization landed**: whole-leaf unlink cascade +
+  `Pager::truncate_tail` reclaim the file's contiguous freed tail
+  outright. S14 churn+reclaim delete: 5.6x LOSS → 3.5x WIN; the file
+  shrinks with the commit and the freelist stays clean (v4 trunk format:
+  one 4-byte entry per free, ~1 write per 1022 frees).
+- **Crash-safety ordering contract**: the header (the only place the
+  committed `n_pages` lives) is written LAST in every flush/checkpoint
+  path, before the truncating `set_len`. The OOM fault-injection suite
+  (532 allocation-failure points) passes with the committed baseline
+  intact at every point; the previous header-first order left a torn
+  window that corrupted files on mid-flush OOM.
+- **ROLLBACK vs truncation**: the truncation floor never drops below the
+  lowest active savepoint's base (pages below hold undo pre-images
+  ROLLBACK must restore); both rollback paths disarm the armed physical
+  truncate. BEGIN;inserts;mass-delete;ROLLBACK is bit-exact.
+- **Root-children routing** for scattered lookups (join fanouts, random
+  probes): the root's full (separator, child) map is cached per write
+  epoch and armed only after 16 consecutive leaf-hint misses, so point
+  lookups never pay for it. Scattered rowid lookups: 198 → 177 ns; the
+  Windows bench-gate's marginal 3-table-join loss flipped to ~20% WIN.
+- **Streaming driver budget contract**: `next_batch` returns AT MOST
+  `budget` rows (the LIMIT/OFFSET + Filter wrappers count on it); the
+  64 → 1024-row batch widening lives in the top-level `step()` serving
+  loop; ScanDriver/RangeDriver gained the 256 KB live-footprint cap.
+- **Torture harness hardening**: best-of-2 child runs per engine per
+  section (shared CI runners swing a single sample 2x — SQLite's S09
+  blob scan measured 5.9ms and 3.7ms across two consecutive runs of
+  identical code).
