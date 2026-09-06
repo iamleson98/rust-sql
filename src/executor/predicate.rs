@@ -663,6 +663,177 @@ fn is_cmp_op(op: BinaryOp) -> bool {
     )
 }
 
+/// A two-sided INTEGER range on one column, extracted for the FUSED
+/// payload-probe scan (see row_codec::probe_int_column): the scan walks
+/// payloads and compares ONE column's bytes directly — no selective
+/// decode, no Row, no predicate dispatch. Only INCLUSIVE two-sided
+/// shapes are extracted (BETWEEN, `lo <= c AND c <= hi` AND-chains,
+/// `c = lit`): a one-sided range must still match TEXT/BLOB values
+/// (SQLite's type order puts every number below TEXT), which the
+/// skip-non-numeric probe cannot express.
+#[derive(Clone, Debug)]
+pub(crate) struct IntRangePred {
+    pub col: usize,
+    pub lo: PredValue,
+    pub hi: PredValue,
+}
+
+/// One comparison side of an AND-chain: the column, its leaf value, and
+/// which bound of the range it carries.
+struct OneBound {
+    col: usize,
+    value: PredValue,
+    side: BoundSide,
+}
+
+enum BoundSide {
+    Lo,
+    Hi,
+}
+
+/// Resolve a column reference against the scan table (same scoping rule
+/// as compile_predicate: an alias REPLACES the table name).
+fn column_index(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<usize> {
+    let Expr::Column { table: ref_t, name } = e else {
+        return None;
+    };
+    let matches = ref_t
+        .as_ref()
+        .map(|t| {
+            if prefix == table.name {
+                t == &table.name || t == prefix
+            } else {
+                t == prefix
+            }
+        })
+        .unwrap_or(true);
+    if matches {
+        table.find_column(name)
+    } else {
+        None
+    }
+}
+
+/// Extract an inclusive two-sided INTEGER range for the fused probe scan
+/// (see row_codec::probe_int_column). Supported shapes:
+/// - `c BETWEEN lo AND hi` (NOT BETWEEN declines),
+/// - `c = leaf` (degenerate range),
+/// - `lo <= c AND c <= hi` and `c >= lo AND c <= hi` two-side AND-chains
+///   (same column; deeper/mixed chains decline).
+pub(crate) fn try_int_column_range(
+    e: &Expr,
+    table: &crate::schema::Table,
+    prefix: &str,
+) -> Option<IntRangePred> {
+    match e {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => {
+            let col = column_index(expr, table, prefix)?;
+            let lo = bind_leaf(low, table, prefix)?;
+            let hi = bind_leaf(high, table, prefix)?;
+            Some(IntRangePred { col, lo, hi })
+        }
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            if let Some(col) = column_index(left, table, prefix) {
+                let v = bind_leaf(right, table, prefix)?;
+                return Some(IntRangePred {
+                    col,
+                    lo: v.clone(),
+                    hi: v,
+                });
+            }
+            if let Some(col) = column_index(right, table, prefix) {
+                let v = bind_leaf(left, table, prefix)?;
+                return Some(IntRangePred {
+                    col,
+                    lo: v.clone(),
+                    hi: v,
+                });
+            }
+            None
+        }
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let l = one_bound(left, table, prefix)?;
+            let r = one_bound(right, table, prefix)?;
+            if l.col != r.col {
+                return None;
+            }
+            match (l.side, r.side) {
+                (BoundSide::Lo, BoundSide::Hi) => Some(IntRangePred {
+                    col: l.col,
+                    lo: l.value,
+                    hi: r.value,
+                }),
+                (BoundSide::Hi, BoundSide::Lo) => Some(IntRangePred {
+                    col: l.col,
+                    lo: r.value,
+                    hi: l.value,
+                }),
+                _ => None, // both lower or both upper: not a two-sided range
+            }
+        }
+        _ => None,
+    }
+}
+
+/// One side of an AND-chain: `c >= v`, `v <= c` (Lo), `c <= v`, `v >= c`
+/// (Hi). BETWEEN / Eq inside chains declines (merging full ranges needs
+/// intersection logic the fused scan does not need today).
+fn one_bound(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<OneBound> {
+    let Expr::Binary { op, left, right } = e else {
+        return None;
+    };
+    match op {
+        BinaryOp::GtEq => {
+            if let Some(col) = column_index(left, table, prefix) {
+                Some(OneBound {
+                    col,
+                    value: bind_leaf(right, table, prefix)?,
+                    side: BoundSide::Lo,
+                })
+            } else if let Some(col) = column_index(right, table, prefix) {
+                Some(OneBound {
+                    col,
+                    value: bind_leaf(left, table, prefix)?,
+                    side: BoundSide::Hi,
+                })
+            } else {
+                None
+            }
+        }
+        BinaryOp::LtEq => {
+            if let Some(col) = column_index(left, table, prefix) {
+                Some(OneBound {
+                    col,
+                    value: bind_leaf(right, table, prefix)?,
+                    side: BoundSide::Hi,
+                })
+            } else if let Some(col) = column_index(right, table, prefix) {
+                Some(OneBound {
+                    col,
+                    value: bind_leaf(left, table, prefix)?,
+                    side: BoundSide::Lo,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Compile a WHERE predicate against a table. Returns None when any part
 /// of the expression isn't a supported shape (caller falls back to the
 /// general `eval_row` path — semantics unchanged).

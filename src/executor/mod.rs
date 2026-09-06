@@ -927,6 +927,34 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     );
                 }
             }
+            // FUSED PATH: Project over an IndexRange (WHERE indexed_col
+            // BETWEEN / range ops) — same selective-decode fusion, plus
+            // the rowid pseudo-column fix: bare `rowid`/`oid`/`_rowid_`
+            // projections resolve via the ROWID_PROJ sentinel instead of
+            // the materialized name lookup (which yielded NULL).
+            if let Plan::IndexRange {
+                table,
+                alias: _,
+                index,
+                start,
+                end,
+                residual,
+                ..
+            } = &**input
+            {
+                if let Some((project, out_cols)) = bare_column_projection(columns, table) {
+                    return exec_index_range_projected(
+                        ctx,
+                        table.clone(),
+                        index.clone(),
+                        start.as_ref(),
+                        end.as_ref(),
+                        residual.as_ref(),
+                        project.as_deref(),
+                        out_cols,
+                    );
+                }
+            }
             // FUSED PATH: Project over an Index Nested-Loop Join — the join
             // emits only the projected columns (no full-width combined row,
             // no second cloning pass). Mirrors the Hash Join fusion.
@@ -10162,6 +10190,256 @@ fn exec_index_range(
     }
 
     Ok(ExecResult { columns, rows })
+}
+
+/// IndexRange with the projection FUSED into the fetch (mirror of
+/// `exec_index_lookup_projected` for range predicates): decodes ONLY the
+/// projected columns per row (selective decode, `ROWID_PROJ` sentinel for
+/// bare `rowid`/`oid`/`_rowid_` projections), reuses ONE table B+tree
+/// handle across the rowid batch, and — unlike the generic
+/// Project(IndexRange) chain — answers `SELECT rowid FROM t WHERE a
+/// BETWEEN ? AND ?` (the materialized rows carry table columns only, so
+/// `apply_projection`'s name lookup returned NULL for the pseudo-column).
+///
+/// A residual (extra conjuncts on non-indexed columns) full-decodes each
+/// row, evaluates, then projects positionally — the rowid pseudo-column
+/// is appended for the evaluation only (same contract as
+/// `exec_rowid_range_projected_impl`).
+///
+/// Wide selections (>= ~25% of the table) use the same MERGE SCAN as
+/// `exec_index_range`: sort the rowids, walk the table B+tree once, and
+/// place decoded rows into position-indexed slots so the observable
+/// emission order stays INDEX order.
+fn exec_index_range_projected(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    index: Arc<crate::schema::Index>,
+    start: Option<&(Expr, bool)>,
+    end: Option<&(Expr, bool)>,
+    residual: Option<&Expr>,
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
+    // Evaluate the bound expressions (constants / parameters), folding
+    // through the first index column's collation — same logic as
+    // exec_index_range.
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let fold_bound = |e: &Expr| -> Result<Value> {
+        let v = evaluate(e, &eval_ctx)?;
+        Ok(match index.columns.first() {
+            Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+            None => v,
+        })
+    };
+    let start_key: Option<(Vec<u8>, bool)> = match start {
+        Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
+        None => None,
+    };
+    let end_key: Option<(Vec<u8>, bool)> = match end {
+        Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
+        None => None,
+    };
+    let scan_start: Vec<u8> = start_key
+        .as_ref()
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default();
+
+    // Phase 1: collect the matching rowids in index order.
+    let mut rowids: Vec<i64> = Vec::new();
+    {
+        let index_root = ctx.index_root(&index);
+        let mut index_bt = Btree::new(ctx.pager, index_root, true);
+        index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
+            if let Some((k, false)) = &start_key {
+                if cell_key.starts_with(k) {
+                    return true; // exclusive lower bound
+                }
+            }
+            if let Some((k, inc)) = &end_key {
+                match index_key_prefix_cmp(cell_key, k) {
+                    std::cmp::Ordering::Greater => return false,
+                    std::cmp::Ordering::Equal if !*inc => return false,
+                    _ => {}
+                }
+            }
+            rowids.push(rowid);
+            true
+        })?;
+    }
+
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    // Residual evaluation context: decoded row + rowid pseudo-column
+    // (same gating as exec_rowid_range: no pseudo column on WITHOUT
+    // ROWID tables or tables with a real "rowid" column).
+    let has_real_rowid_col = table.find_column("rowid").is_some();
+    let residual = residual.filter(|_| !table.without_rowid && !has_real_rowid_col);
+    let eval_cols: Vec<String> = if residual.is_some() {
+        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        v.push("rowid".to_string());
+        v
+    } else {
+        Vec::new()
+    };
+    let params = ctx.params.clone();
+    let named_params = ctx.named_params.clone();
+    let residual_pred = residual;
+
+    let mut rows: Vec<Row> = Vec::with_capacity(rowids.len());
+    let table_root = ctx.table_root(&table);
+
+    // Fetch strategy — same heuristic as exec_index_range: random lookups
+    // for narrow selections, one merge scan for wide ones (position-indexed
+    // so the emission order stays index order).
+    let max_rowid_hint = ctx.get_or_scan_max_rowid(&table).unwrap_or(0);
+    let use_merge_scan = max_rowid_hint > 0 && (rowids.len() as i64) * 4 > max_rowid_hint;
+
+    if use_merge_scan {
+        let index_order: Vec<i64> = rowids.clone();
+        let mut position: std::collections::HashMap<
+            i64,
+            usize,
+            crate::storage::pager::PageIdHashBuild,
+        > = std::collections::HashMap::with_capacity_and_hasher(
+            rowids.len(),
+            crate::storage::pager::PageIdHashBuild,
+        );
+        for (pos, rid) in index_order.iter().enumerate() {
+            position.insert(*rid, pos);
+        }
+        let mut placed: Vec<Option<Row>> = vec![None; index_order.len()];
+        rowids.sort_unstable();
+        rowids.dedup();
+        let mut ri = 0usize;
+        let mut bt = Btree::new(ctx.pager, table_root, false);
+        bt.scan_table_borrowed(|rowid, payload| {
+            while ri < rowids.len() && rowids[ri] < rowid {
+                ri += 1;
+            }
+            if ri >= rowids.len() {
+                return false; // all matches emitted — stop the scan
+            }
+            if rowids[ri] != rowid {
+                return true; // not a match — keep scanning
+            }
+            ri += 1;
+            let keep = match residual_pred {
+                Some(res) => {
+                    if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                        full.push(Value::Integer(rowid));
+                        let k = eval_row(res, &full, &eval_cols, &params, &named_params)
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
+                        full.pop();
+                        if k {
+                            placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] =
+                                Some(project_row_from_full(project, &full, rowid));
+                        }
+                    }
+                    false // row consumed — resume scanning
+                }
+                None => true,
+            };
+            if keep {
+                let row = match project {
+                    Some(idxs) => {
+                        let mut r = Vec::with_capacity(idxs.len());
+                        if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut r)
+                            .is_ok()
+                        {
+                            Some(r)
+                        } else {
+                            None
+                        }
+                    }
+                    None => decode_row(payload, n_cols, rowid, rowid_alias).ok(),
+                };
+                if let Some(r) = row {
+                    placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] = Some(r);
+                }
+            }
+            true
+        })?;
+        for row in placed.into_iter().flatten() {
+            rows.push(row);
+        }
+    } else {
+        // Random lookups: one B+tree handle for the whole batch (pinned
+        // root + leaf-hint warmth carry over — see fetch_rows_by_rowids).
+        let mut table_bt = Btree::new(ctx.pager, table_root, false);
+        for rowid in rowids {
+            match (project, residual_pred) {
+                (Some(idxs), None) => {
+                    let mut row: Row = Vec::with_capacity(idxs.len());
+                    let found = table_bt.lookup_table_with(rowid, |payload| {
+                        decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
+                    })?;
+                    if found.is_some() {
+                        rows.push(row);
+                    }
+                }
+                (Some(idxs), Some(res)) => {
+                    if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
+                        if let Ok(mut full) = decode_row(&payload, n_cols, rowid, rowid_alias) {
+                            full.push(Value::Integer(rowid));
+                            let keep = eval_row(res, &full, &eval_cols, &params, &named_params)
+                                .map(|v| v.is_truthy())
+                                .unwrap_or(false);
+                            full.pop();
+                            if keep {
+                                rows.push(project_row_from_full(Some(idxs), &full, rowid));
+                            }
+                        }
+                    }
+                }
+                (None, res) => {
+                    if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
+                        if let Ok(mut row) = decode_row(&payload, n_cols, rowid, rowid_alias) {
+                            if let Some(res) = res {
+                                row.push(Value::Integer(rowid));
+                                let keep = eval_row(res, &row, &eval_cols, &params, &named_params)
+                                    .map(|v| v.is_truthy())
+                                    .unwrap_or(false);
+                                if !keep {
+                                    continue;
+                                }
+                                row.pop();
+                            }
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ExecResult {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// Positionally project a full table-order row: `ROWID_PROJ` sentinel
+/// slots take the rowid, other slots index the full row (missing tail
+/// columns are NULL — short-row contract of decode_row).
+#[inline]
+fn project_row_from_full(project: Option<&[usize]>, full: &[Value], rowid: i64) -> Row {
+    match project {
+        Some(idxs) => {
+            let mut row = Vec::with_capacity(idxs.len());
+            for &p in idxs {
+                if p == crate::storage::row_codec::ROWID_PROJ {
+                    row.push(Value::Integer(rowid));
+                } else {
+                    row.push(full.get(p).cloned().unwrap_or(Value::Null));
+                }
+            }
+            row
+        }
+        None => full.to_vec(),
+    }
 }
 
 // ============================================================================

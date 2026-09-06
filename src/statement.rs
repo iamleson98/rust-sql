@@ -1323,6 +1323,113 @@ impl Driver for FilteredScanDriver {
         let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
         let mut last = self.last_rowid;
         let mut hit_end = true;
+        // FUSED RANGE-PROBE SCAN: a two-sided INTEGER range on one column
+        // (`a BETWEEN ? AND ?`) skips the selective decode + predicate
+        // dispatch entirely — the payload probe reads ONE column's bytes
+        // (~3-8 ns/row vs ~40-60). Rowid-alias columns are even cheaper:
+        // the range becomes the B+tree's own rowid bounds (a seek, not a
+        // scan). Non-numeric payloads cannot match a two-sided INTEGER
+        // range (SQLite's type order: numbers < TEXT/BLOB; NULL never
+        // matches), so skipping them is exact.
+        let range = if let Some(r) = crate::executor::predicate::try_int_column_range(
+            &self.predicate,
+            &self.table,
+            &self.prefix,
+        ) {
+            // Bounds must be EXACT i64s: a REAL bound (BETWEEN 8.5 AND
+            // 15.5) or a TEXT-typed param ('5') must NOT truncate into
+            // the fused range — those shapes decline to the general
+            // predicate path, which compares them with full mixed-type
+            // semantics (SQLite: INTEGER < REAL < TEXT by value class).
+            let resolve = |v: &crate::executor::predicate::PredValue| -> Option<i64> {
+                match v {
+                    crate::executor::predicate::PredValue::Literal(
+                        crate::types::Value::Integer(i),
+                    ) => Some(*i),
+                    crate::executor::predicate::PredValue::Param(i) => match params.get(*i) {
+                        Some(crate::types::Value::Integer(n)) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            match (resolve(&r.lo), resolve(&r.hi)) {
+                (Some(lo), Some(hi)) if lo <= hi => Some((r.col, lo, hi)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((col, lo, hi)) = range {
+            if rowid_alias == Some(col) {
+                // The range is over the rowid: bound the walk itself.
+                let walk_lo = start.max(lo);
+                bt.scan_table_range_borrowed(walk_lo, hi, |rowid, payload| {
+                    if out.len() >= budget {
+                        hit_end = false;
+                        return false;
+                    }
+                    last = last.max(rowid);
+                    if let Ok(row) =
+                        crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+                    {
+                        out.push(row);
+                    }
+                    true
+                })?;
+            } else {
+                bt.scan_table_range_borrowed(start, i64::MAX, |rowid, payload| {
+                    if out.len() >= budget {
+                        hit_end = false;
+                        return false;
+                    }
+                    last = last.max(rowid);
+                    match crate::storage::row_codec::probe_int_column(
+                        payload,
+                        col,
+                        rowid,
+                        rowid_alias,
+                    ) {
+                        Some(crate::storage::row_codec::ProbeNum::Int(v)) => {
+                            if v >= lo && v <= hi {
+                                if let Ok(row) = crate::storage::row_codec::decode_row(
+                                    payload,
+                                    n_cols,
+                                    rowid,
+                                    rowid_alias,
+                                ) {
+                                    out.push(row);
+                                }
+                            }
+                        }
+                        // Exact mixed INTEGER/REAL comparison via match
+                        // guard: no lossy `lo as f64` casts (SQLite
+                        // compares across the numeric class exactly, and
+                        // so does the fused probe).
+                        Some(crate::storage::row_codec::ProbeNum::Real(v))
+                            if crate::storage::row_codec::real_ge_int(v, lo)
+                                && crate::storage::row_codec::real_le_int(v, hi) =>
+                        {
+                            if let Ok(row) = crate::storage::row_codec::decode_row(
+                                payload,
+                                n_cols,
+                                rowid,
+                                rowid_alias,
+                            ) {
+                                out.push(row);
+                            }
+                        }
+                        // REAL outside the range: no match.
+                        Some(crate::storage::row_codec::ProbeNum::Real(_)) => {}
+                        None => {} // NULL/TEXT/BLOB/absent: cannot match
+                    }
+                    true
+                })?;
+            }
+            self.eof = hit_end && out.len() < budget;
+            self.last_rowid = last;
+            return Ok(out);
+        }
         if wanted.is_empty() {
             // Degenerate (constant) predicate: full decode + positional eval.
             let positions: Vec<usize> = (0..n_cols).collect();

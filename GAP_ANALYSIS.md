@@ -524,3 +524,61 @@ shapes, RETURNING on UPDATE/DELETE, window function variants, CHECK
 expressions, generated columns, trigger NEW/OLD refs, CTE variants,
 ALTER shapes, collations, a 25-case function battery, NULL
 three-valued logic). All green; `parity_audit` still 291/291.
+
+## 9. 2026-09-06 (II) — fused range-probe scans, exact REAL↔INTEGER bounds, rowid via index ranges
+
+**Fused range-probe scan (FilteredScanDriver).** A two-sided INTEGER
+range on one column (`a BETWEEN ? AND ?`, `lo <= a AND a <= hi`
+AND-chains, `a = lit` degenerate ranges) now skips selective decode +
+predicate dispatch entirely: the payload probe reads ONE column's
+bytes (`probe_int_column`, ~3-8 ns/row vs ~40-60) and only matching
+rows pay a full decode. Rowid-alias ranges (`id BETWEEN ? AND ?`)
+bound the B+tree walk itself (a seek, not a scan). NULL/TEXT/BLOB
+payloads skip exactly — SQLite's type order puts every number below
+TEXT, and NULL never matches a range.
+
+**Bounds-typing correctness (the subtle part).** The fused path
+accepts only EXACT INTEGER bounds: REAL bounds (`BETWEEN 8.5 AND
+15.5`), TEXT bounds (`BETWEEN '5' AND 'z'`), and NULL bounds DECLINE
+to the general predicate path with full mixed-type semantics. The
+first cut used `Value::as_integer()` — truncating REALs (8.5 → 8:
+wrong rows on BOTH ends) and parsing TEXT numerics ('5' → 5: matches
+rows SQLite would order above all numbers). Probe payloads keep their
+exact cross-class comparison: `real_ge_int`/`real_le_int` compare via
+floor/ceil with 2^63 saturation — no lossy `lo as f64` casts (SQLite
+compares INTEGER vs REAL exactly across the whole i64 range; the cast
+form wrapped/lost past 2^53).
+
+**Varint-format bug the unit tests caught.** `probe_int_column` and
+its span walker initially decoded 0x07/0x08/0x0A lengths with the
+B+tree's SQLite-style BIG-ENDIAN varint — but the value codec encodes
+them LEB128. Multi-byte TEXT/BLOB spans and zigzag integral-REALs
+misparsed (Real(2e12) probed as Int(85101946)); the walk silently
+desynced past the first wide value. Both now use
+`types::value::decode_uvarint`; regression: probe_all_tags covers
+every width tag, the zigzag path, and rowid-alias/short-row cases.
+
+**`SELECT rowid` through index ranges returned NULL (fixed).** The
+materialized `Project(IndexRange)` chain looked the rowid
+pseudo-column up by NAME in the decoded row's columns — which carry
+table columns only. `SELECT rowid FROM t WHERE a BETWEEN ? AND ?`
+gave NULL on every table shape (alias AND no-alias), while the
+IndexLookup twin worked (its projected variant resolves rowid via the
+`ROWID_PROJ` sentinel). New `exec_index_range_projected` mirrors the
+IndexLookup fusion: selective decode of ONLY the projected columns,
+`ROWID_PROJ` for bare `rowid`/`oid`/`_rowid_`, ONE table B+tree handle
+across the rowid batch, residual predicates full-decode + evaluate +
+project positionally (rowid appended for the evaluation only), and
+the same wide-selection merge scan as `exec_index_range` with
+position-indexed placement so emission order stays INDEX order.
+
+**Known gap (next unit): rowid inside EXPRESSIONS.** Bare
+`SELECT rowid` now works on every access path, but `rowid` referenced
+inside an expression (`SELECT rowid*2`, `max(rowid)`,
+`WHERE rowid % 2 = 0`) evaluates NULL through the materialized
+projection path — the row context carries table columns only, and
+only the bare-column fast paths know the `ROWID_PROJ` sentinel. The
+fix shape is sketched: planner-time rewrite of rowid spellings to the
+rowid-alias column for alias tables + a hidden appended rowid column
+for no-alias tables (star expansion must skip it). Documented here so
+the next sweep starts from the analysis, not the symptom.
