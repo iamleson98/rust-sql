@@ -108,6 +108,16 @@ static ALLOC_SETTLED: AtomicBool = AtomicBool::new(false);
 /// than the drain itself.
 const ALLOC_WAKE_THRESHOLD: u64 = 400_000;
 
+/// Mid-TRANSACTION drain cadence (estimated freed blocks): a long write
+/// transaction churns hundreds of MB of transient blocks, and mimalloc's
+/// delayed-free queues (purge_delay = -1 — pages return to the OS only at
+/// `mi_collect`) retain them all until the end-of-burst drain, so PEAK RSS
+/// scaled with storm size (~+12 MiB on a 1M-row txn where SQLite stays
+/// flat). Draining at this cadence returns pages mid-storm: the ~170 µs
+/// collect amortizes over the ~30k+ statements between drains, and the
+/// end-of-transaction drain still settles the wake for the next readers.
+const MID_TXN_DRAIN_BLOCKS: u64 = 2_000_000;
+
 /// Drain mimalloc's delayed-free wake: ~512 allocations across the small
 /// size classes (8..128 bytes) force the page-acquisition sweep that
 /// read-path allocations would otherwise pay after a bulk-write storm
@@ -3179,7 +3189,16 @@ impl Database {
         // counter) — each spills encode buffers + cell bytes, so weight it
         // as ~150 blocks.
         let blocks = 48 + changes * 6 + dirty_delta * 150;
-        self.alloc_burst.fetch_add(blocks, Ordering::Relaxed);
+        let now = self.alloc_burst.fetch_add(blocks, Ordering::Relaxed) + blocks;
+        // MID-TXN RSS GUARD (see MID_TXN_DRAIN_BLOCKS): periodic
+        // mi_collect while a transaction is open caps the retained
+        // high-water at the cadence instead of the whole storm. Does NOT
+        // touch ALLOC_SETTLED — the end-of-burst drain still runs once
+        // per process to settle the delayed-free wake.
+        if self.in_transaction.load(Ordering::Acquire) && now > MID_TXN_DRAIN_BLOCKS {
+            drain_mimalloc_wake();
+            self.alloc_burst.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Drain mimalloc's delayed-free wake when a write burst COMPLETES —

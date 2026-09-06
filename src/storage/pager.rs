@@ -418,10 +418,83 @@ impl Store {
     }
 }
 
+/// Path of the DELETE-mode mid-transaction page-spill sidecar.
+fn spill_path_for<P: AsRef<Path>>(db_path: P) -> PathBuf {
+    let mut p = db_path.as_ref().as_os_str().to_os_string();
+    p.push("-spill");
+    PathBuf::from(p)
+}
+
+/// DELETE-mode mid-transaction page spill: BOUNDED-RSS eviction for big
+/// write transactions (SQLite's own journal spill, shaped as a sidecar
+/// instead of a rollback journal). In DELETE mode a dirty page could
+/// never leave the cache mid-txn — the main file must keep the
+/// pre-BEGIN bytes until COMMIT — so a 1M-row insert txn held the whole
+/// database in memory (~47 MiB where SQLite peaks at ~10). Under cache
+/// pressure, dirty pages now append as `[u32 id][page bytes]` records
+/// to a `-spill` sidecar:
+/// - `get_page` misses re-read the newest (uncommitted) version from
+///   the spill map and re-cache it DIRTY (back under normal tracking),
+/// - COMMIT drains the records into the main file (with the other
+///   dirty pages, before the header — the crash ordering contract),
+/// - ROLLBACK just drops the file (the main file was never touched),
+/// - a crash mid-txn leaves a stale sidecar that the next open
+///   deletes (uncommitted spill is garbage).
+///
+/// The sidecar is disk, never RSS: the cache stays at its capacity
+/// bound and peak memory stops tracking database size.
+struct DeleteSpill {
+    file: std::fs::File,
+    /// page id -> byte offset of its NEWEST `[id][bytes]` record.
+    pages: std::collections::HashMap<PageId, u64, PageIdHashBuild>,
+}
+
+impl DeleteSpill {
+    /// Append a record for `id`; returns the record offset.
+    fn append(&mut self, id: PageId, data: &[u8]) -> Result<u64> {
+        use std::io::{Seek, SeekFrom, Write};
+        let off = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&id.to_le_bytes())?;
+        self.file.write_all(data)?;
+        Ok(off)
+    }
+
+    /// Read the page body of the record at `off` (the `[id][bytes]`
+    /// header is at `off`, the body at `off + 4`).
+    fn read_page_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        read_exact_at(&self.file, off + 4, buf)
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, off: u64, buf: &mut [u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.read_at(&mut buf[done..], off + done as u64)?;
+        if n == 0 {
+            return Err(Error::corruption("short read on the spill sidecar"));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &std::fs::File, off: u64, buf: &mut [u8]) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file;
+    f.seek(SeekFrom::Start(off))?;
+    f.read_exact(buf)?;
+    Ok(())
+}
+
 impl Pager {
     /// True when the backing store is the in-memory image (a `:memory:`
     /// database). In-memory payloads are this process's own encoder
     /// output — the basis for trusted TEXT decoding in the scan family.
+    /// In-memory stores never evict (the cache IS the store), so the
+    /// DELETE-mode spill never engages for them.
     pub fn is_memory(&self) -> bool {
         self.store.is_memory()
     }
@@ -529,8 +602,6 @@ pub struct Pager {
     /// keep the v3 magic until the next flush, so re-entry must not
     /// re-interpret an already-trunk freelist as legacy-linked).
     legacy_migrated: AtomicBool,
-    /// Write-Ahead Log state. `None` = journal_mode=delete (writes go
-    /// straight to the main file). `Some(...)` = journal_mode=wal: commits
     /// APPEND frames here, reads consult the committed-page map before the
     /// main file (WAL-served reads), and checkpoints copy pages back.
     ///
@@ -539,6 +610,11 @@ pub struct Pager {
     /// under the write lock. `Wal` itself is writer-only; the read path
     /// goes through `Wal::read_frame_at` on a shared handle.
     wal: RwLock<Option<WalState>>,
+    /// DELETE-mode mid-transaction page spill (see `DeleteSpill`):
+    /// `None` until the first cache-pressure eviction of a dirty page
+    /// during a write transaction; dropped (file deleted) at COMMIT
+    /// drain / ROLLBACK / close.
+    delete_spill: Mutex<Option<DeleteSpill>>,
     /// PRAGMA synchronous: 0=OFF, 1=NORMAL, 2=FULL (SQLite default).
     /// In WAL mode NORMAL skips the per-commit fsync (checkpoints carry
     /// durability) — SQLite's recommended high-throughput setting.
@@ -570,13 +646,31 @@ pub struct Pager {
     /// ROLLBACK TO <name> restores those bytes (in cache, marked dirty),
     /// drops pages allocated after the savepoint, and rewinds metadata.
     savepoints: Mutex<Vec<SavepointLevel>>,
-    /// MINIMUM `base.n_pages` across all stacked savepoint levels (u32::MAX
-    /// when none). A page id >= this can NEVER need a pre-image for any
-    /// level (all levels' bases are <= it), so `capture_savepoint_undo`
-    /// skips the lock + hash probe entirely — one relaxed atomic load.
-    /// Maintained at push (min never grows: a new level's base is the
-    /// CURRENT n_pages, >= every existing base) and pop/clear (recompute).
+    /// TRUNCATE FLOOR: the MINIMUM `base.n_pages` across all stacked
+    /// savepoint levels (u32::MAX when none). Pages below it were alive
+    /// before the transaction began and are logged in at least one undo
+    /// map — `truncate_tail`'s rewind must never cross it (a ROLLBACK
+    /// `get_page(id)` would fail past a rewound n_pages). Pages at or
+    /// above the floor were allocated during the current transaction,
+    /// so dropping them is rollback-safe. Maintained at push / pop /
+    /// rollback / clear. (The CAPTURE fast path is the separate
+    /// MAXIMUM-based `savepoint_capture_gate` — see its docs.)
     savepoint_min_base: std::sync::atomic::AtomicU32,
+    /// Capture GATE for `capture_savepoint_undo`'s range fast path: the
+    /// MAXIMUM base n_pages across all savepoint levels. A page at or
+    /// above it was allocated after EVERY level's base, so no level can
+    /// hold (or need) its pre-image — the capture loop's per-level
+    /// `id < level.base.n_pages` check would insert into none of them.
+    /// Distinct from `savepoint_min_base` (the truncate FLOOR — pages
+    /// below the LOWEST base exist in at least one undo map): pages
+    /// between the floor and the gate were allocated after BEGIN but
+    /// BEFORE an upper savepoint, and they DO need pre-images in the
+    /// upper levels (their state at the savepoint is rollback state).
+    /// The old single min-based gate skipped those captures — a nested
+    /// savepoint's ROLLBACK TO then left mid-tree pages mutated (root
+    /// splits during cache-pressure storms exposed it as out-of-range
+    /// page walks).
+    savepoint_capture_gate: std::sync::atomic::AtomicU32,
     /// Mirror of `savepoints.len()` for the get_page fast path (an atomic
     /// load when no savepoint is active — the common case — instead of a
     /// Mutex lock).
@@ -824,10 +918,13 @@ impl Pager {
             pages: std::collections::HashMap::default(),
         });
         // A new level's base is the CURRENT n_pages (>= every existing
-        // base — pages only grow), so the min cannot shrink here; the
-        // store keeps the invariant explicit.
+        // base — pages only grow), so the min cannot shrink and the max
+        // IS the new level's base; the stores keep both invariants
+        // explicit.
         let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
         self.savepoint_min_base.store(m, Ordering::Relaxed);
+        let g = sp.iter().map(|s| s.base.n_pages).max().unwrap_or(u32::MAX);
+        self.savepoint_capture_gate.store(g, Ordering::Relaxed);
         self.savepoint_depth.store(sp.len(), Ordering::Release);
         // Committed-view bound cache: the FIRST level is the txn base.
         if let Some(base) = sp.first().map(|s| s.base.n_pages) {
@@ -873,6 +970,18 @@ impl Pager {
             // re-push, which keeps the same base. No update needed.
             (level.pages, level.base)
         };
+        // The stack was re-shaped above (levels above this savepoint
+        // truncated away, the level itself re-pushed with its base):
+        // recompute both derived bounds — a stale GATE (from a dropped,
+        // higher-base level) would skip needed captures; a stale FLOOR
+        // would mis-gate tail truncation.
+        {
+            let sp = self.savepoints.lock();
+            let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
+            self.savepoint_min_base.store(m, Ordering::Relaxed);
+            let g = sp.iter().map(|s| s.base.n_pages).max().unwrap_or(u32::MAX);
+            self.savepoint_capture_gate.store(g, Ordering::Relaxed);
+        }
         // Phase 2 (no savepoints lock): restore pre-images for pages that
         // existed at savepoint time. Pages below this savepoint keep their
         // existing undo entries (any page in OUR log was fetched after the
@@ -965,6 +1074,8 @@ impl Pager {
         let remaining = sp.len();
         let m = sp.iter().map(|s| s.base.n_pages).min().unwrap_or(u32::MAX);
         self.savepoint_min_base.store(m, Ordering::Relaxed);
+        let g = sp.iter().map(|s| s.base.n_pages).max().unwrap_or(u32::MAX);
+        self.savepoint_capture_gate.store(g, Ordering::Relaxed);
         self.savepoint_depth.store(remaining, Ordering::Release);
         // Releasing the bottom level re-bases the committed view (the
         // savepoint-txn COMMIT path — releasing the outermost savepoint
@@ -1000,6 +1111,8 @@ impl Pager {
         }
         sp.clear();
         self.savepoint_min_base.store(u32::MAX, Ordering::Relaxed);
+        self.savepoint_capture_gate
+            .store(u32::MAX, Ordering::Relaxed);
         self.savepoint_depth.store(0, Ordering::Release);
         self.committed_bound_cache.store(0, Ordering::Release);
         // The transaction ended: unfreeze the committed-view hint epoch.
@@ -1022,6 +1135,9 @@ impl Pager {
             }
         };
         let restored = self.rollback_savepoint(&bottom_name)?;
+        // The savepoint stack is going away: any DELETE-mode spill records
+        // are this transaction's uncommitted mutations being discarded.
+        self.drop_delete_spill();
         self.clear_savepoints();
         Ok(restored.is_some())
     }
@@ -1041,8 +1157,14 @@ impl Pager {
         // allocates all its leaves after BEGIN, so this one atomic load
         // replaces a Mutex + HashMap probe + level scan on EVERY get_page
         // of the write storm (~60-100 ns x 6+ pages/row on multi-index
-        // loads — the dominant per-row overhead vs SQLite).
-        if (id as u64) >= self.savepoint_min_base.load(Ordering::Relaxed) as u64 {
+        // loads — the dominant per-row overhead vs SQLite). The gate is
+        // the MAXIMUM base (pages below it existed within at least the
+        // newest level's lifetime and may need pre-images there); the
+        // pre-fix MIN-based gate wrongly skipped pages allocated between
+        // BEGIN and an upper savepoint — ROLLBACK TO that savepoint then
+        // left their mutations in place (mid-tree pages pointing at
+        // rewound ids).
+        if (id as u64) >= self.savepoint_capture_gate.load(Ordering::Relaxed) as u64 {
             return;
         }
         let mut sp = self.savepoints.lock();
@@ -1140,6 +1262,12 @@ impl Drop for Pager {
         if self.wal.read().is_some() {
             let _ = self.checkpoint_wal();
             let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(&self.path));
+        }
+        // DELETE-mode spill sidecar: uncommitted cache-pressure records.
+        // A clean close either already drained them (COMMIT ran flush) or
+        // the transaction was abandoned — both leave garbage. Best-effort.
+        if self.delete_spill.lock().is_some() {
+            let _ = std::fs::remove_file(spill_path_for(&self.path));
         }
     }
 }
@@ -1256,6 +1384,7 @@ impl Pager {
             dirty_pages: Mutex::new(PageIdSet::default()),
             write_version: std::sync::atomic::AtomicU64::new(0),
             wal: RwLock::new(None),
+            delete_spill: Mutex::new(None),
             synchronous: std::sync::atomic::AtomicU8::new(2),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             instance_id: PAGER_INSTANCE_COUNTER
@@ -1264,6 +1393,7 @@ impl Pager {
                 .unwrap_or(0),
             savepoints: Mutex::new(Vec::new()),
             savepoint_min_base: std::sync::atomic::AtomicU32::new(u32::MAX),
+            savepoint_capture_gate: std::sync::atomic::AtomicU32::new(u32::MAX),
             savepoint_depth: std::sync::atomic::AtomicUsize::new(0),
             codec: RwLock::new(crate::plugin::codec::CodecState::default()),
             required_codec: Mutex::new(None),
@@ -1305,6 +1435,13 @@ impl Pager {
                         .unwrap_or(false)
                 {
                     pager.enable_wal()?;
+                }
+                // Crash recovery: a leftover -spill sidecar is UNCOMMITTED
+                // work from a transaction that never committed (the main
+                // file was never touched mid-txn). Garbage — delete it.
+                let spill_file = spill_path_for(&pager.path);
+                if spill_file.exists() {
+                    let _ = std::fs::remove_file(&spill_file);
                 }
             }
         }
@@ -1878,6 +2015,18 @@ impl Pager {
                 if let Some(state) = wal_guard.as_mut() {
                     if let Some(offset) = state.spilled.remove(&id) {
                         state.wal.read_frame_at(offset, &mut page.data)?;
+                        spilled_hit = true;
+                    }
+                }
+            }
+            // DELETE-mode spill hit: same un-spill semantics as the WAL
+            // path above — the newest (uncommitted) version re-enters the
+            // cache as DIRTY, back under normal dirty tracking.
+            if !spilled_hit {
+                let mut spill_guard = self.delete_spill.lock();
+                if let Some(spill) = spill_guard.as_mut() {
+                    if let Some(off) = spill.pages.remove(&id) {
+                        spill.read_page_at(off, &mut page.data)?;
                         spilled_hit = true;
                     }
                 }
@@ -3528,6 +3677,36 @@ impl Pager {
         self.retired.store(true, Ordering::Release);
     }
 
+    /// Discard the DELETE-mode spill sidecar (records + file). Called
+    /// from the ROLLBACK paths (the spilled records are uncommitted
+    /// work) and best-effort from `Drop`.
+    fn drop_delete_spill(&self) {
+        let mut spill_guard = self.delete_spill.lock();
+        if let Some(spill) = spill_guard.take() {
+            drop(spill);
+            let _ = std::fs::remove_file(spill_path_for(&self.path));
+        }
+    }
+
+    /// True when no page is currently spilled to the DELETE-mode
+    /// sidecar (quiescent-state check for journal-mode switches and
+    /// integrity probes).
+    pub fn delete_spill_empty(&self) -> bool {
+        self.delete_spill
+            .lock()
+            .as_ref()
+            .map_or(true, |s| s.pages.is_empty())
+    }
+
+    /// DELETE-mode rollback of the bottom savepoint: the spill records
+    /// are uncommitted mutations being rolled back — discard them. (The
+    /// pre-images of pre-existing pages restore IN-CACHE; pages
+    /// allocated this transaction are dropped from the cache, and their
+    /// spilled records die with this drop.)
+    pub fn drop_spill_for_rollback(&self) {
+        self.drop_delete_spill();
+    }
+
     pub fn flush(&self) -> Result<()> {
         // LAZY WRITE-BACK MODE (in-memory databases): pure no-op. Do NOT
         // clear the dirty bookkeeping — the dirty_pages set and count are
@@ -3643,6 +3822,33 @@ impl Pager {
             }
         }
 
+        // DELETE-MODE SPILL DRAIN: mid-transaction cache-pressure evictions
+        // wrote the newest uncommitted versions to the sidecar (never the
+        // main file). This is the COMMIT moment — copy every spilled record
+        // into the main file, still BEFORE the header write (the crash
+        // ordering contract: data pages first, header last). A partially
+        // failed drain behaves exactly like a failed dirty-page write above
+        // (the error propagates; ROLLBACK discards the rest).
+        {
+            let mut spill_guard = self.delete_spill.lock();
+            if let Some(spill) = spill_guard.as_mut() {
+                if !spill.pages.is_empty() {
+                    let psz = self.page_size() as usize;
+                    let mut buf = vec![0u8; psz];
+                    let entries: Vec<(PageId, u64)> = spill.pages.drain().collect();
+                    for (id, off) in entries {
+                        spill.read_page_at(off, &mut buf)?;
+                        self.codec_write_page(id, &buf)?;
+                    }
+                    // Reset the sidecar for the next transaction (truncate
+                    // in place — cheaper than delete + recreate).
+                    use std::io::Write;
+                    let _ = spill.file.set_len(0);
+                    let _ = spill.file.flush();
+                }
+            }
+        }
+
         // ---- header LAST: every other page is durable; NOW commit the
         // new page count. A crash before this point leaves the old
         // (smaller or equal) n_pages with a file that covers it. ----
@@ -3736,6 +3942,10 @@ impl Pager {
     /// and truncates the file back to `n_pages` if the transaction allocated
     /// new pages.
     pub fn rollback_to(&self, snap: &PagerSnapshot) -> Result<()> {
+        // 0. DROP the DELETE-mode spill: its records are this
+        // transaction's uncommitted work (the main file was never
+        // touched mid-txn), so rollback simply discards them.
+        self.drop_delete_spill();
         // 1. Drop the entire cache.
         {
             let mut cache = self.cache.write();
@@ -3871,7 +4081,51 @@ impl Pager {
                                         Err(_) => false,
                                     }
                                 } else {
-                                    false
+                                    // DELETE mode (no WAL): spill the dirty
+                                    // page to the sidecar so eviction can
+                                    // proceed WITHOUT touching the main file
+                                    // mid-transaction (its bytes must stay
+                                    // pre-BEGIN until COMMIT). The newest
+                                    // version is re-read from the spill on
+                                    // the next get_page miss; COMMIT drains
+                                    // the records into the main file; a
+                                    // failure keeps the page cached (retry).
+                                    let mut spill = self.delete_spill.lock();
+                                    match spill.as_mut() {
+                                        Some(s) => match s.append(evict_id, &pg.data) {
+                                            Ok(off) => {
+                                                s.pages.insert(evict_id, off);
+                                                true
+                                            }
+                                            Err(_) => false,
+                                        },
+                                        None => {
+                                            let path = spill_path_for(&self.path);
+                                            match OpenOptions::new()
+                                                .read(true)
+                                                .write(true)
+                                                .create(true)
+                                                .truncate(true)
+                                                .open(&path)
+                                            {
+                                                Ok(file) => {
+                                                    let mut s = DeleteSpill {
+                                                        file,
+                                                        pages: std::collections::HashMap::default(),
+                                                    };
+                                                    match s.append(evict_id, &pg.data) {
+                                                        Ok(off) => {
+                                                            s.pages.insert(evict_id, off);
+                                                            *spill = Some(s);
+                                                            true
+                                                        }
+                                                        Err(_) => false,
+                                                    }
+                                                }
+                                                Err(_) => false,
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
                                 false
