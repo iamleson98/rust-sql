@@ -2770,21 +2770,109 @@ impl Pager {
             return Ok(());
         }
         let psz = self.page_size();
+        // Frames for pages at or beyond an ARMED truncation bound are
+        // about to be discarded by this checkpoint's own set_len —
+        // copying them into the main file first is pure waste (VACUUM's
+        // tail retirement leaves hundreds of dead frames in the WAL).
+        let trunc = self.pending_truncate.load(Ordering::Acquire);
         // Sort page ids for sequential main-file writes.
-        let mut ids: Vec<PageId> = state.map.keys().copied().collect();
+        let mut ids: Vec<PageId> = state
+            .map
+            .keys()
+            .copied()
+            .filter(|&id| trunc == 0 || (id as u64) < trunc as u64)
+            .collect();
         ids.sort_unstable();
-        let mut buf = vec![0u8; psz as usize];
-        // Header (page 0) goes LAST (crash safety — see
-        // flush_inner_delete's ordering contract): every other page is
-        // copied back before the n_pages-bearing header commit.
-        for id in ids.iter().copied().filter(|&id| id != 0) {
-            let offset = state.map[&id];
-            state.wal.read_frame_at(offset, &mut buf)?;
-            self.write_file_at(id as u64 * psz as u64, &buf)?;
+        // CACHE-FIRST GATHER (before the WAL lock is taken — the cache
+        // and WAL locks have a fixed acquisition order elsewhere, e.g.
+        // truncate_tail takes cache -> wal, so probing the cache under
+        // the wal write lock would be an ABBA deadlock). Every
+        // page-cached id is served by a ~100 ns cache hit + memcpy
+        // instead of a ~1 us WAL pread; only cache misses pay the frame
+        // read under the lock below. Checkpoint callers hold the engine
+        // write lock, so the cached bytes are stable.
+        let cached: Vec<Option<Vec<u8>>> = {
+            let cache = self.cache.read();
+            ids.iter()
+                .map(|&id| {
+                    cache.get(id).map(|pr| {
+                        let b = pr.lock();
+                        b.data.clone()
+                    })
+                })
+                .collect()
+        };
+        // COALESCED RUNS: consecutive page ids are contiguous in the
+        // main file; when their frame offsets are ALSO consecutive
+        // (flush_wal appends sorted, so they usually are), one read+write
+        // pair moves the whole run. A 500-page commit checkpoints as ONE
+        // 2 MiB pwrite instead of 500 4 KiB syscalls.
+        let flush_run = |run_id: u64, buf: &[u8]| -> Result<()> {
+            if !buf.is_empty() {
+                self.write_file_at(run_id * psz as u64, buf)?;
+            }
+            Ok(())
+        };
+        let mut run_start: Option<u64> = None; // first page id of the current run
+        let _run_off: u64 = 0;
+        let mut run_buf: Vec<u8> = Vec::new();
+        let mut frame = vec![0u8; psz as usize];
+        for (idx, &id) in ids.iter().enumerate() {
+            if id == 0 {
+                continue; // header goes LAST (crash safety)
+            }
+            let bytes: &[u8] = if let Some(b) = cached.get(idx).and_then(|o| o.as_deref()) {
+                b
+            } else {
+                let off = state.map[&id];
+                state.wal.read_frame_at(off, &mut frame)?;
+                &frame[..]
+            };
+            let contiguous = match run_start {
+                Some(s) => (s + (run_buf.len() / psz as usize) as u64) == id as u64,
+                None => false,
+            };
+            if !contiguous {
+                flush_run(run_start.unwrap_or(0), &run_buf)?;
+                run_buf.clear();
+                run_start = Some(id as u64);
+                let _ = state.map[&id];
+            }
+            run_buf.extend_from_slice(bytes);
         }
+        flush_run(run_start.unwrap_or(0), &run_buf)?;
+        // Header (page 0) LAST (crash safety — see flush_inner_delete's
+        // ordering contract): the n_pages-bearing header commit lands
+        // after every other page.
         if let Some(&offset) = state.map.get(&0) {
-            state.wal.read_frame_at(offset, &mut buf)?;
-            self.write_file_at(0, &buf)?;
+            if trunc == 0 {
+                let mut buf = vec![0u8; psz as usize];
+                state.wal.read_frame_at(offset, &mut buf)?;
+                self.write_file_at(0, &buf)?;
+            } else {
+                // The header carries the truncation's new page count —
+                // write it even when a truncation is armed (it is the
+                // commit record for the compact state). Prefer the
+                // in-cache bytes (flush_wal refreshed them from the
+                // atomics).
+                let buf: Vec<u8> = {
+                    let cache = self.cache.read();
+                    cache
+                        .get(0)
+                        .map(|pr| {
+                            let b = pr.lock();
+                            b.data.clone()
+                        })
+                        .unwrap_or_default()
+                };
+                if !buf.is_empty() {
+                    self.write_file_at(0, &buf)?;
+                } else {
+                    let mut b = vec![0u8; psz as usize];
+                    state.wal.read_frame_at(offset, &mut b)?;
+                    self.write_file_at(0, &b)?;
+                }
+            }
         }
         // Ensure the main file covers every page we just wrote (the file
         // may be shorter than the committed page count — new pages live
@@ -2796,10 +2884,18 @@ impl Pager {
             self.store.set_len(want_len)?;
         }
         self.pending_truncate.store(0, Ordering::Release);
-        if !self.skip_fsync.load(Ordering::Acquire) {
+        // SQLite WAL durability semantics at checkpoint: OFF never syncs;
+        // NORMAL syncs the WAL's committed frames to disk before the WAL
+        // reset discards them (the durability point for NORMAL commits);
+        // FULL/extra additionally synced at commit time (flush_wal). The
+        // old unconditional sync made `PRAGMA synchronous=OFF` pay a full
+        // fsync per checkpoint — a parity break vs SQLite (and ~2 ms on
+        // rotational-ish storage per VACUUM).
+        let sync_mode = self.synchronous.load(Ordering::Acquire);
+        if sync_mode >= 1 && !self.skip_fsync.load(Ordering::Acquire) {
             self.store.sync_all()?;
         }
-        state.wal.reset()?;
+        state.wal.reset_synced(sync_mode >= 1)?;
         state.map.clear();
         Ok(())
     }
@@ -2829,7 +2925,7 @@ impl Pager {
         self.dirty_pages.lock().insert(0);
 
         // --- collect dirty page ids ---
-        let dirty_ids: Vec<PageId> = {
+        let mut dirty_ids: Vec<PageId> = {
             let mut set = self.dirty_pages.lock();
             let ids = set.drain().collect::<Vec<_>>();
             // The set was drained — reset the last-noted hint so a page
@@ -2846,6 +2942,12 @@ impl Pager {
             self.dirty_count_approx.store(0, Ordering::Release);
             return Ok(());
         }
+        // Page-ordered frames: a sorted append makes consecutive pages
+        // land at consecutive WAL offsets, which lets `checkpoint_wal`
+        // coalesce them into one contiguous read+write per run (a
+        // 500-page commit checkpoints as ONE 2 MiB pwrite instead of 500
+        // 4 KiB syscalls).
+        dirty_ids.sort_unstable();
 
         // --- append frames under the WAL write lock ---
         let mut frame_offsets: Vec<(PageId, u64)> = Vec::with_capacity(dirty_ids.len());
@@ -3077,6 +3179,160 @@ impl Pager {
     /// True when the pager is in WAL journal mode.
     pub fn wal_active(&self) -> bool {
         self.wal.read().is_some()
+    }
+
+    /// IN-PLACE VACUUM install (WAL file stores, no codec): compact the
+    /// live pages down to a dense prefix {0, 1, .., n-1} directly in the
+    /// page cache, then commit once and checkpoint — SQLite's own VACUUM
+    /// shape, without building a transient image. The plan (see
+    /// `vacuum::plan_in_place_compaction`) is MONOTONE: every page moves
+    /// to a slot <= its old id, so an ascending-new-id move loop can
+    /// never overwrite a source page before its bytes are read.
+    ///
+    /// Per page: one 8 KiB copy when it moves (zero when it stays), plus
+    /// surgical 4-byte reference patches (interior children, right-most
+    /// pointers, leaf overflow-chain heads, overflow next links) — only
+    /// the patches whose referenced page actually moved. A fully-dense
+    /// database (the steady state after a previous VACUUM, or
+    /// bulk-load + suffix-DELETE churn) moves NOTHING: the whole VACUUM
+    /// is one header commit + tail truncation.
+    ///
+    /// Crash safety: identical to `install_compact_image` — the single
+    /// commit frame's header atomically records the new n_pages,
+    /// freelist, and cookie; the checkpoint then applies the armed
+    /// physical truncation.
+    pub(crate) fn install_in_place_compaction(
+        &self,
+        plan: &crate::storage::vacuum::InPlaceCompaction,
+    ) -> Result<()> {
+        if self.wal.read().is_none() {
+            return Err(Error::InvalidArgument(
+                "install_in_place_compaction requires WAL mode".into(),
+            ));
+        }
+        let old_n = self.n_pages.load(Ordering::Acquire);
+        let new_n = plan.sorted.len() as u32;
+        // 1. THE MOVES (ascending new id — see the monotonicity argument
+        //    above). Slot k's destination page is created directly on a
+        //    cache miss (no disk read: whatever bytes it holds are about
+        //    to be overwritten).
+        let psz = self.page_size() as usize;
+        for k in 1..new_n {
+            let o = plan.sorted[k as usize];
+            if o == k && !plan.refs.contains_key(&o) {
+                continue; // identity, no referenced page moved
+            }
+            let o_ref = if o == k {
+                None // patch in place: no copy
+            } else {
+                Some(self.get_page(o)?)
+            };
+            // Destination: cached, or created fresh (no file read).
+            let dst = {
+                let cache = self.cache.read();
+                cache.get(k).cloned()
+            };
+            let dst = match dst {
+                Some(pr) => pr,
+                None => {
+                    let pr: PageRef =
+                        Arc::new(Mutex::new(crate::storage::page::Page::new(k, psz as u32)));
+                    let mut cache = self.cache.write();
+                    cache.insert(k, pr.clone());
+                    pr
+                }
+            };
+            if let Some(src) = &o_ref {
+                let s = src.lock();
+                let mut d = dst.lock();
+                d.data.copy_from_slice(&s.data);
+                d.dirty = true;
+            }
+            // Reference patches: rewrite the 4-byte page ids whose
+            // targets moved. Identity pages take surgical in-place
+            // writes only.
+            if let Some(rlist) = plan.refs.get(&o) {
+                let mut d = dst.lock();
+                let mut changed = false;
+                for &(off, old_ref) in rlist {
+                    if let Some(&nr) = plan.map.get(&old_ref) {
+                        if nr != old_ref {
+                            let off = off as usize;
+                            if off + 4 <= d.data.len() {
+                                d.data[off..off + 4].copy_from_slice(&nr.to_be_bytes());
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    d.dirty = true;
+                }
+            }
+            self.note_dirty(k);
+            self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+        }
+        // 1b. Schema-row rootpage patches: the roots that moved are
+        //     re-anchored in the schema rows' column-3 bodies (same tag,
+        //     same byte width — verified at plan time). Applied at each
+        //     schema leaf's NEW slot after the moves.
+        for patch in &plan.schema_patches {
+            let slot = plan
+                .map
+                .get(&patch.leaf_old)
+                .copied()
+                .unwrap_or(patch.leaf_old);
+            let leaf = self.get_page(slot)?;
+            {
+                let mut d = leaf.lock();
+                let off = patch.body_off as usize;
+                let end = off + patch.width as usize;
+                if end <= d.data.len() {
+                    let v = patch.new_root as i64;
+                    for i in 0..patch.width as usize {
+                        d.data[off + i] = ((v >> (8 * i)) & 0xFF) as u8; // LE body
+                    }
+                    d.dirty = true;
+                } else {
+                    return Err(Error::corruption(format!(
+                        "in-place vacuum: schema rootpage patch out of bounds (page {slot})"
+                    )));
+                }
+            }
+            self.note_dirty(slot);
+            self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+        }
+        // 2. Reset the freelist BEFORE the tail retirement: moved pages
+        //    may have overwritten in-range freelist trunk pages, so the
+        //    trunk-chain scrub inside truncate_tail must not walk them.
+        //    The compact image has no freelist by construction.
+        self.freelist_head.store(0, Ordering::Release);
+        self.freelist_count.store(0, Ordering::Release);
+        // 3. Retire the tail through the standard truncate path (cache /
+        //    LRU / dirty / WAL-map eviction, n_pages rewind, armed
+        //    physical truncation). With the head reset above, the scrub
+        //    is a no-op walk.
+        if new_n < old_n {
+            let freed: Vec<PageId> = (new_n..old_n).collect();
+            self.truncate_tail(&freed)?;
+        }
+        // 4. The cookie must change — statement plans keyed on it
+        //    rebuild; flush_wal materializes page 0's header FROM these
+        //    atomics.
+        self.schema_cookie.fetch_add(1, Ordering::AcqRel);
+        // 5. Ensure flush() does not take its O(1) clean fast path
+        //    (new_n == old_n with no moves retired nothing).
+        self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+        // 6. The single VACUUM commit: the refreshed header page plus
+        //    every moved page as WAL frames.
+        self.flush()?;
+        // 7. Copy the committed frames into the main file, apply the
+        //    armed truncation, and reset the WAL.
+        self.checkpoint_wal()?;
+        // 8. Stale BEGIN-time pre-images from earlier committed-view
+        //    scopes must not serve old-tree bytes over the compact state.
+        self.clear_committed_view();
+        Ok(())
     }
 
     /// Retire this pager: its database file is about to be replaced out

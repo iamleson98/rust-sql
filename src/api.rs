@@ -2017,6 +2017,33 @@ impl Database {
             self.pager.checkpoint_wal()?;
         }
 
+        // IN-PLACE FAST PATH (WAL install only): compact the live pages
+        // directly in the page cache — no transient image, one commit +
+        // checkpoint (SQLite's own VACUUM shape). A monotone old->new
+        // plan moves each page at most one 8 KiB copy downward; a
+        // fully-dense database (steady state, or bulk load + suffix
+        // DELETE churn) moves NOTHING. Shapes an in-place plan cannot
+        // cover (an object root would move — schema rootpage columns
+        // would need re-encoding) keep the image path below; VACUUM INTO
+        // always takes the image path (it needs the bytes).
+        if wal_install && v.into.is_none() {
+            let roots = self.object_roots_from_schema()?;
+            let plan = crate::storage::vacuum::plan_in_place_compaction(&self.pager, &roots)?;
+            if let Some(plan) = plan {
+                self.pager.install_in_place_compaction(&plan)?;
+                // Roots did not move (identity layout), but the cookie
+                // changed and every statement-level cache must revalidate
+                // — reload through the standard adopt path (cheap: the
+                // schema tree is a handful of pages). last_insert_rowid
+                // survives untouched (SQLite keeps it across VACUUM).
+                let mut catalog = Catalog::new();
+                catalog.schema_cookie = self.pager.schema_cookie();
+                load_schema(&self.pager, &mut catalog)?;
+                self.adopt_catalog_after_vacuum(catalog);
+                return Ok(());
+            }
+        }
+
         let image = self.build_compact_image()?;
 
         // VACUUM INTO 'file': SQLite refuses to overwrite.
@@ -2143,6 +2170,22 @@ impl Database {
             }
         }
         self.build_compact_image_rows()
+    }
+
+    /// Read the schema rows and extract every object's root page id
+    /// (tables, indexes — the roots whose trees a VACUUM must preserve).
+    fn object_roots_from_schema(&self) -> Result<Vec<u32>> {
+        let mut roots: Vec<u32> = Vec::new();
+        let mut bt = Btree::new(&self.pager, 0, false);
+        bt.scan_table(|_, payload| {
+            if let Ok(row) = decode_row(payload, 5, 0, None) {
+                if let Some((_, _, _, root, _)) = crate::schema::decode_schema_row(&row) {
+                    roots.push(root);
+                }
+            }
+            true
+        })?;
+        Ok(roots)
     }
 
     /// Page-level compact copy (see `build_compact_image`). Returns None

@@ -333,13 +333,23 @@ impl Wal {
 
     /// Reset the WAL to empty. Called after a checkpoint.
     pub fn reset(&mut self) -> Result<()> {
+        self.reset_synced(true)
+    }
+
+    /// Reset the WAL to a fresh header. `sync=false` skips the header
+    /// fsync — `PRAGMA synchronous=OFF` checkpoints must not pay it
+    /// (SQLite's WAL reset under OFF is a plain header rewrite; the
+    /// durability point is the caller's to decide).
+    pub fn reset_synced(&mut self, sync: bool) -> Result<()> {
         self.header = WalHeader::new(self.page_size);
         self.checksum = (self.header.checksum1, self.header.checksum2);
         self.n_frames = 0;
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&self.header.encode())?;
-        self.file.sync_all()?;
+        if sync {
+            self.file.sync_all()?;
+        }
         Ok(())
     }
 
