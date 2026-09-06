@@ -604,7 +604,7 @@ pub struct Pager {
     /// and at transaction boundaries (`clear_savepoints` removes the
     /// transaction's touched pages; DDL / savepoint ops / VACUUM clear
     /// everything).
-    committed_pages: RwLock<std::collections::HashMap<PageId, PageRef, PageIdHashBuild>>,
+    committed_pages: RwLock<std::collections::HashMap<PageId, CommittedEntry, PageIdHashBuild>>,
     /// Set when a committed-view read served BEGIN-time bytes that differ
     /// from the live cache (pre-images / their memoized copies). Retired
     /// by `CommittedViewGuard::drop` with a single write-epoch bump so
@@ -688,6 +688,57 @@ thread_local! {
     static COMMITTED_VIEW: std::cell::Cell<Option<(u64, u32)>> =
         const { std::cell::Cell::new(None) };
 }
+
+/// A committed-view materialization-cache entry: the shared `PageRef`
+/// plus whether it ALIASES the live cache (path 3: the writer never
+/// fetched this page this transaction, so the live bytes ARE the
+/// committed bytes) or is a pre-image COPY (path 1: BEGIN-time bytes,
+/// always different-or-divergent from live).
+///
+/// The alias bit is decided at INSERT time and never changes: an alias
+/// dies at the writer's first fetch (capture-side invalidation removes
+/// the entry and bumps the epoch) — it can never quietly become a
+/// copy. (The old code re-derived alias-ness on every hit by
+/// cross-probing the LIVE cache with a second read lock per page
+/// fetch — under N concurrent readers that lock word ping-ponged and
+/// dominated the committed-view cost. Statically latched at insert,
+/// the bytes-equivalence invariant carries the same correctness: a
+/// live-page eviction + re-fetch never mutates the entry's PageRef.)
+#[derive(Clone)]
+struct CommittedEntry {
+    pr: PageRef,
+    alias: bool,
+}
+
+/// Per-thread memo of the shared committed-view map. The 1W+7R reader
+/// shape re-fetches the same ~40-60 pages every query (root, interior,
+/// and the working-set leaves): the shared map's read lock is an RMW
+/// on one cache line, so N readers ping-pong it per page fetch. The
+/// memo serves repeat fetches from thread-local storage (no lock, no
+/// shared-line traffic) and validates with ONE read-only epoch load:
+/// the committed-view epoch moves on every invalidating event, so a
+/// matching token proves every memoized entry is still the shared
+/// map's current content.
+///
+/// Capped at [`COMMITTED_MEMO_CAP`] pages: scan-shaped readers beyond
+/// the cap fall back to the shared map (same as pre-memo behavior);
+/// OLTP working sets (the contended shape) fit comfortably.
+struct CommittedMemo {
+    instance: u64,
+    token: u64,
+    pages: std::collections::HashMap<PageId, CommittedEntry, PageIdHashBuild>,
+}
+
+thread_local! {
+    static COMMITTED_MEMO: std::cell::RefCell<Option<CommittedMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hard cap on the per-thread committed-view memo: 256 pages x 4 KiB
+/// = 1 MiB per reader thread — the interior-node working set of even
+/// large tables is tens of pages; hot leaf ranges fit under a few
+/// hundred.
+const COMMITTED_MEMO_CAP: usize = 256;
 
 /// Hard cap on the committed-view materialization cache (pages). See
 /// `cache_committed_page`: bounds the extra footprint of concurrent
@@ -1980,7 +2031,17 @@ impl Pager {
     /// the BEGIN-time state is either restored (rollback), superseded
     /// (commit — the live cache is now the committed state), or
     /// re-baselined (a new BEGIN).
+    ///
+    /// The epoch bump is the INVALIDATION EVENT for the per-thread
+    /// committed-view memos (see `COMMITTED_MEMO`): every entry the
+    /// clear removes must also die in every thread's memo, and the
+    /// moved epoch is what proves that on the next probe. (BEGIN does
+    /// NOT clear — see `set_committed_view_epoch` — but the boundary
+    /// that clears here always moves the token, and a BEGIN without
+    /// intervening writes stores a token whose content provably did
+    /// not change.)
     pub fn clear_committed_view(&self) {
+        self.committed_view_epoch.fetch_add(1, Ordering::AcqRel);
         self.committed_pages.write().clear();
     }
 
@@ -2027,18 +2088,43 @@ impl Pager {
         // rebuilds hints, every drop would bump write_version: a
         // reader-induced invalidation feedback loop that kept 1W+7R
         // readers rebuilding their descent hints per query.
+        //
+        // Fastest tier — the per-thread MEMO: no shared lock, no shared
+        // cache-line RMW. Validated by the committed-view epoch (moved by
+        // EVERY invalidating event: capture-kill bump, clear bump,
+        // clear_savepoints reset-to-zero) and the pager instance; a
+        // matching token proves the entry is still the shared map's
+        // current content. Under N concurrent committed-view readers the
+        // shared map's read lock is a ping-ponging cache line — this
+        // tier is what keeps reader throughput at uncontended speed.
+        let token = self.committed_view_epoch.load(Ordering::Acquire);
+        let memo_hit: Option<CommittedEntry> = COMMITTED_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            match m.as_mut() {
+                Some(memo) if memo.instance == self.instance_id && memo.token == token => {
+                    memo.pages.get(&id).cloned()
+                }
+                _ => None,
+            }
+        });
+        if let Some(entry) = memo_hit {
+            if !entry.alias {
+                self.committed_poison.store(true, Ordering::Release);
+            }
+            return Ok(entry.pr);
+        }
+        // Shared tier: one read-lock probe. On hit, also populate the
+        // memo (resetting it first when its token/instance went stale).
         {
             let cp = self.committed_pages.read();
-            if let Some(pr) = cp.get(&id) {
-                let aliases_live = self
-                    .cache
-                    .read()
-                    .get(id)
-                    .is_some_and(|live| std::sync::Arc::ptr_eq(live, pr));
-                if !aliases_live {
+            if let Some(entry) = cp.get(&id) {
+                let entry = entry.clone();
+                drop(cp);
+                if !entry.alias {
                     self.committed_poison.store(true, Ordering::Release);
                 }
-                return Ok(Arc::clone(pr));
+                self.memo_committed_page(id, &entry, token);
+                return Ok(entry.pr);
             }
         }
         let psz = self.page_size();
@@ -2051,12 +2137,14 @@ impl Pager {
                 let mut page = Page::new(id, psz);
                 page.data.copy_from_slice(bytes);
                 let pr: PageRef = Arc::new(Mutex::new(page));
-                self.cache_committed_page(id, &pr);
+                let entry = CommittedEntry { pr, alias: false };
+                self.cache_committed_page(id, &entry);
+                self.memo_committed_page(id, &entry, token);
                 // BEGIN-time bytes ≠ live cache for writer-fetched pages:
                 // the scope's drop must retire advisory-cache state built
                 // from these bytes (single write-epoch bump).
                 self.committed_poison.store(true, Ordering::Release);
-                return Ok(pr);
+                return Ok(entry.pr);
             }
         }
         // 2. Never touched by the writer this transaction: the committed
@@ -2081,8 +2169,13 @@ impl Pager {
         //    committed-view scans of untouched ranges from per-query
         //    lock cascades into a single Arc clone per page.
         if let Some(page_ref) = self.cache.read().get(id).cloned() {
-            self.cache_committed_page(id, &page_ref);
-            return Ok(page_ref);
+            let entry = CommittedEntry {
+                pr: page_ref,
+                alias: true,
+            };
+            self.cache_committed_page(id, &entry);
+            self.memo_committed_page(id, &entry, token);
+            return Ok(entry.pr);
         }
         let mut page = Page::new(id, psz);
         let mut served_from_wal = false;
@@ -2124,8 +2217,10 @@ impl Pager {
             }
         }
         let pr: PageRef = Arc::new(Mutex::new(page));
-        self.cache_committed_page(id, &pr);
-        Ok(pr)
+        let entry = CommittedEntry { pr, alias: false };
+        self.cache_committed_page(id, &entry);
+        self.memo_committed_page(id, &entry, token);
+        Ok(entry.pr)
     }
 
     /// Materialization-cache insert with a hard page cap: the committed
@@ -2134,15 +2229,42 @@ impl Pager {
     /// transaction (scans then run at live-cache speed); at the cap, the
     /// page is re-materialized per miss — slower, but the memory budget
     /// holds (1k pages = 4 MiB at the default page size).
-    fn cache_committed_page(&self, id: PageId, pr: &PageRef) {
+    fn cache_committed_page(&self, id: PageId, entry: &CommittedEntry) {
         let mut cp = self.committed_pages.write();
         if cp.len() < COMMITTED_PAGES_CAP {
-            cp.insert(id, Arc::clone(pr));
+            cp.insert(id, entry.clone());
             // Latch: once any entry exists, the mutation path must keep
             // invalidating (see note_dirty / clear_savepoints). Never
             // unlatched — a stale `false` would skip needed removals.
             self.committed_view_used.store(true, Ordering::Release);
         }
+    }
+
+    /// Insert into the per-thread committed-view memo (the no-lock
+    /// acceleration tier). A stale token or foreign instance resets the
+    /// whole memo first — the epoch moved, so every old entry died with
+    /// the shared map's content. The cap keeps scan-shaped readers from
+    /// pinning unbounded pages per thread.
+    fn memo_committed_page(&self, id: PageId, entry: &CommittedEntry, token: u64) {
+        COMMITTED_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let reset = match m.as_ref() {
+                Some(memo) => memo.instance != self.instance_id || memo.token != token,
+                None => true,
+            };
+            if reset {
+                *m = Some(CommittedMemo {
+                    instance: self.instance_id,
+                    token,
+                    pages: std::collections::HashMap::default(),
+                });
+            }
+            if let Some(memo) = m.as_mut() {
+                if memo.pages.len() < COMMITTED_MEMO_CAP || memo.pages.contains_key(&id) {
+                    memo.pages.insert(id, entry.clone());
+                }
+            }
+        });
     }
 
     /// Allocate a new page. Uses the freelist first, then extends the file.
