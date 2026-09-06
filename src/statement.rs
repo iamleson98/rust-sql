@@ -101,7 +101,11 @@ pub struct Statement<'a> {
     db: &'a Database,
     sql: String,
     stmt: Arc<AstStatement>,
-    plan: Option<Plan>,
+    /// The cached plan, refcounted — prepare and every start() clone an
+    /// Arc (one atomic) instead of deep-cloning the plan tree (5-10
+    /// allocations for a filter/limit stack; the sqlx driver's
+    /// fetch_optional path prepared per query).
+    plan: Option<Arc<Plan>>,
     has_subqueries: bool,
     fast_path: Option<Arc<FastPath>>,
     params: Vec<Value>,
@@ -178,12 +182,12 @@ impl<'a> Statement<'a> {
         let mut param_count = 0usize;
         let mut named_param_names: Vec<String> = Vec::new();
         collect_parameters(stmt.as_ref(), &mut param_count, &mut named_param_names);
-        let plan = cached.plan.as_ref().map(|p| (**p).clone());
+        let plan = cached.plan.clone();
         // Output columns at PREPARE time when a streaming driver covers
         // the plan (SQLite's column_count/column_name work before the
         // first step). Materialized shapes set columns on first step.
         let prep_columns = plan
-            .as_ref()
+            .as_deref()
             .and_then(try_build_driver)
             .map(|d| d.columns());
         Ok(Self {
@@ -303,6 +307,14 @@ impl<'a> Statement<'a> {
     /// The current row (valid between a `Row` step and the next step).
     pub fn row(&self) -> Option<&Row> {
         self.current_row.as_ref()
+    }
+
+    /// TAKE the current row's ownership (the next `step()` sees None and
+    /// serves fresh rows normally). For single-row consumers — the sqlx
+    /// driver's `fetch_optional` — this replaces a full row clone with a
+    /// move.
+    pub fn take_row(&mut self) -> Option<Row> {
+        self.current_row.take()
     }
 
     /// The current row's value at `idx`.
@@ -518,7 +530,7 @@ impl<'a> Statement<'a> {
                 _ => false,
             };
             let is_dml = matches!(
-                plan,
+                plan.as_ref(),
                 Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
             );
             let has_subq = self.has_subqueries;

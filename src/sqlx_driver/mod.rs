@@ -777,12 +777,8 @@ impl RustqliteConnection {
                         == StepResult::Row
                     {
                         let (columns, names) = columns_from_names(&stmt_column_names(&stmt));
-                        if let Some(row) = stmt.row() {
-                            out.push(Either::Right(RustqliteRow::new(
-                                row.clone(),
-                                &columns,
-                                &names,
-                            )));
+                        if let Some(row) = stmt.take_row() {
+                            out.push(Either::Right(RustqliteRow::new(row, &columns, &names)));
                             logger.increment_rows_returned();
                         }
                     }
