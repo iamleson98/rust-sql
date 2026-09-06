@@ -626,6 +626,11 @@ pub struct Pager {
     /// header offsets (60..64 / 68..72) inside page 0.
     user_version: std::sync::atomic::AtomicU32,
     application_id: std::sync::atomic::AtomicU32,
+    /// Retired flag (VACUUM's rewrite path): the database file is being
+    /// replaced out from under this pager — `Drop` must skip ALL close-time
+    /// bookkeeping (checkpoint / set_len / sidecar removal) so it cannot
+    /// clobber the freshly written compact image. See `retire()`.
+    retired: AtomicBool,
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1001,16 @@ impl Drop for Pager {
         // file and remove the -wal file (SQLite's last-connection-close
         // behavior). Best-effort — an unclean exit (crash, kill) skips
         // this and recovery on next open serves the committed frames.
+        //
+        // A RETIRED pager (its database file was replaced out from under
+        // it — VACUUM's rewrite path) skips all of it: the close-time
+        // bookkeeping would write its own pre-replacement view back over
+        // the new image (an empty-map checkpoint still re-asserts the
+        // old page count via set_len) and delete sidecars now owned by
+        // the fresh pager.
+        if self.retired.load(Ordering::Acquire) {
+            return;
+        }
         if self.wal.read().is_some() {
             let _ = self.checkpoint_wal();
             let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(&self.path));
@@ -1133,6 +1148,7 @@ impl Pager {
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
             application_id: std::sync::atomic::AtomicU32::new(0),
+            retired: AtomicBool::new(false),
         };
 
         let file_size = pager.store.len()?;
@@ -2865,6 +2881,131 @@ impl Pager {
         self.freelist_count.store(freelist_count, Ordering::Release);
         self.schema_cookie.store(schema_cookie, Ordering::Release);
         Ok(())
+    }
+
+    /// Install a fully compacted database image IN PLACE (VACUUM's
+    /// write-back). The image is a complete database: pages
+    /// `0..new_n` replace the old content, every page `>= new_n` is
+    /// gone, the freelist is empty, and page 0's header fields (except
+    /// the ones `flush_wal` refreshes from atomics — n_pages, freelist,
+    /// schema cookie) ride the image bytes (user_version /
+    /// application_id carry over).
+    ///
+    /// The install lands as ONE WAL commit — frames for every image page
+    /// with the trailing commit frame — which is exactly SQLite's own
+    /// VACUUM shape: a crash mid-install leaves recovery at the last
+    /// real commit (the pre-VACUUM state, fully consistent); a crash
+    /// after the commit marker yields the compact state. The explicit
+    /// checkpoint afterwards copies the compact pages into the main
+    /// file, truncates the tail, and resets the WAL, so the steady
+    /// state after VACUUM is a checkpointed main file — same as
+    /// SQLite.
+    ///
+    /// WAL mode only (DELETE-mode flushes cannot make a whole-tree
+    /// replacement atomic — the header-last ordering contract protects
+    /// page additions, not a full rewrite; callers fall back to the
+    /// rewrite-and-reopen path there).
+    pub fn install_compact_image(&self, image: &[u8]) -> Result<()> {
+        if self.wal.read().is_none() {
+            return Err(Error::InvalidArgument(
+                "install_compact_image requires WAL mode".into(),
+            ));
+        }
+        let psz = self.page_size() as usize;
+        if image.is_empty() || image.len() % psz != 0 {
+            return Err(Error::corruption(format!(
+                "vacuum image not page-aligned (len={}, page_size={})",
+                image.len(),
+                psz
+            )));
+        }
+        let new_n = (image.len() / psz) as u32;
+        let old_n = self.n_pages.load(Ordering::Acquire);
+
+        // 1. Retire every page >= new_n through the standard truncate
+        //    path: scrubs the cache / LRU / dirty set / WAL map, rewinds
+        //    n_pages, arms the physical truncation, and bumps the write
+        //    version (advisory caches built over the old tree must not
+        //    survive). Runs BEFORE the image pages are installed so the
+        //    freelist-trunk walk reads the OLD state.
+        if new_n < old_n {
+            let freed: Vec<PageId> = (new_n..old_n).collect();
+            self.truncate_tail(&freed)?;
+        }
+
+        // 2. Install the image pages as dirty (the flush below emits them
+        //    as WAL frames). Pages already cached are overwritten in
+        //    place; pages not in the cache are created directly — no
+        //    disk read, the bytes come from the image.
+        for (i, chunk) in image.chunks_exact(psz).enumerate() {
+            let id = i as PageId;
+            let page_ref = {
+                let cache = self.cache.read();
+                cache.get(id).cloned()
+            };
+            let page_ref = match page_ref {
+                Some(pr) => pr,
+                None => {
+                    let pr: PageRef =
+                        Arc::new(Mutex::new(crate::storage::page::Page::new(id, psz as u32)));
+                    let mut cache = self.cache.write();
+                    cache.insert(id, pr.clone());
+                    pr
+                }
+            };
+            {
+                let mut p = page_ref.lock();
+                p.data.copy_from_slice(chunk);
+                p.dirty = true;
+            }
+            self.note_dirty(id);
+            self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // 3. The compact image has no freelist; the schema moved (roots
+        //    were remapped), so the cookie must change. flush_wal writes
+        //    page 0's header FROM these atomics — setting them here makes
+        //    the committed frame self-consistent. (NEVER the
+        //    direct-file-write `bump_schema_cookie`: a write outside the
+        //    WAL would be invisible to WAL-served readers and clobbered
+        //    by the next checkpoint.)
+        self.freelist_head.store(0, Ordering::Release);
+        self.freelist_count.store(0, Ordering::Release);
+        self.schema_cookie.fetch_add(1, Ordering::AcqRel);
+
+        // 4. The single VACUUM commit: every image page as frames, the
+        //    last frame carrying the commit marker. (flush_wal refreshes
+        //    page 0 from the atomics first, so the header frame is the
+        //    new one.)
+        self.flush()?;
+
+        // 5. Copy the compact pages into the main file, apply the armed
+        //    tail truncation, sync, and reset the WAL. The main file IS
+        //    the compact database afterwards; the sidecar holds only its
+        //    fresh header.
+        self.checkpoint_wal()?;
+
+        // 6. Stale BEGIN-time pre-images from earlier committed-view
+        //    scopes must not serve old-tree bytes over the compact
+        //    state.
+        self.clear_committed_view();
+        Ok(())
+    }
+
+    /// True when the pager is in WAL journal mode.
+    pub fn wal_active(&self) -> bool {
+        self.wal.read().is_some()
+    }
+
+    /// Retire this pager: its database file is about to be replaced out
+    /// from under it (VACUUM's rewrite-and-reopen path). A retired pager
+    /// skips ALL close-time bookkeeping in `Drop` — the checkpoint and
+    /// sidecar removal there would write the OLD pager's view back over
+    /// the freshly installed image (an empty checkpoint still re-asserts
+    /// the old page count via `set_len`) and delete sidecars owned by
+    /// the fresh pager that replaces it.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
     }
 
     pub fn flush(&self) -> Result<()> {

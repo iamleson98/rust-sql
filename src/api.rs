@@ -2002,7 +2002,22 @@ impl Database {
         // rebuild reads it (flush dirty pages; checkpoint any WAL).
         self.break_insert_chain();
         self.pager.flush()?;
-        self.pager.checkpoint_wal()?;
+
+        // Path decision. WAL file DBs without a codec install the compact
+        // image IN PLACE as one WAL commit + checkpoint (SQLite's own
+        // VACUUM shape — no pager replacement, no reopen, and no wasted
+        // pre-copy of the WAL into a file that is about to be replaced).
+        // Everything else (memory, codec, DELETE journal mode) keeps the
+        // rebuild/rewrite flow below — which DOES need the pre-rewrite
+        // checkpoint: it overwrites the main file directly, so no sidecar
+        // frames may survive the swap (crash safety: reopen must never
+        // replay old frames over the new image).
+        let wal_install = !self.pager.is_memory()
+            && self.pager.active_page_codec().is_none()
+            && self.pager.wal_active();
+        if !wal_install {
+            self.pager.checkpoint_wal()?;
+        }
 
         let image = self.build_compact_image()?;
 
@@ -2024,6 +2039,22 @@ impl Database {
         // Connection-scoped bookkeeping (last_insert_rowid) survives the
         // swap — VACUUM must not clobber it (SQLite keeps the value).
         let keep_rowid = self.last_rowid.load(Ordering::Acquire);
+        if wal_install {
+            // One commit: image pages as WAL frames (trailing commit
+            // frame), then checkpoint + truncate + WAL reset. Crash at
+            // any point leaves either the pre-VACUUM or the compact
+            // state — never a mix.
+            self.pager.install_compact_image(&image)?;
+            // The roots moved (remapped). Reload the catalog and reset
+            // every statement-level cache that could embed pre-VACUUM
+            // state (plans, root overrides, count memo, join builds).
+            let mut catalog = Catalog::new();
+            catalog.schema_cookie = self.pager.schema_cookie();
+            load_schema(&self.pager, &mut catalog)?;
+            self.adopt_catalog_after_vacuum(catalog);
+            self.last_rowid.store(keep_rowid, Ordering::Release);
+            return Ok(());
+        }
         if self.pager.is_memory() {
             let mut new = Self::open_in_memory_with_image(image)?;
             new.path = self.path.clone();
@@ -2039,6 +2070,12 @@ impl Database {
         } else {
             let path = self.path.clone();
             let codec = self.pager.active_page_codec();
+            // Retire the OLD pager BEFORE the image lands: its Drop would
+            // otherwise re-apply its own close-time bookkeeping (an empty
+            // checkpoint still `set_len`s the file to the pre-VACUUM page
+            // count and removes the sidecar the fresh pager just
+            // created) — clobbering the just-written compact image.
+            self.pager.retire();
             std::fs::write(&path, &image).map_err(|e| {
                 Error::Io(std::io::Error::other(format!(
                     "vacuum rewrite {path:?}: {e}"
@@ -2061,6 +2098,35 @@ impl Database {
             *self = new;
         }
         Ok(())
+    }
+
+    /// Adopt a freshly reloaded catalog after the in-place VACUUM image
+    /// install. Every piece of `Database` state that embeds pre-VACUUM
+    /// layout (cached plans, root-override maps, count memo, advisory
+    /// leaf/join caches, schema epoch) is reset or invalidated; a query
+    /// after VACUUM re-plans from the new roots.
+    fn adopt_catalog_after_vacuum(&mut self, catalog: Catalog) {
+        let mut schema_root_pages = HashMap::new();
+        for (name, t) in catalog.all_tables() {
+            schema_root_pages.insert(format!("table:{}", name), t.root_page);
+        }
+        for (name, i) in catalog.all_indexes() {
+            schema_root_pages.insert(format!("index:{}", name), i.root_page);
+        }
+        self.catalog = catalog;
+        *self.schema_root_pages.lock() = schema_root_pages;
+        // Root overrides + max-rowid caches describe the OLD tree.
+        *self.maps.write() = empty_maps();
+        self.maps_populated.store(false, Ordering::Release);
+        // Count memo is keyed by write epoch; bump so every entry misses.
+        self.write_epoch.fetch_add(1, Ordering::AcqRel);
+        // Cached plans / prepared statements embed pre-VACUUM Arc<Table>
+        // snapshots and roots.
+        self.invalidate_stmt_cache();
+        self.seen_hashes.lock().clear();
+        // Committed-view readers key on the schema epoch; the roots moved.
+        self.schema_epoch.fetch_add(1, Ordering::AcqRel);
+        self.pager.join_build_cache().lock().clear();
     }
 
     /// Build the compacted image. Two paths:
@@ -7190,6 +7256,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
         "page_size" => Value::Integer(pager.page_size() as i64),
         "page_count" => Value::Integer(pager.n_pages() as i64),
+        "freelist_count" => Value::Integer(pager.freelist_count() as i64),
         "cache_size" => Value::Integer(pager.cache_capacity() as i64),
         "schema_version" => Value::Integer(pager.schema_cookie() as i64),
         "journal_mode" => Value::Text(if pager.wal_enabled() {

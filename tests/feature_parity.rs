@@ -845,3 +845,98 @@ fn vacuum_into_refuses_existing_file() {
     assert!(e.to_string().contains("existing"), "got: {e}");
     let _ = std::fs::remove_file(&into);
 }
+
+/// WAL-mode file VACUUM takes the IN-PLACE install path (one WAL commit +
+/// checkpoint — no pager replacement, no reopen). This is SQLite's own
+/// VACUUM shape, and it has the sharpest failure modes:
+///   1. the compact image must land as WAL frames (crash-consistent),
+///   2. the checkpoint must truncate the file tail (pages >= new_n gone),
+///   3. the SAME handle must keep working (catalog reloaded from the new
+///      roots; every pre-VACUUM cache — plans, root overrides, count
+///      memo, join builds, committed-view scopes — invalidated),
+///   4. a fresh open must see the compact state with no stale sidecar
+///      frames replaying the OLD tree over the new image.
+#[test]
+fn vacuum_wal_mode_in_place_install() {
+    let path = std::env::temp_dir().join("rq_vacuum_wal_test.db");
+    let wal_path = {
+        let mut p = path.clone();
+        p.set_extension("db-wal");
+        p
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal_path);
+    {
+        let mut db = rustqlite::Database::open(&path).unwrap();
+        let mode: String = db.query("PRAGMA journal_mode = WAL", []).unwrap()[0][0]
+            .as_text()
+            .to_string();
+        assert_eq!(mode, "wal");
+
+        vacuum_churn(&mut db);
+        let before = std::fs::metadata(&path).unwrap().len();
+        db.execute("VACUUM", []).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "file {after} !< {before}");
+
+        // Same handle: catalog adopted from the compact roots, all
+        // statement-level caches dropped, values/indexes intact.
+        let rows = db
+            .query("SELECT id, v, f FROM t WHERE v = 'row499'", [])
+            .unwrap();
+        assert_eq!(rows[0][0], Value::Integer(499));
+        assert_eq!(rows[0][2], Value::Real(499.0));
+        let n = db
+            .query("SELECT COUNT(*) FROM t WHERE id + f > 990", [])
+            .unwrap(); // exercises the expression index's new root (ids 496..500)
+        assert_eq!(n[0][0], Value::Integer(5));
+        // rowid generation continues past the vacuumed state.
+        db.execute("INSERT INTO t (v, f) VALUES ('new', 2.5)", [])
+            .unwrap();
+        let rows = db.query("SELECT id FROM t WHERE v = 'new'", []).unwrap();
+        assert_eq!(rows[0][0], Value::Integer(501));
+        // Post-VACUUM writes keep landing in WAL and survive a reopen.
+        db.execute("INSERT INTO t (v, f) VALUES ('new2', 3.5)", [])
+            .unwrap();
+    }
+    // Fresh open from disk: compact state + the post-VACUUM rows durable.
+    let db = rustqlite::Database::open(&path).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(102));
+    let rows = db
+        .query(
+            "SELECT id FROM t WHERE v IN ('new', 'new2') ORDER BY id",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(501));
+    assert_eq!(rows[1][0], Value::Integer(502));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+/// WAL-mode VACUUM with a schema big enough that page-level remap moved
+/// table roots: a fresh connection's PRAGMA integrity-style round trip
+/// (page_count + freelist_count) must show the compact state (empty
+/// freelist, page_count == live pages only).
+#[test]
+fn vacuum_wal_mode_freelist_drained() {
+    let path = std::env::temp_dir().join("rq_vacuum_wal2_test.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = rustqlite::Database::open(&path).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+        vacuum_churn(&mut db);
+        db.execute("VACUUM", []).unwrap();
+        let freelist: i64 = db.query("PRAGMA freelist_count", []).unwrap()[0][0].as_integer();
+        assert_eq!(freelist, 0, "freelist must be drained after VACUUM");
+        let pages: i64 = db.query("PRAGMA page_count", []).unwrap()[0][0].as_integer();
+        assert!(pages > 0);
+    }
+    let db = rustqlite::Database::open(&path).unwrap();
+    let freelist: i64 = db.query("PRAGMA freelist_count", []).unwrap()[0][0].as_integer();
+    assert_eq!(freelist, 0, "freelist drained on reopen too");
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(100));
+    let _ = std::fs::remove_file(&path);
+}
