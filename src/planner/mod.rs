@@ -100,6 +100,37 @@ impl<'a> Planner<'a> {
             plan
         };
 
+        // SINGLE-TABLE ROWID-IN-EXPRESSION REWRITE: `rowid`/`_rowid_`/`oid`
+        // referenced INSIDE an expression (`SELECT rowid*2`, `max(rowid)`,
+        // `WHERE rowid % 2 = 0`, `ORDER BY rowid % 3`) evaluates against
+        // materialized rows that carry table columns only — the bare-column
+        // fast paths know the ROWID_PROJ sentinel, the expression evaluator
+        // does not, so every such reference read NULL. For a single-table
+        // query over a table WITH a rowid-alias column, rewriting the
+        // spelling to the alias column name makes the value reachable from
+        // every evaluation path at once (name lookups, compiled predicates,
+        // aggregates, sorts). Real columns named rowid/_rowid_/oid shadow
+        // the pseudo-column (SQLite rule) and are left alone; subquery
+        // bodies are scope boundaries and are not descended into (their
+        // own plan_select pass rewrites with their own FROM table);
+        // joins/multi-table bodies are skipped entirely (bare rowid is
+        // ambiguous there). No-alias tables keep the documented gap (the
+        // rowid has no in-row value to rewrite to).
+        let mut plan = plan;
+        if let SelectBody::Simple(s) = &stmt.body {
+            if let Some(TableExpression::Table {
+                name,
+                schema: None,
+                alias,
+                ..
+            }) = &s.from
+            {
+                if let Some(table) = self.catalog.get_table(name) {
+                    rewrite_rowid_refs_in_plan(&mut plan, &table, alias.as_deref());
+                }
+            }
+        }
+
         Ok(plan)
     }
 
@@ -2976,6 +3007,273 @@ fn try_elide_rowid_order_sort(plan: Plan) -> Plan {
             columns,
         },
         other => other,
+    }
+}
+
+// ============================================================================
+// rowid-in-expression rewrite (see plan_select's hook for the rationale)
+// ============================================================================
+
+/// Hidden rowid slot name for tables WITHOUT a rowid-alias column: the
+/// row-producing drivers/executors append the rowid value as a trailing
+/// row slot registered under this name, so expression evaluation
+/// resolves it by exact match. The NUL prefix makes it unparseable as an
+/// SQL identifier (no user column can collide) and lets star expansions
+/// filter it out (`SELECT *` must not see it).
+pub(crate) const HIDDEN_ROWID: &str = "\u{0}rowid";
+
+/// True for names that are internal hidden slots (star expansion filter).
+pub(crate) fn is_hidden_rowid(name: &str) -> bool {
+    name.starts_with('\u{0}')
+}
+
+/// Do rows from this table's scans carry the hidden rowid slot? Only
+/// no-alias tables need it (alias tables expose the rowid through the
+/// alias column; WITHOUT ROWID tables have no rowid; a real "rowid"
+/// column shadows the pseudo-column).
+pub(crate) fn wants_rowid_slot(table: &crate::schema::Table) -> bool {
+    table.rowid_alias.is_none() && !table.without_rowid && table.find_column("rowid").is_none()
+}
+
+/// Rewrite `rowid`/`_rowid_`/`oid` column references inside expressions to
+/// the table's rowid-alias column, for single-table queries over a table
+/// WITH an INTEGER PRIMARY KEY. Scope rules:
+/// - A real column named `rowid`/`_rowid_`/`oid` shadows the pseudo-column
+///   (SQLite rule): no rewrite.
+/// - Qualified references must name the table or its alias.
+/// - Subquery / EXISTS bodies are their own scope (their own plan_select
+///   pass fires): not descended into.
+/// - No rowid-alias column: no in-row value exists (documented gap) —
+///   leave the reference (it evaluates NULL, as before).
+fn rewrite_rowid_refs_in_plan(plan: &mut Plan, table: &Arc<Table>, alias: Option<&str>) {
+    let exprs: Vec<&mut Expr> = match plan {
+        Plan::Scan { predicate, .. } => predicate.iter_mut().collect(),
+        Plan::RowidLookup { rowid, .. } => vec![rowid],
+        Plan::RowidIn {
+            values, residual, ..
+        } => values.iter_mut().chain(residual.iter_mut()).collect(),
+        Plan::RowidRange {
+            start,
+            end,
+            residual,
+            ..
+        } => start
+            .iter_mut()
+            .chain(end.iter_mut())
+            .chain(residual.iter_mut())
+            .collect(),
+        Plan::IndexIn {
+            key_exprs,
+            residual,
+            ..
+        } => key_exprs.iter_mut().chain(residual.iter_mut()).collect(),
+        Plan::IndexLookup { key_exprs, .. } => key_exprs.iter_mut().collect(),
+        Plan::IndexRange {
+            start,
+            end,
+            residual,
+            ..
+        } => start
+            .iter_mut()
+            .map(|(e, _)| e)
+            .chain(end.iter_mut().map(|(e, _)| e))
+            .chain(residual.iter_mut())
+            .collect(),
+        Plan::Values { rows } => rows.iter_mut().flatten().collect(),
+        Plan::Filter { input, predicate } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            vec![predicate]
+        }
+        Plan::Project { input, columns } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            columns.iter_mut().map(|c| &mut c.expr).collect()
+        }
+        Plan::Sort { input, terms } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            terms.iter_mut().map(|t| &mut t.expr).collect()
+        }
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            group_by
+                .iter_mut()
+                .chain(aggregates.iter_mut().filter_map(|a| a.arg.as_mut()))
+                .collect()
+        }
+        Plan::Window { input, windows } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            let mut out: Vec<&mut Expr> = Vec::new();
+            for w in windows.iter_mut() {
+                if let Some(a) = w.arg.as_mut() {
+                    out.push(a);
+                }
+                out.extend(w.extra_args.iter_mut());
+                out.extend(w.partition_by.iter_mut());
+                out.extend(w.order_by.iter_mut().map(|t| &mut t.expr));
+            }
+            out
+        }
+        Plan::TableFunction { args, .. } => args.iter_mut().collect(),
+        Plan::Distinct { input } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            Vec::new()
+        }
+        // Subquery plans are NOT rewritten here: their expressions belong
+        // to their own FROM scope (their own plan_select pass fired with
+        // their own table).
+        Plan::Subquery { .. } => Vec::new(),
+        Plan::Limit { input, .. } => {
+            rewrite_rowid_refs_in_plan(input, table, alias);
+            Vec::new()
+        }
+        // Join conditions: bare `rowid` is ambiguous across tables in
+        // general — leave them (rewrite fires only for single-table FROM
+        // anyway, so this is defense-in-depth).
+        Plan::Join { left, right, .. } => {
+            rewrite_rowid_refs_in_plan(left, table, alias);
+            rewrite_rowid_refs_in_plan(right, table, alias);
+            Vec::new()
+        }
+        Plan::IndexNestedLoopJoin { outer, .. } => {
+            rewrite_rowid_refs_in_plan(outer, table, alias);
+            Vec::new()
+        }
+        // DML / CTE rows / set operations: not reachable from a plain
+        // SELECT's plan walk (DML plans are built elsewhere; compound
+        // selects skip the rewrite at the plan_select hook).
+        _ => Vec::new(),
+    };
+    for e in exprs {
+        rewrite_rowid_in_expr(e, table, alias);
+    }
+}
+
+/// One expression tree: rewrite rowid spellings everywhere EXCEPT inside
+/// subquery bodies (scope boundary — see the plan-level doc above).
+fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) {
+    match e {
+        Expr::Column { table: qual, name } => {
+            if let Some(q) = qual {
+                let effective = alias.unwrap_or(&table.name);
+                if !q.eq_ignore_ascii_case(&table.name) && !q.eq_ignore_ascii_case(effective) {
+                    return;
+                }
+            }
+            let is_spelling = name.eq_ignore_ascii_case("rowid")
+                || name.eq_ignore_ascii_case("_rowid_")
+                || name.eq_ignore_ascii_case("oid");
+            if !is_spelling {
+                return;
+            }
+            // A real column with the spelling's name shadows the
+            // pseudo-column (SQLite resolution rule).
+            if table.find_column(name).is_some() {
+                return;
+            }
+            if let Some(idx) = table.rowid_alias {
+                *e = Expr::Column {
+                    table: None,
+                    name: table.columns[idx].name.clone(),
+                };
+            } else if !table.without_rowid {
+                // No alias column: the scan drivers append the rowid as a
+                // trailing slot named HIDDEN_ROWID (see plan_select's
+                // hook) — expression evaluation resolves it by exact
+                // match. Materialized paths without the slot evaluate
+                // NULL (documented in GAP_ANALYSIS §9).
+                *e = Expr::Column {
+                    table: None,
+                    name: HIDDEN_ROWID.to_string(),
+                };
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            rewrite_rowid_in_expr(left, table, alias);
+            rewrite_rowid_in_expr(right, table, alias);
+        }
+        Expr::Unary { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_rowid_in_expr(expr, table, alias);
+            rewrite_rowid_in_expr(low, table, alias);
+            rewrite_rowid_in_expr(high, table, alias);
+        }
+        Expr::In {
+            expr,
+            source: InSource::List(values),
+            ..
+        } => {
+            rewrite_rowid_in_expr(expr, table, alias);
+            for v in values.iter_mut() {
+                rewrite_rowid_in_expr(v, table, alias);
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_rowid_in_expr(expr, table, alias);
+            rewrite_rowid_in_expr(pattern, table, alias);
+            if let Some(es) = escape.as_mut() {
+                rewrite_rowid_in_expr(es, table, alias);
+            }
+        }
+        Expr::IsNull { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        Expr::Is { left, right, .. } => {
+            rewrite_rowid_in_expr(left, table, alias);
+            rewrite_rowid_in_expr(right, table, alias);
+        }
+        Expr::Function { args, filter, .. } => {
+            for a in args.iter_mut() {
+                rewrite_rowid_in_expr(a, table, alias);
+            }
+            if let Some(f) = filter.as_mut() {
+                rewrite_rowid_in_expr(f, table, alias);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand.as_mut() {
+                rewrite_rowid_in_expr(o, table, alias);
+            }
+            for (w, t) in whens.iter_mut() {
+                rewrite_rowid_in_expr(w, table, alias);
+                rewrite_rowid_in_expr(t, table, alias);
+            }
+            if let Some(el) = else_.as_mut() {
+                rewrite_rowid_in_expr(el, table, alias);
+            }
+        }
+        Expr::Row(exprs) => {
+            for x in exprs.iter_mut() {
+                rewrite_rowid_in_expr(x, table, alias);
+            }
+        }
+        Expr::Cast { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        Expr::Collate { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        // Scope boundaries: subqueries plan their own rowid scope.
+        Expr::Subquery(_) | Expr::Exists(_) => {}
+        Expr::In {
+            source: InSource::Subquery(_),
+            ..
+        } => {}
+        // Literals / parameters / RAISE messages carry no column refs.
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::In {
+            source: InSource::Table(_),
+            ..
+        }
+        | Expr::Raise { .. } => {}
     }
 }
 

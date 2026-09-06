@@ -2750,6 +2750,10 @@ fn exec_scan(
     let mut bt = Btree::new(ctx.pager, root, false);
     let rowid_alias = table.rowid_alias;
     let n_cols = table.n_columns();
+    // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
+    // rows carry the trailing rowid so expression projections and
+    // predicates above can reference it by name.
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
     bt.scan_table_borrowed(|rowid, payload| {
         // Fused inline serial decode — semantics identical to
         // `decode_row` (short rows pad NULL, alias column materializes
@@ -2882,6 +2886,9 @@ fn exec_scan(
             col += 1;
         }
         if ok && row.len() == n_cols {
+            if append_rowid {
+                row.push(Value::Integer(rowid));
+            }
             rows.push(row);
         }
         true
@@ -2895,7 +2902,20 @@ fn exec_scan(
     // `qualified_col_names` built once in `build_table` — one refcount bump
     // instead of N `format!()` allocations per query.
     let prefix = alias.as_deref().unwrap_or(&table.name);
-    let columns: Arc<[String]> = if prefix == table.name {
+    let columns: Arc<[String]> = if append_rowid {
+        let base: Vec<String> = if prefix == table.name {
+            table.qualified_col_names.iter().cloned().collect()
+        } else {
+            table
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", prefix, c.name))
+                .collect()
+        };
+        let mut v = base;
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.into()
+    } else if prefix == table.name {
         table.qualified_col_names.clone()
     } else {
         table
@@ -3141,6 +3161,9 @@ fn scan_filter_limit(
             .into()
     };
     let mut rows: Vec<Vec<Value>> = Vec::new();
+    // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
+    // matching rows carry the trailing rowid for projections above.
+    let append_rowid = crate::planner::wants_rowid_slot(table);
     match (&pred, !wanted.is_empty()) {
         (Some(pred), true) => {
             wanted.sort_unstable();
@@ -3168,7 +3191,10 @@ fn scan_filter_limit(
                     return true; // non-matching row: cost = selective decode only
                 }
                 // Matching row: materialize the full row for output.
-                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
                     rows.push(row);
                 }
                 // LIMIT pushdown: stop the scan once enough rows have passed.
@@ -3185,7 +3211,10 @@ fn scan_filter_limit(
             let positions: Vec<usize> = (0..n_cols).collect();
             let stop = stop_after;
             bt.scan_table_borrowed(|rowid, payload| {
-                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
                     if pred.eval(&row, &positions, params) {
                         rows.push(row);
                     }
@@ -3202,7 +3231,10 @@ fn scan_filter_limit(
             // No predicate: accept every row (bare Scan + LIMIT).
             let stop = stop_after;
             bt.scan_table_borrowed(|rowid, payload| {
-                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
                     rows.push(row);
                 }
                 if let Some(stop) = stop {
@@ -3214,6 +3246,13 @@ fn scan_filter_limit(
             })?;
         }
     }
+    let columns: Arc<[String]> = if append_rowid {
+        let mut v: Vec<String> = columns.iter().cloned().collect();
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.into()
+    } else {
+        columns
+    };
     Ok(Some(ExecResult { columns, rows }))
 }
 
@@ -3240,6 +3279,14 @@ fn apply_projection(
 ) -> Result<ExecResult> {
     // Compute output columns, expanding `*` and `table.*` to the underlying
     // input column names.
+    // Hidden rowid slots (no-alias tables — see planner::HIDDEN_ROWID)
+    // are TRAILING in every row that carries them: star expansions must
+    // skip both the name and the trailing value.
+    let hidden_count = inner
+        .columns
+        .iter()
+        .filter(|c| crate::planner::is_hidden_rowid(c))
+        .count();
     let mut out_columns: Vec<String> = Vec::new();
     let mut star_expansions: Vec<Vec<String>> = Vec::new(); // for each column, the list of expanded names (or empty)
     for c in columns {
@@ -3249,6 +3296,7 @@ fn apply_projection(
                 let expanded: Vec<String> = inner
                     .columns
                     .iter()
+                    .filter(|c| !crate::planner::is_hidden_rowid(c))
                     .map(|c| {
                         if let Some(pos) = c.rfind('.') {
                             c[pos + 1..].to_string()
@@ -3310,7 +3358,10 @@ fn apply_projection(
         || (all_resolved
             && resolved.len() == inner.columns.len()
             && resolved.iter().enumerate().all(|(i, r)| r == &Some(i)));
-    if identity_projection {
+    // Hidden slots break row identity (the output must NOT carry them:
+    // SELECT * arity is the visible column count) — take the general
+    // path, which trims trailing slots during star expansion.
+    if identity_projection && hidden_count == 0 {
         return Ok(ExecResult {
             columns: out_columns.into(),
             rows: inner.rows,
@@ -3337,7 +3388,8 @@ fn apply_projection(
                 }
                 if let Expr::Column { name, .. } = &c.expr {
                     if name == "*" {
-                        out.extend(row.iter().cloned());
+                        let take = row.len().saturating_sub(hidden_count);
+                        out.extend(row[..take].iter().cloned());
                         continue;
                     }
                 }
@@ -5868,16 +5920,22 @@ fn exec_aggregate_no_group_by(
     }
 
     // Build column names only if we need them for eval_row calls.
+    // No-alias tables gain the hidden rowid slot name (see
+    // planner::HIDDEN_ROWID): aggregate args like max(rowid) resolve
+    // through the trailing slot on the generic full-row path.
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
     let columns: Option<Vec<String>> = if all_columns {
         None
     } else {
-        Some(
-            table
-                .columns
-                .iter()
-                .map(|c| format!("{}.{}", prefix, c.name))
-                .collect(),
-        )
+        let mut v: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect();
+        if append_rowid {
+            v.push(crate::planner::HIDDEN_ROWID.to_string());
+        }
+        Some(v)
     };
     let columns_ref = columns.as_ref();
 
@@ -6104,6 +6162,9 @@ fn exec_aggregate_no_group_by(
             row_buf.clear();
             if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
                 return true; // skip corrupt rows
+            }
+            if append_rowid {
+                row_buf.push(Value::Integer(rowid));
             }
             // Apply the filter predicate inline (if any).
             if let Some(pred) = filter_predicate {
@@ -9611,6 +9672,12 @@ fn exec_rowid_range(
     // keep the table's declared column shape (SELECT * must not see it).
     let rowid_alias = table.rowid_alias;
     let has_real_rowid_col = table.find_column("rowid").is_some();
+    // Hidden rowid slot (no-alias tables): rows carry the rowid for
+    // expression projections above (see planner::HIDDEN_ROWID). The
+    // OUTPUT column list registers the hidden name; the eval context
+    // below registers the legacy "rowid" name — the trailing slot
+    // position is the same either way.
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
     let residual = residual.filter(|_| {
         // WITHOUT ROWID tables have no rowid; a real "rowid" column
         // shadows the pseudo name (find_column already resolved it in
@@ -9639,17 +9706,25 @@ fn exec_rowid_range(
                 if !keep {
                     return true;
                 }
-                row.pop();
+                if !append_rowid {
+                    row.pop();
+                }
+            } else if append_rowid {
+                row.push(Value::Integer(rowid));
             }
             rows.push(row);
         }
         true
     })?;
 
-    Ok(ExecResult {
-        columns: table.col_names.clone(),
-        rows,
-    })
+    let columns: Arc<[String]> = if append_rowid {
+        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.into()
+    } else {
+        table.col_names.clone()
+    };
+    Ok(ExecResult { columns, rows })
 }
 
 /// Identity position table: `positions[i] == i` for every column index
@@ -9868,14 +9943,16 @@ fn exec_index_lookup(
     index: Arc<crate::schema::Index>,
     key_exprs: &[Expr],
 ) -> Result<ExecResult> {
-    exec_index_lookup_impl(
-        ctx,
-        table.clone(),
-        index,
-        key_exprs,
-        None,
-        table.col_names.clone(),
-    )
+    // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
+    // full-row fetches carry the trailing rowid.
+    let out_cols: Arc<[String]> = if crate::planner::wants_rowid_slot(&table) {
+        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.into()
+    } else {
+        table.col_names.clone()
+    };
+    exec_index_lookup_impl(ctx, table.clone(), index, key_exprs, None, out_cols)
 }
 
 /// IndexLookup with the projection FUSED into the fetch: decodes ONLY the
@@ -9947,12 +10024,18 @@ fn exec_index_lookup_impl(
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
     let mut rows: Vec<Row> = Vec::with_capacity(rowids.len());
+    // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID).
+    // The projected variant handles rowid via the ROWID_PROJ sentinel; the
+    // full-row (non-projected) path appends the trailing slot so generic
+    // projections above can reference it by name.
+    let append_rowid = project.is_none() && crate::planner::wants_rowid_slot(&table);
     fetch_rows_by_rowids(
         &mut table_bt,
         &rowids,
         n_cols,
         rowid_alias,
         project,
+        append_rowid,
         &mut rows,
     )?;
 
@@ -9968,12 +10051,15 @@ fn exec_index_lookup_impl(
 /// decoded values are MOVED into the output rows (no clone pass).
 /// The caller's B+tree handle is reused across all fetches so its pinned
 /// root page and leaf-hint warmth carry over.
+/// `append_rowid` (full-row mode only) appends the trailing hidden rowid
+/// slot (see planner::HIDDEN_ROWID).
 fn fetch_rows_by_rowids(
     table_bt: &mut Btree<'_>,
     rowids: &[i64],
     n_cols: usize,
     rowid_alias: Option<usize>,
     project: Option<&[usize]>,
+    append_rowid: bool,
     rows: &mut Vec<Row>,
 ) -> Result<()> {
     for &rowid in rowids {
@@ -9989,7 +10075,11 @@ fn fetch_rows_by_rowids(
             }
             None => {
                 let found = table_bt.lookup_table_with(rowid, |payload| {
-                    decode_row(payload, n_cols, rowid, rowid_alias)
+                    let mut r = decode_row(payload, n_cols, rowid, rowid_alias)?;
+                    if append_rowid {
+                        r.push(Value::Integer(rowid));
+                    }
+                    Ok(r)
                 })?;
                 if let Some(row) = found {
                     rows.push(row);
@@ -10139,6 +10229,22 @@ fn exec_index_range(
         let params = ctx.params.clone();
         let named_params = ctx.named_params.clone();
         let residual_pred = residual;
+        // Hidden rowid slot (no-alias tables): carried in the OUTPUT rows
+        // (registered under the hidden name); residuals that reference
+        // rowid evaluate against the slot through the "rowid" eval name.
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let eval_names: Vec<String> = if residual_pred.is_some() && append_rowid {
+            let mut v: Vec<String> = plain_names.iter().cloned().collect();
+            v.push("rowid".to_string());
+            v
+        } else {
+            Vec::new()
+        };
+        let eval_list: &[String] = if eval_names.is_empty() {
+            plain_names.as_ref()
+        } else {
+            &eval_names
+        };
         let mut bt = Btree::new(ctx.pager, table_root, false);
         bt.scan_table_borrowed(|rowid, payload| {
             // Advance the merge cursor.
@@ -10152,14 +10258,15 @@ fn exec_index_range(
                 return true; // not a match — keep scanning
             }
             ri += 1;
-            if let Ok(row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
+            if let Ok(mut row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
+                if append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
                 let keep = match residual_pred {
-                    Some(pred) => {
-                        match eval_row(pred, &row, &plain_names, &params, &named_params) {
-                            Ok(v) => v.is_truthy(),
-                            Err(_) => false,
-                        }
-                    }
+                    Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(_) => false,
+                    },
                     None => true,
                 };
                 if keep {
@@ -10174,19 +10281,57 @@ fn exec_index_range(
             rows.push(row);
         }
     } else {
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let eval_names: Vec<String> = if residual.is_some() && append_rowid {
+            let mut v: Vec<String> = plain_names.iter().cloned().collect();
+            v.push("rowid".to_string());
+            v
+        } else {
+            Vec::new()
+        };
         for rowid in rowids {
             let mut table_bt = Btree::new(ctx.pager, table_root, false);
             if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                let row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
+                let mut row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
                 if let Some(pred) = residual {
-                    let v = eval_row(pred, &row, &plain_names, &ctx.params, &ctx.named_params)?;
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
+                    let v = eval_row(
+                        pred,
+                        &row,
+                        if eval_names.is_empty() {
+                            plain_names.as_ref()
+                        } else {
+                            &eval_names
+                        },
+                        &ctx.params,
+                        &ctx.named_params,
+                    )?;
                     if !v.is_truthy() {
                         continue;
                     }
+                    if !append_rowid {
+                        // eval-only slot: restore the table shape.
+                        row.pop();
+                    }
+                } else if append_rowid {
+                    row.push(Value::Integer(rowid));
                 }
                 rows.push(row);
             }
         }
+    }
+
+    // Output columns gain the hidden rowid slot (no-alias tables).
+    if crate::planner::wants_rowid_slot(&table) {
+        let mut v: Vec<String> = columns.iter().cloned().collect();
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        let cols: Arc<[String]> = v.into();
+        return Ok(ExecResult {
+            columns: cols,
+            rows,
+        });
     }
 
     Ok(ExecResult { columns, rows })

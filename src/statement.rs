@@ -904,6 +904,21 @@ fn scan_columns(table: &Arc<crate::schema::Table>, alias: Option<&str>) -> Arc<[
     }
 }
 
+/// Scan columns PLUS the hidden rowid slot for no-alias tables (see
+/// `crate::planner::HIDDEN_ROWID`): expression evaluation resolves
+/// `rowid` through the trailing slot, star expansions filter it out.
+fn scan_columns_with_rowid(
+    table: &Arc<crate::schema::Table>,
+    alias: Option<&str>,
+) -> Arc<[String]> {
+    if !crate::planner::wants_rowid_slot(table) {
+        return scan_columns(table, alias);
+    }
+    let mut cols: Vec<String> = scan_columns(table, alias).iter().cloned().collect();
+    cols.push(crate::planner::HIDDEN_ROWID.to_string());
+    cols.into()
+}
+
 /// Try to build a streaming driver for a plan shape. `None` → materialize.
 fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
     match plan {
@@ -1113,6 +1128,9 @@ struct ScanDriver {
     table: Arc<crate::schema::Table>,
     columns: Arc<[String]>,
     predicate: Option<Expr>,
+    /// Trailing hidden-rowid slot (no-alias tables): every decoded row
+    /// carries the rowid so expressions above can reference it.
+    append_rowid: bool,
     last_rowid: i64,
     eof: bool,
 }
@@ -1123,11 +1141,17 @@ impl ScanDriver {
         alias: Option<String>,
         predicate: Option<Expr>,
     ) -> Self {
-        let columns = scan_columns(&table, alias.as_deref());
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let columns = if append_rowid {
+            scan_columns_with_rowid(&table, alias.as_deref())
+        } else {
+            scan_columns(&table, alias.as_deref())
+        };
         Self {
             table,
             columns,
             predicate,
+            append_rowid,
             last_rowid: i64::MIN,
             eof: false,
         }
@@ -1189,9 +1213,15 @@ impl Driver for ScanDriver {
                 hit_end = false;
                 return false; // stop the walk; resume next batch
             }
-            if let Ok(row) =
+            if let Ok(mut row) =
                 crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
             {
+                // Hidden rowid slot BEFORE predicate eval: the predicate
+                // may itself reference rowid (name resolution happens
+                // against self.columns, which carries the slot).
+                if self.append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
                 if let Some(pred) = predicate {
                     match crate::executor::eval_row(pred, &row, &col_names, &params_owned, named) {
                         Ok(v) if v.is_truthy() => {}
@@ -1240,6 +1270,11 @@ struct FilteredScanDriver {
     predicate: Expr,
     /// Alias (or table name) the predicate compiles against.
     prefix: String,
+    /// Trailing hidden-rowid slot (no-alias tables; see ScanDriver). The
+    /// COMPILED predicate never references it (a hidden-name column ref
+    /// fails compile_predicate, declining the fusion), but MATCHED rows
+    /// carry the slot for the projection drivers above.
+    append_rowid: bool,
     last_rowid: i64,
     eof: bool,
 }
@@ -1254,13 +1289,19 @@ impl FilteredScanDriver {
     }
 
     fn new(table: Arc<crate::schema::Table>, alias: Option<String>, predicate: Expr) -> Self {
-        let columns = scan_columns(&table, alias.as_deref());
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let columns = if append_rowid {
+            scan_columns_with_rowid(&table, alias.as_deref())
+        } else {
+            scan_columns(&table, alias.as_deref())
+        };
         let prefix = alias.unwrap_or_else(|| table.name.clone());
         Self {
             table,
             columns,
             predicate,
             prefix,
+            append_rowid,
             last_rowid: i64::MIN,
             eof: false,
         }
@@ -1361,6 +1402,7 @@ impl Driver for FilteredScanDriver {
             None
         };
         if let Some((col, lo, hi)) = range {
+            let append_rowid = self.append_rowid;
             if rowid_alias == Some(col) {
                 // The range is over the rowid: bound the walk itself.
                 let walk_lo = start.max(lo);
@@ -1370,9 +1412,12 @@ impl Driver for FilteredScanDriver {
                         return false;
                     }
                     last = last.max(rowid);
-                    if let Ok(row) =
+                    if let Ok(mut row) =
                         crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
                     {
+                        if append_rowid {
+                            row.push(Value::Integer(rowid));
+                        }
                         out.push(row);
                     }
                     true
@@ -1392,12 +1437,15 @@ impl Driver for FilteredScanDriver {
                     ) {
                         Some(crate::storage::row_codec::ProbeNum::Int(v)) => {
                             if v >= lo && v <= hi {
-                                if let Ok(row) = crate::storage::row_codec::decode_row(
+                                if let Ok(mut row) = crate::storage::row_codec::decode_row(
                                     payload,
                                     n_cols,
                                     rowid,
                                     rowid_alias,
                                 ) {
+                                    if append_rowid {
+                                        row.push(Value::Integer(rowid));
+                                    }
                                     out.push(row);
                                 }
                             }
@@ -1410,12 +1458,15 @@ impl Driver for FilteredScanDriver {
                             if crate::storage::row_codec::real_ge_int(v, lo)
                                 && crate::storage::row_codec::real_le_int(v, hi) =>
                         {
-                            if let Ok(row) = crate::storage::row_codec::decode_row(
+                            if let Ok(mut row) = crate::storage::row_codec::decode_row(
                                 payload,
                                 n_cols,
                                 rowid,
                                 rowid_alias,
                             ) {
+                                if append_rowid {
+                                    row.push(Value::Integer(rowid));
+                                }
                                 out.push(row);
                             }
                         }
@@ -1440,10 +1491,13 @@ impl Driver for FilteredScanDriver {
                     return false;
                 }
                 last = last.max(rowid);
-                if let Ok(row) =
+                if let Ok(mut row) =
                     crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
                 {
                     if sel_pred.eval(&row, &positions, params) {
+                        if self.append_rowid {
+                            row.push(Value::Integer(rowid));
+                        }
                         out.push(row);
                     }
                 }
@@ -1480,9 +1534,12 @@ impl Driver for FilteredScanDriver {
                     return true; // non-matching row: selective decode only
                 }
                 // Matching row: materialize the full row for the chain above.
-                if let Ok(row) =
+                if let Ok(mut row) =
                     crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
                 {
+                    if self.append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
                     out.push(row);
                 }
                 true
@@ -1501,6 +1558,8 @@ struct RangeDriver {
     start: Option<Expr>,
     end: Option<Expr>,
     residual: Option<Expr>,
+    /// Trailing hidden-rowid slot (no-alias tables; see ScanDriver).
+    append_rowid: bool,
     last_rowid: i64,
     eof: bool,
 }
@@ -1513,13 +1572,19 @@ impl RangeDriver {
         end: Option<Expr>,
         residual: Option<Expr>,
     ) -> Self {
-        let columns = scan_columns(&table, alias.as_deref());
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let columns = if append_rowid {
+            scan_columns_with_rowid(&table, alias.as_deref())
+        } else {
+            scan_columns(&table, alias.as_deref())
+        };
         Self {
             table,
             columns,
             start,
             end,
             residual,
+            append_rowid,
             last_rowid: i64::MIN,
             eof: false,
         }
@@ -1603,9 +1668,13 @@ impl Driver for RangeDriver {
                 hit_end = false;
                 return false;
             }
-            if let Ok(row) =
+            if let Ok(mut row) =
                 crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
             {
+                // Hidden rowid slot BEFORE residual eval (see ScanDriver).
+                if self.append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
                 if let Some(pred) = residual {
                     match crate::executor::eval_row(pred, &row, &col_names, &params_owned, named) {
                         Ok(v) if v.is_truthy() => {}
@@ -1803,7 +1872,11 @@ impl ProjectDriver {
 impl Driver for ProjectDriver {
     fn columns(&self) -> Arc<[String]> {
         let inner_cols = self.base.columns();
-        let inner: Vec<String> = inner_cols.iter().cloned().collect();
+        let inner: Vec<String> = inner_cols
+            .iter()
+            .filter(|c| !crate::planner::is_hidden_rowid(c))
+            .cloned()
+            .collect();
         let mut names: Vec<String> = Vec::new();
         for c in &self.exprs {
             match &c.expr {
@@ -1826,6 +1899,13 @@ impl Driver for ProjectDriver {
     ) -> Result<Vec<Row>> {
         let cols = self.base.columns();
         let col_names: Vec<String> = cols.iter().cloned().collect();
+        // Hidden rowid slots are TRAILING (ScanDriver & friends append
+        // them last): `SELECT *` must expand only the VISIBLE columns, so
+        // slice the trailing slots off each row before extending.
+        let hidden_count = col_names
+            .iter()
+            .filter(|c| crate::planner::is_hidden_rowid(c))
+            .count();
         let params_owned: Vec<Value> = params.to_vec();
         let exprs: Vec<Expr> = self.exprs.iter().map(|c| c.expr.clone()).collect();
         let batch = self.base.next_batch(db, params, named, budget)?;
@@ -1835,7 +1915,10 @@ impl Driver for ProjectDriver {
             for e in &exprs {
                 match e {
                     Expr::Column { name, .. } if name == "*" => {
-                        projected.extend_from_slice(&row);
+                        // Hidden slots are TRAILING: expand only the
+                        // visible columns.
+                        let take = row.len().saturating_sub(hidden_count);
+                        projected.extend_from_slice(&row[..take]);
                     }
                     _ => projected.push(crate::executor::eval_row(
                         e,

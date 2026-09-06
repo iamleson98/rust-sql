@@ -298,15 +298,21 @@ impl<'a> EvalContext<'a> {
     }
 
     fn lookup_in_main(&self, name: &str) -> Value {
-        // Special column: rowid / _rowid_ / oid
+        // Special column: rowid / _rowid_ / oid — and the planner's
+        // rewritten hidden name (no-alias tables; see
+        // planner::HIDDEN_ROWID). The trailing pseudo-rowid slot may be
+        // registered under EITHER name (legacy eval contexts append
+        // "rowid", driver output columns append the hidden name): match
+        // both.
         if name.eq_ignore_ascii_case("rowid")
             || name.eq_ignore_ascii_case("_rowid_")
             || name.eq_ignore_ascii_case("oid")
+            || name == crate::planner::HIDDEN_ROWID
         {
             if let Some(idx) = self
                 .column_names
                 .iter()
-                .position(|c| c.eq_ignore_ascii_case("rowid"))
+                .position(|c| c.eq_ignore_ascii_case("rowid") || c == crate::planner::HIDDEN_ROWID)
             {
                 return self.row.get(idx).cloned().unwrap_or(Value::Null);
             }

@@ -582,3 +582,41 @@ fix shape is sketched: planner-time rewrite of rowid spellings to the
 rowid-alias column for alias tables + a hidden appended rowid column
 for no-alias tables (star expansion must skip it). Documented here so
 the next sweep starts from the analysis, not the symptom.
+
+## 10. 2026-09-06 (III) — rowid inside expressions (§9's gap, closed)
+
+**The §9 gap is closed.** `rowid`/`_rowid_`/`oid` referenced inside
+EXPRESSIONS — `SELECT rowid*2`, `max(rowid)`, `WHERE rowid % 2 = 0`,
+`ORDER BY rowid % 3`, `INSERT ... SELECT rowid` — evaluates correctly on
+BOTH table shapes, through both API surfaces (query + prepare/step):
+
+- **Alias tables (INTEGER PRIMARY KEY):** a planner-time rewrite
+  (single-table queries only) maps every rowid spelling in every plan
+  expression to the rowid-alias COLUMN — projections, predicates
+  (pushed-down scan predicates AND residuals), aggregates (args + GROUP
+  BY + HAVING), ORDER BY, window specs. The value genuinely sits in the
+  row, so every evaluation path resolves it at once. Real columns named
+  rowid/_rowid_/oid shadow the pseudo-column (SQLite rule) and are left
+  alone; qualified refs must name the table or its alias; subquery
+  bodies are scope boundaries (their own plan_select pass rewrites with
+  their own FROM); joins/compound selects skip the rewrite (bare rowid
+  is ambiguous there — SQLite errors on it).
+
+- **No-alias tables (`CREATE TABLE u (a INT)`):** the rowid has no
+  in-row value, so row-producing paths append a TRAILING hidden slot
+  named `"\0rowid"` (unparseable as an identifier — no user column can
+  collide): ScanDriver / FilteredScanDriver / RangeDriver (statement
+  driver layer), exec_scan / scan_filter_limit / exec_rowid_range /
+  exec_index_range / exec_index_lookup (materialized layer), the
+  aggregate executors' eval contexts, and fetch_rows_by_rowids. The
+  planner rewrites rowid spellings to the hidden name; the evaluator's
+  pseudo-rowid special case matches the slot under EITHER its hidden
+  name or the legacy "rowid" eval name (legacy contexts — streaming
+  DML residuals — keep working unchanged). Star expansions filter the
+  hidden name (SELECT * arity stays the visible column count), and the
+  identity fast path steps aside when slots are present.
+
+Tests: tests/rowid_expressions.rs (6 tests — both table shapes, all
+spellings, shadowing, star arity, prepare/step, DML round-trip) on top
+of §9's suites. The §9 probe (probe_range_fused example) and the
+fused-range regression suite stay green.
