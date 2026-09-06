@@ -1485,3 +1485,292 @@ async fn txn_owner_reads_own_writes() {
     sqlx::query("COMMIT").execute(&mut *a).await.unwrap();
     drop(a);
 }
+
+/// chrono / uuid / Json type support (features sqlx-chrono, sqlx-uuid,
+/// sqlx-json): round-trips through the REAL sqlx facade with the exact
+/// storage semantics sqlx-sqlite uses (TEXT formats, INTEGER unix
+/// seconds, REAL seconds, BLOB(16) uuids, JSON-as-TEXT).
+#[cfg(feature = "sqlx-chrono")]
+mod chrono_types {
+    use super::mem_pool;
+    use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn datetime_utc_roundtrip() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let dt: DateTime<Utc> = DateTime::parse_from_rfc3339("2024-06-15T12:34:56.789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("INSERT INTO t (ts) VALUES (?)")
+            .bind(dt)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT ts FROM t WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(back, Some(dt), "DateTime<Utc> roundtrip");
+    }
+
+    #[tokio::test]
+    async fn datetime_local_and_fixed_offset_roundtrip() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let dtl: DateTime<Local> = DateTime::parse_from_rfc3339("2024-06-15T12:34:56.789+02:00")
+            .unwrap()
+            .with_timezone(&Local);
+        sqlx::query("INSERT INTO t (ts) VALUES (?)")
+            .bind(dtl)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<DateTime<Local>> = sqlx::query_scalar("SELECT ts FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.map(|d| d.to_utc()),
+            Some(dtl.to_utc()),
+            "DateTime<Local> roundtrip"
+        );
+
+        let dtf = DateTime::parse_from_rfc3339("2024-06-15T12:34:56.789-05:00").unwrap();
+        sqlx::query("UPDATE t SET ts = ?")
+            .bind(dtf)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<DateTime<FixedOffset>> = sqlx::query_scalar("SELECT ts FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.map(|d| d.to_utc()),
+            Some(dtf.to_utc()),
+            "DateTime<FixedOffset> roundtrip"
+        );
+    }
+
+    #[tokio::test]
+    async fn naive_datetime_roundtrip_and_sqlite_formats() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ndt = NaiveDateTime::parse_from_str("2024-06-15 12:34:56.789", "%F %T%.f").unwrap();
+        sqlx::query("INSERT INTO t (ts) VALUES (?)")
+            .bind(ndt)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<NaiveDateTime> = sqlx::query_scalar("SELECT ts FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(back, Some(ndt));
+
+        // SQLite's other documented TEXT formats parse on decode.
+        sqlx::raw_sql("UPDATE t SET ts = '2024-06-15 12:34'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<NaiveDateTime> = sqlx::query_scalar("SELECT ts FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.map(|d| (d.date(), d.time())),
+            Some((ndt.date(), NaiveTime::from_hms_opt(12, 34, 0).unwrap()))
+        );
+        // ISO "T" separator with Z.
+        sqlx::raw_sql("UPDATE t SET ts = '2024-06-15T12:34:56.789Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<NaiveDateTime> = sqlx::query_scalar("SELECT ts FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(back, Some(ndt));
+    }
+
+    #[tokio::test]
+    async fn datetime_from_unix_int_and_real() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b REAL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO t (a, b) VALUES (1718452496, 1718452496.789)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let from_int: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT a FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let from_real: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT b FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let want = DateTime::from_timestamp(1718452496, 0).unwrap().to_utc();
+        assert_eq!(from_int, Some(want), "INTEGER unix-seconds decode");
+        assert_eq!(
+            from_real.map(|d| d.timestamp()),
+            Some(want.timestamp()),
+            "REAL seconds decode (floor strategy)"
+        );
+    }
+
+    #[tokio::test]
+    async fn naive_date_and_time_roundtrip() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, d TEXT, tm TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let d = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
+        let tm = NaiveTime::from_hms_micro_opt(12, 34, 56, 789123).unwrap();
+        sqlx::query("INSERT INTO t (d, tm) VALUES (?, ?)")
+            .bind(d)
+            .bind(tm)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT d, tm FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let d2: NaiveDate = row.try_get(0).unwrap();
+        let tm2: NaiveTime = row.try_get(1).unwrap();
+        assert_eq!((d2, tm2), (d, tm));
+    }
+}
+
+#[cfg(feature = "sqlx-uuid")]
+mod uuid_types {
+    use super::mem_pool;
+    use sqlx::Row;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn uuid_blob_roundtrip() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, u BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let u = Uuid::parse_str("f81d4fae-7dec-11d0-a765-00a0c91e6bf6").unwrap();
+        sqlx::query("INSERT INTO t (u) VALUES (?)")
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<Uuid> = sqlx::query_scalar("SELECT u FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(back, Some(u), "Uuid BLOB(16) roundtrip");
+        // Storage is 16 raw bytes, exactly like sqlx-sqlite.
+        let n: i64 = sqlx::query_scalar("SELECT length(u) FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 16);
+    }
+
+    #[tokio::test]
+    async fn uuid_from_text_spelling() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO t (u) VALUES ('f81d4fae-7dec-11d0-a765-00a0c91e6bf6')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<Uuid> = sqlx::query_scalar("SELECT u FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.map(|u| u.to_string()),
+            Some("f81d4fae-7dec-11d0-a765-00a0c91e6bf6".into())
+        );
+    }
+}
+
+#[cfg(feature = "sqlx-json")]
+mod json_types {
+    use super::mem_pool;
+    use serde::{Deserialize, Serialize};
+    use sqlx::types::Json;
+    use sqlx::Row;
+
+    #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+    struct Book {
+        title: String,
+        dewey: i64,
+    }
+
+    #[tokio::test]
+    async fn json_struct_roundtrip() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, meta TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let b = Book {
+            title: "An Introduction to Database Systems".into(),
+            dewey: 575,
+        };
+        sqlx::query("INSERT INTO t (meta) VALUES (?)")
+            .bind(Json(b.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let back: Option<Json<Book>> = sqlx::query_scalar("SELECT meta FROM t WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(back.map(|Json(b)| b), Some(b), "Json<T> roundtrip");
+        // The engine's json1 functions operate on the stored JSON.
+        let n: i64 = sqlx::query_scalar("SELECT json_extract(meta, '$.dewey') FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 575, "stored JSON is engine-json1-queryable");
+    }
+
+    #[tokio::test]
+    async fn json_value_roundtrip_and_null() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, j TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let v: Json<serde_json::Value> = Json(serde_json::json!({"a": [1, 2, 3], "b": "x"}));
+        sqlx::query("INSERT INTO t (j) VALUES (?)")
+            .bind(v)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT j FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let back: Json<serde_json::Value> = row.try_get::<Json<serde_json::Value>, _>(0).unwrap();
+        assert_eq!(back.0["a"].as_array().map(|a| a.len()), Some(3));
+    }
+}

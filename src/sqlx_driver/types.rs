@@ -660,3 +660,305 @@ sqlx_core::impl_type_checking!(
         rust_decimal: {},
     },
 );
+
+// ---------------------------------------------------------------------------
+// chrono support (feature `sqlx-chrono`) — sqlx-sqlite-compatible semantics
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sqlx-chrono")]
+mod chrono_support {
+    use super::{DataType, EngineValue, Rustqlite, RustqliteTypeInfo, RustqliteValueRef};
+    use chrono::{
+        DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, SecondsFormat,
+        TimeZone, Utc,
+    };
+    use sqlx_core::decode::Decode;
+    use sqlx_core::encode::{Encode, IsNull};
+    use sqlx_core::error::BoxDynError;
+    use sqlx_core::types::Type;
+
+    impl Type<Rustqlite> for NaiveDateTime {
+        fn type_info() -> RustqliteTypeInfo {
+            RustqliteTypeInfo(DataType::Datetime)
+        }
+
+        fn compatible(ty: &RustqliteTypeInfo) -> bool {
+            matches!(
+                ty.0,
+                DataType::Datetime
+                    | DataType::Text
+                    | DataType::Integer
+                    | DataType::Int4
+                    | DataType::Float
+            )
+        }
+    }
+
+    impl Type<Rustqlite> for NaiveDate {
+        fn type_info() -> RustqliteTypeInfo {
+            RustqliteTypeInfo(DataType::Date)
+        }
+
+        fn compatible(ty: &RustqliteTypeInfo) -> bool {
+            matches!(ty.0, DataType::Date | DataType::Text)
+        }
+    }
+
+    impl Type<Rustqlite> for NaiveTime {
+        fn type_info() -> RustqliteTypeInfo {
+            RustqliteTypeInfo(DataType::Time)
+        }
+
+        fn compatible(ty: &RustqliteTypeInfo) -> bool {
+            matches!(ty.0, DataType::Time | DataType::Text)
+        }
+    }
+
+    impl<Tz: TimeZone> Type<Rustqlite> for DateTime<Tz> {
+        fn type_info() -> RustqliteTypeInfo {
+            <NaiveDateTime as Type<Rustqlite>>::type_info()
+        }
+
+        fn compatible(ty: &RustqliteTypeInfo) -> bool {
+            <NaiveDateTime as Type<Rustqlite>>::compatible(ty)
+        }
+    }
+
+    fn encode_text(s: String, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+        buf.push(EngineValue::Text(s.into()));
+        Ok(IsNull::No)
+    }
+
+    impl<Tz: TimeZone> Encode<'_, Rustqlite> for DateTime<Tz>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        fn encode_by_ref(&self, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+            encode_text(self.to_rfc3339_opts(SecondsFormat::AutoSi, false), buf)
+        }
+    }
+
+    impl Encode<'_, Rustqlite> for NaiveDateTime {
+        fn encode_by_ref(&self, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+            encode_text(self.format("%F %T%.f").to_string(), buf)
+        }
+    }
+
+    impl Encode<'_, Rustqlite> for NaiveDate {
+        fn encode_by_ref(&self, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+            encode_text(self.format("%F").to_string(), buf)
+        }
+    }
+
+    impl Encode<'_, Rustqlite> for NaiveTime {
+        fn encode_by_ref(&self, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+            encode_text(self.format("%T%.f").to_string(), buf)
+        }
+    }
+
+    impl<'r> Decode<'r, Rustqlite> for DateTime<Utc> {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            Ok(Utc.from_utc_datetime(&decode_datetime(value)?.naive_utc()))
+        }
+    }
+
+    impl<'r> Decode<'r, Rustqlite> for DateTime<Local> {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            Ok(Local.from_utc_datetime(&decode_datetime(value)?.naive_utc()))
+        }
+    }
+
+    impl<'r> Decode<'r, Rustqlite> for DateTime<FixedOffset> {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            decode_datetime(value)
+        }
+    }
+
+    impl<'r> Decode<'r, Rustqlite> for NaiveDateTime {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            decode_datetime(value).map(|dt| dt.naive_local())
+        }
+    }
+
+    impl<'r> Decode<'r, Rustqlite> for NaiveDate {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            decode_date(value.text()?.as_ref())
+        }
+    }
+
+    impl<'r> Decode<'r, Rustqlite> for NaiveTime {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            decode_time(value.text()?.as_ref())
+        }
+    }
+
+    /// Datetime decode — TEXT (RFC3339 then SQLite's documented formats),
+    /// INTEGER (unix seconds), or REAL (f64 seconds; both floor and round
+    /// strategies tried, like sqlx-sqlite).
+    fn decode_datetime(value: RustqliteValueRef<'_>) -> Result<DateTime<FixedOffset>, BoxDynError> {
+        let ty = DataType::of(value.value.as_ref());
+        let for_err = value.clone();
+        let dt = match ty {
+            DataType::Text => decode_datetime_from_text(&value.text()?),
+            DataType::Int4 | DataType::Integer => decode_datetime_from_int(value.int64()?),
+            DataType::Float => decode_datetime_from_float(value.double()?),
+            _ => None,
+        };
+        dt.ok_or_else(move || {
+            let t = for_err
+                .text()
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| "<non-text>".to_string());
+            format!("invalid datetime: {t}").into()
+        })
+    }
+
+    fn decode_datetime_from_text(value: &str) -> Option<DateTime<FixedOffset>> {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+            return Some(dt);
+        }
+        // SQLite's documented formats (the same list sqlx-sqlite tries).
+        let sqlite_datetime_formats = &[
+            "%F %T%.f",
+            "%F %R",
+            "%F %RZ",
+            "%F %R%:z",
+            "%F %T%.fZ",
+            "%F %T%.f%:z",
+            "%FT%R",
+            "%FT%RZ",
+            "%FT%R%:z",
+            "%FT%T%.f",
+            "%FT%T%.fZ",
+            "%FT%T%.f%:z",
+        ];
+        for format in sqlite_datetime_formats {
+            if let Ok(dt) = DateTime::parse_from_str(value, format) {
+                return Some(dt);
+            }
+            if let Ok(dt) = NaiveDateTime::parse_from_str(value, format) {
+                return Some(Utc.fix().from_utc_datetime(&dt));
+            }
+        }
+        None
+    }
+
+    fn decode_datetime_from_int(value: i64) -> Option<DateTime<FixedOffset>> {
+        DateTime::from_timestamp(value, 0).map(|dt| dt.fixed_offset())
+    }
+
+    fn decode_datetime_from_float(value: f64) -> Option<DateTime<FixedOffset>> {
+        // 1) floor: seconds + fractional remainder
+        let seconds = value.floor();
+        let micros = (value.fract() * 1_000_000.0).round() as u32;
+        if let Some(dt) = DateTime::from_timestamp(seconds as i64, micros * 1000) {
+            return Some(dt.fixed_offset());
+        }
+        // 2) round to the nearest second
+        let seconds = value.round();
+        DateTime::from_timestamp(seconds as i64, 0).map(|dt| dt.fixed_offset())
+    }
+
+    fn decode_date(value: &str) -> Result<NaiveDate, BoxDynError> {
+        NaiveDate::parse_from_str(value, "%F")
+            .map_err(|e| format!("error decoding Date from {}; {}", value, e).into())
+    }
+
+    fn decode_time(value: &str) -> Result<NaiveTime, BoxDynError> {
+        // %T truncates fractional seconds; try the fractional form first.
+        NaiveTime::parse_from_str(value, "%T%.f")
+            .or_else(|_| NaiveTime::parse_from_str(value, "%T"))
+            .map_err(|e| format!("error decoding Time from {}; {}", value, e).into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// uuid support (feature `sqlx-uuid`) — sqlx-sqlite-compatible semantics
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sqlx-uuid")]
+mod uuid_support {
+    use super::{DataType, EngineValue, Rustqlite, RustqliteTypeInfo, RustqliteValueRef};
+    use sqlx_core::decode::Decode;
+    use sqlx_core::encode::{Encode, IsNull};
+    use sqlx_core::error::BoxDynError;
+    use sqlx_core::types::Type;
+    use uuid::Uuid;
+
+    impl Type<Rustqlite> for Uuid {
+        fn type_info() -> RustqliteTypeInfo {
+            RustqliteTypeInfo(DataType::Blob)
+        }
+
+        fn compatible(ty: &RustqliteTypeInfo) -> bool {
+            matches!(ty.0, DataType::Blob | DataType::Text)
+        }
+    }
+
+    impl Encode<'_, Rustqlite> for Uuid {
+        fn encode_by_ref(&self, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+            buf.push(EngineValue::Blob(self.as_bytes().to_vec()));
+            Ok(IsNull::No)
+        }
+    }
+
+    impl Decode<'_, Rustqlite> for Uuid {
+        fn decode(value: RustqliteValueRef<'_>) -> Result<Self, BoxDynError> {
+            // BLOB(16) is the canonical form; TEXT spellings parse too.
+            let ty = DataType::of(value.value.as_ref());
+            match ty {
+                DataType::Text => {
+                    let t = value.text()?;
+                    Uuid::parse_str(t.as_ref()).map_err(Into::into)
+                }
+                _ => Uuid::from_slice(value.blob()?).map_err(Into::into),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Json<T> support (feature `sqlx-json`) — sqlx-sqlite-compatible semantics
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sqlx-json")]
+mod json_support {
+    use super::{EngineValue, Rustqlite, RustqliteTypeInfo, RustqliteValueRef};
+    use sqlx_core::decode::Decode;
+    use sqlx_core::encode::{Encode, IsNull};
+    use sqlx_core::error::BoxDynError;
+    use sqlx_core::types::{Json, Type};
+
+    impl<T> Type<Rustqlite> for Json<T> {
+        fn type_info() -> RustqliteTypeInfo {
+            <String as Type<Rustqlite>>::type_info()
+        }
+
+        fn compatible(ty: &RustqliteTypeInfo) -> bool {
+            <String as Type<Rustqlite>>::compatible(ty)
+        }
+    }
+
+    impl<T> Encode<'_, Rustqlite> for Json<T>
+    where
+        T: serde::Serialize,
+    {
+        fn encode_by_ref(&self, buf: &mut Vec<EngineValue>) -> Result<IsNull, BoxDynError> {
+            let text = serde_json::to_string(&self.0)?;
+            buf.push(EngineValue::Text(text.into()));
+            Ok(IsNull::No)
+        }
+    }
+
+    impl<'r, T> Decode<'r, Rustqlite> for Json<T>
+    where
+        T: 'r + serde::Deserialize<'r>,
+    {
+        fn decode(value: RustqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+            // Mirror sqlx-sqlite: decode the column as a BORROWED &str (its
+            // lifetime unifies with 'r) and let sqlx-core's hidden
+            // `decode_from_string` drive serde_json under that lifetime.
+            Self::decode_from_string(Decode::<Rustqlite>::decode(value)?)
+        }
+    }
+}
