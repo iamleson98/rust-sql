@@ -1268,3 +1268,90 @@ fn insert_arity_mismatch_errors() {
     db.execute("INSERT INTO t SELECT x, x FROM src", [])
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// VACUUM → append corruption (right=0 interiors)
+// ---------------------------------------------------------------------------
+
+/// Regression: interior pages can keep `right_most = 0` after mass
+/// deletes (the delete/rebalance path zeroes the slot when the right-most
+/// subtree empties; the page-level VACUUM copy preserves that state). The
+/// insert descent, the append walk, and `right_most_leaf` all used to
+/// treat `right = 0` as "descend into page 0" — PAGE 0 IS THE SCHEMA
+/// PAGE, so appends silently inserted rows into the schema tree (rows
+/// became unreachable, the COUNT drifted), and when the schema page
+/// eventually split, the parent splice wrote a phantom `(0, key)` cell
+/// into the table's interior: `PRAGMA integrity_check` reported
+/// "rowid 1 out of order (prev N)". Shape: one big insert transaction,
+/// delete 90%, VACUUM, INSERT..SELECT, delete — integrity at every step.
+#[test]
+fn vacuum_then_append_right_zero_interior() {
+    let path = std::env::temp_dir().join("rq_vac_append_regression.db");
+    let wal = {
+        let mut w = path.clone();
+        w.set_extension("db-wal");
+        w
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+    {
+        let mut db = rustqlite::Database::open(&path).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+        db.execute("PRAGMA synchronous = OFF", []).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+            [],
+        )
+        .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        for i in 1..=500_000i64 {
+            db.execute(
+                "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
+                [
+                    Value::Text(format!("name{i}").into()),
+                    Value::Integer(i),
+                    Value::Real(i as f64 * 1.5),
+                ],
+            )
+            .unwrap();
+        }
+        db.execute("COMMIT", []).unwrap();
+        db.execute("DELETE FROM t WHERE id > 50000", []).unwrap();
+        let ic = db.query("PRAGMA integrity_check", []).unwrap();
+        assert_eq!(ic[0][0], Value::Text("ok".into()));
+        db.execute("VACUUM", []).unwrap();
+        let ic = db.query("PRAGMA integrity_check", []).unwrap();
+        assert_eq!(ic[0][0], Value::Text("ok".into()), "post-vacuum");
+        let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(n[0][0], Value::Integer(50000));
+        // The regression trigger: append a full table's worth of rows.
+        db.execute(
+            "INSERT INTO t (name, val, score) SELECT name, val, score FROM t",
+            [],
+        )
+        .unwrap();
+        let ic = db.query("PRAGMA integrity_check", []).unwrap();
+        assert_eq!(ic[0][0], Value::Text("ok".into()), "post-append");
+        let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(n[0][0], Value::Integer(100000), "appended rows reachable");
+        let mx = db.query("SELECT MAX(id) FROM t", []).unwrap();
+        assert_eq!(mx[0][0], Value::Integer(100000));
+        // And the delete side of the churn.
+        db.execute("DELETE FROM t WHERE id > 50000", []).unwrap();
+        let ic = db.query("PRAGMA integrity_check", []).unwrap();
+        assert_eq!(ic[0][0], Value::Text("ok".into()), "post-delete");
+        let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(n[0][0], Value::Integer(50000));
+        // The schema page must be untouched: exactly one row in
+        // sqlite_schema for this table.
+        let sc = db
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE tbl_name = 't'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(sc[0][0], Value::Integer(1), "schema page not polluted");
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+}

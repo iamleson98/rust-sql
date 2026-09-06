@@ -517,7 +517,18 @@ fn find_index_child(
         }
     }
     if lo >= n {
-        (n as usize, right_most)
+        if right_most != 0 || n == 0 {
+            (n as usize, right_most)
+        } else {
+            // right=0 ("no right-most child" — the state delete/rebalance
+            // leaves behind): the LAST cell's child is the de-facto right
+            // edge. Returning literal 0 would descend the SCHEMA page.
+            let ptr = cell_pointer(n - 1) as usize;
+            match data.get(ptr..).and_then(|c| decode_index_cell(c, true)) {
+                Some(v) => (n as usize, v.left_child),
+                None => (n as usize, 0),
+            }
+        }
     } else {
         let ptr = cell_pointer(lo) as usize;
         match data.get(ptr..).and_then(|c| decode_index_cell(c, true)) {
@@ -2501,10 +2512,28 @@ impl<'a> Btree<'a> {
                 PageType::LeafTable => return Ok(page_id),
                 PageType::InteriorTable => {
                     let right = guard.right_most_pointer();
-                    if right == 0 {
+                    if right != 0 {
+                        page_id = right;
+                        continue;
+                    }
+                    // right=0: the LAST cell's child is the de-facto
+                    // right-most (the state delete/rebalance leaves when
+                    // the right-most subtree emptied). Returning THIS
+                    // interior would poison the append hint (every hinted
+                    // insert re-validates and falls back — correct but
+                    // slow); returning literal page 0 hands out the SCHEMA
+                    // page as a leaf (corruption).
+                    let n = guard.n_cells();
+                    if n == 0 {
                         return Ok(page_id);
                     }
-                    page_id = right;
+                    let last_ptr = guard.cell_pointer(n - 1) as usize;
+                    let last_child =
+                        decode_table_interior_child(&guard.data[last_ptr..]).unwrap_or(0);
+                    if last_child == 0 || last_child == page_id {
+                        return Ok(page_id);
+                    }
+                    page_id = last_child;
                 }
                 _ => return Ok(page_id),
             }
@@ -3106,7 +3135,23 @@ impl<'a> Btree<'a> {
                         }
                     }
                     if lo >= n {
-                        right_most
+                        if right_most != 0 {
+                            right_most
+                        } else if n > 0 {
+                            // right=0 ("no right-most child" — a state the
+                            // delete/rebalance paths leave behind when the
+                            // right-most subtree emptied): the LAST cell's
+                            // child is the de-facto right edge. Descending
+                            // into literal page 0 would insert rows into the
+                            // SCHEMA page (silent corruption: schema rows
+                            // + table rows interleaved, unreachable table
+                            // rows, and a phantom (0, key) parent cell once
+                            // page 0 splits).
+                            let ptr = cp(n - 1) as usize;
+                            decode_table_interior_child(&data[ptr..]).unwrap_or(0)
+                        } else {
+                            0
+                        }
                     } else {
                         let ptr = cp(lo) as usize;
                         decode_table_interior_child(&data[ptr..]).unwrap_or(right_most)
@@ -3181,12 +3226,32 @@ impl<'a> Btree<'a> {
                                 // Inconsistent tree — let the slow path's
                                 // error handling deal with it.
                                 is_right_most = false;
+                            } else if right_now == 0
+                                && found.is_some_and(|(i, _)| i + 1 == n_now as usize)
+                            {
+                                // right=0 and the child is the LAST cell's
+                                // child — the de-facto right-most split. The
+                                // two-cell fast splice would emit
+                                // (split_key-1, old_key) — a NON-MONOTONIC
+                                // pair (old_key < split_key) that misroutes
+                                // every later descent. Decline to the slow
+                                // path, which rewrites the last cell and
+                                // promotes new_page to the right-most slot.
+                                found = None;
+                                is_right_most = false;
                             }
                         }
 
                         if is_right_most {
                             // Append cell1 = (child_id, separator) and make
                             // new_page the new right-most child.
+                            // NOTE: `is_right_most` is only true when
+                            // right_now != 0 — the right=0 shape (child is
+                            // the LAST cell's child, the de-facto right
+                            // edge) must NOT append (the old cell still
+                            // references child_id): it rewrites the last
+                            // cell's separator instead — handled by the
+                            // slow path (fast path declines below).
                             let cell1 = if is_idx_now {
                                 Cell::IndexInterior {
                                     left_child: child_id,
@@ -3344,7 +3409,34 @@ impl<'a> Btree<'a> {
                         }
                     }
 
-                    if let Some(idx) = found_idx {
+                    // right=0 + the child is the LAST cell's child: the
+                    // de-facto right-most split. Rewrite the last cell's
+                    // separator to split_key-1 and promote new_page to the
+                    // right-most SLOT (a real right_most pointer). The plain
+                    // two-cell splice would emit (split_key-1, old_key) —
+                    // non-monotonic (old_key < split_key) — misrouting every
+                    // later descent.
+                    let effective_right_most =
+                        right_most == 0 && found_idx == Some(cells.len() - 1);
+
+                    if effective_right_most {
+                        let cell1 = if is_idx_page {
+                            Cell::IndexInterior {
+                                left_child: child_id,
+                                key: split_key_bytes.clone().unwrap_or_default(),
+                                rowid: split_key,
+                            }
+                        } else {
+                            Cell::TableInterior {
+                                left_child: child_id,
+                                key: split_key - 1,
+                            }
+                        };
+                        if let Some(idx) = found_idx {
+                            cells[idx] = cell1;
+                        }
+                        right_most = new_page;
+                    } else if let Some(idx) = found_idx {
                         if is_idx_page {
                             let (old_key, old_rowid) = match &cells[idx] {
                                 Cell::IndexInterior { key, rowid, .. } => (key.clone(), *rowid),
