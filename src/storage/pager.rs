@@ -632,6 +632,13 @@ pub struct Pager {
     /// live scope gated off. RMW operations on the counter serialize, so
     /// count > 0 holds whenever any scope exists — no ordering hazard.
     committed_scope_count: std::sync::atomic::AtomicUsize,
+    /// Snapshot of `write_epoch()` at BEGIN: while a committed-view scope
+    /// is armed on this pager, `write_epoch` returns THIS value so hints
+    /// built against BEGIN-time pages stay valid for the whole
+    /// transaction (the committed tree is immutable until COMMIT — the
+    /// writer's live `note_write` bumps must not rebuild every reader
+    /// descent). 0 = no transaction open (never consulted then).
+    committed_view_epoch: std::sync::atomic::AtomicU64,
     /// PRAGMA user_version / application_id — persisted at the SQLite
     /// header offsets (60..64 / 68..72) inside page 0.
     user_version: std::sync::atomic::AtomicU32,
@@ -938,6 +945,8 @@ impl Pager {
         self.savepoint_min_base.store(u32::MAX, Ordering::Relaxed);
         self.savepoint_depth.store(0, Ordering::Release);
         self.committed_bound_cache.store(0, Ordering::Release);
+        // The transaction ended: unfreeze the committed-view hint epoch.
+        self.committed_view_epoch.store(0, Ordering::Release);
     }
 
     /// Roll the pager back to the OUTERMOST savepoint — the transaction
@@ -1033,7 +1042,16 @@ impl Pager {
         // served a committed-view read.
         if self.committed_view_used.load(Ordering::Acquire) {
             let mut cp = self.committed_pages.write();
-            cp.remove(&id);
+            if cp.remove(&id).is_some() {
+                // BEGIN-time divergence: this page's committed alias (or
+                // copy) just died — the committed STATE changed. Bump the
+                // committed-state epoch so hints built earlier in the
+                // transaction (which may hold this page's LIVE PageRef —
+                // the writer is about to mutate it in place) are retired:
+                // the next descent rebuilds through get_page_committed
+                // and serves the pre-image instead.
+                self.committed_view_epoch.fetch_add(1, Ordering::AcqRel);
+            }
         }
         for level in sp.iter_mut() {
             if (id as u64) < level.base.n_pages as u64 {
@@ -1198,6 +1216,7 @@ impl Pager {
             committed_view_used: std::sync::atomic::AtomicBool::new(false),
             committed_bound_cache: std::sync::atomic::AtomicU32::new(0),
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
+            committed_view_epoch: std::sync::atomic::AtomicU64::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
             application_id: std::sync::atomic::AtomicU32::new(0),
             retired: AtomicBool::new(false),
@@ -1637,10 +1656,36 @@ impl Pager {
     /// with a single comparison. instance fits 16 bits (65k databases per
     /// process), version 48 bits (281 trillion writes) — wraparound is
     /// beyond any realistic workload.
+    ///
+    /// While a committed-view scope is armed on this thread, the BEGIN-time
+    /// snapshot is returned instead (see `committed_view_epoch`).
     #[inline]
     pub fn write_epoch(&self) -> u64 {
+        // Committed-view scope armed on THIS thread: return the BEGIN-time
+        // epoch. Hints built against BEGIN-time pages validate against it
+        // for the whole transaction, so a concurrent writer's live bumps
+        // do not clear and rebuild every reader descent (the 1W+7R shape
+        // paid a full hint rebuild + root re-descent per query). Live
+        // readers (no scope) and the writer thread keep the live epoch.
+        if self.committed_scope_count.load(Ordering::Acquire) > 0 {
+            if let Some((pid, _)) = committed_scope() {
+                if pid == self.instance_id {
+                    let e = self.committed_view_epoch.load(Ordering::Acquire);
+                    if e != 0 {
+                        return e;
+                    }
+                }
+            }
+        }
         let v = self.write_version.load(Ordering::Relaxed);
         (self.instance_id << 48) | (v & 0xFFFF_FFFF_FFFF)
+    }
+
+    /// Freeze the committed-view hint epoch (see `committed_view_epoch`).
+    /// Called at BEGIN, BEFORE the transaction's first mutation can bump
+    /// the live version.
+    pub fn set_committed_view_epoch(&self, epoch: u64) {
+        self.committed_view_epoch.store(epoch, Ordering::Release);
     }
 
     /// Notify the pager that a specific page is dirty. Adds the page ID

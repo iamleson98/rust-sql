@@ -3612,6 +3612,14 @@ impl Database {
                     self.txn_begin_epoch
                         .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
                     self.txn_has_ddl.store(false, Ordering::Release);
+                    // Freeze the txn's COMMITTED-VIEW hint epoch: hints a
+                    // mid-transaction foreign reader builds against
+                    // BEGIN-time pages stay valid for the whole
+                    // transaction (the committed tree is immutable until
+                    // COMMIT), even as the writer's `note_write` bumps the
+                    // live write version. `Pager::write_epoch` returns
+                    // this snapshot while a committed scope is armed.
+                    self.pager.set_committed_view_epoch(self.pager.write_epoch());
                     // NOTE: no committed-view clear. The entry-invalidation
                     // invariant is maintained by the mutation path
                     // (`note_dirty`) and the transaction boundaries
