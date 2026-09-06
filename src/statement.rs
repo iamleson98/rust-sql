@@ -499,24 +499,32 @@ impl<'a> Statement<'a> {
             return Ok(());
         }
 
-        // Precompiled point/range fast paths: a handful of rows. Skipped
-        // when the committed view is armed — the cached fast path embeds
-        // LIVE roots (B+tree splits mid-transaction move them).
-        if self.fast_path.is_some() && !self.db.pager.committed_reads_armed() {
-            if let Some(fp) = self.fast_path.clone() {
-                let rows = self.db.run_fast_path_public(&fp, &self.params)?;
-                self.columns = Some(fp_output_columns(&fp));
-                self.stream = StreamState::Materialized(rows.into_iter());
-                return Ok(());
-            }
-        }
-
+        // Streaming driver FIRST when one covers the plan: drivers
+        // produce rows in BUDGET-SIZED batches (bounded live memory),
+        // while the precompiled fast paths materialize the ENTIRE result
+        // before the first step — for a 100k-row range consumed one row
+        // at a time (S06), the fused ProjectedRangeDriver measured ~10%
+        // faster and far less peak memory. Point/COUNT lookup plans have
+        // no driver shape, so they still take their fast paths. Fast
+        // paths are skipped anyway under committed reads.
         if let Some(plan) = self.plan.clone() {
             // Streaming driver?
             if let Some(drv) = try_build_driver(&plan) {
                 self.columns = Some(drv.columns());
                 self.stream = StreamState::Driver(drv);
                 return Ok(());
+            }
+            // Precompiled point/COUNT fast paths (plans with no driver
+            // shape): a handful of rows. Skipped when the committed view
+            // is armed — the cached fast path embeds LIVE roots (B+tree
+            // splits mid-transaction move them).
+            if self.fast_path.is_some() && !self.db.pager.committed_reads_armed() {
+                if let Some(fp) = self.fast_path.clone() {
+                    let rows = self.db.run_fast_path_public(&fp, &self.params)?;
+                    self.columns = Some(fp_output_columns(&fp));
+                    self.stream = StreamState::Materialized(rows.into_iter());
+                    return Ok(());
+                }
             }
             // Materialized: DML (with merge-back) or general SELECT.
             // DML WITHOUT RETURNING emits the engine's internal change
@@ -1006,6 +1014,34 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
                     }
                 }
             }
+            // FUSED: Project over a RowidRange with a bare-column
+            // projection and no residual — selective decode inside the
+            // rowid bounds (the streaming twin of
+            // exec_rowid_range_projected_impl). `SELECT id, val FROM t
+            // WHERE id BETWEEN ? AND ?` full-decoded every row in
+            // RangeDriver (wide columns included) and re-projected per
+            // batch; this skips the un-projected decode entirely.
+            if let Plan::RowidRange {
+                table,
+                alias: _,
+                start,
+                end,
+                residual: None,
+            } = input.as_ref()
+            {
+                if table.vtab.is_none() {
+                    if let Some((Some(project), out_cols)) = bare_column_projection(columns, table)
+                    {
+                        return Some(Box::new(ProjectedRangeDriver::new(
+                            table.clone(),
+                            project,
+                            out_cols,
+                            start.clone(),
+                            end.clone(),
+                        )));
+                    }
+                }
+            }
             let base = try_build_driver(input)?;
             Some(Box::new(ProjectDriver::new(base, columns.clone())))
         }
@@ -1115,6 +1151,126 @@ impl Driver for ProjectedScanDriver {
                 true
             },
         )?;
+        self.eof = hit_end && out.len() < budget;
+        self.last_rowid = last;
+        Ok(out)
+    }
+}
+
+/// FUSED ProjectedRangeDriver: `Project(RowidRange)` with a bare-column
+/// projection and no residual decodes ONLY the projected columns inside
+/// the rowid range (selective decode) — the streaming twin of the
+/// executor's `exec_rowid_range_projected_impl`. `SELECT id, val FROM t
+/// WHERE id BETWEEN ? AND ?` previously full-decoded every row (wide
+/// TEXT columns included) in RangeDriver and re-projected per batch;
+/// this skips the un-projected decode entirely. Bounds may be
+/// parameters (re-evaluated per batch, resume-aware).
+struct ProjectedRangeDriver {
+    table: Arc<crate::schema::Table>,
+    columns: Arc<[String]>,
+    /// Wanted column indices, in the projection's output order.
+    project: Vec<usize>,
+    start: Option<Expr>,
+    end: Option<Expr>,
+    last_rowid: i64,
+    eof: bool,
+}
+
+impl ProjectedRangeDriver {
+    fn new(
+        table: Arc<crate::schema::Table>,
+        project: Vec<usize>,
+        out_cols: Arc<[String]>,
+        start: Option<Expr>,
+        end: Option<Expr>,
+    ) -> Self {
+        Self {
+            table,
+            columns: out_cols,
+            project,
+            start,
+            end,
+            last_rowid: i64::MIN,
+            eof: false,
+        }
+    }
+}
+
+impl Driver for ProjectedRangeDriver {
+    fn columns(&self) -> Arc<[String]> {
+        self.columns.clone()
+    }
+    fn next_batch(
+        &mut self,
+        db: &Database,
+        params: &[Value],
+        named: &HashMap<String, Value>,
+        budget: usize,
+    ) -> Result<Vec<Row>> {
+        if self.eof {
+            return Ok(Vec::new());
+        }
+        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let shared = db.read_maps();
+        let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+        for p in params {
+            ctx.bind_positional(p.clone());
+        }
+        let _g = db.plugin_scope();
+        let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+        // Bounds: re-evaluated per batch (parameters may change); the
+        // resume clamp keeps mid-range batches from re-reading rows.
+        let lo = match &self.start {
+            Some(e) => {
+                let v = crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer();
+                if self.last_rowid != i64::MIN && self.last_rowid + 1 > v {
+                    self.last_rowid + 1
+                } else {
+                    v
+                }
+            }
+            None => {
+                if self.last_rowid == i64::MIN {
+                    i64::MIN
+                } else {
+                    self.last_rowid + 1
+                }
+            }
+        };
+        let hi = match &self.end {
+            Some(e) => crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer(),
+            None => i64::MAX,
+        };
+        if lo > hi {
+            self.eof = true;
+            return Ok(Vec::new());
+        }
+        let root = ctx.table_root(&self.table);
+        let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
+        let n_cols = self.table.n_columns();
+        let rowid_alias = self.table.rowid_alias;
+        let mut out: Vec<Row> = Vec::with_capacity(budget.min(BATCH));
+        let mut last = self.last_rowid;
+        let mut hit_end = true;
+        let mut batch_bytes = 0usize;
+        bt.scan_table_range_selective(lo, hi, n_cols, &self.project, rowid_alias, |rowid, row| {
+            if out.len() >= budget {
+                hit_end = false;
+                return false; // resume NEXT batch at this row
+            }
+            batch_bytes += row_heap_bytes(&row);
+            out.push(row);
+            // `last` tracks only PUSHED rows (see ProjectedScanDriver).
+            last = rowid;
+            if batch_bytes >= MAX_BATCH_BYTES {
+                hit_end = false;
+                return false;
+            }
+            true
+        })?;
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
         Ok(out)
