@@ -495,13 +495,21 @@ mod committed_view {
         let state = Arc::new(RwLock::new(db));
 
         let stop = Arc::new(AtomicBool::new(false));
+        // Ready barrier: on a loaded 2-core box the writer thread can
+        // finish all 1000 statements before the OS schedules ANY reader —
+        // total_reads == 0 was a scheduling artifact, not isolation.
+        // Wait for every reader to complete one read first, THEN start
+        // the writer; the mid-transaction interleaving still happens
+        // naturally across the writer's ~ms of statements.
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut reader_handles = Vec::new();
         for _ in 0..4 {
             let s = Arc::clone(&state);
             let stop = Arc::clone(&stop);
+            let started = Arc::clone(&started);
             reader_handles.push(thread::spawn(move || {
                 let mut reads = 0usize;
-                while !stop.load(Ordering::Acquire) {
+                loop {
                     let b = s.read();
                     let n = count(&b);
                     // Reader isolation: BEFORE the writer's BEGIN → live
@@ -513,10 +521,23 @@ mod committed_view {
                         "reader isolation violated: saw intermediate count {n}"
                     );
                     reads += 1;
+                    if reads == 1 {
+                        started.fetch_add(1, Ordering::Release);
+                    }
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     std::thread::yield_now();
                 }
                 reads
             }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while started.load(Ordering::Acquire) < 4 {
+            if std::time::Instant::now() > deadline {
+                panic!("readers never started — scheduler starvation (not isolation)");
+            }
+            std::thread::yield_now();
         }
         // Writer THREAD opens the txn and inserts while readers read.
         let s = Arc::clone(&state);
@@ -596,5 +617,231 @@ mod committed_view {
         );
         drop(state);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod committed_fast_path {
+    use parking_lot::RwLock;
+    use rustqlite::{Database, Value};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Fast-path point lookups under an armed committed view must serve
+    /// BEGIN-time state even while the writer's mid-transaction inserts
+    /// SPLIT the B+tree (moving the live root) — the exact hazard that
+    /// used to make the driver skip the fast path entirely. Rowid lookups
+    /// for rows that exist only after BEGIN must return empty; pre-BEGIN
+    /// rows must return their BEGIN-time values; nothing may error.
+    #[test]
+    fn fast_path_point_lookup_under_root_moves() {
+        let mut db = Database::open_in_memory().expect("open");
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER NOT NULL)",
+            [],
+        )
+        .expect("create");
+        // Enough rows that the writer's appends SPLIT leaves mid-txn
+        // (multi-level tree with root moves), all rowid < 2000.
+        db.execute("BEGIN", []).expect("begin");
+        for i in 1..=2000i64 {
+            db.execute("INSERT INTO t (x) VALUES (?)", [Value::Integer(i)])
+                .expect("seed");
+        }
+        db.execute("COMMIT", []).expect("commit");
+        let state = Arc::new(RwLock::new(db));
+
+        // Prime the statement cache so the fast path exists and the
+        // readers exercise exactly the FastPath::RowidPoint arm.
+        {
+            let b = state.read();
+            for id in [1i64, 2, 1000, 2000] {
+                let rows = b
+                    .query("SELECT x FROM t WHERE id = ?", [Value::Integer(id)])
+                    .expect("prime");
+                assert_eq!(rows.len(), 1);
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let wdb = Arc::clone(&state);
+        let (d2, s2) = (Arc::clone(&dirty), Arc::clone(&stop));
+        let w = thread::spawn(move || {
+            {
+                let mut g = wdb.write();
+                g.execute("BEGIN", []).expect("begin");
+                // Root-moving splits: appends at fresh rowids plus
+                // in-place updates of pre-existing rows.
+                for i in 2001..=2600i64 {
+                    g.execute("INSERT INTO t (x) VALUES (?)", [Value::Integer(i)])
+                        .expect("insert");
+                }
+                g.execute("UPDATE t SET x = -x WHERE id < 300", [])
+                    .expect("update");
+            }
+            d2.store(true, Ordering::Release);
+            while !s2.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            wdb.write().execute("COMMIT", []).expect("commit");
+        });
+        while !dirty.load(Ordering::Acquire) {}
+
+        // Foreign-thread readers: the engine heuristic arms the
+        // committed view; the cached statement takes the fast path.
+        let reader = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                for i in 0..4000u64 {
+                    let id = 1 + (i % 2600) as i64;
+                    let g = state.read();
+                    let rows = g
+                        .query("SELECT x FROM t WHERE id = ?", [Value::Integer(id)])
+                        .expect("fast-path read");
+                    drop(g);
+                    if id <= 2000 {
+                        // BEGIN-time rows: original value (the writer's
+                        // UPDATE is invisible until COMMIT).
+                        assert_eq!(
+                            rows.first().and_then(|r| r.first()).cloned(),
+                            Some(Value::Integer(id)),
+                            "BEGIN-time row {id} must read its BEGIN value"
+                        );
+                    } else {
+                        // Post-BEGIN rowids: invisible to the committed
+                        // view even though the live tree holds them.
+                        assert!(
+                            rows.is_empty(),
+                            "uncommitted row {id} leaked to a committed reader"
+                        );
+                    }
+                }
+            })
+        };
+        reader.join().expect("reader");
+        stop.store(true, Ordering::Release);
+        w.join().expect("writer");
+
+        // Post-COMMIT: everything visible, updated rows flipped.
+        let b = state.read();
+        let rows = b
+            .query("SELECT x FROM t WHERE id = 5", [])
+            .expect("post-commit read");
+        assert_eq!(
+            rows.first().and_then(|r| r.first()).cloned(),
+            Some(Value::Integer(-5))
+        );
+        let n = b.query("SELECT COUNT(*) FROM t", []).expect("count");
+        assert_eq!(
+            n.first().and_then(|r| r.first()).cloned(),
+            Some(Value::Integer(2600))
+        );
+    }
+
+    /// INDEX point lookups under a committed view with index root moves:
+    /// `SELECT x FROM t WHERE xi = ?` over a non-unique index the writer
+    /// is splitting — the FastPath::IndexPoint arm.
+    #[test]
+    fn fast_path_index_lookup_under_root_moves() {
+        let mut db = Database::open_in_memory().expect("open");
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, xi INTEGER NOT NULL, y TEXT)",
+            [],
+        )
+        .expect("create");
+        db.execute("CREATE INDEX t_xi ON t (xi)", [])
+            .expect("index");
+        db.execute("BEGIN", []).expect("begin");
+        for i in 1..=3000i64 {
+            db.execute(
+                "INSERT INTO t (xi, y) VALUES (?, ?)",
+                [Value::Integer(i * 7), Value::Text(format!("v{i}").into())],
+            )
+            .expect("seed");
+        }
+        db.execute("COMMIT", []).expect("commit");
+        let state = Arc::new(RwLock::new(db));
+
+        {
+            let b = state.read();
+            for k in [7i64, 14, 21000] {
+                let rows = b
+                    .query("SELECT y FROM t WHERE xi = ?", [Value::Integer(k)])
+                    .expect("prime");
+                assert_eq!(rows.len(), 1, "xi={k}");
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let wdb = Arc::clone(&state);
+        let (d2, s2) = (Arc::clone(&dirty), Arc::clone(&stop));
+        let w = thread::spawn(move || {
+            {
+                let mut g = wdb.write();
+                g.execute("BEGIN", []).expect("begin");
+                // Split the INDEX: new keys land above every seed key,
+                // growing the index tree until its root moves.
+                for i in 3001..=3800i64 {
+                    g.execute(
+                        "INSERT INTO t (xi, y) VALUES (?, ?)",
+                        [Value::Integer(i * 7), Value::Text(format!("w{i}").into())],
+                    )
+                    .expect("insert");
+                }
+                g.execute("UPDATE t SET xi = -xi WHERE id > 2900", [])
+                    .expect("index rewrite");
+            }
+            d2.store(true, Ordering::Release);
+            while !s2.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            wdb.write().execute("COMMIT", []).expect("commit");
+        });
+        while !dirty.load(Ordering::Acquire) {}
+
+        let reader = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                for i in 0..4000u64 {
+                    let seed = 1 + (i % 3000) as i64;
+                    let key = seed * 7; // BEGIN-time index key
+                    let g = state.read();
+                    let rows = g
+                        .query("SELECT y FROM t WHERE xi = ?", [Value::Integer(key)])
+                        .expect("index fast-path read");
+                    drop(g);
+                    assert_eq!(
+                        rows.len(),
+                        1,
+                        "BEGIN-time key {key} must resolve exactly once"
+                    );
+                    assert_eq!(
+                        rows.first().and_then(|r| r.first()).cloned(),
+                        Some(Value::Text(format!("v{seed}").into()))
+                    );
+                    // Keys that exist only post-BEGIN: invisible.
+                    let post = 3500i64 * 7;
+                    let rows = state
+                        .read()
+                        .query("SELECT y FROM t WHERE xi = ?", [Value::Integer(post)])
+                        .expect("post key read");
+                    assert!(rows.is_empty(), "uncommitted index key {post} leaked");
+                }
+            })
+        };
+        reader.join().expect("reader");
+        stop.store(true, Ordering::Release);
+        w.join().expect("writer");
+
+        let b = state.read();
+        let rows = b.query("SELECT COUNT(*) FROM t", []).expect("count");
+        assert_eq!(
+            rows.first().and_then(|r| r.first()).cloned(),
+            Some(Value::Integer(3800))
+        );
     }
 }

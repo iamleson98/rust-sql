@@ -515,10 +515,10 @@ impl<'a> Statement<'a> {
                 return Ok(());
             }
             // Precompiled point/COUNT fast paths (plans with no driver
-            // shape): a handful of rows. Skipped when the committed view
-            // is armed — the cached fast path embeds LIVE roots (B+tree
-            // splits mid-transaction move them).
-            if self.fast_path.is_some() && !self.db.pager.committed_reads_armed() {
+            // shape): a handful of rows. Committed-view reads take them
+            // too — run_fast_path resolves BEGIN-time roots under an
+            // armed scope (the guard above armed it for SELECTs).
+            if self.fast_path.is_some() {
                 if let Some(fp) = self.fast_path.clone() {
                     let rows = self.db.run_fast_path_public(&fp, &self.params)?;
                     self.columns = Some(fp_output_columns(&fp));

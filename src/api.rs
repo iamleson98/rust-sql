@@ -3845,20 +3845,19 @@ impl Database {
         // over a rowid / index point lookup). Checked BEFORE the plan
         // Arc clone — the fast path never touches the plan, and the
         // refcount pair cost ~15 ns per OLTP query.
-        // Committed-view readers skip it: the cached fast path embeds
-        // LIVE roots (B+tree splits mid-transaction move them).
-        if !self.pager.committed_reads_armed() {
-            if let Some(fp) = &cached.fast_path {
-                // Bind straight from the caller's parameter storage when
-                // it's already contiguous (arrays/Vec) — no per-query Vec.
-                if let Some(slice) = params.as_slice() {
-                    let rows = self.run_fast_path(fp, slice)?;
-                    return Ok(rows);
-                }
-                let params_v: Vec<Value> = params.into_iter().collect();
-                let rows = self.run_fast_path(fp, &params_v)?;
+        // Committed-view readers take it too: run_fast_path resolves
+        // BEGIN-time roots under an armed scope, so the walk serves
+        // BEGIN-time bytes end-to-end.
+        if let Some(fp) = &cached.fast_path {
+            // Bind straight from the caller's parameter storage when
+            // it's already contiguous (arrays/Vec) — no per-query Vec.
+            if let Some(slice) = params.as_slice() {
+                let rows = self.run_fast_path(fp, slice)?;
                 return Ok(rows);
             }
+            let params_v: Vec<Value> = params.into_iter().collect();
+            let rows = self.run_fast_path(fp, &params_v)?;
+            return Ok(rows);
         }
         if let Some(plan) = cached.plan.clone() {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
@@ -4048,21 +4047,20 @@ impl Database {
             }
         }
         if let Some(plan) = cached.plan.clone() {
-            // Pre-compiled point-lookup fast path (see query()). Skipped
-            // for committed-view reads: it embeds LIVE roots.
-            if !self.pager.committed_reads_armed() {
-                if let Some(fp) = &cached.fast_path {
-                    let owned;
-                    let slice: &[Value] = match params.as_slice() {
-                        Some(s) => s,
-                        None => {
-                            owned = params.into_iter().collect::<Vec<Value>>();
-                            &owned
-                        }
-                    };
-                    let rows = self.run_fast_path(fp, slice)?;
-                    return Ok((fp.output_columns().to_vec(), rows));
-                }
+            // Pre-compiled point-lookup fast path (see query()). Works
+            // under committed-view reads too: run_fast_path resolves
+            // BEGIN-time roots under an armed scope.
+            if let Some(fp) = &cached.fast_path {
+                let owned;
+                let slice: &[Value] = match params.as_slice() {
+                    Some(s) => s,
+                    None => {
+                        owned = params.into_iter().collect::<Vec<Value>>();
+                        &owned
+                    }
+                };
+                let rows = self.run_fast_path(fp, slice)?;
+                return Ok((fp.output_columns().to_vec(), rows));
             }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -5024,7 +5022,36 @@ impl Database {
         // replaces the read-lock + two HashMap probes on this hottest
         // OLTP path. Writers hold `&mut self`, so the flag can never be
         // stale while a reader runs.
-        let (table_root, index_root) = if self.maps_populated.load(Ordering::Acquire) {
+        //
+        // COMMITTED-VIEW READS (an armed scope): resolve from the
+        // BEGIN-time snapshot instead — a mid-transaction split moves
+        // the LIVE root, and the committed descent must start where
+        // BEGIN left it. Every page fetch below is redirected to
+        // BEGIN-time bytes by the armed scope itself, so with a
+        // BEGIN-time root the whole walk is committed-correct; a
+        // missing snapshot entry means the root never moved (the
+        // catalog's open-time root IS the BEGIN root). This is what
+        // lets point-lookup readers under an open write transaction
+        // keep the ~0.35 us fast path instead of the ~1.2 us general
+        // pipeline (ExecContext + plan dispatch + EvalContext).
+        let (table_root, index_root) = if self.pager.committed_reads_armed() {
+            let m = self.read_maps();
+            let name = fp.table_name();
+            let t = m
+                .roots
+                .get(name)
+                .copied()
+                .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
+            let i = match fp {
+                FastPath::IndexPoint { index, .. } => m
+                    .index_roots
+                    .get(&index.name)
+                    .copied()
+                    .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
+                _ => None,
+            };
+            (t, i)
+        } else if self.maps_populated.load(Ordering::Acquire) {
             let m = self.maps.read();
             let name = fp.table_name();
             let t = m
