@@ -435,6 +435,14 @@ impl Parser {
                     | "AS"
                     | "CONSTRAINT"
             ),
+            // `GENERATED` lexes as a plain identifier (it is NOT in the
+            // reserved keyword table — tables and columns may be named
+            // "generated"); the constraint dispatch matches it by
+            // uppercase text. This is what makes
+            // `col INT GENERATED ALWAYS AS (expr) [VIRTUAL|STORED]` parse
+            // (the bare `AS (expr)` form always worked — `AS` is a
+            // reserved keyword).
+            Token::Ident(s) => s.eq_ignore_ascii_case("GENERATED"),
             _ => false,
         }
     }
@@ -560,9 +568,30 @@ impl Parser {
                 on_delete,
                 on_update,
             })
-        } else if t.is_keyword("GENERATED") {
+        } else if t.is_keyword("GENERATED")
+            || matches!(&t.token, Token::Ident(s) if s.eq_ignore_ascii_case("GENERATED"))
+        {
+            // Capture the error position BEFORE advancing (`t` borrows
+            // self through the whole branch).
+            let (t_line, t_col) = (t.line, t.col);
             self.advance();
-            self.expect_keyword("ALWAYS")?;
+            // `ALWAYS` also lexes as a plain identifier (not reserved) —
+            // accept either token shape.
+            match &self.peek().token {
+                Token::Keyword(k) if k.eq_ignore_ascii_case("ALWAYS") => {
+                    self.advance();
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("ALWAYS") => {
+                    self.advance();
+                }
+                other => {
+                    return Err(Error::parse(
+                        t_line,
+                        t_col,
+                        format!("expected ALWAYS after GENERATED, got {other:?}"),
+                    ));
+                }
+            }
             self.expect_keyword("AS")?;
             self.expect_punct('(')?;
             let expr = self.parse_expr()?;

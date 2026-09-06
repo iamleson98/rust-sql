@@ -1211,16 +1211,16 @@ pub(crate) fn compile_expr(
             let r = compile_expr(right, col_names, params_len)?;
             Some(CompiledExpr::Binary(*op, Box::new(l), Box::new(r)))
         }
-        // ? positional parameters arrive as Parameter(name); numeric
-        // names index params directly (bare "?" takes the next slot —
-        // the executor binds those sequentially, so treat it as 0 only
-        // when it is the sole placeholder).
+        // ? positional parameters arrive as Parameter(name); numeric names
+        // are the 0-BASED slot index (the lexer canonicalizes both `?` and
+        // `?N` to this form — `?1` and the first `?` both lex to "0").
+        // A bare "?"/"" name never occurs from the lexer; keep the
+        // defensive Param(0) for hand-built ASTs.
         Expr::Parameter(name) => {
             if name == "?" || name.is_empty() {
                 return Some(CompiledExpr::Param(0));
             }
-            if let Ok(idx1) = name.parse::<usize>() {
-                let idx = if idx1 == 0 { 0 } else { idx1 - 1 };
+            if let Ok(idx) = name.parse::<usize>() {
                 if idx < params_len || params_len == 0 {
                     return Some(CompiledExpr::Param(idx));
                 }

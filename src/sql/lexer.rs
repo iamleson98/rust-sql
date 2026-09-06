@@ -85,14 +85,17 @@ pub struct Lexer<'a> {
     pos: usize,
     line: usize,
     col: usize,
-    /// Next anonymous-`?` index. Each `?` token (without explicit digits)
-    /// consumes this number and increments the counter so that successive
-    /// `?` placeholders refer to distinct parameters. This mirrors SQLite's
-    /// semantics: `WHERE a = ? AND b = ?` binds `a` to the first param and
-    /// `b` to the second, NOT both to the first param (which was the prior
-    /// behavior and caused incorrect query results whenever more than one
-    /// anonymous `?` appeared in a single statement).
-    next_anon_param: usize,
+    /// Largest 1-based parameter number assigned so far by this
+    /// statement's placeholders (0 = none). Governs BOTH forms: an
+    /// anonymous `?` takes `max + 1` (SQLite: "a new number one greater
+    /// than the largest parameter number already assigned"), and an
+    /// explicit `?N` raises the floor to `N` — so `? ?1 ?` numbers the
+    /// placeholders 1, 1, 2 (the first `?` and `?1` are the SAME
+    /// parameter, exactly like SQLite). The token's NAME is the 0-based
+    /// slot index ("N-1"), the convention every evaluator in the engine
+    /// already uses for numeric parameter names (anonymous `?` lexed to
+    /// "0","1",... since the beginning).
+    max_param_num: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -102,7 +105,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             col: 1,
-            next_anon_param: 0,
+            max_param_num: 0,
         }
     }
 
@@ -455,23 +458,37 @@ impl<'a> Lexer<'a> {
         let prefix = self.src[self.pos] as char;
         self.advance();
         let mut name = String::new();
-        // For `?` followed by digits: `?1`, `?2`, etc.
-        // For `:name`, `@name`, `$name`: identifier chars.
+        // For `?` followed by digits: `?1`, `?2`, etc. — SQLite-numbered,
+        // 1-BASED (?1 is the FIRST parameter). The emitted token name is
+        // the 0-based slot index (N-1), matching the numeric-name
+        // convention every evaluator uses (anonymous `?` already lexed to
+        // "0","1",...). For `:name`, `@name`, `$name`: identifier chars —
+        // the name (with sigil) is the named-parameter lookup key.
         if prefix == '?' {
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
                 name.push(self.src[self.pos] as char);
                 self.advance();
             }
-            if name.is_empty() {
-                // Anonymous `?` — assign the next incrementing index so that
-                // successive `?` tokens in the same statement bind to distinct
-                // parameters. The name is the decimal string of the index
-                // (e.g. "0", "1", "2"), which `Database::execute` and
-                // `ExecContext::bind` look up by string key.
-                let idx = self.next_anon_param;
-                self.next_anon_param += 1;
-                name = idx.to_string();
-            }
+            let number_1based = if name.is_empty() {
+                // Anonymous `?` — SQLite rule: "a new number one greater
+                // than the largest parameter number already assigned".
+                self.max_param_num + 1
+            } else {
+                let n: usize = name
+                    .parse()
+                    .map_err(|_| Error::lex(self.line, self.col, "parameter number too large"))?;
+                if n == 0 {
+                    return Err(Error::lex(
+                        self.line,
+                        self.col,
+                        "parameter number out of range (1-based)",
+                    ));
+                }
+                n
+            };
+            self.max_param_num = self.max_param_num.max(number_1based);
+            // Canonical 0-based slot name.
+            name = (number_1based - 1).to_string();
         } else {
             name.push(prefix);
             while self.pos < self.src.len() {
@@ -793,8 +810,10 @@ mod tests {
     #[test]
     fn parameters() {
         let toks = lex("? ?1 :name @col $var");
+        // Anonymous `?` = parameter 1 (slot "0"); `?1` is ALSO parameter 1
+        // (slot "0") — SQLite: `?` and `?1` are the same parameter.
         assert_eq!(toks[0], Token::Parameter("0".into()));
-        assert_eq!(toks[1], Token::Parameter("1".into()));
+        assert_eq!(toks[1], Token::Parameter("0".into()));
         assert_eq!(toks[2], Token::Parameter(":name".into()));
         assert_eq!(toks[3], Token::Parameter("@col".into()));
         assert_eq!(toks[4], Token::Parameter("$var".into()));
@@ -805,17 +824,31 @@ mod tests {
         // Regression: previously every anonymous `?` lexed to Parameter("0"),
         // so `WHERE a = ? AND b = ?` bound both predicates to the first
         // parameter, silently masking the second value. Now each `?` gets
-        // the next incrementing index.
+        // the next number (SQLite: one greater than the largest assigned).
         let toks = lex("? ? ?");
         assert_eq!(toks[0], Token::Parameter("0".into()));
         assert_eq!(toks[1], Token::Parameter("1".into()));
         assert_eq!(toks[2], Token::Parameter("2".into()));
 
-        // Mixed `?` and `?N` — explicit N does NOT advance the anonymous
-        // counter, so a later `?` continues from the last assigned index.
+        // Mixed `?` and `?N` — SQLite numbering: the first `?` takes 1,
+        // `?1` is 1 (SAME parameter), and the trailing `?` takes
+        // one-greater-than-the-largest = 2.
         let toks = lex("? ?1 ?");
         assert_eq!(toks[0], Token::Parameter("0".into()));
-        assert_eq!(toks[1], Token::Parameter("1".into()));
+        assert_eq!(toks[1], Token::Parameter("0".into()));
         assert_eq!(toks[2], Token::Parameter("1".into()));
+
+        // `?N` numbering is 1-based: `?2` is the SECOND parameter —
+        // regression: it used to read the third (N as a 0-based index,
+        // off by one).
+        let toks = lex("?1 ?2");
+        assert_eq!(toks[0], Token::Parameter("0".into()));
+        assert_eq!(toks[1], Token::Parameter("1".into()));
+
+        // An explicit high number RAISES the anonymous floor (SQLite:
+        // `?5 ?` numbers the second placeholder 6).
+        let toks = lex("?5 ?");
+        assert_eq!(toks[0], Token::Parameter("4".into()));
+        assert_eq!(toks[1], Token::Parameter("5".into()));
     }
 }

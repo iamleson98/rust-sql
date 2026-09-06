@@ -940,3 +940,331 @@ fn vacuum_wal_mode_freelist_drained() {
     assert_eq!(n[0][0], Value::Integer(100));
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// NUMBERED POSITIONAL PARAMETERS (?N)
+// ---------------------------------------------------------------------------
+
+/// Regression: `?N` was resolved as params[N] (0-based) instead of
+/// params[N-1] (SQLite numbers ?N 1-BASED: ?1 is the FIRST parameter).
+/// Every `INSERT ... VALUES (?1, ...)` statement silently inserted NULL.
+#[test]
+fn numbered_params_one_based() {
+    let mut db = mem();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, v INT, w INT)", ())
+        .unwrap();
+    // ?1 / ?2 / mixed forms.
+    db.execute(
+        "INSERT INTO r (v, w) VALUES (?1, ?2)",
+        [Value::Integer(7), Value::Integer(8)],
+    )
+    .unwrap();
+    let rows = db.query("SELECT v, w FROM r WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(7));
+    assert_eq!(rows[0][1], Value::Integer(8));
+
+    // Repeated ?N binds the same slot.
+    let rows = db
+        .query(
+            "SELECT ?1, ?1, ?2",
+            [Value::Integer(10), Value::Integer(20)],
+        )
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(10));
+    assert_eq!(rows[0][1], Value::Integer(10));
+    assert_eq!(rows[0][2], Value::Integer(20));
+
+    // Out-of-order appearance still binds by number.
+    let rows = db
+        .query("SELECT ?2, ?1", [Value::Integer(1), Value::Integer(2)])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0][1], Value::Integer(1));
+
+    // WHERE / SET / UPDATE paths.
+    let rows = db
+        .query("SELECT v FROM r WHERE w = ?1", [Value::Integer(8)])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(7));
+    db.execute(
+        "UPDATE r SET v = ?1 WHERE id = ?2",
+        [Value::Integer(99), Value::Integer(1)],
+    )
+    .unwrap();
+    let rows = db.query("SELECT v FROM r WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(99));
+}
+
+/// SQLite numbering rule: an anonymous `?` takes "one more than the
+/// largest parameter number already assigned" — so `?` before `?1` means
+/// BOTH are parameter 1, and a trailing `?` becomes parameter 2.
+#[test]
+fn anonymous_and_numbered_param_interaction() {
+    let mut db = mem();
+    // `? ?1 ?`: numbers 1, 1, 2 — the first two bind the SAME parameter,
+    // the trailing `?` is parameter 2 (SQLite: "one more than the largest
+    // number already assigned"; real SQLite reports "statement uses 2"
+    // bindings for this SQL).
+    let rows = db
+        .query(
+            "SELECT ? = ?1, ? <> ?1",
+            [Value::Integer(5), Value::Integer(9)],
+        )
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(1), "? and ?1 are the same param");
+    assert_eq!(rows[0][1], Value::Integer(1), "the second ? is parameter 2");
+
+    // `?5 ?` — the explicit 5 raises the floor: the trailing ? is 6.
+    let rows = db
+        .query(
+            "SELECT ?1, ?2, ?3, ?4, ?5, ?",
+            [
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(4),
+                Value::Integer(5),
+                Value::Integer(6),
+            ],
+        )
+        .unwrap();
+    assert_eq!(rows[0][5], Value::Integer(6), "trailing ? after ?5 is 6");
+
+    // `?0` is rejected (SQLite: parameter number out of range).
+    let e = db.execute("SELECT ?0", []).unwrap_err();
+    assert!(e.to_string().contains("out of range"), "got: {e}");
+}
+
+/// The statement API binds 1-based (sqlite3_bind convention) — `bind(1)`
+/// is the first parameter; `?1` must read it.
+#[test]
+fn statement_numbered_param_binding() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t (a INT, b INT)", ()).unwrap();
+    let mut stmt = db.prepare("INSERT INTO t VALUES (?1, ?2)").unwrap();
+    stmt.bind(1, Value::Integer(11)).unwrap();
+    stmt.bind(2, Value::Integer(22)).unwrap();
+    stmt.raw_execute().unwrap();
+    let rows = db.query("SELECT a, b FROM t", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(11));
+    assert_eq!(rows[0][1], Value::Integer(22));
+}
+
+// ---------------------------------------------------------------------------
+// GENERATED COLUMNS (SQLite 3.31+)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generated_columns_virtual_and_stored() {
+    let mut db = mem();
+    db.execute(
+        "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO g (a) VALUES (21)", []).unwrap();
+    let rows = db.query("SELECT a, b FROM g", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(21));
+    assert_eq!(rows[0][1], Value::Integer(42), "VIRTUAL computes on write");
+
+    db.execute("CREATE TABLE g2 (a INT, b INT AS (a + 1) STORED)", ())
+        .unwrap();
+    db.execute("INSERT INTO g2 (a) VALUES (1)", []).unwrap();
+    let rows = db.query("SELECT a, b FROM g2", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][1], Value::Integer(2), "STORED computes on write");
+
+    // Mixed table: positional INSERT maps values to NON-generated columns
+    // (SQLite rule: generated columns are excluded from the positional
+    // count — `INSERT INTO m VALUES (10, 20)` binds a=10, d=20).
+    db.execute(
+        "CREATE TABLE m (a INT, b INT AS (a * 2) VIRTUAL, c INT AS (a + 1) STORED, d INT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO m VALUES (10, 20)", []).unwrap();
+    let rows = db.query("SELECT a, b, c, d FROM m", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(10));
+    assert_eq!(rows[0][1], Value::Integer(20));
+    assert_eq!(rows[0][2], Value::Integer(11));
+    assert_eq!(rows[0][3], Value::Integer(20));
+    // Supplying the generated slot errors (arity now counts non-generated).
+    let e = db
+        .execute("INSERT INTO m VALUES (1, 2, 3)", [])
+        .unwrap_err();
+    assert!(e.to_string().contains("values were supplied"), "got: {e}");
+}
+
+#[test]
+fn generated_columns_recompute_on_update() {
+    let mut db = mem();
+    db.execute(
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, b INT AS (a * 2) STORED)",
+        (),
+    )
+    .unwrap();
+    for i in 1..=5 {
+        db.execute("INSERT INTO g (a) VALUES (?1)", [Value::Integer(i)])
+            .unwrap();
+    }
+    // Range UPDATE: every streaming path must recompute.
+    db.execute("UPDATE g SET a = a * 10 WHERE id > 3", [])
+        .unwrap();
+    let rows = db.query("SELECT a, b FROM g ORDER BY id", []).unwrap();
+    for (i, r) in rows.iter().enumerate() {
+        let a = r[0].as_integer();
+        assert_eq!(r[1].as_integer(), a * 2, "row {} b stale", i + 1);
+    }
+    // Single-row UPDATE (RowidLookup path).
+    db.execute("UPDATE g SET a = 100 WHERE id = 1", []).unwrap();
+    let rows = db.query("SELECT b FROM g WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(200));
+    // RETURNING sees the computed value.
+    let rows = db
+        .query("UPDATE g SET a = 7 WHERE id = 2 RETURNING a, b", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(7));
+    assert_eq!(rows[0][1], Value::Integer(14));
+}
+
+#[test]
+fn generated_columns_write_rejections() {
+    let mut db = mem();
+    db.execute("CREATE TABLE g (a INT PRIMARY KEY, b INT AS (a + 1))", ())
+        .unwrap();
+    let e = db
+        .execute("INSERT INTO g (a, b) VALUES (1, 2)", [])
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("cannot INSERT into generated column"),
+        "got: {e}"
+    );
+    db.execute("INSERT INTO g (a) VALUES (1)", []).unwrap();
+    let e = db
+        .execute("UPDATE g SET b = 5 WHERE a = 1", [])
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("cannot UPDATE generated column"),
+        "got: {e}"
+    );
+    // A conflicting upsert whose DO UPDATE targets the generated column
+    // is rejected when the action fires.
+    let e = db
+        .execute(
+            "INSERT INTO g (a) VALUES (1) ON CONFLICT(a) DO UPDATE SET b = excluded.b",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("cannot UPDATE generated column"),
+        "got: {e}"
+    );
+}
+
+#[test]
+fn generated_columns_filters_indexes_returning() {
+    let mut db = mem();
+    // Expression index over a generated column + WHERE over it.
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INT, b INT AS (a * 2))",
+        (),
+    )
+    .unwrap();
+    for i in 1..=10 {
+        db.execute("INSERT INTO s (a) VALUES (?1)", [Value::Integer(i)])
+            .unwrap();
+    }
+    let rows = db
+        .query("SELECT id FROM s WHERE b > 15 ORDER BY id", [])
+        .unwrap();
+    assert_eq!(rows.len(), 3, "ids 8,9,10 have b > 15");
+    // Index over the generated column.
+    db.execute("CREATE INDEX ib ON s (b)", []).unwrap();
+    let rows = db.query("SELECT id FROM s WHERE b = 8", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(4));
+    // INSERT ... RETURNING includes the computed value.
+    let rows = db
+        .query("INSERT INTO s (a) VALUES (100) RETURNING a, b", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(100));
+    assert_eq!(rows[0][1], Value::Integer(200));
+    // Upsert recomputes the generated column on the merged row.
+    db.execute(
+        "INSERT INTO s (id, a) VALUES (1, 50) ON CONFLICT(id) DO UPDATE SET a = excluded.a",
+        [],
+    )
+    .unwrap();
+    let rows = db.query("SELECT b FROM s WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(100));
+}
+
+#[test]
+fn generated_columns_schema_roundtrip() {
+    let path = std::env::temp_dir().join("rq_gen_col_test.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = rustqlite::Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL, t TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO g (a, t) VALUES (5, 'x')", [])
+            .unwrap();
+    }
+    let mut db = rustqlite::Database::open(&path).unwrap();
+    let rows = db.query("SELECT a, b, t FROM g", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(5));
+    assert_eq!(rows[0][1], Value::Integer(10));
+    assert_eq!(rows[0][2], Value::Text("x".into()));
+    // Writes still recompute after reopen.
+    db.execute("UPDATE g SET a = 6", []).unwrap();
+    let rows = db.query("SELECT b FROM g", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(12));
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// INSERT arity (SQLite errors, was silently truncated)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn insert_arity_mismatch_errors() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t (a INT, b INT)", ()).unwrap();
+    // Column list + extra values: SQLite errors (values silently dropped
+    // before — the fast path's `if i < target_indices.len()` guard). The
+    // planner's own arity check fires first ("N VALUES for M columns").
+    let e = db
+        .execute("INSERT INTO t (a) VALUES (1, 2)", [])
+        .unwrap_err();
+    let msg = e.to_string();
+    assert!(
+        msg.contains("values were supplied") || msg.contains("VALUES for"),
+        "got: {msg}"
+    );
+    // No column list + short VALUES.
+    let e = db.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
+    let msg = e.to_string();
+    assert!(
+        msg.contains("values were supplied") || msg.contains("VALUES for"),
+        "got: {msg}"
+    );
+    // INSERT ... SELECT with wrong width (2 values for a 1-column
+    // target list) — errors even when the source is EMPTY (SQLite
+    // checks at prepare time).
+    db.execute("CREATE TABLE src (x INT)", ()).unwrap();
+    let e = db
+        .execute("INSERT INTO t (a) SELECT x, x FROM src", [])
+        .unwrap_err();
+    let msg = e.to_string();
+    assert!(
+        msg.contains("values were supplied") || msg.contains("VALUES for"),
+        "got: {msg}"
+    );
+    // Matching width with a full-column target is fine.
+    db.execute("INSERT INTO src VALUES (1)", []).unwrap();
+    db.execute("INSERT INTO t SELECT x, x FROM src", [])
+        .unwrap();
+}

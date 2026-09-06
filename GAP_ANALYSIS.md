@@ -448,3 +448,79 @@ materializes the image. **S14 vacuum: 3.7 ms vs SQLite's 6.4 ms
 (1.7x WIN; was 22x LOSS).** Codec databases keep the row-level path
 (codec encode/decode must apply per page); the fast path declines on
 any copy error and falls back.
+
+## 8. 2026-09-06 — the ?N off-by-one, generated columns, INSERT arity
+
+**CRITICAL correctness fix: numbered placeholders `?N` bound the WRONG
+parameter.** The lexer kept `?N`'s digits verbatim as the parameter
+name (so `?1` → name "1") while every evaluator treats a numeric name
+as a 0-BASED params index (anonymous `?` lexed to "0","1",... since
+the beginning). Net: `?1` read `params[1]` — the SECOND value — and
+`?N` read `params[N]`. Every `INSERT ... VALUES (?1, ?2)` silently
+stored NULLs (and the benches in `benches/` — which use `?1`/`?2`
+throughout — were inserting NULL payloads). The AST eval path and the
+compiled-expression path even disagreed (compile_expr subtracted 1,
+evaluate did not): the compiled path was right, the AST path wrong.
+Fix: the lexer canonicalizes both forms to the 0-based slot name —
+`?N` (1-based, `?0` rejected as out-of-range) maps to "N-1", and an
+anonymous `?` follows SQLite's rule verbatim ("one more than the
+largest parameter number already assigned"), tracked as
+`max_param_num` — so `? ?1 ?` numbers the placeholders 1, 1, 2 (the
+first `?` and `?1` are the SAME parameter, exactly like SQLite).
+compile_expr's `-1` removed (names are now 0-based); statement.rs's
+parameter-count walk and api.rs's FastBound already agreed.
+
+**Generated columns (SQLite 3.31+) — full support.** `col type
+[GENERATED ALWAYS] AS (expr) [STORED|VIRTUAL]` previously only parsed
+in the bare `AS` form (GENERATED/ALWAYS lex as plain identifiers, not
+reserved keywords — the constraint dispatch matched only Keyword
+tokens, so the GENERATED ALWAYS arm was dead code) and the value was
+never computed (NULL). Now:
+- Parse: both forms accepted (Ident("GENERATED")/Ident("ALWAYS")
+  matched by text; `GENERATED` stays usable as a table/column name).
+- Write: `apply_generated_columns` runs on row assembly for INSERT
+  (all three paths: VALUES fast, SELECT-source, materialized),
+  UPDATE (general, UPDATE...FROM, streaming `process_update_row`,
+  single-row lookup), and UPSERT's DO UPDATE merge — after
+  defaults/SET, before constraint enforcement, so NOT NULL / CHECK /
+  triggers / RETURNING / index maintenance all see computed values.
+  Both kinds persist the computed value (SQLite stores a NULL
+  placeholder for VIRTUAL and recomputes on read; we persist instead —
+  every specialized decode path stays correct with zero read-side
+  changes, and UPDATE recomputes so semantics match).
+- Positional INSERT excludes generated columns from the column count
+  (SQLite rule): `INSERT INTO s VALUES (1)` on (a, b AS (a*2) STORED)
+  binds a=1, computes b=2.
+- Rejections: "cannot INSERT into generated column" / "cannot UPDATE
+  generated column" (plan-time for INSERT targets and SET lists,
+  action-time for upsert DO UPDATE SET).
+- The UPDATE payload-patch fast path opts out when the table has
+  generated columns (it would leave stale bytes in the skipped
+  regions).
+- Schema round-trip: the DDL text re-parses on reopen; computed values
+  and recompute-after-reopen covered by regression tests.
+
+**INSERT arity errors (was silent truncation).** The VALUES fast path
+dropped extra values (`if i < target_indices.len()` guard) and
+NULL-filled short lists; INSERT...SELECT never checked the width with
+zero source rows. Now every path errors like SQLite ("table T has N
+columns but M values were supplied"), while `DEFAULT VALUES` (the
+empty expr list) stays legal.
+
+**WAL-mode VACUUM in-place install + `PRAGMA freelist_count`** (see
+§7's page-level fast path): WAL file DBs without a codec now install
+the compact image as ONE WAL commit + checkpoint — SQLite's own VACUUM
+write-back shape; no pager replacement or reopen; the same handle
+keeps working with the catalog reloaded from the new roots and every
+pre-VACUUM cache (plans, root overrides, count memo, join builds,
+committed-view scopes) invalidated; `retire()` stops the old pager's
+Drop bookkeeping from clobbering the freshly written image on the
+rewrite path. `PRAGMA freelist_count` (read form) added — it was
+missing from the pragma dispatch entirely (returned zero rows).
+
+**Gap probe.** New `examples/gap_probe.rs` — 64 checks over surface
+the parity audit didn't cover (introspection pragmas, upsert edge
+shapes, RETURNING on UPDATE/DELETE, window function variants, CHECK
+expressions, generated columns, trigger NEW/OLD refs, CTE variants,
+ALTER shapes, collations, a 25-case function battery, NULL
+three-valued logic). All green; `parity_audit` still 291/291.

@@ -1132,6 +1132,47 @@ fn enforce_row_constraints(
     Ok(())
 }
 
+/// Compute every GENERATED column in `row` (both STORED and VIRTUAL).
+///
+/// Called on row assembly for INSERT and UPDATE — after DEFAULTs / SET
+/// assignments and BEFORE constraint enforcement — so NOT NULL / CHECK /
+/// triggers / RETURNING / index maintenance all observe the computed
+/// values. Both kinds are persisted in the record: SQLite stores a NULL
+/// placeholder for VIRTUAL columns and recomputes on read; we persist the
+/// computed value instead, which keeps every specialized decode path
+/// (selective projections, fused scans, streaming UPDATE) correct with
+/// zero read-side changes. UPDATE always recomputes, so a change to a
+/// referenced column flows through exactly like SQLite's recompute.
+///
+/// Evaluation is a single pass in column order: a generated column may
+/// reference any non-generated column (SQLite forbids generated→generated
+/// references at CREATE time) and earlier-computed generated columns.
+pub(crate) fn apply_generated_columns(
+    table: &Table,
+    row: &mut [Value],
+    col_names: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<()> {
+    for (i, col) in table.columns.iter().enumerate() {
+        if let Some((expr, _stored)) = &col.generated {
+            let v = eval_row(expr, row, col_names, params, named_params)?;
+            let coerced = col.affinity.coerce(v);
+            if i < row.len() {
+                row[i] = coerced;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when the table declares any GENERATED column (drives the
+/// col_names-always-materialized rule on the INSERT scratch and the
+/// payload-patch fast-path opt-out).
+pub(crate) fn table_has_generated_columns(table: &Table) -> bool {
+    table.columns.iter().any(|c| c.generated.is_some())
+}
+
 // ============================================================================
 // FOREIGN KEY enforcement
 // ============================================================================
@@ -10376,9 +10417,13 @@ fn exec_insert(
                 let n_cols = table.n_columns();
                 let row: Vec<Value> = vec![Value::Null; n_cols];
                 let payload: Vec<u8> = Vec::with_capacity(n_cols * 8);
-                // Column names — needed only for CHECK constraints or
-                // RETURNING (NOT NULL checks are purely positional).
-                let cols: Vec<String> = if !table.check_exprs.is_empty() || returning.is_some() {
+                // Column names — needed for CHECK constraints, RETURNING,
+                // or GENERATED columns (their expressions resolve
+                // referenced columns by name).
+                let cols: Vec<String> = if !table.check_exprs.is_empty()
+                    || returning.is_some()
+                    || table_has_generated_columns(&table)
+                {
                     table.columns.iter().map(|c| c.name.clone()).collect()
                 } else {
                     Vec::new()
@@ -10399,6 +10444,20 @@ fn exec_insert(
     // (column1/column2) + 1k Vec<Vec<Value>> overheads.
     if let Plan::Values { rows: expr_rows } = source {
         for exprs in expr_rows {
+            // Arity check (SQLite): a positional/column-list INSERT must
+            // supply exactly one value per target column. An EMPTY expr
+            // list is the DEFAULT VALUES plan shape — allowed. Extra
+            // values were previously SILENTLY DROPPED (`if i <
+            // target_indices.len()`), and short lists silently NULL-filled
+            // — both diverged from SQLite.
+            if !exprs.is_empty() && exprs.len() != target_indices.len() {
+                return Err(Error::semantic(format!(
+                    "table {} has {} columns but {} values were supplied",
+                    table.name,
+                    target_indices.len(),
+                    exprs.len()
+                )));
+            }
             // Reset the row buffer to all-NULLs without releasing capacity.
             for v in full_row.iter_mut() {
                 *v = Value::Null;
@@ -10432,6 +10491,16 @@ fn exec_insert(
                     }
                 }
             }
+            // GENERATED columns: computed from the (defaults-applied) row.
+            // col_names is materialized whenever the table has generated
+            // columns (see the scratch build below).
+            apply_generated_columns(
+                &table,
+                &mut full_row,
+                &col_names,
+                &ctx.params,
+                &ctx.named_params,
+            )?;
 
             // Assign the rowid BEFORE constraint enforcement so that a NULL
             // rowid-alias (auto-assign) doesn't trip NOT NULL (SQLite treats
@@ -10580,6 +10649,16 @@ fn exec_insert(
     // Slow path: source is something else (subquery, etc.) — go through
     // the generic execute() path.
     let source_res = execute(source, ctx)?;
+    // Arity check (SQLite errors at prepare time — even with zero source
+    // rows, `INSERT INTO t SELECT x, x FROM empty` is a width mismatch).
+    if !source_res.columns.is_empty() && source_res.columns.len() != target_indices.len() {
+        return Err(Error::semantic(format!(
+            "table {} has {} columns but {} values were supplied",
+            table.name,
+            target_indices.len(),
+            source_res.columns.len()
+        )));
+    }
     for row in &source_res.rows {
         // Reset the row buffer to all-NULLs without releasing capacity.
         // `Value::Null` is a no-op to drop, so this is just a memset.
@@ -10587,6 +10666,16 @@ fn exec_insert(
             *v = Value::Null;
         }
         let mut explicit_rowid: Option<i64> = None;
+        // Arity check (SQLite) for INSERT ... SELECT: one value per target
+        // column (a short/long SELECT was silently accepted before).
+        if !row.is_empty() && row.len() != target_indices.len() {
+            return Err(Error::semantic(format!(
+                "table {} has {} columns but {} values were supplied",
+                table.name,
+                target_indices.len(),
+                row.len()
+            )));
+        }
         for (i, val) in row.iter().enumerate() {
             if i < target_indices.len() {
                 let col_idx = target_indices[i];
@@ -10613,6 +10702,14 @@ fn exec_insert(
                 }
             }
         }
+        // GENERATED columns: computed from the (defaults-applied) row.
+        apply_generated_columns(
+            &table,
+            &mut full_row,
+            &col_names,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
 
         // Assign the rowid BEFORE constraint enforcement (see fast path).
         let mut rowid_autogen = false;
@@ -10785,12 +10882,14 @@ pub fn fast_insert_literal_rows(
     let n_cols = table.n_columns();
     let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
     let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
-    // Column names — only needed for CHECK constraints (NOT NULL is positional).
-    let col_names: Vec<String> = if table.check_exprs.is_empty() {
-        Vec::new()
-    } else {
-        table.columns.iter().map(|c| c.name.clone()).collect()
-    };
+    // Column names — needed for CHECK constraints and GENERATED columns
+    // (NOT NULL is positional).
+    let col_names: Vec<String> =
+        if table.check_exprs.is_empty() && !table_has_generated_columns(table) {
+            Vec::new()
+        } else {
+            table.columns.iter().map(|c| c.name.clone()).collect()
+        };
     let mut inserted = 0i64;
 
     for row in rows {
@@ -10828,6 +10927,15 @@ pub fn fast_insert_literal_rows(
                 full_row[col_idx] = table.columns[col_idx].affinity.coerce(v);
             }
         }
+
+        // GENERATED columns: computed from the bound row.
+        apply_generated_columns(
+            table,
+            &mut full_row,
+            &col_names,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
 
         // Rowid pre-assignment so a NULL rowid-alias doesn't trip NOT NULL
         // (mirrors exec_insert).
@@ -11534,9 +11642,33 @@ fn exec_upsert_row(
                 let col_idx = table
                     .find_column(col_name)
                     .ok_or_else(|| Error::semantic(format!("no such column: {}", col_name)))?;
+                // Generated columns cannot be assigned.
+                if table
+                    .columns
+                    .get(col_idx)
+                    .is_some_and(|c| c.generated.is_some())
+                {
+                    return Err(Error::semantic(format!(
+                        "cannot UPDATE generated column {}",
+                        col_name
+                    )));
+                }
                 let v = eval_row(expr, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
                 let aff = table.columns[col_idx].affinity;
                 new_row[col_idx] = aff.coerce(v);
+            }
+            // GENERATED columns recompute on the merged row (plain names
+            // resolve against the table's columns).
+            {
+                let plain_names: Vec<String> =
+                    table.columns.iter().map(|c| c.name.clone()).collect();
+                apply_generated_columns(
+                    table,
+                    &mut new_row,
+                    &plain_names,
+                    &ctx.params,
+                    &ctx.named_params,
+                )?;
             }
 
             // WHERE guard: if false, the conflict is left in place (no-op).
@@ -12158,6 +12290,15 @@ fn exec_update(
             let aff = table.columns[*col_idx].affinity;
             new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
         }
+        // GENERATED columns recompute when a referenced column changes
+        // (the persisted value is refreshed, mirroring SQLite's recompute).
+        apply_generated_columns(
+            &table,
+            &mut new_row,
+            &col_names,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
         // NULL assigned to the rowid alias: SQLite rejects with
         // "datatype mismatch" (INSERT auto-assigns, UPDATE does not) —
         // checked BEFORE NOT NULL, which would otherwise mislabel it.
@@ -12387,6 +12528,15 @@ fn exec_update_from(
             let aff = table.columns[*col_idx].affinity;
             new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
         }
+        // GENERATED columns recompute against the new target-row values
+        // (exprs resolve against plain_cols — table column names).
+        apply_generated_columns(
+            table,
+            &mut new_row,
+            &plain_cols,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
         // NULL assigned to the rowid alias: SQLite rejects with
         // "datatype mismatch" (before NOT NULL relabels it).
         if let Some(alias_idx) = table.rowid_alias {
@@ -12827,6 +12977,8 @@ fn try_streaming_update(
                     let aff = table.columns[*col_idx].affinity;
                     new_row[*col_idx] = aff.coerce(v);
                 }
+                // GENERATED columns recompute (single-row path).
+                apply_generated_columns(table, &mut new_row, col_names, &params, &named_params)?;
                 validate_strict_row(table, &mut new_row)?;
                 enforce_row_constraints(table, &new_row, col_names, &params, &named_params)?;
                 enforce_child_fks(ctx, table, &new_row)?;
@@ -13850,6 +14002,7 @@ impl UpdatePatchCtx {
         // bails to the general path before this), and its payload slot is
         // the 1-byte rowid marker — never a decoded NULL.
         if returning.is_some()
+            || table_has_generated_columns(table)
             || table
                 .columns
                 .iter()
@@ -14056,6 +14209,8 @@ fn process_update_row(
         let aff = table.columns[*col_idx].affinity;
         new_row[*col_idx] = aff.coerce(v);
     }
+    // GENERATED columns recompute when a referenced column changes.
+    apply_generated_columns(table, new_row, col_names, params, named_params)?;
     // STRICT tables: validate before the rewrite below mutates the tree.
     validate_strict_row(table, new_row)?;
     // NOT NULL + CHECK constraints on the updated row.

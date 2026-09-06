@@ -5192,11 +5192,37 @@ impl Database {
                 let idx = resolve_insert_column(&table, c).ok_or_else(|| {
                     Error::semantic(format!("column {} not in table {}", c, table.name))
                 })?;
+                // Generated columns cannot be assigned (SQLite: "cannot
+                // INSERT into generated column").
+                if idx != usize::MAX
+                    && table
+                        .columns
+                        .get(idx)
+                        .is_some_and(|col| col.generated.is_some())
+                {
+                    return Err(Error::semantic(format!(
+                        "cannot INSERT into generated column {}",
+                        c
+                    )));
+                }
                 v.push(idx);
             }
             Some(v)
         } else {
-            None
+            // No column list: positional values map to the NON-generated
+            // columns in declared order — SQLite's rule (generated columns
+            // are excluded from the positional column count: `INSERT INTO
+            // s VALUES (1)` on (a, b AS (a*2) STORED) inserts a=1 and
+            // computes b; supplying the generated slot errors "table s has
+            // 1 columns but 2 values were supplied").
+            let v: Vec<usize> = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.generated.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            Some(v)
         };
         let on_conflict = ins.or.unwrap_or(ConflictResolution::Abort);
         Ok(crate::planner::plan::Plan::Insert {
@@ -5257,9 +5283,21 @@ impl Database {
             .iter()
             .map(|(col, expr)| {
                 let idx = table.find_column(col).unwrap_or(0);
-                (idx, expr.clone())
+                // Generated columns cannot be assigned (SQLite: "cannot
+                // UPDATE generated column").
+                if table
+                    .columns
+                    .get(idx)
+                    .is_some_and(|c| c.generated.is_some())
+                {
+                    return Err(Error::semantic(format!(
+                        "cannot UPDATE generated column {}",
+                        col
+                    )));
+                }
+                Ok((idx, expr.clone()))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         // ORDER BY / LIMIT on the matched rows. With `UPDATE ... FROM`
         // the WHERE spans both sides and matching happens in the executor,
         // so a row-level limit cannot be applied on the scan — reject the
