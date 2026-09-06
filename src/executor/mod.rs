@@ -376,6 +376,15 @@ impl StmtMaps {
     pub fn empty() -> Self {
         Self::default()
     }
+
+    /// Shared singleton for the empty maps: one refcount bump instead of
+    /// an ArcBox allocation. Used by `ExecContext::new` (overwritten by
+    /// the detach swap in `execute` before any statement work) and by
+    /// api.rs's `empty_maps()`.
+    pub fn empty_arc() -> std::sync::Arc<Self> {
+        static E: std::sync::OnceLock<std::sync::Arc<StmtMaps>> = std::sync::OnceLock::new();
+        E.get_or_init(|| std::sync::Arc::new(Self::empty())).clone()
+    }
 }
 
 pub struct ExecContext<'a> {
@@ -443,6 +452,13 @@ pub struct ExecContext<'a> {
     pub max_rowids_invalidated: Vec<String>,
     /// Set when `index_roots` gained local entries this statement.
     pub index_roots_changed: bool,
+    /// True when `shared` was DETACHED from the Database's maps slot by
+    /// the `execute` write path (sole logical owner: updates may be
+    /// applied in place and re-attached at statement end). False for
+    /// reader contexts (`new_reader`), whose `shared` is a refcounted
+    /// CLONE of the Database's live map — in-place updates there would
+    /// land on a throwaway copy invisible to the delta merge.
+    pub shared_detached: bool,
     /// Pinned right-most leaf for sequential table appends, valid ONLY
     /// within the current statement (see insert_table_append_hinted). Keyed
     /// by the Arc<Table> identity so a hint never crosses tables.
@@ -471,13 +487,14 @@ impl<'a> ExecContext<'a> {
             txn_snapshot: None,
             catalog_ptr: catalog,
             root_overrides: HashMap::new(),
-            shared: std::sync::Arc::new(StmtMaps::empty()),
+            shared: crate::executor::StmtMaps::empty_arc(),
             index_roots: HashMap::new(),
             max_rowids: HashMap::new(),
             roots_changed: false,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
             index_roots_changed: false,
+            shared_detached: false,
             table_append_hint: None,
             ctes: None,
             trigger_depth: 0,
@@ -515,6 +532,7 @@ impl<'a> ExecContext<'a> {
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
             index_roots_changed: false,
+            shared_detached: false,
             table_append_hint: None,
             ctes: None,
             trigger_depth: 0,
@@ -541,15 +559,18 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.shared.roots.get(&table.name) {
             return r;
         }
-        let lc = table.name.to_ascii_lowercase();
-        if let Some(&r) = self.root_overrides.get(&lc) {
-            return r;
+        // Mixed-case names: probe the lowercase key (the map's canonical
+        // form). An all-lowercase miss is FINAL — skip the String copy.
+        if table.name.bytes().any(|b| b.is_ascii_uppercase()) {
+            let lc = table.name.to_ascii_lowercase();
+            if let Some(&r) = self.root_overrides.get(&lc) {
+                return r;
+            }
+            if let Some(&r) = self.shared.roots.get(&lc) {
+                return r;
+            }
         }
-        self.shared
-            .roots
-            .get(&lc)
-            .copied()
-            .unwrap_or(table.root_page)
+        table.root_page
     }
 
     /// Update the root page override for a table.
@@ -566,15 +587,17 @@ impl<'a> ExecContext<'a> {
         if let Some(&r) = self.shared.index_roots.get(&index.name) {
             return r;
         }
-        let lc = index.name.to_ascii_lowercase();
-        if let Some(&r) = self.index_roots.get(&lc) {
-            return r;
+        // Same final-miss rule as `table_root`.
+        if index.name.bytes().any(|b| b.is_ascii_uppercase()) {
+            let lc = index.name.to_ascii_lowercase();
+            if let Some(&r) = self.index_roots.get(&lc) {
+                return r;
+            }
+            if let Some(&r) = self.shared.index_roots.get(&lc) {
+                return r;
+            }
         }
-        self.shared
-            .index_roots
-            .get(&lc)
-            .copied()
-            .unwrap_or(index.root_page)
+        index.root_page
     }
 
     /// Update the index root override (called after an index B+tree split).
@@ -625,10 +648,10 @@ impl<'a> ExecContext<'a> {
             return Ok(max);
         }
         if let Some(&max) = self.shared.max_rowids.get(&table.name) {
-            // Seed the local overlay so later set_max_rowid_lc calls in
-            // this statement hit the in-place fast path.
-            self.max_rowids.insert(table.name.clone(), max);
-            self.max_rowids_changed = true;
+            // NOTE: no eager local-overlay seed — the seed allocated a
+            // key String clone on EVERY statement (the overlay is
+            // per-statement, the shared map is not). `set_max_rowid_lc`
+            // handles the shared-hit case directly below.
             return Ok(max);
         }
         // Fast path 2: mixed-case name with a cached lowercase key.
@@ -679,8 +702,7 @@ impl<'a> ExecContext<'a> {
     }
 
     /// Fast-path set_max_rowid for pre-lower-cased names. Updates the value
-    /// in place when the key already exists (the common case —
-    /// `get_or_scan_max_rowid` seeds it) instead of re-allocating the key
+    /// in place when the key already exists instead of re-allocating the key
     /// String on every inserted row.
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
         // Monotonic: the max-rowid cache may only ever be RAISED. It feeds
@@ -701,8 +723,29 @@ impl<'a> ExecContext<'a> {
         }
         if let Some(&shared_max) = self.shared.max_rowids.get(table_name_lc) {
             if rowid > shared_max {
-                self.max_rowids.insert(table_name_lc.to_string(), rowid);
-                self.max_rowids_changed = true;
+                if self.in_transaction || !self.shared_detached {
+                    // In a transaction the shared Arc may be aliased by the
+                    // BEGIN-time snapshot (ROLLBACK restore source); on a
+                    // READER context it is a clone of the Database's live
+                    // map. Either way, keep updates in the LOCAL overlay
+                    // (merged at statement end) instead of clone-on-write
+                    // per row.
+                    self.max_rowids.insert(table_name_lc.to_string(), rowid);
+                    self.max_rowids_changed = true;
+                } else {
+                    // Auto-commit: `ctx.shared` is detached from the Database
+                    // slot (sole owner unless a concurrent reader cloned a
+                    // snapshot — Arc::make_mut handles that by cloning). A
+                    // HashMap re-insert would allocate a fresh key String
+                    // AND the overlay's first-insert bucket array (2 allocs
+                    // per statement on the hottest INSERT path); get_mut
+                    // updates the existing entry in place — zero alloc.
+                    let shared = std::sync::Arc::make_mut(&mut self.shared);
+                    if let Some(v) = shared.max_rowids.get_mut(table_name_lc) {
+                        *v = rowid;
+                    }
+                    self.max_rowids_changed = true;
+                }
             }
             // rowid <= shared_max: the shared snapshot is already an upper
             // bound — recording a lower local value would poison allocation.
@@ -1046,7 +1089,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             ctx,
             table.clone(),
             source,
-            columns.clone(),
+            columns,
             *on_conflict,
             upsert.as_ref(),
             returning.as_deref(),
@@ -10296,20 +10339,31 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Take the scratch when it matches this (table, target_indices, indexes)
+/// Take the scratch when it matches this (table, columns, indexes)
 /// shape; `None` otherwise (the caller builds a fresh one). A mismatched
 /// scratch is dropped — never reused for a different table.
+///
+/// The plan's `columns` is borrowed so a scratch HIT never materializes
+/// the target-index Vec (the scratch stores it); `None` compares as the
+/// identity 0..n_cols mapping without allocating.
 fn take_insert_scratch(
     table: &Arc<Table>,
-    target_indices: &[usize],
+    columns: &Option<Vec<usize>>,
     indexes: &[Arc<crate::schema::Index>],
 ) -> Option<InsertScratch> {
     INSERT_SCRATCH.with(|s| {
         let mut slot = s.borrow_mut();
         match slot.take() {
             Some(sc) => {
+                let cols_match = match columns {
+                    Some(v) => sc.target_indices == v.as_slice(),
+                    None => {
+                        sc.target_indices.len() == table.n_columns()
+                            && sc.target_indices.iter().enumerate().all(|(i, &x)| x == i)
+                    }
+                };
                 let same_shape = Arc::ptr_eq(&sc.table, table)
-                    && sc.target_indices == target_indices
+                    && cols_match
                     && sc.index_states.len() == indexes.len()
                     && sc
                         .index_states
@@ -10338,7 +10392,19 @@ fn exec_insert(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
     source: &Plan,
-    columns: Option<Vec<usize>>,
+    columns: &Option<Vec<usize>>,
+    on_conflict: ConflictResolution,
+    upsert: Option<&crate::sql::ast::UpsertClause>,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+) -> Result<ExecResult> {
+    exec_insert_inner(ctx, table, source, columns, on_conflict, upsert, returning)
+}
+
+fn exec_insert_inner(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    source: &Plan,
+    columns: &Option<Vec<usize>>,
     on_conflict: ConflictResolution,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
@@ -10380,7 +10446,6 @@ fn exec_insert(
             rows: Vec::new(),
         });
     }
-    let target_indices: Vec<usize> = columns.unwrap_or_else(|| (0..table.n_columns()).collect());
     // Track the current root page — it may change if the B+tree splits.
     let mut current_root = ctx.table_root(&table);
     let mut max_rowid = ctx.get_or_scan_max_rowid(&table)?;
@@ -10392,12 +10457,15 @@ fn exec_insert(
     // INSERT SCRATCH: same-shape statements on this thread reuse the
     // whole per-statement working set (index maintenance states with
     // their key buffers, row/payload buffers, lowercased name, column
-    // names). Roots are re-seeded from the ctx maps every statement —
-    // DDL, ROLLBACK, or a nested write between statements can move them.
-    // A shape mismatch (different table, column list, or index count)
-    // drops the old scratch and rebuilds.
-    let (mut index_states, table_name_lc, mut full_row, mut payload_buf, col_names) =
-        match take_insert_scratch(&table, &target_indices, &indexes) {
+    // names, target indices). Roots are re-seeded from the ctx maps
+    // every statement — DDL, ROLLBACK, or a nested write between
+    // statements can move them. A shape mismatch (different table,
+    // column list, or index count) drops the old scratch and rebuilds.
+    // The plan's `columns` is BORROWED (no per-statement Vec clone):
+    // a scratch hit reuses the stored target indices; only a miss
+    // materializes them.
+    let (mut index_states, table_name_lc, mut full_row, mut payload_buf, col_names, target_indices) =
+        match take_insert_scratch(&table, columns, &indexes) {
             Some(mut sc) => {
                 for st in sc.index_states.iter_mut() {
                     st.root = ctx.index_root(&st.idx);
@@ -10408,6 +10476,7 @@ fn exec_insert(
                     sc.full_row,
                     sc.payload_buf,
                     sc.col_names,
+                    sc.target_indices,
                 )
             }
             None => {
@@ -10415,6 +10484,7 @@ fn exec_insert(
                 let states = make_index_states(ctx, &indexes, &table);
                 let name_lc = table.name.to_ascii_lowercase();
                 let n_cols = table.n_columns();
+                let target: Vec<usize> = columns.clone().unwrap_or_else(|| (0..n_cols).collect());
                 let row: Vec<Value> = vec![Value::Null; n_cols];
                 let payload: Vec<u8> = Vec::with_capacity(n_cols * 8);
                 // Column names — needed for CHECK constraints, RETURNING,
@@ -10428,7 +10498,7 @@ fn exec_insert(
                 } else {
                     Vec::new()
                 };
-                (states, name_lc, row, payload, cols)
+                (states, name_lc, row, payload, cols, target)
             }
         };
     let empty_row: Vec<Value> = Vec::new();
@@ -10556,7 +10626,6 @@ fn exec_insert(
                 }
                 ctx.table_append_hint = None;
             }
-
             let outcome = exec_insert_one_row(
                 ctx,
                 &table,
@@ -10638,12 +10707,22 @@ fn exec_insert(
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
-        return Ok(finish_insert_result(
-            inserted,
-            returning,
-            &col_names,
-            returning_rows,
-        ));
+        // Persist the working set for the next same-shape statement on this
+        // thread BEFORE the early return below — the VALUES fast path
+        // previously returned without storing the scratch, so every
+        // single-row `?`-param INSERT (the hottest OLTP shape) rebuilt the
+        // whole working set: 7 allocations per statement.
+        let result = finish_insert_result(inserted, returning, &col_names, returning_rows);
+        return_insert_scratch(InsertScratch {
+            table: table.clone(),
+            target_indices,
+            name_lc: table_name_lc,
+            full_row,
+            payload_buf,
+            col_names,
+            index_states,
+        });
+        return Ok(result);
     }
 
     // Slow path: source is something else (subquery, etc.) — go through
@@ -10777,21 +10856,20 @@ fn exec_insert(
     }
     // Persist the working set for the next same-shape statement on this
     // thread (error paths above drop it — a fresh one is rebuilt there).
+    // Result is built FIRST so `col_names` can move into the scratch
+    // instead of cloning (the clone allocated a Vec + Strings per
+    // statement on tables with CHECK / RETURNING / generated columns).
+    let result = finish_insert_result(inserted, returning, &col_names, returning_rows);
     return_insert_scratch(InsertScratch {
         table: table.clone(),
         target_indices,
         name_lc: table_name_lc,
         full_row,
         payload_buf,
-        col_names: col_names.clone(),
+        col_names,
         index_states,
     });
-    Ok(finish_insert_result(
-        inserted,
-        returning,
-        &col_names,
-        returning_rows,
-    ))
+    Ok(result)
 }
 
 /// Build the final ExecResult for an INSERT (with or without RETURNING).
@@ -10813,10 +10891,17 @@ fn finish_insert_result(
             rows: returning_rows,
         }
     } else {
+        // Zero rows — SQLite parity (sqlite3_step on a plain INSERT returns
+        // SQLITE_DONE, no result row; the count reaches callers via
+        // changes()/total_changes(), i.e. ctx.changes here). The old
+        // `vec![vec![Value::Integer(inserted)]]` was dead weight: 2 heap
+        // allocations per INSERT statement, never served (the streaming
+        // statement path Exhaustes non-RETURNING DML before reading rows).
+        let _ = inserted;
         let cols = INSERTED_COLS.get_or_init(|| Arc::from(vec!["inserted".to_string()]));
         ExecResult {
             columns: Arc::clone(cols),
-            rows: vec![vec![Value::Integer(inserted)]],
+            rows: Vec::new(),
         }
     }
 }
@@ -11408,6 +11493,8 @@ fn exec_insert_one_row(
     // path rejection: stale hint, full leaf, non-append rowid) encodes
     // the full payload into `payload_buf` in-branch and takes the
     // ordinary route.
+    // Upsert target resolution + UNIQUE-index conflict probe run before
+    // the btree mutation below; count them as the one-row HEAD.
     let spill_shape = {
         let psz = ctx.pager.page_size() as usize;
         let max_cell = psz.saturating_sub(128);

@@ -1440,12 +1440,35 @@ fn s14_churn_reclaim(engine: Engine) {
                 .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
                 .unwrap();
             check("count_after_delete", cnt == keep);
+            // SQLite's WAL-mode VACUUM writes the compacted image into the
+            // -wal file and leaves the MAIN file untouched; the space is
+            // only returned to the OS after a checkpoint (total footprint
+            // stays at the pre-VACUUM size otherwise — verified against
+            // real SQLite 3.53: `VACUUM` alone: main unchanged, wal
+            // unchanged, 1ms; `VACUUM; wal_checkpoint(TRUNCATE)`: main
+            // shrinks to the live set). Our VACUUM compacts eagerly (the
+            // in-place image install ends with its own commit +
+            // checkpoint, so the file is compact the moment VACUUM
+            // returns). Outcome parity therefore requires timing SQLite's
+            // VACUUM + checkpoint together — comparing our eager compact
+            // against SQLite's lazy WAL-append would pit 3ms of real work
+            // against 1ms of deferred bookkeeping that reclaims nothing.
             let t = Instant::now();
             let vac = conn.execute("VACUUM", []);
+            let ckpt = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            });
             let vacuum_ms = t.elapsed().as_secs_f64() * 1000.0;
             let vac_mb =
                 total_db_bytes(&format!("{}/churn.sq.db", scratch())) as f64 / 1024.0 / 1024.0;
-            metric("vacuum_ok", if vac.is_ok() { 1.0 } else { 0.0 });
+            metric(
+                "vacuum_ok",
+                if vac.is_ok() && ckpt.is_ok() {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
             metric("delete_ms", delete_ms);
             metric("vacuum_ms", vacuum_ms);
             metric("full_mb", full_mb);

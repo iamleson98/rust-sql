@@ -316,17 +316,37 @@ impl Catalog {
     }
 
     pub fn indexes_on_table(&self, table: &str) -> Vec<Arc<Index>> {
-        self.indexes_by_table
-            .get(&table.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
+        // Fast path: the name is already lowercase (the common case) — the
+        // map key is stored lowercase, so probe the borrowed name first.
+        // A miss on an all-lowercase name is FINAL (no allocation for the
+        // lowercase copy); only mixed-case names pay the conversion.
+        // This lookup runs on every DML statement.
+        if let Some(v) = self.indexes_by_table.get(table) {
+            return v.clone();
+        }
+        if table.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self
+                .indexes_by_table
+                .get(&table.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default();
+        }
+        Vec::new()
     }
 
     pub fn triggers_on_table(&self, table: &str) -> Vec<Arc<Trigger>> {
-        self.triggers_by_table
-            .get(&table.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
+        // Same borrowed-name fast path as `indexes_on_table`.
+        if let Some(v) = self.triggers_by_table.get(table) {
+            return v.clone();
+        }
+        if table.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self
+                .triggers_by_table
+                .get(&table.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default();
+        }
+        Vec::new()
     }
 
     pub fn add_table(&mut self, table: Table) {

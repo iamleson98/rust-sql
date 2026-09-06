@@ -593,14 +593,24 @@ pub struct Pager {
     /// COMMITTED-VIEW READ CACHE (see `committed_view` below): pages
     /// materialized for readers that run while a write transaction is
     /// open on another thread. Never touched by the writer's live view;
-    /// cleared at every transaction boundary (BEGIN/COMMIT/ROLLBACK) by
-    /// `clear_committed_view()`.
+    /// entries are invalidated at PRE-IMAGE CAPTURE (the fetch that
+    /// falsifies the alias precondition — see capture_savepoint_undo)
+    /// and at transaction boundaries (`clear_savepoints` removes the
+    /// transaction's touched pages; DDL / savepoint ops / VACUUM clear
+    /// everything).
     committed_pages: RwLock<std::collections::HashMap<PageId, PageRef, PageIdHashBuild>>,
     /// Set when a committed-view read served BEGIN-time bytes that differ
     /// from the live cache (pre-images / their memoized copies). Retired
     /// by `CommittedViewGuard::drop` with a single write-epoch bump so
     /// the reader's advisory-cache state can never outlive its scope.
     committed_poison: std::sync::atomic::AtomicBool,
+    /// Latched true the first time a page is materialized into
+    /// `committed_pages`. The capture path (`capture_savepoint_undo`)
+    /// and the transaction boundaries (`clear_savepoints`) use it to
+    /// skip the committed-pages write lock on pagers that never served
+    /// a committed-view read. Never reset: a stale-true only costs one
+    /// guarded probe per captured page.
+    committed_view_used: std::sync::atomic::AtomicBool,
     /// Cache of the BOTTOM savepoint's base.n_pages (the committed-view
     /// bound) — 0 = no savepoint stack (committed == live). Maintained
     /// inside the savepoints-lock critical sections so
@@ -906,6 +916,24 @@ impl Pager {
     /// Discard all savepoints (COMMIT / plain ROLLBACK).
     pub fn clear_savepoints(&self) {
         let mut sp = self.savepoints.lock();
+        // Committed-view lifecycle: instead of clearing the WHOLE
+        // materialization map at every transaction boundary (the old
+        // behavior — readers re-copied every scanned page after every
+        // BEGIN/COMMIT: ~16 x 8 KiB copies per query under 1W+7R
+        // contention), invalidate ONLY the pages this transaction touched.
+        // The __begin__ level's pre-image key set is a superset of every
+        // page the transaction fetched (all mutations go through
+        // get_page -> capture), so the remaining entries — pages the
+        // writer never touched — still hold the correct BEGIN-time bytes
+        // for the NEXT transaction's committed view too.
+        if self.committed_view_used.load(Ordering::Acquire) {
+            if let Some(begin_level) = sp.first() {
+                let mut cp = self.committed_pages.write();
+                for id in begin_level.pages.keys() {
+                    cp.remove(id);
+                }
+            }
+        }
         sp.clear();
         self.savepoint_min_base.store(u32::MAX, Ordering::Relaxed);
         self.savepoint_depth.store(0, Ordering::Release);
@@ -984,6 +1012,29 @@ impl Pager {
             let b = page.lock();
             b.data.clone()
         };
+        // COMMITTED-VIEW ENTRY INVALIDATION — at the exact moment the
+        // page's committed-bytes source flips from LIVE to PRE-IMAGE.
+        // Until now a reader's alias entry (path 3: live bytes ==
+        // committed bytes for a page the writer had never fetched) was
+        // valid; from this fetch on, the live bytes may diverge (in-place
+        // mutation, payload patch without an epoch bump, freelist
+        // rewrite) while the committed bytes are the pre-image recorded
+        // below. Kill the entry HERE — not at mutation time: note_dirty's
+        // same-page early-return (last_noted_dirty == id) skips
+        // mutation-side invalidation whenever a reader memoized an alias
+        // between two consecutive notes of the same page, and
+        // note_write_in_place deliberately bumps no epoch an entry could
+        // validate against. Fetch-side invalidation has neither hole:
+        // the alias's precondition ("writer never fetched this page this
+        // transaction") is exactly what this capture falsifies. Runs
+        // once per page per transaction (the re-fetch fast exit above
+        // returns first), under the engine write lock that excludes
+        // every reader — and latched off entirely for pagers that never
+        // served a committed-view read.
+        if self.committed_view_used.load(Ordering::Acquire) {
+            let mut cp = self.committed_pages.write();
+            cp.remove(&id);
+        }
         for level in sp.iter_mut() {
             if (id as u64) < level.base.n_pages as u64 {
                 level.pages.entry(id).or_insert_with(|| bytes.clone());
@@ -1144,6 +1195,7 @@ impl Pager {
             join_cache: Mutex::new(std::collections::HashMap::new()),
             committed_pages: RwLock::new(std::collections::HashMap::default()),
             committed_poison: std::sync::atomic::AtomicBool::new(false),
+            committed_view_used: std::sync::atomic::AtomicBool::new(false),
             committed_bound_cache: std::sync::atomic::AtomicU32::new(0),
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
@@ -1606,6 +1658,12 @@ impl Pager {
         if self.last_noted_dirty.load(Ordering::Relaxed) == id {
             return;
         }
+        // NOTE: no committed-view entry invalidation here. The alias
+        // lifecycle is maintained at PRE-IMAGE CAPTURE time
+        // (capture_savepoint_undo) — mutation-side invalidation cannot
+        // be made complete: this same-page early-return legitimately
+        // skips work, and in-place payload patches bump no epoch. See
+        // the capture-side comment for the full invariant.
         let mut dp = self.dirty_pages.lock();
         dp.insert(id);
         self.last_noted_dirty.store(id, Ordering::Relaxed);
@@ -1901,12 +1959,25 @@ impl Pager {
         // Reader-side materialization cache: a hot leaf is read once and
         // the PageRef reused (this is what keeps committed-view scans at
         // live-cache speed — the 8 KiB pre-image copy is amortized to one
-        // per page per transaction). Entries derive from pre-images →
-        // they set the epoch-poison signal.
+        // per page per transaction). Entries derived from pre-images set
+        // the epoch-poison signal; ALIAS entries (path 3: the page was
+        // never fetched by the writer, so the live bytes ARE the committed
+        // bytes) do not — poisoning them would retire the advisory hint
+        // state on every committed-scope drop, and since every query
+        // rebuilds hints, every drop would bump write_version: a
+        // reader-induced invalidation feedback loop that kept 1W+7R
+        // readers rebuilding their descent hints per query.
         {
             let cp = self.committed_pages.read();
             if let Some(pr) = cp.get(&id) {
-                self.committed_poison.store(true, Ordering::Release);
+                let aliases_live = self
+                    .cache
+                    .read()
+                    .get(id)
+                    .is_some_and(|live| std::sync::Arc::ptr_eq(live, pr));
+                if !aliases_live {
+                    self.committed_poison.store(true, Ordering::Release);
+                }
                 return Ok(Arc::clone(pr));
             }
         }
@@ -1937,13 +2008,20 @@ impl Pager {
         //    `get_page` (capture) — so the live cache's bytes ARE the
         //    committed bytes. This covers in-memory stores (flush is a
         //    no-op, the dirty set accumulates forever, the backing image
-        //    is never written) and file stores alike. The live PageRef is
-        //    shared with the writer, but the engine RwLock excludes
-        //    concurrent writer statements for the whole scope, and it is
-        //    NEVER memoized into committed_pages (the writer may dirty it
-        //    in a LATER statement; an alias would then serve
-        //    uncommitted bytes to a later reader).
+        //    is never written) and file stores alike. The live PageRef
+        //    is MEMOIZED into committed_pages: an alias is safe because
+        //    (a) a page eligible for this path was never fetched by the
+        //    writer, and a writer cannot mutate a page without fetching
+        //    it first, and (b) the FIRST fetch of the page in any later
+        //    statement invalidates the entry (capture_savepoint_undo)
+        //    while the engine-level write lock still excludes every
+        //    reader from the fetch->capture window. The old no-memoize
+        //    rule ("an alias would serve uncommitted bytes") predates
+        //    capture-side invalidation; with it, aliasing turns repeated
+        //    committed-view scans of untouched ranges from per-query
+        //    lock cascades into a single Arc clone per page.
         if let Some(page_ref) = self.cache.read().get(id).cloned() {
+            self.cache_committed_page(id, &page_ref);
             return Ok(page_ref);
         }
         let mut page = Page::new(id, psz);
@@ -2000,6 +2078,10 @@ impl Pager {
         let mut cp = self.committed_pages.write();
         if cp.len() < COMMITTED_PAGES_CAP {
             cp.insert(id, Arc::clone(pr));
+            // Latch: once any entry exists, the mutation path must keep
+            // invalidating (see note_dirty / clear_savepoints). Never
+            // unlatched — a stale `false` would skip needed removals.
+            self.committed_view_used.store(true, Ordering::Release);
         }
     }
 

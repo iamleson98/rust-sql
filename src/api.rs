@@ -402,9 +402,7 @@ const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
 /// of an ArcBox allocation, which matters on the per-statement detach /
 /// attach path in `execute` and on the ROLLBACK reset.
 fn empty_maps() -> Arc<crate::executor::StmtMaps> {
-    static E: std::sync::OnceLock<Arc<crate::executor::StmtMaps>> = std::sync::OnceLock::new();
-    E.get_or_init(|| Arc::new(crate::executor::StmtMaps::empty()))
-        .clone()
+    crate::executor::StmtMaps::empty_arc()
 }
 
 /// Generic FxHash-style string hasher for statement-cache keys.
@@ -2870,6 +2868,7 @@ impl Database {
         // DETACH the combined maps (zero-copy): `execute`-family callers
         // hold `&mut self`, so no reader can hold a snapshot concurrently.
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+        ctx.shared_detached = true;
         // The original column-list shape (empty = supplies-all) decides the
         // chain's scanner gate — take it out before `fi.values` moves.
         let stmt_columns: Vec<&str> = fi.columns.clone();
@@ -3276,12 +3275,17 @@ impl Database {
         // iterator-backed params (as_slice() == None) are conservatively
         // treated as parameterized.
         if let Some([]) = params.as_slice() {
-            let parts = crate::sql::parser::split_script(sql);
-            if parts.len() > 1 {
-                for part in &parts {
-                    self.execute(part.as_str(), ())?;
+            // Semicolon pre-scan: single statements (no `;` anywhere) are
+            // the overwhelming majority — `split_script` would otherwise
+            // allocate a Vec + one String per part for EVERY execute.
+            if sql.as_bytes().contains(&b';') {
+                let parts = crate::sql::parser::split_script(sql);
+                if parts.len() > 1 {
+                    for part in &parts {
+                        self.execute(part.as_str(), ())?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
         }
         // A writer must never read the BEGIN-time (committed) state: a
@@ -3360,6 +3364,7 @@ impl Database {
                 ctx.deferred_flush = deferred_flush;
                 ctx.txn_snapshot = txn_snap;
                 ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+                ctx.shared_detached = true;
                 for v in params.into_iter() {
                     ctx.bind_positional(v);
                 }
@@ -3428,6 +3433,7 @@ impl Database {
         // refcount alive and force `Arc::make_mut` to deep-copy the maps
         // on every write-back — a ~30% insert regression.)
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+        ctx.shared_detached = true;
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
@@ -3563,12 +3569,22 @@ impl Database {
                     self.txn_begin_epoch
                         .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
                     self.txn_has_ddl.store(false, Ordering::Release);
-                    self.pager.clear_committed_view();
+                    // NOTE: no committed-view clear. The entry-invalidation
+                    // invariant is maintained by the mutation path
+                    // (`note_dirty`) and the transaction boundaries
+                    // (`clear_savepoints`), so materialized BEGIN-time
+                    // pages stay valid across boundaries when the writer
+                    // never touched them — the 1W+7R readers keep their
+                    // materialized leaves instead of re-copying every
+                    // scanned page after every BEGIN.
                 }
                 Statement::Commit | Statement::Rollback(_) => {
                     *self.txn_maps_snap.write() = None;
                     self.txn_owner_tid.store(0, Ordering::Release);
-                    self.pager.clear_committed_view();
+                    // Committed-view entries: `clear_savepoints` (run by
+                    // the COMMIT/ROLLBACK machinery above) already removed
+                    // this transaction's touched pages; untouched pages'
+                    // entries hold bytes that remain the committed state.
                     if matches!(stmt_ref, Statement::Rollback(_)) {
                         // Pre-BEGIN state is restored — anything stamped
                         // against the mid-transaction epoch is stale.
@@ -4465,7 +4481,9 @@ impl Database {
                     *self.txn_snapshot.lock() = None;
                     *self.txn_maps_snap.write() = None;
                     self.txn_owner_tid.store(0, Ordering::Release);
-                    self.pager.clear_committed_view();
+                    // Committed-view entries: the full clear at function
+                    // entry already handled this savepoint transaction
+                    // (its ops may have re-based the __begin__ level).
                     self.pager.flush()?;
                 }
                 Ok(())
@@ -5444,6 +5462,12 @@ impl Database {
                 if !restored {
                     ctx.pager.clear_savepoints();
                     if let Some(snap) = ctx.txn_snapshot.take() {
+                        // Destructive restore: the cache is dropped and
+                        // re-read from the file; committed-view entries
+                        // were built against the pre-restore live state —
+                        // full clear (this path has no savepoint key set
+                        // to selectively invalidate).
+                        ctx.pager.clear_committed_view();
                         ctx.pager.rollback_to(&snap)?;
                     }
                 }
