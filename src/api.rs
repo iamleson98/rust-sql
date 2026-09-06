@@ -3619,7 +3619,8 @@ impl Database {
                     // COMMIT), even as the writer's `note_write` bumps the
                     // live write version. `Pager::write_epoch` returns
                     // this snapshot while a committed scope is armed.
-                    self.pager.set_committed_view_epoch(self.pager.write_epoch());
+                    self.pager
+                        .set_committed_view_epoch(self.pager.write_epoch());
                     // NOTE: no committed-view clear. The entry-invalidation
                     // invariant is maintained by the mutation path
                     // (`note_dirty`) and the transaction boundaries

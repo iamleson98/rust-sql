@@ -17,7 +17,10 @@ fn main() {
     for i in 1..=1000i64 {
         db.execute(
             "INSERT INTO users (name, dept) VALUES (?, ?)",
-            [Value::Text(format!("user{i}").into()), Value::Text("eng".into())],
+            [
+                Value::Text(format!("user{i}").into()),
+                Value::Text("eng".into()),
+            ],
         )
         .unwrap();
     }
@@ -30,7 +33,8 @@ fn main() {
     }
     db.execute("COMMIT", []).unwrap();
 
-    let sql = "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
+    let sql =
+        "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
     let _ = db.query(sql, [Value::Integer(1)]).unwrap();
     let n = 5000;
     let t = Instant::now();
@@ -44,21 +48,40 @@ fn main() {
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF;")
         .unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)", []).unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)", []).unwrap();
-    conn.execute("CREATE INDEX idx_orders_user ON orders(user_id)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX idx_orders_user ON orders(user_id)", [])
+        .unwrap();
     {
         let txn = conn.transaction().unwrap();
         for i in 1..=1000i64 {
-            txn.execute("INSERT INTO users (name, dept) VALUES (?1, 'eng')", rusqlite::params![format!("user{i}")]).unwrap();
+            txn.execute(
+                "INSERT INTO users (name, dept) VALUES (?1, 'eng')",
+                rusqlite::params![format!("user{i}")],
+            )
+            .unwrap();
         }
         for i in 1..=10_000i64 {
-            txn.execute("INSERT INTO orders (user_id, total) VALUES (?1, ?2)", rusqlite::params![(i % 1000) + 1, i * 10]).unwrap();
+            txn.execute(
+                "INSERT INTO orders (user_id, total) VALUES (?1, ?2)",
+                rusqlite::params![(i % 1000) + 1, i * 10],
+            )
+            .unwrap();
         }
         txn.commit().unwrap();
     }
     let mut stmt = conn
-        .prepare("SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1")
+        .prepare(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1",
+        )
         .unwrap();
     let _ = stmt.query(rusqlite::params![1]).unwrap();
     let t = Instant::now();

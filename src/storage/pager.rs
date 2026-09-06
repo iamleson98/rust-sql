@@ -150,6 +150,12 @@ impl std::hash::BuildHasher for PageIdHashBuild {
 pub type PageCacheMap = std::collections::HashMap<PageId, PageRef, PageIdHashBuild>;
 pub type PageIdSet = std::collections::HashSet<PageId, PageIdHashBuild>;
 
+/// Epoch-space separator for committed-view hint stamps (see
+/// `Pager::write_epoch`): committed-scope epochs carry this bit, live
+/// epochs never do, so a hint built by a live-mode read can never
+/// validate inside a committed scope and vice versa.
+pub(crate) const COMMITTED_EPOCH_MARK: u64 = 1u64 << 47;
+
 /// Pages with id below this bound live in the direct-indexed Vec (any
 /// file up to 4 GB at 4 KB pages); higher ids spill to a HashMap. This
 /// bounds the Vec at 8 MB regardless of database size while keeping the
@@ -1667,12 +1673,21 @@ impl Pager {
         // do not clear and rebuild every reader descent (the 1W+7R shape
         // paid a full hint rebuild + root re-descent per query). Live
         // readers (no scope) and the writer thread keep the live epoch.
+        //
+        // The COMMITTED_EPOCH_MARK bit keeps committed-scope stamps in a
+        // DISJOINT space from live stamps: a hint built by a LIVE-mode
+        // read before BEGIN can never validate inside a committed scope —
+        // even when the live version has not moved since (the seed-write
+        // -> BEGIN -> first-mutation window), because such a hint holds
+        // the LIVE PageRef of a page the writer is about to mutate in
+        // place. Bit 47 is the version field's top bit: writes never
+        // reach 2^47, and the instance id (bits 48..64) stays intact.
         if self.committed_scope_count.load(Ordering::Acquire) > 0 {
             if let Some((pid, _)) = committed_scope() {
                 if pid == self.instance_id {
                     let e = self.committed_view_epoch.load(Ordering::Acquire);
                     if e != 0 {
-                        return e;
+                        return e | COMMITTED_EPOCH_MARK;
                     }
                 }
             }
