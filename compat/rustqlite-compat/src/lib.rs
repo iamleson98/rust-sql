@@ -23,7 +23,8 @@
 //!
 //! Then build once (`cargo build --release -p rustqlite-compat` in the
 //! rust-sql repo) and the patched sys crate links + rpaths your binary to
-//! `rust-sql/target/release/libsqlite3.so`. See `compat/README.md`.
+//! `rust-sql/target/release/libsqlite3.so`. See the repository README.md
+//! (sqlx & sea-orm compatibility section).
 //!
 //! # Threading / connection model
 //!

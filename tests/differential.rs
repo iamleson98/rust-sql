@@ -1375,8 +1375,8 @@ static CASES: &[Case] = &[
     // KNOWN LIMITATION: scalar subqueries via the evaluator aren't supported
     // yet — they require a different execution path than the standard
     // expression evaluator (the planner/executor needs to evaluate the
-    // subquery per-row of the outer scope). Tracked in PRODUCTION_TODO.md
-    // Phase 4. The case below is intentionally commented out so the suite
+    // subquery per-row of the outer scope). Tracked in README.md
+    // (Remaining gaps). The case below is intentionally commented out so the suite
     // remains green; uncomment when the executor gains scalar-subquery
     // support to verify SQLite-parity.
     // case!(

@@ -461,7 +461,7 @@ SELECT id, i, t, r FROM aff
 # literal. `i = '10'` compares Integer(10) to Text('10') directly, which
 # returns false. SQLite would coerce '10' to integer 10 first.
 # Skip this case until affinity-coercion in WHERE is implemented (tracked
-# in PRODUCTION_TODO.md Phase 4).
+# in README.md, Remaining gaps).
 skip
 query I rowsort
 SELECT id FROM aff WHERE i = '10'

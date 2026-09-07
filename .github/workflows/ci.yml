@@ -233,7 +233,7 @@ jobs:
   # TORTURE_TIME_TOLERANCE_PCT (default 15% — single-pass sections are
   # noisier than the bench gates' best-of rounds; the bench-gate jobs own
   # the tight 5% throughput contract). Memory is reported per section
-  # (tracked in GAP_ANALYSIS.md); set TORTURE_MEM_TOLERANCE_PCT to gate
+  # (tracked in README.md); set TORTURE_MEM_TOLERANCE_PCT to gate
   # it too.
   torture:
     name: torture (${{ matrix.os }}, scale matrix)

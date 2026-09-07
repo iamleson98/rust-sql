@@ -132,7 +132,7 @@ dave 6 NULL
 # no right side to match). The expected correct output is 2 rows:
 #   carol NULL
 #   dave NULL
-# Tracked in PRODUCTION_TODO.md Phase 2 / planner predicate pushdown.
+# Tracked in README.md, Remaining gaps (planner).
 # Once the bug is fixed, re-enable this query.
 # query TT rowsort
 # SELECT u.name, r.amount FROM users u LEFT JOIN refunds r ON u.id = r.id WHERE r.amount IS NULL ORDER BY u.name

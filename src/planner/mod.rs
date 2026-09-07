@@ -3183,7 +3183,7 @@ fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) 
                 // trailing slot named HIDDEN_ROWID (see plan_select's
                 // hook) — expression evaluation resolves it by exact
                 // match. Materialized paths without the slot evaluate
-                // NULL (documented in GAP_ANALYSIS §9).
+                // NULL (a documented limitation of the fallback path).
                 *e = Expr::Column {
                     table: None,
                     name: HIDDEN_ROWID.to_string(),

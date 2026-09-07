@@ -1,4 +1,4 @@
-//! rowid-inside-EXPRESSIONS (GAP_ANALYSIS §9 follow-up): `rowid` /
+//! rowid-inside-EXPRESSIONS (rowid-in-expressions hardening (2026-09)): `rowid` /
 //! `_rowid_` / `oid` referenced inside expressions — `rowid*2`,
 //! `max(rowid)`, `WHERE rowid % 2 = 0`, `ORDER BY rowid % 3` — on both
 //! alias tables (INTEGER PRIMARY KEY: planner rewrite to the alias

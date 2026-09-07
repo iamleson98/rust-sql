@@ -223,7 +223,7 @@ SELECT c.vip, SUM(s.qty) FROM customers c JOIN sales s ON c.name = s.customer GR
 # work — the Sort operator can't evaluate aggregate exprs against the
 # Aggregate operator's output. The query still returns all rows but in
 # GROUP BY iteration order (alphabetical by region), not sorted by the
-# aggregate value. Tracked in PRODUCTION_TODO.md Phase 4.
+# aggregate value. Tracked in README.md, Remaining gaps.
 # Once fixed, switch the ORDER BY back to SUM(qty) DESC and re-verify
 # the expected order: south 22, north 18, west 1.
 query TI nosort
