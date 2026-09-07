@@ -447,6 +447,31 @@ fn sqlite_big_group_by(conn: &rusqlite::Connection) -> Duration {
     })
 }
 
+fn rustqlite_big_topn(db: &rustqlite::Database, sql: &str) -> Duration {
+    // Warm (plan + page caches + worker spin-up), then best-of.
+    let _ = db.query(sql, []).unwrap();
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let rows = db.query(sql, []).unwrap();
+        let _ = &rows[0];
+        start.elapsed()
+    })
+}
+
+fn sqlite_big_topn(conn: &rusqlite::Connection, sql: &str) -> Duration {
+    let mut stmt = conn.prepare(sql).unwrap();
+    {
+        let mut rows = stmt.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+    }
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let mut rows = stmt.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
+}
+
 fn sqlite_setup_join(conn: &rusqlite::Connection) {
     conn.execute(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)",
@@ -1490,6 +1515,63 @@ fn main() {
             println!(
                 "{:<50} {:>12} {:>12}   {:>5.2}x",
                 "Big GROUP BY (10k buckets + SUM)",
+                fmt_dur(d_r),
+                fmt_dur(d_s),
+                d_s.as_secs_f64() / d_r.as_secs_f64()
+            );
+        }
+        // Top-N: ORDER BY ... LIMIT splits per-worker keep-heaps across
+        // the rowid ranges and merges under the same strict total order
+        // (bit-identical to the serial streaming top-N).
+        {
+            let sql = "SELECT id, name, val, score FROM t ORDER BY score DESC LIMIT 25";
+            // Answer-equality before timing: score = j*0.25 is unique, so
+            // row order is contract, not implementation detail.
+            let r = db_r.query(sql, []).unwrap();
+            let s: Vec<(i64, i64)> = conn_s
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(2)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
+            assert_eq!(r.len(), s.len(), "top-25 row counts must match");
+            for (a, b) in r.iter().zip(s.iter()) {
+                assert_eq!(a[0], rustqlite::Value::Integer(b.0));
+                assert_eq!(a[2], rustqlite::Value::Integer(b.1));
+            }
+            let d_r = rustqlite_big_topn(&db_r, sql);
+            let d_s = sqlite_big_topn(&conn_s, sql);
+            println!(
+                "{:<50} {:>12} {:>12}   {:>5.2}x",
+                "Big top-25 ORDER BY REAL DESC (full rows)",
+                fmt_dur(d_r),
+                fmt_dur(d_s),
+                d_s.as_secs_f64() / d_r.as_secs_f64()
+            );
+        }
+        {
+            let sql = "SELECT id, val FROM t ORDER BY val DESC LIMIT 50 OFFSET 100";
+            // val = (j*37+11) mod 1e6 is a bijection on 0..1e6 — unique
+            // keys, so the OFFSET window is deterministic too.
+            let r = db_r.query(sql, []).unwrap();
+            let s: Vec<(i64, i64)> = conn_s
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
+            assert_eq!(r.len(), s.len());
+            for (a, b) in r.iter().zip(s.iter()) {
+                assert_eq!(a[0], rustqlite::Value::Integer(b.0));
+                assert_eq!(a[1], rustqlite::Value::Integer(b.1));
+            }
+            let d_r = rustqlite_big_topn(&db_r, sql);
+            let d_s = sqlite_big_topn(&conn_s, sql);
+            println!(
+                "{:<50} {:>12} {:>12}   {:>5.2}x",
+                "Big top-50 ORDER BY INT DESC OFFSET 100 (page)",
                 fmt_dur(d_r),
                 fmt_dur(d_s),
                 d_s.as_secs_f64() / d_r.as_secs_f64()

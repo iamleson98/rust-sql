@@ -1,11 +1,13 @@
-//! Intra-statement parallel aggregation — the concurrency frontier
-//! SQLite categorically does not have (its executor is single-threaded
-//! by design). A large single-table aggregate (`SELECT SUM(v), COUNT(*),
-//! AVG(v) FROM big`, `... WHERE v > K`, `SELECT cat, COUNT(*) FROM big
-//! GROUP BY cat`) splits the table's rowid space across worker threads;
-//! each worker runs the SAME fused/compiled walk the serial path runs,
-//! over its own rowid range; the main thread merges the partial
-//! accumulators deterministically.
+//! Intra-statement parallel aggregation and top-N — the concurrency
+//! frontier SQLite categorically does not have (its executor is
+//! single-threaded by design). A large single-table aggregate
+//! (`SELECT SUM(v), COUNT(*), AVG(v) FROM big`, `... WHERE v > K`,
+//! `SELECT cat, COUNT(*) FROM big GROUP BY cat`) or a bounded top-N
+//! (`SELECT ... FROM big ORDER BY k LIMIT n [OFFSET o]`) splits the
+//! table's rowid space across worker threads; each worker runs the SAME
+//! fused/compiled walk or keep-heap selection the serial path runs, over
+//! its own rowid range; the main thread merges the partial accumulators
+//! or survivor sets deterministically.
 //!
 //! ## Why this is safe with zero new locking
 //!
@@ -802,4 +804,150 @@ pub(crate) fn try_parallel_count(
         }
     }
     Ok(Some(total))
+}
+
+/// Parallel streaming top-N — `ORDER BY <bare col> [DESC] LIMIT k
+/// [OFFSET o]` over a bare table scan, split by rowid range: each worker
+/// feeds its own `keep`-sized survivor heap from a range-selective walk
+/// (the serial `exec_topn_scan` loop, verbatim), then the main thread
+/// merges the per-worker survivors under the SAME strict total order
+/// (key, then serial=rowid ASC).
+///
+/// ## Why the merge is exactly the serial answer
+///
+/// `topn_total_cmp` is a STRICT total order (ties break by rowid, and
+/// the rowid ranges are disjoint), so the global top-`keep` set is
+/// unique. Any row in the global top-keep has at most `keep - 1` rows
+/// ahead of it globally, hence at most `keep - 1` in its OWN range, so
+/// it survives its worker's local selection. The union of the local
+/// survivor sets therefore contains the global top-keep; sorting the
+/// union and taking the first `keep` yields exactly it. No float
+/// latitude, no order-of-operations freedom — bit-identical to the
+/// serial streaming path (and to SQLite's stable sorter for
+/// scan-sourced rows, which this path's tiebreak mirrors).
+///
+/// `Ok(None)` = declined (below threshold / config off / txn open) —
+/// the caller runs the serial `exec_topn_scan` unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_parallel_topn(
+    ctx: &ExecContext<'_>,
+    table: &StdArc<Table>,
+    key_col: usize,
+    desc: bool,
+    keep: usize,
+    offset: usize,
+    project: Option<&[usize]>,
+    out_cols: StdArc<[String]>,
+) -> Result<Option<ExecResult>> {
+    if keep == 0 {
+        return Ok(None); // the serial path's LIMIT-0 shortcut already answers
+    }
+    let root = ctx.table_root(table);
+    let split = match plan_range_split(ctx, root)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+
+    // Wanted columns: the projection's columns plus the key column —
+    // the serial path's exact set (scan-selective contract).
+    let mut wanted: Vec<usize> = match project {
+        Some(ps) => ps.to_vec(),
+        None => (0..n_cols).collect(),
+    };
+    if !wanted.contains(&key_col) {
+        wanted.push(key_col);
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    let project_map: Vec<usize> = match project {
+        Some(ps) => ps
+            .iter()
+            .map(|&p| wanted.iter().position(|&w| w == p).unwrap_or(0))
+            .collect(),
+        None => (0..wanted.len()).collect(),
+    };
+    let key_pos = wanted.iter().position(|&w| w == key_col).unwrap();
+
+    let ranges = split.ranges;
+    let pager = ctx.pager;
+
+    // Workers: the serial top-N loop over each range (identical heap
+    // discipline — sift-up on insert, root-replace + sift-down when the
+    // candidate beats the worst survivor).
+    let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges.iter() {
+            let wanted = wanted.clone();
+            handles.push(scope.spawn(move || -> Result<Vec<super::TopnSel>> {
+                let mut bt = Btree::new(pager, root, false);
+                let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
+                bt.scan_table_range_selective(
+                    lo,
+                    hi,
+                    n_cols,
+                    &wanted,
+                    rowid_alias,
+                    |rowid, row| {
+                        let key = row[key_pos].clone();
+                        if sel.len() < keep {
+                            let idx = sel.len();
+                            sel.push(super::TopnSel {
+                                key,
+                                serial: rowid,
+                                row,
+                            });
+                            super::topn_sift_up(&mut sel, idx, desc);
+                        } else if super::topn_total_cmp(
+                            &key,
+                            rowid,
+                            &sel[0].key,
+                            sel[0].serial,
+                            desc,
+                        ) == std::cmp::Ordering::Less
+                        {
+                            sel[0] = super::TopnSel {
+                                key,
+                                serial: rowid,
+                                row,
+                            };
+                            super::topn_sift_down(&mut sel, 0, desc);
+                        }
+                        true
+                    },
+                )?;
+                Ok(sel)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel top-N worker panicked"))
+            .collect()
+    });
+
+    // Any worker error -> serial fallback (never a divergent answer).
+    let mut merged: Vec<super::TopnSel> = Vec::with_capacity(keep * ranges.len());
+    for p in partials {
+        match p {
+            Ok(sel) => merged.extend(sel),
+            Err(_) => return Ok(None),
+        }
+    }
+
+    // Sort the survivors under the SAME total order, keep the first
+    // `keep` (= the global top-keep — see the proof above), window
+    // [offset..keep) — the serial path's exact tail.
+    merged.sort_by(|a, b| super::cmp_sel(a, b, desc));
+    merged.truncate(keep);
+    let start = offset.min(merged.len());
+    let rows: Vec<Vec<Value>> = merged[start..]
+        .iter()
+        .map(|s| project_map.iter().map(|&w| s.row[w].clone()).collect())
+        .collect();
+    Ok(Some(ExecResult {
+        columns: out_cols,
+        rows,
+    }))
 }

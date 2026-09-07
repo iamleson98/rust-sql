@@ -269,3 +269,188 @@ fn parallel_matches_sqlite_on_big_aggregate() {
     assert_eq!(par[0][2], min.map(Value::Integer).unwrap_or(Value::Null));
     assert_eq!(par[0][3], max.map(Value::Integer).unwrap_or(Value::Null));
 }
+
+// ============================================================================
+// Parallel top-N (ORDER BY ... LIMIT) — the workers feed per-range
+// keep-heaps; the merge must be BIT-IDENTICAL to the serial streaming
+// top-N under the strict total order (key, then rowid).
+// ============================================================================
+
+#[test]
+fn parallel_topn_asc_desc_match_serial() {
+    // r is unique (halves of distinct rowids) — no tie latitude at all.
+    for sql in [
+        "SELECT * FROM t ORDER BY r DESC LIMIT 25",
+        "SELECT * FROM t ORDER BY r ASC LIMIT 25",
+    ] {
+        let (par, ser) = both_ways(sql);
+        assert_eq!(par.len(), 25);
+        assert_eq!(par, ser, "parallel top-N must equal serial exactly");
+    }
+    // Spot-check the DESC extremes: the 25 largest r = 0.5 * (299999-i).
+    let (par, _) = both_ways("SELECT id, r FROM t ORDER BY r DESC LIMIT 25");
+    for (i, row) in par.iter().enumerate() {
+        assert_eq!(row[0], Value::Integer(BIG - 1 - i as i64));
+    }
+}
+
+#[test]
+fn parallel_topn_projection_matches_serial() {
+    // Projection is a strict subset; the key column (r) is NOT projected.
+    let (par, ser) = both_ways("SELECT id, v FROM t ORDER BY r DESC LIMIT 15");
+    assert_eq!(par.len(), 15);
+    assert_eq!(par, ser);
+    assert_eq!(par[0].len(), 2, "projected width");
+    assert_eq!(par[0][0], Value::Integer(BIG - 1));
+}
+
+#[test]
+fn parallel_topn_offset_pagination_matches() {
+    // Page 2 of an ASC ordering — the window is [offset, offset+count).
+    let (par, ser) = both_ways("SELECT id, r FROM t ORDER BY r LIMIT 10 OFFSET 100");
+    assert_eq!(par.len(), 10);
+    assert_eq!(par, ser);
+    assert_eq!(par[0][0], Value::Integer(100), "first row of page 2");
+    assert_eq!(par[9][0], Value::Integer(109), "last row of page 2");
+}
+
+#[test]
+fn parallel_topn_ties_rowid_order_matches_serial() {
+    // cat has 3000 rows per value — massive ties. The strict total order
+    // breaks ties by rowid ASC on BOTH directions (SQLite's stable
+    // sorter semantics for scan-sourced rows); parallel must reproduce
+    // the serial survivor set and order bit-for-bit.
+    for sql in [
+        "SELECT id, cat FROM t ORDER BY cat LIMIT 25",
+        "SELECT id, cat FROM t ORDER BY cat DESC LIMIT 25",
+    ] {
+        let (par, ser) = both_ways(sql);
+        assert_eq!(par, ser, "tied keys must tie-break by rowid identically");
+        assert_eq!(par.len(), 25);
+    }
+    // ASC page 1: cat=0 rows, rowids 0,100,200,... (cat = id % 100).
+    let (par, _) = both_ways("SELECT id, cat FROM t ORDER BY cat LIMIT 25");
+    for (i, row) in par.iter().enumerate() {
+        assert_eq!(row[1], Value::Integer(0));
+        assert_eq!(row[0], Value::Integer(i as i64 * 100));
+    }
+}
+
+#[test]
+fn parallel_topn_null_keys_match_serial() {
+    // v contains NULLs (NULLs sort first ASC, last DESC) — the NULL
+    // ordering must survive the split+merge exactly.
+    for sql in [
+        "SELECT id, v FROM t ORDER BY v ASC LIMIT 12",
+        "SELECT id, v FROM t ORDER BY v DESC LIMIT 12",
+    ] {
+        let (par, ser) = both_ways(sql);
+        assert_eq!(par, ser);
+        assert_eq!(par.len(), 12);
+    }
+}
+
+#[test]
+fn parallel_topn_rowid_alias_key() {
+    // ORDER BY the rowid-alias column: resolve_topn_key_col maps it to
+    // the alias column; DESC on the key of the table itself.
+    let (par, ser) = both_ways("SELECT id, v FROM t ORDER BY id DESC LIMIT 10");
+    assert_eq!(par, ser);
+    assert_eq!(par[0][0], Value::Integer(BIG - 1));
+}
+
+#[test]
+fn parallel_topn_matches_sqlite_unique_keys() {
+    // Cross-check against real SQLite on UNIQUE keys (r halves; and the
+    // top v values, which are distinct). On unique keys even the row
+    // order is contract, not implementation detail.
+    let (par_r, _) = both_ways("SELECT id, v, r, cat FROM t ORDER BY r DESC LIMIT 20");
+    let (par_v, _) = both_ways("SELECT id, v FROM t ORDER BY v DESC LIMIT 20");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, r REAL, cat INTEGER);")
+        .unwrap();
+    let mut stmt = conn
+        .prepare("INSERT INTO t (id, v, r, cat) VALUES (?, ?, ?, ?)")
+        .unwrap();
+    for j in 0..BIG {
+        let v_null = (j % 100) >= 97 && j % 7 == 0;
+        let v: Option<i64> = if v_null { None } else { Some(j - BIG / 2) };
+        stmt.execute(rusqlite::params![j, v, (j as f64) * 0.5, j % 100])
+            .unwrap();
+    }
+    drop(stmt);
+    let sql_r: Vec<(i64, Option<i64>, f64, i64)> = conn
+        .prepare("SELECT id, v, r, cat FROM t ORDER BY r DESC LIMIT 20")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(par_r.len(), sql_r.len());
+    for (a, b) in par_r.iter().zip(sql_r.iter()) {
+        assert_eq!(a[0], Value::Integer(b.0));
+        assert_eq!(a[1], b.1.map(Value::Integer).unwrap_or(Value::Null));
+        assert_eq!(a[2], Value::Real(b.2));
+        assert_eq!(a[3], Value::Integer(b.3));
+    }
+    let sql_v: Vec<(i64, Option<i64>)> = conn
+        .prepare("SELECT id, v FROM t ORDER BY v DESC LIMIT 20")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(par_v.len(), sql_v.len());
+    for (a, b) in par_v.iter().zip(sql_v.iter()) {
+        assert_eq!(a[0], Value::Integer(b.0));
+        assert_eq!(a[1], b.1.map(Value::Integer).unwrap_or(Value::Null));
+    }
+}
+
+#[test]
+fn parallel_topn_declines_inside_transaction() {
+    // Read-your-own-writes: inside an open write txn the workers decline
+    // (serial path) — a freshly inserted extreme row must win the DESC
+    // top-1 immediately.
+    let mut db = big_db();
+    db.execute("BEGIN", []).unwrap();
+    db.execute(
+        "INSERT INTO t (id, v, r, cat) VALUES (9999999, 999999, 5e10, 7)",
+        [],
+    )
+    .unwrap();
+    let rows = db
+        .query("SELECT id, v FROM t ORDER BY v DESC LIMIT 3", [])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], Value::Integer(9_999_999), "the new max wins");
+    assert_eq!(rows[0][1], Value::Integer(999_999));
+    db.execute("ROLLBACK", []).unwrap();
+}
+
+#[test]
+fn parallel_topn_declines_below_threshold() {
+    // A small table: the fusion still answers via the serial streaming
+    // path — correctness independent of the split.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 0..500i64 {
+        db.execute("INSERT INTO s (v) VALUES (?)", [Value::Integer(i * 7 % 97)])
+            .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    let rows = db
+        .query("SELECT id, v FROM s ORDER BY v DESC, id ASC LIMIT 5", [])
+        .unwrap();
+    // Multi-term ORDER BY keeps the general sort path — still correct.
+    assert_eq!(rows.len(), 5);
+    let first_v = match rows[0][1] {
+        Value::Integer(i) => i,
+        ref other => panic!("INTEGER expected, got {:?}", other),
+    };
+    assert_eq!(first_v, 96, "96 = 7*k mod 97 max, first at id 14");
+}

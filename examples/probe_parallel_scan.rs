@@ -1,8 +1,9 @@
-//! Probe: intra-statement parallel aggregation scaling.
+//! Probe: intra-statement parallel aggregation + top-N scaling.
 //!
-//! Builds a 1M-row table, then times the same big aggregate queries with
-//! `PRAGMA parallel_scan=0` (serial) vs the default ON (worker split).
-//! Prints per-query times, speedup, and the worker count.
+//! Builds a 1M-row table, then times the same big aggregate / top-N
+//! queries with `PRAGMA parallel_scan=0` (serial) vs the default ON
+//! (worker split). Prints per-query times, speedup, and the worker
+//! count.
 
 use std::time::Instant;
 
@@ -71,6 +72,19 @@ fn time_groupby(db: &Database, sql: &str, iters: u32) -> f64 {
     best
 }
 
+fn time_topn(db: &Database, sql: &str, iters: u32) -> f64 {
+    let _ = db.query(sql, []);
+    let mut best = f64::MAX;
+    for _ in 0..iters {
+        let t = Instant::now();
+        let rows = db.query(sql, []).unwrap();
+        let dt = t.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(rows.len(), 25, "top-25 rows");
+        best = best.min(dt);
+    }
+    best
+}
+
 fn main() {
     let hw = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -113,6 +127,18 @@ fn main() {
         "GROUP BY 100 buckets    serial {s:8.3} ms   parallel {p:8.3} ms   speedup {:5.2}x",
         s / p
     );
+
+    // Top-N shapes: unique REAL key (r = j/4), full-row projection.
+    let t25 = "SELECT id, v, r, cat FROM t ORDER BY r DESC LIMIT 25";
+    let s = time_topn(&ser, t25, 7);
+    let p = time_topn(&par, t25, 7);
+    println!(
+        "top-25 ORDER BY r DESC  serial {s:8.3} ms   parallel {p:8.3} ms   speedup {:5.2}x",
+        s / p
+    );
+    let a = ser.query(t25, []).unwrap();
+    let b = par.query(t25, []).unwrap();
+    assert_eq!(a, b, "parallel top-N vs serial mismatch");
 
     // Same answer check (cheap sanity on top of tests/parallel_scan.rs).
     let a = ser

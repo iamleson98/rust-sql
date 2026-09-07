@@ -3828,7 +3828,13 @@ fn exec_topn(
 /// sorter semantics for scan-sourced rows (equal keys keep rowid order
 /// on both ASC and DESC terms).
 #[inline]
-fn topn_total_cmp(a: &Value, ai: i64, b: &Value, bi: i64, desc: bool) -> std::cmp::Ordering {
+pub(super) fn topn_total_cmp(
+    a: &Value,
+    ai: i64,
+    b: &Value,
+    bi: i64,
+    desc: bool,
+) -> std::cmp::Ordering {
     let ord = a.cmp(b);
     let ord = if desc { ord.reverse() } else { ord };
     ord.then(ai.cmp(&bi))
@@ -3862,20 +3868,20 @@ fn resolve_topn_key_col(expr: &Expr, table: &Table, alias: Option<&str>) -> Opti
 }
 
 /// One survivor of the streaming top-N selection.
-struct TopnSel {
-    key: Value,
-    serial: i64,
+pub(super) struct TopnSel {
+    pub(super) key: Value,
+    pub(super) serial: i64,
     /// The row in `wanted`-column order (scan-selective contract).
-    row: Vec<Value>,
+    pub(super) row: Vec<Value>,
 }
 
 #[inline]
-fn cmp_sel(a: &TopnSel, b: &TopnSel, desc: bool) -> std::cmp::Ordering {
+pub(super) fn cmp_sel(a: &TopnSel, b: &TopnSel, desc: bool) -> std::cmp::Ordering {
     topn_total_cmp(&a.key, a.serial, &b.key, b.serial, desc)
 }
 
 /// Max-heap sift (parent worst-or-equal vs children) over `sel[..n]`.
-fn topn_sift_down(sel: &mut [TopnSel], mut i: usize, desc: bool) {
+pub(super) fn topn_sift_down(sel: &mut [TopnSel], mut i: usize, desc: bool) {
     let n = sel.len();
     loop {
         let l = 2 * i + 1;
@@ -3895,7 +3901,7 @@ fn topn_sift_down(sel: &mut [TopnSel], mut i: usize, desc: bool) {
     }
 }
 
-fn topn_sift_up(sel: &mut [TopnSel], mut i: usize, desc: bool) {
+pub(super) fn topn_sift_up(sel: &mut [TopnSel], mut i: usize, desc: bool) {
     while i > 0 {
         let p = (i - 1) / 2;
         if cmp_sel(&sel[i], &sel[p], desc) == std::cmp::Ordering::Greater {
@@ -4088,6 +4094,25 @@ fn exec_limit(
                                 };
                                 if projection.is_none() || project.is_some() {
                                     let desc = terms[0].order == Order::Desc;
+                                    // Intra-statement parallel split FIRST
+                                    // (big tables): per-worker keep-heaps
+                                    // merged under the same strict total
+                                    // order — bit-identical to the serial
+                                    // streaming path (see parallel.rs for
+                                    // the proof). Declines below
+                                    // threshold / config off / txn open.
+                                    if let Some(res) = crate::executor::parallel::try_parallel_topn(
+                                        ctx,
+                                        table,
+                                        key_col,
+                                        desc,
+                                        total,
+                                        offset_i as usize,
+                                        project.as_deref(),
+                                        out_cols.clone(),
+                                    )? {
+                                        return Ok(res);
+                                    }
                                     return exec_topn_scan(
                                         ctx,
                                         table,
