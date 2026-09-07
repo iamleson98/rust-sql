@@ -4256,6 +4256,18 @@ impl Database {
         Some((col.declared_type.clone(), not_null, pk))
     }
 
+    /// Ordered column names of a table (or None when the table is
+    /// unknown). The C ABI layer uses this to expand `RETURNING *` /
+    /// `RETURNING t.*` the way SQLite does: the star names the DML
+    /// target table's columns, in declared order — and the row values
+    /// the executor produces for a star are exactly those columns (see
+    /// `project_returning_row`), so the reported column count must match
+    /// the row width or C-ABI consumers (sqlx/sea-orm) misalign rows.
+    pub fn table_column_names(&self, table: &str) -> Option<Vec<String>> {
+        let t = self.catalog.get_table(table)?;
+        Some(t.columns.iter().map(|c| c.name.clone()).collect())
+    }
+
     /// Number of pages in the database file.
     pub fn page_count(&self) -> u32 {
         self.pager.n_pages()

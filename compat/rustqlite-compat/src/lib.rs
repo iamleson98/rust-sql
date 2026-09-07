@@ -136,6 +136,31 @@ pub const SQLITE_LIBVERSION: &str = "3.50.4";
 const SOURCE_ID: &str = "2026-09-01 00:00:00 rustqlite-compat 0.1.0 (SQLite C ABI on rustqlite)";
 
 // ---------------------------------------------------------------------------
+// Rust-visible API (link-closure anchor)
+// ---------------------------------------------------------------------------
+//
+// Everything else in this crate is `#[no_mangle] extern "C"` — invisible to
+// rustc's link-time crate selection. rustc keeps an rlib on a binary's link
+// line only when the ROOT crate's compilation references the crate, so a
+// downstream binary whose code never names `sqlite3::` (e.g. an integration
+// test linking a library that depends on us) would end up with sqlx-sqlite's
+// `sqlite3_*` references UNRESOLVED. Consumers defeat that by referencing
+// one of the functions below from real code (see the backend's
+// `src/db/sqlite_migrate.rs` `ENGINE_LINK_ANCHOR`); the rlib then lands on
+// every dependent's link line and ALL of the C exports come with it.
+
+/// The SQLite C API version this compat layer reports (matches
+/// `sqlite3_libversion()`).
+pub fn engine_version() -> &'static str {
+    SQLITE_LIBVERSION
+}
+
+/// Build identity of the compat layer (matches `sqlite3_source_id()`).
+pub fn engine_source_id() -> &'static str {
+    SOURCE_ID
+}
+
+// ---------------------------------------------------------------------------
 // Opaque C types
 // ---------------------------------------------------------------------------
 
@@ -398,6 +423,11 @@ struct Stmt {
     /// NUL-terminated text buffer for column_text/value_text (valid until
     /// the next accessor call on this statement).
     text_buf: Vec<u8>,
+    /// Blob buffer for column_blob — the blob Value is CLONED out of the
+    /// engine, so the pointer must live in statement-owned storage
+    /// (valid until the next accessor call on this statement, matching
+    /// SQLite's lifetime contract).
+    blob_buf: Vec<u8>,
     /// Error code of the most recent step (sqlite3_reset returns it).
     last_step_err: c_int,
     /// True once the first step ran.
@@ -680,6 +710,27 @@ fn resolve_open_target(filename: &str, flags: c_int) -> Result<(OpenTarget, bool
     } else {
         None
     };
+    if filename == ":memory:" {
+        return Ok((OpenTarget::PrivateMemory, false));
+    }
+    // SQLite forces an in-memory database when SQLITE_OPEN_MEMORY is set,
+    // regardless of the filename (sqlite3.c openDatabase: `isMemdb` includes
+    // `(vfsFlags & SQLITE_OPEN_MEMORY)!=0`). sqlx relies on exactly this:
+    // its in-memory pools open "file:sqlx-in-memory-N" with the MEMORY +
+    // SHAREDCACHE flags and NO `mode=memory` query parameter — the FLAG is
+    // what makes it memory, and the raw filename string is the shared-cache
+    // key (sqlite3.c: for memdb it memcpy's zFilename as the full pathname).
+    if flags & SQLITE_OPEN_MEMORY != 0 {
+        // Normalize an explicit `file:X?mode=memory` URI to the same key
+        // the URI branch below would use, so flagged and unflagged opens
+        // of the same shared memory DB find one engine.
+        let key = match &uri {
+            Some(u) if u.mode_memory => format!("mem:{}", u.path),
+            _ => format!("mem:{}", filename),
+        };
+        let readonly = uri.as_ref().map(|u| u.readonly).unwrap_or(false);
+        return Ok((OpenTarget::Shared(key), readonly));
+    }
     if let Some(u) = uri {
         if u.mode_memory {
             if u.cache_shared {
@@ -691,9 +742,6 @@ fn resolve_open_target(filename: &str, flags: c_int) -> Result<(OpenTarget, bool
             return Ok((OpenTarget::PrivateMemory, u.readonly));
         }
         return Ok((OpenTarget::File(PathBuf::from(u.path)), u.readonly));
-    }
-    if filename == ":memory:" {
-        return Ok((OpenTarget::PrivateMemory, false));
     }
     if filename.is_empty() {
         // SQLite: empty filename = a temporary on-disk database. We map it
@@ -1190,30 +1238,20 @@ fn collect_select(
     max_explicit: &mut usize,
 ) {
     use rustqlite::sql::ast::SelectBody;
-    let body = match &s.body {
-        SelectBody::Simple(sel) => sel,
-        // Compound selects: walk the LEFT-most simple body only — the
-        // parameter slots of a compound are the union anyway, and the
-        // engine binds by index, so missing the right arm's ORDER is
-        // corrected by the named/index mapping below.
-        SelectBody::Binary { left, .. } => match left.as_ref() {
-            SelectBody::Simple(sel) => sel,
-            _ => return,
-        },
-    };
-    for rc in &body.columns {
-        if let rustqlite::sql::ast::ResultColumn::Expr { expr, .. } = rc {
-            walk_expr(expr, slots, max_explicit);
+    // WITH clause: parameters inside CTE bodies bind on this statement.
+    if let Some(w) = &s.with {
+        for cte in &w.ctes {
+            collect_select(&cte.select, slots, max_explicit);
         }
     }
-    if let Some(w) = &body.where_clause {
-        walk_expr(w, slots, max_explicit);
-    }
-    for t in &body.group_by {
-        walk_expr(t, slots, max_explicit);
-    }
-    if let Some(h) = &body.having {
-        walk_expr(h, slots, max_explicit);
+    match &s.body {
+        SelectBody::Simple(sel) => collect_simple_select(sel, slots, max_explicit),
+        // Compound selects: SQLite binds EVERY arm's parameters to this
+        // statement — walk both sides.
+        SelectBody::Binary { left, right, .. } => {
+            collect_body(left, slots, max_explicit);
+            collect_body(right, slots, max_explicit);
+        }
     }
     // ORDER BY / LIMIT live on the SelectStatement, not the body.
     for o in &s.order_by {
@@ -1224,6 +1262,80 @@ fn collect_select(
     }
     if let Some(off) = &s.offset {
         walk_expr(off, slots, max_explicit);
+    }
+}
+
+fn collect_body(
+    b: &rustqlite::sql::ast::SelectBody,
+    slots: &mut Vec<ParamSlot>,
+    max_explicit: &mut usize,
+) {
+    use rustqlite::sql::ast::SelectBody;
+    match b {
+        SelectBody::Simple(sel) => collect_simple_select(sel, slots, max_explicit),
+        SelectBody::Binary { left, right, .. } => {
+            collect_body(left, slots, max_explicit);
+            collect_body(right, slots, max_explicit);
+        }
+    }
+}
+
+fn collect_simple_select(
+    body: &rustqlite::sql::ast::SimpleSelect,
+    slots: &mut Vec<ParamSlot>,
+    max_explicit: &mut usize,
+) {
+    for rc in &body.columns {
+        if let rustqlite::sql::ast::ResultColumn::Expr { expr, .. } = rc {
+            walk_expr(expr, slots, max_explicit);
+        }
+    }
+    if let Some(w) = &body.where_clause {
+        walk_expr(w, slots, max_explicit);
+    }
+    // FROM: derived-table subqueries, JOIN ON constraints, and
+    // table-valued function arguments can all hold `?` parameters —
+    // SQLite binds them on THIS statement (sea-orm's PaginatorTrait::count
+    // generates exactly this shape: SELECT COUNT(*) FROM (… WHERE x = ?)).
+    if let Some(f) = &body.from {
+        collect_table(f, slots, max_explicit);
+    }
+    for t in &body.group_by {
+        walk_expr(t, slots, max_explicit);
+    }
+    if let Some(h) = &body.having {
+        walk_expr(h, slots, max_explicit);
+    }
+}
+
+fn collect_table(
+    te: &rustqlite::sql::ast::TableExpression,
+    slots: &mut Vec<ParamSlot>,
+    max_explicit: &mut usize,
+) {
+    use rustqlite::sql::ast::JoinConstraint;
+    match te {
+        rustqlite::sql::ast::TableExpression::Table { .. } => {}
+        rustqlite::sql::ast::TableExpression::Subquery { select, .. } => {
+            collect_select(select, slots, max_explicit);
+        }
+        rustqlite::sql::ast::TableExpression::Join {
+            left,
+            right,
+            constraint,
+            ..
+        } => {
+            collect_table(left, slots, max_explicit);
+            collect_table(right, slots, max_explicit);
+            if let JoinConstraint::On(e) = constraint {
+                walk_expr(e, slots, max_explicit);
+            }
+        }
+        rustqlite::sql::ast::TableExpression::Function { args, .. } => {
+            for a in args {
+                walk_expr(a, slots, max_explicit);
+            }
+        }
     }
 }
 
@@ -1280,12 +1392,18 @@ fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_expl
                 walk_expr(el, slots, max_explicit);
             }
         }
-        Expr::In {
-            source: rustqlite::sql::ast::InSource::List(items),
-            ..
-        } => {
-            for i in items {
-                walk_expr(i, slots, max_explicit);
+        Expr::In { source, expr, .. } => {
+            walk_expr(expr, slots, max_explicit);
+            match source {
+                rustqlite::sql::ast::InSource::List(items) => {
+                    for i in items {
+                        walk_expr(i, slots, max_explicit);
+                    }
+                }
+                rustqlite::sql::ast::InSource::Subquery(sel) => {
+                    collect_select(sel, slots, max_explicit);
+                }
+                rustqlite::sql::ast::InSource::Table(_) => {}
             }
         }
         Expr::Between {
@@ -1297,7 +1415,10 @@ fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_expl
         }
         Expr::Cast { expr, .. } => walk_expr(expr, slots, max_explicit),
         Expr::Collate { expr, .. } => walk_expr(expr, slots, max_explicit),
-        Expr::Exists(..) | Expr::Subquery(..) => {}
+        // Scalar subqueries / EXISTS: parameters inside them bind on THIS
+        // statement (SQLite semantics).
+        Expr::Subquery(sel) => collect_select(sel, slots, max_explicit),
+        Expr::Exists(sel) => collect_select(sel, slots, max_explicit),
         Expr::IsNull { expr, .. } => walk_expr(expr, slots, max_explicit),
         Expr::Row(items) => {
             for i in items {
@@ -1443,16 +1564,75 @@ unsafe fn prepare_impl(
                         rustqlite::sql::ast::Statement::Delete(d) => d.returning.as_ref(),
                         _ => None,
                     };
-                    for rc in rcs.into_iter().flatten() {
-                        if let Ok(c) = CString::new(result_column_name(rc)) {
+                    // The DML target table (+ alias) — the expansion source
+                    // for `RETURNING *` / `RETURNING t.*`. SQLite expands
+                    // the star to the TARGET table's columns in declared
+                    // order, and the engine's executor produces exactly
+                    // those values per affected row (project_returning_row
+                    // extends the full decoded row) — so the reported
+                    // column count must match or sqlx/sea-orm misalign
+                    // rows (ColumnNotFound on every try_get).
+                    let target: Option<&str> = match &ast {
+                        rustqlite::sql::ast::Statement::Insert(i) => Some(i.table.as_str()),
+                        rustqlite::sql::ast::Statement::Update(u) => Some(u.table.as_str()),
+                        rustqlite::sql::ast::Statement::Delete(d) => Some(d.from.as_str()),
+                        _ => None,
+                    };
+                    let target_alias: Option<&str> = match &ast {
+                        rustqlite::sql::ast::Statement::Insert(i) => i.alias.as_deref(),
+                        rustqlite::sql::ast::Statement::Update(u) => u.alias.as_deref(),
+                        rustqlite::sql::ast::Statement::Delete(d) => d.alias.as_deref(),
+                        _ => None,
+                    };
+                    let mut names: Vec<String> = Vec::new();
+                    {
+                        let rd = engine.db.read();
+                        for rc in rcs.into_iter().flatten() {
+                            match rc {
+                                rustqlite::sql::ast::ResultColumn::Star => {
+                                    let expanded = target
+                                        .and_then(|t| rd.table_column_names(t))
+                                        .unwrap_or_else(|| vec!["*".to_string()]);
+                                    names.extend(expanded);
+                                }
+                                rustqlite::sql::ast::ResultColumn::TableStar(t) => {
+                                    // `RETURNING t.*`: t is the target's name
+                                    // or alias; fall back to a plain catalog
+                                    // lookup, then to the unexpanded label.
+                                    let expanded = rd
+                                        .table_column_names(t)
+                                        .or_else(|| {
+                                            let matches_target = target
+                                                .map(|tt| {
+                                                    t.eq_ignore_ascii_case(tt)
+                                                        || target_alias
+                                                            .map(|a| t.eq_ignore_ascii_case(a))
+                                                            .unwrap_or(false)
+                                                })
+                                                .unwrap_or(false);
+                                            if matches_target {
+                                                target.and_then(|tt| rd.table_column_names(tt))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or_else(|| vec![format!("{t}.*")]);
+                                    names.extend(expanded);
+                                }
+                                _ => names.push(result_column_name(rc)),
+                            }
+                        }
+                    }
+                    for name in names {
+                        if let Ok(c) = CString::new(name) {
                             static_columns.push(c);
                         }
                     }
                 }
             } else if eng_stmt.column_count() > 0 {
                 for i in 0..eng_stmt.column_count() {
-                    let name = eng_stmt.column_name(i).unwrap_or("").to_string();
-                    if let Ok(c) = CString::new(name) {
+                    let name = eng_stmt.column_name(i).unwrap_or("");
+                    if let Ok(c) = CString::new(sqlite_result_name(name)) {
                         static_columns.push(c);
                     }
                 }
@@ -1463,8 +1643,8 @@ unsafe fn prepare_impl(
                     let _ = s.step();
                 }
                 for i in 0..s.column_count() {
-                    let name = s.column_name(i).unwrap_or("").to_string();
-                    if let Ok(c) = CString::new(name) {
+                    let name = s.column_name(i).unwrap_or("");
+                    if let Ok(c) = CString::new(sqlite_result_name(name)) {
                         static_columns.push(c);
                     }
                 }
@@ -1553,6 +1733,7 @@ unsafe fn finish_prepare(
         static_columns,
         value_pool: Vec::new(),
         text_buf: Vec::new(),
+        blob_buf: Vec::new(),
         last_step_err: SQLITE_OK,
         stepped: false,
         done: false,
@@ -2193,9 +2374,12 @@ pub unsafe extern "C" fn sqlite3_column_name(stmt: *mut sqlite3_stmt, i: c_int) 
     }
     if let Exec::Rows(eng) = &s.exec {
         if let Some(name) = eng.column_name(i as usize) {
+            // Normalize the engine's qualified scan-column names to
+            // SQLite's bare result names (see sqlite_result_name).
+            let bare = sqlite_result_name(name);
             // Copy into the scratch buffer (stable until next accessor).
             s.text_buf.clear();
-            s.text_buf.extend_from_slice(name.as_bytes());
+            s.text_buf.extend_from_slice(bare.as_bytes());
             s.text_buf.push(0);
             return s.text_buf.as_ptr() as *const c_char;
         }
@@ -2367,11 +2551,18 @@ pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, i: c_int
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, i: c_int) -> *const c_void {
-    let Some(s) = (stmt as *const Stmt).as_ref() else {
+    let Some(s) = (stmt as *mut Stmt).as_mut() else {
         return std::ptr::null();
     };
+    // Copy into statement-owned storage: stmt_value() CLONES the Value
+    // out of the engine, so a pointer into the clone would dangle the
+    // moment it drops (use-after-free). Same pattern as column_text.
     match stmt_value(s, i as usize) {
-        Some(Value::Blob(b)) if !b.is_empty() => b.as_ptr() as *const c_void,
+        Some(Value::Blob(b)) if !b.is_empty() => {
+            s.blob_buf.clear();
+            s.blob_buf.extend_from_slice(&b);
+            s.blob_buf.as_ptr() as *const c_void
+        }
         _ => std::ptr::null(),
     }
 }
@@ -2469,6 +2660,10 @@ pub unsafe extern "C" fn sqlite3_value_double(v: *const sqlite3_value) -> c_doub
 pub unsafe extern "C" fn sqlite3_value_blob(v: *const sqlite3_value) -> *const c_void {
     match value_of(v) {
         Some(Value::Blob(b)) if !b.is_empty() => b.as_ptr() as *const c_void,
+        // SQLite: sqlite3_value_blob() on a TEXT value returns the text's
+        // bytes (the blob accessor applies the conversion). sqlx-sqlite
+        // reads TEXT columns exactly this way: text() = from_utf8(blob()).
+        Some(Value::Text(t)) if !t.as_bytes().is_empty() => t.as_bytes().as_ptr() as *const c_void,
         _ => std::ptr::null(),
     }
 }
@@ -2868,6 +3063,26 @@ pub unsafe extern "C" fn sqlite3_interrupt(_db: *mut sqlite3) {
 // ---------------------------------------------------------------------------
 // exec
 // ---------------------------------------------------------------------------
+
+/// Normalize an engine result-column name to SQLite's C-ABI reporting:
+/// SQLite names scan/star result columns by their BARE column name
+/// ("id"), while the engine's streaming drivers qualify them
+/// ("scheduled_job.id"). sqlx / sea-orm look columns up by bare name, so
+/// strip a single `table.column` qualifier. Narrow rule: exactly one dot
+/// and no parentheses — function display names like "MAX(t.x)" and
+/// multi-part names are left untouched.
+fn sqlite_result_name(name: &str) -> String {
+    if !name.contains('(')
+        && name.matches('.').count() == 1
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+    {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        bare.to_string()
+    } else {
+        name.to_string()
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_exec(

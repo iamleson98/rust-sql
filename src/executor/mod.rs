@@ -15274,19 +15274,21 @@ fn try_streaming_delete(
 ) -> Result<Option<ExecResult>> {
     use crate::planner::plan::Plan;
 
-    // The source table must be the DELETE target itself.
-    let (src_table, residual_pred, range, index_range) = match source {
+    // The source table must be the DELETE target itself. `index_point_keys`
+    // carries pre-encoded probe keys for IndexIn / IndexLookup sources
+    // (collected here — evaluation needs the statement's bound params).
+    let (src_table, residual_pred, range, index_range, index_point_keys) = match source {
         Plan::Scan {
             table: t,
             predicate,
             ..
-        } => (t, predicate.as_ref(), None, None),
+        } => (t, predicate.as_ref(), None, None, None),
         Plan::Filter { input, predicate } => match input.as_ref() {
             Plan::Scan {
                 table: t,
                 predicate: None,
                 ..
-            } => (t, Some(predicate), None, None),
+            } => (t, Some(predicate), None, None, None),
             _ => return Ok(None),
         },
         Plan::RowidRange {
@@ -15299,6 +15301,7 @@ fn try_streaming_delete(
             t,
             residual.as_ref(),
             Some((start.as_ref(), end.as_ref())),
+            None,
             None,
         ),
         Plan::IndexRange {
@@ -15313,7 +15316,66 @@ fn try_streaming_delete(
             residual.as_ref(),
             None,
             Some((index, start.as_ref(), end.as_ref())),
+            None,
         ),
+        // `DELETE FROM t WHERE indexed_col IN (…)`: probe each encoded key
+        // exactly (mirrors exec_index_in — collated columns fold the probe
+        // key, NULL keys never match, duplicate literals dedup).
+        Plan::IndexIn {
+            table: t,
+            index,
+            key_exprs,
+            residual,
+            ..
+        } => {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
+            for e in key_exprs {
+                let v = evaluate(e, &eval_ctx)?;
+                if v.is_null() {
+                    continue;
+                }
+                let mut buf = Vec::with_capacity(16);
+                crate::plugin::encode_collated_index_key_into(
+                    &index.columns,
+                    std::slice::from_ref(&v),
+                    &mut buf,
+                );
+                keys.push(buf);
+            }
+            keys.sort();
+            keys.dedup();
+            (
+                t,
+                residual.as_ref(),
+                None,
+                None,
+                Some((index.clone(), keys)),
+            )
+        }
+        // `DELETE FROM t WHERE indexed_col = ?`: one exact probe (compound
+        // keys encode all columns — mirrors exec_index_lookup_impl).
+        Plan::IndexLookup {
+            table: t,
+            index,
+            key_exprs,
+            ..
+        } => {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let key_values: Vec<Value> = key_exprs
+                .iter()
+                .map(|e| evaluate(e, &eval_ctx))
+                .collect::<Result<_>>()?;
+            let mut buf = Vec::with_capacity(16);
+            crate::plugin::encode_collated_index_key_into(&index.columns, &key_values, &mut buf);
+            (t, None, None, None, Some((index.clone(), vec![buf])))
+        }
         _ => return Ok(None),
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
@@ -15414,6 +15476,50 @@ fn try_streaming_delete(
         // Fetch each candidate row to evaluate the residual predicate
         // (index bounds alone may over-select; the predicate decides).
         if residual_pred.is_some() || need_row {
+            let mut matched: Vec<i64> = Vec::with_capacity(rowids.len());
+            for rid in rowids.drain(..) {
+                match bt.lookup_table(rid)? {
+                    LookupResult::Found(payload) => {
+                        row_buf.clear();
+                        if decode_row_into(&payload, n_cols, rid, table.rowid_alias, &mut row_buf)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        if let Some(pred) = residual_pred {
+                            match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                                Ok(v) if v.is_truthy() => {}
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    first_error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        matched.push(rid);
+                    }
+                    LookupResult::NotFound => {} // row deleted concurrently — skip
+                }
+            }
+            rowids = matched;
+        }
+    } else if let Some((index, keys)) = index_point_keys {
+        // IndexIn / IndexLookup source: exact probe per encoded key.
+        // Distinct keys hit distinct index entries, and one row holds one
+        // value for the indexed column, so rowids are duplicate-free; the
+        // ascending sort restores table (rowid) order for the bulk
+        // delete fast path below.
+        let index_root = ctx.index_root(&index);
+        {
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            for key in &keys {
+                index_bt.lookup_index_into(key, &mut rowids)?;
+            }
+        }
+        rowids.sort_unstable();
+        // Residual filter (a Filter-wrapped IN can carry extra terms):
+        // fetch each candidate and evaluate.
+        if residual_pred.is_some() {
             let mut matched: Vec<i64> = Vec::with_capacity(rowids.len());
             for rid in rowids.drain(..) {
                 match bt.lookup_table(rid)? {
