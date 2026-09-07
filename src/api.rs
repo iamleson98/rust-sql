@@ -126,10 +126,10 @@ const MID_TXN_DRAIN_BLOCKS: u64 = 2_000_000;
 /// in any class — runs at steady-state cost. No-op cost when the
 /// allocator has nothing pending (~2 µs for 512 empty Vec allocations).
 #[cfg(not(feature = "mimalloc"))]
-fn drain_mimalloc_wake() {}
+pub(crate) fn drain_mimalloc_wake() {}
 
 #[cfg(feature = "mimalloc")]
-fn drain_mimalloc_wake() {
+pub(crate) fn drain_mimalloc_wake() {
     // 1. Wake the deferred-free queues (see the doc comment above).
     let mut sink: Vec<Vec<u8>> = Vec::with_capacity(512);
     for i in 0..512usize {
@@ -302,6 +302,9 @@ pub struct Database {
     /// mirroring how SQLite's costs land inside the operations that cause
     /// them, not on the next unrelated query.
     alloc_burst: AtomicU64,
+    /// Pager cache-miss watermark for the read-burst drain (see
+    /// `maybe_drain_read_burst`): the miss count at the last drain.
+    read_drained_misses: AtomicU64,
     /// Root page currently persisted in the schema table per object
     /// ("table:name" / "index:name" -> rootpage in the schema row).
     /// `sync_schema_roots` rewrites a schema row only when the live root
@@ -1774,6 +1777,28 @@ fn stmt_ref_pre(stmt: &Statement) -> StmtPre {
     }
 }
 
+/// Scope guard: drain allocator wakes when a query completes on ANY
+/// exit path — (a) the read-burst wake (see
+/// `Database::maybe_drain_read_burst`) and (b) the PARSE wake of a big
+/// SQL text: a 5000-literal IN list parses into ~10k tokens plus several
+/// expression-tree copies (AST + plan + compiled forms — ~500 B per
+/// literal transiently); mimalloc retains those freed pages unless
+/// collected, which measured +3 MB of sticky RSS on torture S11 for the
+/// rest of the process. Anything over 8 KB of SQL text is not an OLTP
+/// statement — the ~170 µs collect is noise against its parse time.
+pub(crate) struct ReadBurstDrain<'a> {
+    db: &'a Database,
+    sql_len: usize,
+}
+impl Drop for ReadBurstDrain<'_> {
+    fn drop(&mut self) {
+        self.db.maybe_drain_read_burst();
+        if self.sql_len >= 8192 {
+            drain_mimalloc_wake();
+        }
+    }
+}
+
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -1834,6 +1859,7 @@ impl Database {
             write_epoch: AtomicU64::new(0),
             table_count_cache: RwLock::new(HashMap::new()),
             alloc_burst: AtomicU64::new(0),
+            read_drained_misses: AtomicU64::new(0),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
             last_stmt: RwLock::new(None),
@@ -1960,6 +1986,7 @@ impl Database {
             write_epoch: AtomicU64::new(0),
             table_count_cache: RwLock::new(HashMap::new()),
             alloc_burst: AtomicU64::new(0),
+            read_drained_misses: AtomicU64::new(0),
             schema_root_pages: Mutex::new(schema_root_pages),
             stmt_cache: RwLock::new(StmtCacheMap::default()),
             last_stmt: RwLock::new(None),
@@ -3206,14 +3233,26 @@ impl Database {
     /// COMMIT, ROLLBACK, DDL). Draining mid-transaction is useless: the
     /// remaining statements re-arm the queue (measured in
     /// examples/probe_mid_drain.rs — mid-storm drain leaves a 212 µs wake
-    /// on the next read; a post-storm drain leaves 19.5 µs). Once per
-    /// process: later bursts never re-wake (examples/probe_rounds.rs).
+    /// on the next read; a post-storm drain leaves 19.5 µs).
+    ///
+    /// PER-BURST (was once-per-process): each burst above the threshold
+    /// drains and resets its counter. The once-per-process design relied
+    /// on "later bursts never re-wake" (probe_rounds.rs) — true for
+    /// LATENCY, but RSS-wise the freed pages of every later burst stayed
+    /// in mimalloc's delayed-free queues for the process's lifetime:
+    /// repeated bulk-write cycles (torture S07/S12/S13 shapes) retained
+    /// ~1-3 MB per cycle. The 170 µs collect per ~400k-block burst is
+    /// ~0.4 ns per block — negligible against the multi-ms burst itself —
+    /// and the re-wake cost the once-per-process design avoided is the
+    /// deferred-free sweep's first ~20 µs (probe_rounds), not the 200+ µs
+    /// cold wake.
     fn maybe_drain_after_burst(&self) {
-        if !ALLOC_SETTLED.load(Ordering::Relaxed)
-            && !self.in_transaction.load(Ordering::Acquire)
+        if !self.in_transaction.load(Ordering::Acquire)
             && self.alloc_burst.load(Ordering::Relaxed) > ALLOC_WAKE_THRESHOLD
-            && !ALLOC_SETTLED.swap(true, Ordering::Relaxed)
         {
+            // Mark the process-level settled flag too (the read-side
+            // safety net's precondition) so both drains stay in sync.
+            let _ = ALLOC_SETTLED.swap(true, Ordering::Relaxed);
             drain_mimalloc_wake();
             self.alloc_burst.store(0, Ordering::Relaxed);
         }
@@ -3224,6 +3263,29 @@ impl Database {
     /// passing the transaction-end check (e.g. DML via the query/RETURNING
     /// path). Free once the process-level flag is settled.
     #[inline]
+    /// Read-burst drain: a big scan pulls thousands of pages through the
+    /// pager — each an `Arc<Mutex<Page>>` plus a 4 KB `Vec` allocation,
+    /// freed as the LRU evicts them. mimalloc's delayed-free queues retain
+    /// those pages, so RSS climbs ~2 MB per million-row scan and stays
+    /// (the once-per-process `ALLOC_SETTLED` drain cannot cover repeated
+    /// scan cycles — torture S17 measured +1.9 MB retained per
+    /// open+full-scan iteration). Track the pager's cache-miss counter:
+    /// when a read burst pulls more than 4096 fresh pages (16 MB at 4 KiB)
+    /// since the last drain, run the ~170 µs collect — ~40 ns amortized
+    /// per page, and the pages return to the OS between statements.
+    pub(crate) fn maybe_drain_read_burst(&self) {
+        let misses = self.pager.cache_misses();
+        let last = self.read_drained_misses.load(Ordering::Relaxed);
+        if misses >= last.saturating_add(4096)
+            && self
+                .read_drained_misses
+                .compare_exchange(last, misses, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            drain_mimalloc_wake();
+        }
+    }
+
     fn maybe_settle_allocator(&self) {
         if !ALLOC_SETTLED.load(Ordering::Relaxed)
             && self.alloc_burst.load(Ordering::Relaxed) > ALLOC_WAKE_THRESHOLD
@@ -3795,6 +3857,10 @@ impl Database {
     /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
     /// the duration of the query — a SELECT never writes them back.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
+        let _rbd = ReadBurstDrain {
+            db: self,
+            sql_len: sql.len(),
+        };
         // Per-connection snapshot for `last_insert_rowid()` (see execute).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
         // A hot INSERT chain owns the table's live root / max-rowid while
@@ -4013,6 +4079,10 @@ impl Database {
         sql: &str,
         params: P,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        let _rbd = ReadBurstDrain {
+            db: self,
+            sql_len: sql.len(),
+        };
         self.break_insert_chain();
         self.maybe_settle_allocator();
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {

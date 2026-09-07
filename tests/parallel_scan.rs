@@ -454,3 +454,195 @@ fn parallel_topn_declines_below_threshold() {
     };
     assert_eq!(first_v, 96, "96 = 7*k mod 97 max, first at id 14");
 }
+
+// ========================================================================
+// GROUP BY streaming driver + fused Project-over-Aggregate (2026-09-07
+// memory pass): the statement path finalizes groups in serving batches
+// from the owned grouper (GroupByDriver), and the executor's
+// Project-over-Aggregate fusion emits the final projected rows directly.
+// Both must be result-identical to the materialized path — same rows,
+// same first-seen order, same column names.
+// ========================================================================
+
+/// Sentinel for "insert NULL here" in the test tables below.
+const SENTINEL_NULL: &str = "NULL_SENTINEL";
+
+#[test]
+fn groupby_driver_matches_materialized_path() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, v INTEGER)",
+        [],
+    )
+    .unwrap();
+    for (cat, v) in [
+        ("a", 1),
+        ("b", 5),
+        ("a", 2),
+        (SENTINEL_NULL, 9),
+        ("b", 3),
+        ("c", 7),
+        (SENTINEL_NULL, 1),
+        ("a", 4),
+    ] {
+        let cat_val = if cat == SENTINEL_NULL {
+            Value::Null
+        } else {
+            Value::Text(cat.into())
+        };
+        db.execute(
+            "INSERT INTO t (cat, v) VALUES (?, ?)",
+            [cat_val, Value::Integer(v)],
+        )
+        .unwrap();
+    }
+    let sql = "SELECT cat, COUNT(*), SUM(v), MIN(v), MAX(v) FROM t GROUP BY cat";
+    // Materialized path (db.query — executor fusion).
+    let (cols_q, rows_q) = db.query_with_columns(sql, []).unwrap();
+    // Streaming driver path (prepare/step — GroupByDriver).
+    let mut stmt = db.prepare(sql).unwrap();
+    let mut rows_s: Vec<rustqlite::Row> = Vec::new();
+    while stmt.step().unwrap() == rustqlite::StepResult::Row {
+        if let Some(r) = stmt.row() {
+            rows_s.push(r.clone());
+        }
+    }
+    assert_eq!(rows_q, rows_s, "driver rows must equal materialized rows");
+    let cols_s: Vec<String> = (0..stmt.column_count())
+        .map(|i| stmt.column_name(i).unwrap().to_string())
+        .collect();
+    assert_eq!(cols_q, cols_s, "driver column names must match");
+
+    // First-seen order: a, b, NULL, c.
+    assert_eq!(rows_q.len(), 4);
+    assert_eq!(rows_q[0][0], Value::Text("a".into()));
+    assert_eq!(rows_q[1][0], Value::Text("b".into()));
+    assert_eq!(rows_q[2][0], Value::Null);
+    assert_eq!(rows_q[3][0], Value::Text("c".into()));
+    // a: count 3, sum 7, min 1, max 4.
+    assert_eq!(rows_q[0][1], Value::Integer(3));
+    assert_eq!(rows_q[0][2], Value::Integer(7));
+    assert_eq!(rows_q[0][3], Value::Integer(1));
+    assert_eq!(rows_q[0][4], Value::Integer(4));
+}
+
+#[test]
+fn groupby_driver_arithmetic_key_and_aliases() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=200i64 {
+        db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i * 3)])
+            .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    // Arithmetic key (compiled GROUP BY path) + alias + COUNT only — the
+    // S03 shape, served through the streaming driver.
+    let sql = "SELECT v / 30 AS bucket, COUNT(*) AS n FROM t GROUP BY v / 30";
+    let (cols_q, rows_q) = db.query_with_columns(sql, []).unwrap();
+    let mut stmt = db.prepare(sql).unwrap();
+    let mut rows_s = Vec::new();
+    while stmt.step().unwrap() == rustqlite::StepResult::Row {
+        if let Some(r) = stmt.row() {
+            rows_s.push(r.clone());
+        }
+    }
+    assert_eq!(rows_q, rows_s);
+    let cols_s: Vec<String> = (0..stmt.column_count())
+        .map(|i| stmt.column_name(i).unwrap().to_string())
+        .collect();
+    assert_eq!(cols_q, cols_s);
+    assert_eq!(cols_q, vec!["bucket".to_string(), "n".to_string()]);
+    // v=3..600 (i*3, i=1..200) → floor(v/30) buckets 0..20: buckets 0..19
+    // hold 10 rows each except bucket 0 (v=3..27 → 9 rows), bucket 20
+    // holds only v=600.
+    assert_eq!(rows_q.len(), 21);
+    let last = rows_q.last().unwrap();
+    assert_eq!(last[0], Value::Integer(20));
+    assert_eq!(last[1], Value::Integer(1));
+    let first = rows_q.first().unwrap();
+    assert_eq!(first[0], Value::Integer(0));
+    assert_eq!(first[1], Value::Integer(9));
+}
+
+#[test]
+fn groupby_driver_multi_key_and_concat() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, s TEXT)",
+        [],
+    )
+    .unwrap();
+    for (a, b, s) in [
+        ("x", 1, "p"),
+        ("y", 2, "q"),
+        ("x", 1, "r"),
+        ("x", 2, "s"),
+        ("y", 2, "t"),
+        ("x", 1, "u"),
+    ] {
+        db.execute(
+            "INSERT INTO t (a, b, s) VALUES (?, ?, ?)",
+            [
+                Value::Text(a.into()),
+                Value::Integer(b),
+                Value::Text(s.into()),
+            ],
+        )
+        .unwrap();
+    }
+    // Multi-key + GROUP_CONCAT + DISTINCT: exercises the multi-key intern
+    // path, the cold AggState half, and the DISTINCT replay — through BOTH
+    // serving paths.
+    let sql = "SELECT a, b, GROUP_CONCAT(s), COUNT(DISTINCT b) FROM t GROUP BY a, b";
+    let (_, rows_q) = db.query_with_columns(sql, []).unwrap();
+    let mut stmt = db.prepare(sql).unwrap();
+    let mut rows_s = Vec::new();
+    while stmt.step().unwrap() == rustqlite::StepResult::Row {
+        if let Some(r) = stmt.row() {
+            rows_s.push(r.clone());
+        }
+    }
+    assert_eq!(rows_q, rows_s);
+    // (x,1): p,r,u; (y,2): q,t; (x,2): s — first-seen order.
+    assert_eq!(rows_q.len(), 3);
+    assert_eq!(rows_q[0][2], Value::Text("p,r,u".into()));
+    assert_eq!(rows_q[1][2], Value::Text("q,t".into()));
+    assert_eq!(rows_q[2][2], Value::Text("s".into()));
+    assert_eq!(rows_q[0][3], Value::Integer(1));
+}
+
+#[test]
+fn groupby_fused_projection_survives_wrappers() {
+    // LIMIT / ORDER BY over the fused GROUP BY shape: the fusion is inside
+    // the executor, wrappers (Sort, Limit) must observe identical rows.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=1000i64 {
+        db.execute("INSERT INTO t (g) VALUES (?)", [Value::Integer(i % 37)])
+            .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    for sql in [
+        "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC LIMIT 5",
+        "SELECT g, COUNT(*) c FROM t GROUP BY g HAVING COUNT(*) > 27 ORDER BY c DESC, g",
+        "SELECT COUNT(*), g FROM t GROUP BY g", // aggregate first in projection
+    ] {
+        let (cols_q, rows_q) = db.query_with_columns(sql, []).unwrap();
+        let mut stmt = db.prepare(sql).unwrap();
+        let mut rows_s = Vec::new();
+        while stmt.step().unwrap() == rustqlite::StepResult::Row {
+            if let Some(r) = stmt.row() {
+                rows_s.push(r.clone());
+            }
+        }
+        assert_eq!(rows_q, rows_s, "mismatch for {sql}");
+        let cols_s: Vec<String> = (0..stmt.column_count())
+            .map(|i| stmt.column_name(i).unwrap().to_string())
+            .collect();
+        assert_eq!(cols_q, cols_s, "columns mismatch for {sql}");
+    }
+}

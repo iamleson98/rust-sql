@@ -91,6 +91,16 @@ fn tune_mimalloc() {
         // (see `drain_mimalloc_wake`'s mi_collect).
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
         debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), -1);
+        // NOTE on the startup footprint (measured, not changed here):
+        // mimalloc commits memory at 64 KiB page granularity per size
+        // class — the engine's ~0.4 MiB of open-path allocations spread
+        // across ~15 size classes, so the first `Database::open` shows
+        // ~1 MiB of RSS under mimalloc vs ~0.4 MiB under glibc. That
+        // granularity is the documented trade for mimalloc's 20-40%
+        // small-allocation speed advantage (SQLite is measured against
+        // glibc). `default-features = false` opts out. (eager_commit,
+        // the obvious-sounding option, is deprecated and a no-op in
+        // mimalloc 2.1.)
         // Transparent Huge Pages: the kernel backs the arena's first touch
         // with 2 MiB huge pages, so a handful of touched bytes materialize
         // megabytes of RSS (measured +3-4 MB at process start, plus the

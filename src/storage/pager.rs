@@ -3132,24 +3132,20 @@ impl Pager {
             .filter(|&id| trunc == 0 || (id as u64) < trunc as u64)
             .collect();
         ids.sort_unstable();
-        // CACHE-FIRST GATHER (before the WAL lock is taken — the cache
-        // and WAL locks have a fixed acquisition order elsewhere, e.g.
-        // truncate_tail takes cache -> wal, so probing the cache under
-        // the wal write lock would be an ABBA deadlock). Every
-        // page-cached id is served by a ~100 ns cache hit + memcpy
-        // instead of a ~1 us WAL pread; only cache misses pay the frame
-        // read under the lock below. Checkpoint callers hold the engine
-        // write lock, so the cached bytes are stable.
-        let cached: Vec<Option<Vec<u8>>> = {
+        // CACHE-FIRST SERVE: every page-cached id is served by a ~100 ns
+        // cache hit + memcpy instead of a ~1 us WAL pread; only cache
+        // misses pay the frame read under the lock below. The pages are
+        // probed LAZILY, one at a time inside the run loop (a ~4 KB copy
+        // per probe, bounded by the 1 MiB run buffer's lifetime): the
+        // previous eager gather cloned EVERY cached page up front — up to
+        // a full 512-page cache = 2 MiB of transient copies on every
+        // checkpoint — which stacked on the run buffer's own peak.
+        let cache_read_page = |id: PageId| -> Option<Vec<u8>> {
             let cache = self.cache.read();
-            ids.iter()
-                .map(|&id| {
-                    cache.get(id).map(|pr| {
-                        let b = pr.lock();
-                        b.data.clone()
-                    })
-                })
-                .collect()
+            cache.get(id).map(|pr| {
+                let b = pr.lock();
+                b.data.clone()
+            })
         };
         // COALESCED RUNS: consecutive page ids are contiguous in the
         // main file; when their frame offsets are ALSO consecutive
@@ -3165,12 +3161,22 @@ impl Pager {
         let mut run_start: Option<u64> = None; // first page id of the current run
         let _run_off: u64 = 0;
         let mut run_buf: Vec<u8> = Vec::new();
+        // Bounded coalescing: cap the run buffer at 256 pages (1 MiB at
+        // the default page size). Unbounded accumulation materialized the
+        // ENTIRE committed WAL in RAM during a big commit's checkpoint —
+        // a 7250-page (29 MiB) first-build commit peaked the process at
+        // ~40 MiB where SQLite checkpoints in bounded passes. 1 MiB
+        // pwrites are already contiguous and near-optimal for throughput;
+        // splitting longer runs into 1 MiB chunks trades nothing
+        // measurable for a hard RSS bound.
+        let run_buf_max: usize = psz as usize * 256;
         let mut frame = vec![0u8; psz as usize];
-        for (idx, &id) in ids.iter().enumerate() {
+        for &id in ids.iter() {
             if id == 0 {
                 continue; // header goes LAST (crash safety)
             }
-            let bytes: &[u8] = if let Some(b) = cached.get(idx).and_then(|o| o.as_deref()) {
+            let cached_page = cache_read_page(id);
+            let bytes: &[u8] = if let Some(b) = cached_page.as_deref() {
                 b
             } else {
                 let off = state.map[&id];
@@ -3181,7 +3187,7 @@ impl Pager {
                 Some(s) => (s + (run_buf.len() / psz as usize) as u64) == id as u64,
                 None => false,
             };
-            if !contiguous {
+            if !contiguous || run_buf.len() >= run_buf_max {
                 flush_run(run_start.unwrap_or(0), &run_buf)?;
                 run_buf.clear();
                 run_start = Some(id as u64);

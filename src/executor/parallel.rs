@@ -75,6 +75,23 @@ const MIN_ROWS_PER_WORKER: i64 = 32_768;
 /// one `FusedWalk`/`HashGrouper` + buffers each).
 const MAX_WORKERS: usize = 16;
 
+/// Reclaim worker-thread mimalloc heaps after a parallel scope joins.
+///
+/// Worker threads allocate their per-range scratch (FusedWalk buffers,
+/// partial HashGroupers, keep-heaps) in mimalloc THREAD-LOCAL heaps. When
+/// a scoped worker thread exits, mimalloc *abandons* its heap — the pages
+/// stay resident (RSS) and are NOT automatically reused by the next
+/// statement's fresh worker threads. Measured on GROUP BY 100k buckets:
+/// each parallel statement left ~+22 MiB of abandoned-heap RSS behind, so
+/// a best-of-3 section climbed 71 -> 93 -> ... MiB while the live set
+/// never grew. `mi_collect` (inside `drain_mimalloc_wake`) reclaims the
+/// abandoned pools and madvises fully-freed pages back to the OS; run
+/// once per statement after the scope joins, its ~170 µs amortizes over
+/// the multi-ms parallel scan. No-op without the mimalloc feature.
+fn reclaim_worker_heaps() {
+    crate::api::drain_mimalloc_wake();
+}
+
 /// The rowid split handed to the workers (inclusive ranges).
 #[derive(Debug)]
 pub(crate) struct RangeSplit {
@@ -288,6 +305,7 @@ pub(crate) fn try_parallel_fused_aggregate(
             .map(|h| h.join().expect("parallel aggregate worker panicked"))
             .collect()
     });
+    reclaim_worker_heaps();
 
     // Any bail / error / empty -> fall back to the serial path.
     let mut walks: Vec<FusedWalk> = Vec::with_capacity(partials.len());
@@ -429,7 +447,7 @@ pub(crate) fn try_parallel_groupby_selective(
                             Value::Null
                         });
                     }
-                    let gi = grouper.intern(&key_buf);
+                    let gi = grouper.intern_key(&key_buf);
                     for i in 0..n_aggs {
                         let arg_val: &Value = if agg_count_star[i] {
                             &super::COUNT_STAR_ARG
@@ -457,6 +475,7 @@ pub(crate) fn try_parallel_groupby_selective(
             .map(|h| h.join().expect("parallel group-by worker panicked"))
             .collect()
     });
+    reclaim_worker_heaps();
 
     let mut groupers: Vec<HashGrouper> = Vec::with_capacity(partials.len());
     for p in partials {
@@ -481,7 +500,7 @@ pub(crate) fn try_parallel_groupby_selective(
                 Some(flat) => key_buf.push(flat.get(gi).clone()),
                 None => key_buf.extend(g.keys_multi[gi].iter().cloned()),
             }
-            let dst_gi = merged.intern(&key_buf);
+            let dst_gi = merged.intern_key(&key_buf);
             for i in 0..n_aggs {
                 let src = g.states.get(gi * n_aggs + i);
                 // Safety of the split borrow: `merged.state` mutably
@@ -497,6 +516,10 @@ pub(crate) fn try_parallel_groupby_selective(
             }
         }
     }
+    // Post-merge drain: the partial groupers freed during the loop above;
+    // the post-scope drain ran while they were still live. See the
+    // compiled path's comment for the full rationale.
+    reclaim_worker_heaps();
     Ok(Some(merged))
 }
 
@@ -517,7 +540,7 @@ fn merge_agg_state(
     sep: Option<&str>,
 ) {
     if distinct {
-        if let Some(set) = src.distinct.as_deref() {
+        if let Some(set) = src.cold().and_then(|c| c.distinct.as_ref()) {
             for v in set.iter() {
                 super::update_agg_state(dst, func, &v.0, true, sep);
             }
@@ -557,14 +580,22 @@ fn merge_agg_state(
             }
             // MIN/MAX under SQL value ordering (update_agg_state's
             // comparator).
-            if let Some(m) = src.min.as_deref() {
-                if dst.min.as_deref().map_or(true, |d| m < d) {
-                    dst.min = Some(Box::new(m.clone()));
+            if let Some(m) = src.cold().and_then(|c| c.min.as_ref()) {
+                let better = dst
+                    .cold()
+                    .and_then(|c| c.min.as_ref())
+                    .map_or(true, |d| m < d);
+                if better {
+                    dst.cold_mut().min = Some(m.clone());
                 }
             }
-            if let Some(m) = src.max.as_deref() {
-                if dst.max.as_deref().map_or(true, |d| d < m) {
-                    dst.max = Some(Box::new(m.clone()));
+            if let Some(m) = src.cold().and_then(|c| c.max.as_ref()) {
+                let better = dst
+                    .cold()
+                    .and_then(|c| c.max.as_ref())
+                    .map_or(true, |d| d < m);
+                if better {
+                    dst.cold_mut().max = Some(m.clone());
                 }
             }
         }
@@ -688,7 +719,7 @@ pub(crate) fn try_parallel_groupby_compiled(
                             };
                             key_buf.push(kv);
                         }
-                        grouper.intern(&key_buf)
+                        grouper.intern_key(&key_buf)
                     };
                     for i in 0..n_aggs {
                         if aggregates[i].arg.is_none() {
@@ -728,6 +759,7 @@ pub(crate) fn try_parallel_groupby_compiled(
             })
             .collect()
     });
+    reclaim_worker_heaps();
 
     let mut groupers: Vec<HashGrouper> = Vec::with_capacity(partials.len());
     for p in partials {
@@ -752,7 +784,7 @@ pub(crate) fn try_parallel_groupby_compiled(
                 Some(flat) => key_buf.push(flat.get(gi).clone()),
                 None => key_buf.extend(g.keys_multi[gi].iter().cloned()),
             }
-            let dst_gi = merged.intern(&key_buf);
+            let dst_gi = merged.intern_key(&key_buf);
             for i in 0..n_aggs {
                 let src = g.states.get(gi * n_aggs + i);
                 merge_agg_state(
@@ -765,6 +797,13 @@ pub(crate) fn try_parallel_groupby_compiled(
             }
         }
     }
+    // The partial groupers free DURING the merge loop above (each `g`
+    // moves out and drops at its iteration's end) — the post-scope drain
+    // above ran while they were still live, so their worker-heap pages
+    // could not be reclaimed. Drain again now that the last partial is
+    // gone: mi_collect returns the (now fully-free) worker-heap pages to
+    // the OS instead of leaving them as abandoned-heap RSS.
+    reclaim_worker_heaps();
     Ok(Some(merged))
 }
 
@@ -796,6 +835,7 @@ pub(crate) fn try_parallel_count(
             .map(|h| h.join().expect("parallel count worker panicked"))
             .collect()
     });
+    reclaim_worker_heaps();
     let mut total: u64 = 0;
     for c in counts {
         match c {
@@ -926,6 +966,7 @@ pub(crate) fn try_parallel_topn(
             .map(|h| h.join().expect("parallel top-N worker panicked"))
             .collect()
     });
+    reclaim_worker_heaps();
 
     // Any worker error -> serial fallback (never a divergent answer).
     let mut merged: Vec<super::TopnSel> = Vec::with_capacity(keep * ranges.len());

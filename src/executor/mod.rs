@@ -851,6 +851,27 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         }
         Plan::Filter { input, predicate } => exec_filter(ctx, input, predicate),
         Plan::Project { input, columns } => {
+            // FUSED PATH: Project over an Aggregate with a BARE-SELECTION
+            // projection (`SELECT cat, COUNT(*) FROM t GROUP BY cat` after
+            // the planner's aggregate rewriting). The Aggregate's output
+            // IS the projected shape, so exec_aggregate emits the final
+            // rows directly — without this, the Aggregate materialized its
+            // full output (one Vec<Row> per group) and apply_projection
+            // then built a SECOND full-size copy while the first was still
+            // alive (two 100k-row Vec<Row>s on the common GROUP BY shape;
+            // ~2x the peak statement memory of SQLite on torture S03).
+            if let Plan::Aggregate {
+                input: agg_input,
+                group_by,
+                aggregates,
+            } = input.as_ref()
+            {
+                if !group_by.is_empty() {
+                    if let Some(proj) = trivial_group_projection(columns, group_by, aggregates) {
+                        return exec_aggregate(ctx, agg_input, group_by, aggregates, Some(&proj));
+                    }
+                }
+            }
             // FUSED PATH: Project over a Hash Join. The join can emit the
             // projected columns directly, skipping the intermediate
             // full-width combined rows (one Vec + copies per row) and the
@@ -1007,7 +1028,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             input,
             group_by,
             aggregates,
-        } => exec_aggregate(ctx, input, group_by, aggregates),
+        } => exec_aggregate(ctx, input, group_by, aggregates, None),
         Plan::Window { input, windows } => exec_window(ctx, input, windows),
         Plan::Join {
             left,
@@ -4232,30 +4253,46 @@ fn exec_limit(
 // ============================================================================
 
 #[derive(Clone, Debug)]
-#[allow(clippy::box_collection)] // deliberate: 48 B inline vs 8 B boxed
 struct AggState {
     count: i64,
     sum: f64,
     sum_is_int: bool,
     int_sum: i64,
-    /// BOXED: an inline `Option<Value>` costs 24+ bytes in EVERY state
-    /// (2 of them = ~half the struct) even for the overwhelmingly common
-    /// COUNT/SUM-only GROUP BY shapes; the Box costs 8 inline with one
-    /// allocation per group that actually takes a MIN/MAX. 25k groups:
-    /// ~2.8 MB -> ~1.6 MB of aggregate state.
-    min: Option<Box<Value>>,
-    max: Option<Box<Value>>,
-    /// DISTINCT-aggregate key set. Rarely used — boxed so the hot
-    /// COUNT/SUM/MIN/MAX state stays compact (an inline HashSet costs
-    /// ~48 bytes in EVERY state; the Box costs 8, with one allocation
-    /// per DISTINCT aggregate per group instead).
-    distinct: Option<Box<std::collections::HashSet<SqlValueKey>>>,
-    /// GROUP_CONCAT accumulator. Rarely used — boxed (see `distinct`).
-    concat: Option<Box<String>>,
-    /// GROUP_CONCAT separator (group_concat(x, sep)). Boxed + optional:
-    /// the hot COUNT/SUM state never pays for it.
-    concat_sep: Option<Box<String>>,
+    /// ALL rarely-used state, boxed behind ONE pointer (8 B inline):
+    /// min/max (MIN/MAX), the DISTINCT key set, and the GROUP_CONCAT /
+    /// JSON-group accumulators. The previous layout boxed each field
+    /// separately — 5 × `Option<Box<_>>` = 40 inline bytes per state that
+    /// the overwhelmingly common COUNT/SUM/AVG GROUP BY shapes never
+    /// touch. At 100k groups × n_aggs states that was ~6.4 MB of pure
+    /// pointer overhead on `GROUP BY 100k buckets` (torture S03); this
+    /// layout makes the hot state 40 B and the cold payload one
+    /// allocation per group only when a cold aggregate actually fires.
+    cold: Option<Box<AggCold>>,
     seen_value: bool,
+}
+
+/// The rarely-used half of [`AggState`] — see `cold`.
+#[derive(Clone, Debug, Default)]
+struct AggCold {
+    min: Option<Value>,
+    max: Option<Value>,
+    distinct: Option<std::collections::HashSet<SqlValueKey>>,
+    concat: Option<String>,
+    concat_sep: Option<String>,
+}
+
+impl AggState {
+    /// Cold half, materialized on first use (one allocation per group
+    /// that actually takes a MIN/MAX/DISTINCT/GROUP_CONCAT).
+    #[inline]
+    fn cold_mut(&mut self) -> &mut AggCold {
+        self.cold.get_or_insert_with(Box::default)
+    }
+
+    #[inline]
+    fn cold(&self) -> Option<&AggCold> {
+        self.cold.as_deref()
+    }
 }
 
 /// A single SQL value wrapped for use as a HashSet key with SQL equality
@@ -4423,10 +4460,14 @@ impl Default for HashGrouper {
 /// (`executor::parallel::try_parallel_groupby_selective`) hands merged
 /// groupers back across the module boundary.
 pub(crate) struct HashGrouper {
-    /// Open-addressing slots: (key hash, group index + 1); group index 0
-    /// marks an empty slot. Capacity is a power of two, `mask = cap - 1`,
-    /// growing at 75% load (rehash in place — group indices stay valid).
-    slots: Vec<(u64, u32)>,
+    /// Open-addressing slots: (truncated 32-bit key hash, group index + 1);
+    /// group index 0 marks an empty slot. Capacity is a power of two,
+    /// `mask = cap - 1`, growing at 75% load (rehash in place — group
+    /// indices stay valid). The hash is truncated to u32 to halve the
+    /// slot bytes vs (u64, u32) — at 100k groups that alone was 3.1 MB vs
+    /// 2.1 MB; collisions only cost probe steps (the full key equality
+    /// check still runs on every hash match, so correctness is exact).
+    slots: Vec<(u32, u32)>,
     mask: usize,
     /// Single-key mode: the group key values in first-seen order.
     keys_flat: Option<ChunkVec<Value>>,
@@ -4448,12 +4489,28 @@ impl HashGrouper {
     }
 
     #[inline]
-    fn group_count(&self) -> usize {
+    pub(crate) fn group_count(&self) -> usize {
         if let Some(k) = &self.keys_flat {
             k.len()
         } else {
             self.keys_multi.len()
         }
+    }
+
+    /// Group key slot `s` (0 = the single key / index into the multi-key
+    /// Vec) as a cloned Value — the streaming driver's row builder.
+    pub(crate) fn key_slot(&self, gi: usize, s: usize) -> Value {
+        if let Some(keys) = &self.keys_flat {
+            keys.get(gi).clone()
+        } else {
+            self.keys_multi[gi].get(s).cloned().unwrap_or(Value::Null)
+        }
+    }
+
+    /// Finalize aggregate `i` of group `gi` (the driver-side twin of
+    /// `finish_group_result`'s per-row finalize).
+    pub(crate) fn finalize_slot(&self, gi: usize, i: usize, func: &str) -> Value {
+        finalize_agg(self.states.get(gi * self.n_aggs + i), func)
     }
 
     #[inline]
@@ -4479,6 +4536,7 @@ impl HashGrouper {
         if self.slots.is_empty() {
             return None;
         }
+        let h32 = h as u32;
         let mut slot = (h as usize) & self.mask;
         loop {
             let (sh, gi1) = self.slots[slot];
@@ -4486,7 +4544,7 @@ impl HashGrouper {
                 return None;
             }
             let gi = (gi1 - 1) as usize;
-            if sh == h && eq(gi) {
+            if sh == h32 && eq(gi) {
                 return Some(gi);
             }
             slot = (slot + 1) & self.mask;
@@ -4498,17 +4556,18 @@ impl HashGrouper {
         if self.group_count() > self.mask * 3 / 4 {
             self.rehash();
         }
+        let h32 = h as u32;
         let mut slot = (h as usize) & self.mask;
         while self.slots[slot].1 != 0 {
             slot = (slot + 1) & self.mask;
         }
-        self.slots[slot] = (h, (gi + 1) as u32);
+        self.slots[slot] = (h32, (gi + 1) as u32);
     }
 
     fn rehash(&mut self) {
         let n = self.group_count();
         let new_cap = (self.slots.len() * 2).max(16).next_power_of_two();
-        self.slots = vec![(0u64, 0u32); new_cap];
+        self.slots = vec![(0u32, 0u32); new_cap];
         self.mask = new_cap - 1;
         // Re-insert every group by re-hashing its key.
         for gi in 0..n {
@@ -4523,11 +4582,26 @@ impl HashGrouper {
                 }
                 hasher.finish()
             };
+            let h32 = h as u32;
             let mut slot = (h as usize) & self.mask;
             while self.slots[slot].1 != 0 {
                 slot = (slot + 1) & self.mask;
             }
-            self.slots[slot] = (h, (gi + 1) as u32);
+            self.slots[slot] = (h32, (gi + 1) as u32);
+        }
+    }
+
+    /// Find or create the group for a key slice of ANY width: single-key
+    /// calls take the flat `keys_flat` fast path (zero per-group heap
+    /// allocations — one chunked array), everything else the multi-key
+    /// `Vec` path. All GROUP BY loops route through here so the common
+    /// `GROUP BY <expr>` shape never allocates per group.
+    #[inline]
+    fn intern_key(&mut self, key_buf: &[Value]) -> usize {
+        if key_buf.len() == 1 {
+            self.intern_one(&key_buf[0])
+        } else {
+            self.intern(key_buf)
         }
     }
 
@@ -4614,11 +4688,7 @@ impl Default for AggState {
             sum: 0.0,
             sum_is_int: true, // Optimistic: assume int until we see a Real.
             int_sum: 0,
-            min: None,
-            max: None,
-            distinct: None,
-            concat: None,
-            concat_sep: None,
+            cold: None,
             seen_value: false,
         }
     }
@@ -4650,18 +4720,38 @@ fn exec_aggregate_streaming_scan(
     filter_predicate: Option<&Expr>,
     group_by: &[Expr],
     aggregates: &[AggExpr],
+    projection: Option<&GroupProjection>,
 ) -> Result<ExecResult> {
-    // Fast path: no GROUP BY. We can skip the per-row key computation,
-    // the per-row key String formatting, and the HashMap lookup. There is
-    // exactly one group, so we accumulate directly into a Vec<AggState>.
-    //
-    // Additionally, if all aggregate args are bare Column references
-    // (the common case for `SELECT SUM(col), MAX(col), COUNT(*) FROM t`),
-    // we resolve the column index ONCE upfront and read directly from the
-    // row buffer at that index — no per-row `eval_row` call (which does a
-    // name lookup, type coercion, etc.).
+    // Fast path: no GROUP BY — accumulate a single group directly (no
+    // per-row key computation, no hash table).
     if group_by.is_empty() {
         return exec_aggregate_no_group_by(ctx, table, alias, filter_predicate, aggregates);
+    }
+    let grouper = scan_groupby_grouper(ctx, table, alias, filter_predicate, group_by, aggregates)?;
+    finish_group_result(grouper, group_by, aggregates, projection)
+}
+
+/// The GROUP BY core of [`exec_aggregate_streaming_scan`]: run the
+/// scan/aggregate loops (fused selective / compiled / parallel / general,
+/// byte-identical per-row semantics) and return the OWNED grouper instead
+/// of materializing output rows. The statement-level streaming driver
+/// (`statement.rs`'s `GroupByDriver`) finalizes groups in serving-sized
+/// batches from this grouper, so a 100k-group query never materializes a
+/// 100k-row result set — the grouper state IS the necessary state.
+pub(crate) fn scan_groupby_grouper(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    alias: Option<String>,
+    filter_predicate: Option<&Expr>,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> Result<HashGrouper> {
+    // No-GROUP-BY callers must go through `exec_aggregate`'s dispatch
+    // (`exec_aggregate_no_group_by`) — a grouper only exists WITH grouping.
+    if group_by.is_empty() {
+        return Err(Error::runtime(
+            "scan_groupby_grouper called without GROUP BY",
+        ));
     }
 
     let params: &[Value] = &ctx.params;
@@ -4790,7 +4880,7 @@ fn exec_aggregate_streaming_scan(
             n_cols,
         )? {
             drop(bt);
-            return finish_group_result(g, group_by, aggregates);
+            return Ok(g);
         }
         // ==== Fully vectorized path: selective decode + direct indexing ====
         // Per-agg decode positions + COUNT(*) flags resolved ONCE (was a
@@ -4824,7 +4914,7 @@ fn exec_aggregate_streaming_scan(
                     Value::Null
                 });
             }
-            let gi = grouper.intern(&key_buf);
+            let gi = grouper.intern_key(&key_buf);
             for i in 0..aggregates.len() {
                 let arg_val: &Value = if agg_count_star_gb[i] {
                     &COUNT_STAR_ARG // COUNT(*): constant placeholder, no evaluation
@@ -4929,7 +5019,7 @@ fn exec_aggregate_streaming_scan(
                     n_cols,
                 )? {
                     drop(bt);
-                    return finish_group_result(g, group_by, aggregates);
+                    return Ok(g);
                 }
             }
 
@@ -5007,7 +5097,7 @@ fn exec_aggregate_streaming_scan(
                 }
                 true
             })?;
-            return finish_group_result(grouper, group_by, aggregates);
+            return Ok(grouper);
         }
 
         let identity_ref: &[usize] = &identity;
@@ -5049,7 +5139,7 @@ fn exec_aggregate_streaming_scan(
             if !key_ok {
                 return true;
             }
-            let gi = grouper.intern(&key_buf);
+            let gi = grouper.intern_key(&key_buf);
             for (i, agg) in aggregates.iter().enumerate() {
                 let arg_val = match (&agg.arg, agg_col_indices[i]) {
                     (Some(_), Some(idx)) => row_buf[idx].clone(),
@@ -5073,20 +5163,157 @@ fn exec_aggregate_streaming_scan(
         })?;
     }
 
-    finish_group_result(grouper, group_by, aggregates)
+    Ok(grouper)
+}
+
+/// Trivial projection over an Aggregate node's output: every output
+/// column is a bare selection of one aggregate-output slot (a GROUP BY
+/// key or an `__agg_N`). `SELECT cat, COUNT(*) FROM t GROUP BY cat` — the
+/// single most common GROUP BY shape — projects exactly this way after
+/// the planner's aggregate rewriting. When the Project node matches,
+/// `exec_aggregate` emits the FINAL rows directly (one materialization)
+/// instead of building the Aggregate's full output and then copying it
+/// through `apply_projection` (two full-size `Vec<Row>`s alive at once —
+/// on 100k groups that was ~2 × 10 MB of pure duplication).
+#[derive(Clone)]
+pub(crate) struct GroupProjection {
+    /// Source slot per output column: `0..n_group` = group key slots,
+    /// `n_group + i` = aggregate `i`.
+    pub(crate) src: Vec<usize>,
+    /// Output column names, exactly as `apply_projection` would render
+    /// them (user alias, else the reference's display name).
+    pub(crate) names: Vec<String>,
+}
+
+/// Does `columns` project a bare selection of the Aggregate output slots
+/// (`[group keys..., __agg_N...]`)? Returns the slot mapping + output
+/// names, or `None` when any projected expression is not a bare column
+/// reference into that output (or an aggregate is a plugin aggregate —
+/// those take the generic materialized path).
+pub(crate) fn trivial_group_projection(
+    columns: &[ProjectExpr],
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> Option<GroupProjection> {
+    // Plugin aggregates run the generic path — no fusion there.
+    if aggregates
+        .iter()
+        .any(|a| crate::plugin::lookup_aggregate(&a.func).is_some())
+    {
+        return None;
+    }
+    // The Aggregate's output slot names (finish_group_result's exact
+    // naming — the planner's rewrite_aggregates_and_groups matches it).
+    let mut slot_names: Vec<String> = Vec::with_capacity(group_by.len() + aggregates.len());
+    for (i, g) in group_by.iter().enumerate() {
+        let name = match g {
+            Expr::Column { table: None, name } => name.clone(),
+            Expr::Column {
+                table: Some(t),
+                name,
+            } => format!("{}.{}", t, name),
+            _ => format!("col{}", i + 1),
+        };
+        slot_names.push(name);
+    }
+    for i in 0..aggregates.len() {
+        slot_names.push(format!("__agg_{}", i));
+    }
+    let n_group = group_by.len();
+    let mut src = Vec::with_capacity(columns.len());
+    let mut names = Vec::with_capacity(columns.len());
+    for c in columns {
+        let Expr::Column { table: None, name } = &c.expr else {
+            return None;
+        };
+        if name == "*" {
+            return None; // star expansion is never a bare selection
+        }
+        // Resolve exactly like the projection fast path: case-sensitive
+        // exact match first, then case-insensitive, then suffix.
+        let mut slot = None;
+        for (i, s) in slot_names.iter().enumerate() {
+            if s == name {
+                slot = Some(i);
+                break;
+            }
+        }
+        if slot.is_none() {
+            for (i, s) in slot_names.iter().enumerate() {
+                if s.eq_ignore_ascii_case(name) {
+                    slot = Some(i);
+                    break;
+                }
+            }
+        }
+        if slot.is_none() {
+            for (i, s) in slot_names.iter().enumerate() {
+                if let Some(pos) = s.rfind('.') {
+                    if &s[pos + 1..] == name {
+                        slot = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        let slot = slot?;
+        let _ = n_group;
+        src.push(slot);
+        names.push(c.alias.clone().unwrap_or_else(|| name.clone()));
+    }
+    Some(GroupProjection { src, names })
 }
 
 /// Emit one output row per group, in first-seen order (matches the
 /// previous implementation's `group_order` behavior). Shared by the
 /// compiled-expression fast path and the general path.
+///
+/// `projection`: when the parent Project is a bare selection of the
+/// aggregate output (see `trivial_group_projection`), emit the FINAL
+/// projected rows directly — one materialization instead of two.
 fn finish_group_result(
     grouper: HashGrouper,
     group_by: &[Expr],
     aggregates: &[AggExpr],
+    projection: Option<&GroupProjection>,
 ) -> Result<ExecResult> {
     let n_groups = grouper.len();
-    let n_out = group_by.len() + aggregates.len();
     let n_aggs = grouper.n_aggs;
+    if let Some(proj) = projection {
+        let n_out = proj.src.len().max(1);
+        let n_group = group_by.len();
+        let mut out_rows = Vec::with_capacity(n_groups);
+        for gi in 0..n_groups {
+            let mut row: Vec<Value> = Vec::with_capacity(n_out);
+            for &s in proj.src.iter() {
+                if s < n_group {
+                    if let Some(keys) = &grouper.keys_flat {
+                        row.push(keys.get(gi).clone());
+                    } else {
+                        row.push(
+                            grouper.keys_multi[gi]
+                                .get(s)
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                } else {
+                    let i = s - n_group;
+                    row.push(finalize_agg(
+                        grouper.states.get(gi * n_aggs + i),
+                        &aggregates[i].func,
+                    ));
+                }
+            }
+            out_rows.push(row);
+        }
+        drop(grouper);
+        return Ok(ExecResult {
+            columns: proj.names.clone().into(),
+            rows: out_rows,
+        });
+    }
+    let n_out = group_by.len() + aggregates.len();
     let mut out_rows = Vec::with_capacity(n_groups);
     for gi in 0..n_groups {
         // Exact capacity: key width + one slot per aggregate (a Vec::new
@@ -6643,6 +6870,7 @@ fn exec_aggregate(
     input: &Plan,
     group_by: &[Expr],
     aggregates: &[AggExpr],
+    projection: Option<&GroupProjection>,
 ) -> Result<ExecResult> {
     // USER AGGREGATES: when any aggregate function name resolves to a
     // registered plugin aggregate, run the generic path. It materializes
@@ -6721,6 +6949,7 @@ fn exec_aggregate(
                 None,
                 group_by,
                 aggregates,
+                projection,
             );
         }
     }
@@ -6791,6 +7020,7 @@ fn exec_aggregate(
                     Some(predicate),
                     group_by,
                     aggregates,
+                    projection,
                 );
             }
         }
@@ -6956,7 +7186,7 @@ fn exec_aggregate(
         if !key_ok {
             continue;
         }
-        let gi = grouper.intern(&key_buf);
+        let gi = grouper.intern_key(&key_buf);
         for (i, agg) in aggregates.iter().enumerate() {
             let arg_val = match (&agg.arg, agg_col_indices[i]) {
                 (Some(_), Some(idx)) => row[idx].clone(),
@@ -7263,8 +7493,9 @@ fn update_agg_state(
     // a heap allocation per row for DISTINCT aggregates.
     if distinct
         && !state
+            .cold_mut()
             .distinct
-            .get_or_insert_with(Box::default)
+            .get_or_insert_with(Default::default)
             .insert(SqlValueKey(v.clone()))
     {
         return;
@@ -7316,28 +7547,29 @@ fn update_agg_state(
             }
         }
         AggFunc::Min => {
-            if !v.is_null() && (state.min.is_none() || v < state.min.as_deref().unwrap()) {
-                state.min = Some(Box::new(v.clone()));
+            let c = state.cold_mut();
+            if !v.is_null() && (c.min.is_none() || v < c.min.as_ref().unwrap()) {
+                c.min = Some(v.clone());
             }
         }
         AggFunc::Max => {
-            if !v.is_null() && (state.max.is_none() || v > state.max.as_deref().unwrap()) {
-                state.max = Some(Box::new(v.clone()));
+            let c = state.cold_mut();
+            if !v.is_null() && (c.max.is_none() || v > c.max.as_ref().unwrap()) {
+                c.max = Some(v.clone());
             }
         }
         AggFunc::GroupConcat if !v.is_null() => {
-            let buf = state
-                .concat
-                .get_or_insert_with(|| Box::new(String::with_capacity(16)));
+            let c = state.cold_mut();
+            let sep_next = c
+                .concat_sep
+                .as_deref()
+                .map(|s| s.to_string())
+                .or_else(|| sep.map(|s| s.to_string()));
+            let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
             if !buf.is_empty() {
-                let sep = state
-                    .concat_sep
-                    .as_deref()
-                    .map(|s| s.to_string())
-                    .or_else(|| sep.map(|s| s.to_string()));
-                if let Some(s) = sep {
+                if let Some(s) = sep_next {
                     // Cache for the NEXT row (state is per-group).
-                    state.concat_sep = Some(Box::new(s.clone()));
+                    c.concat_sep = Some(s.clone());
                     buf.push_str(&s);
                 } else {
                     buf.push(',');
@@ -7347,9 +7579,8 @@ fn update_agg_state(
         }
         // JSON_GROUP_ARRAY(x): [v1, v2, ...] — JSON-quoted elements.
         AggFunc::JsonGroupArray if !v.is_null() => {
-            let buf = state
-                .concat
-                .get_or_insert_with(|| Box::new(String::with_capacity(16)));
+            let c = state.cold_mut();
+            let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
             if !buf.is_empty() {
                 buf.push(',');
             }
@@ -7359,9 +7590,8 @@ fn update_agg_state(
         // per-row `"key":value` fragment (see __json_object_frag); join
         // with ',' and let finalize wrap in {}.
         AggFunc::JsonGroupObject if !v.is_null() => {
-            let buf = state
-                .concat
-                .get_or_insert_with(|| Box::new(String::with_capacity(16)));
+            let c = state.cold_mut();
+            let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
             if !buf.is_empty() {
                 buf.push(',');
             }
@@ -7396,18 +7626,38 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
                 Value::Real((state.sum / state.count as f64 * 1e10).round() / 1e10)
             }
         }
-        "min" => state.min.as_deref().cloned().unwrap_or(Value::Null),
-        "max" => state.max.as_deref().cloned().unwrap_or(Value::Null),
-        "group_concat" | "string_agg" => {
-            Value::Text(state.concat.as_deref().cloned().unwrap_or_default().into())
-        }
+        "min" => state
+            .cold()
+            .and_then(|c| c.min.clone())
+            .unwrap_or(Value::Null),
+        "max" => state
+            .cold()
+            .and_then(|c| c.max.clone())
+            .unwrap_or(Value::Null),
+        "group_concat" | "string_agg" => Value::Text(
+            state
+                .cold()
+                .and_then(|c| c.concat.clone())
+                .unwrap_or_default()
+                .into(),
+        ),
         "json_group_array" => Value::Text(
-            format!("[{}]", state.concat.as_deref().cloned().unwrap_or_default()).into(),
+            format!(
+                "[{}]",
+                state
+                    .cold()
+                    .and_then(|c| c.concat.clone())
+                    .unwrap_or_default()
+            )
+            .into(),
         ),
         "json_group_object" => Value::Text(
             format!(
                 "{{{}}}",
-                state.concat.as_deref().cloned().unwrap_or_default()
+                state
+                    .cold()
+                    .and_then(|c| c.concat.clone())
+                    .unwrap_or_default()
             )
             .into(),
         ),

@@ -43,7 +43,10 @@
 
 use crate::api::{Database, FastPath};
 use crate::error::{Error, Result};
-use crate::executor::{bare_column_projection, execute, ExecContext};
+use crate::executor::{
+    bare_column_projection, execute, scan_groupby_grouper, trivial_group_projection, ExecContext,
+    GroupProjection,
+};
 use crate::planner::plan::Plan;
 use crate::sql::ast::{Expr, Statement as AstStatement};
 use crate::types::{Row, Value};
@@ -382,6 +385,12 @@ impl<'a> Statement<'a> {
                 if batch.is_empty() {
                     self.done = true;
                     self.stream = StreamState::Exhausted;
+                    // The driver's scan pulled pages through the pager
+                    // (each an Arc + 4 KB allocation freed on LRU
+                    // eviction) — return them to the OS now that the
+                    // statement is finished instead of retaining the
+                    // wake for the rest of the process.
+                    db.maybe_drain_read_burst();
                     return Ok(StepResult::Done);
                 }
                 self.columns.get_or_insert_with(|| drv.columns());
@@ -400,6 +409,7 @@ impl<'a> Statement<'a> {
                 None => {
                     self.done = true;
                     self.stream = StreamState::Exhausted;
+                    self.db.maybe_drain_read_burst();
                     Ok(StepResult::Done)
                 }
             },
@@ -927,8 +937,187 @@ fn scan_columns_with_rowid(
     cols.into()
 }
 
+/// GROUP BY streaming driver: `Project(Aggregate(Scan | Filter(Scan)))`
+/// with a bare-selection projection (the planner's rewritten shape of
+/// `SELECT cat, COUNT(*) FROM t GROUP BY cat` — by far the most common
+/// GROUP BY form). The aggregation runs ONCE (first batch) into the
+/// owned HashGrouper — the necessary state — and groups are finalized in
+/// budget-sized batches on every later `next_batch`. The 100k-group query
+/// therefore never materializes a 100k-row result set: the previous
+/// materialized path built the full `Vec<Row>` (plus the projected copy,
+/// before the executor's fused Project-over-Aggregate) — on torture S03
+/// that was ~10 MB of output rows stacked on the grouper's state, where
+/// SQLite streams its sorted aggregation at flat memory.
+struct GroupByDriver {
+    /// The Aggregate's input, verbatim (Scan or Filter(Scan)).
+    input: Box<Plan>,
+    group_by: Vec<Expr>,
+    aggregates: Vec<crate::planner::plan::AggExpr>,
+    proj: GroupProjection,
+    columns: Arc<[String]>,
+    grouper: Option<crate::executor::HashGrouper>,
+    next_gi: usize,
+}
+
+impl GroupByDriver {
+    fn new(
+        input: Box<Plan>,
+        group_by: Vec<Expr>,
+        aggregates: Vec<crate::planner::plan::AggExpr>,
+        proj: GroupProjection,
+    ) -> Self {
+        let columns: Arc<[String]> = proj.names.clone().into();
+        Self {
+            input,
+            group_by,
+            aggregates,
+            proj,
+            columns,
+            grouper: None,
+            next_gi: 0,
+        }
+    }
+
+    /// Extract (table, alias, filter) from the Aggregate's input when it
+    /// is the scan-groupby shape `scan_groupby_grouper` handles.
+    fn scan_input(
+        plan: &Plan,
+    ) -> Option<(
+        std::sync::Arc<crate::schema::Table>,
+        Option<String>,
+        Option<Expr>,
+    )> {
+        match plan {
+            Plan::Scan {
+                table,
+                alias,
+                index: None,
+                predicate: None,
+            } if table.vtab.is_none() => Some((table.clone(), alias.clone(), None)),
+            Plan::Filter { input, predicate } => {
+                if let Plan::Scan {
+                    table,
+                    alias,
+                    index: None,
+                    predicate: None,
+                } = input.as_ref()
+                {
+                    if table.vtab.is_none() {
+                        return Some((table.clone(), alias.clone(), Some(predicate.clone())));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Driver for GroupByDriver {
+    fn columns(&self) -> Arc<[String]> {
+        self.columns.clone()
+    }
+
+    fn next_batch(
+        &mut self,
+        db: &Database,
+        params: &[Value],
+        named: &HashMap<String, Value>,
+        budget: usize,
+    ) -> Result<Vec<Row>> {
+        if self.grouper.is_none() {
+            if self.next_gi > 0 {
+                return Ok(Vec::new()); // finished
+            }
+            let (table, alias, filter) = match Self::scan_input(&self.input) {
+                Some(t) => t,
+                None => {
+                    return Err(Error::runtime(
+                        "GroupByDriver: unsupported aggregate input shape",
+                    ))
+                }
+            };
+            let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+            let shared = db.read_maps();
+            let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+            for p in params {
+                ctx.bind_positional(p.clone());
+            }
+            ctx.named_params = named.clone();
+            let _g = db.plugin_scope();
+            let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            let grouper = scan_groupby_grouper(
+                &mut ctx,
+                table,
+                alias,
+                filter.as_ref(),
+                &self.group_by,
+                &self.aggregates,
+            )?;
+            self.grouper = Some(grouper);
+        }
+        let grouper = match self.grouper.as_ref() {
+            Some(g) => g,
+            None => return Ok(Vec::new()),
+        };
+        let n_groups = grouper.group_count();
+        if self.next_gi >= n_groups {
+            self.grouper = None;
+            return Ok(Vec::new());
+        }
+        let n = (n_groups - self.next_gi).min(budget.max(1));
+        let n_group = self.group_by.len();
+        let mut out: Vec<Row> = Vec::with_capacity(n);
+        for gi in self.next_gi..self.next_gi + n {
+            let mut row: Vec<Value> = Vec::with_capacity(self.proj.src.len().max(1));
+            for &s in self.proj.src.iter() {
+                if s < n_group {
+                    row.push(grouper.key_slot(gi, s));
+                } else {
+                    let i = s - n_group;
+                    row.push(grouper.finalize_slot(gi, i, &self.aggregates[i].func));
+                }
+            }
+            out.push(row);
+        }
+        self.next_gi += n;
+        if self.next_gi >= n_groups {
+            self.grouper = None; // fully drained — free the state
+        }
+        Ok(out)
+    }
+}
+
 /// Try to build a streaming driver for a plan shape. `None` → materialize.
 fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
+    // GROUP BY streaming: Project(Aggregate(scan-ish)) with a bare
+    // selection projection — groups finalize in batches from the owned
+    // grouper (see GroupByDriver). Must be checked before the generic
+    // Project/Filter arms below would decompose the shape.
+    if let Plan::Project { input, columns } = plan {
+        if let Plan::Aggregate {
+            input: agg_input,
+            group_by,
+            aggregates,
+        } = input.as_ref()
+        {
+            if !group_by.is_empty()
+                && aggregates
+                    .iter()
+                    .all(|a| crate::plugin::lookup_aggregate(&a.func).is_none())
+                && GroupByDriver::scan_input(agg_input).is_some()
+            {
+                if let Some(proj) = trivial_group_projection(columns, group_by, aggregates) {
+                    return Some(Box::new(GroupByDriver::new(
+                        agg_input.clone(),
+                        group_by.clone(),
+                        aggregates.clone(),
+                        proj,
+                    )));
+                }
+            }
+        }
+    }
     match plan {
         Plan::Scan {
             table,

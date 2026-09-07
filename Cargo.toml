@@ -52,10 +52,6 @@ name = "probe_mv_breakdown"
 path = "examples/probe_mv_breakdown.rs"
 
 # open_in_memory() cost breakdown (tempfile vs open vs first statements).
-[[example]]
-name = "probe_open_cost"
-path = "examples/probe_open_cost.rs"
-
 # Scan-cost isolation: walk vs decode vs materialize (pinned + unpinned).
 [[example]]
 name = "probe_scan_cost"
