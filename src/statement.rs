@@ -186,10 +186,15 @@ impl<'a> Statement<'a> {
         // Output columns at PREPARE time when a streaming driver covers
         // the plan (SQLite's column_count/column_name work before the
         // first step). Materialized shapes set columns on first step.
-        let prep_columns = plan
-            .as_deref()
-            .and_then(try_build_driver)
-            .map(|d| d.columns());
+        // Subquery-bearing plans never take the driver path (see start()),
+        // so they don't advertise driver columns here either.
+        let prep_columns = if cached.has_subqueries {
+            None
+        } else {
+            plan.as_deref()
+                .and_then(try_build_driver)
+                .map(|d| d.columns())
+        };
         Ok(Self {
             db,
             sql: sql.to_string(),
@@ -507,23 +512,36 @@ impl<'a> Statement<'a> {
         // faster and far less peak memory. Point/COUNT lookup plans have
         // no driver shape, so they still take their fast paths. Fast
         // paths are skipped anyway under committed reads.
+        //
+        // SUBQUERY-BEARING plans are EXCLUDED from both shortcuts: the
+        // driver / fast-path paths evaluate plan expressions WITHOUT the
+        // subquery rewrite (rewrite_plan_subqueries runs on the
+        // materialized path only) and WITHOUT an installed CorrGuard —
+        // an IN / scalar / EXISTS subquery inside a driver predicate
+        // then fails to evaluate, and FilterDriver SWALLOWS the error
+        // (`.unwrap_or(false)`), silently dropping every row. The
+        // materialized path below rewrites uncorrelated subqueries into
+        // literals and evaluates correlated ones with the guard
+        // installed, which is the only correct route for them.
         if let Some(plan) = self.plan.clone() {
-            // Streaming driver?
-            if let Some(drv) = try_build_driver(&plan) {
-                self.columns = Some(drv.columns());
-                self.stream = StreamState::Driver(drv);
-                return Ok(());
-            }
-            // Precompiled point/COUNT fast paths (plans with no driver
-            // shape): a handful of rows. Committed-view reads take them
-            // too — run_fast_path resolves BEGIN-time roots under an
-            // armed scope (the guard above armed it for SELECTs).
-            if self.fast_path.is_some() {
-                if let Some(fp) = self.fast_path.clone() {
-                    let rows = self.db.run_fast_path_public(&fp, &self.params)?;
-                    self.columns = Some(fp_output_columns(&fp));
-                    self.stream = StreamState::Materialized(rows.into_iter());
+            if !self.has_subqueries {
+                // Streaming driver?
+                if let Some(drv) = try_build_driver(&plan) {
+                    self.columns = Some(drv.columns());
+                    self.stream = StreamState::Driver(drv);
                     return Ok(());
+                }
+                // Precompiled point/COUNT fast paths (plans with no driver
+                // shape): a handful of rows. Committed-view reads take them
+                // too — run_fast_path resolves BEGIN-time roots under an
+                // armed scope (the guard above armed it for SELECTs).
+                if self.fast_path.is_some() {
+                    if let Some(fp) = self.fast_path.clone() {
+                        let rows = self.db.run_fast_path_public(&fp, &self.params)?;
+                        self.columns = Some(fp_output_columns(&fp));
+                        self.stream = StreamState::Materialized(rows.into_iter());
+                        return Ok(());
+                    }
                 }
             }
             // Materialized: DML (with merge-back) or general SELECT.
@@ -713,10 +731,18 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
             }
             Expr::In { expr, source, .. } => {
                 walk_expr(expr, max_pos, saw_numeric, named, counter);
-                if let crate::sql::ast::InSource::List(items) = source {
-                    for i in items {
-                        walk_expr(i, max_pos, saw_numeric, named, counter);
+                match source {
+                    crate::sql::ast::InSource::List(items) => {
+                        for i in items {
+                            walk_expr(i, max_pos, saw_numeric, named, counter);
+                        }
                     }
+                    // Parameters inside `IN (SELECT … ? …)` belong to THIS
+                    // statement (SQLite binds them here too).
+                    crate::sql::ast::InSource::Subquery(s) => {
+                        walk_select(s, max_pos, saw_numeric, named, counter)
+                    }
+                    crate::sql::ast::InSource::Table(_) => {}
                 }
             }
             Expr::Like {
@@ -764,6 +790,10 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
             }
             Expr::Cast { expr, .. } => walk_expr(expr, max_pos, saw_numeric, named, counter),
             Expr::Collate { expr, .. } => walk_expr(expr, max_pos, saw_numeric, named, counter),
+            // Scalar subqueries / EXISTS: parameters inside them bind on
+            // THIS statement (SQLite semantics), so they must count.
+            Expr::Subquery(s) => walk_select(s, max_pos, saw_numeric, named, counter),
+            Expr::Exists(s) => walk_select(s, max_pos, saw_numeric, named, counter),
             _ => {}
         }
     }
@@ -774,6 +804,12 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
         named: &mut Vec<String>,
         counter: &mut usize,
     ) {
+        // WITH clause: parameters inside CTE bodies bind on this statement.
+        if let Some(w) = &s.with {
+            for cte in &w.ctes {
+                walk_select(&cte.select, max_pos, saw_numeric, named, counter);
+            }
+        }
         walk_body(&s.body, max_pos, saw_numeric, named, counter);
         for t in &s.order_by {
             walk_expr(&t.expr, max_pos, saw_numeric, named, counter);
@@ -831,6 +867,13 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
         match te {
             crate::sql::ast::TableExpression::Subquery { select, .. } => {
                 walk_select(select, max_pos, saw_numeric, named, counter)
+            }
+            crate::sql::ast::TableExpression::Function { args, .. } => {
+                // Table-valued function arguments may be bound params
+                // (`pragma_table_info(?)`, `json_each(?)`).
+                for a in args {
+                    walk_expr(a, max_pos, saw_numeric, named, counter);
+                }
             }
             crate::sql::ast::TableExpression::Join {
                 left,
@@ -1006,9 +1049,14 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             {
                 if table.vtab.is_none() {
                     if let Some((project, out_cols)) = bare_column_projection(columns, table) {
+                        // `project == None` means SELECT * (all columns,
+                        // table order) — `unwrap_or_default()` would turn
+                        // it into an EMPTY projection and the scan would
+                        // decode ZERO columns (empty rows, values lost).
+                        let project = project.unwrap_or_else(|| (0..table.n_columns()).collect());
                         return Some(Box::new(ProjectedScanDriver::new(
                             table.clone(),
-                            project.unwrap_or_default(),
+                            project,
                             out_cols,
                         )));
                     }

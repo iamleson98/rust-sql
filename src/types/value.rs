@@ -720,17 +720,9 @@ impl Affinity {
                     Value::Text(s)
                 }
             }
-            (Affinity::Integer, Value::Blob(b)) => {
-                let s = std::str::from_utf8(&b).unwrap_or("");
-                let trimmed = s.trim();
-                if let Ok(i) = trimmed.parse::<i64>() {
-                    Value::Integer(i)
-                } else if let Ok(f) = trimmed.parse::<f64>() {
-                    Value::Real(f)
-                } else {
-                    Value::Blob(b)
-                }
-            }
+            // SQLite (datatype3.html §3.1): a BLOB value is NEVER
+            // converted by column affinity — it stays a BLOB.
+            (Affinity::Integer, Value::Blob(b)) => Value::Blob(b),
             (Affinity::Integer, Value::Null) => Value::Null,
 
             (Affinity::Real, Value::Integer(i)) => Value::Real(i as f64),
@@ -746,20 +738,18 @@ impl Affinity {
                 }
             }
             (Affinity::Real, Value::Blob(b)) => {
-                let s = std::str::from_utf8(&b).unwrap_or("");
-                let trimmed = s.trim();
-                if let Ok(f) = trimmed.parse::<f64>() {
-                    Value::Real(f)
-                } else {
-                    Value::Blob(b)
-                }
+                // SQLite: BLOBs are never converted by affinity.
+                Value::Blob(b)
             }
             (Affinity::Real, Value::Null) => Value::Null,
 
             (Affinity::Text, Value::Integer(i)) => Value::Text(i.to_string().into()),
             (Affinity::Text, Value::Real(f)) => Value::Text(format_real(f).into()),
             (Affinity::Text, Value::Text(s)) => Value::Text(s.duplicate()),
-            (Affinity::Text, Value::Blob(b)) => Value::Text(Text::from_utf8_lossy(&b)),
+            // SQLite: a BLOB is never converted to TEXT by affinity —
+            // lossy UTF-8 decoding here would corrupt every binary value
+            // (sqlx stores UUIDs as 16-byte BLOBs in uuid-text columns).
+            (Affinity::Text, Value::Blob(b)) => Value::Blob(b),
             (Affinity::Text, Value::Null) => Value::Null,
 
             // BLOB and None: leave as-is
