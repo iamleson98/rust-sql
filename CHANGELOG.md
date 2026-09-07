@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased] — 2026-09-07 (II) all-docs comparison refresh (performance · resource · concurrency vs SQLite)
+
+### Docs
+
+- Re-ran the full `bench_compare` head-to-head and refreshed **every**
+  `.md` in the repo with the verified three-way comparison vs SQLite:
+  - **BENCHMARKS.md**: new **[9] Resource consumption & concurrency**
+    section (file size byte-exact 262.14 KB, peak RSS 0.94× at 44.2 vs
+    46.9 MB over the whole run incl. the 1M-row parallel section, WAL
+    commits 1.13×, binary 1.5× with the mimalloc opt-out; concurrency
+    table: 8.3× concurrent reads, 2.0× 1W+7R, 5.1× 8-task pools,
+    5.7–8.2× intra-statement parallel aggregates); [8] numbers refreshed
+    from the fresh run (16.2 vs 132.8 ms, 12.5 vs 74.4 ms, 49.9 vs
+    285.0 ms); the 2026-07-30 §7 resource section marked historical.
+  - **README.md**: performance table refreshed; new "Resource consumption
+    vs SQLite" and "Concurrency vs SQLite" sections; "Where we win" /
+    "remaining deltas" / Limitations updated (binary size honestly
+    restated at 1.5× after the recent feature growth).
+  - **GAP_ANALYSIS.md**: §1 rows 20–22 re-measured (file size now
+    byte-exact by default, RSS 0.94×, binary 1.5×), new rows 25 (1M-row
+    parallel aggregates) and 26 (1 writer + 7 readers); header restated
+    as all-three-dimensions win.
+  - **ARCHITECTURE.md**: "Performance characteristics", "What we cut",
+    and "Future Work" rewritten to the current state (all stale
+    slower-than-SQLite claims replaced with the measured wins and
+    mechanisms); `query(&self)` API docs fixed; new "Performance, memory
+    & concurrency characteristics (vs SQLite)" subsection.
+  - **TESTING.md**: `tests/parallel_scan.rs` added to the quick reference
+    and the concurrency matrix row (parallel-vs-serial equality contract).
+  - **PRODUCTION_TODO.md**: 2026-09-07 status banner — goal reached on
+    all three axes (performance / resource consumption / concurrency);
+    the 2026-08-28 baseline table kept as historical record.
+  - **PLUGINS.md**, **compat/README.md**, **sqlx-interop/README.md**,
+    **docs/SQLX_COMPAT.md**: per-layer performance/concurrency notes
+    (plugin-less fast path measured; C-ABI ≈ rusqlite-level with
+    SQLite-exact semantics; native driver 1.5–2.8× / 18.4× streams).
+
 ## [Unreleased] — 2026-09-07 intra-statement parallel aggregation
 
 ### Concurrency (the headline)

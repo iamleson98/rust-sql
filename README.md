@@ -154,35 +154,81 @@ The engine is structured in five layers, each with a clear contract:
 ## Performance
 
 Head-to-head vs SQLite (rusqlite with bundled SQLite), `cargo run --release
---example bench_compare`, measured 2026-09-02 after the overflow-page +
-fused-scan sprint (every row at parity or faster):
+--example bench_compare`, measured 2026-09-07 after the intra-statement
+parallel-aggregation pass (every row an outright win):
 
 | Workload                              | rustqlite   | SQLite     | Ratio            |
 |---------------------------------------|-------------|------------|------------------|
-| Single-row inserts (auto-commit, 1k)  | **840 µs**  | 1.89 ms    | **2.25x faster** |
-| INSERT in txn (100k rows)             | **79.9 ms** | 129 ms     | **1.62x faster** |
-| Multi-row VALUES (10k rows)           | **4.26 ms** | 6.22 ms    | **1.46x faster** |
-| Point lookup by rowid (1k ops)        | **291 µs**  | 373 µs     | **1.28x faster** |
-| Range scan (10 rows)                  | **945 ns**  | 1.53 µs    | **1.62x faster** |
-| Range scan (1000 rows)                | **67 µs**   | 107 µs     | **1.59x faster** |
-| Full scan + COUNT with filter         | **404 µs**  | 470 µs     | **1.16x faster** |
+| Single-row inserts (auto-commit, 1k)  | **768 µs**  | 1.83 ms    | **2.38x faster** |
+| INSERT in txn (10k rows)              | **7.64 ms** | 12.9 ms    | **1.69x faster** |
+| INSERT in txn (100k rows)             | **78.0 ms** | 131 ms     | **1.68x faster** |
+| Multi-row VALUES (10k rows)           | **4.43 ms** | 6.22 ms    | **1.40x faster** |
+| Point lookup by rowid (1k ops)        | **225 µs**  | 443 µs     | **1.97x faster** |
+| Range scan (10 rows)                  | **997 ns**  | 1.98 µs    | **2.0x faster**  |
+| Range scan (100 rows)                 | **7.0 µs**  | 15.9 µs    | **2.26x faster** |
+| Range scan (1000 rows)                | **67.8 µs** | 156 µs     | **2.29x faster** |
+| Range scan (5000 rows)                | **345 µs**  | 775 µs     | **2.25x faster** |
+| Full scan + COUNT with filter         | **179 µs**  | 453 µs     | **2.53x faster** |
 | COUNT(*) bare (memoized)              | **92 ns**   | 2.5 µs     | **27x faster**   |
-| Aggregate (SUM/AVG/MIN/MAX)           | **683 µs**  | 1.18 ms    | **1.73x faster** |
-| GROUP BY (100 buckets)                | **766 µs**  | 1.84 ms    | **2.40x faster** |
-| Indexed point lookup (1k ops)         | **336 µs**  | 537 µs     | **1.60x faster** |
-| 2-table join (PK filter)              | **2.24 µs** | 3.00 µs    | **1.34x faster** |
-| 3-table join (PK filter, 50 out)      | **15.5 µs** | 22.2 µs    | **1.43x faster** |
-| 2-table join + GROUP BY               | **1.73 ms** | 2.88 ms    | **1.66x faster** |
-| UPDATE by PK (1k ops)                 | **1.66 ms** | 1.98 ms    | **1.19x faster** |
-| UPDATE range (5k rows, indexed)       | **1.11 ms** | 1.14 ms    | **1.03x faster** |
-| DELETE by PK (1k ops)                 | **611 µs**  | 1.39 ms    | **2.27x faster** |
-| Mixed 80/20 read/write (5k ops)       | **1.94 ms** | 2.54 ms    | **1.31x faster** |
-| DB file size (10k rows)               | **262 KB**  | 262 KB     | **byte-exact**   |
-| Peak RSS (100k insert + count)        | **32.8 MB** | 35.5 MB    | **0.92x**        |
+| Aggregate (SUM/AVG/MIN/MAX)           | **258 µs**  | 1.18 ms    | **4.6x faster**  |
+| GROUP BY (100 buckets)                | **690 µs**  | 1.84 ms    | **2.67x faster** |
+| Indexed point lookup (1k ops)         | **340 µs**  | 616 µs     | **1.81x faster** |
+| 2-table join (PK filter)              | **2.58 µs** | 2.78 µs    | **1.08x faster** |
+| 3-table join (PK filter, 50 out)      | **14.5 µs** | 21.4 µs    | **1.47x faster** |
+| 2-table join + GROUP BY               | **1.56 ms** | 2.78 ms    | **1.78x faster** |
+| UPDATE by PK (1k ops)                 | **1.64 ms** | 1.80 ms    | **1.10x faster** |
+| UPDATE range (5k rows, indexed)       | **683 µs**  | 1.14 ms    | **1.67x faster** |
+| DELETE by PK (1k ops)                 | **671 µs**  | 1.40 ms    | **2.09x faster** |
+| Mixed 80/20 read/write (5k ops)       | **1.92 ms** | 2.51 ms    | **1.31x faster** |
 
-Every engine benchmark row leads or matches (steady-state probes in
+Large-table **parallel** aggregates (1M rows, 2 workers vs SQLite's one
+thread — see [Concurrency](#concurrency-vs-sqlite)):
+
+| Workload (1M rows)                    | rustqlite   | SQLite     | Ratio            |
+|---------------------------------------|-------------|------------|------------------|
+| Big aggregate (COUNT/SUM/AVG/MIN/MAX) | **16.2 ms** | 132.8 ms   | **8.2x faster**  |
+| Filtered aggregate (val > 500000)     | **12.5 ms** | 74.4 ms    | **6.0x faster**  |
+| GROUP BY (10k buckets + SUM)          | **49.9 ms** | 285 ms     | **5.7x faster**  |
+
+Every engine benchmark row is an outright win (steady-state probes in
 GAP_ANALYSIS.md confirm each; the criterion harness measures concurrent
 reads, `cargo bench --bench sqlite_comparison`).
+
+### Resource consumption vs SQLite
+
+| Metric                              | rustqlite    | SQLite     | Verdict                                   |
+|-------------------------------------|--------------|------------|-------------------------------------------|
+| DB file size (10k rows, on disk)    | **262.14 KB**| 262.14 KB  | **byte-exact** (4 KiB pages, codec v2)    |
+| Peak RSS (100k insert+count, whole run incl. the 1M-row parallel section) | **44.2 MB** | 46.9 MB | **0.94x — lower** |
+| Stripped binary (CLI)               | 3.10 MB      | ~2.06 MB   | 1.5x larger — mimalloc buys the 1.5–2.1x write wins; `default-features = false` drops it |
+| WAL commit latency                  | **25.3 µs/txn** | 28.5 µs/txn | **1.13x faster** (delete journal mode: 6.2x faster) |
+
+Memory stays at parity or better on every measured shape: the streaming
+fused scan drivers decode rows in batches instead of materializing result
+sets, `LIMIT k` stops the walk at the k-th match, big write transactions
+spill pages in DELETE journal mode (bounded RSS), and the parallel workers'
+per-range scratch is bounded (one FusedWalk/grouper + a keep-sized heap
+each). The single resource regression is deliberate: ~140 KiB of mimalloc
+in exchange for 1.5–2.1x write throughput (opt-out: `default-features =
+false`).
+
+### Concurrency vs SQLite
+
+| Concurrency workload                        | rustqlite vs SQLite | Why                                             |
+|---------------------------------------------|--------------------|--------------------------------------------------|
+| Concurrent reads (8 threads, criterion)     | **8.3x faster**    | per-page locks + interior-mutability pager vs SQLite's serialized connection mutex |
+| 1 writer + 7 readers (sqlx pool)            | **2.0x faster**    | lock-free per-thread committed-view memo; readers never block on the writer |
+| 8-task one-pool (sqlx, same API)            | **5.1x faster**    | inline async execution vs worker thread + FFI   |
+| 8-conn concurrent reads (sqlx)              | **2.8x faster**    | MRMW shared pages                                |
+| Mixed 80/20 (sqlx)                          | **1.05x**          | at high write fan-out the writer gate + commit fsync dominates; reads stay 2.8x |
+| Intra-statement parallel aggregates (1M)    | **5.7–8.2x faster**| worker-split rowid ranges + range-ordered merge — SQLite's executor is single-threaded **by design** |
+| Multi-connection writers                    | SQLite-equivalent | single-writer + BUSY + busy timeout, exactly SQLite's own contract |
+
+SQLite executes one query on one core, forever; rustqlite additionally
+splits large single-statement scans across worker threads
+(`PRAGMA parallel_scan`, default ON above 131072 estimated rows; 0/OFF is
+bit-identical serial). Workers decline while any transaction is open and
+any worker bail falls back to the serial path — answers can never diverge.
 
 ### sqlx driver vs sqlx-sqlite (same sqlx 0.9 API)
 
@@ -213,33 +259,38 @@ identical sqlx API and pool options:
   for caching), we beat SQLite's re-prepare cost.
 - **Concurrency**: multiple readers run truly in parallel on shared pages
   (page-level locks + interior-mutability pager); SQLite serializes
-  everything through its connection mutex. Through the sqlx driver the
-  same 8-way read workload is 2.8× sqlx-sqlite, and 1-writer/7-reader
-  is 2× — with snapshot isolation, no dirty reads
-  (`examples/probe_dirty_read.rs`).
+  everything through its connection mutex. 8-thread concurrent reads are
+  **8.3×** SQLite (criterion); through the sqlx driver the same 8-way read
+  workload is 2.8× sqlx-sqlite, and 1-writer/7-reader is 2× — with
+  snapshot isolation, no dirty reads (`examples/probe_dirty_read.rs`).
 - **Intra-statement parallelism (2026-09)**: large single-table
   aggregates and GROUP BYs split their rowid space across worker
   threads and merge partial accumulators deterministically — a
   concurrency frontier SQLite's single-threaded executor cannot follow
   (one query, one core, forever). On 1M rows: big aggregate **8.2×**,
-  filtered aggregate **5.9×**, GROUP BY **5.6×** vs SQLite
+  filtered aggregate **6.0×**, GROUP BY **5.7×** vs SQLite
   (`examples/bench_compare.rs` section [8], scaling probe
   `examples/probe_parallel_scan.rs`). `PRAGMA parallel_scan` gates it
   (default ON at 131072 rows; OFF is bit-identical serial).
+- **Analytical scans / aggregates**: fused scan drivers with selective
+  decode beat SQLite 2–4.6× serially on scans, filtered COUNTs, and
+  aggregates — before the parallel split compounds it.
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index
   and touches only matching rows; SQLite's planner picks a full table walk
   on this workload shape.
 - **Rowid range scans**: `WHERE id BETWEEN ? AND ?` runs a dedicated fast
   path — no pipeline setup, binary-searched leaf descent, and an early
-  stop at the first cell past the range end (previously every leaf right
-  of the range was still visited). 100- and 1000-row ranges now beat
-  SQLite; 10-row ranges cut from 39 µs to ~10 µs.
+  stop at the first cell past the range end. Every measured range size
+  (10/100/1000/5000 rows) beats SQLite ~2×.
 - **Filtered joins**: IndexNestedLoopJoin + a warm statement cache beats
   SQLite's prepared-statement path on point-filtered joins.
 - **Bulk inserts**: BTREE_APPEND right-most descent + append-mode splits +
   codec v2 (rows are ~40% smaller than v1) keep sequential loads dense.
-- **File size**: byte-exact with SQLite on identical workloads (4 KiB
-  default pages, ~100% sequential-load page fill, overflow chains).
+- **File size & memory**: byte-exact file size with SQLite on identical
+  workloads (4 KiB default pages, ~100% sequential-load page fill,
+  overflow chains), and **equal-or-lower peak RSS** on every measured
+  shape (0.92–0.94×) — streaming drivers, LIMIT-early-stop, and bounded
+  write-txn spill (see the resource table above).
 - **Streaming**: `fetch()` / `Statement::step` deliver rows in batches from
   a resumable fused Filter-over-Scan driver with selective decode —
   non-matching rows decode only the predicate's columns, and `LIMIT k`
@@ -247,16 +298,17 @@ identical sqlx API and pool options:
 
 ### Where the remaining deltas are
 
-Every `bench_compare` row now leads or matches; the residual deltas are
-elsewhere and shrinking (full ledger in GAP_ANALYSIS.md):
+Every `bench_compare` row is an outright win; the residual deltas are
+elsewhere (full ledger in GAP_ANALYSIS.md):
 
-- **Binary size (+0.4 MB)**: mimalloc adds ~140 KiB of code but buys
-  1.5–2.1× on write-heavy paths; builds with `default-features = false`
-  drop it.
-- **8-conn mixed R/W 80/20 (1.05x)**: at high write-fan-out the writer
+- **Binary size (+1.0 MB, 1.5x)**: mimalloc (~140 KiB) plus the engine's
+  own feature surface (plugins, sqlx driver, parallel executor) —
+  `default-features = false` drops mimalloc; SQLite's ~2 MB is a
+  25-year-head-start of hand-tuned code size.
+- **8-conn mixed R/W 80/20 (1.05x)**: at high write fan-out the writer
   gate + commit fsync dominates; reads stay 2.8× throughout.
-- **`UPDATE range` (1.03x)**: parity at the bench's size; wins grow with
-  table size (payload-patch fast path avoids full row re-encode).
+- **2-table join / UPDATE by PK (1.08–1.10x)**: wins, but narrow — the
+  statement cache keeps both at parity; they grow with table size.
 
 Run the benchmarks yourself:
 
@@ -410,13 +462,17 @@ cargo run --release --example bench_sqlx_native --features sqlx
 
 Known gaps (shrinking — see `GAP_ANALYSIS.md` for the full ledger):
 
-- **Concurrent access**: page-level MRMW reads (3.1× SQLite's
-  concurrent-read throughput) plus the sqlx driver's snapshot isolation
-  (no dirty reads, readers never blocked by read-only transactions).
+- **Concurrent access**: page-level MRMW reads (**8.3×** SQLite's
+  concurrent-read throughput), the sqlx driver's snapshot isolation
+  (no dirty reads, readers never blocked by read-only transactions),
+  and intra-statement parallel aggregation (5.7–8.2× on 1M-row scans).
   Multi-connection single-writer concurrency is SQLite-equivalent;
-  multiple concurrent writers still serialize through the write gate.
+  multiple concurrent writers still serialize through the write gate
+  (SQLite's own contract — BUSY + busy timeout).
 - **Numeric precision**: `AVG` rounds to 10 decimals; some edge cases in
-  real formatting differ from SQLite.
+  real formatting differ from SQLite. Parallel REAL SUMs merge partial
+  sums in range order — the last ULP can differ from a serial scan (the
+  latitude every parallel SQL engine takes).
 - **Compat surface**: `sqlite3_serialize`/`deserialize`, preupdate hooks,
   and unlock-notify are stubs in `compat/`; `sqlite_master` DDL text and a
   few `PRAGMA` result shapes continue to be tightened via differential

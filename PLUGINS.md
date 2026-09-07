@@ -330,3 +330,10 @@ Costs:
 
 Statement caches are invalidated on plugin registration (plans may hold
 `Arc<Table>` schemas affected by vtab connects).
+
+The engine's head-to-head vs SQLite — performance (1.4–2.4× inserts,
+2.0–4.6× reads), resource consumption (byte-exact file size, 0.94× peak
+RSS), and concurrency (8.3× concurrent reads, 5.7–8.2× intra-statement
+parallel aggregates) — is measured with the plugin system compiled in
+and zero plugins registered, so those numbers are the plugin-less fast
+path's numbers. See `BENCHMARKS.md` [9] for the consolidated tables.

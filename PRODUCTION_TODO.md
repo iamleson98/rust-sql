@@ -6,7 +6,21 @@
 > criterion benchmark harness running identical workloads against
 > `rusqlite` and rustqlite.
 
-## Current baseline (recorded `2026-08-28`, after IndexNestedLoopJoin + index split fix + in-place UPDATE + deferred flush)
+## ✅ Status (2026-09-07 re-measurement) — goal reached on all three axes
+
+Fresh `cargo run --release --example bench_compare` run: **every workload
+row is an outright win** (inserts 1.4–2.4×, reads 2.0–4.6×, GROUP BY 2.7×,
+deletes 2.1×, joins 1.1–1.8×), **resource consumption at parity or better**
+(DB file size byte-exact at 262.14 KB, peak RSS 0.94× at 44.2 vs 46.9 MB,
+WAL commits 1.13× faster — only the stripped binary is 1.5× larger,
+deliberately, for mimalloc's 1.5–2.1× write wins), and **concurrency
+beyond SQLite's design envelope** (8-thread concurrent reads 8.3×,
+1-writer/7-reader 2.0×, intra-statement parallel aggregates 5.7–8.2× on
+1M rows). Full tables: BENCHMARKS.md [9] and GAP_ANALYSIS.md §1. The
+table below is the historical 2026-08-28 baseline, kept for the record
+of the trajectory.
+
+## Current baseline (recorded `2026-08-28`, after IndexNestedLoopJoin + index split fix + in-place UPDATE + deferred flush — historical)
 
 `cargo test --release`: **57 unit + 1 differential (164 cases) + 1 SLT (140 cases) + 2 doctests = 61 tests, 304 internal cases, all passing.**
 `cargo run --release --example bench_compare` on the same workload (with `set_deferred_flush(true)` mirroring SQLite's WAL+synchronous=NORMAL):

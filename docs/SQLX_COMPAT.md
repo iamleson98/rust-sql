@@ -9,6 +9,7 @@ wired:
 | C toolchain / FFI | none — 100% safe Rust | builds + links `libsqlite3.so` |
 | Works with | sqlx 0.9 (unmodified, generic API) | sqlx 0.9 **and sea-orm 2.0** (unmodified) |
 | Perf vs sqlx-sqlite | 1.5–2.8× (18× on `fetch()` streams) | ≈ rusqlite-level (C ABI + worker thread) |
+| Concurrency vs sqlx-sqlite | 8-task one pool **5.1×**, 8-conn reads **2.8×**, 1 writer + 7 readers **2.0×**, mixed R/W 1.05× | SQLite-exact semantics (BUSY-then-retry, snapshot isolation) |
 | Doc | [`src/sqlx_driver` module docs](../src/sqlx_driver/mod.rs) | this page, below |
 
 ## Path A — native Rust driver (`features = ["sqlx"]`)
@@ -46,6 +47,16 @@ connection's uncommitted writes (they wait, then `SQLITE_BUSY` after the
 busy timeout); read-only transactions never block readers; a dropped
 connection rolls back whatever transaction it left open. See the module
 docs and `tests/sqlx_driver.rs` (27 tests) for the full contract.
+
+**Performance & concurrency headroom** (same sqlx API and pool options,
+`examples/bench_sqlx_native.rs`): point lookups 2.7×, filtered scans
+2.6×, GROUP BY 2.8×, transactions 3.7×, `fetch()` streams 18.4×; under
+concurrency, 8 tasks on one pool 5.1×, 8 connections reading 2.8×, and
+1 writer + 7 readers 2.0× (a lock-free per-thread committed-view memo —
+readers run at BEGIN-time roots under an open write txn). The engine
+beneath additionally splits large single-statement aggregates across
+worker threads (5.7–8.2× on 1M rows — SQLite's executor is
+single-threaded by design; see BENCHMARKS.md [8]/[9]).
 
 **sea-orm note**: sea-orm's connection layer hardcodes the three sqlx
 backends it ships (sqlite/postgres/mysql), so a custom sqlx backend

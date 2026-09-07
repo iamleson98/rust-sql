@@ -16,6 +16,8 @@ cargo test --test sql_fuzz                    # mutation + structured SQL fuzz
 cargo test --test db_corrupt_fuzz             # database corruption fuzz
 cargo test --test integrity_check             # PRAGMA integrity_check itself
 cargo test --test differential                # results vs real SQLite
+cargo test --test parallel_scan               # intra-statement parallelism vs serial
+cargo test --test concurrent_throughput       # concurrent-read/write vs SQLite
 RUSTQLITE_FUZZ_ITERS=200000 cargo test --test sql_fuzz   # long fuzz run
 RUSTQLITE_FUZZ_SEED=12345 cargo test --test sql_fuzz     # reproduce a failure
 cargo clippy --all-targets                    # zero-warning lint gate
@@ -38,7 +40,7 @@ cargo run --release --example bench_compare   # performance vs SQLite
 | **Differential testing** | `tests/differential.rs` | randomized workloads executed against rustqlite and real SQLite; row sets must be identical |
 | **`PRAGMA integrity_check`** (§3.2's verifier) | `tests/integrity_check.rs` + `src/storage/integrity.rs` | full structural walk: file shape (WAL-aware), freelist chain (cycles, bounds), every table b-tree (rowid ordering, record decoding), every index b-tree (entry order, bidirectional index↔table cross-verification). Clean DBs report `ok`; induced corruption is reported (never panics). Run by the crash and I/O-error suites after every fault |
 | **Soak / long-run** | `RUSTQLITE_FUZZ_ITERS=200000` env on the fuzzers; `tests/concurrency_stress.rs` | 32-thread mixed workload for 2s, long fuzz iterations |
-| **Concurrency testing** (§5) | `tests/concurrency_stress.rs`, `tests/concurrent_throughput.rs`, `tests/concurrent*.rs` | 16-thread pure reads, mixed readers+writer, writer serialization, snapshot consistency, throughput scaling — no deadlocks, no lost writes, no torn reads |
+| **Concurrency testing** (§5) | `tests/concurrency_stress.rs`, `tests/concurrent_throughput.rs`, `tests/parallel_scan.rs`, `tests/concurrent*.rs` | 16-thread pure reads, mixed readers+writer, writer serialization, snapshot consistency, throughput scaling — no deadlocks, no lost writes, no torn reads; **intra-statement parallelism**: parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order), a 300k-row SQLite cross-check, transaction-decline and PRAGMA-gate contracts |
 | **SQL Logic Tests (SLT)** | `tests/slt_runner.rs` + `tests/slt/` | the SQL Logic Test format (record/query/result files) — the same format SQLite's core team uses for thousands of conformance cases |
 | **Memory-error detection (valgrind/ASan)** (§3.4) | Rust's ownership model + `--features oom-injection` allocator | use-after-free / leaks are prevented by construction; allocation failure behavior is exercised explicitly |
 | **Sanitizer-style checks** | `cargo clippy --all-targets` at zero warnings | a language-level static audit, kept clean at all times |

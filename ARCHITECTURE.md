@@ -349,8 +349,8 @@ impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database>;
     pub fn open_in_memory() -> Result<Database>;
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()>;
-    pub fn query<P: Params>(&mut self, sql: &str, params: P) -> Result<Vec<Row>>;
-    pub fn query_with_columns<P: Params>(&mut self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)>;
+    pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>>;
+    pub fn query_with_columns<P: Params>(&self, sql: &str, params: P) -> Result<(Vec<String>, Vec<Row>)>;
 }
 
 pub trait Params {
@@ -361,7 +361,7 @@ pub trait Params {
 // Implemented for: (), Vec<Value>, [Value; N]
 ```
 
-The API is rusqlite-like: `execute` for statements that don't return rows, `query` for those that do. Parameters are passed as a `Vec<Value>` or array.
+The API is rusqlite-like: `execute` for statements that don't return rows, `query` for those that do. Parameters are passed as a `Vec<Value>` or array. `query` takes `&self` — concurrent readers can share one `Database` and query simultaneously (the concurrency model below).
 
 ---
 
@@ -391,21 +391,43 @@ The server is single-threaded (one connection at a time). A `Mutex<Database>` pr
 - **B+tree correctness**: Tested with randomized inserts, point lookups, range scans, and deletes. The split logic is the trickiest part and is well-tested.
 - **WAL integrity**: CRC32 + salt + running checksum makes torn-write recovery robust.
 - **SQL coverage**: The parser handles a large subset of SQLite's SQL grammar, including window functions, CTEs, UPSERT, RETURNING.
+- **Concurrency model**: `&self` reads + per-page locks + scoped worker threads give three distinct concurrency tiers (inter-connection, inter-statement, intra-statement) with zero unsafe code.
 
-### What we cut
+### What we cut (deliberate omissions)
 
-- **Streaming executor**: Collect-all is simpler but limits memory efficiency. The fix is to move to `Rc<RefCell<>>` for shared state and implement a Volcano-style pull iterator.
-- **Index-based query planning**: Indexes are stored but not consulted by the planner. Adding this is mostly mechanical: in the planner, when a `WHERE col = ?` predicate matches an index's first column, replace `Scan` with `IndexScan` + `RowidLookup`.
-- **Subquery execution**: Scalar subqueries and `EXISTS` parse but return `Unsupported` at execution. The fix is to add a `Subquery` operator that re-enters the executor recursively.
-- **Trigger firing**: Triggers are stored in the catalog but never fired. The fix is to hook into `exec_insert`/`exec_update`/`exec_delete` and dispatch to triggers registered on the affected table.
-- **Foreign key enforcement**: Parsed but not enforced. The fix is to add post-INSERT/UPDATE/DELETE checks against referenced tables.
+- **Multi-writer transactions**: one writer at a time, `SQLITE_BUSY` + busy timeout — SQLite's own durability contract. True concurrent writers would need a page-level conflict tracker; documented rather than diverged from.
+- **The VDBE**: SQLite's bytecode executor buys statement portability ( TCL/Python generators) at dispatch cost; rustqlite's direct Rust call tree is a large part of why serial scans run 2–4.6× faster.
+- **Async runtime inside the engine**: the engine stays synchronous and `Send`+`Sync`; async lives in the sqlx driver layer, which runs statements inline in the task (no dedicated worker thread).
 
-### Performance characteristics
+### Performance, memory & concurrency characteristics (vs SQLite)
 
-- **Range scans are faster than SQLite** because our executor has less per-row overhead (no VDBE interpretation, no type coercion layer).
-- **Point lookups are slower** because we don't yet use the rowid B+tree for `WHERE rowid = ?` — we always scan. Adding `RowidLookup` to the planner (it's already implemented as an operator) would close most of this gap.
-- **Inserts are slower** because we flush after every statement. Wrapping in a transaction (or batching flushes) would close the gap.
-- **Joins are slower** because we use nested-loop with materialization. A hash join or streaming nested-loop would close the gap.
+Measured head-to-head on identical workloads (`bench_compare`, 2026-09-07;
+full tables in BENCHMARKS.md, including [9]):
+
+- **Serial execution wins every workload row**: inserts 1.4–2.4×, range
+  scans 2.0–2.3×, aggregates 4.6×, GROUP BY 2.7×, deletes 2.1×, joins
+  1.1–1.8×. Mechanisms: fused scan drivers with selective column decode,
+  the bucket-keyed 2-way leaf cache + cursor-ix cell bias for point
+  lookups, BTREE_APPEND + append-mode splits for bulk loads, payload-patch
+  UPDATE fast path.
+- **Resource consumption at parity or better**: byte-exact DB file size
+  (4 KiB pages + SQLite-class record codec), peak RSS 0.92–0.94× SQLite
+  (streaming batch decode, LIMIT early-stop, DELETE-mode write-txn page
+  spill), WAL commits 1.13× faster. The one tradeoff: stripped binary
+  1.5× larger (mimalloc buys 1.5–2.1× write throughput; feature surface
+  is the rest; `default-features = false` opts out).
+- **Concurrency**: three tiers, each beyond SQLite's design envelope —
+  (1) inter-connection: per-page locks + interior-mutability pager give
+  8-thread concurrent reads **8.3×** SQLite's serialized-connection-mutex
+  model, with snapshot isolation (readers never see uncommitted writes);
+  (2) inter-statement: the sqlx driver executes inline in the async task
+  (5.1× on 8-task pools, 2.0× on 1-writer/7-reader); (3) **intra-statement**:
+  large single-table aggregates split across worker threads with a
+  deterministic range-ordered merge — 5.7–8.2× on 1M rows, on a frontier
+  SQLite's single-threaded executor cannot follow at all.
+- **Where SQLite still wins**: nothing measured; the residual deltas are
+  binary size (deliberate) and mixed R/W under high write fan-out at the
+  sqlx layer (1.05× — the writer gate + commit fsync dominates).
 
 ---
 
@@ -460,18 +482,24 @@ examples/
 
 The highest-impact improvements, in rough priority order:
 
-1. **Streaming executor**: Move from collect-all to pull-based iterators using `Rc<RefCell<>>` for shared state. This unblocks large result sets and reduces peak memory.
-2. **Index-based planning**: Wire `RowidLookup` and `IndexScan` into the planner. Closes the point-lookup gap.
-3. **Subquery execution**: Implement scalar subqueries, `IN (subquery)`, `EXISTS (subquery)`. Add a `Subquery` operator that re-enters the executor.
-4. **Insert batching**: Group multiple inserts in a transaction into a single WAL flush. Closes the insert gap.
-5. **Hash join**: For equi-joins between medium/large relations, build a hash table on the smaller side. Closes the join gap.
-6. **Trigger firing**: Hook into DML operators to dispatch to triggers.
-7. **FK enforcement**: Post-DML constraint checks.
-8. **View expansion**: In the planner, expand view references to their underlying SELECT.
-9. **Predicate pushdown**: Push `WHERE` predicates into `Scan` operators so they can use indexes.
-10. **Cost-based optimization**: Track table statistics (row counts, cardinality) and choose join order / index selection based on cost.
+1. **Parallel ORDER BY / top-N**: extend `executor::parallel` from
+   aggregates to bounded top-N selection (per-worker keep-heaps, merged
+   under the same total order — provably identical to the serial result)
+   and full sorts (chunk sort + k-way range-ordered merge).
+2. **Compiled no-GROUP-BY aggregates with parameter filters**: the fused
+   machine's filter shape covers numeric column comparisons; complex
+   predicates with bound params still run the generic path.
+3. **Multi-writer transactions**: page-level conflict tracking inside
+   the write gate (out of scope today — SQLite's own contract is one
+   writer at a time).
+4. **Cost-based planning**: table statistics (row counts, cardinality)
+   driving join order / index choice.
+5. **Prefetch / read-ahead**: batched page I/O for file-backed large
+   scans (the pager already dedupes; sequential prefetch would cut syscall
+   count).
 
-Each of these is a self-contained project that fits cleanly into the existing architecture.
+Each is a self-contained project that fits cleanly into the existing
+architecture.
 
 ---
 

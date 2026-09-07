@@ -38,3 +38,18 @@ RUSTQLITE_LIB_DIR=../target/release cargo run --release --bin migrate_interop   
 | `sea_orm_interop` | `DeriveEntityModel` entities, `Schema::create_table` from entities, insert with auto-generated PK, `find_by_id`, filter + order, update, delete, transaction rollback + commit, duplicate-insert error propagation (UNIQUE violation with the exact SQLite message) |
 | `sea_orm_relations` | junction-table entities (`#[sea_orm::model]` + `has_many, via`), `find_also_related` two-hop LEFT JOINs (with NULL rows), `Linked::find_linked` INNER JOIN chains, `find_with_related` grouped loading, the paginator (COUNT + LIMIT/OFFSET pages), relation counts with filters |
 | `migrate_interop` | `sqlx::migrate!` fresh apply, idempotent re-run, `_sqlx_migrations` bookkeeping, `pragma_table_info`, atomic rollback of failing migrations, multi-pool schema visibility |
+
+## Performance & concurrency vs SQLite
+
+Through this C-ABI layer throughput is ≈ rusqlite-level (the
+step/bind/column protocol and FFI boundary dominate), with SQLite-exact
+concurrency semantics (cross-connection BUSY-then-retry, snapshot
+isolation — the suites above verify both). The engine underneath beats
+SQLite on every head-to-head row — performance (1.4–2.4× inserts,
+2.0–4.6× reads, 2.7× GROUP BY), resource consumption (byte-exact file
+size, 0.94× peak RSS), and concurrency (8.3× concurrent reads,
+5.7–8.2× intra-statement parallel aggregates on 1M rows; see
+`BENCHMARKS.md` [9]). For the engine's full concurrency envelope without
+the FFI hop, use the native Rust driver (`features = ["sqlx"]`,
+`docs/SQLX_COMPAT.md` Path A): 1.5–2.8× sqlx-sqlite on mixed workloads,
+5.1× on 8-task pools, 18.4× on `fetch()` streams.

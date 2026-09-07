@@ -1,6 +1,6 @@
 # rustqlite vs SQLite — Detailed Comparison Report
 
-**Date:** 2026-07-30 (initial) · **Updated:** 2026-09-07 (intra-statement parallel aggregation — see the new [8] parallel section and `executor::parallel`)
+**Date:** 2026-07-30 (initial) · **Updated:** 2026-09-07 (intra-statement parallel aggregation — see the new [8] parallel section and `executor::parallel`; resource/concurrency close-out re-measurement — see [9])
 **Engines:** rustqlite 0.1.0 (this project) vs SQLite 3.46 (via `rusqlite` 0.32 with `bundled` feature)
 **Methodology:** Single-process, in-memory databases (`:memory:`), single-threaded unless noted. SQLite configured with `PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF` to level the durability playing field. Both engines compiled with `lto = "fat"` and `codegen-units = 1`.
 **Hardware:** Linux x86_64, Rust 1.98.0.
@@ -63,17 +63,18 @@ wins, 0 ties, 0 losses** (COUNT(*) 32.9×, multi-VALUES 1.17×).
 | Range COUNT       | **2.2× faster**       | zero-decode cell counting via Btree::count_rows_range                  |
 | COUNT(*) bare     | **27× faster**        | FastPath::CountStar + write-epoch memoization (92 ns vs 2.5 µs)         |
 | sqlx driver (vs sqlx-sqlite) | **1.5–18.4× faster** | 11/11 scenarios; inline execution vs worker thread + FFI |
-| Large-table parallel aggregates (1M rows) | **5.6–8.2× faster** | worker-split scans + range-ordered merge; SQLite's executor is single-threaded by design (see [8]) |
+| Large-table parallel aggregates (1M rows) | **5.7–8.2× faster** | worker-split scans + range-ordered merge; SQLite's executor is single-threaded by design (see [8]) |
 | DB file size      | **byte-exact**        | 4 KiB default pages now match SQLite's file size exactly (262,144 B each on the 10k-row bench) |
-| Binary size       | 1.16× larger (est.)   | mimalloc (~140 KiB) buys the 1.5–2.1× write wins; no-default-features build is 2.17 MB |
-| Peak RSS          | **0.92×**             | 32.8 vs 35.5 MB                                                        |
-| WAL commits       | **1.13× faster**      | 25.3 vs 28.5 µs/txn (delete journal mode: 6.2× faster)                  |
+| Binary size       | 1.5× larger (est.)   | mimalloc (~140 KiB) buys the 1.5–2.1× write wins; no-default-features build drops it (see [9]) |
+| Peak RSS          | **0.94×**             | 44.2 vs 46.9 MB (whole bench run incl. the 1M-row parallel section — see [9]) |
+| WAL commits       | **1.13× faster**      | 25.3 vs 28.5 µs/txn (delete journal mode: 6.2× faster) |
 
-**Bottom line (2026-09-02):** every criterion in `bench_compare` is now at
-parity or faster — every perf row is an outright win, the remainder (binary
-size) is a deliberate resource tradeoff with an exact-match opt-out
-(`default-features = false`), and the file size row is now byte-exact by
-default (4 KiB pages). SQL
+**Bottom line (2026-09-07 re-measurement):** every criterion in `bench_compare`
+runs as an outright win on this machine (fresh run: inserts 1.4–2.4×,
+reads 2.0–4.6×, GROUP BY 2.7×, parallel 1M-row aggregates 5.7–8.2×, peak
+RSS 0.94×, file size byte-exact); the sole resource tradeoff is binary
+size (mimalloc + feature surface, with the exact-match opt-out
+`default-features = false`). SQL
 feature surface: correlated
 subqueries (scalar/EXISTS/IN, nested, in DML), views, triggers, CTEs
 (incl. WITH RECURSIVE), window functions, JSON1, date/time, UPSERT,
@@ -244,15 +245,69 @@ Measured on 2 hardware threads (this machine; the split scales with
 
 | Workload (1M rows) | rustqlite (2 workers) | SQLite (1 thread) | Ratio |
 |--------------------|----------------------:|------------------:|------:|
-| Big aggregate (COUNT/SUM/AVG/MIN/MAX) | **16.2 ms** | 132.4 ms | **8.2× faster** |
-| Filtered aggregate (val > 500000) | **12.7 ms** | 74.7 ms | **5.9× faster** |
-| GROUP BY 10k buckets + SUM | **50.4 ms** | 281.8 ms | **5.6× faster** |
+| Big aggregate (COUNT/SUM/AVG/MIN/MAX) | **16.2 ms** | 132.8 ms | **8.2× faster** |
+| Filtered aggregate (val > 500000) | **12.5 ms** | 74.4 ms | **6.0× faster** |
+| GROUP BY 10k buckets + SUM | **49.9 ms** | 285.0 ms | **5.7× faster** |
 
 The engine-internal parallel-vs-serial speedup is 1.7–1.9× on every
 shape at 2 threads (near-linear); the vs-SQLite ratios compound the
 serial engine's ~3× fused-scan advantage with the worker split. Run
 `cargo run --release --example bench_compare` (section [8]) or
 `cargo run --release --example probe_parallel_scan` (scaling probe).
+
+## [9] Resource consumption & concurrency (2026-09-07 re-measurement)
+
+The three-way comparison the project is judged on — **performance**
+(every `bench_compare` row above), **resource consumption**, and
+**concurrency support** — measured in one fresh `bench_compare` run plus
+the criterion/sqlx harnesses on the same machine:
+
+### Resource consumption vs SQLite
+
+| Metric | rustqlite | SQLite | Verdict |
+|---|---:|---:|---|
+| DB file size (10k rows, on disk) | **262.14 KB** | 262.14 KB | **byte-exact** — 4 KiB default pages, codec v2, overflow chains, append-mode splits |
+| Peak RSS (100k insert + count, whole run incl. [8]) | **44.2 MB** | 46.9 MB | **0.94× — lower** |
+| Peak RSS at the 10k-row bench (2026-09-02 run) | **32.8 MB** | 35.5 MB | **0.92× — lower** |
+| Stripped binary (CLI) | 3.10 MB | ~2.06 MB (est.) | 1.5× larger — deliberate (below) |
+| WAL commit latency | **25.3 µs/txn** | 28.5 µs/txn | **1.13× faster**; delete journal mode 6.2× faster |
+
+**Why memory stays at parity or lower.** The collect-all executor was the
+old RSS liability (2026-07-30: 1.17× larger, §7 below — historical);
+the streaming fused drivers (`Statement::step`, `fetch()`, the fused
+Filter-over-Scan machine) now decode rows in batches with selective
+column decode instead of materializing result sets; `LIMIT k` stops the
+B+tree walk at the k-th match; big write transactions spill pages in
+DELETE journal mode (bounded RSS for 100k+-row txns); and each parallel
+worker's scratch is bounded (one `FusedWalk`/grouper plus buffers). The
+one regression is deliberate: mimalloc (~140 KiB of code) buys the
+1.5–2.1× write-throughput wins, and the rest of the growth is the
+feature surface itself (plugins, sqlx driver, parallel executor).
+`default-features = false` drops mimalloc.
+
+### Concurrency support vs SQLite
+
+| Concurrency workload | rustqlite vs SQLite | Mechanism |
+|---|---|---|
+| Concurrent reads (8 threads, criterion) | **8.3×** | per-page `Arc<Mutex<Page>>` locks + interior-mutability pager (`&self` reads) vs SQLite's serialized connection mutex |
+| 1 writer + 7 readers (sqlx pool) | **2.0×** | lock-free per-thread committed-view memo; readers see BEGIN-time roots under an open write txn |
+| 8-task one-pool (sqlx, same API) | **5.1×** | inline async-task execution vs sqlx-sqlite's dedicated worker thread + FFI |
+| 8-conn concurrent reads (sqlx) | **2.8×** | MRMW shared pages, snapshot isolation, no dirty reads |
+| 8-conn mixed R/W 80/20 (sqlx) | 1.05× | writer gate + commit fsync dominates at high write fan-out; reads stay 2.8× |
+| Intra-statement parallel aggregates (1M rows) | **5.7–8.2×** | rowid-range worker split + range-ordered merge ([8] above) — SQLite cannot follow: its executor is one-threaded **by design** |
+| Multi-connection writers | SQLite-equivalent | single writer + `SQLITE_BUSY` + busy timeout — SQLite's own contract (documented, not a divergence) |
+| Transactional isolation | SQLite semantics | snapshot isolation via WAL frame indexing; readers wait then BUSY, exactly like SQLite |
+
+**The categorical divide.** SQLite runs one query on one core, forever.
+rustqlite scales a single statement across worker threads when the table
+is large enough to pay for the split (`PRAGMA parallel_scan`, default ON
+above 131072 estimated rows — below that, or with any transaction open,
+the serial path runs unchanged). Workers run the serial path's own
+machinery over disjoint rowid ranges, so per-row semantics are identical
+by construction; any worker bail aborts the whole attempt and the serial
+path answers. Multi-writer transactions remain deliberately
+SQLite-shaped (one writer at a time) — matching SQLite's own durability
+contract rather than diverging from it.
 
 ## 1. Insert workloads
 
@@ -405,6 +460,11 @@ All the fixes from sections 2-5 compound here. With rowid lookup + index lookup 
 ---
 
 ## 7. Resource metrics
+
+> **Historical (2026-07-30 initial report).** Current state: file size is
+> byte-exact by default, peak RSS is 0.92–0.94× SQLite's, and the codec is
+> SQLite-class — see [9] for the re-measured tables. This section is kept
+> for the record of where the engine started.
 
 | Metric                                    | rustqlite | SQLite    | Ratio       |
 |-------------------------------------------|-----------|-----------|-------------|

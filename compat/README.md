@@ -73,3 +73,18 @@ RETURNING rows + changes.
 
 See `docs/SQLX_COMPAT.md` for the end-to-end guide (sqlx 0.9 and sea-orm 2.0,
 both unmodified, running on the rustqlite engine).
+
+## Performance & concurrency vs SQLite (through this layer)
+
+The engine beneath this ABI beats SQLite head-to-head on every measured
+row (see `BENCHMARKS.md` [9] for the consolidated performance / resource
+/ concurrency tables): 1.4–2.4× inserts, 2.0–4.6× reads, 8.3× 8-thread
+concurrent reads, 5.7–8.2× intra-statement parallel aggregates on 1M
+rows, byte-exact DB files, 0.94× peak RSS. Through the C ABI itself,
+throughput is ≈ rusqlite-level (the step/bind/column protocol and its
+FFI boundary dominate), while the concurrency semantics match SQLite's:
+cross-connection transaction serialization with `SQLITE_BUSY` → wait →
+retry, and snapshot isolation (readers never see uncommitted writes).
+Apps that want the engine's full concurrency envelope natively should
+use the `features = ["sqlx"]` Rust driver instead — see
+`docs/SQLX_COMPAT.md` Path A.
