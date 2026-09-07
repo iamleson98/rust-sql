@@ -1,6 +1,6 @@
 # rustqlite vs SQLite — Detailed Comparison Report
 
-**Date:** 2026-07-30 (initial) · **Updated:** 2026-09-02 (gap-close sprint: GROUP BY compiled expression keys, bucket-keyed 2-way leaf cache, cursor-ix cell bias, mimalloc post-storm wake drain, UPDATE payload-patch fast path)
+**Date:** 2026-07-30 (initial) · **Updated:** 2026-09-07 (intra-statement parallel aggregation — see the new [8] parallel section and `executor::parallel`)
 **Engines:** rustqlite 0.1.0 (this project) vs SQLite 3.46 (via `rusqlite` 0.32 with `bundled` feature)
 **Methodology:** Single-process, in-memory databases (`:memory:`), single-threaded unless noted. SQLite configured with `PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF` to level the durability playing field. Both engines compiled with `lto = "fat"` and `codegen-units = 1`.
 **Hardware:** Linux x86_64, Rust 1.98.0.
@@ -63,6 +63,7 @@ wins, 0 ties, 0 losses** (COUNT(*) 32.9×, multi-VALUES 1.17×).
 | Range COUNT       | **2.2× faster**       | zero-decode cell counting via Btree::count_rows_range                  |
 | COUNT(*) bare     | **27× faster**        | FastPath::CountStar + write-epoch memoization (92 ns vs 2.5 µs)         |
 | sqlx driver (vs sqlx-sqlite) | **1.5–18.4× faster** | 11/11 scenarios; inline execution vs worker thread + FFI |
+| Large-table parallel aggregates (1M rows) | **5.6–8.2× faster** | worker-split scans + range-ordered merge; SQLite's executor is single-threaded by design (see [8]) |
 | DB file size      | **byte-exact**        | 4 KiB default pages now match SQLite's file size exactly (262,144 B each on the 10k-row bench) |
 | Binary size       | 1.16× larger (est.)   | mimalloc (~140 KiB) buys the 1.5–2.1× write wins; no-default-features build is 2.17 MB |
 | Peak RSS          | **0.92×**             | 32.8 vs 35.5 MB                                                        |
@@ -223,6 +224,35 @@ as a known limitation pending an architectural change to thread
 Run: `cargo test --release --test differential`
 
 ---
+
+## [8] Large-table PARALLEL aggregates (2026-09-07) — intra-statement parallelism
+
+SQLite's executor is single-threaded by design — one query, one core,
+forever. rustqlite now splits large single-table aggregate scans across
+worker threads (`executor::parallel`): the rowid space is partitioned
+into inclusive ranges, each worker runs the serial path's own
+fused/compiled walk over its range, and partial accumulators merge in
+RANGE order (deterministic — GROUP BY first-seen order identical to a
+serial scan; integer sums exact). `PRAGMA parallel_scan` gates it
+(default ON, min-rows 131072; 0/OFF = always serial, bit-identical).
+Workers decline while any transaction is open, and any worker bail
+falls back to the serial path — the parallel attempt can never produce
+a divergent answer.
+
+Measured on 2 hardware threads (this machine; the split scales with
+`available_parallelism()`), 1M rows, best-of-5, in-memory:
+
+| Workload (1M rows) | rustqlite (2 workers) | SQLite (1 thread) | Ratio |
+|--------------------|----------------------:|------------------:|------:|
+| Big aggregate (COUNT/SUM/AVG/MIN/MAX) | **16.2 ms** | 132.4 ms | **8.2× faster** |
+| Filtered aggregate (val > 500000) | **12.7 ms** | 74.7 ms | **5.9× faster** |
+| GROUP BY 10k buckets + SUM | **50.4 ms** | 281.8 ms | **5.6× faster** |
+
+The engine-internal parallel-vs-serial speedup is 1.7–1.9× on every
+shape at 2 threads (near-linear); the vs-SQLite ratios compound the
+serial engine's ~3× fused-scan advantage with the worker split. Run
+`cargo run --release --example bench_compare` (section [8]) or
+`cargo run --release --example probe_parallel_scan` (scaling probe).
 
 ## 1. Insert workloads
 

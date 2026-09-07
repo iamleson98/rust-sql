@@ -162,6 +162,13 @@ pub(crate) const COMMITTED_EPOCH_MARK: u64 = 1u64 << 47;
 /// no-hash fast path for every page of a normal database.
 const PAGE_VEC_DIRECT_LIMIT: usize = 1 << 20;
 
+/// PRAGMA parallel_scan default: tables at or above this estimated row
+/// count split their aggregate scans across worker threads
+/// (`executor::parallel`). 128k rows sits above every existing
+/// test/bench table (so those paths stay serial, bit-identical) and
+/// below the 1M-row analytical range where the split pays.
+pub(crate) const DEFAULT_PARALLEL_SCAN_MIN_ROWS: i64 = 131_072;
+
 /// Dense page-id → page cache.
 ///
 /// Page ids are small sequential integers, so low ids are stored in a
@@ -748,6 +755,14 @@ pub struct Pager {
     /// bookkeeping (checkpoint / set_len / sidecar removal) so it cannot
     /// clobber the freshly written compact image. See `retire()`.
     retired: AtomicBool,
+    /// PRAGMA parallel_scan — the minimum estimated row count at which
+    /// single-table aggregate scans split across worker threads (see
+    /// `executor::parallel`). 0 disables intra-statement parallelism
+    /// (the serial paths are then ALWAYS taken, bit-identical). Lives on
+    /// the pager — like foreign_keys/recursive_triggers — because the
+    /// executor's ExecContext carries a `&Pager`, the one shared handle
+    /// both the engine and the statement dispatcher reach.
+    parallel_scan_min_rows: std::sync::atomic::AtomicI64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1422,9 @@ impl Pager {
             user_version: std::sync::atomic::AtomicU32::new(0),
             application_id: std::sync::atomic::AtomicU32::new(0),
             retired: AtomicBool::new(false),
+            parallel_scan_min_rows: std::sync::atomic::AtomicI64::new(
+                crate::storage::pager::DEFAULT_PARALLEL_SCAN_MIN_ROWS,
+            ),
         };
 
         let file_size = pager.store.len()?;
@@ -4207,6 +4225,21 @@ impl Pager {
     pub fn recursive_triggers_enabled(&self) -> bool {
         self.recursive_triggers_enabled
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// PRAGMA parallel_scan: the minimum estimated row count at which
+    /// single-table aggregate scans split across worker threads. 0 =
+    /// disabled (always serial). See `executor::parallel`.
+    pub fn parallel_scan_min_rows(&self) -> i64 {
+        self.parallel_scan_min_rows
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// PRAGMA parallel_scan write side. 0/negative disables; a positive
+    /// value is the custom min-rows threshold.
+    pub fn set_parallel_scan_min_rows(&self, n: i64) {
+        self.parallel_scan_min_rows
+            .store(n.max(0), std::sync::atomic::Ordering::Release);
     }
 
     pub fn cache_bytes(&self) -> usize {

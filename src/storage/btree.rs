@@ -2502,6 +2502,35 @@ impl<'a> Btree<'a> {
         Ok(Some(leaf_id))
     }
 
+    /// Cheap upper-bound row estimate for parallel-scan eligibility: the
+    /// LAST cell's rowid on the right-most leaf — one O(log N) descent,
+    /// no payload decode. For dense-rowid tables (bulk INSERT shapes)
+    /// this is the row count; with deletes it over-counts, which at
+    /// worst starts a parallel scan whose workers find fewer rows (the
+    /// split stays valid — the right-most worker is just lighter).
+    /// Returns 0 for an empty (or degenerate) tree.
+    pub fn max_rowid_hint(&self) -> Result<i64> {
+        let leaf = self.right_most_leaf()?;
+        let page = self.pager.get_page(leaf)?;
+        let guard = page.lock();
+        match guard.page_type()? {
+            PageType::LeafTable => {
+                let n = guard.n_cells();
+                if n == 0 {
+                    return Ok(0);
+                }
+                let ptr = guard.cell_pointer(n - 1) as usize;
+                match decode_rowid_only(guard.cell_slice_checked(ptr)?) {
+                    Some((rowid, _)) => Ok(rowid),
+                    None => Err(Error::corruption("truncated leaf rowid in max_rowid_hint")),
+                }
+            }
+            // Degenerate interior (delete-heavy churn can leave one; see
+            // right_most_leaf). No live right-most leaf row to read.
+            _ => Ok(0),
+        }
+    }
+
     /// Descend the right-most-child chain to the right-most leaf.
     fn right_most_leaf(&self) -> Result<PageId> {
         let mut page_id = self.root;

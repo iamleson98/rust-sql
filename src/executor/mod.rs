@@ -15,6 +15,7 @@ pub mod datetime;
 pub(crate) mod explain;
 pub mod expr;
 pub mod json;
+pub(crate) mod parallel;
 pub(crate) mod predicate;
 pub(crate) mod tableval;
 pub(crate) mod triggers;
@@ -4393,7 +4394,10 @@ impl Default for HashGrouper {
     }
 }
 
-struct HashGrouper {
+/// HashGrouper: pub(crate) — the parallel driver
+/// (`executor::parallel::try_parallel_groupby_selective`) hands merged
+/// groupers back across the module boundary.
+pub(crate) struct HashGrouper {
     /// Open-addressing slots: (key hash, group index + 1); group index 0
     /// marks an empty slot. Capacity is a power of two, `mask = cap - 1`,
     /// growing at 75% load (rehash in place — group indices stay valid).
@@ -4745,6 +4749,24 @@ fn exec_aggregate_streaming_scan(
     let mut bt = Btree::new(ctx.pager, root, false);
 
     if selective_eligible {
+        // ==== Intra-statement parallel split (the concurrency frontier
+        // SQLite's single-threaded executor cannot follow): big tables
+        // split their rowid space across workers; each runs this loop's
+        // exact semantics over its range; partials merge in range order
+        // (first-seen group order identical to the serial scan). Any
+        // decline below threshold / config / shape falls through to the
+        // serial loop unchanged.
+        if let Some(g) = crate::executor::parallel::try_parallel_groupby_selective(
+            ctx,
+            &table,
+            &key_col_indices,
+            &agg_col_indices,
+            aggregates,
+            n_cols,
+        )? {
+            drop(bt);
+            return finish_group_result(g, group_by, aggregates);
+        }
         // ==== Fully vectorized path: selective decode + direct indexing ====
         // Per-agg decode positions + COUNT(*) flags resolved ONCE (was a
         // `wanted.iter().position()` scan + Value clone per agg per row).
@@ -4861,6 +4883,30 @@ fn exec_aggregate_streaming_scan(
             }
             wanted.sort_unstable();
             wanted.dedup();
+
+            // Intra-statement parallel split (see the selective-branch
+            // note above): the compiled loop replicated per rowid range,
+            // merged in range order — identical groups, identical order.
+            // Declines unless the filter also compiled (workers have no
+            // eval_row context).
+            if filter_predicate.map_or(true, |_| compiled_filter.is_some()) {
+                if let Some(g) = crate::executor::parallel::try_parallel_groupby_compiled(
+                    ctx,
+                    &table,
+                    &wanted,
+                    &compiled_keys,
+                    &compiled_args,
+                    &key_col_indices,
+                    &agg_col_indices,
+                    compiled_filter.as_ref(),
+                    aggregates,
+                    group_by.len(),
+                    n_cols,
+                )? {
+                    drop(bt);
+                    return finish_group_result(g, group_by, aggregates);
+                }
+            }
 
             let mut wide: Vec<Value> = vec![Value::Null; n_cols];
             let mut owned_key: Value = Value::Null;
@@ -5135,12 +5181,18 @@ enum FusedCmp {
     GtEq,
 }
 
+/// `fused_filter_of`'s extracted shape (Clone: the parallel driver
+/// clones one per worker).
+#[derive(Clone)]
 struct FusedFilter {
     col: usize,
     lit: NumVal,
     cmp: FusedCmp,
 }
 
+/// One aggregate's fused spec (op + decode slot). Clone: the parallel
+/// driver clones the spec set per worker.
+#[derive(Clone)]
 struct FusedAggSpec {
     op: FusedOp,
     /// Decoded-slot position of the argument (None for COUNT(*)).
@@ -5150,6 +5202,325 @@ struct FusedAggSpec {
 /// Maximum distinct argument/filter columns the fused machine handles
 /// (stack array). Wider shapes fall back to the generic paths.
 const FUSED_MAX_COLS: usize = 8;
+
+/// Typed accumulator state of ONE fused aggregate spec. Lives at module
+/// level (was a local in `try_fused_aggregate`) so the parallel driver
+/// (`executor::parallel`) can run one `FusedWalk` per worker and merge
+/// partials with `fused_merge_acc`. No `Default`: `sum_is_int` must start
+/// `true` (an int-sum accumulator) — `FusedAcc::new` is the only
+/// constructor.
+#[derive(Clone)]
+struct FusedAcc {
+    count: u64,
+    i_sum: i64,
+    sum: f64,
+    /// false once a REAL input flipped the SUM/Total accumulator to f64.
+    sum_is_int: bool,
+    seen: bool,
+    min: Option<NumVal>,
+    max: Option<NumVal>,
+}
+
+impl FusedAcc {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            i_sum: 0,
+            sum: 0.0,
+            sum_is_int: true,
+            seen: false,
+            min: None,
+            max: None,
+        }
+    }
+
+    /// The accumulator's numeric sum in f64 form (int accumulators convert
+    /// at read time).
+    #[inline]
+    fn sum_f64(&self) -> f64 {
+        if self.sum_is_int {
+            self.i_sum as f64
+        } else {
+            self.sum
+        }
+    }
+}
+
+/// Fold `src` (a partial range's accumulator) into `dst`. The merge is
+/// OP-AWARE because `FusedAcc` overloads its fields per aggregate:
+/// Sum/Total use (i_sum, sum, sum_is_int); Avg uses (count, sum) with
+/// `sum` ALWAYS f64 and the int fields inert; Count uses only `count`;
+/// Min/Max use only min/max. Integer sums merge exactly; REAL sums merge
+/// in range order — float addition is not associative, so the last ULP
+/// can differ from a serial scan (the same latitude every parallel SQL
+/// engine takes; SQLite's own float-SUM order is unspecified).
+fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
+    match op {
+        FusedOp::Avg => {
+            // Avg's accumulator: (count, sum). A generic fold would hit
+            // the Sum/Total layout (i_sum/sum_is_int) and merge ZEROS —
+            // dropping the real sum on the floor.
+            dst.count = dst.count.saturating_add(src.count);
+            dst.sum += src.sum;
+        }
+        FusedOp::CountStar | FusedOp::CountCol => {
+            dst.count = dst.count.saturating_add(src.count);
+        }
+        FusedOp::Sum | FusedOp::Total | FusedOp::Min | FusedOp::Max => {
+            dst.count = dst.count.saturating_add(src.count);
+            dst.seen |= src.seen;
+            // SUM/Total: int+int stays exact; any float flips to f64 addition.
+            if dst.sum_is_int && src.sum_is_int {
+                dst.i_sum = dst.i_sum.saturating_add(src.i_sum);
+            } else {
+                let a = dst.sum_f64();
+                dst.sum = a + src.sum_f64();
+                dst.sum_is_int = false;
+            }
+            // MIN/MAX: cross-type compares as f64 (numval_lt — Value::Ord's
+            // numeric path; NaN never reaches a fused accumulator).
+            if let Some(m) = &src.min {
+                if dst.min.map_or(true, |d| numval_lt(*m, d)) {
+                    dst.min = Some(*m);
+                }
+            }
+            if let Some(m) = &src.max {
+                if dst.max.map_or(true, |d| numval_lt(d, *m)) {
+                    dst.max = Some(*m);
+                }
+            }
+        }
+    }
+}
+
+/// The fused row walker: decode ONLY the wanted numeric columns, apply
+/// the optional simple numeric filter, accumulate into `accs`. Extracted
+/// from `try_fused_aggregate`'s scan closure so the serial path and the
+/// parallel workers (`executor::parallel`) run byte-identical per-row
+/// logic — the parallel driver's contract is "same states as the serial
+/// scan, partitioned by rowid range".
+struct FusedWalk {
+    /// Table column -> decode-slot position (usize::MAX = not wanted).
+    col_slot: Vec<usize>,
+    n_cols: usize,
+    rowid_alias: Option<usize>,
+    specs: Vec<FusedAggSpec>,
+    filter: Option<FusedFilter>,
+    filter_slot: Option<usize>,
+    vals: [NumVal; FUSED_MAX_COLS],
+    accs: Vec<FusedAcc>,
+    bailed: bool,
+}
+
+impl FusedWalk {
+    fn new(
+        col_slot: Vec<usize>,
+        n_cols: usize,
+        rowid_alias: Option<usize>,
+        specs: Vec<FusedAggSpec>,
+        filter: Option<FusedFilter>,
+        filter_slot: Option<usize>,
+    ) -> Self {
+        let n = specs.len();
+        Self {
+            col_slot,
+            n_cols,
+            rowid_alias,
+            specs,
+            filter,
+            filter_slot,
+            vals: [NumVal::Null; FUSED_MAX_COLS],
+            accs: (0..n).map(|_| FusedAcc::new()).collect(),
+            bailed: false,
+        }
+    }
+
+    /// One row. Returns false to stop the walk (a bail — the caller
+    /// discards and falls back to the generic paths).
+    #[inline]
+    fn row(&mut self, rowid: i64, payload: &[u8]) -> bool {
+        // ---- decode ONLY wanted numeric columns ----
+        let mut pos = 0usize;
+        let mut col = 0usize;
+        while pos < payload.len() && col < self.n_cols {
+            let slot = self.col_slot[col];
+            if slot == usize::MAX {
+                // Not wanted: skip the whole encoded value.
+                match fused_value_size(payload, pos) {
+                    Some(sz) => {
+                        pos += sz;
+                        col += 1;
+                        continue;
+                    }
+                    None => {
+                        self.bailed = true;
+                        return false;
+                    }
+                }
+            }
+            if Some(col) == self.rowid_alias {
+                // Rowid-alias column: value is the B+tree key.
+                self.vals[slot] = NumVal::I(rowid);
+                pos += 1; // the 0x09 marker byte (or absent — short rows)
+                col += 1;
+                continue;
+            }
+            match fused_decode_num(payload, pos) {
+                Some((v, sz)) => {
+                    if let NumVal::F(f) = v {
+                        if f.is_nan() {
+                            // NaN ordering semantics live in Value::Ord —
+                            // reproduce them through the generic path.
+                            self.bailed = true;
+                            return false;
+                        }
+                    }
+                    self.vals[slot] = v;
+                    pos += sz;
+                    col += 1;
+                }
+                None => {
+                    // Text/Blob/truncated: the generic path handles these
+                    // (with text coercion semantics) — bail.
+                    self.bailed = true;
+                    return false;
+                }
+            }
+        }
+        // Short rows (ALTER TABLE ADD COLUMN): the payload ended before
+        // every column was processed — wanted slots this row did NOT
+        // write would otherwise read the PREVIOUS row's decoded value
+        // (the pre-extraction closure's latent bug). Reset them to Null
+        // (decode_row's semantics for missing columns). Full rows write
+        // every slot they read — no reset needed on the hot path.
+        let short_row = col < self.n_cols;
+        if short_row {
+            self.reset_row_slots();
+        }
+
+        // ---- filter ----
+        if let (Some(f), Some(fslot)) = (self.filter.as_ref(), self.filter_slot) {
+            let v = self.vals[fslot];
+            let pass = match (v, f.lit) {
+                (NumVal::I(a), NumVal::I(b)) => match f.cmp {
+                    FusedCmp::Eq => a == b,
+                    FusedCmp::Neq => a != b,
+                    FusedCmp::Lt => a < b,
+                    FusedCmp::LtEq => a <= b,
+                    FusedCmp::Gt => a > b,
+                    FusedCmp::GtEq => a >= b,
+                },
+                (NumVal::Null, _) | (_, NumVal::Null) => {
+                    // NULL filter semantics (SQL three-valued logic →
+                    // excluded): numeric compare with 0.0 would be WRONG.
+                    // The generic compiled predicate handles NULL; bail.
+                    self.bailed = true;
+                    false
+                }
+                (a, b) => {
+                    let (x, y) = (a.as_f64(), b.as_f64());
+                    match f.cmp {
+                        FusedCmp::Eq => x == y,
+                        FusedCmp::Neq => x != y,
+                        FusedCmp::Lt => x < y,
+                        FusedCmp::LtEq => x <= y,
+                        FusedCmp::Gt => x > y,
+                        FusedCmp::GtEq => x >= y,
+                    }
+                }
+            };
+            if !pass {
+                return true; // filtered out; nothing to accumulate
+            }
+        }
+
+        // ---- accumulate ----
+        self.accumulate();
+        true
+    }
+
+    /// Accumulate `vals` into `accs` (mirrors update_agg_state exactly).
+    #[inline]
+    fn accumulate(&mut self) {
+        for (i, spec) in self.specs.iter().enumerate() {
+            let v = match spec.slot {
+                Some(s) => self.vals[s],
+                None => NumVal::I(1), // COUNT(*) placeholder (non-null)
+            };
+            let acc = &mut self.accs[i];
+            let non_null = !matches!(v, NumVal::Null);
+            if non_null {
+                acc.seen = true;
+            }
+            match spec.op {
+                FusedOp::CountStar | FusedOp::CountCol => {
+                    if non_null {
+                        acc.count += 1;
+                    }
+                }
+                FusedOp::Sum | FusedOp::Total => {
+                    if non_null {
+                        match v {
+                            NumVal::F(f) => {
+                                if acc.sum_is_int {
+                                    acc.sum = acc.i_sum as f64;
+                                }
+                                acc.sum_is_int = false;
+                                acc.sum += f;
+                            }
+                            NumVal::I(i) => {
+                                if acc.sum_is_int {
+                                    acc.i_sum = acc.i_sum.saturating_add(i);
+                                } else {
+                                    acc.sum += i as f64;
+                                }
+                            }
+                            NumVal::Null => {}
+                        }
+                    }
+                }
+                FusedOp::Avg => {
+                    if non_null {
+                        acc.count += 1;
+                        acc.sum += v.as_f64();
+                    }
+                }
+                FusedOp::Min => {
+                    if non_null {
+                        let replace = match acc.min {
+                            None => true,
+                            Some(m) => numval_lt(v, m),
+                        };
+                        if replace {
+                            acc.min = Some(v);
+                        }
+                    }
+                }
+                FusedOp::Max => {
+                    if non_null {
+                        let replace = match acc.max {
+                            None => true,
+                            Some(m) => numval_lt(m, v),
+                        };
+                        if replace {
+                            acc.max = Some(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear written slots back to Null — called only for SHORT rows
+    /// (payload shorter than the table's column list, e.g. ALTER TABLE
+    /// ADD COLUMN): a wanted column the payload lacks decodes as NULL,
+    /// not as the previous row's value. Full rows overwrite every slot
+    /// they read, so the hot path pays nothing.
+    #[inline]
+    fn reset_row_slots(&mut self) {
+        self.vals = [NumVal::Null; FUSED_MAX_COLS];
+    }
+}
 
 /// Zero-decode COUNT(*) over a TEXT filter: `COUNT(*) WHERE col = 'lit'`
 /// or `COUNT(*) WHERE col LIKE '%needle%'`. Returns `Ok(None)` when the
@@ -5590,210 +5961,36 @@ fn try_fused_aggregate(
     }
     let filter_slot = filter.as_ref().and_then(|f| slot_of(f.col));
 
-    // ---- Typed accumulators -------------------------------------------
-    #[derive(Clone)]
-    struct FusedAcc {
-        count: u64,
-        i_sum: i64,
-        sum: f64,
-        sum_is_int: bool,
-        seen: bool,
-        min: Option<NumVal>,
-        max: Option<NumVal>,
-    }
-    let mut accs: Vec<FusedAcc> = specs
-        .iter()
-        .map(|_| FusedAcc {
-            count: 0,
-            i_sum: 0,
-            sum: 0.0,
-            sum_is_int: true,
-            seen: false,
-            min: None,
-            max: None,
-        })
-        .collect();
-
     // Column -> slot lookup table (usize::MAX = not wanted).
     let n_cols = table.n_columns();
     let mut col_slot = vec![usize::MAX; n_cols];
     for (slot, &col) in wanted_cols.iter().enumerate() {
         col_slot[col] = slot;
     }
-    let rowid_alias = table.rowid_alias;
-
-    let mut vals = [NumVal::Null; FUSED_MAX_COLS];
-    let mut bailed = false;
 
     let root = ctx.table_root(table);
     let mut bt = Btree::new(ctx.pager, root, false);
-    bt.scan_table_borrowed(|rowid, payload| {
-        // ---- inline serial walk: decode ONLY wanted numeric columns ----
-        let mut pos = 0usize;
-        let mut col = 0usize;
-        let mut filled = 0usize; // count of slots written this row
-        while pos < payload.len() && col < n_cols {
-            let slot = col_slot[col];
-            if slot == usize::MAX {
-                // Not wanted: skip the whole encoded value.
-                match fused_value_size(payload, pos) {
-                    Some(sz) => {
-                        pos += sz;
-                        col += 1;
-                        continue;
-                    }
-                    None => {
-                        bailed = true;
-                        return false;
-                    }
-                }
-            }
-            if Some(col) == rowid_alias {
-                // Rowid-alias column: value is the B+tree key.
-                vals[slot] = NumVal::I(rowid);
-                filled += 1;
-                pos += 1; // the 0x09 marker byte (or absent — short rows)
-                col += 1;
-                continue;
-            }
-            match fused_decode_num(payload, pos) {
-                Some((v, sz)) => {
-                    if let NumVal::F(f) = v {
-                        if f.is_nan() {
-                            // NaN ordering semantics live in Value::Ord —
-                            // reproduce them through the generic path.
-                            bailed = true;
-                            return false;
-                        }
-                    }
-                    vals[slot] = v;
-                    filled += 1;
-                    pos += sz;
-                    col += 1;
-                }
-                None => {
-                    // Text/Blob/truncated: the generic path handles these
-                    // (with text coercion semantics) — bail.
-                    bailed = true;
-                    return false;
-                }
-            }
-        }
-        // Short rows (ALTER TABLE ADD COLUMN): remaining wanted cols are NULL.
-        let _ = filled;
+    let mut walk = FusedWalk::new(
+        col_slot,
+        n_cols,
+        table.rowid_alias,
+        specs,
+        filter,
+        filter_slot,
+    );
+    bt.scan_table_borrowed(|rowid, payload| walk.row(rowid, payload))?;
 
-        // ---- filter ----
-        if let (Some(f), Some(fslot)) = (&filter, filter_slot) {
-            let v = vals[fslot];
-            let pass = match (v, f.lit) {
-                (NumVal::I(a), NumVal::I(b)) => match f.cmp {
-                    FusedCmp::Eq => a == b,
-                    FusedCmp::Neq => a != b,
-                    FusedCmp::Lt => a < b,
-                    FusedCmp::LtEq => a <= b,
-                    FusedCmp::Gt => a > b,
-                    FusedCmp::GtEq => a >= b,
-                },
-                (NumVal::Null, _) | (_, NumVal::Null) => {
-                    // NULL filter semantics (SQL three-valued logic →
-                    // excluded): numeric compare with 0.0 would be WRONG.
-                    // The generic compiled predicate handles NULL; bail.
-                    bailed = true;
-                    false
-                }
-                (a, b) => {
-                    let (x, y) = (a.as_f64(), b.as_f64());
-                    match f.cmp {
-                        FusedCmp::Eq => x == y,
-                        FusedCmp::Neq => x != y,
-                        FusedCmp::Lt => x < y,
-                        FusedCmp::LtEq => x <= y,
-                        FusedCmp::Gt => x > y,
-                        FusedCmp::GtEq => x >= y,
-                    }
-                }
-            };
-            if !pass {
-                return true; // filtered out; nothing to accumulate
-            }
-        }
-
-        // ---- typed accumulation (mirrors update_agg_state exactly) ----
-        for (i, spec) in specs.iter().enumerate() {
-            let v = match spec.slot {
-                Some(s) => vals[s],
-                None => NumVal::I(1), // COUNT(*) placeholder (non-null)
-            };
-            let acc = &mut accs[i];
-            let non_null = !matches!(v, NumVal::Null);
-            if non_null {
-                acc.seen = true;
-            }
-            match spec.op {
-                FusedOp::CountStar | FusedOp::CountCol => {
-                    if non_null {
-                        acc.count += 1;
-                    }
-                }
-                FusedOp::Sum | FusedOp::Total => {
-                    if non_null {
-                        match v {
-                            NumVal::F(f) => {
-                                if acc.sum_is_int {
-                                    acc.sum = acc.i_sum as f64;
-                                }
-                                acc.sum_is_int = false;
-                                acc.sum += f;
-                            }
-                            NumVal::I(i) => {
-                                if acc.sum_is_int {
-                                    acc.i_sum = acc.i_sum.saturating_add(i);
-                                } else {
-                                    acc.sum += i as f64;
-                                }
-                            }
-                            NumVal::Null => {}
-                        }
-                    }
-                }
-                FusedOp::Avg => {
-                    if non_null {
-                        acc.count += 1;
-                        acc.sum += v.as_f64();
-                    }
-                }
-                FusedOp::Min => {
-                    if non_null {
-                        let replace = match acc.min {
-                            None => true,
-                            Some(m) => numval_lt(v, m),
-                        };
-                        if replace {
-                            acc.min = Some(v);
-                        }
-                    }
-                }
-                FusedOp::Max => {
-                    if non_null {
-                        let replace = match acc.max {
-                            None => true,
-                            Some(m) => numval_lt(m, v),
-                        };
-                        if replace {
-                            acc.max = Some(v);
-                        }
-                    }
-                }
-            }
-        }
-        true
-    })?;
-
-    if bailed {
+    if walk.bailed {
         return Ok(None);
     }
 
-    // ---- finalize (mirrors finalize_agg) --------------------------------
+    Ok(Some(fused_finalize(aggregates, &walk.accs)))
+}
+
+/// Finalize a fused walk's accumulators into the single-row `ExecResult`
+/// (mirrors finalize_agg). Shared by the serial fused path and the
+/// parallel driver's merged accumulators.
+fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> ExecResult {
     let mut out_row: Vec<Value> = Vec::with_capacity(aggregates.len());
     for (agg, acc) in aggregates.iter().zip(accs.iter()) {
         let v = match AggFunc::from_name(&agg.func) {
@@ -5838,10 +6035,10 @@ fn try_fused_aggregate(
         .enumerate()
         .map(|(i, _)| format!("__agg_{}", i))
         .collect();
-    Ok(Some(ExecResult {
+    ExecResult {
         columns: out_cols.into(),
         rows: vec![out_row],
-    }))
+    }
 }
 
 /// Numeric ordering for Min/Max accumulation. Cross-type compares as f64
@@ -5864,7 +6061,23 @@ fn exec_aggregate_no_group_by(
     let n_cols = table.n_columns();
     let prefix = alias.as_deref().unwrap_or(&table.name);
 
-    // Fused typed-aggregate machine first: bare-column numeric aggregates
+    // Intra-statement parallel split FIRST (before the serial fused
+    // machine, or it would answer first): same fused-shape checks, big
+    // tables only, range-ordered deterministic merge. A decline (config
+    // off / txn open / below threshold / unsupported shape) or a worker
+    // bail falls through to the serial paths — the parallel attempt can
+    // never produce a divergent answer.
+    if let Some(res) = crate::executor::parallel::try_parallel_fused_aggregate(
+        ctx,
+        &table,
+        alias.as_deref(),
+        filter_predicate,
+        aggregates,
+    )? {
+        return Ok(res);
+    }
+
+    // Fused typed-aggregate machine: bare-column numeric aggregates
     // with an optional `col <op> literal` filter. Returns None for any
     // shape it cannot reproduce exactly — then the generic paths below
     // take over (identical results, slower decode/dispatch).
@@ -6443,6 +6656,16 @@ fn exec_aggregate(
                 // for COUNT(col) because we need to skip NULLs, which requires
                 // decoding.
                 if agg.func == "count" && agg.arg.is_none() && !agg.distinct {
+                    // Parallel split first (big tables): each worker counts
+                    // leaf cells in its rowid range (still zero decode),
+                    // counts sum. Declines below threshold / config off.
+                    if let Some(n) = crate::executor::parallel::try_parallel_count(ctx, table)? {
+                        let row: Vec<Value> = vec![Value::Integer(n as i64)];
+                        return Ok(ExecResult {
+                            columns: Arc::from(vec!["__agg_0".to_string()]),
+                            rows: vec![row],
+                        });
+                    }
                     let root = ctx.table_root(table);
                     let mut bt = Btree::new(ctx.pager, root, false);
                     let n = bt.count_rows()?;

@@ -1,5 +1,94 @@
 # Changelog
 
+## [Unreleased] — 2026-09-07 intra-statement parallel aggregation
+
+### Concurrency (the headline)
+
+- **Parallel aggregate scans — the concurrency frontier SQLite's
+  single-threaded executor cannot follow.** Large single-table
+  aggregates now split the rowid space across worker threads: each
+  worker runs the SAME fused/compiled walk the serial path runs over
+  its own `[lo, hi]` range, and the main thread merges the partial
+  accumulators in RANGE order. New `src/executor/parallel.rs` drives
+  four shapes:
+  - no-GROUP-BY fused aggregates (`SELECT COUNT(*), SUM(v), AVG(v),
+    MIN(v), MAX(v) FROM big [WHERE v > k]`),
+  - bare `COUNT(*)` full-table cell counts (per-range leaf counting),
+  - GROUP BY over the selective branch (bare keys + bare args), and
+  - GROUP BY over the compiled-expression branch (the shape most real
+    GROUP BY queries take, including `COUNT(*)`), with compiled filters.
+  Measured on 2 hardware threads (1M rows, best-of-5):
+  big aggregate **8.2× vs SQLite** (16.2 vs 132.4 ms — the serial
+  engine's ~3× fused-scan advantage compounded by the ~1.9× worker
+  split), filtered aggregate **5.9×**, GROUP BY 10k buckets **5.6×**;
+  engine-internal parallel-vs-serial speedup 1.7–1.9× on every shape.
+  On N-core hosts the split scales with `available_parallelism()`
+  (capped at 16 workers, one per ≥32768 estimated rows).
+- **Why it needs no new locking**: a statement's execution is bracketed
+  by the engine's aliasing model (reads run under `&Database`, a writer
+  needs `&mut Database` — Rust's type system guarantees no writer
+  interleaves within one engine call), and pages are individually
+  `Arc<Mutex<Page>>`-locked. Workers spawned inside that call observe a
+  write-free world; range-ordered merging reproduces the serial scan's
+  GROUP BY first-seen group order exactly.
+- **Determinism contract**: integer accumulators merge exactly; REAL
+  sums merge in range order (float addition is not associative — the
+  last ULP can differ from a serial scan, the same latitude every
+  parallel SQL engine takes; SQLite's own float-SUM order is
+  unspecified). A worker bail (TEXT payload in a numeric fused shape,
+  corrupt cell) aborts the whole parallel attempt — the serial path
+  answers, so results can never diverge.
+- **`PRAGMA parallel_scan`** (default ON, min-rows 131072): `0`/`OFF`
+  disables (always-serial, bit-identical), `1`/`ON`/`TRUE` enables at
+  the default threshold, `N` sets a custom threshold. Read form returns
+  the current threshold. The 131072 default sits above every existing
+  test/bench table (those paths stay serial, unchanged) and below the
+  1M-row analytical range where the split pays. Workers decline while
+  ANY transaction is open (worker threads are foreign to the
+  committed-view TLS — live pages must BE the committed state).
+
+### Fixes found under the parallel work
+
+- **The fused aggregate machine's stale-slot bug for SHORT rows**:
+  a payload shorter than the table's column list (ALTER TABLE ADD
+  COLUMN territory) left the previous row's decoded value in the
+  wanted-slot array — the fused filter/accumulators could read the
+  PREVIOUS row's value for a missing column. Extraction into
+  `FusedWalk` (shared by serial + parallel) now resets slots to Null
+  for short rows only (full rows overwrite every slot they read — the
+  hot path pays nothing). Matches `decode_row`'s NULL semantics.
+- **AVG merge bug (parallel-only, caught by the new tests before it
+  ever shipped)**: `FusedAcc`/`AggState` overload their fields per
+  aggregate — SUM/Total use `(i_sum, sum, sum_is_int)`; AVG uses
+  `(count, sum)` with the int fields inert. The first merge draft
+  folded the SUM layout for AVG accumulators and merged ZEROS, dropping
+  the real sum. `fused_merge_acc`/`merge_agg_state` are now OP-AWARE.
+- **The parallel range split covers rowid 0 and negatives**: the first
+  draft split `[1, max_rowid]` and silently dropped rowid-0 rows
+  (explicit `id=0` inserts are legal SQLite); worker 0's range now
+  extends to `i64::MIN` so the full rowid space tiles without gaps.
+
+### Tests & tooling
+
+- `tests/parallel_scan.rs` (12): parallel-vs-serial equality for every
+  shape (including GROUP BY row ORDER), SQLite cross-check on 300k
+  rows, NULL/REAL/DISTINCT handling, rowid gaps, in-transaction decline,
+  threshold boundary, PRAGMA round-trips.
+- `examples/probe_parallel_scan.rs`: scaling probe (serial vs parallel
+  per shape); `examples/probe_par_pragma.rs`: pragma parse probe.
+- `bench_compare` section [8]: 1M-row parallel aggregates vs SQLite
+  with answer-equality asserts before timing.
+- `row_codec.rs` +11 unit tests (the last untested codec surfaces):
+  `decode_row_selective_wide` round-trips (all value classes + alias
+  markers), `decode_row_selective_sorted` with the `ROWID_PROJ`
+  pseudo-slot, payload-region tiling + alias/rejection contracts,
+  local-prefix spans (spilled bodies, short rows), spill-prefix
+  concatenation exactness, and a 500-case deterministic codec fuzz
+  (encode/decode/selective/wide equivalence). Lib tests: 139 → 150.
+- `Btree::max_rowid_hint()`: O(log N) right-most descent reading the
+  last leaf cell's rowid (the parallel eligibility gate's row
+  estimate).
+
 ## [Unreleased] — 2026-09-05 WAL-grade read concurrency (committed-view reads)
 
 ### Concurrency (the headline)

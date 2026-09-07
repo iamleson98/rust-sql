@@ -1172,4 +1172,330 @@ mod tests {
         let decoded = decode_row(&bytes, 1, 0, None).unwrap();
         assert_eq!(decoded[0], Value::Text(s.clone().into()));
     }
+
+    // ------------------------------------------------------------------
+    // decode_row_selective_wide — the parallel GROUP BY's decode contract
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn selective_wide_roundtrip_all_types() {
+        // Every value class, selective decode of a subset, full-width
+        // buffer with NULL padding at the skipped positions.
+        let row = vec![
+            Value::Integer(-9),
+            Value::Text("short".into()),
+            Value::Text("a-much-longer-text-value".into()),
+            Value::Real(2.5),
+            Value::Blob(vec![0u8, 1, 2, 255]),
+            Value::Null,
+            Value::Integer(i64::MIN),
+        ];
+        let bytes = encode_row(&row);
+        let n = row.len();
+        for wanted in [
+            vec![0usize],
+            vec![3usize],
+            vec![0, 3],
+            vec![1, 2, 4],
+            vec![0, 1, 2, 3, 4, 5, 6],
+            vec![6],
+            vec![5],
+        ] {
+            let mut wide = Vec::new();
+            decode_row_selective_wide(&bytes, n, &wanted, 0, None, &mut wide).unwrap();
+            assert_eq!(wide.len(), n, "full width at {:?}", wanted);
+            for (i, v) in wide.iter().enumerate() {
+                let expect = if wanted.contains(&i) {
+                    row[i].clone()
+                } else {
+                    Value::Null
+                };
+                assert_eq!(v, &expect, "col {i} at wanted={:?}", wanted);
+            }
+        }
+    }
+
+    #[test]
+    fn selective_wide_with_alias_marker() {
+        // (id INTEGER PRIMARY KEY alias, name, val)
+        let row = vec![
+            Value::Integer(321),
+            Value::Text("z".into()),
+            Value::Real(0.5),
+        ];
+        let mut buf = Vec::new();
+        encode_row_aliased_into(&row, Some(0), &mut buf);
+        let mut wide = Vec::new();
+        // wanted includes the alias: value materializes from the rowid.
+        decode_row_selective_wide(&buf, 3, &[0, 2], 321, Some(0), &mut wide).unwrap();
+        assert_eq!(
+            wide,
+            vec![Value::Integer(321), Value::Null, Value::Real(0.5)]
+        );
+        // wanted excludes the alias: the marker is skipped, not decoded.
+        let mut wide2 = Vec::new();
+        decode_row_selective_wide(&buf, 3, &[1], 321, Some(0), &mut wide2).unwrap();
+        assert_eq!(
+            wide2,
+            vec![Value::Null, Value::Text("z".into()), Value::Null]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // decode_row_selective_sorted — the ROWID_PROJ pseudo-slot contract
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn selective_sorted_with_rowid_projection() {
+        let row = vec![
+            Value::Integer(10),
+            Value::Text("k".into()),
+            Value::Real(7.0),
+        ];
+        let bytes = encode_row(&row);
+        let mut out = Vec::new();
+        decode_row_selective_sorted(&bytes, 3, &[1, ROWID_PROJ], 4242, None, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![Value::Text("k".into()), Value::Integer(4242)],
+            "ROWID_PROJ decodes from the cell key"
+        );
+        // Bare ROWID_PROJ only.
+        let mut out2 = Vec::new();
+        decode_row_selective_sorted(&bytes, 3, &[ROWID_PROJ], 7, None, &mut out2).unwrap();
+        assert_eq!(out2, vec![Value::Integer(7)]);
+        // Ordinary sorted projection still matches the plain selective form.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        decode_row_selective_sorted(&bytes, 3, &[0, 2], 0, None, &mut a).unwrap();
+        decode_row_selective(&bytes, 3, &[0, 2], 0, None, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn selective_sorted_short_row_nulls() {
+        // ALTER TABLE ADD COLUMN shape: payload holds 1 of 3 columns.
+        let short = encode_row(&vec![Value::Integer(9)]);
+        let mut out = Vec::new();
+        decode_row_selective_sorted(&short, 3, &[1, 2], 0, None, &mut out).unwrap();
+        assert_eq!(out, vec![Value::Null, Value::Null]);
+    }
+
+    // ------------------------------------------------------------------
+    // Payload regions — the UPDATE payload-patch fast path's layout walk
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn column_regions_tile_payload_exactly() {
+        let row = vec![
+            Value::Integer(127),
+            Value::Text("hello".into()),
+            Value::Real(-1.5),
+            Value::Blob(vec![9u8, 8, 7, 6, 5]),
+        ];
+        let bytes = encode_row(&row);
+        let mut regions = Vec::new();
+        assert!(row_column_regions_into(&bytes, 4, None, &mut regions));
+        assert_eq!(regions.len(), 4);
+        // Regions must tile [0, len) with no gaps or overlaps.
+        let mut pos = 0usize;
+        for (off, len) in &regions {
+            assert_eq!(*off as usize, pos, "regions are contiguous");
+            pos += *len as usize;
+        }
+        assert_eq!(pos, bytes.len(), "regions cover the whole payload");
+        // Each region independently decodes to its column value.
+        for (i, (off, len)) in regions.iter().enumerate() {
+            let v =
+                decode_span_value(&bytes[*off as usize..*off as usize + *len as usize]).unwrap();
+            assert_eq!(v, row[i], "region {i} decodes to its column");
+        }
+    }
+
+    #[test]
+    fn column_regions_alias_and_rejects() {
+        // Alias marker region is exactly 1 byte at its position.
+        let row = vec![Value::Integer(11), Value::Text("q".into())];
+        let mut buf = Vec::new();
+        encode_row_aliased_into(&row, Some(0), &mut buf);
+        let mut regions = Vec::new();
+        assert!(row_column_regions_into(&buf, 2, Some(0), &mut regions));
+        assert_eq!(regions[0], (0, 1), "alias region = marker byte");
+
+        // Truncated payload (n_cols longer than encoded columns): false.
+        let short = encode_row(&vec![Value::Integer(1)]);
+        assert!(!row_column_regions_into(&short, 3, None, &mut regions));
+        // Marker expected but a value tag found: false.
+        let plain = encode_row(&vec![Value::Integer(5), Value::Integer(6)]);
+        assert!(!row_column_regions_into(&plain, 2, Some(0), &mut regions));
+    }
+
+    // ------------------------------------------------------------------
+    // Local-prefix spans — the overflow-aware lazy decode layout
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn local_spans_match_full_payload_layout() {
+        let row = vec![
+            Value::Integer(3),
+            Value::Text("mid-length-text".into()),
+            Value::Real(4.5),
+            Value::Blob(vec![7u8; 40]),
+        ];
+        let full = encode_row(&row);
+        // A prefix covering everything: spans equal the region walk.
+        let spans = column_spans_local(&full, full.len(), 4, 3).unwrap();
+        let mut regions = Vec::new();
+        assert!(row_column_regions_into(&full, 4, None, &mut regions));
+        for (i, s) in spans.iter().enumerate() {
+            let s = s.unwrap();
+            assert_eq!((s.off, s.len), (regions[i].0, regions[i].1), "col {i}");
+        }
+    }
+
+    #[test]
+    fn local_spans_handle_spilled_and_short_rows() {
+        // A wide TEXT body in the middle: the local prefix ends inside it.
+        let row = vec![
+            Value::Integer(1),
+            Value::Text("y".repeat(200).into()),
+            Value::Integer(2),
+        ];
+        let full = encode_row(&row);
+        let local = &full[..8]; // cut inside col 1's body
+        let spans = column_spans_local(local, full.len(), 3, 1).unwrap();
+        let s0 = spans[0].unwrap();
+        assert_eq!(s0.off, 0, "col 0 starts at 0");
+        assert!(s0.end() <= local.len(), "col 0 fully local");
+        let s1 = spans[1].unwrap();
+        assert_eq!(s1.off as usize, s0.end(), "col 1 starts right after col 0");
+        assert!(
+            s1.end() > local.len(),
+            "col 1's body spills past the local prefix"
+        );
+
+        // Short row: positions past the encoded payload are None (NULL).
+        let short = encode_row(&vec![Value::Integer(5)]);
+        let spans = column_spans_local(&short, short.len(), 4, 3).unwrap();
+        assert!(spans[0].is_some());
+        assert!(spans[1].is_none() && spans[2].is_none() && spans[3].is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Spill prefix — overflow rows written prefix-first
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn spill_prefix_concatenation_is_exact() {
+        // Trailing 5 KB BLOB on a 3-column row: guaranteed spill shape.
+        let row = vec![
+            Value::Integer(42),
+            Value::Text("tag".into()),
+            Value::Blob(vec![0xABu8; 5000]),
+        ];
+        let (tail, prefix_len, total) = spill_tail_shape(&row, None, 100).expect("spills");
+        assert_eq!(tail, 2);
+        let mut full = Vec::new();
+        encode_row_aliased_into(&row, None, &mut full);
+        assert_eq!(total, full.len(), "total = full payload size");
+        let mut prefix = Vec::new();
+        encode_row_spill_prefix_into(&row, None, tail, &mut prefix);
+        assert_eq!(prefix.len(), prefix_len);
+        // [prefix][body] == the full payload, byte for byte.
+        let mut reassembled = prefix.clone();
+        reassembled.extend_from_slice(&full[prefix_len..]);
+        assert_eq!(reassembled, full, "prefix + body == full payload");
+        // The reassembled payload must round-trip.
+        let decoded = decode_row(&reassembled, 3, 0, None).unwrap();
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn spill_shape_declines_small_and_alias_tails() {
+        // Body fits in-cell: no spill.
+        let small = vec![Value::Integer(1), Value::Blob(vec![1u8; 50])];
+        assert!(spill_tail_shape(&small, None, 100).is_none());
+        // Trailing column is the rowid alias marker: nothing to hand off.
+        let alias_tail = vec![Value::Text("x".into()), Value::Integer(9)];
+        assert!(spill_tail_shape(&alias_tail, Some(1), 1).is_none());
+        // Trailing column is not a wide type: no spill.
+        let int_tail = vec![Value::Integer(1), Value::Integer(2)];
+        assert!(spill_tail_shape(&int_tail, None, 1).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Deterministic round-trip fuzz across the value classes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn codec_roundtrip_fuzz() {
+        // 8-bit LCG (xorshift64): deterministic, no dependencies.
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..500u32 {
+            let n_cols = 2 + (next() % 5) as usize; // 2..6
+            let row: Vec<Value> = (0..n_cols)
+                .map(|_c| match next() % 7 {
+                    0 => Value::Null,
+                    1 => Value::Integer(next() as i64),
+                    2 => Value::Integer((next() as i64) - (1 << 40)),
+                    3 => Value::Real((next() % 10_000) as f64 * 0.25),
+                    4 => {
+                        let len = (next() % 40) as usize;
+                        let seed = next();
+                        let s: String = (0..len)
+                            .map(|i| char::from(b'a' + ((seed >> (i % 13)) % 26) as u8))
+                            .collect();
+                        Value::Text(s.into())
+                    }
+                    5 => {
+                        let len = (next() % 33) as usize;
+                        let b = (next() % 256) as u8;
+                        Value::Blob(vec![b; len])
+                    }
+                    _ => Value::Integer((next() % 127) as i64),
+                })
+                .collect();
+            let alias = if next() % 3 == 0 {
+                let a = (next() % n_cols as u64) as usize;
+                matches!(row[a], Value::Integer(_)).then_some(a)
+            } else {
+                None
+            };
+            let rowid = alias
+                .map(|a| match row[a] {
+                    Value::Integer(i) => i,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            // Full round-trip.
+            let bytes = encode_row_aliased(&row, alias);
+            let decoded = decode_row(&bytes, n_cols, rowid, alias).unwrap();
+            assert_eq!(decoded, row, "case {case} full round-trip");
+            // Selective == projection of the full decode, for a random subset.
+            let take: Vec<usize> = (0..n_cols).filter(|_| next() % 2 == 0).collect();
+            if !take.is_empty() {
+                let mut sel = Vec::new();
+                decode_row_selective(&bytes, n_cols, &take, rowid, alias, &mut sel).unwrap();
+                let expect: Vec<Value> = take.iter().map(|&i| decoded[i].clone()).collect();
+                assert_eq!(sel, expect, "case {case} selective subset");
+                // Wide form: full width, NULL at non-wanted.
+                let mut wide = Vec::new();
+                decode_row_selective_wide(&bytes, n_cols, &take, rowid, alias, &mut wide).unwrap();
+                for i in 0..n_cols {
+                    let e = if take.contains(&i) {
+                        decoded[i].clone()
+                    } else {
+                        Value::Null
+                    };
+                    assert_eq!(wide[i], e, "case {case} wide col {i}");
+                }
+            }
+        }
+    }
 }

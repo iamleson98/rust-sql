@@ -217,6 +217,15 @@ identical sqlx API and pool options:
   same 8-way read workload is 2.8× sqlx-sqlite, and 1-writer/7-reader
   is 2× — with snapshot isolation, no dirty reads
   (`examples/probe_dirty_read.rs`).
+- **Intra-statement parallelism (2026-09)**: large single-table
+  aggregates and GROUP BYs split their rowid space across worker
+  threads and merge partial accumulators deterministically — a
+  concurrency frontier SQLite's single-threaded executor cannot follow
+  (one query, one core, forever). On 1M rows: big aggregate **8.2×**,
+  filtered aggregate **5.9×**, GROUP BY **5.6×** vs SQLite
+  (`examples/bench_compare.rs` section [8], scaling probe
+  `examples/probe_parallel_scan.rs`). `PRAGMA parallel_scan` gates it
+  (default ON at 131072 rows; OFF is bit-identical serial).
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index
   and touches only matching rows; SQLite's planner picks a full table walk
   on this workload shape.

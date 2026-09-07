@@ -275,6 +275,178 @@ fn sqlite_group_by(conn: &rusqlite::Connection) -> Duration {
     })
 }
 
+// =============================================================================
+// [8] Large-table PARALLEL aggregates (1M rows) — the intra-statement
+// parallelism section. SQLite's executor is single-threaded by design;
+// rustqlite splits the rowid space across worker threads (see
+// `executor::parallel`) and merges partial accumulators in range order.
+// =============================================================================
+
+const HUGE: usize = 1_000_000;
+
+fn rustqlite_build_big(db: &mut rustqlite::Database) {
+    db.execute("BEGIN", []).unwrap();
+    let mut i = 0usize;
+    while i < HUGE {
+        let hi = (i + 5_000).min(HUGE);
+        let mut sql = String::from("INSERT INTO t (id, name, val, score) VALUES ");
+        for j in i..hi {
+            if j > i {
+                sql.push(',');
+            }
+            sql.push_str(&format!(
+                "({}, 'n{}', {}, {})",
+                j,
+                j,
+                (j * 37 + 11) % 1_000_000,
+                j as f64 * 0.25
+            ));
+        }
+        db.execute(&sql, []).unwrap();
+        i = hi;
+    }
+    db.execute("COMMIT", []).unwrap();
+}
+
+fn sqlite_build_big(conn: &rusqlite::Connection) {
+    conn.execute_batch("BEGIN").unwrap();
+    let mut stmt = conn
+        .prepare("INSERT INTO t (id, name, val, score) VALUES (?, ?, ?, ?)")
+        .unwrap();
+    for j in 0..HUGE {
+        stmt.execute(params![
+            j as i64,
+            format!("n{}", j),
+            ((j * 37 + 11) % 1_000_000) as i64,
+            j as f64 * 0.25
+        ])
+        .unwrap();
+    }
+    drop(stmt);
+    conn.execute_batch("COMMIT").unwrap();
+}
+
+fn rustqlite_big_aggregate(db: &rustqlite::Database) -> Duration {
+    // Warm the caches (plan + page + thread spin-up), then best-of.
+    let _ = db
+        .query(
+            "SELECT COUNT(*), SUM(val), AVG(score), MIN(val), MAX(val) FROM t",
+            [],
+        )
+        .unwrap();
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let rows = db
+            .query(
+                "SELECT COUNT(*), SUM(val), AVG(score), MIN(val), MAX(val) FROM t",
+                [],
+            )
+            .unwrap();
+        let _ = &rows[0];
+        start.elapsed()
+    })
+}
+
+fn sqlite_big_aggregate(conn: &rusqlite::Connection) -> Duration {
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*), SUM(val), AVG(score), MIN(val), MAX(val) FROM t")
+        .unwrap();
+    stmt.query_row([], |_| Ok::<(), rusqlite::Error>(()))
+        .unwrap();
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .unwrap();
+        start.elapsed()
+    })
+}
+
+fn rustqlite_big_filtered(db: &rustqlite::Database) -> Duration {
+    let _ = db
+        .query(
+            "SELECT COUNT(*), SUM(val), AVG(score) FROM t WHERE val > 500000",
+            [],
+        )
+        .unwrap();
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let rows = db
+            .query(
+                "SELECT COUNT(*), SUM(val), AVG(score) FROM t WHERE val > 500000",
+                [],
+            )
+            .unwrap();
+        let _ = &rows[0];
+        start.elapsed()
+    })
+}
+
+fn sqlite_big_filtered(conn: &rusqlite::Connection) -> Duration {
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*), SUM(val), AVG(score) FROM t WHERE val > 500000")
+        .unwrap();
+    stmt.query_row([], |_| Ok::<(), rusqlite::Error>(()))
+        .unwrap();
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let _ = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                ))
+            })
+            .unwrap();
+        start.elapsed()
+    })
+}
+
+fn rustqlite_big_group_by(db: &rustqlite::Database) -> Duration {
+    let _ = db
+        .query(
+            "SELECT val / 100 AS bucket, COUNT(*), SUM(val) FROM t GROUP BY bucket",
+            [],
+        )
+        .unwrap();
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let rows = db
+            .query(
+                "SELECT val / 100 AS bucket, COUNT(*), SUM(val) FROM t GROUP BY bucket",
+                [],
+            )
+            .unwrap();
+        let _ = rows.len();
+        start.elapsed()
+    })
+}
+
+fn sqlite_big_group_by(conn: &rusqlite::Connection) -> Duration {
+    let mut stmt = conn
+        .prepare("SELECT val / 100 AS bucket, COUNT(*), SUM(val) FROM t GROUP BY bucket")
+        .unwrap();
+    {
+        let mut rows = stmt.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+    }
+    best_of::<5>(|| {
+        let start = Instant::now();
+        let mut rows = stmt.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        start.elapsed()
+    })
+}
+
 fn sqlite_setup_join(conn: &rusqlite::Connection) {
     conn.execute(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT)",
@@ -1251,6 +1423,79 @@ fn main() {
 
     let _ = std::fs::remove_file(&r_path);
     let _ = std::fs::remove_file(&s_path);
+
+    // ----- Section 8: Large-table PARALLEL aggregates (1M rows) -----
+    println!();
+    println!("[8] LARGE-TABLE PARALLEL AGGREGATES ({} rows)", HUGE);
+    println!("{}", "-".repeat(78));
+    println!("         (rustqlite splits the scan across worker threads;");
+    println!("          SQLite's executor is single-threaded by design)");
+    {
+        let mut db_r = rustqlite_open();
+        rustqlite_create_table(&mut db_r);
+        rustqlite_build_big(&mut db_r);
+        let conn_s = sqlite_open();
+        sqlite_create_table(&conn_s);
+        sqlite_build_big(&conn_s);
+
+        // Sanity: identical answers before timing anything.
+        let r = db_r
+            .query("SELECT COUNT(*), SUM(val) FROM t WHERE val > 500000", [])
+            .unwrap();
+        let (s_n, s_sum): (i64, Option<i64>) = conn_s
+            .query_row(
+                "SELECT COUNT(*), SUM(val) FROM t WHERE val > 500000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(r[0][0], rustqlite::Value::Integer(s_n));
+        assert_eq!(
+            r[0][1],
+            s_sum
+                .map(rustqlite::Value::Integer)
+                .unwrap_or(rustqlite::Value::Null)
+        );
+
+        let hw = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        println!("{:<50} {} worker threads", "Parallel scan workers:", hw);
+
+        {
+            let d_r = rustqlite_big_aggregate(&db_r);
+            let d_s = sqlite_big_aggregate(&conn_s);
+            println!(
+                "{:<50} {:>12} {:>12}   {:>5.2}x",
+                "Big aggregate (COUNT/SUM/AVG/MIN/MAX)",
+                fmt_dur(d_r),
+                fmt_dur(d_s),
+                d_s.as_secs_f64() / d_r.as_secs_f64()
+            );
+        }
+        {
+            let d_r = rustqlite_big_filtered(&db_r);
+            let d_s = sqlite_big_filtered(&conn_s);
+            println!(
+                "{:<50} {:>12} {:>12}   {:>5.2}x",
+                "Big filtered aggregate (val > 500000)",
+                fmt_dur(d_r),
+                fmt_dur(d_s),
+                d_s.as_secs_f64() / d_r.as_secs_f64()
+            );
+        }
+        {
+            let d_r = rustqlite_big_group_by(&db_r);
+            let d_s = sqlite_big_group_by(&conn_s);
+            println!(
+                "{:<50} {:>12} {:>12}   {:>5.2}x",
+                "Big GROUP BY (10k buckets + SUM)",
+                fmt_dur(d_r),
+                fmt_dur(d_s),
+                d_s.as_secs_f64() / d_r.as_secs_f64()
+            );
+        }
+    }
 
     println!();
     println!("Done.");

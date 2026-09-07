@@ -1,6 +1,6 @@
 # Gap Analysis — rustqlite vs SQLite
 
-> Re-measured `2026-09-02` after the gap-close sprint (see §1b — GROUP BY
+> Re-measured `2026-09-07` after the intra-statement parallel-aggregation pass (see §11) (see §1b — GROUP BY
 > compiled expression keys, bucket-keyed 2-way leaf cache, cursor-ix cell
 > bias, the mimalloc post-storm wake drain, and the UPDATE payload-patch
 > fast path). Every head-to-head workload row is now at parity or FASTER;
@@ -620,3 +620,60 @@ Tests: tests/rowid_expressions.rs (6 tests — both table shapes, all
 spellings, shadowing, star arity, prepare/step, DML round-trip) on top
 of §9's suites. The §9 probe (probe_range_fused example) and the
 fused-range regression suite stay green.
+
+## 11. 2026-09-07 — intra-statement parallel aggregation (the concurrency frontier)
+
+**SQLite's executor is single-threaded by design — one query, one core,
+forever.** rustqlite now splits large single-table aggregate scans
+across worker threads (`src/executor/parallel.rs`): the rowid space
+tiles into inclusive ranges (worker 0's range extends to `i64::MIN` so
+explicit rowid-0/negative rows are never dropped), each worker runs
+the serial path's own fused/compiled walk over its range, and partial
+accumulators merge in RANGE order.
+
+**Measured (2 hardware threads, 1M rows, best-of-5):**
+
+| shape | serial | parallel | speedup | vs SQLite |
+|---|---:|---:|---:|---:|
+| COUNT+SUM+AVG+MIN+MAX | 25.5 ms | 14.1 ms | 1.81x | **8.2x** |
+| filtered aggregate (val > 500000) | 19.7 ms | 11.6 ms | 1.70x | **5.9x** |
+| REAL aggregate | 24.3 ms | 13.5 ms | 1.80x | — |
+| GROUP BY 100 buckets | 98.5 ms | 51.8 ms | 1.90x | **5.6x** (10k buckets) |
+
+**Correctness contract** (tests/parallel_scan.rs, 12 cases incl. a
+300k-row SQLite cross-check):
+
+- Workers run the serial path's own machinery — `FusedWalk` (extracted
+  from `try_fused_aggregate`'s closure), `decode_row_selective_wide`,
+  `HashGrouper`, `update_agg_state` — so per-row semantics are identical
+  by construction. Merging is OP-AWARE (the accumulator layouts differ:
+  SUM uses `(i_sum, sum, sum_is_int)`, AVG uses `(count, sum)`, COUNT
+  uses `count`, MIN/MAX use min/max — the first draft folded the SUM
+  layout for AVG and dropped the real sum; the tests caught it).
+- Range-order merging reproduces the serial scan's GROUP BY first-seen
+  group order exactly. Integer sums merge exactly; REAL sums merge in
+  range order — the last ULP can differ from a serial scan (float
+  addition is not associative; every parallel SQL engine takes this
+  latitude, and SQLite's own float-SUM order is unspecified).
+- A worker bail aborts the whole attempt — the serial path answers, so
+  results can never diverge. Workers decline while any transaction is
+  open (foreign to the committed-view TLS).
+- `PRAGMA parallel_scan` (default ON, min-rows 131072; 0/OFF =
+  bit-identical serial). The default threshold sits above every
+  existing test/bench table, so all pre-existing paths are unchanged.
+
+**Bugs found under the work:**
+
+1. The fused aggregate machine's stale-slot bug for SHORT rows (ALTER
+   TABLE ADD COLUMN payloads): a missing column read the PREVIOUS row's
+   decoded value from the slot array. `FusedWalk` resets slots to Null
+   for short rows (full rows pay nothing).
+2. The first range-split draft started at rowid 1 and silently dropped
+   explicit rowid-0 rows (`INSERT ... VALUES (0, ...)`); the split now
+   tiles `[i64::MIN, max_rowid]`.
+
+**Remaining known gap (next unit):** parallel ORDER BY (chunk sort +
+k-way merge) and parallel top-N; the compiled-arithmetic no-GROUP-BY
+aggregate path (complex predicates with bound params) still runs
+serial. Multi-writer transactions remain out of scope by design —
+SQLite's own contract (one writer at a time, BUSY + busy timeout).

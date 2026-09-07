@@ -6895,6 +6895,40 @@ impl Database {
                         ctx.pager.set_recursive_triggers_enabled(on);
                     }
                 }
+                "parallel_scan" => {
+                    // PRAGMA parallel_scan = 0/OFF/NONE → disabled;
+                    // = 1/ON/TRUE → enabled at the default threshold;
+                    // = N (>1) → custom min-rows threshold.
+                    // (ON evaluates to Integer(1) through the pragma
+                    // expression path — same arm.)
+                    let n = match (&v, value_as_expr(value)) {
+                        (Value::Integer(i), _) => *i,
+                        (Value::Text(t), _) => match t.to_ascii_lowercase().as_str() {
+                            "off" | "none" | "false" => 0,
+                            "on" | "true" => 1,
+                            other => other.parse::<i64>().unwrap_or(-1),
+                        },
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            match name.to_ascii_lowercase().as_str() {
+                                "off" | "none" | "false" | "0" => 0,
+                                "on" | "true" | "1" => 1,
+                                other => other.parse::<i64>().unwrap_or(-1),
+                            }
+                        }
+                        _ => -1,
+                    };
+                    let n = if n == 1 {
+                        crate::storage::pager::DEFAULT_PARALLEL_SCAN_MIN_ROWS
+                    } else {
+                        n
+                    };
+                    if n < 0 {
+                        return Err(Error::semantic(
+                            "PRAGMA parallel_scan expects ON/OFF or a minimum row count",
+                        ));
+                    }
+                    ctx.pager.set_parallel_scan_min_rows(n);
+                }
                 "journal_mode" => {
                     // `PRAGMA journal_mode = WAL` parses WAL as a bare
                     // identifier (column ref), which evaluates to NULL —
@@ -7414,6 +7448,9 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let pager = &db.pager;
     let v = match name.as_str() {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
+        // The min-rows threshold (0 = parallel scans disabled) — SQLite
+        // has no equivalent pragma; the value round-trips the setting.
+        "parallel_scan" => Value::Integer(pager.parallel_scan_min_rows()),
         "page_size" => Value::Integer(pager.page_size() as i64),
         "page_count" => Value::Integer(pager.n_pages() as i64),
         "freelist_count" => Value::Integer(pager.freelist_count() as i64),

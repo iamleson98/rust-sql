@@ -321,6 +321,21 @@ The executor walks a `Plan` tree and produces rows. It uses a **collect-all mode
 - Column names (including qualified `alias.column` names from joins)
 - Bound parameters
 
+**Intra-statement parallel aggregation** (`executor::parallel`, 2026-09):
+large single-table aggregates (COUNT/SUM/AVG/MIN/MAX with optional
+simple filters; GROUP BY over bare or compiled keys) split the table's
+rowid space across `std::thread::scope` workers. Each worker builds its
+own `Btree` handle over the shared `&Pager` and runs the serial path's
+own `FusedWalk`/`HashGrouper` loop over its `[lo, hi]` range; the main
+thread merges partial accumulators in range order (GROUP BY first-seen
+order and integer results are identical to a serial scan). Safety comes
+from the engine's aliasing model — a statement executes under `&Database`
+while writers need `&mut Database`, so no writer can interleave within
+one call — plus per-page `Arc<Mutex<Page>>` locks. `PRAGMA parallel_scan`
+gates it (default min-rows 131072, 0/OFF disables); workers decline while
+any transaction is open (they are foreign to the committed-view TLS), and
+any worker bail falls back to the serial path.
+
 **Function library**: scalar functions (`abs`, `length`, `lower`, `upper`, `coalesce`, `case`, etc.) are implemented in `call_scalar`. Date/time functions are minimal stubs.
 
 ---
