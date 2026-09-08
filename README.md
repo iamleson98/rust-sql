@@ -711,12 +711,12 @@ what it costs, why it exists, and (where decided) what the fix looks like.
     fragmentation of the insert churn), and the child's whole build phase defines the
     HWM. SQLite's pager is 25 years of bounded-everything tuning; each remaining MB
     needs profiling at the allocator level.
-  - **S03 GROUP BY 100k buckets (0.65x at the last measured pass)**: the 100k group
+  - **S03 GROUP BY 100k buckets (spilling, verified in CI)**: the 100k group
     states now spill through the ephemeral temp-store (65536-group threshold, k-way
     chunk merge on output — see the Storage section), so the in-RAM floor is bounded
-    at ~2 epochs regardless of cardinality. The hash-grouper speed advantage stays
-    (the merge is sequential I/O over ~6 MB); the remaining delta is the spill
-    encoding cost itself.
+    at ~2 epochs regardless of cardinality: the 2026-09-08 post-spill CI pass
+    measured **26 MB** (was 57 MB pre-spill) at **3.34x faster** — and the absolute
+    delta vs SQLite is now dominated by the 1M-row BUILD phase, not the grouper.
   - **S07/S10/S12/S13/S16/S18 (~0.73–0.93x, 1–2 MB each)**: the mimalloc
     baseline — its 64 KiB-per-size-class page granularity commits ~1 MB at
     `Database::open` where glibc packs the same allocations into ~0.4 MB. That is
@@ -724,10 +724,11 @@ what it costs, why it exists, and (where decided) what the fix looks like.
     (SQLite is measured against glibc); `default-features = false` recovers the
     baseline. The 2026-09-08 THP constructor already removed a 2-4x amplification
     layer that sat on top of this on `THP=always` kernels.
-  - **S11 IN-list 5000 literals (0.78x at the last measured pass)**: the AST, the
+  - **S11 IN-list 5000 literals (Arc-shared, verified in CI)**: the AST, the
     plan's predicate clone, and the RowidIn/IndexIn extractions now share ONE
-    `Arc<Vec<Expr>>` list (the S11 fix) instead of retaining three deep copies in
-    the statement cache; the remaining delta is the compiled membership set +
+    `Arc<Vec<Expr>>` list instead of retaining three deep copies in the statement
+    cache — the 2026-09-08 post-fix CI pass measured **7 MB** (was 12 MB) at
+    **2.12x faster**; the remaining delta is the compiled membership set +
     parse-time token churn, which SQLite also pays in its own form.
 
 ### Concurrency gaps
