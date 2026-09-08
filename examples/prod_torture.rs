@@ -2103,10 +2103,31 @@ fn env_tolerance(var: &str, default: f64) -> f64 {
 /// requires being at least 1 ms slower. Real regressions are
 /// multi-percent AND multi-millisecond; runner jitter is not.
 fn gated(rq: f64, sq: f64, tolerance_pct: f64) -> bool {
+    gated_with_floor(rq, sq, tolerance_pct, 1.0)
+}
+
+/// `gated` with an explicit absolute-jitter floor (milliseconds).
+fn gated_with_floor(rq: f64, sq: f64, tolerance_pct: f64, floor_ms: f64) -> bool {
     if rq <= 0.0 || sq <= 0.0 || tolerance_pct < 0.0 {
         return false;
     }
-    rq > sq * (1.0 + tolerance_pct / 100.0) && (rq - sq) > 1.0
+    rq > sq * (1.0 + tolerance_pct / 100.0) && (rq - sq) > floor_ms
+}
+
+/// Absolute-jitter floor per extra metric. Cold-start metrics —
+/// `open_first_query_ms` spans process spawn, file open, and the first
+/// query (page-cache cold, AV scan on Windows) — wobble by several
+/// milliseconds across runner instances with unchanged code (observed
+/// rq best-of-3 on Windows runners: 10.0 ms then 14.9 ms; SQLite
+/// likewise 10.0 then 12.7 ms). A FAIL there now requires being at
+/// least 5 ms slower — still well inside the multi-10s-of-% margin a
+/// real first-query regression produces, but outside cross-runner
+/// cold-start jitter.
+fn extra_floor(metric: &str) -> f64 {
+    match metric {
+        "open_first_query_ms" => 5.0,
+        _ => 1.0,
+    }
 }
 
 fn main() {
@@ -2216,7 +2237,7 @@ fn main() {
                 let v = verdict(rq.get(k), sq.get(k), true);
                 if v.contains("LOSS") {
                     losses.push(format!("{id} {title} ({k})"));
-                    if gated(rq.get(k), sq.get(k), time_tol) {
+                    if gated_with_floor(rq.get(k), sq.get(k), time_tol, extra_floor(k)) {
                         failures.push(format!(
                             "{id} {title} ({k}): rq {:.1}ms vs sq {:.1}ms (time > {time_tol:.0}% slower)",
                             rq.get(k),

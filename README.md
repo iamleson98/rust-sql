@@ -12,8 +12,7 @@ A from-scratch embedded SQL database engine written in pure Rust — modeled aft
 > design envelope** on three tiers, including intra-statement parallelism SQLite cannot
 > follow (see [Concurrency](#concurrency-vs-sqlite)). sqlx 0.9 native driver **and** drop-in
 > C ABI verified with sea-orm 2.0 end to end — schema discovery and migrations included.
-> Full SQLite-style plugin system. What landed most recently:
-> [Recent improvements](#recent-improvements). Remaining deltas:
+> Full SQLite-style plugin system. Remaining deltas:
 > [Remaining gaps](#remaining-gaps-vs-sqlite).
 
 This README is the single source of truth for the project: architecture, the latest
@@ -30,7 +29,6 @@ test methodology, and the honest ledger of what is still missing.
 - [Concurrency vs SQLite](#concurrency-vs-sqlite)
 - [sqlx driver vs sqlx-sqlite](#sqlx-driver-vs-sqlx-sqlite)
 - [SQLite file-format interop](#sqlite-file-format-interop)
-- [Recent improvements](#recent-improvements)
 - [Remaining gaps vs SQLite](#remaining-gaps-vs-sqlite)
 - [Usage](#usage)
 - [Testing](#testing)
@@ -145,6 +143,7 @@ let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES (?) RETURNING 
 - **`compat/`** exports the real `sqlite3_*` C ABI (124 symbols) on the engine and ships a drop-in `libsqlite3-sys` replacement, so **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line
 - **`sqlite3_serialize` / `sqlite3_deserialize` are real**: the full database image in a `sqlite3_free`-able buffer (the native container round-trips), and deserialize accepts BOTH native images and real SQLite-format buffers (loaded through the fileformat2 bridge with full read/write semantics — serialize with real SQLite, deserialize here, query it). `tests/compat_abi.rs` pins the round-trip, the cross-engine image case, post-deserialize writes, and re-serialization; the remaining compat stubs are the preupdate-hook family (unlock-notify is a functional immediate-notify)
 - **Schema tooling works end to end**: table-valued PRAGMAs (`PRAGMA table_info('t')` and friends) return rows through the prepared-statement path with SQLite's prepare-time column layout, so sea-schema / sea-orm-cli discovery, sea-orm-codegen entity generation, and `sqlx::migrate!` (fresh + idempotent re-run + atomic rollback + cross-pool visibility) all run unmodified
+- **C ABI throughput & observability**: read statements stream 64-row chunks under a single read-lock acquisition per chunk (concurrent readers stop trading cache-line ping-pong on the lock); `BEGIN`/`COMMIT`/`ROLLBACK` are classified once at prepare time instead of re-parsed on every execution; `engine_stats()` exposes process-global atomic counters (connections open/close/live, prepares, steps, rows, writes, transactions begun/committed/rolled back, busy waits/timeouts) and per-file snapshots (page size/count, freelist, cache pages/capacity/hits/misses, WAL frames, `total_changes`, live connections) at ~1 ns per event — always on, not sampled
 - SQLite-exact error messages + extended result codes (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_MISMATCH`, …) — what sqlx's `error_kind()` and sea-orm's `DbErr` classify on
 - Full UPDATE constraint semantics: sequential unique-index checking (ratchets pass, swaps conflict), `OR IGNORE`/`OR REPLACE`, rowid moves (`UPDATE t SET id = X`), collation-aware (NOCASE) unique probes, atomic statement aborts, and UPDATE via exact index probes on tables whose PK is not the rowid alias (`version BIGINT PRIMARY KEY`-style bookkeeping UPDATEs)
 - `sqlx-interop/` — the integration workspace that proves it: a checked-in sea-orm 2.0 + sqlx 0.9 app compiled and passing tests against `compat/`'s `libsqlite3.so` replacement, plus a `rust-be-template`-style `make migrate-up / migrate-status / migrate-reset` flow verified on a fresh database
@@ -220,13 +219,13 @@ The catalog is an in-memory map of name → `Arc<Table>` / `Arc<Index>` / `Arc<V
 
 ### Planner
 
-Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot, and rowid-via-index-range plans. Not yet: predicate pushdown into all scan shapes, join reordering, subquery decorrelation, cost-based index choice.
+Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot, and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Not yet: predicate pushdown into all scan shapes, join reordering, subquery decorrelation.
 
 ### Executor
 
 Walks a `Plan` tree and produces rows. OLTP plan shapes (Scan with rowid-resume, RowidRange, Filter, Project, Limit, vtab cursors) run as **resumable streaming drivers** — rows arrive in batches, `LIMIT k` stops the walk at the k-th match, non-matching rows decode only the predicate's columns (selective decode). Everything else executes once into materialized rows (still a single parse + plan per prepare). The expression evaluator walks `Expr` against the current row, qualified join columns, and bound parameters.
 
-**Intra-statement parallelism** (`src/executor/parallel.rs`, 2026-09) is the tier SQLite's single-threaded executor cannot follow: large single-table aggregates (COUNT/SUM/AVG/MIN/MAX, optional simple filters; GROUP BY bare/compiled), and bounded top-N (`ORDER BY ... LIMIT k [OFFSET n]`) split the table's rowid space across `std::thread::scope` workers:
+**Intra-statement parallelism** (`src/executor/parallel.rs`) is the tier SQLite's single-threaded executor cannot follow: large single-table aggregates (COUNT/SUM/AVG/MIN/MAX, optional simple filters; GROUP BY bare/compiled), and bounded top-N (`ORDER BY ... LIMIT k [OFFSET n]`) split the table's rowid space across `std::thread::scope` workers:
 
 - The rowid range tiles into inclusive ranges — worker 0's range extends to `i64::MIN` so explicit rowid-0/negative rows are never dropped. Each worker builds its own `Btree` handle over the shared `&Pager` and runs the serial path's own `FusedWalk` / `HashGrouper` / keep-heap machinery over its `[lo, hi]` range, so per-row semantics are identical by construction.
 - Aggregates merge partial accumulators in **range order** with **op-aware layouts** (SUM `(i_sum, sum, is_int)`, AVG `(count, sum)`, COUNT `count`, MIN/MAX min/max — the merge is not a byte-blit); GROUP BY first-seen group order is reproduced exactly; DISTINCT replays via set-union.
@@ -332,9 +331,9 @@ include/rustqlite_ext.h # Extension header for C/C++/Zig
 
 ## Performance vs SQLite
 
-Head-to-head against rusqlite with bundled SQLite on identical workloads, `cargo run --release --example bench_compare` — **every timing row carries an answer-equality assert against SQLite before it is timed**. Measured 2026-09-07 (2 vCPU, best-of-5, after the intra-statement parallel aggregation, parallel top-N, and bounded-memory passes). Ratio > 1 = rustqlite faster.
+Head-to-head against rusqlite with bundled SQLite on identical workloads, `cargo run --release --example bench_compare` — **every timing row carries an answer-equality assert against SQLite before it is timed**. Measured on a 2 vCPU machine, best-of-5. Ratio > 1 = rustqlite faster.
 
-The harness gained an **adaptive warmup** on 2026-09-08: `best_of` now probes once and trains — 100 extra runs for µs-scale workloads, a handful for ms-scale, nothing for ≥100 ms rows — applied identically to both engines, so the tables measure steady-state latency instead of cold icache / branch-predictor / allocator state (min-of-5 single shots had let the 2-table PK join flip between a 1.13x win and a 0.85x loss across runs while the code stood still). Re-measured under that discipline the win margins held everywhere: joins 1.4–1.7x, range scans 2–2.4x, aggregates 2–6x, UPDATE/DELETE 1.1–1.7x, peak-RSS 0.9x — and the properly-warmed 2-table PK join came in at **1.92 µs vs SQLite's 2.74 µs (1.43x)** rather than the parity shown in the table below.
+The harness applies an **adaptive warmup** identically to both engines: `best_of` probes once and trains — 100 extra runs for µs-scale workloads, a handful for ms-scale, nothing for ≥100 ms rows — so the tables measure steady-state latency instead of cold icache / branch-predictor / allocator state. Under that discipline the win margins hold everywhere: joins 1.4–1.7x, range scans 2–2.4x, aggregates 2–6x, UPDATE/DELETE 1.1–1.7x, peak-RSS 0.9x — and the properly-warmed 2-table PK join measures **1.92 µs vs SQLite's 2.74 µs (1.43x)** (the parity entry in the table below is the colder best-of-5 view).
 
 ### Serial workloads
 
@@ -380,15 +379,11 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **Analytical scans / aggregates**: fused scan drivers with selective column decode beat SQLite 2–5x serially on scans, filtered COUNTs, and aggregates — before the parallel split compounds it. COUNT(*) is memoized on the B+tree (27x).
 - **Point lookups**: the bucket-keyed 2-way leaf cache + cursor-ix cell bias makes rowid probes ~2x.
 - **Rowid range scans**: `WHERE id BETWEEN ? AND ?` runs a dedicated fused range-probe path — no pipeline setup, binary-searched leaf descent, early stop at the first cell past the range end.
-- **UPDATE range / index scans**: the `IndexRange` plan node seeks the index and touches only matching rows; UPDATE rewrites payloads in place where possible (payload-patch fast path).
+- **UPDATE range / index scans**: the `IndexRange` plan node seeks the index and touches only matching rows; UPDATE rewrites payloads in place where possible (payload-patch fast path). UPDATEs whose WHERE is an exact unique-index probe (`WHERE k = ?`, `WHERE k IN (...)`) take an index-point path — seek, rowid fetch, payload patch — and `IN` probes keep every key's matches in per-key scratch buffers.
 - **Top-N**: per-worker bounded keep-heaps under the statement's exact total order, merged range-ordered — the serial streaming top-N's own algorithm, split across workers.
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
 - **Concurrency**: see the [concurrency section](#concurrency-vs-sqlite) — the 8.3x concurrent-read and 5.7–8.3x parallel-aggregate multipliers sit on top of these serial wins.
-
-### Trajectory
-
-The 2026-08-28 baseline had rustqlite 1.1–8.7x *slower* than SQLite on these same rows. The 2026-09 sprints (fused scans, codec v2, append splits, payload-patch UPDATE, leaf cache, mimalloc wake tuning, committed-view concurrency, parallel executor) flipped every row to a win; the 2026-09-08 sprint then added the THP constructor (memory), index-point UPDATEs, the adaptive-warmup benchmark discipline, and the sea-orm/sqlx-migration compatibility fixes — and its evening pass closed four documented gaps outright: the ephemeral temp-store (S03), Arc-shared IN lists (S11), ANALYZE + sqlite_stat1 with a stat1-driven cost model, and real sqlite3_serialize/deserialize. The full ledger of each sprint lives in git history (`git log --oneline`).
 
 Run the benchmarks yourself:
 
@@ -425,14 +420,14 @@ for 1.5–2.1x write throughput (opt-out: `default-features = false`); the
 rest of the binary delta is the feature surface (plugins, sqlx driver,
 parallel executor) that SQLite ships as separate extensions.
 
-### Production torture matrix (memory columns, 2026-09-08 pass)
+### Production torture matrix (memory columns)
 
 The 18-section torture matrix (`cargo run --release --example
 prod_torture`, one isolated child process per engine per section, peak
-RSS measured via VmHWM / mach / Win32, best-of-2 per section). The
-2026-09-08 pass adds the process-wide THP disable (see below) — on
-`THP=always` kernels it cut 30-50% off every memory column while every
-time column stayed a win:
+RSS measured via VmHWM / mach / Win32, best-of-3 per section), with the
+process-wide THP disable active (on `THP=always` kernels it removes a
+30-50% amplification from every memory column while every time column
+stays a win):
 
 | Section (scale 1.0)                 | rustqlite | SQLite | Mem verdict |
 |-------------------------------------|-----------|--------|-------------|
@@ -446,33 +441,28 @@ time column stayed a win:
 | S15 rollback 500k txn               | 21 MB     | 20 MB  | TIE (0.97x) |
 | S07 random inserts 300k             | 16 MB     | 14 MB  | 0.87x       |
 | S10 LIKE scan 100k                  | 9 MB      | 8 MB   | 0.93x       |
-| S11 IN-list 5000 literals           | 12 MB     | 10 MB  | 0.78x       |
+| S11 IN-list 5000 literals           | 7 MB      | 10 MB  | 0.70x — WIN (Arc-shared lists, 2.12x time) |
 | S12 5-index load                    | 19 MB     | 17 MB  | 0.87x       |
 | S13 sustained 2M ops (leak probe)   | 7 MB      | 5 MB   | 0.73x (no leak: 6→7 MB flat) |
 | S14 churn + reclaim (file)          | 13 MB     | 8 MB   | 0.62x       |
 | S16 8r+2w concurrency               | 10 MB     | 8 MB   | 0.86x       |
 | S17 open 1M-row file + SUM          | 14 MB     | 7 MB   | 0.50x       |
 | S18 differential hash               | 9 MB      | 8 MB   | 0.93x       |
-| S03 GROUP BY 100k buckets           | 57 MB     | 37 MB  | 0.65x — see the gap ledger |
+| S03 GROUP BY 100k buckets           | 26 MB     | 37 MB  | 0.70x — WIN (temp-store spill, 3.34x time) |
 
-**The 2026-09-08 THP discovery**: mimalloc's `allow_thp=0` prctl path
+**THP handling**: mimalloc's `allow_thp=0` prctl path
 only runs at mimalloc init — which happens on the first Rust-runtime
 allocation, before any engine code can set the option. On
 `transparent_hugepage=always` kernels that meant every touched 4 KiB
 allocation page inside mimalloc's arena reservations materialized a
 2 MiB huge page: the same engine+workload measured 22 MB where the
-identical binary on a `madvise` kernel measured 12 MB. The engine now
+identical binary on a `madvise` kernel measured 12 MB. The engine therefore
 runs `prctl(PR_SET_THP_DISABLE)` from an `.init_array` constructor —
 before the runtime's first allocation — with `RSQL_ALLOW_THP=1` as the
-opt-out for huge-page-friendly throughput builds. Measured impact on a
-`THP=always` kernel: S17 28→14 MB, S13 12→7 MB, S14 24→13 MB, S11
-22→12 MB, S16 21→10 MB, and the micro-benchmark baseline 10.4→8.3 MB —
-with every time column unchanged (S02 6.07x, S16 7.12x).
-
-Earlier passes: the 2026-09-07 bounded-memory pass closed S17 72→14 MB,
-S14 44→13 MB and S03 96→57 MB (bounded WAL checkpoint, 40 B aggregate
-states, per-burst allocator drains). Every time column stayed a win or
-tie throughout.
+opt-out for huge-page-friendly throughput builds. On a `THP=always`
+kernel the constructor halves the file-backed sections (S17 14 MB, S13
+7 MB, S14 13 MB, S16 10 MB) with every time column unchanged (S02 6.07x,
+S16 7.12x).
 
 ## Concurrency vs SQLite
 
@@ -530,6 +520,15 @@ thread and an FFI boundary; the native driver executes inline in the async task 
 the engine's `Send + Sync` core. The 18.4x stream number compounds that with the engine's
 batch-at-a-time streaming drivers (rows are produced in batches of 64 instead of
 per-row FFI callbacks).
+
+The **8-conn mixed R/W 80/20** row is parity-class by construction: rustqlite runs its
+shared-memory engine while sqlx-sqlite runs a file-backed WAL database with an fsync per
+commit, so SQLite's number on that row is dominated by the host's fsync latency — the
+same binaries measured 394 ms on a macOS-ARM runner and 6.33 s on linux-x64 (a 16x swing
+by host). On fast-fsync hosts SQLite can take the row; on slower-fsync hosts it loses by
+8–20x. Reads inside the mixed workload stay 2.8x throughout, and the CI bench gate
+treats the row as an explicitly-marked parity guard (wide band) rather than a strict
+win/loss — the honest classification for a runner-hardware-dominated comparison.
 
 ## SQLite file-format interop
 
@@ -615,166 +614,102 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
   is always fully dense); UTF-16-encoded files are rejected (the engine
   is UTF-8 throughout).
 
-## Recent improvements
-
-The 2026-09-08 sprint, by axis — each line is a commit in `git log` with its own
-verification (the evening pass added the four headline gap closures:
-**temp-store spill** — S03's structural memory gap; **Arc-shared IN lists** — S11's
-retained copies; **ANALYZE + sqlite_stat1 + a stat1-driven cost model** — the planner
-statistics gap; and **real sqlite3_serialize/deserialize** — the compat gap):
-
-### Performance
-
-- **ANALYZE-driven index choice**: `sqlite_stat1` statistics feed SQLite's row-estimate
-  model (`rows / (D1 × … × Dk)`) into the planner's index ranking, and an index that
-  would match > 75% of the table is declined in favor of the sequential scan — the
-  same cost-model call SQLite makes. Pre-ANALYZE behavior is bit-identical (the
-  heuristic path).
-- **Sequential read-ahead**: +1 page-access runs trigger a 4-page batched fetch into
-  the pager cache — cold file-backed scans cut syscalls ~5x, gated to the plain
-  (non-WAL, non-codec, version-less) page states only.
-- **Chunked SELECT streaming in the C ABI**: `sqlite3_step` on a read statement used to acquire the engine read-lock once *per row* (plus a `total_changes` read under another lock to bracket the step). The statement now refills a 64-row buffer under ONE read-lock acquisition and serves the buffered rows without re-locking — typical ORM page sizes (30–50 rows) complete in a single acquisition, and concurrent readers stop trading cache-line ping-pong on the lock. C semantics unchanged: one row per `step`, `Done` after the buffer drains, `reset` clears the buffer.
-- **Transaction-control classified at PREPARE**: `run_once` re-parsed every Once statement's SQL on every execution just to recognize BEGIN/COMMIT/ROLLBACK — a full lexer+parser round-trip twice per transaction. The flavor (`TxKind`) is now computed once at prepare time and carried on the statement handle.
-- **JSONB + `->`/`->>` (byte-identical to SQLite 3.45+)**: the full `jsonb_*` family and both path operators with SQLite's exact precedence — JSON work no longer round-trips through text parsing, and the differential tests pin the encoder's bytes against real SQLite.
-- **Index-point UPDATEs**: UPDATEs whose WHERE clause is an exact unique-index probe (`UPDATE ... WHERE version = ?`, `WHERE k IN (...)`) now stream through the index-point path — index seek, rowid fetch, payload patch — instead of the general materialize-then-match path, mirroring what `try_streaming_delete` already did.
-- **IN-list probes keep every key's matches**: the per-key rowid probes used to clear a shared out-buffer on each call, so `WHERE k IN ('a','b')` only ever applied the last key's rows; each key now gets its own scratch buffer (a correctness fix that is also a throughput fix — no re-probing).
-- **Steady-state benchmarking**: the harness's adaptive warmup (above) removed cold-start noise from every µs-scale row — measurements now track engine quality, not runner mood.
-
-### Observability
-
-- **`sqlite3::engine_stats()` C-ABI surface**: process-global atomic counters (connections opened/closed/live, statements prepared, steps, rows returned, writes executed, transactions begun/committed/rolled back, busy waits + timeouts) plus per-file snapshots (page size/count, freelist, cache pages/capacity/hits/misses, WAL frames, `total_changes`, live connections, transaction-active). One relaxed atomic per hot-path event — the same ~1 ns trade SQLite's own `SQLITE_STATUS` counters make — so it's always-on, not sampled. Consumers: the rust-be-template admin dashboard's `/api/admin/system` endpoint (memory used / throughput / performance capacity cards).
-
-### Resource consumption
-
-- **Ephemeral temp-store (SQLite-style)**: high-cardinality GROUP BYs freeze group
-  states to disk-backed ephemeral files at a 65536-group threshold and stream results
-  back through a k-way chunk merge — bounded RSS for unbounded group cardinality
-  (torture S03's structural gap). Every aggregate family is spill-mergeable; spilled
-  output is key-sorted (SQLite's ephemeral-sorter order); `PRAGMA temp_store = 2`
-  (MEMORY) keeps everything in RAM; I/O failures degrade to the in-RAM contract.
-- **Arc-shared IN lists**: the AST's `IN (…)` list, the plan's predicate clone, and the
-  RowidIn/IndexIn extractions all point at ONE `Arc<Vec<Expr>>` — a 5000-literal
-  cached statement no longer retains three deep copies (torture S11).
-- **Process-wide THP disable at `.init_array`**: runs `prctl(PR_SET_THP_DISABLE)` before the Rust runtime's first allocation (mimalloc's own `allow_thp=0` runs too late to help). On `transparent_hugepage=always` kernels this cut **30–50% off every torture-matrix memory column** (S17 28→14 MB, S13 12→7 MB, S14 24→13 MB) with every time column unchanged. `RSQL_ALLOW_THP=1` opts back in for huge-page-friendly throughput builds.
-- Earlier in the sprint: bounded WAL-checkpoint copying (1 MiB run buffer — a 7250-page commit previously materialized the whole 29 MiB WAL), 40-byte aggregate states, and per-burst allocator drains closed S17 72→14 MB, S14 44→13 MB, S03 96→57 MB.
-
-### Concurrency
-
-- **Fresh-DB pool split fixed**: the compat engine-map keyed by `canonicalize(path)`, which only works while the file exists — the first `mode=rwc` open created the file under the raw-path key, and the pool's second connection canonicalized to the absolute path, missed the map, and built a *second* engine whose catalog predated the first one's DDL. Statements then round-robined across two engines and `CREATE TABLE` on connection A followed by `CREATE INDEX` on connection B failed. The key is now canonicalized parent-directory + file-name, independent of file existence.
-- **Streaming-UPDATE phase-2 root staleness fixed**: after a deferred insert split the b-tree, phase 2 kept inserting into the stale root page (now an ordinary interior node) — duplicated rows, out-of-order rowids, silent row loss once a size-changing UPDATE crossed a leaf split (~250+ rows on 4 KiB pages). The root now refreshes after every split, and the done-mask translates deferred positions through the index order.
-
-### Compatibility & robustness
-
-- **`sqlite3_serialize` / `sqlite3_deserialize` (real)**: the full database image
-  round-trips through the C ABI, and deserialize accepts real SQLite-format buffers
-  too (the cross-engine case) with full read/write semantics and re-serialization.
-- **`TRUE`/`FALSE` keywords** (SQLite 3.23+): previously lexed as identifiers, so `SELECT TRUE` evaluated to NULL and sqlx's migrator wrote NULL into its `success BOOLEAN NOT NULL` column, failing the whole migration. Now keywords, with SQLite's fallback rule keeping them legal as unquoted column/table names.
-- **Table-valued PRAGMAs through the prepared-statement path**: `PRAGMA table_info('t')` and friends previously returned zero rows via the write path, and sqlx panicked caching a 1-column layout that became 6 columns on first step. They now classify as reads, execute once under the read lock at prepare time, and buffer the real column layout — sea-schema discovery, sea-orm-codegen, and `sqlx::migrate!` all work end to end.
-- **UPDATE-FROM rowid resolution for non-alias tables**: the general path compared materialized source rows `[cols.., rowid]` against stored rows `[cols..]` — shapes that never match, so every strict/generated-column/expression-index UPDATE on a table without an `INTEGER PRIMARY KEY` alias failed with "UPDATE target row disappeared". The rowid now comes from the hidden rowid slot the scan drivers already append.
-- **CLI exits cleanly on EPIPE** — a reader leaving early (`| head`) no longer panics the shell.
-- **CI**: Windows live-handle interop fixed (SQL oplocks on renamed files) and workspace-wide clippy in the matrix.
-
 ## Remaining gaps vs SQLite
 
-The honest ledger, organized the way the comparisons above are: performance, resource
-consumption, concurrency, and the feature/compat surface still missing. Every entry says
-what it costs, why it exists, and (where decided) what the fix looks like.
+The honest ledger of everything still missing, organized the way the comparisons
+above are: performance, resource consumption, concurrency, and the feature /
+compat surface. Every entry says what it costs and why it exists.
 
 ### Performance gaps
 
-- **Narrow serial wins**: the unfiltered 2-table PK join sits at parity in the
-  best-of-5 table (the adaptive-warmup re-measure puts it at 1.43x — see above), and
-  UPDATE by PK is 1.09x — both grow with table size and index selectivity.
-- **8-conn mixed R/W 80/20 at 1.05x**: at high write fan-out the writer gate + commit
-  fsync dominates; reads stay 2.8x throughout. SQLite's WAL has the same shape.
-- **Planner**: predicate pushdown into all scan shapes, join reordering, and subquery
-  decorrelation are not implemented — plan SHAPES are rule-based. The stat1-driven
-  cost model (2026-09-08, post-ANALYZE) now ranks index candidates and declines
-  unselective indexes, but SQLite's cost model makes better choices on a few
-  adversarial JOIN ORDERS (shape-level, which statistics alone cannot fix).
-- **Parallel executor coverage**: parallel top-N shipped (2026-09-07); unbounded
-  parallel ORDER BY (chunk sort + k-way range-ordered merge) and the compiled
-  no-GROUP-BY aggregate path with parameter filters still run serial. Complex predicates
-  with bound params take the generic (still fast, but not worker-split) path.
-- **Numeric precision**: `AVG` rounds to 10 decimals (SQLite rounds differently in a few
-  edge cases); parallel REAL SUMs merge partial sums in range order — the last ULP can
-  differ from a serial scan (float addition is not associative; every parallel SQL engine
-  takes this latitude, and SQLite's own float-SUM order is unspecified).
+- **Two narrow serial rows**: the unfiltered 2-table PK join sits at parity in
+  the cold best-of-5 table (1.43x under proper warmup — see
+  [Performance](#performance-vs-sqlite)), and UPDATE by PK is 1.09x. Both
+  grow with table size and index selectivity.
+- **8-conn mixed R/W 80/20 (parity-class)**: at high write fan-out the writer
+  gate + commit fsync set the floor; reads stay 2.8x throughout. The row
+  compares a shared-memory engine against SQLite's file-backed WAL, so its
+  verdict is host-fsync-dominated (394 ms vs 6.33 s for SQLite across host
+  families — see the note in the sqlx section); the CI bench gate treats it
+  as an explicitly-marked parity guard. Same shape as SQLite's own WAL.
+- **Planner plan shapes**: predicate pushdown into all scan shapes, join
+  reordering, and subquery decorrelation are not implemented — plan shapes
+  are rule-based. The stat1-driven cost model ranks index candidates and
+  declines unselective ones after `ANALYZE`, but SQLite's cost model makes
+  better choices on a few adversarial join orders (a shape-level gap that
+  statistics alone cannot fix).
+- **Parallel executor coverage**: unbounded parallel ORDER BY (chunk sort +
+  k-way range-ordered merge) and the compiled no-GROUP-BY aggregate path
+  with parameter filters still run serial. Complex predicates with bound
+  params take the generic (still fast, but not worker-split) path.
+- **Numeric precision**: `AVG` rounds to 10 decimals (SQLite rounds
+  differently in a few edge cases); parallel REAL SUMs merge partial sums
+  in range order, so the last ULP can differ from a serial scan (float
+  addition is not associative; every parallel SQL engine takes this
+  latitude, and SQLite's own float-SUM order is unspecified).
 
 ### Resource-consumption gaps
 
-- **Binary size (+1.0 MB, 1.5x)**: mimalloc (~140 KiB) plus the engine's own feature
-  surface (plugins, sqlx driver, parallel executor) — `default-features = false` drops
-  mimalloc; SQLite's ~2 MB is a 25-year head start of hand-tuned code size. This is the
-  only resource metric where rustqlite is behind, and it is deliberate.
-- **Torture-matrix memory on the hardest shapes** (the 2026-09-07/08 passes closed the
-  worst — S03 96→57 MB, S14 44→13 MB, S17 72→14 MB — and the 2026-09-08 evening
-  sprint added the temp-store spill (closes S03's structural gap — see below), the
-  Arc-shared IN list (S11's retained-copy overhead), and sequential read-ahead; the
-  bench peak-RSS row is a 0.91x win; what remains, measured at scale 1.0):
-  - **S17 open 1M-row file + SUM (0.51x)** and **S14 churn (0.62x)**: the file-mode
-    build transaction peaks ~3 MB over SQLite (WAL-side bookkeeping plus allocator
-    fragmentation of the insert churn), and the child's whole build phase defines the
-    HWM. SQLite's pager is 25 years of bounded-everything tuning; each remaining MB
-    needs profiling at the allocator level.
-  - **S03 GROUP BY 100k buckets (spilling, verified in CI)**: the 100k group
-    states now spill through the ephemeral temp-store (65536-group threshold, k-way
-    chunk merge on output — see the Storage section), so the in-RAM floor is bounded
-    at ~2 epochs regardless of cardinality: the 2026-09-08 post-spill CI pass
-    measured **26 MB** (was 57 MB pre-spill) at **3.34x faster** — and the absolute
-    delta vs SQLite is now dominated by the 1M-row BUILD phase, not the grouper.
-  - **S07/S10/S12/S13/S16/S18 (~0.73–0.93x, 1–2 MB each)**: the mimalloc
-    baseline — its 64 KiB-per-size-class page granularity commits ~1 MB at
-    `Database::open` where glibc packs the same allocations into ~0.4 MB. That is
-    the documented cost of the 20–40% small-allocation throughput mimalloc buys
-    (SQLite is measured against glibc); `default-features = false` recovers the
-    baseline. The 2026-09-08 THP constructor already removed a 2-4x amplification
-    layer that sat on top of this on `THP=always` kernels.
-  - **S11 IN-list 5000 literals (Arc-shared, verified in CI)**: the AST, the
-    plan's predicate clone, and the RowidIn/IndexIn extractions now share ONE
-    `Arc<Vec<Expr>>` list instead of retaining three deep copies in the statement
-    cache — the 2026-09-08 post-fix CI pass measured **7 MB** (was 12 MB) at
-    **2.12x faster**; the remaining delta is the compiled membership set +
-    parse-time token churn, which SQLite also pays in its own form.
+- **Binary size (+1.0 MB, 1.5x)**: mimalloc (~140 KiB) plus the engine's own
+  feature surface (plugins, sqlx driver, parallel executor) —
+  `default-features = false` drops mimalloc. The only resource metric where
+  rustqlite is behind, and it is deliberate: SQLite's ~2 MB is a 25-year
+  head start of hand-tuned code size.
+- **S17 open 1M-row file + SUM (0.50x) and S14 churn (0.62x)**: the
+  file-mode build transaction peaks ~3–6 MB over SQLite (WAL-side
+  bookkeeping plus allocator fragmentation of the insert churn), and the
+  child's whole build phase defines the high-water mark. SQLite's pager is
+  25 years of bounded-everything tuning; each remaining MB needs profiling
+  at the allocator level.
+- **S07/S10/S12/S13/S16/S18 (~0.73–0.93x, 1–2 MB each)**: the mimalloc
+  baseline — its 64 KiB-per-size-class page granularity commits ~1 MB at
+  `Database::open` where glibc packs the same allocations into ~0.4 MB.
+  That is the documented cost of the 20–40% small-allocation throughput
+  mimalloc buys (SQLite is measured against glibc);
+  `default-features = false` recovers the baseline. S03 (temp-store spill)
+  and S11 (Arc-shared IN lists) are memory *wins* now — see the torture
+  matrix above.
 
 ### Concurrency gaps
 
-- **Multi-writer transactions**: one writer at a time, `SQLITE_BUSY` + busy timeout —
-  SQLite's own durability contract, kept by design rather than diverged from. (SQLite
-  itself is single-writer; this is parity, not a gap — but it bounds write fan-out.)
-- **High write fan-out flattens the read win**: the 8-conn mixed 80/20 row is 1.05x
-  because commit fsync + the writer gate set the floor; the read-side multipliers
-  (2.8x) only dominate when reads outnumber writes. Same shape as SQLite's WAL, not a
-  divergence.
+- **Multi-writer transactions**: one writer at a time, `SQLITE_BUSY` + busy
+  timeout — SQLite's own durability contract, kept by design rather than
+  diverged from. (SQLite itself is single-writer; this is parity, not a
+  gap — but it bounds write fan-out.)
+- **High write fan-out flattens the read win**: the 8-conn mixed 80/20 row
+  is parity-class because commit fsync + the writer gate set the floor; the
+  read-side multipliers (2.8x) only dominate when reads outnumber writes.
+  Same shape as SQLite's WAL, not a divergence.
 - **SQLite-format files are single-connection** (see
-  [interop limitations](#interop-limitations)): the whole image loads on open and each
-  commit rewrites the file — O(file) per commit boundary. Native format carries the
-  MRMW pager; interchange is the SQLite-format mode's job.
+  [interop limitations](#interop-limitations)): the whole image loads on
+  open and each commit rewrites the file — O(file) per commit boundary.
+  The native format carries the MRMW pager; interchange is the
+  SQLite-format mode's job.
 
 ### Missing parts (feature & compat surface)
 
 - **Compat C ABI stubs**: the preupdate-hook family
   (`sqlite3_preupdate_hook/old/new/count/depth`) remain stubs;
   `sqlite3_unlock_notify` is a functional immediate-notify (the engine
-  never blocks a reader); `sqlite3_serialize` / `sqlite3_deserialize`
-  are fully real (see the compat section above).
-- **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are approximations —
-  being tightened one at a time via differential tests against real SQLite.
-- **No index overflow chains in the native format**: index keys larger than one page
-  cannot load from SQLite files (table data of any size is fine); the native index
-  b-tree has no overflow-chain support yet.
-- **Non-BINARY collations in written SQLite files**: index definitions with custom
-  collations fall back to binary ordering in the written file; `auto_vacuum` pointer-map
-  pages are read but not written (output is always dense); UTF-16-encoded SQLite files
-  are rejected (the engine is UTF-8 throughout).
-- **Planner beyond statistics**: predicate pushdown into all scan shapes, join
-  reordering, and subquery decorrelation are not implemented — the stat1-driven cost
-  model now ranks index candidates (and declines unselective ones after ANALYZE),
-  but plan SHAPES are still rule-based.
-- **WAL for SQLite-format mode**: the SQLite-format writer commits atomically via
-  temp-file + rename, not a real `-wal` sidecar — readers of a rustqlite-written file
-  never see journal state, but a rustqlite-opened SQLite file's own live `-wal` is
-  folded into the read view only (writes rewrite the file).
+  never blocks a reader, so it never needs SQLite's blocking path — but it
+  is not SQLite's exact blocking semantic); `sqlite3_serialize` /
+  `sqlite3_deserialize` are fully real.
+- **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
+  approximations — tightened one at a time via differential tests against
+  real SQLite.
+- **No index overflow chains in the native format**: index keys larger
+  than one page cannot load from SQLite files (table data of any size is
+  fine); the native index b-tree has no overflow-chain support.
+- **Non-BINARY collations in written SQLite files**: index definitions
+  with custom collations fall back to binary ordering in the written file;
+  `auto_vacuum` pointer-map pages are read but not written (output is
+  always dense); UTF-16-encoded SQLite files are rejected (the engine is
+  UTF-8 throughout).
+- **WAL for SQLite-format mode**: the SQLite-format writer commits
+  atomically via temp-file + rename, not a real `-wal` sidecar — readers
+  of a rustqlite-written file never see journal state, but a
+  rustqlite-opened SQLite file's own live `-wal` is folded into the read
+  view only (writes rewrite the file).
 
 ## Usage
 
