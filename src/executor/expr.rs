@@ -14,6 +14,30 @@ use crate::sql::ast::*;
 use crate::types::{Affinity, Value};
 use std::collections::HashMap;
 
+/// `x -> path` → the JSON text of the target; `x ->> path` → the SQL
+/// value. RHS: INTEGER = array index, TEXT '$...' = full path, TEXT
+/// '[N]' = index, other TEXT = a single object key. A missing target is
+/// NULL; malformed documents/paths RAISE like SQLite.
+fn arrow_eval(op: BinaryOp, l: &Value, r: &Value) -> Result<Value> {
+    if l.is_null() || r.is_null() {
+        return Ok(Value::Null);
+    }
+    let doc = match crate::executor::json::load_doc(l)? {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    let segs = crate::executor::jsonb::arrow_rhs_segments(r).map_err(Error::Runtime)?;
+    let Some(segs) = segs else {
+        return Ok(Value::Null);
+    };
+    let node = crate::executor::jsonb::jb_resolve(&doc, &segs);
+    Ok(match (op, node) {
+        (BinaryOp::Arrow, Some(n)) => Value::Text(n.render().into()),
+        (BinaryOp::ArrowText, Some(n)) => n.to_value(),
+        _ => Value::Null,
+    })
+}
+
 /// Resolve a `substr(X, Y, Z)` range to 0-based `[begin, end)` bounds
 /// over a value of `n` units (characters for TEXT, bytes for BLOB),
 /// implementing SQLite's exact algorithm from `substrFunc` (func.c):
@@ -360,6 +384,12 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         Expr::Binary { op, left, right } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
+            // JSON path operators: `x -> path` (JSON text) / `x ->> path`
+            // (SQL value). They bind tighter than every other binary
+            // operator and can RAISE (malformed JSON / bad path).
+            if matches!(op, BinaryOp::Arrow | BinaryOp::ArrowText) {
+                return arrow_eval(*op, &l, &r);
+            }
             // COLLATE on either comparison operand applies a collation to
             // text comparison (SQLite: `a < b COLLATE NOCASE`). Only
             // ordering / equality operators honor it.
@@ -871,11 +901,27 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         }
         // __JSON_OBJECT_FRAG(k, v) — hidden scalar feeding
         // json_group_object's accumulator: `"k":v` (JSON-quoted).
+        // NULL values are INCLUDED as null (SQLite); NULL keys skip the
+        // pair entirely.
         "__json_object_frag" => {
-            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
+            if args.len() == 2 && !args[0].is_null() {
                 let k = crate::executor::json::json_quote_value(&args[0]);
                 let v = crate::executor::json::json_quote_value(&args[1]);
                 Value::Text(format!("{k}:{v}").into())
+            } else {
+                Value::Null
+            }
+        }
+        // __JSONB_OBJECT_FRAG(k, v) — the JSONB analogue: the encoded
+        // key element + value element bytes, feeding jsonb_group_object.
+        "__jsonb_object_frag" => {
+            if args.len() == 2 && !args[0].is_null() {
+                let key = crate::executor::jsonb::value_to_jb(&args[0]);
+                let val = crate::executor::jsonb::value_to_jb(&args[1]);
+                let mut buf = Vec::new();
+                crate::executor::jsonb::encode_elem_pub(&mut buf, &key);
+                crate::executor::jsonb::encode_elem_pub(&mut buf, &val);
+                Value::Blob(buf)
             } else {
                 Value::Null
             }
@@ -1344,6 +1390,82 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 }
             }
         },
+        // UNISTR(X) — decode \uXXXX escapes (with surrogate pairs) in
+        // the text; a malformed \u sequence is an error. Other
+        // backslashes pass through verbatim (SQLite: `unistr('a\\b')`
+        // keeps both characters).
+        "unistr" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let s = v.as_text();
+                match unistr_decode(&s) {
+                    Ok(out) => Value::Text(out.into()),
+                    Err(()) => return Err(Error::Runtime("invalid Unicode escape".to_string())),
+                }
+            }
+        },
+        // UNISTR_QUOTE(X) — render as a SQL literal that evaluates back to
+        // X: a plain 'literal' when no escaping is needed, otherwise
+        // `unistr('...')` with \uXXXX escapes for control characters
+        // (backslashes and non-ASCII stay raw — SQLite:
+        // unistr_quote('a\tb') → unistr('a\u0009b')).
+        "unistr_quote" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => {
+                let s = v.as_text();
+                let mut body = String::with_capacity(s.len() + 2);
+                let mut escaped = false;
+                for c in s.chars() {
+                    match c {
+                        '\'' => body.push_str("''"),
+                        c if (c as u32) < 0x20 => {
+                            escaped = true;
+                            body.push_str(&format!("\\u{:04x}", c as u32));
+                        }
+                        c => body.push(c),
+                    }
+                }
+                let quoted = format!("'{}'", body);
+                Value::Text(if escaped {
+                    format!("unistr({})", quoted).into()
+                } else {
+                    quoted.into()
+                })
+            }
+        },
+        // SOUNDEX(X) — the classic Soundex code (letter + 3 digits);
+        // input with no letters gives "?000".
+        "soundex" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Text(soundex(&v.as_text()).into()),
+        },
+        "sqlite_compileoption_get" => {
+            let n = args.first().map(|v| v.as_integer()).unwrap_or(-1);
+            Value::Text(
+                compile_options()
+                    .get(n.max(0) as usize)
+                    .map(|s| (*s).into())
+                    .unwrap_or_default(),
+            )
+        }
+        "sqlite_compileoption_used" => {
+            let name = args.first().map(|v| v.as_text());
+            let name =
+                match name {
+                    Some(n) if !n.is_empty() => n,
+                    _ => return Err(Error::Runtime(
+                        "argument to sqlite_compileoption_used() must be a positive length string"
+                            .to_string(),
+                    )),
+                };
+            let hit = compile_options().iter().any(|o| {
+                o.split_once('=')
+                    .map(|(k, _)| k)
+                    .unwrap_or(o)
+                    .eq_ignore_ascii_case(&name)
+            });
+            Value::Integer(if hit { 1 } else { 0 })
+        }
         // TRUE() / FALSE() — SQLite 3.23+ boolean literals.
         "true" => Value::Integer(1),
         "false" => Value::Integer(0),
@@ -1356,7 +1478,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
                 return r;
             }
-            crate::executor::json::call_json_function(&fname, args).unwrap_or(Value::Null)
+            crate::executor::json::call_json_function(&fname, args)?.unwrap_or(Value::Null)
         }
     })
 }
@@ -1406,6 +1528,22 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "json_replace",
         "json_set",
         "json_valid",
+        "jsonb",
+        "jsonb_array",
+        "jsonb_extract",
+        "jsonb_group_array",
+        "jsonb_group_object",
+        "jsonb_insert",
+        "jsonb_object",
+        "jsonb_patch",
+        "jsonb_remove",
+        "jsonb_replace",
+        "jsonb_set",
+        "soundex",
+        "sqlite_compileoption_get",
+        "sqlite_compileoption_used",
+        "unistr",
+        "unistr_quote",
         "julianday",
         "last_insert_rowid",
         "length",
@@ -1530,6 +1668,9 @@ fn cmp_operand_missing(v: &Value) -> bool {
 pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
     use BinaryOp::*;
     match op {
+        // JSON path operators are intercepted in `evaluate` (they can
+        // raise); reaching here means a fallback context — treat as NULL.
+        Arrow | ArrowText => Value::Null,
         // Integer overflow PROMOTES TO REAL (SQLite: 9223372036854775807 + 1
         // is 9.223372036854776e18, never a wrapped i64).
         Add => arith_checked(l, r, i64::checked_add, |a, b| a + b),
@@ -2051,6 +2192,139 @@ fn apply_printf_width(raw: String, minus: bool, zero: bool, width: usize) -> Str
     } else {
         format!("{pad}{raw}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// unistr / soundex / compile options
+// ---------------------------------------------------------------------------
+
+/// Decode `\uXXXX` escapes (surrogate pairs included). A malformed
+/// `\u` sequence is an error; other backslashes copy through verbatim.
+fn unistr_decode(s: &str) -> std::result::Result<String, ()> {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            match b.get(i + 1) {
+                // \uXXXX — code point escape.
+                Some(b'u') => {
+                    let hex = s.get(i + 2..i + 6).ok_or(())?;
+                    let cp = u32::from_str_radix(hex, 16).map_err(|_| ())?;
+                    i += 6;
+                    // Lone surrogates decode to U+FFFD (SQLite emits raw
+                    // WTF-8 there, which is not valid UTF-8).
+                    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                }
+                // \\ — an escaped backslash.
+                Some(b'\\') => {
+                    out.push('\\');
+                    i += 2;
+                }
+                // Any other backslash sequence is invalid.
+                _ => return Err(()),
+            }
+        } else {
+            // Copy one UTF-8 char.
+            let ch = s[i..].chars().next().ok_or(())?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Ok(out)
+}
+
+/// The Soundex letter→digit table (A..Z): 0 = not coded (vowels, H, W, Y).
+const SOUNDEX_TABLE: &[u8; 26] = b"01230120022455012623010202";
+
+fn soundex(s: &str) -> String {
+    let mut it = s.chars().skip_while(|c| !c.is_ascii_alphabetic());
+    let Some(first) = it.next() else {
+        return "?000".to_string();
+    };
+    let up = first.to_ascii_uppercase();
+    let mut out = [b'0'; 4];
+    out[0] = up as u8;
+    let mut k = 1usize;
+    let mut last = SOUNDEX_TABLE[(up as u8 - b'A') as usize];
+    for c in it {
+        if !c.is_ascii_alphabetic() {
+            continue;
+        }
+        let cu = c.to_ascii_uppercase() as u8;
+        let code = SOUNDEX_TABLE[(cu - b'A') as usize];
+        let is_h_or_w = cu == b'H' || cu == b'W';
+        if code == b'0' {
+            // Vowels (and Y) reset the collapse; H and W do not.
+            if !is_h_or_w {
+                last = b'0';
+            }
+        } else if code != last {
+            out[k] = code;
+            k += 1;
+            if k == 4 {
+                break;
+            }
+            last = code;
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Compile options reported by `sqlite_compileoption_get/used`. Mirrors
+/// the reference SQLite build the engine is differentially tested
+/// against (feature-detection probes like `ENABLE_FTS5` succeed).
+const COMPILE_OPTIONS: &[&str] = &[
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=rustc",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_GEOPOLY",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_RTREE",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=1000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=32766",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1",
+];
+
+fn compile_options() -> &'static [&'static str] {
+    COMPILE_OPTIONS
 }
 
 #[cfg(test)]

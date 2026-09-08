@@ -513,6 +513,13 @@ impl<'a> Lexer<'a> {
         // returned.) Now: direct byte comparison, no allocation.
         let a = *self.src.get(self.pos)?;
         let b = *self.src.get(self.pos + 1)?;
+        // `->>` (JSON ->> path operator) before `->`.
+        if a == b'-' && b == b'>' && self.src.get(self.pos + 2) == Some(&b'>') {
+            self.advance();
+            self.advance();
+            self.advance();
+            return Some("->>");
+        }
         let op: &'static str = match (a, b) {
             (b'<', b'=') => "<=",
             (b'>', b'=') => ">=",
@@ -522,6 +529,7 @@ impl<'a> Lexer<'a> {
             (b'|', b'|') => "||",
             (b'<', b'<') => "<<",
             (b'>', b'>') => ">>",
+            (b'-', b'>') => "->",
             _ => return None,
         };
         self.advance();

@@ -4,7 +4,7 @@ pub mod text;
 pub mod value;
 
 pub use text::Text;
-pub use value::{format_real, values_sql_equal, Affinity, GroupKey, Row, Value};
+pub use value::{format_real, format_real_sig, values_sql_equal, Affinity, GroupKey, Row, Value};
 
 use std::ops::Range;
 use std::sync::Arc;

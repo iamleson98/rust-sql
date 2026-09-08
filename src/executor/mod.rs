@@ -15,6 +15,7 @@ pub mod datetime;
 pub(crate) mod explain;
 pub mod expr;
 pub mod json;
+pub mod jsonb;
 pub(crate) mod parallel;
 pub(crate) mod predicate;
 pub(crate) mod tableval;
@@ -4279,6 +4280,9 @@ struct AggCold {
     distinct: Option<std::collections::HashSet<SqlValueKey>>,
     concat: Option<String>,
     concat_sep: Option<String>,
+    /// JSONB element fragments for jsonb_group_array / jsonb_group_object
+    /// (raw byte accumulation; finalized as an array/object container).
+    concat_blob: Option<Vec<u8>>,
     /// Collected numeric values for the percentile family (median /
     /// percentile_cont / percentile_disc / stddev). Materialized only
     /// when one of those aggregates actually fires.
@@ -4364,6 +4368,10 @@ enum AggFunc {
     GroupConcat,
     JsonGroupArray,
     JsonGroupObject,
+    /// jsonb_group_array(x) — JSONB blob output.
+    JsonbGroupArray,
+    /// jsonb_group_object(k, v) — JSONB blob output.
+    JsonbGroupObject,
     /// stddev / stddev_samp (sample) — Turso percentile-extension parity.
     Stddev,
     /// stddev_pop (population).
@@ -4389,6 +4397,8 @@ impl AggFunc {
             "group_concat" | "string_agg" => AggFunc::GroupConcat,
             "json_group_array" => AggFunc::JsonGroupArray,
             "json_group_object" => AggFunc::JsonGroupObject,
+            "jsonb_group_array" => AggFunc::JsonbGroupArray,
+            "jsonb_group_object" => AggFunc::JsonbGroupObject,
             "stddev" | "stddev_samp" => AggFunc::Stddev,
             "stddev_pop" => AggFunc::StddevPop,
             "median" => AggFunc::Median,
@@ -7600,13 +7610,35 @@ fn update_agg_state(
             buf.push_str(&v.as_text());
         }
         // JSON_GROUP_ARRAY(x): [v1, v2, ...] — JSON-quoted elements.
-        AggFunc::JsonGroupArray if !v.is_null() => {
+        // NULLs are INCLUDED as JSON null (SQLite: json_group_array over
+        // (1, NULL, 2) is [1,null,2]).
+        AggFunc::JsonGroupArray => {
             let c = state.cold_mut();
             let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
             if !buf.is_empty() {
                 buf.push(',');
             }
             buf.push_str(crate::executor::json::json_quote_value(v).as_str());
+        }
+        // JSONB_GROUP_ARRAY(x): raw element bytes joined into one array.
+        AggFunc::JsonbGroupArray => {
+            let elem = crate::executor::jsonb::value_to_jb(v);
+            let bytes = crate::executor::jsonb::jb_to_bytes(&elem);
+            let c = state.cold_mut();
+            c.concat_blob
+                .get_or_insert_with(|| Vec::with_capacity(32))
+                .extend_from_slice(&bytes);
+        }
+        // JSONB_GROUP_OBJECT(k, v): the planner feeds the accumulator the
+        // per-row `__jsonb_object_frag` blob (key element + value element
+        // bytes); finalize wraps in an object container.
+        AggFunc::JsonbGroupObject if !v.is_null() => {
+            if let Value::Blob(frag) = v {
+                let c = state.cold_mut();
+                c.concat_blob
+                    .get_or_insert_with(|| Vec::with_capacity(32))
+                    .extend_from_slice(frag);
+            }
         }
         // JSON_GROUP_OBJECT(k, v): the planner feeds the accumulator the
         // per-row `"key":value` fragment (see __json_object_frag); join
@@ -7627,16 +7659,16 @@ fn update_agg_state(
         | AggFunc::StddevPop
         | AggFunc::Median
         | AggFunc::PercentileCont
-        | AggFunc::PercentileDisc => {
-            if !v.is_null() {
-                let c = state.cold_mut();
-                if c.pct.is_none() {
-                    if let Some(s) = sep {
-                        c.pct = s.trim().parse::<f64>().ok();
-                    }
+        | AggFunc::PercentileDisc
+            if !v.is_null() =>
+        {
+            let c = state.cold_mut();
+            if c.pct.is_none() {
+                if let Some(s) = sep {
+                    c.pct = s.trim().parse::<f64>().ok();
                 }
-                c.nums.get_or_insert_with(Vec::new).push(v.as_real());
             }
+            c.nums.get_or_insert_with(Vec::new).push(v.as_real());
         }
         _ => {}
     }
@@ -7729,6 +7761,32 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
             )
             .into(),
         ),
+        "jsonb_group_array" => {
+            let payload = state
+                .cold()
+                .and_then(|c| c.concat_blob.clone())
+                .unwrap_or_default();
+            let mut out = Vec::with_capacity(payload.len() + 5);
+            crate::executor::jsonb::push_container(
+                &mut out,
+                crate::executor::jsonb::T_ARRAY,
+                &payload,
+            );
+            Value::Blob(out)
+        }
+        "jsonb_group_object" => {
+            let payload = state
+                .cold()
+                .and_then(|c| c.concat_blob.clone())
+                .unwrap_or_default();
+            let mut out = Vec::with_capacity(payload.len() + 5);
+            crate::executor::jsonb::push_container(
+                &mut out,
+                crate::executor::jsonb::T_OBJECT,
+                &payload,
+            );
+            Value::Blob(out)
+        }
         "json_group_object" => Value::Text(
             format!(
                 "{{{}}}",

@@ -8533,6 +8533,8 @@ pub(crate) fn expr_to_sql(e: &Expr) -> String {
                 GtEq => ">=",
                 And => "AND",
                 Or => "OR",
+                Arrow => "->",
+                ArrowText => "->>",
             };
             format!("{} {} {}", expr_to_sql(left), sym, expr_to_sql(right))
         }

@@ -852,30 +852,87 @@ pub fn format_real(f: f64) -> String {
             "-Inf".to_string()
         };
     }
-    if f == 0.0 {
+    // SQLite's REAL→TEXT is C `%!.17g`: 17 significant digits, `%g`
+    // fixed/scientific selection, always a decimal point
+    // (`1e15` → "1000000000000000.0", `1e18` → "1.0e+18",
+    // `9.223372036854776e18` → "9.2233720368547758e+18").
+    format_real_sig(f, 17)
+}
+
+/// C `"%!.Ng"` — N significant digits with SQLite's fixed/scientific
+/// selection (scientific when exponent < -4 or >= N) and a guaranteed
+/// decimal point. N = 17 for SQL REAL→TEXT, 15 for JSON rendering
+/// (SQLite's json_quote).
+pub fn format_real_sig(v: f64, sig: usize) -> String {
+    if v == 0.0 {
         // SQLite prints "0.0" for both +0.0 and -0.0.
         return "0.0".to_string();
     }
-
-    // Shortest round-trippable: try digits=0, 1, 2, …, 17 and return the
-    // first one whose textual form parses back to the same f64.
-    for digits in 0..=17usize {
-        let candidate = format!("{:.*}", digits, f);
-        if let Ok(parsed) = candidate.parse::<f64>() {
-            if parsed == f {
-                return normalize_real_string(candidate);
-            }
+    let prec = sig.saturating_sub(1);
+    let sci = format!("{:.*e}", prec, v.abs());
+    // "1.23456789012346e17" → mantissa digits + exponent.
+    let (mant, exp_s) = sci.split_once('e').expect("scientific form");
+    let exp: i32 = exp_s.parse().unwrap();
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let neg = v < 0.0;
+    if (-4..sig as i32).contains(&exp) {
+        // Fixed notation: strip trailing zeros, at least one fractional
+        // digit.
+        let nd = digits.len() as i32;
+        let mut out = String::new();
+        if neg {
+            out.push('-');
         }
-    }
-    normalize_real_string(format!("{}", f))
-}
-
-fn normalize_real_string(s: String) -> String {
-    // Ensure there's always a decimal point (SQLite quirk).
-    if !s.contains('.') && !s.contains('e') && !s.contains("inf") {
-        format!("{}.0", s)
+        if exp >= 0 {
+            let int_len = exp + 1;
+            if nd <= int_len {
+                out.push_str(digits);
+                for _ in 0..(int_len - nd) {
+                    out.push('0');
+                }
+                out.push_str(".0");
+            } else {
+                out.push_str(&digits[..int_len as usize]);
+                out.push('.');
+                out.push_str(&digits[int_len as usize..]);
+            }
+        } else {
+            out.push_str("0.");
+            for _ in 0..(-exp - 1) {
+                out.push('0');
+            }
+            out.push_str(digits);
+        }
+        out
     } else {
-        s
+        // Scientific: mantissa with a decimal point, exponent with sign
+        // and at least two digits ("1.0e+18", "1.2345e-05").
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        if digits.len() == 1 {
+            out.push_str(digits);
+            out.push_str(".0");
+        } else {
+            out.push_str(&digits[..1]);
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        if exp < 0 {
+            out.push('-');
+        } else {
+            out.push('+');
+        }
+        let e = exp.abs();
+        if e < 10 {
+            out.push('0');
+        }
+        out.push_str(&e.to_string());
+        out
     }
 }
 

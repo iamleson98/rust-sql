@@ -614,6 +614,10 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+    /// JSON path access `->` (returns the JSON text of the target).
+    Arrow,
+    /// JSON path access `->>` (returns the SQL value of the target).
+    ArrowText,
 }
 
 impl BinaryOp {
@@ -638,6 +642,11 @@ impl BinaryOp {
     /// LOOSER than `<`/`<=`/`>`/`>=` (`SELECT 0 = 1 < 0` is `0 = (1 < 0)`).
     /// The IS-family, NOT, ESCAPE, and COLLATE levels are handled directly
     /// in the parser (they are not `Expr::Binary` nodes).
+    ///
+    /// The JSON `->`/`->>` operators sit ABOVE `||` (tighter than every
+    /// other binary operator, including `*`) but BELOW unary minus
+    /// (`-'[1]' -> 0` parses as `(-'[1]') -> 0` — verified against SQLite
+    /// 3.53: `SELECT -'[1]' -> 0` is NULL, `SELECT '[1]' -> 0 + 1` is 2).
     pub fn precedence(&self) -> u8 {
         use BinaryOp::*;
         match self {
@@ -649,6 +658,7 @@ impl BinaryOp {
             Add | Sub => 8,
             Mul | Div | Mod => 9,
             Concat => 10,
+            Arrow | ArrowText => 11,
         }
     }
 }

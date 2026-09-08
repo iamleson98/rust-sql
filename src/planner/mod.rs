@@ -877,9 +877,17 @@ pub fn rewrite_aggregates_and_groups(
                         .unwrap_or(false)
                 {
                     None
-                } else if name.eq_ignore_ascii_case("json_group_object") && args.len() == 2 {
+                } else if (name.eq_ignore_ascii_case("json_group_object")
+                    || name.eq_ignore_ascii_case("jsonb_group_object"))
+                    && args.len() == 2
+                {
+                    let frag_name = if name.eq_ignore_ascii_case("jsonb_group_object") {
+                        "__jsonb_object_frag"
+                    } else {
+                        "__json_object_frag"
+                    };
                     synthesized = Some(Expr::Function {
-                        name: "__json_object_frag".into(),
+                        name: frag_name.into(),
                         distinct: false,
                         args: args.clone(),
                         over: None,
@@ -1254,6 +1262,8 @@ pub fn is_aggregate_call(name: &str, n_args: usize) -> bool {
         "count" | "sum" | "avg" | "total" | "group_concat" | "string_agg" => true,
         "json_group_array" => n_args == 1,
         "json_group_object" => n_args == 2,
+        "jsonb_group_array" => n_args == 1,
+        "jsonb_group_object" => n_args == 2,
         "min" | "max" => n_args <= 1,
         // Percentile family (Turso percentile-extension parity).
         "stddev" | "stddev_samp" | "stddev_pop" | "median" => n_args == 1,
@@ -1387,12 +1397,19 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         display_name: aggregate_display_name(name, *distinct, args),
                     });
                     return;
-                } else if fname == "json_group_object" && args.len() == 2 {
+                } else if (fname == "json_group_object" || fname == "jsonb_group_object")
+                    && args.len() == 2
+                {
                     // Two-argument aggregate: accumulate the per-row
-                    // `"key":value` fragment (a hidden scalar that the
-                    // accumulator joins with ','); finalize wraps in {}.
+                    // fragment (a hidden scalar that the accumulator
+                    // joins); finalize wraps in {} / an object container.
+                    let frag_name = if fname == "jsonb_group_object" {
+                        "__jsonb_object_frag"
+                    } else {
+                        "__json_object_frag"
+                    };
                     Some(Expr::Function {
-                        name: "__json_object_frag".into(),
+                        name: frag_name.into(),
                         distinct: false,
                         args: args.clone(),
                         over: None,

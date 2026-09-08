@@ -2394,6 +2394,8 @@ impl Parser {
                 "<=" => Some(BinaryOp::LtEq),
                 ">" => Some(BinaryOp::Gt),
                 ">=" => Some(BinaryOp::GtEq),
+                "->" => Some(BinaryOp::Arrow),
+                "->>" => Some(BinaryOp::ArrowText),
                 _ => None,
             },
             Token::Keyword(k) => match *k {
@@ -2872,6 +2874,14 @@ impl Parser {
                 if self.peek().is_punct('(') {
                     self.advance();
                     return self.parse_function_call(name);
+                }
+                // Bare TRUE/FALSE (SQLite 3.23+: they lex as identifiers
+                // here but are boolean literals, never column refs).
+                if name.eq_ignore_ascii_case("true") {
+                    return Ok(Expr::Literal(Value::Integer(1)));
+                }
+                if name.eq_ignore_ascii_case("false") {
+                    return Ok(Expr::Literal(Value::Integer(0)));
                 }
                 if self.peek().is_punct('.') {
                     self.advance();

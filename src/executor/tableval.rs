@@ -76,24 +76,13 @@ pub(crate) fn exec_table_function(
 }
 
 // ---------------------------------------------------------------------------
-// JSON walkers
+// JSON walkers (json_each / json_tree over the raw-preserving JSONB
+// pipeline: `id`/`parent` are byte offsets in the canonical JSONB
+// encoding — identical to SQLite's)
 // ---------------------------------------------------------------------------
 
-/// One row of the json_each/json_tree output, keyed by (path, key).
-struct JsonWalkRow {
-    key: Value,
-    value: Value,
-    type_name: Value,
-    atom: Value,
-    id: Value,
-    parent: Value,
-    fullkey: Value,
-    path: Value,
-}
-
-/// `json_each(x)` (one level) / `json_tree(x)` (recursive) over the FIRST
-/// argument (SQL semantics: NULL/x-shaped args give an empty set or an
-/// error for malformed JSON text, mirroring SQLite).
+/// `json_each(x[, root])` (one level) / `json_tree(x[, root])`
+/// (recursive) over the FIRST argument.
 fn json_each(
     args: &[Value],
     recursive: bool,
@@ -101,145 +90,111 @@ fn json_each(
     const COLS: [&str; 8] = [
         "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
     ];
-    let mut out: Vec<JsonWalkRow> = Vec::new();
-    let root = match args.first() {
-        None | Some(Value::Null) => {
-            // SQLite: json_each(NULL) returns no rows.
-            return Ok((COLS.to_vec(), Vec::new()));
-        }
+    // Load the document: TEXT input is encoded to canonical JSONB (SQLite
+    // walks the JSONB form, which is what makes the id/parent offsets line
+    // up); a BLOB is walked AS GIVEN when it is valid JSONB (its own byte
+    // offsets), with a text-parse fallback.
+    let (bytes, sp): (Vec<u8>, crate::executor::jsonb::Sp) = match args.first() {
+        None | Some(Value::Null) => return Ok((COLS.to_vec(), Vec::new())),
         Some(Value::Text(t)) => {
             let s: &str = t;
-            match crate::executor::json::parse_json(s) {
-                Some(j) => j,
-                None => {
-                    return Err(Error::semantic(format!(
+            match crate::executor::jsonb::parse_lenient(s) {
+                Ok(jb) => {
+                    let bytes = crate::executor::jsonb::jb_to_bytes(&jb);
+                    let sp = crate::executor::jsonb::sp_from_bytes(&bytes)
+                        .map_err(|_| Error::Runtime("malformed JSON".to_string()))?;
+                    (bytes, sp)
+                }
+                Err(_) => {
+                    return Err(Error::Runtime(format!(
                         "malformed JSON: {}",
                         truncate_for_err(s)
                     )))
                 }
             }
         }
-        // json_each of a non-text, non-null value: SQLite returns no rows
-        // for numbers/ints... actually it errors only on malformed text;
-        // other types (e.g. integers) yield an empty set.
-        Some(_) => return Ok((COLS.to_vec(), Vec::new())),
+        Some(Value::Blob(b)) => match crate::executor::jsonb::sp_from_bytes(b) {
+            Ok(sp) => (b.clone(), sp),
+            Err(()) => {
+                if let Ok(s) = std::str::from_utf8(b) {
+                    if let Ok(jb) = crate::executor::jsonb::parse_lenient(s) {
+                        let bytes = crate::executor::jsonb::jb_to_bytes(&jb);
+                        let sp = crate::executor::jsonb::sp_from_bytes(&bytes)
+                            .map_err(|_| Error::Runtime("malformed JSON".to_string()))?;
+                        let segs = segs_of(args)?;
+                        return Ok(walk_rows(&sp, &segs, recursive, COLS));
+                    }
+                }
+                return Err(Error::Runtime("malformed JSON".to_string()));
+            }
+        },
+        Some(other) => {
+            let jb = if matches!(other, Value::Integer(_) | Value::Real(_)) {
+                crate::executor::jsonb::value_to_jb(other)
+            } else {
+                match crate::executor::jsonb::parse_lenient(&other.as_text()) {
+                    Ok(jb) => jb,
+                    Err(_) => {
+                        return Err(Error::Runtime(format!(
+                            "malformed JSON: {}",
+                            truncate_for_err(&other.as_text())
+                        )))
+                    }
+                }
+            };
+            let bytes = crate::executor::jsonb::jb_to_bytes(&jb);
+            let sp = crate::executor::jsonb::sp_from_bytes(&bytes)
+                .map_err(|_| Error::Runtime("malformed JSON".to_string()))?;
+            (bytes, sp)
+        }
     };
-    // The document root itself is a row ONLY for json_tree.
-    if recursive {
-        out.push(walk_row(&Value::Null, &root, "$", Value::Null, "$"));
+    let _ = bytes;
+    let segs = segs_of(args)?;
+    Ok(walk_rows(&sp, &segs, recursive, COLS))
+}
+
+/// Path segments of the optional second argument (empty when absent);
+/// a malformed path raises like SQLite's `bad JSON path`.
+fn segs_of(args: &[Value]) -> Result<Vec<crate::executor::json::PathSeg>, Error> {
+    match args.get(1) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(p) => {
+            let s = p.as_text();
+            match crate::executor::json::parse_path(&s) {
+                Some(path) => Ok(path.segs().to_vec()),
+                None => Err(Error::Runtime(format!("bad JSON path: '{}'", s))),
+            }
+        }
     }
-    walk(&root, "$", &mut out, recursive);
-    let rows = out
+}
+
+/// Resolve the start node and emit the 8-column rows.
+fn walk_rows(
+    sp: &crate::executor::jsonb::Sp,
+    segs: &[crate::executor::json::PathSeg],
+    recursive: bool,
+    cols: [&'static str; 8],
+) -> (Vec<&'static str>, Vec<Vec<Value>>) {
+    let Some(resolved) = crate::executor::jsonb::sp_resolve(sp, segs) else {
+        // Path misses: no rows (SQLite: json_each('{"a":1}', '$.b') → empty).
+        return (cols.to_vec(), Vec::new());
+    };
+    let rows = crate::executor::jsonb::each_rows(&resolved, recursive)
         .into_iter()
         .map(|r| {
             vec![
                 r.key,
                 r.value,
-                r.type_name,
+                Value::Text(r.type_name.into()),
                 r.atom,
-                r.id,
-                r.parent,
-                r.fullkey,
-                r.path,
+                Value::Integer(r.id),
+                r.parent.map(Value::Integer).unwrap_or(Value::Null),
+                Value::Text(r.fullkey.into()),
+                Value::Text(r.path.into()),
             ]
         })
         .collect();
-    Ok((COLS.to_vec(), rows))
-}
-
-/// Depth-first walk. `json_each` emits only the DIRECT children of the
-/// root (plus, for objects/arrays at nested levels, nothing further);
-/// `json_tree` emits every descendant.
-fn walk(
-    node: &crate::executor::json::Json,
-    path: &str,
-    out: &mut Vec<JsonWalkRow>,
-    recursive: bool,
-) {
-    match node {
-        crate::executor::json::Json::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                let fullkey = format!("{}[{}]", path, i);
-                out.push(walk_row(
-                    &Value::Integer(i as i64),
-                    item,
-                    &fullkey,
-                    Value::Text(path.into()),
-                    path,
-                ));
-                if recursive {
-                    walk(item, &fullkey, out, recursive);
-                }
-            }
-        }
-        crate::executor::json::Json::Object(pairs) => {
-            for (k, item) in pairs.iter() {
-                let fullkey = format!("{}.{}", path, k);
-                out.push(walk_row(
-                    &Value::Text(k.as_str().into()),
-                    item,
-                    &fullkey,
-                    Value::Text(path.into()),
-                    path,
-                ));
-                if recursive {
-                    walk(item, &fullkey, out, recursive);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Build one output row. `id`/`parent` follow SQLite's observed output:
-/// `id` = the element's path id counter... in practice SQLite returns
-/// NULL for both on the common shapes; we emit the fullkey-based values
-/// that round-trip through `json_extract` paths.
-fn walk_row(
-    key: &Value,
-    node: &crate::executor::json::Json,
-    fullkey: &str,
-    parent: Value,
-    path: &str,
-) -> JsonWalkRow {
-    use crate::executor::json::Json;
-    let (value, type_name, atom) = match node {
-        Json::Null => (Value::Null, "null", Value::Null),
-        Json::True => (Value::Integer(1), "true", Value::Integer(1)),
-        Json::False => (Value::Integer(0), "false", Value::Integer(0)),
-        Json::Integer(i) => (Value::Integer(*i), "integer", Value::Integer(*i)),
-        Json::Real(r) => (Value::Real(*r), "real", Value::Real(*r)),
-        Json::Str(s) => (
-            Value::Text(s.as_str().into()),
-            "text",
-            Value::Text(s.as_str().into()),
-        ),
-        Json::Text(s) => (
-            Value::Text(s.as_str().into()),
-            "text",
-            Value::Text(s.as_str().into()),
-        ),
-        Json::Array(_) => (
-            Value::Text(crate::executor::json::json_to_string(node).into()),
-            "array",
-            Value::Null,
-        ),
-        Json::Object(_) => (
-            Value::Text(crate::executor::json::json_to_string(node).into()),
-            "object",
-            Value::Null,
-        ),
-    };
-    JsonWalkRow {
-        key: key.clone(),
-        value,
-        type_name: Value::Text(type_name.into()),
-        atom,
-        id: Value::Text(fullkey.into()),
-        parent,
-        fullkey: Value::Text(fullkey.into()),
-        path: Value::Text(path.into()),
-    }
+    (cols.to_vec(), rows)
 }
 
 fn truncate_for_err(s: &str) -> String {

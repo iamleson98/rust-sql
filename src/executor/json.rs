@@ -1,411 +1,27 @@
-//! JSON1 support: a small self-contained JSON engine (parser, path
-//! evaluation, serialization) and the SQLite JSON1 scalar functions.
+//! JSON1 support: the SQLite JSON SQL functions on the raw-preserving
+//! JSONB pipeline (`crate::executor::jsonb`).
 //!
-//! Supported functions: `json`, `json_extract`, `json_valid`, `json_type`,
-//! `json_quote`, `json_array`, `json_object`, `json_array_length`,
-//! `json_insert`, `json_replace`, `json_set`, `json_remove`, `json_patch`.
-//! Path syntax: `$`, `.key`, `."quoted key"`, `[index]`, `[#-n]` (negative
-//! index from the end), and chained forms — the common subset of SQLite's
-//! path language.
+//! Everything SQLite does round-trips: `json('[1e2, 1.50]')` →
+//! `'[1e2,1.50]'` (original numeric text kept), `json('"a\u0062"')` →
+//! verbatim escapes, JSONB blobs are accepted by every function, and
+//! malformed input RAISES `malformed JSON` like SQLite instead of
+//! returning an error text.
+//!
+//! Path syntax: `$`, `.key`, `."quoted key"`, `[index]`, `[#-n]`, and
+//! chained forms — SQLite's path language subset used by the engine.
 
+use crate::error::Error;
+use crate::executor::jsonb::{
+    self, jb_patch, jb_remove_at, jb_set_at, parse_lenient, parse_strict, value_to_jb, Jb,
+};
 use crate::types::Value;
 
 // ---------------------------------------------------------------------------
-// JSON tree
+// Path language
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Json {
-    Null,
-    True,
-    False,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-    /// A JSON string value (distinct from Text-as-SQL-value: JSON strings
-    /// come from the document; `json_extract` unquotes them).
-    Str(String),
-    Array(Vec<Json>),
-    Object(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn type_name(&self) -> &'static str {
-        match self {
-            Json::Null => "null",
-            Json::True | Json::False => "true",
-            Json::Integer(_) => "integer",
-            Json::Real(_) => "real",
-            Json::Str(_) | Json::Text(_) => "text",
-            Json::Array(_) => "array",
-            Json::Object(_) => "object",
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
-
-struct JsonParser<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn new(s: &'a str) -> Self {
-        Self {
-            b: s.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while self.pos < self.b.len() && matches!(self.b[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
-            self.pos += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.pos).copied()
-    }
-
-    fn parse_value(&mut self) -> Option<Json> {
-        self.skip_ws();
-        match self.peek()? {
-            b'{' => self.parse_object(),
-            b'[' => self.parse_array(),
-            b'"' => self.parse_string().map(Json::Str),
-            b't' => self.parse_lit("true", Json::True),
-            b'f' => self.parse_lit("false", Json::False),
-            b'n' => self.parse_lit("null", Json::Null),
-            b'-' | b'0'..=b'9' => self.parse_number(),
-            _ => None,
-        }
-    }
-
-    fn parse_lit(&mut self, lit: &str, v: Json) -> Option<Json> {
-        if self.b[self.pos..].starts_with(lit.as_bytes()) {
-            self.pos += lit.len();
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    fn parse_number(&mut self) -> Option<Json> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        let mut is_real = false;
-        if self.peek() == Some(b'.') {
-            is_real = true;
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            is_real = true;
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        let s = std::str::from_utf8(&self.b[start..self.pos]).ok()?;
-        if is_real {
-            s.parse::<f64>().ok().map(Json::Real)
-        } else {
-            match s.parse::<i64>() {
-                Ok(i) => Some(Json::Integer(i)),
-                Err(_) => s.parse::<f64>().ok().map(Json::Real),
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Option<String> {
-        if self.peek() != Some(b'"') {
-            return None;
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            match self.peek()? {
-                b'"' => {
-                    self.pos += 1;
-                    return Some(out);
-                }
-                b'\\' => {
-                    self.pos += 1;
-                    match self.peek()? {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            // \uXXXX (surrogate pairs handled)
-                            let hex = self.b.get(self.pos + 1..self.pos + 5)?;
-                            let cp =
-                                u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-                            self.pos += 4;
-                            if (0xD800..0xDC00).contains(&cp) {
-                                // expect low surrogate
-                                if self.b.get(self.pos + 1) == Some(&b'\\')
-                                    && self.b.get(self.pos + 2) == Some(&b'u')
-                                {
-                                    let hex2 = self.b.get(self.pos + 3..self.pos + 7)?;
-                                    let lo =
-                                        u32::from_str_radix(std::str::from_utf8(hex2).ok()?, 16)
-                                            .ok()?;
-                                    self.pos += 6;
-                                    let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                    out.push(char::from_u32(c)?);
-                                } else {
-                                    out.push('\u{FFFD}');
-                                }
-                            } else {
-                                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                            }
-                        }
-                        _ => return None,
-                    }
-                    self.pos += 1;
-                }
-                c if c < 0x80 => {
-                    out.push(c as char);
-                    self.pos += 1;
-                }
-                _ => {
-                    // Multi-byte UTF-8: copy the whole sequence.
-                    let rest = std::str::from_utf8(&self.b[self.pos..]).ok()?;
-                    let ch = rest.chars().next()?;
-                    out.push(ch);
-                    self.pos += ch.len_utf8();
-                }
-            }
-        }
-    }
-
-    fn parse_array(&mut self) -> Option<Json> {
-        self.pos += 1; // [
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Some(Json::Array(items));
-        }
-        loop {
-            let v = self.parse_value()?;
-            items.push(v);
-            self.skip_ws();
-            match self.peek()? {
-                b',' => {
-                    self.pos += 1;
-                }
-                b']' => {
-                    self.pos += 1;
-                    return Some(Json::Array(items));
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    fn parse_object(&mut self) -> Option<Json> {
-        self.pos += 1; // {
-        let mut members = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Some(Json::Object(members));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return None;
-            }
-            self.pos += 1;
-            let v = self.parse_value()?;
-            members.push((key, v));
-            self.skip_ws();
-            match self.peek()? {
-                b',' => {
-                    self.pos += 1;
-                }
-                b'}' => {
-                    self.pos += 1;
-                    return Some(Json::Object(members));
-                }
-                _ => return None,
-            }
-        }
-    }
-}
-
-/// Parse a complete JSON document (trailing non-whitespace is invalid,
-/// matching SQLite's json_valid).
-pub fn parse_json(s: &str) -> Option<Json> {
-    let mut p = JsonParser::new(s);
-    let v = p.parse_value()?;
-    p.skip_ws();
-    if p.pos == p.b.len() {
-        Some(v)
-    } else {
-        None
-    }
-}
-
-/// Parse a JSON document, reporting the 1-based BYTE position of the
-/// first syntax error on failure (SQLite 3.47+ `json_error_position`
-/// semantics: 0 when valid, the error offset otherwise).
-fn parse_json_with_error_position(s: &str) -> Result<Json, usize> {
-    let mut p = JsonParser::new(s);
-    let v = match p.parse_value() {
-        Some(v) => v,
-        None => return Err(p.pos + 1),
-    };
-    p.skip_ws();
-    if p.pos == p.b.len() {
-        Ok(v)
-    } else {
-        Err(p.pos + 1)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Serializer (minified, SQLite-compatible)
-// ---------------------------------------------------------------------------
-
-pub fn json_to_string(j: &Json) -> String {
-    let mut out = String::new();
-    write_json(j, &mut out);
-    out
-}
-
-/// json_pretty(json) — SQLite 3.46+: two-space indentation, one member
-/// per line, `": "` after object keys.
-fn write_json_pretty(j: &Json, out: &mut String, indent: usize) {
-    let pad = |out: &mut String, n: usize| {
-        for _ in 0..n {
-            out.push_str("  ");
-        }
-    };
-    match j {
-        Json::Array(items) if !items.is_empty() => {
-            out.push_str("[\n");
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(",\n");
-                }
-                pad(out, indent + 1);
-                write_json_pretty(item, out, indent + 1);
-            }
-            out.push('\n');
-            pad(out, indent);
-            out.push(']');
-        }
-        Json::Object(members) if !members.is_empty() => {
-            out.push_str("{\n");
-            for (i, (k, v)) in members.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(",\n");
-                }
-                pad(out, indent + 1);
-                write_json_string(k, out);
-                out.push_str(": ");
-                write_json_pretty(v, out, indent + 1);
-            }
-            out.push('\n');
-            pad(out, indent);
-            out.push('}');
-        }
-        Json::Array(_) => out.push_str("[]"),
-        Json::Object(_) => out.push_str("{}"),
-        other => write_json(other, out),
-    }
-}
-
-fn write_json(j: &Json, out: &mut String) {
-    match j {
-        Json::Null => out.push_str("null"),
-        Json::True => out.push_str("true"),
-        Json::False => out.push_str("false"),
-        Json::Integer(i) => out.push_str(&i.to_string()),
-        Json::Real(r) => {
-            if r.is_finite() {
-                if *r == r.trunc() && r.abs() < 1e15 {
-                    // SQLite prints integral reals with .0
-                    out.push_str(&format!("{:.1}", r));
-                } else {
-                    out.push_str(&format!("{}", r));
-                }
-            } else {
-                out.push_str("9e999");
-            }
-        }
-        Json::Str(s) | Json::Text(s) => write_json_string(s, out),
-        Json::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json(item, out);
-            }
-            out.push(']');
-        }
-        Json::Object(members) => {
-            out.push('{');
-            for (i, (k, v)) in members.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json_string(k, out);
-                out.push(':');
-                write_json(v, out);
-            }
-            out.push('}');
-        }
-    }
-}
-
-fn write_json_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-// ---------------------------------------------------------------------------
-// Path evaluation: $ .key ."quoted key" [index] [#-n]
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-enum PathSeg {
+pub enum PathSeg {
     Key(String),
     Index(i64), // negative = from end
 }
@@ -413,6 +29,12 @@ enum PathSeg {
 #[derive(Clone, Debug)]
 pub struct JsonPath {
     segs: Vec<PathSeg>,
+}
+
+impl JsonPath {
+    pub fn segs(&self) -> &[PathSeg] {
+        &self.segs
+    }
 }
 
 /// Parse a JSON path like `$`, `$.a.b`, `$[0].x`, `."q k"`, `[#-1]`.
@@ -423,7 +45,6 @@ pub fn parse_path(p: &str) -> Option<JsonPath> {
     if b.first() != Some(&b'$') {
         return None;
     }
-    // Position 0 is the '$' root marker; the path body starts after it.
     let mut i = 1usize;
     while i < b.len() {
         match b[i] {
@@ -467,7 +88,7 @@ pub fn parse_path(p: &str) -> Option<JsonPath> {
                     let n: i64 = rest.parse().ok()?;
                     segs.push(PathSeg::Index(-n));
                 } else if inner == "#" {
-                    segs.push(PathSeg::Index(-0)); // # alone == 0 from end? SQLite: array length marker
+                    segs.push(PathSeg::Index(-1)); // # alone = last element
                 } else if let Ok(n) = inner.parse::<i64>() {
                     segs.push(PathSeg::Index(n));
                 } else {
@@ -486,421 +107,459 @@ pub fn parse_path(p: &str) -> Option<JsonPath> {
     Some(JsonPath { segs })
 }
 
-impl JsonPath {
-    /// Resolve against a document. Returns None when any step misses.
-    pub fn resolve<'a>(&self, root: &'a Json) -> Option<&'a Json> {
-        let mut cur = root;
-        for seg in &self.segs {
-            cur = match (seg, cur) {
-                (PathSeg::Key(k), Json::Object(members)) => {
-                    members.iter().find(|(mk, _)| mk == k).map(|(_, v)| v)?
-                }
-                (PathSeg::Index(i), Json::Array(items)) => {
-                    let idx = if *i < 0 { items.len() as i64 + i } else { *i };
-                    if idx < 0 || idx >= items.len() as i64 {
-                        return None;
+// ---------------------------------------------------------------------------
+// Document loading (text or JSONB blob, SQLite's dual-parse rules)
+// ---------------------------------------------------------------------------
+
+/// Parse the first argument of a JSON function: TEXT parses as JSON text,
+/// BLOB parses as JSON text first (dual-valid blobs read as text), then
+/// falls back to JSONB. NULL stays NULL; other scalars parse their text
+/// form (`json_extract(5, '$')` works).
+pub(crate) fn load_doc(v: &Value) -> Result<Option<Jb>, Error> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Blob(b) => {
+            // JSONB-first (sqlite.org/jsonb.html §3.4: a well-formed
+            // element that exactly fills the blob IS JSONB); text is the
+            // fallback for blobs that fail the structural check.
+            match jsonb::jb_from_bytes(b) {
+                Ok(jb) => Ok(Some(jb)),
+                Err(()) => {
+                    if let Ok(s) = std::str::from_utf8(b) {
+                        if let Ok(jb) = parse_lenient(s) {
+                            return Ok(Some(jb));
+                        }
                     }
-                    &items[idx as usize]
+                    Err(Error::Runtime("malformed JSON".to_string()))
                 }
-                _ => return None,
-            };
+            }
         }
-        Some(cur)
+        // Numeric arguments become their JSON number form directly
+        // (SQLite renders JSON numbers from SQL REALs at 15 significant
+        // digits — different from the 17-digit REAL→TEXT conversion).
+        Value::Integer(_) | Value::Real(_) => Ok(Some(value_to_jb(v))),
+        other => parse_lenient(&other.as_text())
+            .map(Some)
+            .map_err(|_| Error::Runtime("malformed JSON".to_string())),
+    }
+}
+
+fn bad_path(p: &str) -> Error {
+    Error::Runtime(format!("bad JSON path: '{}'", p))
+}
+
+fn parse_doc_path(p: &Value) -> Result<JsonPath, Error> {
+    let s = p.as_text();
+    parse_path(&s).ok_or_else(|| bad_path(&s))
+}
+
+/// Render the output of a JSON-producing function: TEXT for the `json_*`
+/// family, BLOB for the `jsonb_*` family.
+enum Out {
+    Text,
+    Blob,
+}
+
+impl Out {
+    fn emit(self, jb: &Jb) -> Value {
+        match self {
+            Out::Text => Value::Text(jb.render().into()),
+            Out::Blob => Value::Blob(jsonb::jb_to_bytes(jb)),
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// SQL value conversion
+// The JSON1 scalar functions
 // ---------------------------------------------------------------------------
 
-/// JSON node → SQL value (SQLite's json_extract semantics: strings are
-/// unquoted text, numbers become Integer/Real, arrays/objects become their
-/// JSON text).
-pub fn json_to_sql(j: &Json) -> Value {
-    match j {
-        Json::Null => Value::Null,
-        Json::True => Value::Integer(1),
-        Json::False => Value::Integer(0),
-        Json::Integer(i) => Value::Integer(*i),
-        Json::Real(r) => Value::Real(*r),
-        Json::Str(s) | Json::Text(s) => Value::Text(s.clone().into()),
-        Json::Array(_) | Json::Object(_) => Value::Text(json_to_string(j).into()),
+/// Dispatch a JSON1 function call. `args` are the evaluated SQL arguments.
+/// Returns Ok(None) when `fname` isn't a JSON function (caller falls
+/// through); errors propagate (SQLite raises on malformed JSON/paths).
+pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, Error> {
+    let v = match fname {
+        "json" => json_fn(args, Out::Text)?,
+        "jsonb" => json_fn(args, Out::Blob)?,
+        "json_quote" => json_quote(args)?,
+        "json_pretty" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => match load_doc(v)? {
+                None => Value::Null,
+                Some(jb) => Value::Text(jb.render_pretty().into()),
+            },
+        },
+        "json_error_position" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Integer(match v {
+                Value::Text(t) => match parse_lenient(t) {
+                    Ok(_) => 0,
+                    Err(pos) => pos as i64,
+                },
+                Value::Blob(b) => {
+                    let ok = (std::str::from_utf8(b)
+                        .ok()
+                        .map(|s| parse_lenient(s).is_ok()))
+                    .unwrap_or(false)
+                        || jsonb::jb_from_bytes(b).is_ok();
+                    if ok {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                _ => 0,
+            }),
+        },
+        "json_valid" => json_valid(args)?,
+        "json_type" => {
+            let Some(doc) = load_doc(args.first().unwrap_or(&Value::Null))? else {
+                return Ok(Some(Value::Null));
+            };
+            let target = match args.get(1) {
+                Some(p) => {
+                    let path = parse_doc_path(p)?;
+                    jsonb::jb_resolve(&doc, path.segs())
+                }
+                None => Some(&doc),
+            };
+            match target {
+                Some(node) => Value::Text(node.type_name().into()),
+                None => Value::Null,
+            }
+        }
+        "json_array_length" => {
+            let Some(doc) = load_doc(args.first().unwrap_or(&Value::Null))? else {
+                return Ok(Some(Value::Null));
+            };
+            let target = match args.get(1) {
+                Some(p) => {
+                    let path = parse_doc_path(p)?;
+                    jsonb::jb_resolve(&doc, path.segs())
+                }
+                None => Some(&doc),
+            };
+            Value::Integer(match target {
+                Some(Jb::Array(items)) => items.len() as i64,
+                _ => 0,
+            })
+        }
+        "json_array" => {
+            let items: Vec<Jb> = args.iter().map(value_to_jb).collect();
+            Out::Text.emit(&Jb::Array(items))
+        }
+        "jsonb_array" => {
+            let items: Vec<Jb> = args.iter().map(value_to_jb).collect();
+            Out::Blob.emit(&Jb::Array(items))
+        }
+        "json_object" => json_object(args, Out::Text)?,
+        "jsonb_object" => json_object(args, Out::Blob)?,
+        "json_extract" => json_extract(args, Out::Text)?,
+        "jsonb_extract" => json_extract(args, Out::Blob)?,
+        "json_set" | "json_insert" | "json_replace" => json_mutate(fname, args, Out::Text)?,
+        "jsonb_set" | "jsonb_insert" | "jsonb_replace" => {
+            json_mutate(&fname[..fname.len() - 1], args, Out::Blob)?
+        }
+        "json_remove" => json_remove(args, Out::Text)?,
+        "jsonb_remove" => json_remove(args, Out::Blob)?,
+        "json_patch" => {
+            if args.len() != 2 {
+                return Ok(Some(Value::Null));
+            }
+            let target = load_doc(&args[0])?;
+            let patch = load_doc(&args[1])?;
+            match (target, patch) {
+                (Some(t), Some(p)) => Out::Text.emit(&jb_patch(&t, &p)),
+                _ => Value::Null,
+            }
+        }
+        "jsonb_patch" => {
+            if args.len() != 2 {
+                return Ok(Some(Value::Null));
+            }
+            let target = load_doc(&args[0])?;
+            let patch = load_doc(&args[1])?;
+            match (target, patch) {
+                (Some(t), Some(p)) => Out::Blob.emit(&jb_patch(&t, &p)),
+                _ => Value::Null,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
+/// `json(X)` / `jsonb(X)`: parse, re-render. JSONB blobs that are valid
+/// JSONB (and not valid text) round-trip VERBATIM.
+fn json_fn(args: &[Value], out: Out) -> Result<Value, Error> {
+    let Some(first) = args.first() else {
+        return Ok(Value::Null);
+    };
+    match first {
+        Value::Null => Ok(Value::Null),
+        Value::Blob(b) => {
+            // JSONB-first; a valid JSONB blob round-trips VERBATIM
+            // through jsonb() (SQLite's identity, even for non-shortest
+            // headers), and renders as text through json().
+            match jsonb::jb_from_bytes(b) {
+                Ok(jb) => match out {
+                    Out::Blob => Ok(Value::Blob(b.clone())),
+                    Out::Text => Ok(Value::Text(jb.render().into())),
+                },
+                Err(()) => {
+                    if let Ok(s) = std::str::from_utf8(b) {
+                        if let Ok(jb) = parse_lenient(s) {
+                            return Ok(out.emit(&jb));
+                        }
+                    }
+                    Err(Error::Runtime("malformed JSON".to_string()))
+                }
+            }
+        }
+        other => {
+            if matches!(other, Value::Integer(_) | Value::Real(_)) {
+                let jb = value_to_jb(other);
+                return Ok(out.emit(&jb));
+            }
+            match parse_lenient(&other.as_text()) {
+                Ok(jb) => Ok(out.emit(&jb)),
+                Err(_) => Err(Error::Runtime("malformed JSON".to_string())),
+            }
+        }
     }
 }
+
+/// `json_quote(X)`: SQL value → JSON text (NULL quotes to the TEXT
+/// 'null', matching SQLite).
+fn json_quote(args: &[Value]) -> Result<Value, Error> {
+    match args.first() {
+        None | Some(Value::Null) => Ok(Value::Text("null".into())),
+        Some(Value::Blob(b)) => {
+            // A JSONB blob renders as its JSON text; anything else is null.
+            match jsonb::blob_to_jb(b) {
+                Ok(jb) => Ok(Value::Text(jb.render().into())),
+                Err(()) => Ok(Value::Text("null".into())),
+            }
+        }
+        Some(v) => {
+            let jb = value_to_jb(v);
+            Ok(Value::Text(jb.render().into()))
+        }
+    }
+}
+
+/// `json_object(k1, v1, ...)` / `jsonb_object(...)`.
+fn json_object(args: &[Value], out: Out) -> Result<Value, Error> {
+    if args.is_empty() {
+        return Ok(out.emit(&Jb::Object(Vec::new())));
+    }
+    if args.len() % 2 != 0 {
+        // SQLite raises; message matches sqlite3_errmsg.
+        return Err(Error::Runtime(
+            "json_object() requires an even number of arguments".to_string(),
+        ));
+    }
+    let mut pairs = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let key = match &args[i] {
+            Value::Null => {
+                return Err(Error::Runtime(
+                    "json_object() labels must be TEXT".to_string(),
+                ))
+            }
+            v => value_to_jb(v),
+        };
+        if !key.is_string() {
+            return Err(Error::Runtime(
+                "json_object() labels must be TEXT".to_string(),
+            ));
+        }
+        pairs.push((key, value_to_jb(&args[i + 1])));
+        i += 2;
+    }
+    Ok(out.emit(&Jb::Object(pairs)))
+}
+
+/// `json_extract(X, P...)` / `jsonb_extract(...)`: single path → the value
+/// (SQL semantics for json_, element for jsonb_); multiple paths → an
+/// array of the results.
+fn json_extract(args: &[Value], out: Out) -> Result<Value, Error> {
+    if args.len() < 2 {
+        return Err(Error::Runtime(
+            "json_extract() requires at least two arguments".to_string(),
+        ));
+    }
+    let Some(doc) = load_doc(&args[0])? else {
+        return Ok(Value::Null);
+    };
+    let mut paths = Vec::with_capacity(args.len() - 1);
+    for p in &args[1..] {
+        paths.push(parse_doc_path(p)?);
+    }
+    if paths.len() == 1 {
+        return Ok(match jsonb::jb_resolve(&doc, paths[0].segs()) {
+            Some(node) => match out {
+                // json_extract: SQL value semantics.
+                Out::Text => node.to_value(),
+                // jsonb_extract: the JSONB blob for CONTAINER targets;
+                // scalars come back as their SQL values (SQLite returns
+                // typeof integer/real/text/null for scalar paths).
+                Out::Blob => match node {
+                    Jb::Array(_) | Jb::Object(_) => Value::Blob(jsonb::jb_to_bytes(node)),
+                    scalar => scalar.to_value(),
+                },
+            },
+            None => Value::Null,
+        });
+    }
+    // Multiple paths: array of per-path results. json_extract builds from
+    // the extracted SQL VALUES (canonical round-trip); jsonb_extract keeps
+    // the raw elements.
+    let items: Vec<Jb> = paths
+        .iter()
+        .map(|p| match jsonb::jb_resolve(&doc, p.segs()) {
+            Some(node) => match out {
+                Out::Text => value_to_jb(&node.to_value()),
+                Out::Blob => node.clone(),
+            },
+            None => Jb::Null,
+        })
+        .collect();
+    Ok(out.emit(&Jb::Array(items)))
+}
+
+/// `json_set` / `json_insert` / `json_replace` (and the jsonb_ variants —
+/// `fname` arrives WITHOUT the jsonb_ prefix here).
+fn json_mutate(fname: &str, args: &[Value], out: Out) -> Result<Value, Error> {
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(Error::Runtime(format!(
+            "{}() requires an odd number of arguments",
+            fname
+        )));
+    }
+    let Some(mut doc) = load_doc(&args[0])? else {
+        return Ok(Value::Null);
+    };
+    let mut i = 1;
+    while i + 1 < args.len() {
+        let path = parse_doc_path(&args[i])?;
+        let new_val = sql_value_as_raw(value_to_jb(&args[i + 1]));
+        let exists = jsonb::jb_resolve(&doc, path.segs()).is_some();
+        let apply = match fname {
+            "json_insert" => !exists,
+            "json_replace" => exists,
+            _ => true, // json_set
+        };
+        if apply {
+            doc = jb_set_at(doc, path.segs(), new_val, fname != "json_replace", false);
+        }
+        i += 2;
+    }
+    Ok(out.emit(&doc))
+}
+
+/// SQLite's mutation functions (json_set/insert/replace) insert SQL TEXT
+/// values as TEXTRAW elements — the payload stays raw and escapes are
+/// added lazily at render time. Numbers, nulls, and JSONB-blob embeds
+/// pass through untouched.
+fn sql_value_as_raw(jb: Jb) -> Jb {
+    match jb {
+        Jb::Text(s) => Jb::TextRaw(s),
+        Jb::TextJ(s) => Jb::TextRaw(jsonb::decode_escapes(&s, false)),
+        other => other,
+    }
+}
+
+/// `json_remove(X, P...)` — removing the root path yields SQL NULL.
+fn json_remove(args: &[Value], out: Out) -> Result<Value, Error> {
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+    let Some(mut doc) = load_doc(&args[0])? else {
+        return Ok(Value::Null);
+    };
+    for p in &args[1..] {
+        let path = parse_doc_path(p)?;
+        match jb_remove_at(doc, path.segs()) {
+            Some(new_doc) => doc = new_doc,
+            None => return Ok(Value::Null), // path '$' removes the document
+        }
+    }
+    Ok(out.emit(&doc))
+}
+
+/// `json_valid(X)` (strict JSON) / `json_valid(X, flags)` — bit 1 = strict
+/// RFC 8259 text, bit 2 = JSON5 text, bits 4|8 = JSONB blob; any enabled
+/// check passing returns 1.
+fn json_valid(args: &[Value]) -> Result<Value, Error> {
+    let flags: i64 = match args.len() {
+        1 => 1,
+        2 => match &args[1] {
+            Value::Null => return Ok(Value::Null),
+            v => v.as_integer(),
+        },
+        _ => {
+            return Err(Error::Runtime(
+                "json_valid() takes at most two arguments".to_string(),
+            ))
+        }
+    };
+    if !(1..=15).contains(&flags) {
+        return Err(Error::Runtime(
+            "FLAGS parameter to json_valid() must be between 1 and 15".to_string(),
+        ));
+    }
+    let Some(x) = args.first() else {
+        return Ok(Value::Null);
+    };
+    let owned_bytes: Option<Vec<u8>> = match x {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(t) => Some(t.as_bytes().to_vec()),
+        Value::Blob(b) => Some(b.clone()),
+        other => Some(other.as_text().into_bytes()),
+    };
+    let Some(bytes) = owned_bytes else {
+        return Ok(Value::Integer(0));
+    };
+    let bytes: &[u8] = &bytes;
+    let mut valid = false;
+    if flags & 1 != 0 {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            valid |= parse_strict(s).is_ok();
+        }
+    }
+    if flags & 2 != 0 {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            valid |= jsonb::parse_json5(s).is_ok();
+        }
+    }
+    if flags & 12 != 0 {
+        valid |= jsonb::jb_from_bytes(bytes).is_ok();
+    }
+    Ok(Value::Integer(if valid { 1 } else { 0 }))
+}
+
+// ---------------------------------------------------------------------------
+// Legacy helpers kept for the aggregate accumulators
+// ---------------------------------------------------------------------------
 
 /// JSON-quote a SQL value for embedding in a JSON document text
 /// (json_group_array / json_group_object accumulation).
 pub fn json_quote_value(v: &Value) -> String {
     match v {
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => {
-            if r.is_finite() {
-                format!("{}", r)
-            } else {
-                "null".to_string()
-            }
-        }
         Value::Null => "null".to_string(),
-        Value::Text(t) => {
-            let s = t.to_string();
-            let mut out = String::with_capacity(s.len() + 2);
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c if (c as u32) < 0x20 => {
-                        out.push_str(&format!("\\u{:04x}", c as u32));
-                    }
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-            out
-        }
-        Value::Blob(_) => "null".to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => jsonb::render_sql_f64(*r),
+        Value::Text(_) | Value::Blob(_) => value_to_jb(v).render(),
     }
 }
 
-/// SQL value → JSON node (json_quote semantics).
-pub fn sql_to_json(v: &Value) -> Json {
-    match v {
-        Value::Null => Json::Null,
-        Value::Integer(i) => Json::Integer(*i),
-        Value::Real(r) => Json::Real(*r),
-        Value::Text(s) => Json::Str(s.as_str().to_owned()),
-        Value::Blob(b) => Json::Str(String::from_utf8_lossy(b).to_string()),
-    }
+/// SQL value → JSON node (legacy decoded view for the old tree consumers).
+pub fn sql_to_json(v: &Value) -> Jb {
+    value_to_jb(v)
 }
 
-// ---------------------------------------------------------------------------
-// Path rewriting for the mutation functions
-// ---------------------------------------------------------------------------
-
-/// Set the value at `path` inside `root` (creating intermediate objects for
-/// json_set/json_insert with `create` = true). Returns the new document.
-fn json_set_at(
-    root: Json,
-    path: &JsonPath,
-    new_val: Json,
-    create: bool,
-    insert_only: bool,
-) -> Json {
-    fn walk(node: Json, segs: &[PathSeg], new_val: &Json, create: bool, insert_only: bool) -> Json {
-        if segs.is_empty() {
-            if insert_only {
-                return node; // json_insert: only if absent — absent means we'd
-                             // have created it; handled by caller returning early
-            }
-            return new_val.clone();
-        }
-        match (&segs[0], node) {
-            (PathSeg::Key(k), Json::Object(mut members)) => {
-                if let Some(pos) = members.iter().position(|(mk, _)| mk == k) {
-                    let child = std::mem::replace(&mut members[pos].1, Json::Null);
-                    members[pos].1 = walk(child, &segs[1..], new_val, create, insert_only);
-                    Json::Object(members)
-                } else if create {
-                    let child = Json::Object(Vec::new());
-                    members.push((
-                        k.clone(),
-                        walk(child, &segs[1..], new_val, create, insert_only),
-                    ));
-                    Json::Object(members)
-                } else {
-                    Json::Object(members)
-                }
-            }
-            (PathSeg::Index(i), Json::Array(mut items)) => {
-                let idx = if *i < 0 { items.len() as i64 + i } else { *i };
-                if idx >= 0 && (idx as usize) < items.len() {
-                    let pos = idx as usize;
-                    let child = std::mem::replace(&mut items[pos], Json::Null);
-                    items[pos] = walk(child, &segs[1..], new_val, create, insert_only);
-                } else if create && idx >= 0 && (idx as usize) == items.len() {
-                    // append
-                    let child = Json::Object(Vec::new());
-                    items.push(walk(child, &segs[1..], new_val, create, insert_only));
-                }
-                Json::Array(items)
-            }
-            (_, node) => node,
-        }
-    }
-    walk(root, &path.segs, &new_val, create, insert_only)
-}
-
-/// Remove the value at `path`. Returns the new document (unchanged when the
-/// path doesn't resolve).
-fn json_remove_at(root: Json, path: &JsonPath) -> Json {
-    fn walk(node: Json, segs: &[PathSeg]) -> Json {
-        if segs.is_empty() {
-            return node;
-        }
-        if segs.len() == 1 {
-            return match (&segs[0], node) {
-                (PathSeg::Key(k), Json::Object(mut members)) => {
-                    members.retain(|(mk, _)| mk != k);
-                    Json::Object(members)
-                }
-                (PathSeg::Index(i), Json::Array(mut items)) => {
-                    let idx = if *i < 0 { items.len() as i64 + i } else { *i };
-                    if idx >= 0 && (idx as usize) < items.len() {
-                        items.remove(idx as usize);
-                    }
-                    Json::Array(items)
-                }
-                (_, node) => node,
-            };
-        }
-        match (&segs[0], node) {
-            (PathSeg::Key(k), Json::Object(mut members)) => {
-                if let Some(pos) = members.iter().position(|(mk, _)| mk == k) {
-                    let child = std::mem::replace(&mut members[pos].1, Json::Null);
-                    members[pos].1 = walk(child, &segs[1..]);
-                }
-                Json::Object(members)
-            }
-            (PathSeg::Index(i), Json::Array(mut items)) => {
-                let idx = if *i < 0 { items.len() as i64 + i } else { *i };
-                if idx >= 0 && (idx as usize) < items.len() {
-                    let pos = idx as usize;
-                    let child = std::mem::replace(&mut items[pos], Json::Null);
-                    items[pos] = walk(child, &segs[1..]);
-                }
-                Json::Array(items)
-            }
-            (_, node) => node,
-        }
-    }
-    walk(root, &path.segs)
-}
-
-/// RFC 7396 JSON Merge Patch.
-fn json_patch_target(target: &Json, patch: &Json) -> Json {
-    match patch {
-        Json::Object(patch_members) => {
-            let mut out = match target {
-                Json::Object(m) => m.clone(),
-                _ => Vec::new(),
-            };
-            for (k, pv) in patch_members {
-                if matches!(pv, Json::Null) {
-                    out.retain(|(mk, _)| mk != k);
-                } else {
-                    let existing = out.iter().find(|(mk, _)| mk == k).map(|(_, v)| v.clone());
-                    let merged = match existing {
-                        Some(e) => json_patch_target(&e, pv),
-                        None => json_patch_target(&Json::Object(Vec::new()), pv),
-                    };
-                    if let Some(pos) = out.iter().position(|(mk, _)| mk == k) {
-                        out[pos].1 = merged;
-                    } else {
-                        out.push((k.clone(), merged));
-                    }
-                }
-            }
-            Json::Object(out)
-        }
-        other => other.clone(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public entry: the JSON1 scalar functions
-// ---------------------------------------------------------------------------
-
-/// Dispatch a JSON1 function call. `args` are the evaluated SQL arguments.
-/// Returns None when `fname` isn't a JSON function (caller falls through).
-pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
-    match fname {
-        "json_pretty" => Some(match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => match parse_json(&v.as_text()) {
-                Some(j) => {
-                    let mut out = String::new();
-                    write_json_pretty(&j, &mut out, 0);
-                    Value::Text(out.into())
-                }
-                None => Value::Null,
-            },
-        }),
-        "json_error_position" => Some(match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => match parse_json_with_error_position(&v.as_text()) {
-                Ok(_) => Value::Integer(0),
-                Err(pos) => Value::Integer(pos as i64),
-            },
-        }),
-        "json_valid" => Some(match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => {
-                let s = v.as_text();
-                Value::Integer(if parse_json(&s).is_some() { 1 } else { 0 })
-            }
-        }),
-        "json" => Some(match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => match parse_json(&v.as_text()) {
-                Some(j) => Value::Text(json_to_string(&j).into()),
-                None => Value::Text(format!("malformed JSON: {}", trunc(&v.as_text())).into()),
-            },
-        }),
-        "json_type" => {
-            let (doc, path) = doc_and_path(args)?;
-            Some(match path {
-                Some(p) => match p.resolve(&doc) {
-                    Some(node) => Value::Text(node.type_name().to_string().into()),
-                    None => Value::Null,
-                },
-                None => Value::Text(doc.type_name().to_string().into()),
-            })
-        }
-        "json_quote" => Some(match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => {
-                let j = sql_to_json(v);
-                Value::Text(json_to_string(&j).into())
-            }
-        }),
-        "json_array" => {
-            let items: Vec<Json> = args.iter().map(sql_to_json).collect();
-            Some(Value::Text(json_to_string(&Json::Array(items)).into()))
-        }
-        "json_object" => {
-            // json_object(k1, v1, k2, v2, ...) — odd arg count is an error
-            // in SQLite; we mirror by returning a malformed marker text.
-            if args.len() % 2 != 0 {
-                return Some(Value::Text(
-                    "json_object() requires an even number of arguments"
-                        .to_string()
-                        .into(),
-                ));
-            }
-            let mut members = Vec::with_capacity(args.len() / 2);
-            let mut i = 0;
-            while i + 1 < args.len() {
-                let k = args[i].as_text();
-                members.push((k, sql_to_json(&args[i + 1])));
-                i += 2;
-            }
-            Some(Value::Text(json_to_string(&Json::Object(members)).into()))
-        }
-        "json_array_length" => {
-            let (doc, path) = doc_and_path(args)?;
-            let target = match &path {
-                Some(p) => p.resolve(&doc).cloned(),
-                None => Some(doc.clone()),
-            };
-            Some(match target {
-                Some(Json::Array(items)) => Value::Integer(items.len() as i64),
-                Some(_) => Value::Integer(0),
-                None => Value::Integer(0),
-            })
-        }
-        "json_extract" => {
-            // json_extract(x, path1, path2, ...): single path → the value;
-            // multiple paths → a JSON array of the values. No matching path
-            // → NULL (SQLite behavior for a single path; multiple paths
-            // yield an array of nulls... we return NULL only when ALL miss).
-            if args.len() < 2 {
-                return Some(Value::Null);
-            }
-            let doc = parse_json(&args[0].as_text())?;
-            let mut results = Vec::with_capacity(args.len() - 1);
-            let mut any = false;
-            for p in &args[1..] {
-                let path = parse_path(&p.as_text());
-                match path.and_then(|pp| pp.resolve(&doc).cloned()) {
-                    Some(node) => {
-                        any = true;
-                        results.push(json_to_sql(&node));
-                    }
-                    None => results.push(Value::Null),
-                }
-            }
-            if args.len() == 2 {
-                Some(if any {
-                    results.pop().unwrap()
-                } else {
-                    Value::Null
-                })
-            } else {
-                Some(Value::Text(
-                    json_to_string(&Json::Array(
-                        results.into_iter().map(|v| sql_to_json(&v)).collect(),
-                    ))
-                    .into(),
-                ))
-            }
-        }
-        "json_insert" | "json_replace" | "json_set" => {
-            // (doc, path, value [, path, value ...])
-            if args.len() < 3 || args.len() % 2 == 0 {
-                return Some(Value::Null);
-            }
-            let mut doc = parse_json(&args[0].as_text())?;
-            let mut i = 1;
-            while i + 1 < args.len() {
-                let Some(path) = parse_path(&args[i].as_text()) else {
-                    return Some(Value::Text("bad JSON path".to_string().into()));
-                };
-                let new_val = sql_to_json(&args[i + 1]);
-                let exists = path.resolve(&doc).is_some();
-                let apply = match fname {
-                    // insert: only when absent
-                    "json_insert" => !exists,
-                    // replace: only when present
-                    "json_replace" => exists,
-                    // set: always
-                    _ => true,
-                };
-                if apply {
-                    doc = json_set_at(doc, &path, new_val, fname != "json_replace", false);
-                }
-                i += 2;
-            }
-            Some(Value::Text(json_to_string(&doc).into()))
-        }
-        "json_remove" => {
-            // (doc, path...)
-            if args.is_empty() {
-                return Some(Value::Null);
-            }
-            let mut doc = parse_json(&args[0].as_text())?;
-            for p in &args[1..] {
-                if let Some(path) = parse_path(&p.as_text()) {
-                    doc = json_remove_at(doc, &path);
-                }
-            }
-            Some(Value::Text(json_to_string(&doc).into()))
-        }
-        "json_patch" => {
-            if args.len() != 2 {
-                return Some(Value::Null);
-            }
-            let target = parse_json(&args[0].as_text())?;
-            let patch = parse_json(&args[1].as_text())?;
-            Some(Value::Text(
-                json_to_string(&json_patch_target(&target, &patch)).into(),
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn doc_and_path(args: &[Value]) -> Option<(Json, Option<JsonPath>)> {
-    let doc = parse_json(&args.first()?.as_text())?;
-    let path = match args.get(1) {
-        Some(p) => Some(parse_path(&p.as_text())?),
-        None => None,
-    };
-    Some((doc, path))
-}
-
-fn trunc(s: &str) -> String {
-    s.chars().take(32).collect()
+/// Parse a complete JSON document (decoded view) — legacy entry point.
+pub fn parse_json(s: &str) -> Option<Jb> {
+    parse_lenient(s).ok()
 }
