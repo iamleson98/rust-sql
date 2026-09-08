@@ -152,6 +152,8 @@ pub mod executor;
 pub use api::{Database, Params};
 pub use error::{Error, Result};
 pub use statement::{Statement, StepResult};
+/// SQLite disk-format interop surface (see `storage::sqlitefmt`).
+pub use storage::sqlitefmt;
 pub use types::{Affinity, Row, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

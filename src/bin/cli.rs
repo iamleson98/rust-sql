@@ -1,7 +1,13 @@
 //! Interactive CLI shell for rustqlite.
 //!
 //! Usage:
-//!   rustqlite-cli [DB_PATH]
+//!   rustqlite-cli [OPTIONS] [DB_PATH]
+//!
+//! Options:
+//!   --sqlite-format   Create the database file in SQLite's own disk
+//!                     format (fileformat2) — openable by the `sqlite3`
+//!                     CLI and every SQLite driver. Existing SQLite files
+//!                     are detected automatically regardless of the flag.
 //!
 //! If DB_PATH is not given, opens an in-memory database.
 //! Reads SQL statements from stdin (one per line, terminated by `;`).
@@ -19,17 +25,27 @@ use std::io::{self, BufRead, Write};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let path = if args.len() >= 2 {
-        args[1].clone()
-    } else {
-        ":memory:".to_string()
-    };
+    let sqlite_format = args.iter().any(|a| a == "--sqlite-format");
+    let path = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| ":memory:".to_string());
 
     let mut db = if path == ":memory:" {
         match Database::open_in_memory() {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("error opening in-memory database: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if sqlite_format {
+        match Database::open_sqlite_format(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("error opening {}: {}", path, e);
                 std::process::exit(1);
             }
         }

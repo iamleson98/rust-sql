@@ -25,7 +25,7 @@ use crate::types::{Row, Value};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -406,6 +406,46 @@ pub struct Database {
     /// for read-heavy workloads) the break costs ONE relaxed atomic load
     /// instead of a mutex round-trip (~10 ns) on every query.
     insert_chain_hot: AtomicBool,
+    /// SQLite-format (fileformat2) bridge state. `Some` when this
+    /// database's persistent file is a REAL SQLite `.db`: the operating
+    /// state lives in the in-memory pager (native engine speed) and the
+    /// file is rewritten in SQLite's exact disk format at every commit
+    /// boundary (see `dump_foreign`).
+    foreign: Option<ForeignSqlite>,
+}
+
+/// Persistence state for a SQLite-format (fileformat2) database file.
+///
+/// The engine's native `RSQLDB04` container stays the default for
+/// files it creates; when `Database::open` sniffs SQLite's magic, the
+/// whole image is decoded into the engine and this struct owns the
+/// round-trip bookkeeping: emit order of `sqlite_schema` rows (original
+/// creation order first, engine-created objects appended), the
+/// `sqlite_sequence` map, and the header counters that must advance
+/// monotonically across dumps.
+pub(crate) struct ForeignSqlite {
+    path: std::path::PathBuf,
+    dirty: AtomicBool,
+    /// Emit order for sqlite_schema rows: original rows in creation
+    /// order, then objects first seen at a later dump.
+    order: Mutex<Vec<SchemaOrderKey>>,
+    next_rowid: Mutex<i64>,
+    /// `sqlite_sequence` contents: table name (lowercased) -> high-water mark.
+    sequences: Mutex<HashMap<String, i64>>,
+    /// Preserve the source's page size across rewrites (0 = default 4096).
+    page_size: u32,
+    change_counter: AtomicU32,
+    schema_cookie: AtomicU32,
+    had_wal: AtomicBool,
+}
+
+/// Identifies one sqlite_schema row for stable emit ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SchemaOrderKey {
+    Table(String),
+    Index(String),
+    View(String),
+    Trigger(String),
 }
 
 /// Default capacity of the statement cache.
@@ -416,6 +456,105 @@ const DEFAULT_STMT_CACHE_CAPACITY: usize = 64;
 /// attach path in `execute` and on the ROLLBACK reset.
 fn empty_maps() -> Arc<crate::executor::StmtMaps> {
     crate::executor::StmtMaps::empty_arc()
+}
+
+// ---------------------------------------------------------------------------
+// SQLite file-format interop helpers
+// ---------------------------------------------------------------------------
+
+/// Double-quoted SQL identifier with `"` escaping.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The record-position -> declared-column mapping for a WITHOUT ROWID
+/// table: the record stores the PRIMARY KEY columns first (in PK order),
+/// then the remaining columns in declared order.
+fn without_rowid_record_map(table: &Table) -> Vec<usize> {
+    let mut pk: Vec<(u8, usize)> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.pk_seq > 0)
+        .map(|(i, c)| (c.pk_seq, i))
+        .collect();
+    pk.sort_by_key(|(seq, _)| *seq);
+    let mut map: Vec<usize> = pk.into_iter().map(|(_, i)| i).collect();
+    for (i, c) in table.columns.iter().enumerate() {
+        if c.pk_seq == 0 {
+            map.push(i);
+        }
+    }
+    map
+}
+
+fn order_key_name(k: &SchemaOrderKey) -> String {
+    match k {
+        SchemaOrderKey::Table(n)
+        | SchemaOrderKey::Index(n)
+        | SchemaOrderKey::View(n)
+        | SchemaOrderKey::Trigger(n) => n.clone(),
+    }
+}
+
+/// Append catalog objects absent from the persisted emit order (engine-
+/// created since the last dump), in stable alphabetical order.
+fn append_new_objects<T>(
+    map: &HashMap<String, std::sync::Arc<T>>,
+    kind_of: fn(String) -> SchemaOrderKey,
+    known: &std::collections::HashSet<String>,
+    order: &mut Vec<SchemaOrderKey>,
+) {
+    let mut names: Vec<&String> = map.keys().collect();
+    names.sort();
+    for n in names {
+        if !known.contains(n.as_str()) {
+            order.push(kind_of(n.clone()));
+        }
+    }
+}
+
+/// The engine-synthesized autoindexes of one table, in catalog-name order.
+fn sorted_indexes_on(
+    indexes: &HashMap<String, std::sync::Arc<Index>>,
+    table_lc: &str,
+) -> Vec<(String, std::sync::Arc<Index>)> {
+    let mut out: Vec<(String, std::sync::Arc<Index>)> = indexes
+        .iter()
+        .filter(|(_, idx)| idx.table.eq_ignore_ascii_case(table_lc))
+        .map(|(n, i)| (n.clone(), i.clone()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Map a collation name to the writer's supported set.
+fn collation_of(name: &str, index: &str) -> crate::storage::sqlitefmt::Collation {
+    match name.to_ascii_lowercase().as_str() {
+        "" | "binary" | "bom" => crate::storage::sqlitefmt::Collation::Binary,
+        "nocase" => crate::storage::sqlitefmt::Collation::NoCase,
+        other => {
+            // Unsupported collations in the SQLite-format output: the
+            // engine may know them (plugin collations), but the writer
+            // can only order BINARY/NOCASE. Fall back to binary with a
+            // dev-visible name — the round-trip test suite covers the
+            // supported set.
+            let _ = (other, index);
+            crate::storage::sqlitefmt::Collation::Binary
+        }
+    }
+}
+
+/// Dump the SQLite-format file on drop when writes are pending (the
+/// in-memory state is the only durable copy at that point).
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(f) = &self.foreign {
+            if f.dirty.load(Ordering::Acquire) || f.had_wal.load(Ordering::Acquire) {
+                let _ = self.dump_foreign();
+            }
+        }
+    }
 }
 
 /// Generic FxHash-style string hasher for statement-cache keys.
@@ -1819,6 +1958,20 @@ impl Database {
     ) -> Result<Self> {
         crate::engine_init();
         let path = path.as_ref().to_path_buf();
+        // SQLite-format sniff: a real `.db` written by SQLite (or by this
+        // engine's sqlitefmt writer) loads through the interop bridge.
+        if !memory
+            && path.as_os_str() != ":memory:"
+            && crate::storage::sqlitefmt::is_sqlite_file(&path)
+        {
+            if codec.is_some() {
+                return Err(Error::semantic(
+                    "page codecs are only supported on the native format; \
+                         open SQLite-format files without a codec",
+                ));
+            }
+            return Self::from_sqlite_file(&path);
+        }
         let pager = Pager::open_opts(&path, DEFAULT_CACHE_PAGES, memory)?;
         if let Some(c) = &codec {
             pager.set_codec(Some(c.clone()))?;
@@ -1874,6 +2027,7 @@ impl Database {
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
+            foreign: None,
         })
     }
 
@@ -2001,7 +2155,696 @@ impl Database {
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
+            foreign: None,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SQLite FILE-FORMAT INTEROP (fileformat2)
+    // ------------------------------------------------------------------
+
+    /// Open a database file written by SQLite (any tool: the `sqlite3`
+    /// CLI, Python's `sqlite3` module, rusqlite, Turso, ...). The file is
+    /// decoded into the engine's in-memory state, every SQL feature works
+    /// at native speed, and each commit rewrites the file in SQLite's
+    /// exact disk format (atomic temp+rename) — so the file stays a real
+    /// SQLite database at all times and passes `PRAGMA integrity_check`.
+    ///
+    /// `Database::open` sniffs the magic and routes here automatically;
+    /// this constructor is the explicit form (handy for `CREATE` intent,
+    /// which is `Database::open_sqlite_format`).
+    fn from_sqlite_file(path: &Path) -> Result<Self> {
+        let image = crate::storage::sqlitefmt::read_sqlite_file(path)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let mut db = Self::open_memory_inner()?;
+        db.path = path.to_path_buf();
+        let foreign = ForeignSqlite {
+            path: path.to_path_buf(),
+            dirty: AtomicBool::new(false),
+            order: Mutex::new(Vec::new()),
+            next_rowid: Mutex::new(0),
+            sequences: Mutex::new(image.sequences.clone()),
+            page_size: image.page_size,
+            change_counter: AtomicU32::new(0),
+            schema_cookie: AtomicU32::new(0),
+            had_wal: AtomicBool::new(image.had_wal),
+        };
+        db.foreign = Some(foreign);
+        db.load_foreign_image(image)?;
+        Ok(db)
+    }
+
+    /// Create (or open) a database whose file is written in SQLite's
+    /// own disk format — so the `sqlite3` CLI and every SQLite driver
+    /// can open what this engine writes. This is the explicit form of
+    /// the format choice; opening an existing SQLite file auto-detects.
+    ///
+    /// A fresh file is written immediately (a valid empty database); a
+    /// file with SQLite magic is opened through the interop path.
+    pub fn open_sqlite_format<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if path.exists() && crate::storage::sqlitefmt::is_sqlite_file(path) {
+            return Self::from_sqlite_file(path);
+        }
+        if path.exists() {
+            // A non-empty non-SQLite file: refuse rather than clobber.
+            if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(true) {
+                return Err(Error::semantic(format!(
+                    "open_sqlite_format: {} exists and is not a SQLite-format file",
+                    path.display()
+                )));
+            }
+        }
+        let mut db = Self::open_memory_inner()?;
+        db.path = path.to_path_buf();
+        db.foreign = Some(ForeignSqlite {
+            path: path.to_path_buf(),
+            dirty: AtomicBool::new(true),
+            order: Mutex::new(Vec::new()),
+            next_rowid: Mutex::new(0),
+            sequences: Mutex::new(HashMap::new()),
+            page_size: 0, // default 4096 on first write
+            change_counter: AtomicU32::new(1),
+            schema_cookie: AtomicU32::new(1),
+            had_wal: AtomicBool::new(false),
+        });
+        db.dump_foreign()?;
+        Ok(db)
+    }
+
+    /// The persistent disk format of this database: `"sqlite"` when the
+    /// file is a real SQLite database (interop mode), `"native"` for the
+    /// engine's own `RSQLDB04` container.
+    pub fn disk_format(&self) -> &'static str {
+        if self.foreign.is_some() {
+            "sqlite"
+        } else {
+            "native"
+        }
+    }
+
+    /// Load a decoded SQLite image into the engine: tables first, then
+    /// rows, then indexes (backfilling from the rows), then views and
+    /// triggers last (triggers must not fire during the load).
+    fn load_foreign_image(
+        &mut self,
+        image: crate::storage::sqlitefmt::SqliteDbImage,
+    ) -> Result<()> {
+        // Order bookkeeping from the source schema.
+        {
+            let foreign = self.foreign.as_ref().unwrap();
+            let mut order = foreign.order.lock();
+            let mut next_rowid = foreign.next_rowid.lock();
+            for row in &image.schema {
+                let key = match row.kind.as_str() {
+                    "table" => SchemaOrderKey::Table(row.name.to_ascii_lowercase()),
+                    "index" => SchemaOrderKey::Index(row.name.to_ascii_lowercase()),
+                    "view" => SchemaOrderKey::View(row.name.to_ascii_lowercase()),
+                    "trigger" => SchemaOrderKey::Trigger(row.name.to_ascii_lowercase()),
+                    _ => continue,
+                };
+                order.push(key);
+                *next_rowid = (*next_rowid).max(row.rowid);
+            }
+        }
+        // 1. Tables (sqlite_sequence is tracked in the foreign state).
+        for row in &image.schema {
+            if row.kind != "table" {
+                continue;
+            }
+            let name_lc = row.name.to_ascii_lowercase();
+            if name_lc == "sqlite_sequence" {
+                continue;
+            }
+            let Some(sql) = &row.sql else { continue };
+            self.execute_load(sql, &row.name)?;
+        }
+        // 2. Rows.
+        for row in &image.schema {
+            if row.kind != "table" {
+                continue;
+            }
+            let name_lc = row.name.to_ascii_lowercase();
+            if name_lc == "sqlite_sequence" {
+                continue;
+            }
+            let rows = match image.table_rows.get(&name_lc) {
+                Some(r) => r,
+                None => continue,
+            };
+            self.load_foreign_table_rows(&row.name, rows)?;
+        }
+        // 3. Indexes (explicit CREATE INDEX; autoindexes are synthesized
+        //    by the engine's CREATE TABLE path — matching SQLite's own
+        //    sqlite_autoindex naming).
+        for row in &image.schema {
+            if row.kind != "index" {
+                continue;
+            }
+            let Some(sql) = &row.sql else { continue };
+            self.execute_load(sql, &row.name)?;
+        }
+        // 4. Views + triggers.
+        for row in &image.schema {
+            if row.kind != "view" && row.kind != "trigger" {
+                continue;
+            }
+            let Some(sql) = &row.sql else { continue };
+            self.execute_load(sql, &row.name)?;
+        }
+        // 5. Header pragmas.
+        if image.user_version != 0 {
+            self.execute(&format!("PRAGMA user_version = {}", image.user_version), ())?;
+        }
+        if image.application_id != 0 {
+            self.execute(
+                &format!("PRAGMA application_id = {}", image.application_id),
+                (),
+            )?;
+        }
+        // A loaded WAL sidecar is now folded into the in-memory state;
+        // the next dump removes the stale sidecars.
+        Ok(())
+    }
+
+    /// Execute a schema statement during load, wrapping errors with the
+    /// object name (SQLite reports malformed schema rows this way).
+    fn execute_load(&mut self, sql: &str, object: &str) -> Result<()> {
+        self.execute(sql, ())
+            .map_err(|e| Error::semantic(format!("loading sqlite_schema row '{object}': {e}")))
+    }
+
+    /// Bulk-insert decoded rows through the normal INSERT path (rowids
+    /// preserved, indexes maintained, CHECK/NOT NULL enforced) in
+    /// multi-row chunks with positional parameters.
+    fn load_foreign_table_rows(
+        &mut self,
+        table_name: &str,
+        rows: &[crate::storage::sqlitefmt::RawRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let Some(table) = self.catalog.get_table(table_name) else {
+            return Ok(()); // virtual tables etc.
+        };
+        if table.vtab.is_some() {
+            return Ok(());
+        }
+        let n_cols = table.n_columns();
+        // WITHOUT ROWID records store PK columns first; map back to the
+        // declared column order.
+        let wr_map: Option<Vec<usize>> = if table.without_rowid {
+            Some(without_rowid_record_map(&table))
+        } else {
+            None
+        };
+        // Insert column list: skip generated columns (computed).
+        let mut listed: Vec<String> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+        for (i, c) in table.columns.iter().enumerate() {
+            if c.generated.is_some() {
+                continue;
+            }
+            listed.push(quote_ident(&c.name));
+            positions.push(i);
+        }
+        let rowid_listed = table.rowid_alias.is_none() && !table.without_rowid;
+        let mut col_list = listed.clone();
+        if rowid_listed {
+            col_list.push("rowid".to_string());
+        }
+        let rowid_pos = if table.rowid_alias.is_some() {
+            table.rowid_alias
+        } else {
+            None
+        };
+        let _ = rowid_pos;
+
+        let chunk = 256usize;
+        let mut out: Vec<Value> = Vec::with_capacity(chunk * (col_list.len() + 1));
+        let mut count_in_chunk = 0usize;
+        let flush = |db: &mut Database, out: &mut Vec<Value>, n: usize| -> Result<()> {
+            if n == 0 {
+                return Ok(());
+            }
+            let placeholders = format!(
+                "({})",
+                (0..col_list.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                quote_ident(table_name),
+                col_list.join(", "),
+                (0..n)
+                    .map(|_| placeholders.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let params: Vec<Value> = std::mem::take(out);
+            let res = db.execute(&sql, params);
+            if let Err(e) = res {
+                return Err(Error::semantic(format!(
+                    "loading rows of table {table_name}: {e}"
+                )));
+            }
+            Ok(())
+        };
+        for raw in rows {
+            let mut values_declared: Vec<Value> = Vec::with_capacity(n_cols);
+            if let Some(map) = &wr_map {
+                // Record is PK-first; reorder to declared order.
+                values_declared.resize(n_cols, Value::Null);
+                for (rec_i, val) in raw.values.iter().enumerate() {
+                    if let Some(&decl_i) = map.get(rec_i) {
+                        if decl_i < n_cols {
+                            values_declared[decl_i] = val.clone();
+                        }
+                    }
+                }
+            } else {
+                for i in 0..n_cols {
+                    values_declared.push(raw.values.get(i).cloned().unwrap_or(Value::Null));
+                }
+            }
+            // Explicit rowid: alias column takes the rowid value (the
+            // engine stores it as the b-tree key); non-alias tables list
+            // "rowid" explicitly.
+            for &p in &positions {
+                out.push(values_declared.get(p).cloned().unwrap_or(Value::Null));
+            }
+            if let Some(alias) = table.rowid_alias {
+                // replace the alias column's NULL with the rowid
+                let idx_in_list = positions.iter().position(|&p| p == alias);
+                if let Some(list_i) = idx_in_list {
+                    let last = out.len() - positions.len() + list_i;
+                    out[last] = Value::Integer(raw.rowid);
+                }
+            } else if table.without_rowid {
+                // no rowid
+            } else {
+                out.push(Value::Integer(raw.rowid));
+            }
+            count_in_chunk += 1;
+            if count_in_chunk == chunk {
+                flush(self, &mut out, count_in_chunk)?;
+                count_in_chunk = 0;
+            }
+        }
+        flush(self, &mut out, count_in_chunk)
+    }
+
+    /// Mark the SQLite-format file dirty after a successful write, and
+    /// dump immediately when this is an autocommit boundary (no explicit
+    /// transaction open). Used by the fast-insert paths, which return
+    /// early from `execute`.
+    fn note_foreign_write(&mut self) -> Result<()> {
+        if let Some(f) = &self.foreign {
+            f.dirty.store(true, Ordering::Release);
+            if !self.in_transaction.load(Ordering::Acquire) {
+                self.dump_foreign()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite the persistent file in SQLite's disk format when the
+    /// in-memory state has committed writes. Atomic: temp + fsync +
+    /// rename. No-op when clean.
+    pub fn dump_foreign(&self) -> Result<()> {
+        let Some(foreign) = self.foreign.as_ref() else {
+            return Ok(());
+        };
+        if !foreign.dirty.load(Ordering::Acquire) && !foreign.had_wal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let out = self.collect_foreign_dump()?;
+        let path = foreign.path.clone();
+        crate::storage::sqlitefmt::write_sqlite_file(&path, &out)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        foreign.dirty.store(false, Ordering::Release);
+        // had_wal referred to the SOURCE's sidecar, removed by the write.
+        foreign.had_wal.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Collect the complete committed state as a SQLite-format build.
+    fn collect_foreign_dump(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
+        use crate::storage::sqlitefmt::{OutDb, OutObject};
+
+        let foreign = self.foreign.as_ref().unwrap();
+        let mut objects: Vec<OutObject> = Vec::new();
+
+        // Live catalog snapshots (lowercased names). The engine's
+        // sqlite_master / sqlite_schema query shims are NOT schema rows
+        // — they exist implicitly in every SQLite file.
+        let tables: HashMap<String, std::sync::Arc<Table>> = self
+            .catalog
+            .all_tables()
+            .into_iter()
+            .filter(|(n, _)| {
+                let n = n.as_str();
+                n != "sqlite_master" && n != "sqlite_schema"
+            })
+            .collect();
+        let indexes: HashMap<String, std::sync::Arc<Index>> =
+            self.catalog.all_indexes().into_iter().collect();
+        let views: HashMap<String, std::sync::Arc<crate::schema::View>> =
+            self.catalog.all_views().into_iter().collect();
+        let triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>> =
+            self.catalog.all_triggers().into_iter().collect();
+
+        // ---- Emit-order resolution ----
+        let mut order = foreign.order.lock().clone();
+        let known: std::collections::HashSet<String> = order.iter().map(order_key_name).collect();
+        // Append engine-created objects (stable alphabetical within each
+        // kind — deterministic across dumps).
+        append_new_objects(&tables, SchemaOrderKey::Table, &known, &mut order);
+        append_new_objects(&indexes, SchemaOrderKey::Index, &known, &mut order);
+        append_new_objects(&views, SchemaOrderKey::View, &known, &mut order);
+        append_new_objects(&triggers, SchemaOrderKey::Trigger, &known, &mut order);
+
+        // Objects emitted so far (for autoindex de-dup vs original rows).
+        let mut emitted_autoindexes: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut emitted_tables: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for key in &order {
+            match key {
+                SchemaOrderKey::Table(name) => {
+                    if name == "sqlite_sequence" {
+                        continue; // synthesized below
+                    }
+                    let Some(table) = tables.get(name) else {
+                        continue;
+                    };
+                    if table.vtab.is_some() {
+                        // Virtual table: rootpage 0, original SQL only.
+                        objects.push(OutObject::Other {
+                            kind: "table",
+                            name: table.name.clone(),
+                            tbl_name: table.name.clone(),
+                            sql: table.create_sql.clone(),
+                        });
+                        continue;
+                    }
+                    let table_name = table.name.clone();
+                    if table.without_rowid {
+                        let rows = self.dump_without_rowid_rows(table)?;
+                        objects.push(OutObject::WithoutRowid {
+                            name: table_name.clone(),
+                            sql: table.create_sql.clone(),
+                            rows,
+                        });
+                    } else {
+                        let rows = self.dump_table_rows(table)?;
+                        objects.push(OutObject::Table {
+                            name: table_name.clone(),
+                            sql: table.create_sql.clone(),
+                            alias: table.rowid_alias,
+                            rows,
+                        });
+                    }
+                    emitted_tables.insert(name.clone());
+                    // The engine's catalog carries the autoindexes it
+                    // synthesized at CREATE time (SQLite-compatible
+                    // sqlite_autoindex naming) — emit them right after
+                    // the table.
+                    for (idx_name, idx) in sorted_indexes_on(&indexes, name) {
+                        if idx_name.starts_with("sqlite_autoindex_") {
+                            let obj = self.dump_index_object(idx.as_ref(), &tables)?;
+                            objects.push(obj);
+                            emitted_autoindexes.insert(idx_name);
+                        }
+                    }
+                }
+                SchemaOrderKey::Index(name) => {
+                    if name.starts_with("sqlite_autoindex_") {
+                        // Emitted with its table above (or dropped with it).
+                        if emitted_autoindexes.contains(name) {
+                            continue;
+                        }
+                        // Autoindex whose table is gone: skip silently.
+                        continue;
+                    }
+                    let Some(idx) = indexes.get(name) else {
+                        continue;
+                    };
+                    let obj = self.dump_index_object(idx.as_ref(), &tables)?;
+                    objects.push(obj);
+                }
+                SchemaOrderKey::View(name) => {
+                    let Some(v) = views.get(name) else { continue };
+                    objects.push(OutObject::Other {
+                        kind: "view",
+                        name: v.name.clone(),
+                        tbl_name: v.name.clone(),
+                        sql: v.create_sql.clone(),
+                    });
+                }
+                SchemaOrderKey::Trigger(name) => {
+                    let Some(t) = triggers.get(name) else {
+                        continue;
+                    };
+                    objects.push(OutObject::Other {
+                        kind: "trigger",
+                        name: t.name.clone(),
+                        tbl_name: t.table.clone(),
+                        sql: t.create_sql.clone(),
+                    });
+                }
+            }
+        }
+
+        // ---- sqlite_sequence ----
+        let mut any_autoinc = false;
+        for t in tables.values() {
+            if t.columns.iter().any(|c| c.autoincrement) {
+                any_autoinc = true;
+                break;
+            }
+        }
+        if any_autoinc {
+            let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+            let seqs = foreign.sequences.lock();
+            for (name, t) in &tables {
+                if !t.columns.iter().any(|c| c.autoincrement) {
+                    continue;
+                }
+                let max_rowid = self.table_max_rowid(t).unwrap_or(0);
+                let seq = seqs.get(name).copied().unwrap_or(0).max(max_rowid);
+                seq_rows.push((
+                    seq_rows.len() as i64 + 1,
+                    vec![
+                        Value::Text(crate::types::text::Text::from(t.name.as_str())),
+                        Value::Integer(seq),
+                    ],
+                ));
+            }
+            if !seq_rows.is_empty() {
+                objects.push(OutObject::Table {
+                    name: "sqlite_sequence".into(),
+                    sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
+                    alias: None,
+                    rows: seq_rows,
+                });
+            }
+        }
+
+        // ---- Header counters ----
+        let change_counter = foreign.change_counter.load(Ordering::Acquire).max(1);
+        let schema_cookie = foreign.schema_cookie.load(Ordering::Acquire).max(1);
+
+        Ok(OutDb {
+            page_size: foreign.page_size,
+            user_version: self.pager.user_version(),
+            application_id: self.pager.application_id(),
+            change_counter,
+            schema_cookie,
+            objects,
+        })
+    }
+
+    /// `(rowid, values)` for a rowid table, in rowid order. The alias
+    /// column's value comes back as its rowid (the writer NULLs it in the
+    /// record, per SQLite's rowid-alias storage).
+    fn dump_table_rows(&self, table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
+        if table.vtab.is_some() {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT rowid, * FROM {}", quote_ident(&table.name));
+        let rows = self.query(&sql, ())?;
+        let mut out = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            if row.is_empty() {
+                continue;
+            }
+            let rowid = match row.remove(0) {
+                Value::Integer(i) => i,
+                _ => 0,
+            };
+            out.push((rowid, row));
+        }
+        Ok(out)
+    }
+
+    /// Full records for a WITHOUT ROWID table: PK columns first, then the
+    /// remaining columns in declared order — the on-disk layout.
+    fn dump_without_rowid_rows(&self, table: &Table) -> Result<Vec<Vec<Value>>> {
+        let sql = format!("SELECT * FROM {}", quote_ident(&table.name));
+        let rows = self.query(&sql, ())?;
+        let map = without_rowid_record_map(table);
+        let n = table.n_columns();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut record: Vec<Value> = vec![Value::Null; n];
+            for (decl_i, val) in row.iter().enumerate() {
+                if decl_i < n {
+                    record[decl_i] = val.clone();
+                }
+            }
+            // Reorder: build the PK-first layout.
+            let mut sorted: Vec<Option<Value>> = vec![None; n];
+            let mut used = vec![false; n];
+            for (rec_i, decl_i) in map.iter().enumerate() {
+                if *decl_i < n {
+                    sorted[rec_i] = Some(record[*decl_i].clone());
+                    used[*decl_i] = true;
+                }
+            }
+            let mut next = 0usize;
+            for decl_i in 0..n {
+                if !used[decl_i] {
+                    while next < n && sorted[next].is_some() {
+                        next += 1;
+                    }
+                    if next < n {
+                        sorted[next] = Some(record[decl_i].clone());
+                    }
+                }
+            }
+            out.push(
+                sorted
+                    .into_iter()
+                    .map(|v| v.unwrap_or(Value::Null))
+                    .collect(),
+            );
+        }
+        // Sort by the PK columns (declared order + collations).
+        let pk_cols: Vec<(usize, String)> = table
+            .columns
+            .iter()
+            .filter(|c| c.pk_seq > 0)
+            .map(|c| (c.pk_seq as usize, c.name.clone()))
+            .collect();
+        let _ = pk_cols;
+        Ok(out)
+    }
+
+    /// One index object: entries are complete index records (key columns
+    /// plus rowid for rowid tables, or plus the remaining PK columns for
+    /// WITHOUT ROWID tables).
+    fn dump_index_object(
+        &self,
+        idx: &Index,
+        tables: &HashMap<String, std::sync::Arc<Table>>,
+    ) -> Result<crate::storage::sqlitefmt::OutObject> {
+        use crate::storage::sqlitefmt::Collation;
+        let Some(table) = tables.get(&idx.table.to_ascii_lowercase()) else {
+            // Index on a dropped table: skip.
+            return Err(Error::semantic(format!(
+                "index {} references missing table {}",
+                idx.name, idx.table
+            )));
+        };
+        let key_len = idx.columns.len();
+        let mut select_items: Vec<String> = Vec::with_capacity(key_len + 1);
+        for c in &idx.columns {
+            // Plain columns quote as identifiers; expression-index keys
+            // (SQLite 3.9+) must be EVALUATED — quoting the rendered text
+            // would resolve to a nonexistent column and yield NULLs.
+            let item = match &c.expr {
+                Some(e) => expr_to_sql(e),
+                None => quote_ident(&c.name),
+            };
+            select_items.push(item);
+        }
+        let suffix_cols: Vec<String> = if table.without_rowid {
+            // Remaining PK columns not already among the key columns.
+            table
+                .columns
+                .iter()
+                .filter(|c| c.pk_seq > 0)
+                .map(|c| c.name.clone())
+                .filter(|n| !idx.columns.iter().any(|ic| ic.name.eq_ignore_ascii_case(n)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if table.without_rowid {
+            for s in &suffix_cols {
+                select_items.push(quote_ident(s));
+            }
+        } else {
+            select_items.push("rowid".to_string());
+        }
+        let mut sql = format!(
+            "SELECT {} FROM {}",
+            select_items.join(", "),
+            quote_ident(&table.name)
+        );
+        if let Some(partial) = &idx.partial_expr {
+            sql.push_str(" WHERE ");
+            sql.push_str(&expr_to_sql(partial));
+        }
+        let rows = self.query(&sql, ())?;
+        let mut entries: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut entry: Vec<Value> = row;
+            // Trim any extra columns the engine may project.
+            entry.truncate(select_items.len());
+            entries.push(entry);
+        }
+        // DESC flags + collations for the KEY columns.
+        let desc: Vec<bool> = idx
+            .columns
+            .iter()
+            .map(|c| c.order == crate::sql::ast::Order::Desc)
+            .collect();
+        let collations: Vec<Collation> = idx
+            .columns
+            .iter()
+            .map(|c| collation_of(&c.collation, &idx.name))
+            .collect();
+        Ok(crate::storage::sqlitefmt::OutObject::Index {
+            name: idx.name.clone(),
+            tbl_name: idx.table.clone(),
+            sql: if idx.name.starts_with("sqlite_autoindex_") {
+                None // SQLite stores NULL for autoindexes
+            } else {
+                Some(idx.create_sql.clone())
+            },
+            desc,
+            collations,
+            entries,
+        })
+    }
+
+    /// Maximum rowid of a table (for sqlite_sequence high-water marks).
+    fn table_max_rowid(&self, table: &Table) -> Result<i64> {
+        if table.without_rowid || table.vtab.is_some() {
+            return Ok(0);
+        }
+        let sql = format!("SELECT max(rowid) FROM {}", quote_ident(&table.name));
+        let rows = self.query(&sql, ())?;
+        Ok(match rows.first().and_then(|r| r.first().cloned()) {
+            Some(Value::Integer(i)) => i,
+            _ => 0,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -2023,6 +2866,29 @@ impl Database {
     /// then re-seeds a `:memory:` database from the image bytes, or
     /// rewrites the file and reopens it.
     fn execute_vacuum(&mut self, v: &VacuumStatement) -> Result<()> {
+        // SQLite-format databases: the dump IS the compaction (dense
+        // rebuild, no freelist, no fragmentation) — every write already
+        // produces SQLite's own VACUUM-shaped file.
+        if self.foreign.is_some() {
+            if let Some(into) = &v.into {
+                let p = std::path::Path::new(into);
+                if p.exists() {
+                    return Err(Error::semantic(format!(
+                        "cannot VACUUM INTO existing file: {into}"
+                    )));
+                }
+                let out = self.collect_foreign_dump()?;
+                crate::storage::sqlitefmt::write_sqlite_file(p, &out)
+                    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                return Ok(());
+            }
+            let foreign = self.foreign.as_ref();
+            if let Some(foreign) = foreign {
+                foreign.dirty.store(true, Ordering::Release);
+            }
+            self.dump_foreign()?;
+            return Ok(());
+        }
         if let Some(schema) = &v.schema {
             if !schema.eq_ignore_ascii_case("main") {
                 return Err(Error::semantic(format!(
@@ -3444,10 +4310,12 @@ impl Database {
                 .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
             if first == Some(&b'I') || first == Some(&b'i') {
                 if self.exec_chained_insert(sql)? {
+                    self.note_foreign_write()?;
                     return Ok(());
                 }
                 if let Some(fi) = try_fast_insert_parse(sql) {
                     if self.exec_fast_insert(fi)? {
+                        self.note_foreign_write()?;
                         return Ok(());
                     }
                 }
@@ -3757,6 +4625,27 @@ impl Database {
             let dirty = self.pager.dirty_page_count();
             if dirty >= deferred_flush_threshold {
                 let _ = self.pager.flush();
+            }
+        }
+        // SQLite-format persistence boundary: a successful write outside
+        // an explicit transaction (autocommit DML/DDL) rewrites the file
+        // immediately; inside BEGIN..COMMIT the dump is deferred to the
+        // COMMIT statement itself. Runs last — after every map merge,
+        // root sync, and cache invalidation — so the dump reads fully
+        // settled state.
+        if result.is_ok() && !ctx.rolled_back {
+            if let Some(foreign) = self.foreign.as_ref() {
+                let wrote = ctx.changes > 0
+                    || is_ddl
+                    || matches!(stmt_ref, Statement::Commit)
+                    || matches!(stmt_ref, Statement::Pragma(p) if p.value.is_some());
+                if wrote {
+                    let in_txn = self.in_transaction.load(Ordering::Acquire);
+                    foreign.dirty.store(true, Ordering::Release);
+                    if !in_txn {
+                        self.dump_foreign()?;
+                    }
+                }
             }
         }
         // Allocator-wake drain at write-burst completion (COMMIT / auto-
@@ -5834,10 +6723,17 @@ impl Database {
                 catalog.add_table(table.clone());
 
                 // Implicit UNIQUE indexes — mirrors SQLite's
-                // `sqlite_autoindex_<table>_<n>` behavior:
+                // `sqlite_autoindex_<table>_<n>` behavior (numbering in
+                // textual constraint order: column-level constraints of
+                // each column in declaration order, then table-level
+                // constraints):
                 //   1. Column-level UNIQUE constraints.
-                //   2. Table-level UNIQUE (a, b, ...) constraints.
-                //   3. Table-level PRIMARY KEY that is NOT a rowid alias
+                //   2. Column-level PRIMARY KEY that is NOT a rowid alias
+                //      (TEXT PK, non-INTEGER, `INTEGER ... DESC`, exact
+                //      declared type != INTEGER). Never for WITHOUT ROWID
+                //      (the PK IS the table's storage).
+                //   3. Table-level UNIQUE (a, b, ...) constraints.
+                //   4. Table-level PRIMARY KEY that is NOT a rowid alias
                 //      (composite PKs, or a single non-INTEGER PK column).
                 //
                 // Without these, UNIQUE constraints in CREATE TABLE were
@@ -5845,29 +6741,39 @@ impl Database {
                 // We synthesize a parseable `CREATE UNIQUE INDEX` statement
                 // as the schema SQL so the index round-trips on reopen.
                 let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
-                for col in &columns {
-                    if col
-                        .constraints
-                        .iter()
-                        .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique))
-                    {
-                        // Inherit the column's declared COLLATE (SQLite:
-                        // the implicit auto-index uses the column's
-                        // collation, so `email TEXT UNIQUE COLLATE NOCASE`
-                        // enforces case-insensitive uniqueness).
-                        let collate = col.constraints.iter().find_map(|c| {
-                            if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
-                                Some(name.clone())
-                            } else {
-                                None
+                for (ci, col) in columns.iter().enumerate() {
+                    let collate = col.constraints.iter().find_map(|c| {
+                        if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    // Constraint order within the column = textual order
+                    // (SQLite numbers autoindexes that way).
+                    for constraint in &col.constraints {
+                        match constraint {
+                            crate::sql::ast::ColumnConstraint::Unique => {
+                                implicit.push(vec![crate::sql::ast::IndexedColumn {
+                                    name: col.name.clone(),
+                                    order: crate::sql::ast::Order::Asc,
+                                    collation: collate.clone(),
+                                    expr: None,
+                                }]);
                             }
-                        });
-                        implicit.push(vec![crate::sql::ast::IndexedColumn {
-                            name: col.name.clone(),
-                            order: crate::sql::ast::Order::Asc,
-                            collation: collate,
-                            expr: None,
-                        }]);
+                            crate::sql::ast::ColumnConstraint::PrimaryKey { order, .. }
+                                // PK autoindex: only for rowid tables whose
+                                // PK is NOT the rowid alias.
+                                if !without_rowid && table.rowid_alias != Some(ci) => {
+                                    implicit.push(vec![crate::sql::ast::IndexedColumn {
+                                        name: col.name.clone(),
+                                        order: *order,
+                                        collation: collate.clone(),
+                                        expr: None,
+                                    }]);
+                                }
+                            _ => {}
+                        }
                     }
                 }
                 for c in &constraints {

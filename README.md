@@ -27,6 +27,7 @@ test methodology, and the honest ledger of what is still missing.
 - [Resource consumption vs SQLite](#resource-consumption-vs-sqlite)
 - [Concurrency vs SQLite](#concurrency-vs-sqlite)
 - [sqlx driver vs sqlx-sqlite](#sqlx-driver-vs-sqlx-sqlite)
+- [SQLite file-format interop](#sqlite-file-format-interop)
 - [Remaining gaps vs SQLite](#remaining-gaps-vs-sqlite)
 - [Usage](#usage)
 - [Testing](#testing)
@@ -505,6 +506,90 @@ thread and an FFI boundary; the native driver executes inline in the async task 
 the engine's `Send + Sync` core. The 18.4x stream number compounds that with the engine's
 batch-at-a-time streaming drivers (rows are produced in batches of 64 instead of
 per-row FFI callbacks).
+
+## SQLite file-format interop
+
+rustqlite reads and writes **real SQLite database files** (the `fileformat2`
+on-disk container): files created by the `sqlite3` CLI, Python's `sqlite3`,
+rusqlite or any other SQLite tooling open directly in rustqlite — and files
+rustqlite creates open in all of them, passing `PRAGMA integrity_check`.
+
+### How it works
+
+The engine's own native container (`RSQLDB04`) stays the default for files
+it creates — it carries the page-codec plugin markers, the spill-file
+bounded-memory transactions and the checksummed WAL. SQLite files get a
+complete second format stack:
+
+- **Reader** (`src/storage/sqlitefmt/reader.rs`): parses the 100-byte
+  header (any page size 512 B–64 KiB, reserved bytes honored), folds
+  committed `-wal` sidecar frames into the read view, walks table b-trees
+  (rowid + `WITHOUT ROWID`), reassembles overflow chains with fileformat2's
+  exact local-length formulas, and decodes records (serial types 0–9,
+  12+) into engine values.
+- **Writer** (`src/storage/sqlitefmt/writer.rs`): bulk-builds dense
+  b-trees bottom-up with SQLite's own separator invariants (rowid bounds
+  copied up for table trees, real entries pushed up for index trees —
+  verified empirically against 3.46/3.53 files), writes overflow chains
+  with the exact `K = M + (P−M) % (U−4)` split, `sqlite_autoindex_*`
+  rows with NULL sql, `sqlite_sequence`, views, triggers, and header
+  counters. Commits are atomic: temp file + fsync + rename.
+
+Opening a SQLite file decodes it into the engine's in-memory state (every
+SQL feature — planner, parallel scans, the C ABI, the sqlx driver — works
+unchanged at native speed), and each commit boundary rewrites the file in
+SQLite's format, so the file stays a genuine SQLite database at all times.
+
+### Usage
+
+```rust
+// Open a SQLite file (auto-detected by magic):
+let mut db = Database::open("created_by_sqlite3.db")?;
+let rows = db.query("SELECT * FROM t", ())?;
+db.execute("INSERT INTO t VALUES (…)", ())?;        // file stays SQLite format
+
+// Create a NEW file in SQLite's format (readable by the sqlite3 CLI):
+let mut db = Database::open_sqlite_format("new.db")?;
+db.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)", ())?;
+```
+
+```sh
+# CLI: same two forms
+rustqlite-cli data.db                  # opens SQLite or native files
+rustqlite-cli --sqlite-format new.db   # creates a SQLite-format file
+```
+
+`VACUUM INTO 'out.db'` on any database writes `out.db` as a SQLite file
+(the native→SQLite export path).
+
+### Verified by tests
+
+`tests/sqlite_interop.rs` (rusqlite = real bundled SQLite as the other
+side) covers both directions: all value types, `i64::MIN`, overflow
+payloads spanning many pages, multi-level trees (3k+ rows), `INTEGER
+PRIMARY KEY` alias storage, `TEXT PRIMARY KEY` autoindexes, unique and
+expression indexes, `AUTOINCREMENT` + `sqlite_sequence` high-water
+preservation, `user_version` / `application_id`, views, triggers,
+`WITHOUT ROWID` records, explicit transactions, ROLLBACK, dump-on-drop,
+and a live-WAL-sidecar read. Every file the engine writes is re-opened by
+SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
+(`interop`) additionally exercises the real `sqlite3` CLI against the
+`rustqlite` CLI on Linux and macOS.
+
+### Interop limitations
+
+- SQLite-format databases are single-connection (the whole image is
+  loaded on open; the file is rewritten per commit — O(file) per commit
+  boundary, not O(dirty pages)). Use the native format for hot
+  write-heavy workloads; SQLite-format mode targets interchange.
+- Index keys larger than one page (huge TEXT/`WITHOUT ROWID` PK values)
+  cannot be loaded: the engine's native index b-tree has no overflow
+  chains. Table data of any size round-trips fine.
+- Non-BINARY/NOCASE collations in index definitions fall back to binary
+  ordering in the written file.
+- `auto_vacuum` pointer-map pages are read fine but not written (output
+  is always fully dense); UTF-16-encoded files are rejected (the engine
+  is UTF-8 throughout).
 
 ## Remaining gaps vs SQLite
 

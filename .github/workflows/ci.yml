@@ -406,10 +406,45 @@ jobs:
           path: target/bench-results/
           if-no-files-found: ignore
 
+  # ------------------------------------------------- SQLite file interop
+  # Bidirectional .db-file compatibility with real SQLite: the rustqlite
+  # test suite (rusqlite as the SQLite side, both directions +
+  # integrity_check) on all three platforms, plus a CLI-level script
+  # (real sqlite3 binary) on Linux/macOS: sqlite3 creates -> engine
+  # reads+writes -> sqlite3 verifies; engine --sqlite-format creates ->
+  # sqlite3 verifies.
+  interop:
+    name: sqlite file interop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: interop-${{ matrix.os }}
+          cache-on-failure: true
+      - name: Install sqlite3 CLI (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: cargo test --test sqlite_interop
+        run: cargo test --test sqlite_interop
+      - name: CLI-level interop (sqlite3 <-> rustqlite-cli)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash tests/interop_cli.sh
+
   # ------------------------------------------------------------ aggregate OK
   ci-ok:
     name: ci-ok (all gates green)
-    needs: [fmt, clippy, test, test-windows, test-macos, test-oom, test-compat, torture, bench-gate]
+    needs: [fmt, clippy, test, test-windows, test-macos, test-oom, test-compat, torture, bench-gate, interop]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -423,4 +458,4 @@ jobs:
           echo "${{ join(needs.*.result, ',') }}"
           exit 1
       - name: All green
-        run: echo "fmt + clippy + tests + torture (3-OS, time-gated) + beat-SQLite bench gates all green on Linux, Windows and macOS."
+        run: echo "fmt + clippy + tests + torture (3-OS, time-gated) + beat-SQLite bench gates + SQLite file interop all green on Linux, Windows and macOS."

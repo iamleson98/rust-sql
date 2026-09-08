@@ -609,8 +609,15 @@ pub fn build_table(
                     autoincrement = *ai;
                     primary_key_order = *order;
                     nullable = false;
-                    // INTEGER PRIMARY KEY is a rowid alias.
-                    if affinity == Affinity::Integer {
+                    // INTEGER PRIMARY KEY is a rowid alias — but ONLY with
+                    // the exact declared type "INTEGER" (SQLite: "INT
+                    // PRIMARY KEY" is NOT an alias, fileformat2 §2.6.1)
+                    // and ONLY ascending ("INTEGER PRIMARY KEY DESC" is a
+                    // real column with an implicit autoindex).
+                    if affinity == Affinity::Integer
+                        && col.type_name.trim().eq_ignore_ascii_case("INTEGER")
+                        && *order == Order::Asc
+                    {
                         rowid_alias = Some(i);
                     }
                 }
