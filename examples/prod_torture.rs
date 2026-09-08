@@ -2095,11 +2095,18 @@ fn env_tolerance(var: &str, default: f64) -> f64 {
 
 /// True when `rq` is worse than `sq` by more than the tolerance percent
 /// (lower is better). n/a metrics never gate.
+///
+/// Absolute noise floor: shared-runner jitter at the single-digit-ms
+/// scale exceeds the 15% band (S09's blob scan flipped green/red across
+/// runs with unchanged code — the same cold-state noise class the
+/// bench_compare adaptive-warmup commit documented), so a FAIL also
+/// requires being at least 1 ms slower. Real regressions are
+/// multi-percent AND multi-millisecond; runner jitter is not.
 fn gated(rq: f64, sq: f64, tolerance_pct: f64) -> bool {
     if rq <= 0.0 || sq <= 0.0 || tolerance_pct < 0.0 {
         return false;
     }
-    rq > sq * (1.0 + tolerance_pct / 100.0)
+    rq > sq * (1.0 + tolerance_pct / 100.0) && (rq - sq) > 1.0
 }
 
 fn main() {
