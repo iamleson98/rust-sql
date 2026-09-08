@@ -382,7 +382,11 @@ fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
 fn is_table_valued_read_pragma(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "table_info" | "table_xinfo" | "index_list" | "index_info" | "index_xinfo"
+        "table_info"
+            | "table_xinfo"
+            | "index_list"
+            | "index_info"
+            | "index_xinfo"
             | "foreign_key_list"
     )
 }
