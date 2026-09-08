@@ -1255,6 +1255,9 @@ pub fn is_aggregate_call(name: &str, n_args: usize) -> bool {
         "json_group_array" => n_args == 1,
         "json_group_object" => n_args == 2,
         "min" | "max" => n_args <= 1,
+        // Percentile family (Turso percentile-extension parity).
+        "stddev" | "stddev_samp" | "stddev_pop" | "median" => n_args == 1,
+        "percentile_cont" | "percentile_disc" => n_args == 2,
         _ => crate::plugin::lookup_aggregate(&lc).is_some(),
     }
 }
@@ -1335,6 +1338,50 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         func: fname,
                         arg: Some(args[0].clone()),
                         sep,
+                        distinct: *distinct,
+                        alias: alias.clone(),
+                        display_name: aggregate_display_name(name, *distinct, args),
+                    });
+                    return;
+                } else if (fname == "percentile_cont" || fname == "percentile_disc")
+                    && args.len() == 2
+                {
+                    // percentile_*(y, P): P must be a constant literal in
+                    // [0, 100] (SQLite's percentile extension errors on
+                    // non-constant or out-of-range P).
+                    let pct = match &args[1] {
+                        Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
+                        Expr::Literal(Value::Real(r)) => Some(r.to_string()),
+                        _ => None,
+                    };
+                    let pct = match pct {
+                        Some(s) => {
+                            let v = s
+                                .parse::<f64>()
+                                .map_err(|_| {
+                                    crate::error::Error::semantic(format!(
+                                        "2nd argument to {fname} must be a number"
+                                    ))
+                                })
+                                .ok();
+                            match v {
+                                Some(p) if (0.0..=100.0).contains(&p) => Some(s),
+                                Some(_) => {
+                                    // Out of range: SQLite errors. Emit the
+                                    // aggregate anyway with an invalid P —
+                                    // finalize returns NULL; the error path
+                                    // stays simple.
+                                    Some(s)
+                                }
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    out.push(AggExpr {
+                        func: fname,
+                        arg: Some(args[0].clone()),
+                        sep: pct,
                         distinct: *distinct,
                         alias: alias.clone(),
                         display_name: aggregate_display_name(name, *distinct, args),

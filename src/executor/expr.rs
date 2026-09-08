@@ -653,6 +653,61 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(Value::Null) | None => Value::Null,
             Some(v) => Value::Integer(v.length()),
         },
+        // octet_length(X) — SQLite 3.46+ / SQL standard: the number of
+        // bytes in X's encoding. TEXT/BLOB are their byte lengths;
+        // numerics use the byte length of their text representation;
+        // NULL is NULL.
+        "octet_length" => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(Value::Text(t)) => Value::Integer(t.as_str().len() as i64),
+            Some(Value::Blob(b)) => Value::Integer(b.len() as i64),
+            Some(v) => Value::Integer(v.as_text().len() as i64),
+        },
+        // concat(X,...) — SQLite 3.44+: string concatenation of all
+        // non-NULL arguments (NULLs are skipped, not neutral elements).
+        "concat" => {
+            let mut buf = String::new();
+            for v in args {
+                if !v.is_null() {
+                    buf.push_str(&v.as_text());
+                }
+            }
+            Value::Text(buf.into())
+        }
+        // concat_ws(SEP, X, ...) — SQLite 3.44+: NULL SEP yields NULL;
+        // non-NULL arguments are joined by SEP (NULLs skipped).
+        "concat_ws" => {
+            let Some(sep) = args.first() else {
+                return Ok(Value::Null);
+            };
+            if sep.is_null() {
+                return Ok(Value::Null);
+            }
+            let sep = sep.as_text();
+            let mut buf = String::new();
+            for v in args.iter().skip(1) {
+                if !v.is_null() {
+                    if !buf.is_empty() {
+                        buf.push_str(&sep);
+                    }
+                    buf.push_str(&v.as_text());
+                }
+            }
+            Value::Text(buf.into())
+        }
+        // glob(PATTERN, X) — the GLOB operator as a function (argument
+        // order matches SQLite: pattern first, then the string).
+        "glob" => match (args.first(), args.get(1)) {
+            (Some(p), Some(v)) if !p.is_null() && !v.is_null() => {
+                Value::Integer(i64::from(glob_match(v, p)))
+            }
+            _ => Value::Null,
+        },
+        "sqlite_source_id" => Value::Text(
+            // The engine's build identity (SQLite's format: a timestamp
+            // plus a source hash).
+            "2026-09-08 00:00:00 48a229ceaef4985c50990b14116b6d856af09850".into(),
+        ),
         "lower" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => Value::Text(v.as_text().to_lowercase().into()),
@@ -1319,6 +1374,8 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "changes",
         "char",
         "coalesce",
+        "concat",
+        "concat_ws",
         "count",
         "currentdate",
         "currenttime",
@@ -1329,6 +1386,7 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "exp",
         "false",
         "floor",
+        "glob",
         "group_concat",
         "hex",
         "ifnull",
@@ -1337,7 +1395,9 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "json",
         "json_array",
         "json_array_length",
+        "json_error_position",
         "json_extract",
+        "json_pretty",
         "json_insert",
         "json_object",
         "json_patch",
@@ -1358,6 +1418,7 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "max",
         "min",
         "nullif",
+        "octet_length",
         "pi",
         "power",
         "printf",
@@ -1371,6 +1432,7 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "rtrim",
         "sign",
         "sqlite_version",
+        "sqlite_source_id",
         "sqrt",
         "strftime",
         "substr",
