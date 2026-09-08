@@ -4279,6 +4279,13 @@ struct AggCold {
     distinct: Option<std::collections::HashSet<SqlValueKey>>,
     concat: Option<String>,
     concat_sep: Option<String>,
+    /// Collected numeric values for the percentile family (median /
+    /// percentile_cont / percentile_disc / stddev). Materialized only
+    /// when one of those aggregates actually fires.
+    nums: Option<Vec<f64>>,
+    /// The constant percentile P (0..=100), parsed once from the
+    /// literal the planner threaded through the separator channel.
+    pct: Option<f64>,
 }
 
 impl AggState {
@@ -4357,6 +4364,16 @@ enum AggFunc {
     GroupConcat,
     JsonGroupArray,
     JsonGroupObject,
+    /// stddev / stddev_samp (sample) — Turso percentile-extension parity.
+    Stddev,
+    /// stddev_pop (population).
+    StddevPop,
+    /// median — Turso percentile-extension parity.
+    Median,
+    /// percentile_cont(Y, P) — linear interpolation.
+    PercentileCont,
+    /// percentile_disc(Y, P) — first value at/above the percentile.
+    PercentileDisc,
     Other,
 }
 
@@ -4372,6 +4389,11 @@ impl AggFunc {
             "group_concat" | "string_agg" => AggFunc::GroupConcat,
             "json_group_array" => AggFunc::JsonGroupArray,
             "json_group_object" => AggFunc::JsonGroupObject,
+            "stddev" | "stddev_samp" => AggFunc::Stddev,
+            "stddev_pop" => AggFunc::StddevPop,
+            "median" => AggFunc::Median,
+            "percentile_cont" => AggFunc::PercentileCont,
+            "percentile_disc" => AggFunc::PercentileDisc,
             _ => AggFunc::Other,
         }
     }
@@ -7597,8 +7619,64 @@ fn update_agg_state(
             }
             buf.push_str(&v.as_text());
         }
+        // Percentile family (Turso percentile-extension parity): collect
+        // numeric non-NULL inputs; NULLs are skipped (SQL aggregate
+        // semantics). The percentile P travels through the same
+        // constant-literal channel as group_concat's separator.
+        AggFunc::Stddev
+        | AggFunc::StddevPop
+        | AggFunc::Median
+        | AggFunc::PercentileCont
+        | AggFunc::PercentileDisc => {
+            if !v.is_null() {
+                let c = state.cold_mut();
+                if c.pct.is_none() {
+                    if let Some(s) = sep {
+                        c.pct = s.trim().parse::<f64>().ok();
+                    }
+                }
+                c.nums.get_or_insert_with(Vec::new).push(v.as_real());
+            }
+        }
         _ => {}
     }
+}
+
+/// Compute a percentile over the collected values.
+/// `cont`: linear interpolation (percentile_cont); otherwise the first
+/// value whose cumulative position is at or above P (percentile_disc).
+fn percentile_of(nums: &mut [f64], pct: f64, cont: bool) -> Option<f64> {
+    if nums.is_empty() || !(0.0..=100.0).contains(&pct) || nums.iter().any(|v| v.is_nan()) {
+        return None;
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = nums.len();
+    let k = (n - 1) as f64 * pct / 100.0;
+    let idx = if cont {
+        k.floor() as usize
+    } else {
+        // disc: the smallest index with cumulative share >= P.
+        k.ceil() as usize
+    };
+    let idx = idx.min(n - 1);
+    Some(if cont && idx + 1 < n {
+        let frac = k - k.floor();
+        nums[idx] * (1.0 - frac) + nums[idx + 1] * frac
+    } else {
+        nums[idx]
+    })
+}
+
+/// Sample / population standard deviation over the collected values.
+fn stddev_of(nums: &[f64], sample: bool) -> Option<f64> {
+    let n = nums.len();
+    if n == 0 || (sample && n < 2) {
+        return None;
+    }
+    let mean = nums.iter().sum::<f64>() / n as f64;
+    let denom = (n - usize::from(sample)) as f64;
+    let var = nums.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / denom;
+    Some(var.sqrt())
 }
 
 fn finalize_agg(state: &AggState, func: &str) -> Value {
@@ -7661,6 +7739,43 @@ fn finalize_agg(state: &AggState, func: &str) -> Value {
             )
             .into(),
         ),
+        "stddev" | "stddev_samp" => {
+            let nums = state
+                .cold()
+                .and_then(|c| c.nums.clone())
+                .unwrap_or_default();
+            stddev_of(&nums, true).map_or(Value::Null, Value::Real)
+        }
+        "stddev_pop" => {
+            let nums = state
+                .cold()
+                .and_then(|c| c.nums.clone())
+                .unwrap_or_default();
+            stddev_of(&nums, false).map_or(Value::Null, Value::Real)
+        }
+        "median" => {
+            let mut nums = state
+                .cold()
+                .and_then(|c| c.nums.clone())
+                .unwrap_or_default();
+            percentile_of(&mut nums, 50.0, true).map_or(Value::Null, Value::Real)
+        }
+        "percentile_cont" => {
+            let mut nums = state
+                .cold()
+                .and_then(|c| c.nums.clone())
+                .unwrap_or_default();
+            let pct = state.cold().and_then(|c| c.pct).unwrap_or(f64::NAN);
+            percentile_of(&mut nums, pct, true).map_or(Value::Null, Value::Real)
+        }
+        "percentile_disc" => {
+            let mut nums = state
+                .cold()
+                .and_then(|c| c.nums.clone())
+                .unwrap_or_default();
+            let pct = state.cold().and_then(|c| c.pct).unwrap_or(f64::NAN);
+            percentile_of(&mut nums, pct, false).map_or(Value::Null, Value::Real)
+        }
         _ => Value::Null,
     }
 }

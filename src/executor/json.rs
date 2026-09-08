@@ -268,6 +268,23 @@ pub fn parse_json(s: &str) -> Option<Json> {
     }
 }
 
+/// Parse a JSON document, reporting the 1-based BYTE position of the
+/// first syntax error on failure (SQLite 3.47+ `json_error_position`
+/// semantics: 0 when valid, the error offset otherwise).
+fn parse_json_with_error_position(s: &str) -> Result<Json, usize> {
+    let mut p = JsonParser::new(s);
+    let v = match p.parse_value() {
+        Some(v) => v,
+        None => return Err(p.pos + 1),
+    };
+    p.skip_ws();
+    if p.pos == p.b.len() {
+        Ok(v)
+    } else {
+        Err(p.pos + 1)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serializer (minified, SQLite-compatible)
 // ---------------------------------------------------------------------------
@@ -276,6 +293,49 @@ pub fn json_to_string(j: &Json) -> String {
     let mut out = String::new();
     write_json(j, &mut out);
     out
+}
+
+/// json_pretty(json) — SQLite 3.46+: two-space indentation, one member
+/// per line, `": "` after object keys.
+fn write_json_pretty(j: &Json, out: &mut String, indent: usize) {
+    let pad = |out: &mut String, n: usize| {
+        for _ in 0..n {
+            out.push_str("  ");
+        }
+    };
+    match j {
+        Json::Array(items) if !items.is_empty() => {
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                pad(out, indent + 1);
+                write_json_pretty(item, out, indent + 1);
+            }
+            out.push('\n');
+            pad(out, indent);
+            out.push(']');
+        }
+        Json::Object(members) if !members.is_empty() => {
+            out.push_str("{\n");
+            for (i, (k, v)) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                pad(out, indent + 1);
+                write_json_string(k, out);
+                out.push_str(": ");
+                write_json_pretty(v, out, indent + 1);
+            }
+            out.push('\n');
+            pad(out, indent);
+            out.push('}');
+        }
+        Json::Array(_) => out.push_str("[]"),
+        Json::Object(_) => out.push_str("{}"),
+        other => write_json(other, out),
+    }
 }
 
 fn write_json(j: &Json, out: &mut String) {
@@ -657,6 +717,24 @@ fn json_patch_target(target: &Json, patch: &Json) -> Json {
 /// Returns None when `fname` isn't a JSON function (caller falls through).
 pub fn call_json_function(fname: &str, args: &[Value]) -> Option<Value> {
     match fname {
+        "json_pretty" => Some(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => match parse_json(&v.as_text()) {
+                Some(j) => {
+                    let mut out = String::new();
+                    write_json_pretty(&j, &mut out, 0);
+                    Value::Text(out.into())
+                }
+                None => Value::Null,
+            },
+        }),
+        "json_error_position" => Some(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => match parse_json_with_error_position(&v.as_text()) {
+                Ok(_) => Value::Integer(0),
+                Err(pos) => Value::Integer(pos as i64),
+            },
+        }),
         "json_valid" => Some(match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
