@@ -206,10 +206,31 @@ fn rename_column_errors() {
     assert!(db
         .execute("ALTER TABLE t RENAME COLUMN a TO b", [])
         .is_err());
-    // Rowid alias.
-    assert!(db
-        .execute("ALTER TABLE t RENAME COLUMN id TO key", [])
-        .is_err());
+}
+
+#[test]
+fn rename_rowid_alias_to_fallback_keyword_name() {
+    // `RENAME COLUMN id TO key` is LEGAL in SQLite (verified against
+    // 3.4x): `key` is a %fallback-ID keyword, usable unquoted as a
+    // column name, and the renamed column keeps its rowid-alias role.
+    // (This used to error only because the parser rejected keyword
+    // column names — see the %fallback-ID rule in parse_ident.)
+    let mut db = memdb();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN id TO key", []).unwrap();
+    db.execute("INSERT INTO t (key, a) VALUES (5, 1)", []).unwrap();
+    let rows = db.query("SELECT key, rowid, a FROM t", []).unwrap();
+    assert_eq!(rows[0][0], rustqlite::Value::Integer(5));
+    assert_eq!(
+        rows[0][1],
+        rustqlite::Value::Integer(5),
+        "renamed column keeps the rowid alias"
+    );
+    assert_eq!(rows[0][2], rustqlite::Value::Integer(1));
 }
 
 #[test]

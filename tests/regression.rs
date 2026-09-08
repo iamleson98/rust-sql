@@ -1166,3 +1166,239 @@ fn regression_schema_split_survives_reopen() {
     assert_eq!(n[0][0], rustqlite::Value::Integer(351));
     let _ = std::fs::remove_file(&path);
 }
+
+// ===========================================================================
+// UPDATE via index point probe on a table WITHOUT an INTEGER PRIMARY KEY
+// rowid alias. sqlx 0.9's migrator runs `UPDATE _sqlx_migrations SET
+// execution_time = ?1 WHERE version = ?2`; `_sqlx_migrations` is declared
+// `version BIGINT PRIMARY KEY` (NOT a rowid alias), so the statement plans
+// as an IndexLookup on the PK autoindex. try_streaming_update only handled
+// Scan / Filter / RowidRange / RowidLookup / IndexRange sources — the
+// IndexLookup / IndexIn shapes fell to the general UPDATE path, which
+// requires a rowid alias and errored with "unsupported: UPDATE on a table
+// without INTEGER PRIMARY KEY". Fixed by the IndexPoint source (exact
+// index probes — mirrors try_streaming_delete's index_point_keys).
+// ===========================================================================
+
+#[test]
+fn regression_update_by_non_alias_pk_point_lookup() {
+    let mut db = Database::open_in_memory().unwrap();
+    // sqlx's exact `_sqlx_migrations` shape.
+    db.execute(
+        "CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (20260901000001, 'create_users', TRUE, x'010203', -1)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (20260901000002, 'add_notes', TRUE, x'040506', -1)",
+        [],
+    )
+    .unwrap();
+
+    // The bookkeeping UPDATE that used to fail.
+    db.execute(
+        "UPDATE _sqlx_migrations SET execution_time = ?1 WHERE version = ?2",
+        [Value::Integer(12345), Value::Integer(20260901000001)],
+    )
+    .unwrap();
+    let rows = db
+        .query(
+            "SELECT version, execution_time FROM _sqlx_migrations ORDER BY version",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(20260901000001));
+    assert_eq!(rows[0][1], Value::Integer(12345), "target row updated");
+    assert_eq!(rows[1][1], Value::Integer(-1), "other row untouched");
+
+    // Matching-zero update is fine too.
+    db.execute(
+        "UPDATE _sqlx_migrations SET execution_time = 1 WHERE version = 999",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn regression_update_by_indexed_col_in_list() {
+    let mut db = Database::open_in_memory().unwrap();
+    // No INTEGER PRIMARY KEY: plain rowid table with a secondary index.
+    db.execute("CREATE TABLE t (k TEXT, v INT)", []).unwrap();
+    db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
+    db.execute(
+        "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3), ('b', 22)",
+        [],
+    )
+    .unwrap();
+
+    // UPDATE ... WHERE indexed_col IN (...): IndexIn point probes.
+    db.execute("UPDATE t SET v = v * 10 WHERE k IN ('a', 'b')", []).unwrap();
+    let rows = db.query("SELECT v FROM t ORDER BY v", []).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(3)],
+            vec![Value::Integer(10)],
+            vec![Value::Integer(20)],
+            vec![Value::Integer(220)],
+        ]
+    );
+
+    // Index maintenance follows the point-probe update (index key changed
+    // by the SET? k untouched here — also verify a SET on the indexed
+    // column itself moves the entry).
+    db.execute("UPDATE t SET k = 'z' WHERE k = 'c'", []).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM t WHERE k = 'z'", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(1), "index entry moved with the SET");
+    let n = db.query("SELECT COUNT(*) FROM t WHERE k = 'c'", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(0), "old index entry gone");
+
+    // Duplicate IN members and NULL members behave (dedup, no match).
+    db.execute("UPDATE t SET v = 0 WHERE k IN ('z', 'z', NULL)", []).unwrap();
+    let rows = db.query("SELECT v FROM t WHERE k = 'z'", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(0));
+}
+
+// ===========================================================================
+// DELETE via IN-list point probes on an indexed column: the accumulate
+// loop called lookup_index_into(key, &mut rowids) per key, but that
+// function CLEARS its out buffer on every call — only the LAST key's
+// matches survived (`DELETE FROM t WHERE k IN ('a','b')` deleted just the
+// 'b' rows, leaving 'a' behind). Found while adding the IndexPoint source
+// to try_streaming_update (same accumulator pattern). Fixed by probing
+// into a per-key scratch buffer and extending.
+// ===========================================================================
+
+#[test]
+fn regression_delete_by_indexed_col_in_list_keeps_all_keys() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (k TEXT, v INT)", []).unwrap();
+    db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
+    db.execute(
+        "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3), ('b', 22)",
+        [],
+    )
+    .unwrap();
+
+    db.execute("DELETE FROM t WHERE k IN ('a', 'b')", []).unwrap();
+    let rows = db.query("SELECT k, v FROM t", []).unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::Text("c".into()), Value::Integer(3)]],
+        "both 'a' and both 'b' rows deleted — every IN member applies"
+    );
+
+    // Three-member list with duplicates, deleting everything.
+    db.execute("INSERT INTO t VALUES ('x', 9), ('y', 8)", []).unwrap();
+    db.execute("DELETE FROM t WHERE k IN ('x', 'y', 'x')", []).unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(1));
+}
+
+// ===========================================================================
+// Streaming UPDATE phase 2: the per-row deferred loop never refreshed the
+// local `root` after `insert_table` split the tree. The ctx root was
+// updated, but the NEXT iteration built its Btree on the stale (now
+// interior-node) page — inserts landed in a stale subtree, duplicating
+// rows and leaving cells out of order ("rowid N out of order in table…",
+// totals drifting +N; silent row LOSS on shrink-heavy shapes). Latent in
+// every journal mode once a size-changing UPDATE grew the tree past a
+// split (~250+ rows on 4 KiB pages) — exposed by routing IndexLookup
+// UPDATEs through the streaming path.
+// ===========================================================================
+
+#[test]
+fn regression_streaming_update_root_split_keeps_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("reg-update-split.db");
+
+    let mut db = Database::open(&path).unwrap();
+    db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)", [])
+        .unwrap();
+    db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=300i64 {
+        db.execute(
+            "INSERT INTO t (k, v) VALUES (?, ?)",
+            [Value::Integer(i % 10), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    // Size-changing UPDATE via the scan path: 'v123' (4 B) -> 'upd' (3 B)
+    // forces the deferred delete+insert loop; ~100 deferred rows grow the
+    // tree 2 pages -> 4 pages (root split mid-loop).
+    db.execute("UPDATE t SET v = 'upd' WHERE v LIKE 'v1%'", []).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(300), "no rows lost or duplicated");
+    let n = db.query("SELECT COUNT(*) FROM t WHERE v = 'upd'", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(111), "all matching rows updated");
+
+    let ic = db.query("PRAGMA integrity_check", []).unwrap();
+    for row in &ic {
+        assert!(
+            row[0].as_text().contains("ok"),
+            "integrity: {:?}",
+            row[0].as_text()
+        );
+    }
+    drop(db);
+
+    // The file must reopen intact (the stale-root writes used to corrupt
+    // the persisted view too).
+    let db = Database::open(&path).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(300), "reopen keeps every row");
+    let n = db.query("SELECT COUNT(*) FROM t WHERE k = 3", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(30), "index intact after reopen");
+}
+
+#[test]
+fn regression_streaming_update_deferred_mask_index_order() {
+    // done_mask translation: `deferred` positions index the SORTED update
+    // list, done_mask indexes `updates`. With updates collected in INDEX
+    // order (IndexRange / IndexPoint sources), order != identity — the
+    // untranslated positions marked the wrong rows, double-patching some
+    // and skipping others.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)", [])
+        .unwrap();
+    db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=300i64 {
+        db.execute(
+            "INSERT INTO t (k, v) VALUES (?, ?)",
+            [Value::Integer(i % 10), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    // IndexRange source: rows arrive in k order (NOT rowid order). k>5
+    // matches k in {6,7,8,9} = 120 of the 300 rows.
+    db.execute("UPDATE t SET v = 'upd' WHERE k > 5", []).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(300));
+    let n = db.query("SELECT COUNT(*) FROM t WHERE v = 'upd'", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(120), "k>5 -> 120 rows (k in 6..=9) updated once each");
+    let ic = db.query("PRAGMA integrity_check", []).unwrap();
+    for row in &ic {
+        assert!(row[0].as_text().contains("ok"), "integrity: {:?}", row[0].as_text());
+    }
+}

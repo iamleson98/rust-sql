@@ -572,6 +572,71 @@ fn abi_cross_connection_shared_file() {
 }
 
 #[test]
+fn abi_relative_path_fresh_db_single_engine() {
+    // Regression (sqlx pool + FRESH database, relative path — the
+    // sea-orm-migration failure): the engine-map key used to be
+    // `canonicalize(path)` with a fallback to the RAW path, which only
+    // applies while the file does not exist. The first open of
+    // "rel.db" keyed its engine as "rel.db"; that open CREATES the file
+    // on disk, so the pool's second connection canonicalized to
+    // "/abs/rel.db", missed the map, and built a second engine whose
+    // catalog predated the first engine's DDL. CREATE TABLE on
+    // connection A followed by CREATE INDEX on connection B then
+    // failed with "not found: table: …". The key is now the canonical
+    // parent directory + file name — independent of file existence.
+    let rel = format!("compat-rel-{}.db", std::process::id());
+    let _ = std::fs::remove_file(&rel);
+    let cpath = CString::new(rel.clone()).unwrap();
+
+    let mut a: *mut compat::sqlite3 = ptr::null_mut();
+    let mut b: *mut compat::sqlite3 = ptr::null_mut();
+    let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    unsafe {
+        assert_eq!(
+            sqlite3_open_v2(cpath.as_ptr(), &mut a, flags, ptr::null()),
+            SQLITE_OK
+        );
+        // B opens AFTER the first open created the file on disk — the
+        // exact pool timeline that used to split the engines.
+        assert_eq!(
+            sqlite3_open_v2(cpath.as_ptr(), &mut b, flags, ptr::null()),
+            SQLITE_OK
+        );
+    }
+    let (a, b) = (Db(a), Db(b));
+
+    // The exact failing sequence from the migration log: DDL through A,
+    // then DDL through B (a pooled statement may land on either).
+    exec(&a, "CREATE TABLE \"user\" (id INTEGER PRIMARY KEY, status TEXT)");
+    exec(&b, "CREATE INDEX \"User_status_idx\" ON \"user\" (\"status\")");
+    exec(&a, "INSERT INTO \"user\" VALUES (1, 'active')");
+    let (mut q, _) = prepare(&b, "SELECT COUNT(*) FROM \"user\"");
+    let rows = step_all_text(&mut q);
+    assert_eq!(
+        rows[0][0], "1",
+        "committed DDL + rows visible across connections on a fresh database"
+    );
+
+    // "./<name>" and "<name>" must resolve to the SAME engine: the key
+    // unifies them through the canonicalized parent directory.
+    let dotted = format!("./{rel}");
+    let cdotted = CString::new(dotted).unwrap();
+    let mut c: *mut compat::sqlite3 = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            sqlite3_open_v2(cdotted.as_ptr(), &mut c, flags, ptr::null()),
+            SQLITE_OK
+        );
+    }
+    let c = Db(c);
+    let (mut q, _) = prepare(&c, "SELECT COUNT(*) FROM \"user\"");
+    let rows = step_all_text(&mut q);
+    assert_eq!(rows[0][0], "1", "\"./name\" shares the engine with \"name\"");
+
+    let _ = std::fs::remove_file(&rel);
+}
+
+#[test]
 fn abi_transaction_conflict_yields_busy_then_succeeds() {
     // Connection B's BEGIN while A holds the engine tx -> BUSY; after A
     // commits, B's BEGIN succeeds (busy_timeout retry).
