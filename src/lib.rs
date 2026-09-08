@@ -116,10 +116,87 @@ fn tune_mimalloc() {
 #[cfg(not(feature = "mimalloc"))]
 fn tune_mimalloc() {}
 
-/// Engine one-time init: allocator tuning. Called from every `Database`
-/// constructor before any page is touched.
+/// Disable transparent huge pages for this process (Linux).
+///
+/// On `THP=always` kernels every page fault inside an aligned region —
+/// mimalloc's 64 MiB arena reservations included — materializes a 2 MiB
+/// huge page: a touched 4 KiB allocation page costs 2 MiB of RSS, so
+/// small workloads measure 2-4x their live set. mimalloc's own
+/// `allow_thp=0` path prctl's exactly this, but only at mimalloc INIT —
+/// which happens on the first Rust-runtime allocation, long before any
+/// engine code can set the option. Doing the prctl here covers every
+/// page fault after the first `Database` constructor (the runtime's
+/// pre-open footprint is a few hundred KiB and already materialized).
+///
+/// Per-process (never system-wide), matching what mimalloc itself would
+/// do with `MIMALLOC_ALLOW_THP=0` in the environment at exec time.
+#[cfg(target_os = "linux")]
+fn disable_thp_for_process() {
+    use std::sync::Once;
+    static DONE: Once = Once::new();
+    DONE.call_once(thp_prctl);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_thp_for_process() {}
+
+/// The raw prctl (idempotent).
+///
+/// Early execution matters: mimalloc initializes on the first allocation
+/// — before `main` — so the option-based path inside mimalloc can never
+/// see our `allow_thp=0`. An `.init_array` constructor runs before the
+/// Rust runtime's own allocations, covering the entire process.
+/// `RSQL_ALLOW_THP=1` in the environment opts out (huge-page-friendly
+/// throughput builds, `madvise`-configured kernels where THP only
+/// applies to explicitly madvised regions, or profiling setups).
+#[cfg(target_os = "linux")]
+fn thp_prctl() {
+    unsafe {
+        extern "C" {
+            fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
+        }
+        // PR_SET_THP_DISABLE = 41 (linux/prctl.h). Fails harmlessly on
+        // kernels without THP support; the return value is advisory.
+        prctl(41, 1, 0, 0, 0);
+    }
+}
+
+/// C-constructor: run the THP prctl before the Rust runtime allocates.
+#[cfg(target_os = "linux")]
+#[used]
+#[link_section = ".init_array"]
+static THP_DISABLE_CTOR: extern "C" fn() = thp_ctor;
+
+#[cfg(target_os = "linux")]
+extern "C" fn thp_ctor() {
+    // `RSQL_ALLOW_THP=1` (any non-empty value) opts out: huge-page
+    // throughput builds, `madvise`-configured kernels where THP only
+    // applies to explicitly madvised regions, or profiling setups.
+    // getenv in a ctor is safe and allocation-free; a ctor allocation
+    // would itself be THP-backed — the exact thing being avoided.
+    unsafe {
+        extern "C" {
+            fn getenv(name: *const u8) -> *const u8;
+        }
+        let v = getenv(b"RSQL_ALLOW_THP\0".as_ptr());
+        if !v.is_null() {
+            let mut len = 0usize;
+            while *v.add(len) != 0 {
+                len += 1;
+            }
+            if len > 0 {
+                return;
+            }
+        }
+    }
+    thp_prctl();
+}
+
+/// Engine one-time init: allocator + process memory-policy tuning.
+/// Called from every `Database` constructor before any page is touched.
 fn engine_init() {
     tune_mimalloc();
+    disable_thp_for_process();
 }
 
 pub mod error;

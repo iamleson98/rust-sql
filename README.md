@@ -410,45 +410,54 @@ for 1.5–2.1x write throughput (opt-out: `default-features = false`); the
 rest of the binary delta is the feature surface (plugins, sqlx driver,
 parallel executor) that SQLite ships as separate extensions.
 
-### Production torture matrix (memory columns, 2026-09-07 pass)
+### Production torture matrix (memory columns, 2026-09-08 pass)
 
-The 18-section torture matrix (`cargo run --release --example prod_torture`,
-one isolated child process per engine per section, peak RSS measured via
-VmHWM / mach / Win32) after the bounded-memory pass:
+The 18-section torture matrix (`cargo run --release --example
+prod_torture`, one isolated child process per engine per section, peak
+RSS measured via VmHWM / mach / Win32, best-of-2 per section). The
+2026-09-08 pass adds the process-wide THP disable (see below) — on
+`THP=always` kernels it cut 30-50% off every memory column while every
+time column stayed a win:
 
 | Section (scale 1.0)                 | rustqlite | SQLite | Mem verdict |
 |-------------------------------------|-----------|--------|-------------|
-| S01 bulk load 1M (txn)              | 35 MB     | 35 MB  | TIE (0.99x) |
-| S02 full scan + aggregates 1M       | 36 MB     | 35 MB  | TIE (0.98x) |
-| S04 top-N ORDER BY 1M               | 36 MB     | 35 MB  | TIE (0.98x) |
-| S05 point lookups 20k @1M           | 36 MB     | 35 MB  | TIE (0.98x) |
+| S01 bulk load 1M (txn)              | 36 MB     | 35 MB  | TIE (0.99x) |
+| S02 full scan + aggregates 1M       | 36 MB     | 35 MB  | TIE (0.96x) |
+| S04 top-N ORDER BY 1M               | 36 MB     | 35 MB  | TIE (0.97x) |
+| S05 point lookups 20k @1M           | 36 MB     | 35 MB  | TIE (0.97x) |
 | S06 range 100k rows materialized    | 36 MB     | 35 MB  | TIE (0.97x) |
-| S08 wide rows 2KB × 25k             | 56 MB     | 57 MB  | TIE         |
-| S09 blobs 64KB × 1k                 | 72 MB     | 73 MB  | TIE         |
-| S10 LIKE scan 100k                  | 8 MB      | 8 MB   | TIE         |
-| S15 rollback 500k txn               | 20 MB     | 20 MB  | TIE (0.98x) |
-| S03 GROUP BY 100k buckets           | 57 MB     | 37 MB  | 0.65x — see the gap ledger |
+| S08 wide rows 2KB × 25k             | 57 MB     | 57 MB  | TIE (1.02x) |
+| S09 blobs 64KB × 1k                 | 72 MB     | 73 MB  | TIE (1.01x) |
+| S15 rollback 500k txn               | 21 MB     | 20 MB  | TIE (0.97x) |
 | S07 random inserts 300k             | 16 MB     | 14 MB  | 0.87x       |
-| S11 IN-list 5000 literals           | 12 MB     | 9 MB   | 0.77x       |
-| S12 5-index load                    | 19 MB     | 16 MB  | 0.87x       |
-| S13 sustained 2M ops (leak probe)   | 7 MB      | 5 MB   | 0.74x (no leak: 6→7 MB flat) |
+| S10 LIKE scan 100k                  | 9 MB      | 8 MB   | 0.93x       |
+| S11 IN-list 5000 literals           | 12 MB     | 10 MB  | 0.78x       |
+| S12 5-index load                    | 19 MB     | 17 MB  | 0.87x       |
+| S13 sustained 2M ops (leak probe)   | 7 MB      | 5 MB   | 0.73x (no leak: 6→7 MB flat) |
 | S14 churn + reclaim (file)          | 13 MB     | 8 MB   | 0.62x       |
-| S16 8r+2w concurrency               | 10 MB     | 8 MB   | 0.87x       |
-| S17 open 1M-row file + SUM          | 14 MB     | 7 MB   | 0.51x       |
-| S18 differential hash               | 8 MB      | 8 MB   | 0.94x       |
+| S16 8r+2w concurrency               | 10 MB     | 8 MB   | 0.86x       |
+| S17 open 1M-row file + SUM          | 14 MB     | 7 MB   | 0.50x       |
+| S18 differential hash               | 9 MB      | 8 MB   | 0.93x       |
+| S03 GROUP BY 100k buckets           | 57 MB     | 37 MB  | 0.65x — see the gap ledger |
 
-The 2026-09-07 memory pass closed the worst gaps: S17 72→14 MB and S14
-44→13 MB (bounded WAL checkpoint: the run buffer no longer materializes
-the whole committed WAL, and the checkpoint no longer clones the entire
-page cache up front), S03 96→57 MB (40 B aggregate states with the cold
-half boxed behind one pointer, 8 B hash slots, flat single-key storage, a
-result-identical fused Project-over-Aggregate, and the statement-level
-GROUP BY streaming driver that finalizes groups in 64-row batches from
-the owned grouper), and per-burst allocator drains (write bursts, read
-bursts over 4096 cache misses, and 8 KB+ SQL texts) that return
-mimalloc's delayed-free pages to the OS between statements instead of
-retaining them for the process lifetime. Every time column stayed a win
-or tie throughout the pass.
+**The 2026-09-08 THP discovery**: mimalloc's `allow_thp=0` prctl path
+only runs at mimalloc init — which happens on the first Rust-runtime
+allocation, before any engine code can set the option. On
+`transparent_hugepage=always` kernels that meant every touched 4 KiB
+allocation page inside mimalloc's arena reservations materialized a
+2 MiB huge page: the same engine+workload measured 22 MB where the
+identical binary on a `madvise` kernel measured 12 MB. The engine now
+runs `prctl(PR_SET_THP_DISABLE)` from an `.init_array` constructor —
+before the runtime's first allocation — with `RSQL_ALLOW_THP=1` as the
+opt-out for huge-page-friendly throughput builds. Measured impact on a
+`THP=always` kernel: S17 28→14 MB, S13 12→7 MB, S14 24→13 MB, S11
+22→12 MB, S16 21→10 MB, and the micro-benchmark baseline 10.4→8.3 MB —
+with every time column unchanged (S02 6.07x, S16 7.12x).
+
+Earlier passes: the 2026-09-07 bounded-memory pass closed S17 72→14 MB,
+S14 44→13 MB and S03 96→57 MB (bounded WAL checkpoint, 40 B aggregate
+states, per-burst allocator drains). Every time column stayed a win or
+tie throughout.
 
 ## Concurrency vs SQLite
 
@@ -638,15 +647,17 @@ remaining deltas are elsewhere:
     That hash-hold is also what makes it **4.0x faster**; `PRAGMA parallel_scan=0`
     drops to ~0.8x memory at ~2.6x speed. Reaching SQLite's flat profile needs an
     ephemeral-B-tree spill (SQLite's own temp-store design) — the documented next unit.
-  - **S07/S12/S13/S16/S18 (~0.74–0.94x, 1–2 MB each)**: the mimalloc baseline — its
-    64 KiB-per-size-class page granularity commits ~1 MB at `Database::open` where
-    glibc packs the same allocations into ~0.4 MB. That is the documented cost of the
-    20–40% small-allocation throughput mimalloc buys (SQLite is measured against
-    glibc); `default-features = false` recovers the baseline.
-  - **S11 IN-list 5000 literals (0.77x)**: ~0.5 KB per literal of parse machinery —
-    tokens, the AST list, the plan's clone of it, and the compiled membership set —
-    retained by the statement cache. SQLite compiles literal IN lists straight into a
-    VDBE transient table without retaining three expression trees; the fix is
+  - **S07/S10/S12/S13/S16/S18 (~0.73–0.93x, 1–2 MB each)**: the mimalloc
+    baseline — its 64 KiB-per-size-class page granularity commits ~1 MB at
+    `Database::open` where glibc packs the same allocations into ~0.4 MB. That is
+    the documented cost of the 20–40% small-allocation throughput mimalloc buys
+    (SQLite is measured against glibc); `default-features = false` recovers the
+    baseline. The 2026-09-08 THP constructor already removed a 2-4x amplification
+    layer that sat on top of this on `THP=always` kernels.
+  - **S11 IN-list 5000 literals (0.78x)**: ~0.5 KB per literal of parse
+    machinery — tokens, the AST list, the plan's clone of it — retained by the
+    statement cache. SQLite compiles literal IN lists straight into a VDBE
+    transient table without retaining three expression trees; the fix is
     Arc-sharing the predicate between AST and plan.
 
 ## Usage
