@@ -23,6 +23,29 @@ use rustqlite::{Database, Value};
 use std::env;
 use std::io::{self, BufRead, Write};
 
+/// Stdout wrapper that treats EPIPE as success: a reader leaving early
+/// (`cli ... | grep -q ...`) must make the process exit cleanly instead
+/// of panicking on the write unwrap — `set -o pipefail` pipelines depend
+/// on it (SQLite's own CLI exits quietly on SIGPIPE).
+struct PipeTolerant<W: std::io::Write>(W);
+
+impl<W: std::io::Write> std::io::Write for PipeTolerant<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.write(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+            Err(e) => Err(e),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.flush() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let sqlite_format = args.iter().any(|a| a == "--sqlite-format");
@@ -64,7 +87,7 @@ fn main() {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = PipeTolerant(stdout.lock());
     let mut buffer = String::new();
     let mut mode = OutputMode::Table;
 
