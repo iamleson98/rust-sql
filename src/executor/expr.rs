@@ -594,7 +594,7 @@ fn evaluate_in(
         InSource::List(list) => {
             let mut found = false;
             let mut list_has_null = false;
-            for e in list {
+            for e in list.iter() {
                 let candidate = evaluate(e, ctx)?;
                 if candidate.is_null() {
                     list_has_null = true;

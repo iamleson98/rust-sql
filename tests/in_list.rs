@@ -106,3 +106,51 @@ fn in_list_semantics_and_planning() {
 
     println!("IN-list semantics: all assertions passed");
 }
+
+/// The torture-S11 shape: a 5000-literal IN list through the statement
+/// cache — with the Arc-shared list, re-executions must stay correct
+/// (the plan's list and the AST's are ONE object now).
+#[test]
+fn big_in_list_5000_literals() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+        .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=100_000i64 {
+        db.execute(
+            &format!("INSERT INTO t (val) VALUES ({})", (i * 37) % 100_000),
+            [],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    // 4000 present + 1000 absent values.
+    let list: Vec<String> = (0..5000)
+        .map(|i| {
+            if i % 5 == 0 {
+                format!("{}", 1_000_000 + i) // absent
+            } else {
+                format!("{}", (i * 91) % 100_000) // present
+            }
+        })
+        .collect();
+    let sql = format!("SELECT COUNT(*) FROM t WHERE val IN ({})", list.join(", "));
+    let expected: i64 = (0..5000)
+        .filter(|i| i % 5 != 0)
+        .map(|i| (i * 91) % 100_000)
+        .collect::<std::collections::HashSet<i64>>()
+        .len() as i64;
+
+    // Same SQL text 10x: the cache holds ONE plan (Arc-shared list) and
+    // every execution must produce the identical count.
+    let mut counts = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let rows = db.query(&sql, []).unwrap();
+        counts.push(rows[0][0].clone());
+    }
+    assert!(
+        counts.iter().all(|c| *c == Value::Integer(expected)),
+        "5000-literal IN list count drifted: expected {expected}, got {counts:?}"
+    );
+}

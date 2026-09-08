@@ -346,7 +346,7 @@ pub(crate) fn compiled_columns(p: &CompiledPredicate, out: &mut Vec<usize>) {
         }
         CompiledPredicate::InList { col, vals, .. } => {
             out.push(*col);
-            for v in vals {
+            for v in vals.iter() {
                 operand_columns(v, out);
             }
         }
@@ -989,7 +989,7 @@ pub(crate) fn compile_predicate(
             }
             let col = table.find_column(name)?;
             let mut bound = Vec::with_capacity(vals.len());
-            for v in vals {
+            for v in vals.iter() {
                 bound.push(bind_leaf(v, table, prefix)?);
             }
             // All-integer-literal members: prebuilt membership set (the

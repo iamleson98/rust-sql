@@ -12,6 +12,7 @@ pub mod page;
 pub mod pager;
 pub mod row_codec;
 pub mod sqlitefmt;
+pub mod tempstore;
 pub mod vacuum;
 pub mod wal;
 

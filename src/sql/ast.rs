@@ -26,9 +26,18 @@ pub enum Statement {
     Detach(DetachStatement),
     Vacuum(VacuumStatement),
     Alter(AlterStatement),
-    /// ANALYZE / REINDEX — accepted grammar, catalog no-ops (the planner
-    /// has no statistics-driven cost model to feed).
+    /// REINDEX — accepted grammar, a catalog no-op (B+tree indexes are
+    /// built page-identically on insert; rebuilding changes nothing).
     NoOp,
+    /// ANALYZE [schema.][table|index] — collects index statistics into
+    /// `sqlite_stat1` (SQLite's own contract: one row per index with
+    /// `"rows D1 D2 …"` distinct-prefix counts, plus one `idx = NULL`
+    /// row per index-less table) and refreshes the planner's in-memory
+    /// cost model. A target narrows the collection to one table (an
+    /// index target analyzes its owning table — SQLite semantics).
+    Analyze {
+        target: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -681,7 +690,11 @@ pub enum LikeOp {
 
 #[derive(Clone, Debug)]
 pub enum InSource {
-    List(Vec<Expr>),
+    /// `IN (v1, v2, …)` — shared behind an `Arc` so the AST, the plan's
+    /// cloned predicate, and the RowidIn/IndexIn extraction all point at
+    /// ONE list (a 5000-literal IN list used to cost three retained
+    /// deep copies in the statement cache — torture S11).
+    List(std::sync::Arc<Vec<Expr>>),
     Subquery(Box<SelectStatement>),
     Table(String),
 }

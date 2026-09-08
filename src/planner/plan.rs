@@ -39,8 +39,9 @@ pub enum Plan {
         table: Arc<Table>,
         alias: Option<String>,
         /// The IN-list member expressions (evaluated with the statement's
-        /// parameters, so `IN (?, ?, ?)` works).
-        values: Vec<Expr>,
+        /// parameters, so `IN (?, ?, ?)` works) — `Arc`-shared with the
+        /// AST's list: one copy, not two per cached statement.
+        values: Arc<Vec<Expr>>,
         /// Remaining predicates for a top-level Filter (e.g.
         /// `id IN (1,2,3) AND name = 'x'`).
         residual: Option<Expr>,
@@ -63,8 +64,9 @@ pub enum Plan {
         table: Arc<Table>,
         alias: Option<String>,
         index: Arc<Index>,
-        /// The IN-list member expressions (one per index seek).
-        key_exprs: Vec<Expr>,
+        /// The IN-list member expressions (one per index seek) —
+        /// `Arc`-shared with the AST's list.
+        key_exprs: Arc<Vec<Expr>>,
         /// Remaining predicates for a top-level Filter.
         residual: Option<Expr>,
     },

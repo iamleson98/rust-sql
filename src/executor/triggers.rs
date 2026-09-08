@@ -210,7 +210,7 @@ fn substitute_new_old(
             Expr::In { expr, source, .. } => {
                 walk_expr(expr, lookup)?;
                 if let crate::sql::ast::InSource::List(list) = source {
-                    for item in list {
+                    for item in std::sync::Arc::make_mut(list).iter_mut() {
                         walk_expr(item, lookup)?;
                     }
                 }

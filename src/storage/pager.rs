@@ -759,6 +759,15 @@ pub struct Pager {
     /// executor's ExecContext carries a `&Pager`, the one shared handle
     /// both the engine and the statement dispatcher reach.
     parallel_scan_min_rows: std::sync::atomic::AtomicI64,
+    /// `PRAGMA temp_store` (SQLite semantics: 0/DEFAULT and 1/FILE let
+    /// ephemeral structures spill to disk; 2/MEMORY keeps them in RAM).
+    /// The aggregate grouper's temp-store freeze honors it — see
+    /// `executor::HashGrouper::armed_grouper`.
+    temp_store: std::sync::atomic::AtomicI64,
+    /// Sequential-access tracker for read-ahead: the last page id
+    /// touched (any path) and the length of the current +1 run.
+    prefetch_last: std::sync::atomic::AtomicU32,
+    prefetch_run: std::sync::atomic::AtomicU8,
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1350,77 @@ impl Pager {
         }
     }
 
+    /// The CURRENT image of a `:memory:` database — cache included. In
+    /// lazy write-back mode the cache IS the store (`flush` is a no-op,
+    /// so the backing `Vec` can be arbitrarily stale); this snapshot
+    /// merges every cached page on top of the store bytes, resizes to
+    /// the live page count, and rewrites the header (n_pages, freelist,
+    /// schema cookie — exactly what a real flush would write last).
+    ///
+    /// This is `Database::image`'s `:memory:` path and the C ABI's
+    /// `sqlite3_serialize` contract: the buffer a fresh
+    /// `open_memory_from_image` (or `open_in_memory_with_image`)
+    /// reopens faithfully.
+    pub(crate) fn memory_image_current(&self) -> Result<Vec<u8>> {
+        if !self.store.is_memory() {
+            return Err(Error::InvalidArgument(
+                "memory_image_current on a file-backed pager".into(),
+            ));
+        }
+        if self.wal.read().is_some() {
+            return Err(Error::InvalidArgument(
+                "serialize of a WAL-armed memory pager is not supported".into(),
+            ));
+        }
+        if self.codec.read().is_active() {
+            return Err(Error::InvalidArgument(
+                "serialize of a page-codec database is not supported".into(),
+            ));
+        }
+        let psz = self.page_size() as usize;
+        let n_pages_val = self.n_pages.load(Ordering::Acquire);
+        let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
+        let freelist_count_val = self.freelist_count.load(Ordering::Acquire);
+        let schema_cookie_val = self.schema_cookie.load(Ordering::Acquire);
+
+        let mut out = vec![0u8; n_pages_val as usize * psz];
+        // Base: whatever the store already holds (evicted pages).
+        {
+            let base_len = {
+                let m = match &self.store {
+                    Store::Memory(m) => m,
+                    Store::File(_) => unreachable!("checked above"),
+                };
+                let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+                let take = guard.len().min(out.len());
+                out[..take].copy_from_slice(&guard[..take]);
+                guard.len()
+            };
+            let _ = base_len;
+        }
+        // Overlay: every cached page (the newest state; the cache is
+        // authoritative in lazy mode).
+        {
+            let cache = self.cache.read();
+            for (id, page) in cache.iter() {
+                let idx = id as usize;
+                if idx >= n_pages_val as usize {
+                    continue;
+                }
+                let borrowed = page.lock();
+                let start = idx * psz;
+                out[start..start + psz].copy_from_slice(&borrowed.data);
+            }
+        }
+        // Header: the same fields a real flush writes last.
+        if out.len() >= psz {
+            FileHeader::write(&mut out[..psz], psz as u32, n_pages_val, schema_cookie_val);
+            out[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
+            out[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
+        }
+        Ok(out)
+    }
+
     /// Open a pure in-memory pager seeded from a COMPLETE database image
     /// (page 0 header + every live page — exactly the byte sequence a
     /// file store would hold on disk). `from_store` reads the header and
@@ -1421,6 +1501,9 @@ impl Pager {
             parallel_scan_min_rows: std::sync::atomic::AtomicI64::new(
                 crate::storage::pager::DEFAULT_PARALLEL_SCAN_MIN_ROWS,
             ),
+            temp_store: std::sync::atomic::AtomicI64::new(0),
+            prefetch_last: std::sync::atomic::AtomicU32::new(u32::MAX),
+            prefetch_run: std::sync::atomic::AtomicU8::new(0),
         };
 
         let file_size = pager.store.len()?;
@@ -1996,6 +2079,7 @@ impl Pager {
             let cache = self.cache.read();
             if let Some(page_ref) = cache.get(id).cloned() {
                 drop(cache);
+                self.note_seq_access(id);
                 // SAVEPOINT undo capture: the bytes at fetch time are the
                 // pre-mutation state (every mutation get_page()s before it
                 // modifies). One atomic load when no savepoint is active.
@@ -2107,10 +2191,65 @@ impl Pager {
             }
             page_ref
         };
+        // Sequential read-ahead: after a +1 run of page touches, batch the
+        // next few pages into the cache in one go — cold sequential scans
+        // (bulk loads, full-table aggregates, VACUUM) cut their syscall
+        // count ~5x. Heavily gated: only the plain file-backed, non-WAL,
+        // non-codec, no-committed-scope, no-spill state (every other
+        // layout serves pages from a VERSIONED source whose bytes must
+        // not be short-circuited from the main file). Prefetched pages
+        // enter CLEAN — later fetchers take the normal path (fast-path
+        // hit, savepoint capture, WAL check all still run).
+        if self.prefetch_run.load(Ordering::Relaxed) >= 2
+            && !self.store.is_memory()
+            && self.wal.read().is_none()
+            && !self.codec.read().is_active()
+            && self.committed_scope_count.load(Ordering::Acquire) == 0
+            && self.delete_spill.lock().is_none()
+            && self.savepoint_depth.load(Ordering::Relaxed) == 0
+        {
+            const PREFETCH_PAGES: u32 = 4;
+            let psz = self.page_size();
+            let mut cache = self.cache.write();
+            for pid in (id + 1)..(id + 1 + PREFETCH_PAGES) {
+                if pid >= n_pages_val {
+                    break;
+                }
+                if cache.get(pid).is_some() {
+                    continue;
+                }
+                let mut p = Page::new(pid, psz);
+                let offset = pid as u64 * psz as u64;
+                match self.read_file_at(offset, &mut p.data) {
+                    Ok(n) if n == psz as usize => {}
+                    _ => break, // short read / I/O error: leave it to the real miss path
+                }
+                self.maybe_evict_locked(&mut cache);
+                let prefetched = Arc::new(Mutex::new(p));
+                cache.insert(pid, prefetched);
+                self.lru.lock().push_back(pid);
+            }
+        }
+        self.note_seq_access(id);
         if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
             self.capture_savepoint_undo(id, &page_ref);
         }
         Ok(page_ref)
+    }
+
+    /// Track the +1 access pattern for sequential read-ahead.
+    #[inline]
+    fn note_seq_access(&self, id: PageId) {
+        let last = self.prefetch_last.load(Ordering::Relaxed);
+        if id == last.wrapping_add(1) {
+            let r = self.prefetch_run.load(Ordering::Relaxed);
+            if r < 8 {
+                self.prefetch_run.store(r + 1, Ordering::Relaxed);
+            }
+        } else {
+            self.prefetch_run.store(0, Ordering::Relaxed);
+        }
+        self.prefetch_last.store(id, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------
@@ -4242,6 +4381,24 @@ impl Pager {
     pub fn set_parallel_scan_min_rows(&self, n: i64) {
         self.parallel_scan_min_rows
             .store(n.max(0), std::sync::atomic::Ordering::Release);
+    }
+
+    /// `true` when `PRAGMA temp_store = 2` (MEMORY): ephemeral
+    /// structures must stay in RAM instead of spilling to temp files.
+    pub fn temp_store_memory(&self) -> bool {
+        self.temp_store.load(std::sync::atomic::Ordering::Acquire) == 2
+    }
+
+    /// Current `PRAGMA temp_store` value (0/1/2).
+    pub fn temp_store(&self) -> i64 {
+        self.temp_store.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set `PRAGMA temp_store` (clamped to SQLite's 0–2 range).
+    pub fn set_temp_store(&self, v: i64) {
+        let v = v.clamp(0, 2);
+        self.temp_store
+            .store(v, std::sync::atomic::Ordering::Release);
     }
 
     pub fn cache_bytes(&self) -> usize {

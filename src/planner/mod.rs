@@ -1453,7 +1453,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
         Expr::In { expr, source, .. } => {
             collect_aggregates_rec(expr, &None, out);
             if let InSource::List(l) = source {
-                for e in l {
+                for e in l.iter() {
                     collect_aggregates_rec(e, &None, out);
                 }
             }
@@ -1632,12 +1632,18 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
 /// Compound-index candidate for `apply_where_for_scan`: the index whose
 /// prefix is equality-bound by the most conjuncts, the bound key
 /// expressions (in index column order), and the bound column names (for
-/// residual computation).
+/// residual computation). With `sqlite_stat1` statistics present,
+/// `est_rows` carries SQLite's row-estimate model for the bound prefix
+/// (`rows / (D1 × … × Dk)`) and drives the choice — the covered-prefix
+/// heuristic only breaks ties between equal estimates.
 struct IdxCandidate {
     index: std::sync::Arc<crate::schema::Index>,
     key_exprs: Vec<Expr>,
     bound_cols: Vec<String>,
     covered: usize,
+    /// Estimated matching rows; `None` when no statistics exist for the
+    /// index (the pre-ANALYZE behavior: rank by covered prefix only).
+    est_rows: Option<i64>,
 }
 
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
@@ -1787,12 +1793,30 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                     }
                 }
                 let covered = key_exprs.len();
-                if best.as_ref().map_or(true, |c| covered > c.covered) {
+                // Stat-based estimate for the bound prefix (None without
+                // ANALYZE statistics).
+                let est_rows = catalog
+                    .index_stats(&index.name)
+                    .map(|s| s.estimate_eq(covered));
+                // Ranking: estimated rows when BOTH sides carry stats
+                // (ties fall to the covered-prefix heuristic); the
+                // covered-prefix heuristic whenever either side lacks
+                // stats (the pre-ANALYZE behavior).
+                let better = match (&best, est_rows) {
+                    (None, _) => true,
+                    (Some(c), Some(ne)) => match c.est_rows {
+                        Some(ce) => ne < ce || (ne == ce && covered > c.covered),
+                        None => covered > c.covered,
+                    },
+                    (Some(c), None) => covered > c.covered,
+                };
+                if better {
                     best = Some(IdxCandidate {
                         index: index.clone(),
                         key_exprs,
                         bound_cols,
                         covered,
+                        est_rows,
                     });
                 }
             }
@@ -1801,34 +1825,54 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
             index,
             key_exprs,
             bound_cols,
+            est_rows,
             ..
         }) = best
         {
-            // Residual: conjuncts NOT consumed as index keys (an
-            // equality conjunct whose column is a bound prefix column was
-            // consumed; everything else survives as a Filter).
-            let other_conjuncts: Vec<Expr> = conjuncts
-                .iter()
-                .filter(|c| {
-                    extract_eq_predicate(c)
-                        .map(|(cn, _)| !bound_cols.contains(&cn.to_ascii_lowercase()))
-                        .unwrap_or(true)
-                })
-                .cloned()
-                .collect();
-            let lookup = Plan::IndexLookup {
-                table: table.clone(),
-                alias: alias.clone(),
-                index,
-                key_exprs,
+            // Stat-based scan guard: an index whose bound prefix matches
+            // (nearly) the whole table is a net LOSS — each hit costs an
+            // index seek PLUS a row fetch, so a sequential scan filtering
+            // in place wins. SQLite's cost model makes the same call. The
+            // guard only fires with real statistics (ANALYZE'd); the
+            // heuristic path keeps the index as before.
+            let unselective = match est_rows {
+                Some(est) => {
+                    let n = catalog
+                        .index_stats(&index.name)
+                        .map(|s| s.rows)
+                        .unwrap_or(0);
+                    n > 0 && est * 4 > n * 3 // > 75% of the table matches
+                }
+                None => false,
             };
-            if other_conjuncts.is_empty() {
-                return lookup;
+            if !unselective {
+                // Residual: conjuncts NOT consumed as index keys (an
+                // equality conjunct whose column is a bound prefix column was
+                // consumed; everything else survives as a Filter).
+                let other_conjuncts: Vec<Expr> = conjuncts
+                    .iter()
+                    .filter(|c| {
+                        extract_eq_predicate(c)
+                            .map(|(cn, _)| !bound_cols.contains(&cn.to_ascii_lowercase()))
+                            .unwrap_or(true)
+                    })
+                    .cloned()
+                    .collect();
+                let lookup = Plan::IndexLookup {
+                    table: table.clone(),
+                    alias: alias.clone(),
+                    index,
+                    key_exprs,
+                };
+                if other_conjuncts.is_empty() {
+                    return lookup;
+                }
+                return Plan::Filter {
+                    input: Box::new(lookup),
+                    predicate: combine_and(&other_conjuncts),
+                };
             }
-            return Plan::Filter {
-                input: Box::new(lookup),
-                predicate: combine_and(&other_conjuncts),
-            };
+            // Unselective: fall through to the scan+Filter paths below.
         }
         // No rowid/equality access path matched. Try an IndexRange from
         // conjuncts that are range predicates on the first column of some
@@ -2265,7 +2309,7 @@ fn collect_column_refs_rec(expr: &Expr, out: &mut Vec<(Option<String>, String)>)
         Expr::In { expr, source, .. } => {
             collect_column_refs_rec(expr, out);
             if let crate::sql::ast::InSource::List(es) = source {
-                for e in es {
+                for e in es.iter() {
                     collect_column_refs_rec(e, out);
                 }
             }
@@ -3115,7 +3159,10 @@ fn rewrite_rowid_refs_in_plan(plan: &mut Plan, table: &Arc<Table>, alias: Option
         Plan::RowidLookup { rowid, .. } => vec![rowid],
         Plan::RowidIn {
             values, residual, ..
-        } => values.iter_mut().chain(residual.iter_mut()).collect(),
+        } => std::sync::Arc::make_mut(values)
+            .iter_mut()
+            .chain(residual.iter_mut())
+            .collect(),
         Plan::RowidRange {
             start,
             end,
@@ -3130,7 +3177,10 @@ fn rewrite_rowid_refs_in_plan(plan: &mut Plan, table: &Arc<Table>, alias: Option
             key_exprs,
             residual,
             ..
-        } => key_exprs.iter_mut().chain(residual.iter_mut()).collect(),
+        } => std::sync::Arc::make_mut(key_exprs)
+            .iter_mut()
+            .chain(residual.iter_mut())
+            .collect(),
         Plan::IndexLookup { key_exprs, .. } => key_exprs.iter_mut().collect(),
         Plan::IndexRange {
             start,
@@ -3272,7 +3322,7 @@ fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) 
             ..
         } => {
             rewrite_rowid_in_expr(expr, table, alias);
-            for v in values.iter_mut() {
+            for v in std::sync::Arc::make_mut(values).iter_mut() {
                 rewrite_rowid_in_expr(v, table, alias);
             }
         }

@@ -743,7 +743,7 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                 walk_expr(expr, max_pos, saw_numeric, named, counter);
                 match source {
                     crate::sql::ast::InSource::List(items) => {
-                        for i in items {
+                        for i in items.iter() {
                             walk_expr(i, max_pos, saw_numeric, named, counter);
                         }
                     }
@@ -998,8 +998,14 @@ struct GroupByDriver {
     aggregates: Vec<crate::planner::plan::AggExpr>,
     proj: GroupProjection,
     columns: Arc<[String]>,
-    grouper: Option<crate::executor::HashGrouper>,
-    next_gi: usize,
+    /// Built once (first batch) from the scan; consumed batch-at-a-time
+    /// after that. The iterator itself carries the bounded-memory
+    /// contract: RAM-only groupers walk first-seen order; spilled
+    /// groupers stream the temp-store chunk merge — the driver never
+    /// materializes more than one batch of output rows regardless of
+    /// group cardinality.
+    iter: Option<crate::executor::GroupIter>,
+    finished: bool,
 }
 
 impl GroupByDriver {
@@ -1016,8 +1022,8 @@ impl GroupByDriver {
             aggregates,
             proj,
             columns,
-            grouper: None,
-            next_gi: 0,
+            iter: None,
+            finished: false,
         }
     }
 
@@ -1068,10 +1074,10 @@ impl Driver for GroupByDriver {
         named: &HashMap<String, Value>,
         budget: usize,
     ) -> Result<Vec<Row>> {
-        if self.grouper.is_none() {
-            if self.next_gi > 0 {
-                return Ok(Vec::new()); // finished
-            }
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        if self.iter.is_none() {
             let (table, alias, filter) = match Self::scan_input(&self.input) {
                 Some(t) => t,
                 None => {
@@ -1097,35 +1103,36 @@ impl Driver for GroupByDriver {
                 &self.group_by,
                 &self.aggregates,
             )?;
-            self.grouper = Some(grouper);
+            self.iter = Some(grouper.into_group_iter());
         }
-        let grouper = match self.grouper.as_ref() {
-            Some(g) => g,
+        let iter = match self.iter.as_mut() {
+            Some(i) => i,
             None => return Ok(Vec::new()),
         };
-        let n_groups = grouper.group_count();
-        if self.next_gi >= n_groups {
-            self.grouper = None;
-            return Ok(Vec::new());
-        }
-        let n = (n_groups - self.next_gi).min(budget.max(1));
         let n_group = self.group_by.len();
-        let mut out: Vec<Row> = Vec::with_capacity(n);
-        for gi in self.next_gi..self.next_gi + n {
+        let mut out: Vec<Row> = Vec::with_capacity(budget.clamp(1, 4096));
+        while out.len() < budget.max(1) {
+            let (keys, states) = match iter.next_group() {
+                Some(g) => g,
+                None => {
+                    self.finished = true;
+                    self.iter = None; // fully drained — free the state
+                    break;
+                }
+            };
             let mut row: Vec<Value> = Vec::with_capacity(self.proj.src.len().max(1));
             for &s in self.proj.src.iter() {
                 if s < n_group {
-                    row.push(grouper.key_slot(gi, s));
+                    row.push(keys.get(s).cloned().unwrap_or(Value::Null));
                 } else {
                     let i = s - n_group;
-                    row.push(grouper.finalize_slot(gi, i, &self.aggregates[i].func));
+                    row.push(crate::executor::finalize_agg(
+                        &states[i],
+                        &self.aggregates[i].func,
+                    ));
                 }
             }
             out.push(row);
-        }
-        self.next_gi += n;
-        if self.next_gi >= n_groups {
-            self.grouper = None; // fully drained — free the state
         }
         Ok(out)
     }

@@ -1025,7 +1025,7 @@ fn rename_column_in_expr(e: &mut Expr, old: &str, new: &str, qualifier: &str) {
         Expr::In { expr, source, .. } => {
             rename_column_in_expr(expr, old, new, qualifier);
             if let crate::sql::ast::InSource::List(items) = source {
-                for it in items.iter_mut() {
+                for it in std::sync::Arc::make_mut(items).iter_mut() {
                     rename_column_in_expr(it, old, new, qualifier);
                 }
             }
@@ -5177,6 +5177,25 @@ impl Database {
         &self.path
     }
 
+    /// The complete current database image (the native container's byte
+    /// sequence): the memory store for `:memory:` databases, the whole
+    /// file for file-backed ones (flushed first, so uncommitted pages
+    /// are included — SQLite's serialize contract). The result feeds
+    /// [`Self::open_in_memory_with_image`] and the C ABI's
+    /// `sqlite3_serialize`.
+    pub fn image(&self) -> Result<Vec<u8>> {
+        if self.path.as_os_str() == ":memory:" {
+            // Lazy write-back mode: the cache IS the store — snapshot the
+            // merged cache+store state (a flush would be a no-op).
+            self.pager.memory_image_current()
+        } else {
+            // A flush failure on a read-only handle must not fail the
+            // read-back (the file holds the last committed state).
+            let _ = self.pager.flush();
+            std::fs::read(&self.path).map_err(Error::from)
+        }
+    }
+
     /// Get a reference to the catalog (for debugging/testing).
     pub fn catalog_ref(&self) -> &Catalog {
         &self.catalog
@@ -6472,6 +6491,151 @@ impl Database {
         })
     }
 
+    /// ANALYZE: collect per-index statistics into `sqlite_stat1` (real
+    /// table, SQLite's own format) and refresh the catalog's in-memory
+    /// cost map. Runs the collection through the engine's own SQL
+    /// machinery — CREATE TABLE / DELETE / INSERT / GROUP BY — so the
+    /// stat table participates in transactions, WAL, and reopen like any
+    /// other table (exactly SQLite's contract: `sqlite_stat1` is an
+    /// ordinary table).
+    fn execute_analyze(
+        target: Option<String>,
+        ctx: &mut ExecContext,
+        catalog: &mut Catalog,
+    ) -> Result<()> {
+        // Resolve the target: a table name, or an index name (analyzes
+        // the owning table — SQLite semantics). None = every table.
+        let tables: Vec<Arc<crate::schema::Table>> = match &target {
+            Some(t) => {
+                if let Some(tbl) = catalog.get_table(t) {
+                    vec![tbl]
+                } else if let Some(idx) = catalog.get_index(t) {
+                    catalog.get_table(&idx.table).into_iter().collect()
+                } else {
+                    return Err(Error::semantic(format!("no such table or index: {t}")));
+                }
+            }
+            None => {
+                // Every user table (skip the schema pseudo-tables and
+                // sqlite_stat1 itself).
+                catalog
+                    .all_tables()
+                    .into_iter()
+                    .filter(|(name, t)| !name.starts_with("sqlite_") && t.vtab.is_none())
+                    .map(|(_, t)| t)
+                    .collect()
+            }
+        };
+
+        // The stat table (created by ANALYZE, like SQLite).
+        const STAT1_DDL: &str =
+            "CREATE TABLE IF NOT EXISTS sqlite_stat1 (tbl TEXT, idx TEXT, stat TEXT)";
+        let ddl = parse(STAT1_DDL)?;
+        Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL)?;
+        // Clear this run's rows (a targeted ANALYZE keeps other tables'
+        // rows — SQLite only replaces the analyzed tables' entries).
+        let clear_sql = match &target {
+            Some(t) => {
+                let owner = catalog
+                    .get_index(t)
+                    .map(|i| i.table.clone())
+                    .unwrap_or_else(|| t.clone());
+                format!(
+                    "DELETE FROM sqlite_stat1 WHERE tbl = '{}'",
+                    owner.replace('\'', "''")
+                )
+            }
+            None => "DELETE FROM sqlite_stat1".to_string(),
+        };
+        let del = parse(&clear_sql)?;
+        Self::execute_statement_static(&del, ctx, catalog, &clear_sql)?;
+
+        // Collect: row count per table (memoized cell-count walk) +
+        // distinct-prefix counts per index (GROUP BY counting through the
+        // engine's own grouper).
+        let mut stat_rows: Vec<(String, crate::schema::IndexStats)> = Vec::new();
+        let mut insert_sqls: Vec<String> = Vec::new();
+        for table in &tables {
+            let root = ctx.table_root(table);
+            let n = Btree::new(ctx.pager, root, false).count_rows().unwrap_or(0) as i64;
+            let indexes = catalog.indexes_on_table(&table.name);
+            if indexes.is_empty() {
+                // SQLite writes an idx = NULL row for index-less tables.
+                insert_sqls.push(format!(
+                    "INSERT INTO sqlite_stat1 VALUES ('{}', NULL, '{}')",
+                    table.name.replace('\'', "''"),
+                    n
+                ));
+                continue;
+            }
+            for index in indexes {
+                // Per-prefix distinct counts: one GROUP BY per prefix k,
+                // counting the groups. Columns render as their SQL (plain
+                // names or the index's expression text — expr_to_sql).
+                let mut distinct: Vec<i64> = Vec::with_capacity(index.columns.len());
+                for k in 1..=index.columns.len() {
+                    let cols: Vec<String> = index.columns[..k]
+                        .iter()
+                        .map(|c| match &c.expr {
+                            Some(e) => expr_to_sql(e),
+                            None => c.name.clone(),
+                        })
+                        .collect();
+                    let sql = format!(
+                        "SELECT COUNT(*) FROM (SELECT 1 FROM \"{}\" GROUP BY {})",
+                        table.name.replace('"', "\"\""),
+                        cols.join(", ")
+                    );
+                    let cnt = Self::analyze_scalar_query(&sql, ctx, catalog)?;
+                    distinct.push(cnt.max(0));
+                }
+                let stats = crate::schema::IndexStats {
+                    rows: n,
+                    distinct_prefix: distinct,
+                };
+                insert_sqls.push(format!(
+                    "INSERT INTO sqlite_stat1 VALUES ('{}', '{}', '{}')",
+                    table.name.replace('\'', "''"),
+                    index.name.replace('\'', "''"),
+                    stats.to_stat_text()
+                ));
+                stat_rows.push((index.name.clone(), stats));
+            }
+        }
+        for sql in &insert_sqls {
+            let stmt = parse(sql)?;
+            Self::execute_statement_static(&stmt, ctx, catalog, sql)?;
+        }
+        // Keep other tables' in-memory rows on a targeted run.
+        if target.is_some() {
+            let mut merged: Vec<(String, crate::schema::IndexStats)> = catalog.stat1_snapshot();
+            merged.extend(stat_rows);
+            catalog.set_stat1(merged);
+        } else {
+            catalog.set_stat1(stat_rows);
+        }
+        Ok(())
+    }
+
+    /// Run a scalar `SELECT COUNT(*) …` for ANALYZE's distinct counting.
+    fn analyze_scalar_query(sql: &str, ctx: &mut ExecContext, catalog: &Catalog) -> Result<i64> {
+        let stmt = parse(sql)?;
+        match stmt {
+            Statement::Select(sel) => {
+                let mut planner = Planner::new(catalog);
+                let plan = planner.plan_select(&sel)?;
+                let res = execute(&plan, ctx)?;
+                if let Some(first) = res.rows.first() {
+                    if let Some(v) = first.first() {
+                        return Ok(v.as_integer());
+                    }
+                }
+                Ok(0)
+            }
+            _ => Err(Error::semantic("ANALYZE internal query must be SELECT")),
+        }
+    }
+
     fn execute_statement_static(
         stmt: &Statement,
         ctx: &mut ExecContext,
@@ -6552,6 +6716,7 @@ impl Database {
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
             Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
+            Statement::Analyze { target } => Self::execute_analyze(target.clone(), ctx, catalog),
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
             Statement::NoOp => Ok(()),
@@ -7917,6 +8082,36 @@ impl Database {
                     }
                     ctx.pager.set_parallel_scan_min_rows(n);
                 }
+                "temp_store" => {
+                    // SQLite semantics: 0/DEFAULT, 1/FILE (spill to disk),
+                    // 2/MEMORY (keep ephemeral structures in RAM).
+                    // (Words arrive as Text or bare identifiers — the
+                    // parallel_scan arm's dual path.)
+                    let n = match (&v, value_as_expr(value)) {
+                        (Value::Integer(i), _) => *i,
+                        (Value::Text(t), _) => match t.to_ascii_lowercase().as_str() {
+                            "default" => 0,
+                            "file" => 1,
+                            "memory" => 2,
+                            other => other.parse::<i64>().unwrap_or(-1),
+                        },
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            match name.to_ascii_lowercase().as_str() {
+                                "default" | "0" => 0,
+                                "file" | "1" => 1,
+                                "memory" | "2" => 2,
+                                other => other.parse::<i64>().unwrap_or(-1),
+                            }
+                        }
+                        _ => -1,
+                    };
+                    if !(0..=2).contains(&n) {
+                        return Err(Error::semantic(
+                            "PRAGMA temp_store expects DEFAULT/FILE/MEMORY or 0..2",
+                        ));
+                    }
+                    ctx.pager.set_temp_store(n);
+                }
                 "journal_mode" => {
                     // `PRAGMA journal_mode = WAL` parses WAL as a bare
                     // identifier (column ref), which evaluates to NULL —
@@ -8439,6 +8634,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         // The min-rows threshold (0 = parallel scans disabled) — SQLite
         // has no equivalent pragma; the value round-trips the setting.
         "parallel_scan" => Value::Integer(pager.parallel_scan_min_rows()),
+        "temp_store" => Value::Integer(pager.temp_store()),
         "page_size" => Value::Integer(pager.page_size() as i64),
         "page_count" => Value::Integer(pager.n_pages() as i64),
         "freelist_count" => Value::Integer(pager.freelist_count() as i64),
@@ -8457,7 +8653,6 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
                 .unwrap_or_else(|| "none".into()),
         ),
         "synchronous" => Value::Integer(pager.synchronous() as i64),
-        "temp_store" => Value::Integer(0),
         "locking_mode" => Value::Text(if pager.locking_mode_exclusive() {
             "exclusive".into()
         } else {
@@ -8990,6 +9185,28 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                 _ => {}
             }
             let _ = tbl_name;
+        }
+    }
+    // sqlite_stat1 rows -> the catalog's cost map, so a database that
+    // was ANALYZEd in a previous session plans cost-based immediately.
+    if let Some(stat_table) = catalog.get_table("sqlite_stat1") {
+        if stat_table.n_columns() == 3 {
+            let mut bt = Btree::new(pager, stat_table.root_page, false);
+            let mut stats: Vec<(String, crate::schema::IndexStats)> = Vec::new();
+            let _ = bt.scan_table(|_rowid, payload| {
+                if let Ok(row) = decode_row(payload, 3, 0, None) {
+                    // (tbl, idx, stat): only INDEX rows (idx NOT NULL) feed
+                    // the planner; the idx-NULL table rows are advisory.
+                    if let (Value::Text(idx), Value::Text(stat)) = (&row[1], &row[2]) {
+                        stats.push((
+                            idx.as_str().to_string(),
+                            crate::schema::IndexStats::parse(stat.as_str()),
+                        ));
+                    }
+                }
+                true
+            });
+            catalog.set_stat1(stats);
         }
     }
     Ok(())

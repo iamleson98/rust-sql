@@ -126,14 +126,15 @@ impl Parser {
                 "VACUUM" => self.parse_vacuum(),
                 "ANALYZE" => {
                     // ANALYZE [schema.] [table|index]... — statistics
-                    // collection. The planner is index-cost-model-free
-                    // (it always uses the applicable index), so this is a
-                    // catalog no-op that accepts the full grammar.
+                    // collection into sqlite_stat1 (the planner's cost
+                    // model reads it back through the catalog).
                     self.advance();
                     let mut target: Option<String> = None;
                     if !self.peek().is_punct(';') && !matches!(self.peek().token, Token::Eof) {
                         if self.peek().is_keyword("DATABASE") {
-                            // ANALYZE DATABASE name — accepted, no-op.
+                            // ANALYZE DATABASE name — SQLite's ATTACHed-db
+                            // form; the engine is single-database, so the
+                            // name is accepted and ignored (full analyze).
                             self.advance();
                             let _ = self.parse_ident_or_keyword()?;
                         } else {
@@ -146,8 +147,7 @@ impl Parser {
                             }
                         }
                     }
-                    let _ = target;
-                    Ok(Statement::NoOp)
+                    Ok(Statement::Analyze { target })
                 }
                 "REINDEX" => {
                     // REINDEX [collation | table | index]... — rebuilds
@@ -2753,7 +2753,7 @@ impl Parser {
                     }
                 }
                 self.expect_punct(')')?;
-                Ok(InSource::List(list))
+                Ok(InSource::List(list.into()))
             }
         } else {
             let name = self.parse_ident()?;

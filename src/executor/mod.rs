@@ -1707,10 +1707,10 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
             let new_source = match source {
                 InSource::List(list) => {
                     let mut new_list = Vec::with_capacity(list.len());
-                    for item in list {
+                    for item in list.iter() {
                         new_list.push(r!(item));
                     }
-                    InSource::List(new_list)
+                    InSource::List(new_list.into())
                 }
                 other => other.clone(),
             };
@@ -2038,7 +2038,9 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::RowidIn {
             values, residual, ..
         } => {
-            for v in values.iter_mut() {
+            // Copy-on-write: rewrites only fire on rowid refs; a literal
+            // list stays shared with the AST.
+            for v in std::sync::Arc::make_mut(values).iter_mut() {
                 rewrite_expr_in_place(v, ctx)?;
             }
             if let Some(r) = residual.as_mut() {
@@ -2050,7 +2052,7 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
             residual,
             ..
         } => {
-            for k in key_exprs.iter_mut() {
+            for k in std::sync::Arc::make_mut(key_exprs).iter_mut() {
                 rewrite_expr_in_place(k, ctx)?;
             }
             if let Some(r) = residual.as_mut() {
@@ -2275,7 +2277,7 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                             .iter()
                             .map(|r| Expr::Literal(r.first().cloned().unwrap_or(Value::Null)))
                             .collect();
-                        InSource::List(list)
+                        InSource::List(list.into())
                     }
                 }
                 other => other,
@@ -2610,7 +2612,7 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_expr_refs(expr, out);
             match source {
                 InSource::List(list) => {
-                    for item in list {
+                    for item in list.iter() {
                         collect_expr_refs(item, out);
                     }
                 }
@@ -4254,7 +4256,7 @@ fn exec_limit(
 // ============================================================================
 
 #[derive(Clone, Debug)]
-struct AggState {
+pub(crate) struct AggState {
     count: i64,
     sum: f64,
     sum_is_int: bool,
@@ -4358,7 +4360,7 @@ fn hash_sql_value<H: std::hash::Hasher>(v: &Value, state: &mut H) {
 /// Replaces per-row `&str` matching in `update_agg_state` (the planner
 /// lowercases names, so this only needs the lowercase forms).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AggFunc {
+pub(crate) enum AggFunc {
     Count,
     Sum,
     Total,
@@ -4460,6 +4462,15 @@ impl<T: Clone> ChunkVec<T> {
         self.chunks[ci][ei] = v;
         self.len += 1;
     }
+
+    /// Drop every entry AND its backing chunks — the memory returns to
+    /// the allocator immediately (used by the temp-store freeze: the
+    /// in-RAM epoch's pages must actually leave RSS, not linger as
+    /// capacity).
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
 }
 
 /// Zero-allocation hash grouper for GROUP BY: an open-addressing table of
@@ -4484,6 +4495,10 @@ impl Default for HashGrouper {
             keys_multi: Vec::new(),
             states: ChunkVec::new(7, AggState::default()),
             n_aggs: 0,
+            agg_ctx: Vec::new(),
+            spill_threshold: 0,
+            spill: None,
+            epoch_seq_base: 0,
         }
     }
 }
@@ -4508,6 +4523,45 @@ pub(crate) struct HashGrouper {
     /// Flat aggregate states: `gi * n_aggs + agg_idx`.
     states: ChunkVec<AggState>,
     n_aggs: usize,
+    // ---- Temp-store spill (SQLite's ephemeral-b-tree replacement) ----
+    /// Per-aggregate merge context — present only when the grouper is
+    /// spill-armed. Needed at merge time to combine two partial states
+    /// of the same group key (see `merge_agg_state`).
+    agg_ctx: Vec<AggMergeCtx>,
+    /// Groups at which an epoch freezes to disk. 0 = never.
+    spill_threshold: usize,
+    /// Backing ephemeral file, created lazily at the FIRST freeze (never-
+    /// spilling queries pay zero file syscalls).
+    spill: Option<crate::storage::tempstore::EphemeralFile>,
+    /// First-seen sequence number of the CURRENT RAM epoch's group 0 —
+    /// the group at index `gi` has seq `epoch_seq_base + gi`. Records it
+    /// across freezes so the k-way merge can order and re-merge groups
+    /// that recur in later epochs.
+    epoch_seq_base: u64,
+}
+
+/// Per-aggregate info the spill merge needs (a trimmed mirror of what
+/// `merge_agg_state` takes).
+#[derive(Clone)]
+struct AggMergeCtx {
+    func: AggFunc,
+    distinct: bool,
+    sep: Option<String>,
+}
+
+/// The effective group-spill threshold: the const default, overridable
+/// once per process through `RSQL_GROUP_SPILL_THRESHOLD` (tests force
+/// multi-chunk spills with tiny values; ops can raise it for
+/// spill-averse workloads).
+pub(crate) fn group_spill_threshold() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("RSQL_GROUP_SPILL_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(HashGrouper::GROUP_SPILL_THRESHOLD)
+    })
 }
 
 impl HashGrouper {
@@ -4520,6 +4574,133 @@ impl HashGrouper {
         }
     }
 
+    /// Groups an epoch holds before it freezes to the temp store
+    /// (≈6 MB of live group state: keys + 40 B states + hash slots).
+    /// SQLite's own ephemeral b-trees spill through their page cache at
+    /// a similar working-set scale. `RSQL_GROUP_SPILL_THRESHOLD` (env)
+    /// overrides — the knob tests and ops tuning use.
+    pub(crate) const GROUP_SPILL_THRESHOLD: usize = 1 << 16;
+
+    /// Prepare a SPILL-ARMED grouper from the statement's aggregate
+    /// list: once [`GROUP_SPILL_THRESHOLD`] groups are live, the epoch
+    /// freezes to an [`EphemeralFile`] chunk and the table restarts
+    /// empty — bounded RSS for unbounded cardinality (SQLite's temp-store
+    /// behavior for its ephemeral b-trees). Declines to plain RAM for
+    /// plugin aggregates (`AggFunc::Other`) — their states are opaque.
+    pub(crate) fn with_spill_for(aggregates: &[AggExpr], threshold: usize) -> Self {
+        let n_aggs = aggregates.len().max(1);
+        let mut ctxs = Vec::with_capacity(n_aggs);
+        for (i, a) in aggregates.iter().enumerate() {
+            let func = AggFunc::from_name(&a.func);
+            if matches!(func, AggFunc::Other) {
+                return Self::with_aggs(n_aggs);
+            }
+            ctxs.push(AggMergeCtx {
+                func,
+                distinct: a.distinct,
+                sep: agg_sep_at(aggregates, i).map(|s| s.to_string()),
+            });
+        }
+        Self {
+            n_aggs,
+            states: ChunkVec::new(7, AggState::default()),
+            agg_ctx: ctxs,
+            spill_threshold: threshold,
+            ..Default::default()
+        }
+    }
+
+    /// The grouper a GROUP BY context should construct, honoring
+    /// `PRAGMA temp_store = 2` (MEMORY: everything stays in RAM).
+    pub(crate) fn armed_grouper(ctx: &ExecContext<'_>, aggregates: &[AggExpr]) -> Self {
+        if ctx.pager.temp_store_memory() {
+            Self::with_aggs(aggregates.len().max(1))
+        } else {
+            Self::with_spill_for(aggregates, group_spill_threshold())
+        }
+    }
+
+    /// Spill is armed and the cardinality has crossed the threshold.
+    #[inline]
+    fn freeze_due(&self) -> bool {
+        self.spill_threshold > 0 && self.group_count() >= self.spill_threshold
+    }
+
+    /// Freeze the current epoch to disk and restart the table empty.
+    /// Any I/O failure disarms the spill permanently (the grouper keeps
+    /// everything in RAM — the pre-spill contract) instead of failing
+    /// the statement.
+    fn freeze(&mut self) {
+        if self.spill.is_none() {
+            match crate::storage::tempstore::EphemeralFile::create() {
+                Ok(ef) => self.spill = Some(ef),
+                Err(_) => {
+                    self.spill_threshold = 0;
+                    return;
+                }
+            }
+        }
+        let n = self.group_count();
+        let n_aggs = self.n_aggs.max(1);
+        // Field-destructure for disjoint borrows: the chunk writer holds
+        // `&mut spill` while the encoder reads `keys_*` / `states`.
+        let result = {
+            let Self {
+                spill,
+                keys_flat,
+                keys_multi,
+                states,
+                epoch_seq_base,
+                ..
+            } = self;
+            let base = *epoch_seq_base;
+            let spill = spill.as_mut().unwrap();
+            (|| -> std::io::Result<()> {
+                let mut w = spill.begin_chunk()?;
+                let mut rec: Vec<u8> = Vec::with_capacity(128);
+                let mut gi = 0usize;
+                while gi < n {
+                    rec.clear();
+                    let state_at = |i: usize| states.get(gi * n_aggs + i);
+                    match keys_flat {
+                        Some(flat) => encode_group_into(
+                            &mut rec,
+                            base + gi as u64,
+                            flat.get(gi),
+                            state_at,
+                            n_aggs,
+                        ),
+                        None => encode_group_into_multi(
+                            &mut rec,
+                            base + gi as u64,
+                            &keys_multi[gi],
+                            state_at,
+                            n_aggs,
+                        ),
+                    }
+                    w.write_record(&rec)?;
+                    gi += 1;
+                }
+                w.finish()
+            })()
+        };
+        if result.is_err() {
+            // Degrade to in-RAM (this epoch's data is still intact —
+            // only the freeze failed).
+            self.spill_threshold = 0;
+            return;
+        }
+        // Reset the live table. `slots` gets a minimal fresh table
+        // (NOT empty: `insert_slot` indexes with the stale mask before
+        // any rehash would trigger).
+        self.slots = vec![(0u32, 0u32); 16];
+        self.mask = 15;
+        self.keys_flat = None;
+        self.keys_multi.clear();
+        self.states.clear();
+        self.epoch_seq_base += n as u64;
+    }
+
     #[inline]
     pub(crate) fn group_count(&self) -> usize {
         if let Some(k) = &self.keys_flat {
@@ -4527,22 +4708,6 @@ impl HashGrouper {
         } else {
             self.keys_multi.len()
         }
-    }
-
-    /// Group key slot `s` (0 = the single key / index into the multi-key
-    /// Vec) as a cloned Value — the streaming driver's row builder.
-    pub(crate) fn key_slot(&self, gi: usize, s: usize) -> Value {
-        if let Some(keys) = &self.keys_flat {
-            keys.get(gi).clone()
-        } else {
-            self.keys_multi[gi].get(s).cloned().unwrap_or(Value::Null)
-        }
-    }
-
-    /// Finalize aggregate `i` of group `gi` (the driver-side twin of
-    /// `finish_group_result`'s per-row finalize).
-    pub(crate) fn finalize_slot(&self, gi: usize, i: usize, func: &str) -> Value {
-        finalize_agg(self.states.get(gi * self.n_aggs + i), func)
     }
 
     #[inline]
@@ -4659,6 +4824,11 @@ impl HashGrouper {
         }) {
             return gi;
         }
+        // Temp-store: freeze before the table grows past the threshold
+        // (the incoming key starts the fresh epoch).
+        if self.freeze_due() {
+            self.freeze();
+        }
         // New group.
         let gi = self.keys_multi.len();
         self.keys_multi.push(key.to_vec());
@@ -4687,6 +4857,11 @@ impl HashGrouper {
         }) {
             return gi;
         }
+        // Temp-store: freeze before the table grows past the threshold
+        // (the incoming key starts the fresh epoch).
+        if self.freeze_due() {
+            self.freeze();
+        }
         let keys = self
             .keys_flat
             .get_or_insert_with(|| ChunkVec::new(9, Value::Null));
@@ -4711,6 +4886,567 @@ impl HashGrouper {
         }
         gi
     }
+
+    /// Consume the grouper into a group iterator. RAM-only groupers walk
+    /// first-seen order exactly as before; spilled groupers run the
+    /// k-way chunk merge (key-ordered output, like SQLite's ephemeral
+    /// sorter path — GROUP BY output order is unspecified in SQL).
+    pub(crate) fn into_group_iter(self) -> GroupIter {
+        let agg_ctx = self.agg_ctx.clone();
+        GroupIter::new(self, agg_ctx)
+    }
+}
+
+// ============================================================================
+// Temp-store record codec
+// ============================================================================
+//
+// One spilled record = (first-seen seq, group key(s), aggregate states).
+// Values and states encode with fixed-width little-endian fields so a
+// chunk decodes without trusting anything but its own framing (the
+// record length prefix comes from the temp-store layer).
+
+const V_NULL: u8 = 0;
+const V_INT: u8 = 1;
+const V_REAL: u8 = 2;
+const V_TEXT: u8 = 3;
+const V_BLOB: u8 = 4;
+
+#[inline]
+fn encode_value_into(buf: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Null => buf.push(V_NULL),
+        Value::Integer(i) => {
+            buf.push(V_INT);
+            buf.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Real(f) => {
+            buf.push(V_REAL);
+            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Value::Text(s) => {
+            buf.push(V_TEXT);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Blob(b) => {
+            buf.push(V_BLOB);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+    }
+}
+
+#[inline]
+fn decode_value(cur: &mut &[u8]) -> Option<Value> {
+    let tag = *cur.first()?;
+    *cur = &cur[1..];
+    match tag {
+        V_NULL => Some(Value::Null),
+        V_INT => {
+            if cur.len() < 8 {
+                return None;
+            }
+            let (b, rest) = cur.split_at(8);
+            *cur = rest;
+            Some(Value::Integer(i64::from_le_bytes(b.try_into().unwrap())))
+        }
+        V_REAL => {
+            if cur.len() < 8 {
+                return None;
+            }
+            let (b, rest) = cur.split_at(8);
+            *cur = rest;
+            Some(Value::Real(f64::from_bits(u64::from_le_bytes(
+                b.try_into().unwrap(),
+            ))))
+        }
+        V_TEXT | V_BLOB => {
+            if cur.len() < 4 {
+                return None;
+            }
+            let (lb, rest) = cur.split_at(4);
+            *cur = rest;
+            let len = u32::from_le_bytes(lb.try_into().unwrap()) as usize;
+            if cur.len() < len {
+                return None;
+            }
+            let (b, rest) = cur.split_at(len);
+            *cur = rest;
+            if tag == V_TEXT {
+                Some(Value::Text(String::from_utf8_lossy(b).into_owned().into()))
+            } else {
+                Some(Value::Blob(b.to_vec()))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Presence bitmap for the cold half's optional fields.
+const C_MIN: u16 = 1 << 0;
+const C_MAX: u16 = 1 << 1;
+const C_DISTINCT: u16 = 1 << 2;
+const C_CONCAT: u16 = 1 << 3;
+const C_CONCAT_SEP: u16 = 1 << 4;
+const C_CONCAT_BLOB: u16 = 1 << 5;
+const C_NUMS: u16 = 1 << 6;
+const C_PCT: u16 = 1 << 7;
+
+#[inline]
+fn encode_agg_state_into(buf: &mut Vec<u8>, s: &AggState) {
+    buf.extend_from_slice(&s.count.to_le_bytes());
+    buf.extend_from_slice(&s.sum.to_bits().to_le_bytes());
+    buf.extend_from_slice(&s.int_sum.to_le_bytes());
+    let mut flags = 0u8;
+    flags |= u8::from(s.sum_is_int);
+    flags |= u8::from(s.seen_value) << 1;
+    let cold = s.cold();
+    flags |= u8::from(cold.is_some()) << 2;
+    buf.push(flags);
+    if let Some(c) = cold {
+        let mut bits = 0u16;
+        if c.min.is_some() {
+            bits |= C_MIN;
+        }
+        if c.max.is_some() {
+            bits |= C_MAX;
+        }
+        if c.distinct.is_some() {
+            bits |= C_DISTINCT;
+        }
+        if c.concat.is_some() {
+            bits |= C_CONCAT;
+        }
+        if c.concat_sep.is_some() {
+            bits |= C_CONCAT_SEP;
+        }
+        if c.concat_blob.is_some() {
+            bits |= C_CONCAT_BLOB;
+        }
+        if c.nums.is_some() {
+            bits |= C_NUMS;
+        }
+        if c.pct.is_some() {
+            bits |= C_PCT;
+        }
+        buf.extend_from_slice(&bits.to_le_bytes());
+        if let Some(v) = &c.min {
+            encode_value_into(buf, v);
+        }
+        if let Some(v) = &c.max {
+            encode_value_into(buf, v);
+        }
+        if let Some(set) = &c.distinct {
+            buf.extend_from_slice(&(set.len() as u32).to_le_bytes());
+            for k in set {
+                encode_value_into(buf, &k.0);
+            }
+        }
+        if let Some(s) = &c.concat {
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        if let Some(s) = &c.concat_sep {
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        if let Some(b) = &c.concat_blob {
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        if let Some(nums) = &c.nums {
+            buf.extend_from_slice(&(nums.len() as u32).to_le_bytes());
+            for f in nums {
+                buf.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+        }
+        if let Some(p) = c.pct {
+            buf.extend_from_slice(&p.to_bits().to_le_bytes());
+        }
+    }
+}
+
+#[inline]
+fn decode_agg_state(cur: &mut &[u8]) -> Option<AggState> {
+    fn take_u32(cur: &mut &[u8]) -> Option<u32> {
+        if cur.len() < 4 {
+            return None;
+        }
+        let (b, rest) = cur.split_at(4);
+        *cur = rest;
+        Some(u32::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn take_u64(cur: &mut &[u8]) -> Option<u64> {
+        if cur.len() < 8 {
+            return None;
+        }
+        let (b, rest) = cur.split_at(8);
+        *cur = rest;
+        Some(u64::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn take_bytes<'a>(cur: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        if cur.len() < len {
+            return None;
+        }
+        let (b, rest) = cur.split_at(len);
+        *cur = rest;
+        Some(b)
+    }
+    let count = take_u64(cur)? as i64;
+    let sum = f64::from_bits(take_u64(cur)?);
+    let int_sum = take_u64(cur)? as i64;
+    if cur.is_empty() {
+        return None;
+    }
+    let flags = cur[0];
+    *cur = &cur[1..];
+    let mut s = AggState {
+        count,
+        sum,
+        int_sum,
+        ..Default::default()
+    };
+    s.sum_is_int = flags & 0b1 != 0;
+    s.seen_value = flags & 0b10 != 0;
+    if flags & 0b100 != 0 {
+        let bits = u16::from_le_bytes(take_bytes(cur, 2)?.try_into().unwrap());
+        let mut cold = AggCold::default();
+        if bits & C_MIN != 0 {
+            cold.min = Some(decode_value(cur)?);
+        }
+        if bits & C_MAX != 0 {
+            cold.max = Some(decode_value(cur)?);
+        }
+        if bits & C_DISTINCT != 0 {
+            let n = take_u32(cur)? as usize;
+            let mut set = std::collections::HashSet::with_capacity(n);
+            for _ in 0..n {
+                set.insert(SqlValueKey(decode_value(cur)?));
+            }
+            cold.distinct = Some(set);
+        }
+        if bits & C_CONCAT != 0 {
+            let n = take_u32(cur)? as usize;
+            cold.concat = Some(String::from_utf8_lossy(take_bytes(cur, n)?).into_owned());
+        }
+        if bits & C_CONCAT_SEP != 0 {
+            let n = take_u32(cur)? as usize;
+            cold.concat_sep = Some(String::from_utf8_lossy(take_bytes(cur, n)?).into_owned());
+        }
+        if bits & C_CONCAT_BLOB != 0 {
+            let n = take_u32(cur)? as usize;
+            cold.concat_blob = Some(take_bytes(cur, n)?.to_vec());
+        }
+        if bits & C_NUMS != 0 {
+            let n = take_u32(cur)? as usize;
+            let mut nums = Vec::with_capacity(n);
+            for _ in 0..n {
+                nums.push(f64::from_bits(take_u64(cur)?));
+            }
+            cold.nums = Some(nums);
+        }
+        if bits & C_PCT != 0 {
+            cold.pct = Some(f64::from_bits(take_u64(cur)?));
+        }
+        s.cold = Some(Box::new(cold));
+    }
+    Some(s)
+}
+
+/// Encode one spilled group (single-key form).
+fn encode_group_into<'a, F: Fn(usize) -> &'a AggState>(
+    buf: &mut Vec<u8>,
+    seq: u64,
+    key: &Value,
+    state_at: F,
+    n_aggs: usize,
+) {
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.push(1);
+    encode_value_into(buf, key);
+    for i in 0..n_aggs {
+        encode_agg_state_into(buf, state_at(i));
+    }
+}
+
+/// Encode one spilled group (multi-key form).
+fn encode_group_into_multi<'a, F: Fn(usize) -> &'a AggState>(
+    buf: &mut Vec<u8>,
+    seq: u64,
+    keys: &[Value],
+    state_at: F,
+    n_aggs: usize,
+) {
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.push(keys.len() as u8);
+    for k in keys {
+        encode_value_into(buf, k);
+    }
+    for i in 0..n_aggs {
+        encode_agg_state_into(buf, state_at(i));
+    }
+}
+
+/// Decode one spilled record.
+fn decode_group(rec: &[u8], n_aggs: usize) -> Option<(u64, Vec<Value>, Vec<AggState>)> {
+    let cur = &mut &rec[..];
+    if cur.len() < 9 {
+        return None;
+    }
+    let (sb, rest) = cur.split_at(8);
+    *cur = rest;
+    let seq = u64::from_le_bytes(sb.try_into().unwrap());
+    let n_keys = cur[0] as usize;
+    *cur = &cur[1..];
+    let mut keys = Vec::with_capacity(n_keys);
+    for _ in 0..n_keys {
+        keys.push(decode_value(cur)?);
+    }
+    let mut states = Vec::with_capacity(n_aggs);
+    for _ in 0..n_aggs {
+        states.push(decode_agg_state(cur)?);
+    }
+    Some((seq, keys, states))
+}
+
+// ============================================================================
+// GroupIter — the grouper's output cursor (RAM walk or chunk merge)
+// ============================================================================
+
+/// One group emitted to a consumer: its key values and per-aggregate
+/// states, ready for `finalize_agg` or `merge_agg_state`.
+pub(crate) struct GroupIter {
+    mode: GroupIterMode,
+    n_aggs: usize,
+    /// Merge context — only meaningful in spill mode.
+    agg_ctx: Vec<AggMergeCtx>,
+    /// Record scratch for chunk reads.
+    rec_buf: Vec<u8>,
+}
+
+enum GroupIterMode {
+    /// Pure in-RAM grouper: first-seen order walk (identical to the
+    /// pre-spill behavior).
+    Ram { grouper: HashGrouper, gi: usize },
+    /// Spilled: one stream per frozen chunk plus the residual RAM epoch;
+    /// emitted in key order (SQLite's ephemeral-sorter output order),
+    /// equal keys re-merged with `merge_agg_state`.
+    Spill { streams: Vec<MergeStream> },
+}
+
+struct SpilledGroup {
+    seq: u64,
+    keys: Vec<Value>,
+    states: Vec<AggState>,
+}
+
+/// One merge input: a frozen chunk's records, or the residual RAM epoch.
+struct MergeStream {
+    src: StreamSrc,
+    head: Option<SpilledGroup>,
+}
+
+enum StreamSrc {
+    Chunk(crate::storage::tempstore::RecordReader),
+    RamTail {
+        keys_flat: Option<ChunkVec<Value>>,
+        keys_multi: Vec<Vec<Value>>,
+        states: ChunkVec<AggState>,
+        gi: usize,
+        base: u64,
+    },
+}
+
+impl GroupIter {
+    fn new(grouper: HashGrouper, agg_ctx: Vec<AggMergeCtx>) -> Self {
+        let n_aggs = grouper.n_aggs.max(1);
+        match grouper.spill {
+            Some(ef) => {
+                // Spill mode: one reader per chunk + the RAM tail.
+                let n_chunks = ef.chunk_count();
+                let mut streams = Vec::with_capacity(n_chunks + 1);
+                for ci in 0..n_chunks {
+                    // An unreadable chunk contributes nothing (freeze
+                    // already disarmed on write errors, so this is fd
+                    // exhaustion at read time — the RAM tail still holds
+                    // every group interned after the LAST successful
+                    // freeze, and earlier chunks are independently
+                    // readable).
+                    if let Ok(r) = ef.reader(ci) {
+                        streams.push(MergeStream {
+                            src: StreamSrc::Chunk(r),
+                            head: None,
+                        });
+                    }
+                }
+                streams.push(MergeStream {
+                    src: StreamSrc::RamTail {
+                        keys_flat: grouper.keys_flat,
+                        keys_multi: grouper.keys_multi,
+                        states: grouper.states,
+                        gi: 0,
+                        base: grouper.epoch_seq_base,
+                    },
+                    head: None,
+                });
+                Self {
+                    mode: GroupIterMode::Spill { streams },
+                    n_aggs,
+                    agg_ctx,
+                    rec_buf: Vec::with_capacity(256),
+                }
+            }
+            None => Self {
+                mode: GroupIterMode::Ram { grouper, gi: 0 },
+                n_aggs,
+                agg_ctx,
+                rec_buf: Vec::new(),
+            },
+        }
+    }
+
+    /// Next group, or `None` at exhaustion. Spill mode merges duplicate
+    /// keys across streams and emits in (key, seq) order.
+    pub(crate) fn next_group(&mut self) -> Option<(Vec<Value>, Vec<AggState>)> {
+        match &mut self.mode {
+            GroupIterMode::Ram { grouper, gi } => {
+                let n = grouper.group_count();
+                if *gi >= n {
+                    return None;
+                }
+                let keys = match &grouper.keys_flat {
+                    Some(flat) => vec![flat.get(*gi).clone()],
+                    None => grouper.keys_multi[*gi].clone(),
+                };
+                let n_aggs = self.n_aggs;
+                let mut states = Vec::with_capacity(n_aggs);
+                for i in 0..n_aggs {
+                    states.push(grouper.states.get(*gi * n_aggs + i).clone());
+                }
+                *gi += 1;
+                Some((keys, states))
+            }
+            GroupIterMode::Spill { streams } => {
+                // Fill every stream's head (disjoint field borrows: the
+                // streams live in `self.mode`, the record scratch in
+                // `self.rec_buf`).
+                let rec_buf = &mut self.rec_buf;
+                let n_aggs = self.n_aggs;
+                for s in streams.iter_mut() {
+                    if s.head.is_none() {
+                        fill_head_into(rec_buf, s, n_aggs);
+                    }
+                }
+                // Find the minimum (key, seq) head.
+                let mut min_i = None;
+                for (i, s) in streams.iter().enumerate() {
+                    if let Some(h) = &s.head {
+                        match min_i {
+                            None => min_i = Some(i),
+                            Some(mi) => {
+                                let m = streams[mi].head.as_ref().unwrap();
+                                if (cmp_keys(&h.keys, &m.keys), h.seq)
+                                    < (std::cmp::Ordering::Equal, m.seq)
+                                {
+                                    min_i = Some(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mi = min_i?;
+                let mut winner = streams[mi].head.take().expect("head checked above");
+                // Fold every other stream's sql-equal key into it.
+                for s in streams.iter_mut() {
+                    if s.head.is_none() {
+                        continue;
+                    }
+                    let same = {
+                        let h = s.head.as_ref().unwrap();
+                        h.keys.len() == winner.keys.len()
+                            && h.keys
+                                .iter()
+                                .zip(winner.keys.iter())
+                                .all(|(a, b)| crate::types::values_sql_equal(a, b))
+                    };
+                    if same {
+                        let dup = s.head.take().unwrap();
+                        for (i, ctx) in self.agg_ctx.iter().enumerate() {
+                            if i >= winner.states.len() {
+                                break;
+                            }
+                            crate::executor::parallel::merge_agg_state(
+                                &mut winner.states[i],
+                                &dup.states[i],
+                                ctx.func,
+                                ctx.distinct,
+                                ctx.sep.as_deref(),
+                            );
+                        }
+                    }
+                }
+                Some((winner.keys, winner.states))
+            }
+        }
+    }
+}
+
+/// Free-function form — callable while the caller holds `&mut self.mode`'s
+/// streams (disjoint-field borrow).
+fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
+    match &mut s.src {
+        StreamSrc::Chunk(r) => {
+            if let Ok(Some(())) = r.next_record(rec_buf) {
+                if let Some((seq, keys, states)) = decode_group(rec_buf, n_aggs) {
+                    s.head = Some(SpilledGroup { seq, keys, states });
+                }
+            }
+        }
+        StreamSrc::RamTail {
+            keys_flat,
+            keys_multi,
+            states,
+            gi,
+            base,
+        } => {
+            let n = match keys_flat {
+                Some(flat) => flat.len(),
+                None => keys_multi.len(),
+            };
+            if *gi >= n {
+                return;
+            }
+            let keys = match keys_flat {
+                Some(flat) => vec![flat.get(*gi).clone()],
+                None => keys_multi[*gi].clone(),
+            };
+            let mut st = Vec::with_capacity(n_aggs);
+            for i in 0..n_aggs {
+                st.push(states.get(*gi * n_aggs + i).clone());
+            }
+            s.head = Some(SpilledGroup {
+                seq: *base + *gi as u64,
+                keys,
+                states: st,
+            });
+            *gi += 1;
+        }
+    }
+}
+
+/// Lexicographic SQLite value ordering over two key tuples (the merge's
+/// primary order — spilled output comes out key-sorted, exactly like
+/// SQLite's ephemeral sorter).
+fn cmp_keys(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        match a[i].cmp(&b[i]) {
+            std::cmp::Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 impl Default for AggState {
@@ -4884,8 +5620,7 @@ pub(crate) fn scan_groupby_grouper(
         Vec::new()
     };
 
-    let n_aggs = aggregates.len();
-    let mut grouper = HashGrouper::with_aggs(n_aggs);
+    let mut grouper = HashGrouper::armed_grouper(ctx, aggregates);
 
     // Scratch buffers, reused across rows.
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
@@ -5309,60 +6044,47 @@ fn finish_group_result(
     aggregates: &[AggExpr],
     projection: Option<&GroupProjection>,
 ) -> Result<ExecResult> {
-    let n_groups = grouper.len();
-    let n_aggs = grouper.n_aggs;
+    // The iterator walks the grouper's RAM table (first-seen order) or,
+    // when the temp store spilled, the chunk merge (key order) — either
+    // way rows materialize one group at a time and the state memory
+    // behind them is released as the walk advances.
+    let mut iter = grouper.into_group_iter();
     if let Some(proj) = projection {
         let n_out = proj.src.len().max(1);
         let n_group = group_by.len();
-        let mut out_rows = Vec::with_capacity(n_groups);
-        for gi in 0..n_groups {
+        let mut out_rows = Vec::new();
+        while let Some((keys, states)) = iter.next_group() {
             let mut row: Vec<Value> = Vec::with_capacity(n_out);
             for &s in proj.src.iter() {
                 if s < n_group {
-                    if let Some(keys) = &grouper.keys_flat {
-                        row.push(keys.get(gi).clone());
-                    } else {
-                        row.push(
-                            grouper.keys_multi[gi]
-                                .get(s)
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                        );
-                    }
+                    row.push(keys.get(s).cloned().unwrap_or(Value::Null));
                 } else {
                     let i = s - n_group;
-                    row.push(finalize_agg(
-                        grouper.states.get(gi * n_aggs + i),
-                        &aggregates[i].func,
-                    ));
+                    row.push(finalize_agg(&states[i], &aggregates[i].func));
                 }
             }
             out_rows.push(row);
         }
-        drop(grouper);
+        drop(iter);
         return Ok(ExecResult {
             columns: proj.names.clone().into(),
             rows: out_rows,
         });
     }
     let n_out = group_by.len() + aggregates.len();
-    let mut out_rows = Vec::with_capacity(n_groups);
-    for gi in 0..n_groups {
+    let mut out_rows = Vec::new();
+    while let Some((keys, states)) = iter.next_group() {
         // Exact capacity: key width + one slot per aggregate (a Vec::new
         // + push grows to a 128 B class — 2x the exact-capacity bytes at
         // 10k+ groups).
         let mut row: Vec<Value> = Vec::with_capacity(n_out.max(1));
-        if let Some(keys) = &grouper.keys_flat {
-            row.push(keys.get(gi).clone());
-        } else {
-            row.extend(grouper.keys_multi[gi].iter().cloned());
-        }
+        row.extend(keys.iter().cloned());
         for (i, agg) in aggregates.iter().enumerate() {
-            row.push(finalize_agg(grouper.states.get(gi * n_aggs + i), &agg.func));
+            row.push(finalize_agg(&states[i], &agg.func));
         }
         out_rows.push(row);
     }
-    drop(grouper);
+    drop(iter);
 
     let mut out_cols = Vec::new();
     for (i, g) in group_by.iter().enumerate() {
@@ -7711,7 +8433,7 @@ fn stddev_of(nums: &[f64], sample: bool) -> Option<f64> {
     Some(var.sqrt())
 }
 
-fn finalize_agg(state: &AggState, func: &str) -> Value {
+pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
     match func {
         "count" => Value::Integer(state.count),
         "sum" => {
@@ -14020,7 +14742,7 @@ fn try_streaming_update(
             let eval_ctx =
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
-            for e in key_exprs {
+            for e in key_exprs.iter() {
                 let v = evaluate(e, &eval_ctx)?;
                 if v.is_null() {
                     continue;
@@ -15708,7 +16430,7 @@ fn try_streaming_delete(
             let eval_ctx =
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
-            for e in key_exprs {
+            for e in key_exprs.iter() {
                 let v = evaluate(e, &eval_ctx)?;
                 if v.is_null() {
                     continue;

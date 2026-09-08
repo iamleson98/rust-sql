@@ -421,9 +421,21 @@ pub(crate) fn try_parallel_groupby_selective(
             let seps: Vec<Option<String>> = (0..aggregates.len())
                 .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
                 .collect();
+            // Workers take the same temp-store discipline as the serial
+            // path (spill-armed unless PRAGMA temp_store=MEMORY), so a
+            // high-cardinality parallel GROUP BY stays bounded too.
+            let spill_ok = !ctx.pager.temp_store_memory();
+            let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> Result<HashGrouper> {
                 let mut bt = Btree::new(pager, root, false);
-                let mut grouper = HashGrouper::with_aggs(n_aggs);
+                let mut grouper = if spill_ok {
+                    HashGrouper::with_spill_for(
+                        aggregates_for_grouper,
+                        super::group_spill_threshold(),
+                    )
+                } else {
+                    HashGrouper::with_aggs(n_aggs)
+                };
                 let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
                 let mut key_buf: Vec<Value> = Vec::with_capacity(key_pos.len());
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
@@ -490,25 +502,26 @@ pub(crate) fn try_parallel_groupby_selective(
 
     // Merge in range order into a fresh grouper: for each worker group,
     // intern its key, then fold its AggStates into the destination.
-    let mut merged = HashGrouper::with_aggs(n_aggs);
-    let mut key_buf: Vec<Value> = Vec::with_capacity(key_pos.len().max(1));
+    // Spilled partials iterate through their own chunk merges, and the
+    // destination spills under the same threshold — the whole fold runs
+    // at bounded memory.
+    let spill_ok = !ctx.pager.temp_store_memory();
+    let mut merged = if spill_ok {
+        HashGrouper::with_spill_for(aggregates, super::group_spill_threshold())
+    } else {
+        HashGrouper::with_aggs(n_aggs)
+    };
     for g in groupers {
-        let n_groups = g.len();
-        for gi in 0..n_groups {
-            key_buf.clear();
-            match &g.keys_flat {
-                Some(flat) => key_buf.push(flat.get(gi).clone()),
-                None => key_buf.extend(g.keys_multi[gi].iter().cloned()),
-            }
-            let dst_gi = merged.intern_key(&key_buf);
+        let mut iter = g.into_group_iter();
+        while let Some((keys, states)) = iter.next_group() {
+            let dst_gi = merged.intern_key(&keys);
             for i in 0..n_aggs {
-                let src = g.states.get(gi * n_aggs + i);
                 // Safety of the split borrow: `merged.state` mutably
-                // borrows `merged`, `src` borrows `g` (a different
-                // object).
+                // borrows `merged`, `states` borrows the iterator's
+                // record (disjoint).
                 merge_agg_state(
                     merged.state(dst_gi, i),
-                    src,
+                    &states[i],
                     agg_funcs[i],
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),
@@ -532,7 +545,14 @@ pub(crate) fn try_parallel_groupby_selective(
 /// `update_agg_state` — the set-union is exactly the global distinct
 /// value set, and each replayed value updates the numeric state once,
 /// which is precisely what the serial scan computed.
-fn merge_agg_state(
+///
+/// The same fold is the temp-store spill merge's combiner (see
+/// `GroupIter`): two partial states of ONE group key, the earlier
+/// (lower seq / earlier range) as `dst`, the later as `src`. Every
+/// builtin aggregate is covered — `AggFunc::Other` (plugin aggregates)
+/// never reaches a HashGrouper (the plugin path has its own grouper),
+/// and spill-arming declines on it defensively.
+pub(crate) fn merge_agg_state(
     dst: &mut AggState,
     src: &AggState,
     func: AggFunc,
@@ -557,6 +577,65 @@ fn merge_agg_state(
         }
         AggFunc::Count => {
             dst.count = dst.count.saturating_add(src.count);
+        }
+        AggFunc::GroupConcat => {
+            // dst ++ sep ++ src — chunk/range order preserves scan order
+            // (all of dst's rows precede all of src's for one key).
+            if let Some(b) = src.cold().and_then(|c| c.concat.clone()) {
+                if !b.is_empty() {
+                    let c = dst.cold_mut();
+                    let joiner = c
+                        .concat_sep
+                        .clone()
+                        .or_else(|| sep.map(|s| s.to_string()))
+                        .unwrap_or_else(|| ",".to_string());
+                    let buf = c.concat.get_or_insert_with(String::new);
+                    if !buf.is_empty() {
+                        buf.push_str(&joiner);
+                        c.concat_sep = Some(joiner);
+                    }
+                    buf.push_str(&b);
+                }
+            }
+        }
+        AggFunc::JsonGroupArray | AggFunc::JsonGroupObject => {
+            // Elements/fragments join with ',' inside one container.
+            if let Some(b) = src.cold().and_then(|c| c.concat.clone()) {
+                if !b.is_empty() {
+                    let buf = dst.cold_mut().concat.get_or_insert_with(String::new);
+                    if !buf.is_empty() {
+                        buf.push(',');
+                    }
+                    buf.push_str(&b);
+                }
+            }
+        }
+        AggFunc::JsonbGroupArray | AggFunc::JsonbGroupObject => {
+            // Raw per-element frames — plain byte concatenation.
+            if let Some(b) = src.cold().and_then(|c| c.concat_blob.clone()) {
+                if !b.is_empty() {
+                    dst.cold_mut()
+                        .concat_blob
+                        .get_or_insert_with(Vec::new)
+                        .extend_from_slice(&b);
+                }
+            }
+        }
+        AggFunc::Stddev
+        | AggFunc::StddevPop
+        | AggFunc::Median
+        | AggFunc::PercentileCont
+        | AggFunc::PercentileDisc => {
+            // The collected-value multiset concatenates; the percentile
+            // P is constant per aggregate (kept from whichever side has
+            // it — dst first, matching update's first-write semantics).
+            if let Some(src_nums) = src.cold().and_then(|c| c.nums.clone()) {
+                let c = dst.cold_mut();
+                c.nums.get_or_insert_with(Vec::new).extend(src_nums);
+                if c.pct.is_none() {
+                    c.pct = src.cold().and_then(|sc| sc.pct);
+                }
+            }
         }
         _ => {
             dst.count = dst.count.saturating_add(src.count);
@@ -677,9 +756,19 @@ pub(crate) fn try_parallel_groupby_compiled(
             let seps: Vec<Option<String>> = (0..aggregates.len())
                 .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
                 .collect();
+            // Same temp-store discipline as the serial / selective paths.
+            let spill_ok = !ctx.pager.temp_store_memory();
+            let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> Result<HashGrouper> {
                 let mut bt = Btree::new(pager, root, false);
-                let mut grouper = HashGrouper::with_aggs(n_aggs);
+                let mut grouper = if spill_ok {
+                    HashGrouper::with_spill_for(
+                        aggregates_for_grouper,
+                        super::group_spill_threshold(),
+                    )
+                } else {
+                    HashGrouper::with_aggs(n_aggs)
+                };
                 let mut wide: Vec<Value> = vec![Value::Null; n_cols];
                 let mut key_buf: Vec<Value> = Vec::with_capacity(group_by_len.max(1));
                 let mut owned_key: Value = Value::Null;
@@ -773,23 +862,23 @@ pub(crate) fn try_parallel_groupby_compiled(
     }
 
     // Merge in range order (deterministic first-seen order, identical to
-    // the serial scan — see the module docs).
-    let mut merged = HashGrouper::with_aggs(n_aggs);
-    let mut key_buf: Vec<Value> = Vec::with_capacity(group_by_len.max(1));
+    // the serial scan — see the module docs). Spilled partials iterate
+    // through their chunk merges; the destination spills under the same
+    // threshold.
+    let spill_ok = !ctx.pager.temp_store_memory();
+    let mut merged = if spill_ok {
+        HashGrouper::with_spill_for(aggregates, super::group_spill_threshold())
+    } else {
+        HashGrouper::with_aggs(n_aggs)
+    };
     for g in groupers {
-        let n_groups = g.len();
-        for gi in 0..n_groups {
-            key_buf.clear();
-            match &g.keys_flat {
-                Some(flat) => key_buf.push(flat.get(gi).clone()),
-                None => key_buf.extend(g.keys_multi[gi].iter().cloned()),
-            }
-            let dst_gi = merged.intern_key(&key_buf);
+        let mut iter = g.into_group_iter();
+        while let Some((keys, states)) = iter.next_group() {
+            let dst_gi = merged.intern_key(&keys);
             for i in 0..n_aggs {
-                let src = g.states.get(gi * n_aggs + i);
                 merge_agg_state(
                     merged.state(dst_gi, i),
-                    src,
+                    &states[i],
                     agg_funcs[i],
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),

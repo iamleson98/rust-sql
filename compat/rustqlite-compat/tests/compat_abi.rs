@@ -211,6 +211,25 @@ fn step_all_text(stmt: &mut St) -> Vec<Vec<String>> {
 // Tests
 // ---------------------------------------------------------------------------
 
+// serialize/deserialize surface (this file's tests below).
+extern "C" {
+    fn sqlite3_serialize(
+        db: *mut compat::sqlite3,
+        schema: *const c_char,
+        size: *mut i64,
+        flags: c_int,
+    ) -> *mut u8;
+    fn sqlite3_deserialize(
+        db: *mut compat::sqlite3,
+        schema: *const c_char,
+        data: *mut u8,
+        db_size: i64,
+        sz: i64,
+        flags: c_int,
+    ) -> c_int;
+    fn sqlite3_free(p: *mut c_void);
+}
+
 #[test]
 fn abi_lifecycle_open_close() {
     let db = open_memory();
@@ -1616,4 +1635,166 @@ fn abi_probe_delete_in_subquery_returning() {
         );
     }
     assert!(rc == 100, "RETURNING must yield the deleted row");
+}
+
+// ---------------------------------------------------------------------------
+// sqlite3_serialize / sqlite3_deserialize
+// ---------------------------------------------------------------------------
+
+/// Serialize -> deserialize round trip through the C ABI: build data,
+/// take the image, open a FRESH connection, deserialize into it, and
+/// verify the data (plus post-deserialize writes + re-serialize).
+#[test]
+fn abi_serialize_deserialize_round_trip() {
+    let db = open_memory();
+    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&db, "BEGIN");
+    for i in 1..=50 {
+        exec(&db, &format!("INSERT INTO t (v) VALUES ('v{i}')"));
+    }
+    exec(&db, "COMMIT");
+
+    let mut size: i64 = -1;
+    let buf =
+        unsafe { sqlite3_serialize(db.0, CString::new("main").unwrap().as_ptr(), &mut size, 0) };
+    assert!(!buf.is_null(), "serialize returned NULL");
+    assert!(size > 0, "serialize size = {size}");
+    // The image must carry our native magic.
+    unsafe {
+        assert_eq!(&std::slice::from_raw_parts(buf, 8), b"RSQLDB04");
+    }
+
+    // Deserialize into a brand-new connection.
+    let db2 = open_memory();
+    let rc = unsafe {
+        sqlite3_deserialize(
+            db2.0,
+            ptr::null(),
+            buf,
+            size,
+            size,
+            1, // SQLITE_DESERIALIZE_FREEONCE: the buffer is freed for us
+        )
+    };
+    assert_eq!(rc, SQLITE_OK, "deserialize rc={rc}");
+
+    // The loaded connection answers queries.
+    exec(&db2, "SELECT * FROM t");
+    let csql = CString::new("SELECT COUNT(*), MAX(v) FROM t").unwrap();
+    let mut stmt: *mut compat::sqlite3_stmt = ptr::null_mut();
+    let rc = unsafe { sqlite3_prepare_v3(db2.0, csql.as_ptr(), -1, 0, &mut stmt, ptr::null_mut()) };
+    assert_eq!(rc, SQLITE_OK);
+    let st = St(stmt);
+    let rc = unsafe { sqlite3_step(st.0) };
+    assert_eq!(rc, SQLITE_ROW);
+    let n = unsafe { sqlite3_column_int64(st.0, 0) };
+    let mx = cstr(unsafe { sqlite3_column_text(st.0, 1) as *const c_char });
+    assert_eq!(n, 50);
+    // TEXT comparison is lexicographic: "v9" > "v50".
+    assert_eq!(mx, "v9");
+
+    // Post-deserialize writes persist and re-serialize returns them.
+    exec(&db2, "INSERT INTO t (v) VALUES ('post')");
+    let mut size2: i64 = -1;
+    let buf2 = unsafe { sqlite3_serialize(db2.0, ptr::null(), &mut size2, 0) };
+    assert!(!buf2.is_null());
+    let db3 = open_memory();
+    let rc = unsafe { sqlite3_deserialize(db3.0, ptr::null(), buf2, size2, size2, 0) };
+    assert_eq!(rc, SQLITE_OK);
+    let csql = CString::new("SELECT COUNT(*) FROM t").unwrap();
+    let mut stmt: *mut compat::sqlite3_stmt = ptr::null_mut();
+    let rc = unsafe { sqlite3_prepare_v3(db3.0, csql.as_ptr(), -1, 0, &mut stmt, ptr::null_mut()) };
+    assert_eq!(rc, SQLITE_OK);
+    let st = St(stmt);
+    assert_eq!(unsafe { sqlite3_step(st.0) }, SQLITE_ROW);
+    assert_eq!(unsafe { sqlite3_column_int64(st.0, 0) }, 51);
+    unsafe { sqlite3_free(buf2 as *mut c_void) };
+}
+
+/// Deserialize of a SQLite-format image (built through the engine's
+/// fileformat2 writer — the format real SQLite writes, verified against
+/// the real thing by the interop suite): the cross-engine image case.
+#[test]
+fn abi_deserialize_real_sqlite_image() {
+    // Build a genuine fileformat2 SQLite file.
+    let path = std::env::temp_dir().join(format!(
+        "compat-ser-real-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    {
+        let mut src = rustqlite::Database::open_sqlite_format(&path).unwrap();
+        src.execute("CREATE TABLE s (a INTEGER PRIMARY KEY, b TEXT)", ())
+            .unwrap();
+        src.execute(
+            "INSERT INTO s (b) VALUES ('alpha'), ('beta'), ('gamma')",
+            (),
+        )
+        .unwrap();
+    }
+    let image = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(&image[..16], b"SQLite format 3\0");
+
+    let db = open_memory();
+    let mut buf = image.clone();
+    let rc = unsafe {
+        sqlite3_deserialize(
+            db.0,
+            ptr::null(),
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            buf.len() as i64,
+            0,
+        )
+    };
+    assert_eq!(rc, SQLITE_OK, "real-SQLite image deserialize rc={rc}");
+
+    let csql = CString::new("SELECT b FROM s ORDER BY a").unwrap();
+    let mut stmt: *mut compat::sqlite3_stmt = ptr::null_mut();
+    let rc = unsafe { sqlite3_prepare_v3(db.0, csql.as_ptr(), -1, 0, &mut stmt, ptr::null_mut()) };
+    assert_eq!(rc, SQLITE_OK);
+    let st = St(stmt);
+    let mut got: Vec<String> = Vec::new();
+    loop {
+        let rc = unsafe { sqlite3_step(st.0) };
+        match rc {
+            SQLITE_ROW => got.push(cstr(unsafe {
+                sqlite3_column_text(st.0, 0) as *const c_char
+            })),
+            SQLITE_DONE => break,
+            other => panic!("step rc={other}"),
+        }
+    }
+    assert_eq!(got, vec!["alpha", "beta", "gamma"]);
+}
+
+/// Bad schema name / null data return the documented errors.
+#[test]
+fn abi_serialize_deserialize_argument_checks() {
+    let db = open_memory();
+    let rc = unsafe {
+        sqlite3_deserialize(
+            db.0,
+            CString::new("temp").unwrap().as_ptr(),
+            ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    };
+    const SQLITE_MISUSE: c_int = 21;
+    assert_eq!(rc, SQLITE_MISUSE);
+    let p = unsafe {
+        sqlite3_serialize(
+            db.0,
+            CString::new("temp").unwrap().as_ptr(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    assert!(p.is_null());
 }

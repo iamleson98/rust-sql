@@ -1455,7 +1455,7 @@ fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_expl
             walk_expr(expr, slots, max_explicit);
             match source {
                 rustqlite::sql::ast::InSource::List(items) => {
-                    for i in items {
+                    for i in items.iter() {
                         walk_expr(i, slots, max_explicit);
                     }
                 }
@@ -3342,26 +3342,128 @@ pub unsafe extern "C" fn sqlite3_preupdate_new(
     SQLITE_ERROR
 }
 
+/// `sqlite3_serialize` — the complete database image in a buffer the
+/// caller frees with `sqlite3_free`. `*piSize` receives the byte count.
+/// `SQLITE_SERIALIZE_NOCOPY` is a hint we are always free to ignore
+/// (the engine's image may live in a file — a copy is the only correct
+/// answer there). `zSchema` must be "main" (or NULL, which means main).
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_serialize(
-    _db: *mut sqlite3,
-    _schema: *const c_char,
-    _size: *mut i64,
-    _flags: c_int,
+    db: *mut sqlite3,
+    schema: *const c_char,
+    size: *mut i64,
+    flags: c_int,
 ) -> *mut c_uchar {
-    std::ptr::null_mut()
+    let _ = flags; // NOCOPY is a hint; a copy is always correct.
+    if !schema.is_null() {
+        let s = std::ffi::CStr::from_ptr(schema).to_bytes();
+        if !s.is_empty() && !s.eq_ignore_ascii_case(b"main") {
+            return std::ptr::null_mut();
+        }
+    }
+    let conn = &*(db as *const Conn);
+    let Some(engine) = &conn.engine else {
+        return std::ptr::null_mut();
+    };
+    let image = {
+        let guard = engine.db.read();
+        guard.image()
+    };
+    match image {
+        Ok(bytes) => {
+            if !size.is_null() {
+                *size = bytes.len() as i64;
+            }
+            // sqlite3_malloc's allocation discipline: capacity-backed
+            // Vec, forgotten here, freed by sqlite3_free.
+            let mut v = Vec::<u8>::with_capacity(bytes.len().max(1));
+            v.extend_from_slice(&bytes);
+            let p = v.as_mut_ptr() as *mut c_uchar;
+            std::mem::forget(v);
+            p
+        }
+        Err(_) => {
+            if !size.is_null() {
+                *size = 0;
+            }
+            std::ptr::null_mut()
+        }
+    }
 }
 
+/// `SQLITE_DESERIALIZE_FREEONCE` — free the caller's buffer after
+/// consuming it.
+const SQLITE_DESERIALIZE_FREEONCE: c_int = 1;
+
+/// `sqlite3_deserialize` — replace the connection's main database with
+/// an in-memory image. Both formats are accepted: the engine's native
+/// container (`RSQLDB04` — the `sqlite3_serialize` round-trip) and real
+/// SQLite images (the cross-engine case: serialize with real SQLite,
+/// deserialize here). SQLite-format buffers are staged through a unique
+/// temp file so the loaded connection keeps full read/write semantics
+/// (writes persist in the staging file; a later `sqlite3_serialize`
+/// returns them — SQLite's memory-backed deserialize contract, just
+/// with the memory living in the temp file).
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_deserialize(
-    _db: *mut sqlite3,
-    _schema: *const c_char,
-    _data: *mut u_uchar,
-    _db_size: i64,
+    db: *mut sqlite3,
+    schema: *const c_char,
+    data: *mut u_uchar,
+    db_size: i64,
     _sz: i64,
-    _flags: c_int,
+    flags: c_int,
 ) -> c_int {
-    SQLITE_ERROR
+    if data.is_null() || db_size <= 0 {
+        return SQLITE_MISUSE;
+    }
+    if !schema.is_null() {
+        let s = std::ffi::CStr::from_ptr(schema).to_bytes();
+        if !s.is_empty() && !s.eq_ignore_ascii_case(b"main") {
+            return SQLITE_ERROR;
+        }
+    }
+    let conn = &*(db as *const Conn);
+    let Some(engine) = &conn.engine else {
+        return SQLITE_ERROR;
+    };
+    let bytes = std::slice::from_raw_parts(data as *const u8, db_size as usize).to_vec();
+    let loaded = load_image_as_database(&bytes);
+    let result = match loaded {
+        Ok(new_db) => {
+            *engine.db.write() = new_db;
+            SQLITE_OK
+        }
+        Err(_) => SQLITE_CORRUPT,
+    };
+    if flags & SQLITE_DESERIALIZE_FREEONCE != 0 {
+        sqlite3_free(data as *mut c_void);
+    }
+    result
+}
+
+/// Build a `Database` from an image buffer: native magic seeds the
+/// in-memory store directly; SQLite-format images stage through a
+/// unique temp file (the interop bridge sniffs them on open).
+fn load_image_as_database(bytes: &[u8]) -> Result<rustqlite::Database, ()> {
+    if bytes.len() >= 8 && &bytes[..8] == b"RSQLDB04" {
+        rustqlite::Database::open_in_memory_with_image(bytes.to_vec()).map_err(|_| ())
+    } else if bytes.len() >= 16 && &bytes[..16] == b"SQLite format 3\0" {
+        let path = std::env::temp_dir().join(format!(
+            "rustqlite-deserialize-{}-{}.db",
+            std::process::id(),
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                N.fetch_add(1, Ordering::Relaxed)
+            }
+        ));
+        std::fs::write(&path, bytes).map_err(|_| ())?;
+        // The staging file's lifetime is the engine's (the OS temp
+        // cleaner reclaims any stragglers after process exit).
+        rustqlite::Database::open(&path).map_err(|_| ())
+    } else {
+        Err(())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -199,11 +199,98 @@ pub struct Catalog {
     triggers_by_table: HashMap<String, Vec<Arc<Trigger>>>,
     /// Schema cookie — bumped whenever the schema changes.
     pub schema_cookie: u32,
+    /// `sqlite_stat1` rows, keyed by index name (lowercase) — the
+    /// planner's cost model. Empty until `ANALYZE` runs (or a
+    /// stat1-bearing database opens). Written by ANALYZE's refresh and
+    /// by `load_schema`'s stat-table walk; read on every indexed lookup
+    /// plan decision.
+    stat1: HashMap<String, IndexStats>,
+}
+
+/// One `sqlite_stat1` row: the planner's estimate inputs for an index.
+/// `stat` text parses as `"rows D1 D2 …"` — `rows` is the OWNING table's
+/// row count, `Dk` the distinct-value count over the index's first `k`
+/// columns (SQLite's exact format).
+#[derive(Clone, Debug, Default)]
+pub struct IndexStats {
+    /// Owning table's row count at ANALYZE time.
+    pub rows: i64,
+    /// `D1..Dk` — distinct counts for the index's column prefixes.
+    /// Empty when the stat row carried only the table row count.
+    pub distinct_prefix: Vec<i64>,
+}
+
+impl IndexStats {
+    /// Parse the `stat` column text: `"N"` or `"N D1 D2 …"`.
+    pub fn parse(stat: &str) -> Self {
+        let mut it = stat.split_whitespace();
+        let rows = it.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        let distinct_prefix = it.filter_map(|s| s.parse::<i64>().ok()).collect::<Vec<_>>();
+        Self {
+            rows,
+            distinct_prefix,
+        }
+    }
+
+    /// SQLite's row-estimate model for an equality lookup over the first
+    /// `k` bound columns: `rows / (D1 × … × Dk)`, floored at 1. Missing
+    /// stats degrade to 0 (caller treats unknown as "no estimate").
+    pub fn estimate_eq(&self, k: usize) -> i64 {
+        if self.rows <= 0 {
+            return 0;
+        }
+        let mut est = self.rows as f64;
+        for d in self.distinct_prefix.iter().take(k) {
+            if *d <= 0 {
+                return 1;
+            }
+            est /= *d as f64;
+        }
+        est.max(1.0) as i64
+    }
+
+    /// Render back to the `stat` column text.
+    pub fn to_stat_text(&self) -> String {
+        let mut s = self.rows.to_string();
+        for d in &self.distinct_prefix {
+            s.push(' ');
+            s.push_str(&d.to_string());
+        }
+        s
+    }
 }
 
 impl Catalog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Statistics for one index (from the in-memory stat1 map). `None`
+    /// when ANALYZE has not covered this index.
+    pub fn index_stats(&self, index_name: &str) -> Option<IndexStats> {
+        self.stat1.get(&index_name.to_ascii_lowercase()).cloned()
+    }
+
+    /// Replace the whole in-memory stat map (ANALYZE's refresh path).
+    pub fn set_stat1(&mut self, rows: Vec<(String, IndexStats)>) {
+        self.stat1.clear();
+        for (name, s) in rows {
+            self.stat1.insert(name.to_ascii_lowercase(), s);
+        }
+    }
+
+    /// Current stat rows (index name, stats) — the targeted-ANALYZE merge
+    /// path reads the surviving rows before replacing the map.
+    pub fn stat1_snapshot(&self) -> Vec<(String, IndexStats)> {
+        self.stat1
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Drop all stats (schema invalidation, e.g. a table dropped).
+    pub fn clear_stat1(&mut self) {
+        self.stat1.clear();
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
