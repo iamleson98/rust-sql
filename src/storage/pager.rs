@@ -35,10 +35,6 @@ use crate::storage::page::{FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAG
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-// Seek/Read/Write are only needed by the non-unix fallback I/O helpers
-// below; the unix path uses positioned I/O (read_at/write_all_at).
-#[cfg(not(unix))]
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
