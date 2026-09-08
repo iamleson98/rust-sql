@@ -633,10 +633,16 @@ statistics gap; and **real sqlite3_serialize/deserialize** — the compat gap):
 - **Sequential read-ahead**: +1 page-access runs trigger a 4-page batched fetch into
   the pager cache — cold file-backed scans cut syscalls ~5x, gated to the plain
   (non-WAL, non-codec, version-less) page states only.
+- **Chunked SELECT streaming in the C ABI**: `sqlite3_step` on a read statement used to acquire the engine read-lock once *per row* (plus a `total_changes` read under another lock to bracket the step). The statement now refills a 64-row buffer under ONE read-lock acquisition and serves the buffered rows without re-locking — typical ORM page sizes (30–50 rows) complete in a single acquisition, and concurrent readers stop trading cache-line ping-pong on the lock. C semantics unchanged: one row per `step`, `Done` after the buffer drains, `reset` clears the buffer.
+- **Transaction-control classified at PREPARE**: `run_once` re-parsed every Once statement's SQL on every execution just to recognize BEGIN/COMMIT/ROLLBACK — a full lexer+parser round-trip twice per transaction. The flavor (`TxKind`) is now computed once at prepare time and carried on the statement handle.
 - **JSONB + `->`/`->>` (byte-identical to SQLite 3.45+)**: the full `jsonb_*` family and both path operators with SQLite's exact precedence — JSON work no longer round-trips through text parsing, and the differential tests pin the encoder's bytes against real SQLite.
 - **Index-point UPDATEs**: UPDATEs whose WHERE clause is an exact unique-index probe (`UPDATE ... WHERE version = ?`, `WHERE k IN (...)`) now stream through the index-point path — index seek, rowid fetch, payload patch — instead of the general materialize-then-match path, mirroring what `try_streaming_delete` already did.
 - **IN-list probes keep every key's matches**: the per-key rowid probes used to clear a shared out-buffer on each call, so `WHERE k IN ('a','b')` only ever applied the last key's rows; each key now gets its own scratch buffer (a correctness fix that is also a throughput fix — no re-probing).
 - **Steady-state benchmarking**: the harness's adaptive warmup (above) removed cold-start noise from every µs-scale row — measurements now track engine quality, not runner mood.
+
+### Observability
+
+- **`sqlite3::engine_stats()` C-ABI surface**: process-global atomic counters (connections opened/closed/live, statements prepared, steps, rows returned, writes executed, transactions begun/committed/rolled back, busy waits + timeouts) plus per-file snapshots (page size/count, freelist, cache pages/capacity/hits/misses, WAL frames, `total_changes`, live connections, transaction-active). One relaxed atomic per hot-path event — the same ~1 ns trade SQLite's own `SQLITE_STATUS` counters make — so it's always-on, not sampled. Consumers: the rust-be-template admin dashboard's `/api/admin/system` endpoint (memory used / throughput / performance capacity cards).
 
 ### Resource consumption
 

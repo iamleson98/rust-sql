@@ -161,6 +161,145 @@ pub fn engine_source_id() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Engine metrics (admin stats: memory, throughput, capacity)
+// ---------------------------------------------------------------------------
+
+/// Process-global counters for the C-ABI surface. Every sqlite3_* call in
+/// this crate bumps exactly one of these with a single relaxed atomic —
+/// the "observability tax" on the hot path is ~1 ns per step, the same
+/// trade SQLite's own SQLITE_STATUS counters make. Read via
+/// [`engine_stats`] and served by consumers (the rust-be-template admin
+/// dashboard's `/api/admin/system` endpoint).
+pub mod metrics {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Total `sqlite3_open*` calls that produced a live connection.
+    pub static CONNECTIONS_OPENED: AtomicU64 = AtomicU64::new(0);
+    /// Connections fully dropped (last Arc<Conn> released).
+    pub static CONNECTIONS_CLOSED: AtomicU64 = AtomicU64::new(0);
+    /// Successful `sqlite3_prepare*` calls (statement handles created).
+    pub static STATEMENTS_PREPARED: AtomicU64 = AtomicU64::new(0);
+    /// Total `sqlite3_step` calls (statement-execution progress).
+    pub static STEPS: AtomicU64 = AtomicU64::new(0);
+    /// Rows handed to the caller (steps that returned SQLITE_ROW).
+    pub static ROWS_RETURNED: AtomicU64 = AtomicU64::new(0);
+    /// Write statements executed to completion (DML / DDL / write pragmas).
+    pub static WRITES_EXECUTED: AtomicU64 = AtomicU64::new(0);
+    /// BEGIN statements accepted (transactions started).
+    pub static TX_BEGUN: AtomicU64 = AtomicU64::new(0);
+    /// COMMIT statements accepted.
+    pub static TX_COMMITTED: AtomicU64 = AtomicU64::new(0);
+    /// ROLLBACK statements accepted (incl. abandoned-txn auto-rollback).
+    pub static TX_ROLLED_BACK: AtomicU64 = AtomicU64::new(0);
+    /// Times a writer had to WAIT for a foreign transaction's slot.
+    pub static BUSY_WAITS: AtomicU64 = AtomicU64::new(0);
+    /// Waits that exhausted `busy_timeout` and returned SQLITE_BUSY.
+    pub static BUSY_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+    /// One relaxed increment — cheap enough for every step call.
+    #[inline]
+    pub(crate) fn bump(c: &AtomicU64) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-engine (per database file) snapshot. Only REGISTERED engines are
+/// reported — file-backed and named shared-memory databases. Private
+/// `:memory:` engines (one per connection, test-only shapes) are not in
+/// the registry and are intentionally omitted.
+#[derive(Debug, Clone)]
+pub struct EngineFileStats {
+    /// Registry key (canonical file path, or the shared-memory name).
+    pub name: String,
+    /// Page size in bytes.
+    pub page_size: u32,
+    /// Pages in the database file.
+    pub page_count: u32,
+    /// Pages on the freelist (reclaimable space).
+    pub freelist_pages: u32,
+    /// Pages currently held in the shared page cache.
+    pub cache_pages: usize,
+    /// Cache capacity in pages (`PRAGMA cache_size`, `-65536` KiB form
+    /// resolved by the engine to pages).
+    pub cache_capacity_pages: usize,
+    /// Page-cache hits since open.
+    pub cache_hits: u64,
+    /// Page-cache misses (file/WAL reads) since open.
+    pub cache_misses: u64,
+    /// Frames currently in the write-ahead log.
+    pub wal_frames: u64,
+    /// Rows modified since open (SQLite's total_changes).
+    pub total_changes: i64,
+    /// Live C-ABI connections sharing this engine right now.
+    pub live_connections: usize,
+    /// True when a transaction owns the engine slot right now.
+    pub transaction_active: bool,
+}
+
+/// Process-wide engine statistics — the snapshot behind the admin
+/// dashboard's database cards (memory used, throughput, capacity).
+#[derive(Debug, Clone)]
+pub struct EngineStats {
+    pub connections_opened: u64,
+    pub connections_closed: u64,
+    pub statements_prepared: u64,
+    pub steps: u64,
+    pub rows_returned: u64,
+    pub writes_executed: u64,
+    pub transactions_begun: u64,
+    pub transactions_committed: u64,
+    pub transactions_rolled_back: u64,
+    pub busy_waits: u64,
+    pub busy_timeouts: u64,
+    /// One entry per registered engine, registry order.
+    pub files: Vec<EngineFileStats>,
+}
+
+/// Snapshot the process's engine activity + per-file resource usage.
+///
+/// Takes the engines registry lock briefly and each engine's `Database`
+/// read lock briefly (pager counters). Safe to call from any thread at
+/// any cadence — nothing blocks statement execution for long.
+pub fn engine_stats() -> EngineStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut files = Vec::new();
+    if let Ok(map) = engines().lock() {
+        for (name, engine) in map.iter() {
+            let db = engine.db.read();
+            let pager = db.pager();
+            files.push(EngineFileStats {
+                name: name.clone(),
+                page_size: db.page_size(),
+                page_count: db.page_count(),
+                freelist_pages: pager.freelist_count(),
+                cache_pages: pager.cache_size(),
+                cache_capacity_pages: pager.cache_capacity(),
+                cache_hits: pager.cache_hits(),
+                cache_misses: pager.cache_misses(),
+                wal_frames: pager.wal_frames(),
+                total_changes: db.total_changes(),
+                live_connections: engine.live_connections.load(Relaxed),
+                transaction_active: engine.tx_owner.load(std::sync::atomic::Ordering::Acquire) != 0,
+            });
+        }
+    }
+    EngineStats {
+        connections_opened: metrics::CONNECTIONS_OPENED.load(Relaxed),
+        connections_closed: metrics::CONNECTIONS_CLOSED.load(Relaxed),
+        statements_prepared: metrics::STATEMENTS_PREPARED.load(Relaxed),
+        steps: metrics::STEPS.load(Relaxed),
+        rows_returned: metrics::ROWS_RETURNED.load(Relaxed),
+        writes_executed: metrics::WRITES_EXECUTED.load(Relaxed),
+        transactions_begun: metrics::TX_BEGUN.load(Relaxed),
+        transactions_committed: metrics::TX_COMMITTED.load(Relaxed),
+        transactions_rolled_back: metrics::TX_ROLLED_BACK.load(Relaxed),
+        busy_waits: metrics::BUSY_WAITS.load(Relaxed),
+        busy_timeouts: metrics::BUSY_TIMEOUTS.load(Relaxed),
+        files,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Opaque C types
 // ---------------------------------------------------------------------------
 
@@ -203,6 +342,9 @@ struct Engine {
     /// (0 = none). Serializes cross-connection transactions with
     /// SQLite-style BUSY/busy_timeout semantics.
     tx_owner: AtomicUsize,
+    /// Live C-ABI connections sharing this engine — the "concurrency"
+    /// stat on the admin dashboard (each sqlx pool connection = one).
+    live_connections: AtomicUsize,
 }
 
 impl Engine {
@@ -313,6 +455,13 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        // Connection accounting (exactly once per connection — Drop runs
+        // when the LAST Arc<Conn> goes away, after every statement that
+        // cloned it has finalized).
+        if let Some(engine) = self.engine.as_ref() {
+            engine.live_connections.fetch_sub(1, Ordering::Relaxed);
+            metrics::bump(&metrics::CONNECTIONS_CLOSED);
+        }
         // Auto-rollback of an abandoned transaction (SQLite rolls back at
         // close when the connection had an open tx).
         if let Some(engine) = self
@@ -323,6 +472,7 @@ impl Drop for Conn {
         {
             let _ = engine.db.write().execute("ROLLBACK", []);
             engine.tx_owner.store(0, Ordering::Release);
+            metrics::bump(&metrics::TX_ROLLED_BACK);
         }
     }
 }
@@ -391,13 +541,28 @@ fn is_table_valued_read_pragma(name: &str) -> bool {
     )
 }
 
-/// Is this statement a transaction-control statement?
-fn is_tx_control(stmt: &rustqlite::sql::ast::Statement) -> bool {
+/// Transaction-control FLAVOR — classified once at PREPARE and carried on
+/// the statement handle so `run_once` never re-parses the SQL. BEGIN and
+/// COMMIT/ROLLBACK need slot bookkeeping; SAVEPOINT/RELEASE just execute
+/// under the write lock (SQLite semantics preserved from the old
+/// re-parse-and-match code).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TxKind {
+    Begin,
+    Commit,
+    Rollback,
+    SavepointOrRelease,
+}
+
+fn tx_kind_of(stmt: &rustqlite::sql::ast::Statement) -> Option<TxKind> {
     use rustqlite::sql::ast::Statement as S;
-    matches!(
-        stmt,
-        S::Begin(_) | S::Commit | S::Rollback(_) | S::Savepoint(_) | S::Release(_)
-    )
+    match stmt {
+        S::Begin(_) => Some(TxKind::Begin),
+        S::Commit => Some(TxKind::Commit),
+        S::Rollback(_) => Some(TxKind::Rollback),
+        S::Savepoint(_) | S::Release(_) => Some(TxKind::SavepointOrRelease),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +596,15 @@ struct Stmt {
     exec: Exec,
     /// True for statements that write (take the engine write lock).
     is_write: bool,
+    /// Transaction-control flavor, classified at PREPARE (Exec::Once
+    /// statements only) — replaces the per-execution re-parse that used
+    /// to happen in `run_once`. `None` for non-tx statements.
+    tx_kind: Option<TxKind>,
+    /// Chunked read path (SELECT streaming): rows fetched in batches of
+    /// [`READ_CHUNK`] under ONE read-lock acquisition, served one per
+    /// sqlite3_step call without re-locking. Empty for the write path
+    /// and for Once/Query kinds.
+    row_chunk: std::collections::VecDeque<Vec<Value>>,
     /// SQLite parameter table: one entry per `?`/`:name`/`@name`/`$var`
     /// parameter in order of appearance. Index (1-based) → slot.
     params: Vec<ParamSlot>,
@@ -452,8 +626,6 @@ struct Stmt {
     /// True once the first step ran.
     stepped: bool,
     done: bool,
-    /// total_changes snapshot at the last step's start (for changes).
-    total_at_step_start: i64,
     /// Exec::Query: the query ran on the first step.
     query_ran: bool,
     /// update_hook fired for this execution already.
@@ -462,9 +634,19 @@ struct Stmt {
     /// Done step of a RETURNING statement from clobbering it with 0 —
     /// SQLite keeps the statement's change count until the next run).
     changes_reported: bool,
-    /// Exec::Query: the row being served.
+    /// The row being served: Exec::Query's buffered row, or the chunked
+    /// read path's current row. `None` for the DML-RETURNING path (which
+    /// reads values straight off the engine statement).
     current_row: Option<Vec<Value>>,
 }
+
+/// Rows fetched per read-lock acquisition on the SELECT streaming path.
+/// 64 amortizes the RwLock acquire/release (and its cache-line traffic
+/// under concurrent readers) across 64 rows instead of 1, while keeping
+/// the lock-hold window short enough that writers never wait on a batch
+/// that outran its consumer. Typical ORM page sizes (30-50 rows) are
+/// fetched in a single acquisition.
+const READ_CHUNK: usize = 64;
 
 enum ParamSlot {
     /// Positional: engine positional index (0-based).
@@ -854,6 +1036,7 @@ fn acquire_engine(
                 Some(Arc::new(Engine {
                     db: parking_lot::RwLock::new(db),
                     tx_owner: AtomicUsize::new(0),
+                    live_connections: AtomicUsize::new(0),
                 })),
                 true,
             ))
@@ -867,6 +1050,7 @@ fn acquire_engine(
                 let e = Arc::new(Engine {
                     db: parking_lot::RwLock::new(db),
                     tx_owner: AtomicUsize::new(0),
+                    live_connections: AtomicUsize::new(0),
                 });
                 map.insert(key.clone(), e.clone());
                 Ok((Some(e), false))
@@ -886,6 +1070,7 @@ fn acquire_engine(
                 let e = Arc::new(Engine {
                     db: parking_lot::RwLock::new(db),
                     tx_owner: AtomicUsize::new(0),
+                    live_connections: AtomicUsize::new(0),
                 });
                 map.insert(key, e.clone());
                 Ok((Some(e), false))
@@ -899,6 +1084,12 @@ fn acquire_engine(
 // ---------------------------------------------------------------------------
 
 fn new_conn(engine: Option<Arc<Engine>>, readonly: bool) -> Arc<Conn> {
+    // Connection accounting: one live connection on its engine + the
+    // process-wide opened counter (decremented exactly once in Drop).
+    if let Some(e) = engine.as_ref() {
+        e.live_connections.fetch_add(1, Ordering::Relaxed);
+        metrics::bump(&metrics::CONNECTIONS_OPENED);
+    }
     Arc::new(Conn {
         id: next_conn_id(),
         engine,
@@ -1210,12 +1401,22 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let mut waited = false;
     loop {
         let owner = engine.tx_owner.load(Ordering::Acquire);
         if owner == 0 || owner == conn_id {
+            if waited {
+                // Waited at least one poll for a foreign transaction —
+                // concurrency-pressure signal for the admin stats.
+                metrics::bump(&metrics::BUSY_WAITS);
+            }
             return true;
         }
+        if !waited {
+            waited = true;
+        }
         if timeout_ms > 0 && std::time::Instant::now() >= deadline {
+            metrics::bump(&metrics::BUSY_TIMEOUTS);
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1585,6 +1786,9 @@ unsafe fn prepare_impl(
         kind,
         StmtKind::Dml { .. } | StmtKind::PragmaWrite | StmtKind::Once
     );
+    // Transaction-control flavor, computed once here (replaces the
+    // per-execution re-parse that run_once used to do).
+    let tx_kind = tx_kind_of(&ast);
     let params = collect_param_slots(&ast);
 
     let mut static_columns: Vec<CString> = Vec::new();
@@ -1718,6 +1922,7 @@ unsafe fn prepare_impl(
                     stmt_text,
                     kind,
                     is_write,
+                    tx_kind,
                     Exec::Rows(Box::new(erased)),
                     params,
                     static_columns,
@@ -1772,6 +1977,7 @@ unsafe fn prepare_impl(
         stmt_text,
         kind,
         is_write,
+        tx_kind,
         exec,
         params,
         static_columns,
@@ -1796,6 +2002,7 @@ unsafe fn finish_prepare(
     stmt_text: String,
     kind: StmtKind,
     is_write: bool,
+    tx_kind: Option<TxKind>,
     exec: Exec,
     params: Vec<ParamSlot>,
     static_columns: Vec<CString>,
@@ -1821,6 +2028,8 @@ unsafe fn finish_prepare(
         kind,
         exec,
         is_write,
+        tx_kind,
+        row_chunk: std::collections::VecDeque::new(),
         params,
         static_columns,
         value_pool: Vec::new(),
@@ -1829,13 +2038,13 @@ unsafe fn finish_prepare(
         last_step_err: SQLITE_OK,
         stepped: false,
         done: false,
-        total_at_step_start: 0,
         query_ran: false,
         hook_fired: false,
         changes_reported: false,
         current_row: None,
     });
     stmt.conn.live_statements.fetch_add(1, Ordering::AcqRel);
+    metrics::bump(&metrics::STATEMENTS_PREPARED);
     *pp_stmt = Box::into_raw(stmt) as *mut sqlite3_stmt;
     conn.clear_err();
     SQLITE_OK
@@ -1887,6 +2096,10 @@ fn free_value_pool(stmt: &mut Stmt) {
 
 /// Run the "Once" path: execute one statement through the mutable path,
 /// applying transaction bookkeeping. Returns the result code.
+///
+/// Transaction control is classified ONCE at PREPARE (`Stmt::tx_kind`) —
+/// this used to re-parse the SQL on every execution (twice per
+/// transaction: BEGIN + COMMIT), a parse round-trip saved on each.
 fn run_once(stmt: &mut Stmt) -> c_int {
     let engine = stmt.engine.clone().expect("engine");
     let conn = stmt.conn.clone();
@@ -1897,13 +2110,8 @@ fn run_once(stmt: &mut Stmt) -> c_int {
 
     // Transaction-control handling: BEGIN waits for the engine-level tx
     // slot (cross-connection serialization, SQLite-style BUSY).
-    let ast = rustqlite::sql::parser::parse(&sql).ok();
-    let is_tx = ast.as_ref().map(is_tx_control).unwrap_or(false);
-    if is_tx {
-        let is_begin = matches!(ast, Some(rustqlite::sql::ast::Statement::Begin(_)));
-        let is_commit = matches!(ast, Some(rustqlite::sql::ast::Statement::Commit));
-        let is_rollback = matches!(ast, Some(rustqlite::sql::ast::Statement::Rollback(_)));
-        if is_begin {
+    if let Some(tx) = stmt.tx_kind {
+        if tx == TxKind::Begin {
             if conn.state.in_tx.load(Ordering::Acquire) {
                 return conn.set_err(
                     SQLITE_ERROR,
@@ -1921,17 +2129,25 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         };
         match result {
             Ok(()) => {
-                if is_begin {
-                    engine.tx_owner.store(conn.id, Ordering::Release);
-                    conn.state.in_tx.store(true, Ordering::Release);
-                } else if is_commit || is_rollback {
-                    engine.tx_owner.store(0, Ordering::Release);
-                    conn.state.in_tx.store(false, Ordering::Release);
-                    if is_commit {
+                match tx {
+                    TxKind::Begin => {
+                        engine.tx_owner.store(conn.id, Ordering::Release);
+                        conn.state.in_tx.store(true, Ordering::Release);
+                        metrics::bump(&metrics::TX_BEGUN);
+                    }
+                    TxKind::Commit => {
+                        engine.tx_owner.store(0, Ordering::Release);
+                        conn.state.in_tx.store(false, Ordering::Release);
+                        metrics::bump(&metrics::TX_COMMITTED);
                         fire_commit_hook(&conn);
-                    } else {
+                    }
+                    TxKind::Rollback => {
+                        engine.tx_owner.store(0, Ordering::Release);
+                        conn.state.in_tx.store(false, Ordering::Release);
+                        metrics::bump(&metrics::TX_ROLLED_BACK);
                         fire_rollback_hook(&conn);
                     }
+                    TxKind::SavepointOrRelease => {}
                 }
                 conn.clear_err();
                 SQLITE_OK
@@ -1965,6 +2181,7 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                         .store(engine.last_rowid(), Ordering::Release);
                     fire_update_hook(&conn, &sql, engine.last_rowid());
                 }
+                metrics::bump(&metrics::WRITES_EXECUTED);
                 conn.clear_err();
                 SQLITE_OK
             }
@@ -2066,7 +2283,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
     free_value_pool(s);
     s.text_buf.clear();
     s.stepped = true;
-    s.total_at_step_start = s.engine.as_ref().map(|e| e.total_changes()).unwrap_or(0);
+    metrics::bump(&metrics::STEPS);
 
     let rc = match &mut s.exec {
         Exec::Once { .. } => {
@@ -2109,6 +2326,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
             match rows.next() {
                 Some(row) => {
                     s.current_row = Some(row);
+                    metrics::bump(&metrics::ROWS_RETURNED);
                     SQLITE_ROW
                 }
                 None => {
@@ -2119,50 +2337,118 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
             }
         }
         Exec::Rows(eng) => {
-            // SELECT: read lock around step; DML: write lock.
             let engine = s.engine.as_ref().unwrap().clone();
-            let before = engine.total_changes();
-            let outcome = if s.is_write {
-                let _w = engine.db.write();
-                eng.step()
+            if s.is_write {
+                // ── DML / write statements: per-step write lock ────────
+                // (unchanged — writes serialize on the engine write lock,
+                // and the changes()/rowid bookkeeping below needs the
+                // total_changes bracket around each step).
+                let before = engine.total_changes();
+                let outcome = {
+                    let _w = engine.db.write();
+                    eng.step()
+                };
+                let after = engine.total_changes();
+                let delta = after - before;
+                if delta > 0 {
+                    conn.state.changes.store(delta, Ordering::Release);
+                    conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
+                    conn.state
+                        .last_rowid
+                        .store(engine.last_rowid(), Ordering::Release);
+                    s.changes_reported = true;
+                    if !s.hook_fired {
+                        fire_update_hook(&conn, &s.sql.to_string_lossy(), engine.last_rowid());
+                        s.hook_fired = true;
+                    }
+                } else if matches!(s.kind, StmtKind::Dml { .. })
+                    && eng_done(&outcome)
+                    && !s.changes_reported
+                {
+                    // 0-row DML: SQLite reports changes() == 0 — but only
+                    // once per execution (a RETURNING statement's trailing
+                    // Done step must not clobber the real count).
+                    conn.state.changes.store(0, Ordering::Release);
+                    s.changes_reported = true;
+                }
+                match outcome {
+                    Ok(StepResult::Row) => {
+                        metrics::bump(&metrics::ROWS_RETURNED);
+                        SQLITE_ROW
+                    }
+                    Ok(StepResult::Done) => {
+                        s.done = true;
+                        metrics::bump(&metrics::WRITES_EXECUTED);
+                        SQLITE_DONE
+                    }
+                    Err(e) => {
+                        s.done = true;
+                        let rc = set_conn_err(&conn, &e);
+                        s.last_step_err = rc;
+                        return rc;
+                    }
+                }
             } else {
-                let _r = engine.db.read();
-                eng.step()
-            };
-            let after = engine.total_changes();
-            let delta = after - before;
-            if delta > 0 {
-                conn.state.changes.store(delta, Ordering::Release);
-                conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
-                conn.state
-                    .last_rowid
-                    .store(engine.last_rowid(), Ordering::Release);
-                s.changes_reported = true;
-                if !s.hook_fired {
-                    fire_update_hook(&conn, &s.sql.to_string_lossy(), engine.last_rowid());
-                    s.hook_fired = true;
-                }
-            } else if matches!(s.kind, StmtKind::Dml { .. })
-                && eng_done(&outcome)
-                && !s.changes_reported
-            {
-                // 0-row DML: SQLite reports changes() == 0 — but only
-                // once per execution (a RETURNING statement's trailing
-                // Done step must not clobber the real count).
-                conn.state.changes.store(0, Ordering::Release);
-                s.changes_reported = true;
-            }
-            match outcome {
-                Ok(StepResult::Row) => SQLITE_ROW,
-                Ok(StepResult::Done) => {
-                    s.done = true;
-                    SQLITE_DONE
-                }
-                Err(e) => {
-                    s.done = true;
-                    let rc = set_conn_err(&conn, &e);
-                    s.last_step_err = rc;
-                    return rc;
+                // ── SELECT streaming: CHUNKED read path ───────────────
+                //
+                // Serve buffered rows first — NO lock acquisition while a
+                // previously fetched chunk drains (this was one read-lock
+                // acquire + one total_changes read-lock PER ROW before;
+                // now it's one per READ_CHUNK rows). When the chunk is
+                // empty, refill under a single read-lock acquisition:
+                // step the engine up to READ_CHUNK times, taking each row
+                // with `take_row`, then release the lock and serve the
+                // batch. C semantics are unchanged — sqlite3_step still
+                // returns exactly one row per call.
+                if let Some(row) = s.row_chunk.pop_front() {
+                    s.current_row = Some(row);
+                    metrics::bump(&metrics::ROWS_RETURNED);
+                    SQLITE_ROW
+                } else {
+                    let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(READ_CHUNK);
+                    let mut step_err: Option<rustqlite::Error> = None;
+                    {
+                        let _r = engine.db.read();
+                        for _ in 0..READ_CHUNK {
+                            match eng.step() {
+                                Ok(StepResult::Row) => {
+                                    if let Some(row) = eng.take_row() {
+                                        chunk.push(row);
+                                    }
+                                }
+                                Ok(StepResult::Done) => break,
+                                Err(e) => {
+                                    step_err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(e) = step_err {
+                        s.done = true;
+                        s.current_row = None;
+                        return finish_step_err(s, &conn, &e);
+                    }
+                    if chunk.is_empty() {
+                        // Engine finished (Done with no rows in this
+                        // refill) — the statement is exhausted. A LATER
+                        // step after Done keeps returning Done (the engine
+                        // statement never auto-restarts), so there is no
+                        // re-execution risk when the caller steps again.
+                        s.done = true;
+                        s.current_row = None;
+                        SQLITE_DONE
+                    } else {
+                        s.row_chunk.extend(chunk);
+                        // If the engine hit Done inside this refill, the
+                        // rows already fetched still serve from the chunk;
+                        // the next step after the chunk drains takes the
+                        // empty-refill path above and reports Done.
+                        let row = s.row_chunk.pop_front().expect("chunk non-empty");
+                        s.current_row = Some(row);
+                        metrics::bump(&metrics::ROWS_RETURNED);
+                        SQLITE_ROW
+                    }
                 }
             }
         }
@@ -2211,6 +2497,7 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> c_int {
     s.hook_fired = false;
     s.changes_reported = false;
     s.current_row = None;
+    s.row_chunk.clear();
     match &mut s.exec {
         Exec::Rows(eng) => eng.reset(),
         Exec::Query { rows, .. } => {
@@ -2596,7 +2883,15 @@ fn static_decltype(t: &str) -> *const c_char {
 /// Current row's value at column i (unified across Exec kinds).
 fn stmt_value(s: &Stmt, i: usize) -> Option<Value> {
     match &s.exec {
-        Exec::Rows(eng) => eng.column_value(i).cloned(),
+        // Chunked SELECT path: the row is served from the statement's own
+        // buffer (`current_row`), NOT the engine statement (whose cursor
+        // already moved past it while filling the chunk).
+        // DML-RETURNING path: values come straight off the engine
+        // statement (current_row is always None there).
+        Exec::Rows(eng) => match s.current_row.as_ref() {
+            Some(row) => row.get(i).cloned(),
+            None => eng.column_value(i).cloned(),
+        },
         Exec::Query { .. } => s.current_row.as_ref()?.get(i).cloned(),
         Exec::Once { .. } => None,
     }

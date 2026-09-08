@@ -632,6 +632,13 @@ pub struct Pager {
     /// Count of get_page slow-path (cache-miss → file read) events.
     /// Debug/diagnostic counter.
     cache_misses: std::sync::atomic::AtomicU64,
+    /// Count of get_page FAST-path (cache-hit) events — the complement of
+    /// [`Self::cache_misses`], giving the admin stats endpoint a live cache
+    /// HIT RATE without any periodic sampling. One relaxed fetch_add on the
+    /// page-cache hit path (~1 ns uncontended; a page serves many rows, so
+    /// the per-row amortized cost is negligible — same trade SQLite's own
+    /// SQLITE_STATUS counters make).
+    cache_hits: std::sync::atomic::AtomicU64,
     /// Unique id of this Pager instance within the process. Advisory
     /// caches (btree leaf hints) tag entries with (instance, version) so a
     /// new database opened on the same thread can never mistake stale
@@ -1478,6 +1485,7 @@ impl Pager {
             delete_spill: Mutex::new(None),
             synchronous: std::sync::atomic::AtomicU8::new(2),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
             instance_id: PAGER_INSTANCE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
@@ -1908,6 +1916,23 @@ impl Pager {
         self.cache_misses.load(Ordering::Relaxed)
     }
 
+    /// Number of cache-HIT page fetches so far (diagnostics) — the
+    /// complement of [`Self::cache_misses`]. `hits / (hits + misses)` is
+    /// the live cache hit rate.
+    pub fn cache_hits(&self) -> u64 {
+        self.cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Number of frames currently in the write-ahead log (diagnostics;
+    /// 0 when WAL mode is off or the database is in-memory).
+    pub fn wal_frames(&self) -> u64 {
+        self.wal
+            .read()
+            .as_ref()
+            .map(|state| state.wal.n_frames() as u64)
+            .unwrap_or(0)
+    }
+
     /// Variant of `note_write` for mutations that CANNOT change any B+tree
     /// layout: same-size in-place payload patches. The dirty counter still
     /// moves (flush must write the page) but the write epoch does NOT —
@@ -2078,6 +2103,7 @@ impl Pager {
         {
             let cache = self.cache.read();
             if let Some(page_ref) = cache.get(id).cloned() {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 drop(cache);
                 self.note_seq_access(id);
                 // SAVEPOINT undo capture: the bytes at fetch time are the
