@@ -1037,7 +1037,7 @@ fn abi_column_blob_survives_the_value_clone() {
     exec(&db, "CREATE TABLE b (id INTEGER PRIMARY KEY, v BLOB)");
     exec(&db, "INSERT INTO b VALUES (1, X'0A0B0C'), (2, x'deadbeef')");
 
-    let (mut st, _) = prepare(&db, "SELECT v FROM b WHERE id = 1");
+    let (st, _) = prepare(&db, "SELECT v FROM b WHERE id = 1");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_ROW);
     let p = unsafe { sqlite3_column_blob(st.0, 0) };
@@ -1069,7 +1069,7 @@ fn abi_probe_select_star_column_names() {
         &db,
         "INSERT INTO scheduled_job VALUES ('x', 1, '2026-09-01')",
     );
-    let (mut st, _) = prepare(
+    let (st, _) = prepare(
         &db,
         "SELECT * FROM scheduled_job WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= '2026-09-02'",
     );
@@ -1100,7 +1100,7 @@ fn abi_probe_value_handle_chain() {
         "INSERT INTO t VALUES ('2f230c53-c600-4700-a7b2-2d661de7d694', X'0A0B0C')",
     );
 
-    let (mut st, _) = prepare(&db, "SELECT id, v FROM t");
+    let (st, _) = prepare(&db, "SELECT id, v FROM t");
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_ROW);
 
@@ -1152,7 +1152,7 @@ fn abi_probe_seaorm_select_shape() {
     exec(&db, "INSERT INTO \"scheduled_job\" VALUES (X'2F230C53C6004700A7B22D661DE7D694', 'due.job', 1, 1, 0, 30, '2026-09-01T18:00:00Z', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')");
 
     let sql = "SELECT \"scheduled_job\".\"id\", \"scheduled_job\".\"job_type\", \"scheduled_job\".\"enabled\", \"scheduled_job\".\"interval_days\", \"scheduled_job\".\"at_hour\", \"scheduled_job\".\"at_minute\", \"scheduled_job\".\"next_run_at\", \"scheduled_job\".\"created_at\", \"scheduled_job\".\"updated_at\" FROM \"scheduled_job\" WHERE \"scheduled_job\".\"enabled\" = ? AND \"scheduled_job\".\"next_run_at\" IS NOT NULL AND \"scheduled_job\".\"next_run_at\" <= ?";
-    let (mut st, _) = prepare(&db, sql);
+    let (st, _) = prepare(&db, sql);
     unsafe { sqlite3_bind_int64(st.0, 1, 1) };
     unsafe { sqlite3_bind_text64(st.0, 2, c"2026-09-02T00:00:00Z".as_ptr(), 20, None, 1) };
 
@@ -1187,7 +1187,7 @@ fn abi_probe_bare_select_star() {
     let db = open_memory();
     exec(&db, "CREATE TABLE t (a TEXT PRIMARY KEY, b INT, c REAL)");
     exec(&db, "INSERT INTO t VALUES ('x', 1, 2.5)");
-    let (mut st, _) = prepare(&db, "SELECT * FROM t");
+    let (st, _) = prepare(&db, "SELECT * FROM t");
     let n = unsafe { sqlite3_column_count(st.0) };
     eprintln!("bare star column_count = {n}");
     for i in 0..n {
@@ -1248,7 +1248,7 @@ fn abi_probe_app_flow_bind_insert_then_filtered_select() {
         0x94,
     ];
     {
-        let (mut st, _) = prepare(&db, "INSERT INTO \"scheduled_job\" (\"id\", \"job_type\", \"enabled\", \"interval_days\", \"at_hour\", \"at_minute\", \"next_run_at\", \"created_at\", \"updated_at\") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let (st, _) = prepare(&db, "INSERT INTO \"scheduled_job\" (\"id\", \"job_type\", \"enabled\", \"interval_days\", \"at_hour\", \"at_minute\", \"next_run_at\", \"created_at\", \"updated_at\") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
         unsafe {
             sqlite3_bind_blob64(st.0, 1, uuid_bytes.as_ptr() as *const c_void, 16, None);
             sqlite3_bind_text64(st.0, 2, c"due.job".as_ptr(), 7, None, 1);
@@ -1266,7 +1266,7 @@ fn abi_probe_app_flow_bind_insert_then_filtered_select() {
 
     // The app's filtered SELECT (sea-orm shape, explicit qualified cols).
     let sql = "SELECT \"scheduled_job\".\"id\", \"scheduled_job\".\"job_type\", \"scheduled_job\".\"enabled\", \"scheduled_job\".\"interval_days\", \"scheduled_job\".\"at_hour\", \"scheduled_job\".\"at_minute\", \"scheduled_job\".\"next_run_at\", \"scheduled_job\".\"created_at\", \"scheduled_job\".\"updated_at\" FROM \"scheduled_job\" WHERE \"scheduled_job\".\"enabled\" = 1 AND \"scheduled_job\".\"next_run_at\" IS NOT NULL AND \"scheduled_job\".\"next_run_at\" <= '2026-09-02T00:00:00Z'";
-    let (mut st, _) = prepare(&db, sql);
+    let (st, _) = prepare(&db, sql);
     let rc = unsafe { sqlite3_step(st.0) };
     assert_eq!(rc, SQLITE_ROW, "expected the row");
     let n = unsafe { sqlite3_column_count(st.0) };
@@ -1301,7 +1301,7 @@ fn abi_probe_count_where_bound_param() {
     exec(&db, "INSERT INTO \"job_run\" VALUES (X'110C53C6004700A7B22D661DE7D694AA', 'osm.import', 'failed')");
 
     // Literal WHERE — sanity.
-    let (mut st, _) = prepare(
+    let (st, _) = prepare(
         &db,
         "SELECT COUNT(*) FROM \"job_run\" WHERE \"job_run\".\"job_type\" = 'osm.import'",
     );
@@ -1311,7 +1311,7 @@ fn abi_probe_count_where_bound_param() {
     eprintln!("count with literal = {lit}");
 
     // Bound param WHERE — the sea-orm shape.
-    let (mut st2, _) = prepare(
+    let (st2, _) = prepare(
         &db,
         "SELECT COUNT(*) FROM \"job_run\" WHERE \"job_run\".\"job_type\" = ?",
     );
@@ -1322,7 +1322,7 @@ fn abi_probe_count_where_bound_param() {
     eprintln!("count with bound param = {bound}");
 
     // Also: filter on a BLOB pk with a bound blob (find_by_id shape).
-    let (mut st3, _) = prepare(
+    let (st3, _) = prepare(
         &db,
         "SELECT COUNT(*) FROM \"job_run\" WHERE \"job_run\".\"id\" = ?",
     );
@@ -1413,7 +1413,7 @@ fn abi_probe_driver_covered_bound_text_param() {
     exec(&db, "CREATE TABLE t (a TEXT PRIMARY KEY, b INT)");
     exec(&db, "INSERT INTO t VALUES ('x', 1), ('y', 2)");
 
-    let (mut st, _) = prepare(&db, "SELECT a, b FROM t WHERE a = ?");
+    let (st, _) = prepare(&db, "SELECT a, b FROM t WHERE a = ?");
     // column_count at prepare > 0 → driver-covered, NO pre-execute.
     let n = unsafe { sqlite3_column_count(st.0) };
     eprintln!("driver-covered column_count at prepare = {n}");
@@ -1460,7 +1460,7 @@ fn abi_probe_job_run_count_flow() {
             "queued",
         ),
     ] {
-        let (mut st, _) = prepare(&db, "INSERT INTO job_run (id, job_type, status, detail, error, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        let (st, _) = prepare(&db, "INSERT INTO job_run (id, job_type, status, detail, error, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
         unsafe {
             sqlite3_bind_blob64(st.0, 1, id.as_ptr() as *const c_void, 16, None);
             sqlite3_bind_text64(st.0, 2, c"osm.import".as_ptr(), 10, None, 1);
@@ -1484,7 +1484,7 @@ fn abi_probe_job_run_count_flow() {
     }
 
     // COUNT with bound param.
-    let (mut st2, _) = prepare(&db, "SELECT COUNT(*) FROM job_run WHERE job_type = ?");
+    let (st2, _) = prepare(&db, "SELECT COUNT(*) FROM job_run WHERE job_type = ?");
     unsafe { sqlite3_bind_text64(st2.0, 1, c"osm.import".as_ptr(), 10, None, 1) };
     let rc = unsafe { sqlite3_step(st2.0) };
     assert_eq!(rc, 100 /* ROW */);
@@ -1503,7 +1503,7 @@ fn abi_probe_seaorm_count_subquery_shape() {
     exec(&db, "INSERT INTO job_run (id, job_type, status, created_at) VALUES ('b', 'osm.import', 'queued', '2026-09-01T19:00:00Z')");
 
     let sql = "SELECT COUNT(*) AS \"num_items\" FROM (SELECT \"job_run\".\"id\" AS \"id\", \"job_run\".\"job_type\" AS \"job_type\", \"job_run\".\"status\" AS \"status\", \"job_run\".\"detail\" AS \"detail\", \"job_run\".\"error\" AS \"error\", \"job_run\".\"started_at\" AS \"started_at\", \"job_run\".\"finished_at\" AS \"finished_at\", \"job_run\".\"created_at\" AS \"created_at\" FROM \"job_run\" WHERE \"job_run\".\"job_type\" = ?) AS \"sub_query\"";
-    let (mut st, _) = prepare(&db, sql);
+    let (st, _) = prepare(&db, sql);
     let n_cols = unsafe { sqlite3_column_count(st.0) };
     let name0 = unsafe { cstr(sqlite3_column_name(st.0, 0)) };
     eprintln!("count-subquery: n_cols={n_cols} name0={name0:?}");
@@ -1589,7 +1589,7 @@ fn abi_probe_delete_in_subquery_returning() {
     exec(&db, "INSERT INTO jobs (id, job_type, payload, attempts, available_at, created_at) VALUES ('j1', 'test.noop', '{}', 0, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')");
 
     let sql = "DELETE FROM \"jobs\" WHERE \"id\" IN (SELECT \"id\" FROM \"jobs\" WHERE \"available_at\" <= ? ORDER BY \"available_at\" ASC LIMIT 1) RETURNING \"id\", \"job_type\", \"payload\", \"attempts\"";
-    let (mut st, _) = prepare(&db, sql);
+    let (st, _) = prepare(&db, sql);
     // param must be discovered (1 slot) and bindable
     unsafe { sqlite3_bind_text64(st.0, 1, c"2026-09-02T00:00:00Z".as_ptr(), 20, None, 1) };
     let rc = unsafe { sqlite3_step(st.0) };

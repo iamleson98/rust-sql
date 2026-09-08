@@ -189,7 +189,25 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
     Ok(image)
 }
 
-/// Write atomically (temp file + fsync + rename).
+/// Remove a sidecar file; when Windows denies removal (open handle
+/// without share-delete), truncate it to zero length instead.
+fn clear_sidecar(path: &std::path::Path) {
+    if std::fs::remove_file(path).is_err() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+        {
+            let _ = f.write_all(&[]);
+            let _ = f.sync_all();
+        }
+    }
+}
+
+/// Write atomically (temp file + fsync + rename), with an in-place
+/// fallback when Windows denies the rename over a live cross-process
+/// handle.
 pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
     let bytes = build_bytes(db)?;
     let tmp = path.with_extension(format!("rsqltmp{}", std::process::id()));
@@ -202,16 +220,42 @@ pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path).or_else(|e| {
-        // Windows/EXDEV: fall back to remove + rename.
-        let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp, path).map_err(|e2| format!("rename: {e} / {e2}"))
-    })?;
-    // Stale sidecars would resurrect pre-dump frames.
-    let _ = std::fs::remove_file(super::reader::wal_path_of(path));
+    std::fs::rename(&tmp, path)
+        .or_else(|e| {
+            // Windows/EXDEV: fall back to remove + rename.
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path).map_err(|e2| format!("rename: {e} / {e2}"))
+        })
+        .or_else(|e| {
+            // Windows with a live cross-process SQLite connection: the
+            // other handle has share read+write but no share-delete, so
+            // both rename and remove are denied ("os error 5"). SQLite
+            // itself opens the file with share-write, so overwriting the
+            // bytes in place succeeds — atomicity is traded for
+            // correctness in exactly this edge (single writer).
+            let _ = e;
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|e| format!("in-place open {}: {e}", path.display()))?;
+            f.write_all(&bytes)
+                .map_err(|e| format!("in-place write {}: {e}", path.display()))?;
+            f.sync_all()
+                .map_err(|e| format!("in-place fsync {}: {e}", path.display()))?;
+            let _ = std::fs::remove_file(&tmp);
+            Ok::<(), String>(())
+        })?;
+    // Stale sidecars would resurrect pre-dump frames. On Windows a live
+    // cross-process connection may hold them open (no share-delete), so
+    // when removal fails, TRUNCATE in place: a zero-length WAL is an
+    // empty WAL to every SQLite reader, and the writer's own close-time
+    // checkpoint of an empty WAL is a no-op instead of a resurrection.
+    clear_sidecar(&super::reader::wal_path_of(path));
     let mut shm = path.as_os_str().to_os_string();
     shm.push("-shm");
-    let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
+    clear_sidecar(std::path::Path::new(&shm));
     Ok(())
 }
 
