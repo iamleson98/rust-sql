@@ -13323,52 +13323,6 @@ fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
     Ok(max)
 }
 
-fn find_rowids_for_rows(
-    ctx: &mut ExecContext<'_>,
-    table: &Table,
-    rows: &[Vec<Value>],
-) -> Result<Vec<i64>> {
-    let root = ctx.table_root(table);
-    let mut stored = Vec::new();
-    let mut bt = Btree::new(ctx.pager, root, false);
-    bt.scan_table_borrowed(|rowid, payload| {
-        if let Ok(row) = decode_row(payload, table.n_columns(), rowid, table.rowid_alias) {
-            stored.push((rowid, row));
-        }
-        true
-    })?;
-
-    let mut used = vec![false; stored.len()];
-    let key_columns: Vec<usize> = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter_map(|(index, column)| column.primary_key.then_some(index))
-        .collect();
-    rows.iter()
-        .map(|wanted| {
-            stored
-                .iter()
-                .enumerate()
-                .find(|(index, (_, row))| {
-                    !used[*index]
-                        && if key_columns.is_empty() {
-                            row == wanted
-                        } else {
-                            key_columns
-                                .iter()
-                                .all(|column| row.get(*column) == wanted.get(*column))
-                        }
-                })
-                .map(|(index, (rowid, _))| {
-                    used[index] = true;
-                    *rowid
-                })
-                .ok_or_else(|| Error::Runtime("UPDATE target row disappeared".into()))
-        })
-        .collect()
-}
-
 // ============================================================================
 // UPDATE
 // ============================================================================
@@ -13434,11 +13388,22 @@ fn exec_update(
     let source_res = execute(source, ctx)?;
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let mut updated = 0i64;
-    let source_rowids = if table.rowid_alias.is_none() {
-        find_rowids_for_rows(ctx, &table, &source_res.rows)?
-    } else {
-        Vec::new()
-    };
+    // Tables WITHOUT a rowid-alias column: the scan drivers append the
+    // hidden rowid slot (planner's HIDDEN_ROWID) as a trailing value on
+    // every materialized source row — the rowid comes from there. (This
+    // replaces a value-matching table rescan that compared the full
+    // materialized row [cols.., rowid] against decoded stored rows
+    // [cols..] — the shapes never matched, so EVERY non-alias-table
+    // UPDATE failed with "UPDATE target row disappeared", breaking
+    // strict / generated-column / expression-index UPDATEs. The
+    // streaming path handles the common source shapes; this is the
+    // general path's fallback.)
+    let hidden_rowid_slot = table.rowid_alias.is_none()
+        && source_res
+            .columns
+            .last()
+            .is_some_and(|c| c.as_str() == crate::planner::HIDDEN_ROWID);
+    let n_cols = table.n_columns();
 
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
@@ -13449,14 +13414,24 @@ fn exec_update(
     // B+tree modification, exactly like SQLite's statement-level ABORT.
     let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> =
         Vec::with_capacity(source_res.rows.len());
-    for (row_index, row) in source_res.rows.iter().enumerate() {
+    for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
+        } else if hidden_rowid_slot {
+            // Trailing hidden slot holds the row's B+tree key.
+            row.last().map(|v| v.as_integer()).unwrap_or(0)
         } else {
-            source_rowids[row_index]
+            // No alias column and no hidden slot (WITHOUT ROWID table,
+            // a real "rowid" column, or a source that dropped the slot).
+            return Err(Error::Unsupported(
+                "UPDATE on a table without INTEGER PRIMARY KEY",
+            ));
         };
 
-        let mut new_row = row.clone();
+        // Drop the trailing hidden slot (if present) before the SET
+        // expressions run: the write-set row must have exactly n_cols
+        // values.
+        let mut new_row: Vec<Value> = row[..n_cols].to_vec();
         for (col_idx, expr) in assignments {
             new_row[*col_idx] = eval_row(expr, row, &col_names, &ctx.params, &ctx.named_params)?;
             let aff = table.columns[*col_idx].affinity;
@@ -13888,6 +13863,20 @@ fn try_streaming_update(
             end: Option<&'a (Expr, bool)>,
             residual: Option<&'a Expr>,
         },
+        /// `UPDATE ... WHERE indexed_col = ?` / `... WHERE indexed_col
+        /// IN (...)`: exact index probes (mirrors try_streaming_delete's
+        /// index_point_keys handling). Keys are pre-encoded during source
+        /// detection. Without this arm, a point lookup on a NON-alias PK
+        /// (`version BIGINT PRIMARY KEY` — sqlx's `_sqlx_migrations`)
+        /// fell through to the general path, which requires a rowid alias
+        /// and errored with "UPDATE on a table without INTEGER PRIMARY
+        /// KEY".
+        IndexPoint {
+            table: &'a Arc<Table>,
+            index: &'a Arc<crate::schema::Index>,
+            residual: Option<&'a Expr>,
+            keys: Vec<Vec<u8>>,
+        },
     }
     let src = match source {
         Plan::Scan { table: t, .. } => StreamingSource::Scan {
@@ -13933,6 +13922,66 @@ fn try_streaming_update(
             end: end.as_ref(),
             residual: residual.as_ref(),
         },
+        // `UPDATE t SET ... WHERE indexed_col = ?`: one exact probe
+        // (compound keys encode all columns — mirrors the DELETE side).
+        Plan::IndexLookup {
+            table: t,
+            index,
+            key_exprs,
+            ..
+        } => {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let key_values: Vec<Value> = key_exprs
+                .iter()
+                .map(|e| evaluate(e, &eval_ctx))
+                .collect::<Result<_>>()?;
+            let mut buf = Vec::with_capacity(16);
+            crate::plugin::encode_collated_index_key_into(&index.columns, &key_values, &mut buf);
+            StreamingSource::IndexPoint {
+                table: t,
+                index,
+                residual: None,
+                keys: vec![buf],
+            }
+        }
+        // `UPDATE t SET ... WHERE indexed_col IN (...)`: probe each
+        // encoded key exactly (collated columns fold the probe key, NULL
+        // keys never match, duplicate literals dedup).
+        Plan::IndexIn {
+            table: t,
+            index,
+            key_exprs,
+            residual,
+            ..
+        } => {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
+            for e in key_exprs {
+                let v = evaluate(e, &eval_ctx)?;
+                if v.is_null() {
+                    continue;
+                }
+                let mut buf = Vec::with_capacity(16);
+                crate::plugin::encode_collated_index_key_into(
+                    &index.columns,
+                    std::slice::from_ref(&v),
+                    &mut buf,
+                );
+                keys.push(buf);
+            }
+            keys.sort();
+            keys.dedup();
+            StreamingSource::IndexPoint {
+                table: t,
+                index,
+                residual: residual.as_ref(),
+                keys,
+            }
+        }
         _ => return Ok(None),
     };
 
@@ -13946,13 +13995,16 @@ fn try_streaming_update(
         StreamingSource::RowidRange { table: t, .. } => t,
         StreamingSource::RowidLookup { table: t, .. } => t,
         StreamingSource::IndexRange { table: t, .. } => t,
+        StreamingSource::IndexPoint { table: t, .. } => t,
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
         return Ok(None);
     }
-    if table.rowid_alias.is_none() {
-        return Ok(None);
-    }
+    // NOTE: no rowid-alias gate here — the streaming path handles
+    // no-alias tables through every source shape (the scan drivers and
+    // the index probes all yield rowids directly). A blanket
+    // `rowid_alias.is_none() -> decline` gate used to force ALL
+    // non-alias-table UPDATEs onto the general path.
 
     // Rowid-alias reassignment (`UPDATE t SET id = X`) moves the row —
     // its B+tree cell key changes. The streaming path patches payloads
@@ -13997,6 +14049,7 @@ fn try_streaming_update(
         StreamingSource::RowidRange { residual, .. } => *residual,
         StreamingSource::RowidLookup { .. } => None,
         StreamingSource::IndexRange { residual, .. } => *residual,
+        StreamingSource::IndexPoint { residual, .. } => *residual,
     };
     // Compile the residual predicate ONCE per statement (mirrors
     // exec_filter / the aggregate streaming scan): positional evaluation
@@ -14680,6 +14733,77 @@ fn try_streaming_update(
             }
         }
         Ok::<(), crate::error::Error>(())
+    } else if let StreamingSource::IndexPoint { index, keys, .. } = &src {
+        // IndexPoint source (`UPDATE ... WHERE indexed_col = ?` / IN):
+        // probe the index for exact matches, then fetch + process each
+        // row through the shared collect path; phase 2 applies the write
+        // set atomically. This is the shape a NON-alias PK lookup plans
+        // to (`version BIGINT PRIMARY KEY`, sqlx's `_sqlx_migrations`
+        // bookkeeping UPDATE) — previously it fell to the general path
+        // and failed with "UPDATE on a table without INTEGER PRIMARY
+        // KEY" even though every rowid table has implicit rowids.
+        let mut rowids: Vec<i64> = Vec::with_capacity(keys.len());
+        {
+            let index_root = ctx.index_root(index);
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            // lookup_index_into CLEARS its out buffer per call — probe
+            // into a scratch buffer and extend the accumulator (a naive
+            // shared-buffer loop keeps only the last key's rowids).
+            let mut probe_rowids: Vec<i64> = Vec::new();
+            for key in keys {
+                probe_rowids.clear();
+                index_bt.lookup_index_into(key, &mut probe_rowids)?;
+                rowids.extend_from_slice(&probe_rowids);
+            }
+        }
+        // Ascending rowid order (stable B+tree access pattern).
+        // Duplicate IN-list keys were deduped at source detection, so
+        // rowids are duplicate-free; dedup anyway as a belt-and-braces
+        // guarantee for the write set.
+        rowids.sort_unstable();
+        rowids.dedup();
+        for rowid in rowids {
+            match bt.lookup_table(rowid)? {
+                LookupResult::Found(payload) => {
+                    // Owned payload — stash for phase 2's index maintenance
+                    // (saves a re-fetch descent per row when the SET clause
+                    // touches an indexed column).
+                    let old_owned = if needs_old_payload {
+                        Some(payload.clone())
+                    } else {
+                        None
+                    };
+                    if let Err(e) = process_update_row(
+                        ctx,
+                        &payload,
+                        n_cols,
+                        rowid,
+                        &mut row_buf,
+                        &mut new_row,
+                        &mut payload_buf,
+                        assignments,
+                        col_names,
+                        &params,
+                        &named_params,
+                        table,
+                        residual_pred,
+                        &mut updates,
+                        &mut update_arena,
+                        &mut returning_rows,
+                        returning,
+                        old_owned,
+                        compiled_ref,
+                        compiled_residual.as_ref(),
+                        patch_ctx.as_mut(),
+                    ) {
+                        first_error = Some(e);
+                        break;
+                    }
+                }
+                LookupResult::NotFound => {}
+            }
+        }
+        Ok::<(), crate::error::Error>(())
     } else {
         // Full scan (optionally filtered). Fused single-pass patch when
         // eligible (see the RowidRange branch for the conditions).
@@ -14914,12 +15038,22 @@ fn try_streaming_update(
             ctx.set_table_root(&table.name, root);
         }
     } else {
-        deferred = (0..updates.len()).collect();
+        // Order-space: every sorted position is deferred (skip-retain
+        // may have shrunk `order` — see the done_mask translation below).
+        deferred = (0..order.len()).collect();
     }
     // Everything the bulk pass did NOT defer is already applied.
+    //
+    // done_mask indexes UPDATES space, but `deferred` positions come
+    // from update_table_bulk, which indexes the SORTED list (order
+    // space). When updates arrive in index order (IndexRange / IndexPoint
+    // sources), order != identity and the raw positions would mark the
+    // WRONG rows as unapplied — some rows then patched twice (duplicate
+    // rowids in the table) while others never applied. Translate through
+    // `order`.
     let mut done_mask: Vec<bool> = vec![true; updates.len()];
     for &di in &deferred {
-        done_mask[di] = false; // not applied yet
+        done_mask[order[di]] = false; // not applied yet
     }
     for &i in order.iter() {
         if done_mask[i] {
@@ -14939,6 +15073,16 @@ fn try_streaming_update(
             new_root = bt.root;
         }
         ctx.set_table_root(&table.name, new_root);
+        // CRITICAL: refresh the loop's root. insert_table's fallback can
+        // SPLIT the tree (root page moves); the ctx was updated but the
+        // local `root` used to be left stale — every later iteration then
+        // built its Btree on the OLD root page, which is now an ordinary
+        // interior node of the NEW tree: inserts landed in a stale
+        // subtree, duplicating rows and leaving cells out of order
+        // ("rowid N out of order in table …", totals drifting +N). Only
+        // visible once a size-changing UPDATE grew the tree past a split
+        // (~250+ rows on 4 KiB pages) — every journal mode.
+        root = new_root;
         // AFTER UPDATE triggers: NEW = the post-change row, OLD = the
         // pre-change row (decoded from the stash when present; otherwise
         // we can't reconstruct it — triggers on indexed-SET updates always
@@ -15019,7 +15163,11 @@ fn try_streaming_update(
     }
     // Count the bulk-applied rows (they skipped the per-row loop).
     {
-        let bulk_applied = updates.len().saturating_sub(deferred.len());
+        // Order-space: positions the bulk pass applied directly. (NOT
+        // updates.len() — skip-retain may have dropped skipped rows from
+        // `order`, and those must not be counted as applied; OR IGNORE's
+        // changes() count depends on this.)
+        let bulk_applied = order.len().saturating_sub(deferred.len());
         updated += bulk_applied as i64;
         ctx.changes += bulk_applied as i64;
     }
@@ -15679,8 +15827,16 @@ fn try_streaming_delete(
         let index_root = ctx.index_root(&index);
         {
             let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            // lookup_index_into CLEARS its out buffer on every call — a
+            // naive `for key { lookup_index_into(key, &mut rowids) }`
+            // accumulated only the LAST key's matches (DELETE ... WHERE k
+            // IN ('a','b') deleted just the 'b' rows). Probe into a
+            // scratch buffer and extend the accumulator instead.
+            let mut probe_rowids: Vec<i64> = Vec::new();
             for key in &keys {
-                index_bt.lookup_index_into(key, &mut rowids)?;
+                probe_rowids.clear();
+                index_bt.lookup_index_into(key, &mut probe_rowids)?;
+                rowids.extend_from_slice(&probe_rowids);
             }
         }
         rowids.sort_unstable();

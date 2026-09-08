@@ -753,6 +753,46 @@ fn resolve_open_target(filename: &str, flags: c_int) -> Result<(OpenTarget, bool
     Ok((OpenTarget::File(PathBuf::from(filename)), false))
 }
 
+/// Stable identity of a file-backed database for the engine map.
+///
+/// The key must NOT depend on whether the file exists at lookup time.
+/// `canonicalize(p)` fails while `p` does not exist yet (the first open
+/// of a fresh database, e.g. sqlx's `sqlite:app.db?mode=rwc` with a
+/// relative path) and succeeds afterwards — so keying on it made the
+/// second connection of the same pool create a SECOND engine whose
+/// catalog was decoded from the file BEFORE the first engine flushed
+/// its DDL. Statements then round-robined across the two engines:
+/// `CREATE TABLE` on connection A followed by `CREATE INDEX` on
+/// connection B failed with `not found: table: …`, and committed data
+/// was invisible to later statements (exactly the sea-orm-migration
+/// failure on a fresh database).
+///
+/// Canonicalizing only the PARENT directory (which must exist for the
+/// open to succeed at all) and joining the file name yields an
+/// existence-independent key that also unifies `app.db`, `./app.db`,
+/// and the absolute path of the same file — every open of one file
+/// finds the one shared engine, which is the documented intent of the
+/// map ("every `sqlite3_open*` of the same file path in this process
+/// shares ONE engine").
+fn engine_file_key(p: &std::path::Path) -> String {
+    let parent = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let canonical_parent = std::fs::canonicalize(&parent).unwrap_or(parent);
+    // Degenerate paths with no file-name component (trailing slash,
+    // "..") fall back to the raw string; they cannot be opened for
+    // read/write anyway, so they never reach the map.
+    let name = p
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| p.as_os_str().to_os_string());
+    canonical_parent
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn open_engine(target: &OpenTarget, create: bool, readonly: bool) -> Result<Database, String> {
     let db = match target {
         OpenTarget::PrivateMemory => Database::open_in_memory(),
@@ -817,8 +857,11 @@ fn acquire_engine(
             }
         }
         OpenTarget::File(p) => {
-            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            let key = key.to_string_lossy().into_owned();
+            // Existence-independent key (see engine_file_key): the flip
+            // from "canonicalize fails" (file not created yet) to
+            // "canonicalize succeeds" (engine already created it) must
+            // not split one file across two engines.
+            let key = engine_file_key(p);
             let mut map = engines().lock().unwrap();
             if let Some(e) = map.get(&key) {
                 Ok((Some(e.clone()), false))

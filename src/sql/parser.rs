@@ -3077,6 +3077,18 @@ impl Parser {
                 self.advance();
                 Ok(s)
             }
+            // SQLite's %fallback ID rule in NAME position: non-reserved
+            // keywords (TRUE, FALSE, END, KEY, ...) are legal unquoted
+            // column / table / alias / index names — `CREATE TABLE t
+            // (true INTEGER)` parses in SQLite. Reserved words (WHERE,
+            // ORDER, NULL, PRIMARY, ...) stay errors. In EXPRESSION
+            // position the dedicated literal heads (NULL / TRUE /
+            // FALSE / CURRENT_*) fire before this fallback is consulted.
+            Token::Keyword(k) if keyword_is_fallback_ident(k) => {
+                let s = k.to_ascii_lowercase();
+                self.advance();
+                Ok(s)
+            }
             _ => Err(Error::parse(
                 t.line,
                 t.col,
@@ -3508,6 +3520,8 @@ fn keyword_is_fallback_ident(k: &str) -> bool {
             | "EXCLUDE"
             | "GROUPS"
             | "OTHERS"
+            | "TRUE"
+            | "FALSE"
             | "TIES"
             | "GENERATED"
             | "ALWAYS"
