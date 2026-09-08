@@ -2100,10 +2100,15 @@ fn env_tolerance(var: &str, default: f64) -> f64 {
 /// scale exceeds the 15% band (S09's blob scan flipped green/red across
 /// runs with unchanged code — the same cold-state noise class the
 /// bench_compare adaptive-warmup commit documented), so a FAIL also
-/// requires being at least 1 ms slower. Real regressions are
-/// multi-percent AND multi-millisecond; runner jitter is not.
+/// requires being at least 2 ms slower. Observed wobble on the
+/// single-digit-ms metrics with unchanged code: S08 scan_ms 2.1 -> 4.4 ms
+/// and S06 3.8 -> 4.7 ms across macOS-ARM runner draws — ±1.5 ms is the
+/// noise scale of that class. Real regressions are multi-percent AND
+/// multi-millisecond; runner jitter is not. The statistically-sampled
+/// bench-gate jobs (criterion, bench_compare, bench_sqlx_native) own the
+/// tight throughput contract; this gate catches multi-x regressions.
 fn gated(rq: f64, sq: f64, tolerance_pct: f64) -> bool {
-    gated_with_floor(rq, sq, tolerance_pct, 1.0)
+    gated_with_floor(rq, sq, tolerance_pct, 2.0)
 }
 
 /// `gated` with an explicit absolute-jitter floor (milliseconds).
@@ -2126,7 +2131,7 @@ fn gated_with_floor(rq: f64, sq: f64, tolerance_pct: f64, floor_ms: f64) -> bool
 fn extra_floor(metric: &str) -> f64 {
     match metric {
         "open_first_query_ms" => 5.0,
-        _ => 1.0,
+        _ => 2.0,
     }
 }
 

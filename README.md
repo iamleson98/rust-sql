@@ -626,6 +626,13 @@ compat surface. Every entry says what it costs and why it exists.
   the cold best-of-5 table (1.43x under proper warmup — see
   [Performance](#performance-vs-sqlite)), and UPDATE by PK is 1.09x. Both
   grow with table size and index selectivity.
+- **S06 range scan materializing 100k rows (0.72–1.13x by host)**: through
+  the streaming prepared-statement path (`step` + per-row consume) rustqlite
+  is near-parity on this shape — the per-row `Row` allocation in the step
+  path is the remaining cost (torture S06: 0.92x linux, 0.72–0.87x
+  macOS-ARM, 1.08–1.13x Windows, tracked LOSS). Short ranges where setup
+  dominates stay 2–2.3x faster (the table above); a borrowed-accessor step
+  path is the fix shape.
 - **8-conn mixed R/W 80/20 (parity-class)**: at high write fan-out the writer
   gate + commit fsync set the floor; reads stay 2.8x throughout. The row
   compares a shared-memory engine against SQLite's file-backed WAL, so its
