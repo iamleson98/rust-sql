@@ -362,7 +362,7 @@ fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
             returning: d.returning.is_some(),
         },
         S::Pragma(p) => {
-            if p.value.is_some() {
+            if p.value.is_some() && !is_table_valued_read_pragma(&p.name) {
                 StmtKind::PragmaWrite
             } else {
                 StmtKind::PragmaRead
@@ -370,6 +370,21 @@ fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
         }
         _ => StmtKind::Once,
     }
+}
+
+/// Argumented pragmas that are pure READS returning result rows (the
+/// table-valued introspection set, mirroring the engine's `read_pragma`
+/// dispatch). `PRAGMA table_info('t')` etc. carry a value but must go down
+/// the Query path — classifying them as PragmaWrite made them execute
+/// via `Database::execute`, which returns no rows and broke every
+/// schema-discovery tool (sea-schema, sea-orm-cli). Every other pragma
+/// WITH a value is the write form.
+fn is_table_valued_read_pragma(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "table_info" | "table_xinfo" | "index_list" | "index_info" | "index_xinfo"
+            | "foreign_key_list"
+    )
 }
 
 /// Is this statement a transaction-control statement?
@@ -526,7 +541,7 @@ fn ast_mutates_database(stmt: &rustqlite::sql::ast::Statement) -> bool {
     match stmt {
         S::Select(_) | S::Explain(_) => false,
         S::Begin(_) | S::Commit | S::Rollback(_) | S::Savepoint(_) | S::Release(_) => false,
-        S::Pragma(p) => p.value.is_some(),
+        S::Pragma(p) => p.value.is_some() && !is_table_valued_read_pragma(&p.name),
         // INSERT / UPDATE / DELETE / CREATE / DROP / ALTER / ATTACH /
         // DETACH / VACUUM all mutate.
         _ => true,
@@ -1569,6 +1584,9 @@ unsafe fn prepare_impl(
     let params = collect_param_slots(&ast);
 
     let mut static_columns: Vec<CString> = Vec::new();
+    // PragmaRead only: set when the read pragma was executed (and its
+    // rows + real column layout buffered) at PREPARE time.
+    let mut pragma_pre_ran = false;
     let exec: Exec = match &kind {
         StmtKind::Select | StmtKind::Dml { .. } => {
             let eng_stmt = {
@@ -1706,24 +1724,45 @@ unsafe fn prepare_impl(
             Exec::Rows(Box::new(erased))
         }
         StmtKind::PragmaRead => {
-            let name = match &ast {
-                rustqlite::sql::ast::Statement::Pragma(p) => p.name.clone(),
-                _ => String::new(),
+            // SQLite publishes a pragma's column layout at PREPARE time;
+            // sqlx caches column_count / column_name before the first step
+            // and panics ("index out of bounds") when the stepped rows are
+            // wider than the cached metadata. Run the read pragma once NOW
+            // under the read lock to learn the real layout and buffer the
+            // rows (introspection queries are cheap and side-effect free).
+            // A prepare-time failure falls back to the provisional
+            // single-column layout and lets the lazy first-step run surface
+            // the error.
+            let (columns, rows, pre_ran): (Vec<String>, Vec<Vec<Value>>, bool) = {
+                let rd = engine.db.read();
+                match rd.query_with_columns(&stmt_text, []) {
+                    Ok((cols, result_rows)) => (cols, result_rows, true),
+                    Err(_) => {
+                        let name = match &ast {
+                            rustqlite::sql::ast::Statement::Pragma(p) => p.name.clone(),
+                            _ => String::new(),
+                        };
+                        (vec![name], Vec::new(), false)
+                    }
+                }
             };
-            if let Ok(c) = CString::new(name) {
-                static_columns.push(c);
+            for c in &columns {
+                if let Ok(cc) = CString::new(c.clone()) {
+                    static_columns.push(cc);
+                }
             }
+            pragma_pre_ran = pre_ran;
             Exec::Query {
                 sql: stmt_text.clone(),
-                rows: Vec::new().into_iter(),
-                columns: Vec::new(),
+                rows: rows.into_iter(),
+                columns,
             }
         }
         StmtKind::PragmaWrite | StmtKind::Once => Exec::Once {
             sql: stmt_text.clone(),
         },
     };
-    finish_prepare(
+    let rc = finish_prepare(
         conn,
         engine,
         stmt_text,
@@ -1733,7 +1772,16 @@ unsafe fn prepare_impl(
         params,
         static_columns,
         pp_stmt,
-    )
+    );
+    // Rows + columns were already computed at prepare: skip the lazy
+    // first-step re-run. sqlite3_reset flips this back to lazy, so a
+    // re-executed statement refreshes its rows the normal way.
+    if rc == SQLITE_OK && pragma_pre_ran {
+        if let Some(s) = (*pp_stmt as *mut Stmt).as_mut() {
+            s.query_ran = true;
+        }
+    }
+    rc
 }
 
 /// Build the statement handle and store it at `*pp_stmt`.
