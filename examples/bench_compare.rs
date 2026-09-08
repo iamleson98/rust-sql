@@ -36,6 +36,25 @@ const LARGE: usize = 100_000;
 /// way to compare engines on the work they actually do. Applied to BOTH
 /// engines identically.
 fn best_of<const N: usize>(mut f: impl FnMut() -> Duration) -> Duration {
+    // Adaptive warmup: microsecond-scale workloads are dominated on the
+    // first handful of runs by cold icache / branch-predictor / allocator
+    // state — steady-state latency is the engine-quality signal, and BOTH
+    // engines run through this same discipline. Probe once; if the
+    // workload is µs-scale, train with 100 extra runs; ms-scale gets a
+    // handful; anything ≥ 100 ms amortizes cold start internally already.
+    // (The only mutating closures routed through best_of — the
+    // `score = score + 1.0` UPDATE ranges — do identical work every run,
+    // so repeated warmup runs are sound for them too.)
+    let probe = f();
+    if probe < Duration::from_millis(2) {
+        for _ in 0..100 {
+            let _ = f();
+        }
+    } else if probe < Duration::from_millis(100) {
+        for _ in 0..5 {
+            let _ = f();
+        }
+    }
     let mut best = Duration::MAX;
     for _ in 0..N {
         let d = f();
