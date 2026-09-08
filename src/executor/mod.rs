@@ -13381,6 +13381,52 @@ fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
     Ok(max)
 }
 
+fn find_rowids_for_rows(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rows: &[Vec<Value>],
+) -> Result<Vec<i64>> {
+    let root = ctx.table_root(table);
+    let mut stored = Vec::new();
+    let mut bt = Btree::new(ctx.pager, root, false);
+    bt.scan_table_borrowed(|rowid, payload| {
+        if let Ok(row) = decode_row(payload, table.n_columns(), rowid, table.rowid_alias) {
+            stored.push((rowid, row));
+        }
+        true
+    })?;
+
+    let mut used = vec![false; stored.len()];
+    let key_columns: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.primary_key.then_some(index))
+        .collect();
+    rows.iter()
+        .map(|wanted| {
+            stored
+                .iter()
+                .enumerate()
+                .find(|(index, (_, row))| {
+                    !used[*index]
+                        && if key_columns.is_empty() {
+                            row == wanted
+                        } else {
+                            key_columns
+                                .iter()
+                                .all(|column| row.get(*column) == wanted.get(*column))
+                        }
+                })
+                .map(|(index, (rowid, _))| {
+                    used[index] = true;
+                    *rowid
+                })
+                .ok_or_else(|| Error::Runtime("UPDATE target row disappeared".into()))
+        })
+        .collect()
+}
+
 // ============================================================================
 // UPDATE
 // ============================================================================
@@ -13446,6 +13492,11 @@ fn exec_update(
     let source_res = execute(source, ctx)?;
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let mut updated = 0i64;
+    let source_rowids = if table.rowid_alias.is_none() {
+        find_rowids_for_rows(ctx, &table, &source_res.rows)?
+    } else {
+        Vec::new()
+    };
 
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
@@ -13456,13 +13507,11 @@ fn exec_update(
     // B+tree modification, exactly like SQLite's statement-level ABORT.
     let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> =
         Vec::with_capacity(source_res.rows.len());
-    for row in &source_res.rows {
+    for (row_index, row) in source_res.rows.iter().enumerate() {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else {
-            return Err(Error::Unsupported(
-                "UPDATE on a table without INTEGER PRIMARY KEY",
-            ));
+            source_rowids[row_index]
         };
 
         let mut new_row = row.clone();
@@ -13957,6 +14006,9 @@ fn try_streaming_update(
         StreamingSource::IndexRange { table: t, .. } => t,
     };
     if !src_table.name.eq_ignore_ascii_case(&table.name) {
+        return Ok(None);
+    }
+    if table.rowid_alias.is_none() {
         return Ok(None);
     }
 
