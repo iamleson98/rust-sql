@@ -1246,7 +1246,8 @@ fn regression_update_by_indexed_col_in_list() {
     .unwrap();
 
     // UPDATE ... WHERE indexed_col IN (...): IndexIn point probes.
-    db.execute("UPDATE t SET v = v * 10 WHERE k IN ('a', 'b')", []).unwrap();
+    db.execute("UPDATE t SET v = v * 10 WHERE k IN ('a', 'b')", [])
+        .unwrap();
     let rows = db.query("SELECT v FROM t ORDER BY v", []).unwrap();
     assert_eq!(
         rows,
@@ -1261,14 +1262,20 @@ fn regression_update_by_indexed_col_in_list() {
     // Index maintenance follows the point-probe update (index key changed
     // by the SET? k untouched here — also verify a SET on the indexed
     // column itself moves the entry).
-    db.execute("UPDATE t SET k = 'z' WHERE k = 'c'", []).unwrap();
-    let n = db.query("SELECT COUNT(*) FROM t WHERE k = 'z'", []).unwrap();
+    db.execute("UPDATE t SET k = 'z' WHERE k = 'c'", [])
+        .unwrap();
+    let n = db
+        .query("SELECT COUNT(*) FROM t WHERE k = 'z'", [])
+        .unwrap();
     assert_eq!(n[0][0], Value::Integer(1), "index entry moved with the SET");
-    let n = db.query("SELECT COUNT(*) FROM t WHERE k = 'c'", []).unwrap();
+    let n = db
+        .query("SELECT COUNT(*) FROM t WHERE k = 'c'", [])
+        .unwrap();
     assert_eq!(n[0][0], Value::Integer(0), "old index entry gone");
 
     // Duplicate IN members and NULL members behave (dedup, no match).
-    db.execute("UPDATE t SET v = 0 WHERE k IN ('z', 'z', NULL)", []).unwrap();
+    db.execute("UPDATE t SET v = 0 WHERE k IN ('z', 'z', NULL)", [])
+        .unwrap();
     let rows = db.query("SELECT v FROM t WHERE k = 'z'", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(0));
 }
@@ -1294,7 +1301,8 @@ fn regression_delete_by_indexed_col_in_list_keeps_all_keys() {
     )
     .unwrap();
 
-    db.execute("DELETE FROM t WHERE k IN ('a', 'b')", []).unwrap();
+    db.execute("DELETE FROM t WHERE k IN ('a', 'b')", [])
+        .unwrap();
     let rows = db.query("SELECT k, v FROM t", []).unwrap();
     assert_eq!(
         rows,
@@ -1303,8 +1311,10 @@ fn regression_delete_by_indexed_col_in_list_keeps_all_keys() {
     );
 
     // Three-member list with duplicates, deleting everything.
-    db.execute("INSERT INTO t VALUES ('x', 9), ('y', 8)", []).unwrap();
-    db.execute("DELETE FROM t WHERE k IN ('x', 'y', 'x')", []).unwrap();
+    db.execute("INSERT INTO t VALUES ('x', 9), ('y', 8)", [])
+        .unwrap();
+    db.execute("DELETE FROM t WHERE k IN ('x', 'y', 'x')", [])
+        .unwrap();
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(1));
 }
@@ -1328,8 +1338,11 @@ fn regression_streaming_update_root_split_keeps_rows() {
 
     let mut db = Database::open(&path).unwrap();
     db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+        [],
+    )
+    .unwrap();
     db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=300i64 {
@@ -1344,10 +1357,13 @@ fn regression_streaming_update_root_split_keeps_rows() {
     // Size-changing UPDATE via the scan path: 'v123' (4 B) -> 'upd' (3 B)
     // forces the deferred delete+insert loop; ~100 deferred rows grow the
     // tree 2 pages -> 4 pages (root split mid-loop).
-    db.execute("UPDATE t SET v = 'upd' WHERE v LIKE 'v1%'", []).unwrap();
+    db.execute("UPDATE t SET v = 'upd' WHERE v LIKE 'v1%'", [])
+        .unwrap();
     let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(n[0][0], Value::Integer(300), "no rows lost or duplicated");
-    let n = db.query("SELECT COUNT(*) FROM t WHERE v = 'upd'", []).unwrap();
+    let n = db
+        .query("SELECT COUNT(*) FROM t WHERE v = 'upd'", [])
+        .unwrap();
     assert_eq!(n[0][0], Value::Integer(111), "all matching rows updated");
 
     let ic = db.query("PRAGMA integrity_check", []).unwrap();
@@ -1377,8 +1393,11 @@ fn regression_streaming_update_deferred_mask_index_order() {
     // untranslated positions marked the wrong rows, double-patching some
     // and skipping others.
     let mut db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)", [])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+        [],
+    )
+    .unwrap();
     db.execute("CREATE INDEX idx_k ON t(k)", []).unwrap();
     db.execute("BEGIN", []).unwrap();
     for i in 1..=300i64 {
@@ -1392,13 +1411,24 @@ fn regression_streaming_update_deferred_mask_index_order() {
 
     // IndexRange source: rows arrive in k order (NOT rowid order). k>5
     // matches k in {6,7,8,9} = 120 of the 300 rows.
-    db.execute("UPDATE t SET v = 'upd' WHERE k > 5", []).unwrap();
+    db.execute("UPDATE t SET v = 'upd' WHERE k > 5", [])
+        .unwrap();
     let n = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(n[0][0], Value::Integer(300));
-    let n = db.query("SELECT COUNT(*) FROM t WHERE v = 'upd'", []).unwrap();
-    assert_eq!(n[0][0], Value::Integer(120), "k>5 -> 120 rows (k in 6..=9) updated once each");
+    let n = db
+        .query("SELECT COUNT(*) FROM t WHERE v = 'upd'", [])
+        .unwrap();
+    assert_eq!(
+        n[0][0],
+        Value::Integer(120),
+        "k>5 -> 120 rows (k in 6..=9) updated once each"
+    );
     let ic = db.query("PRAGMA integrity_check", []).unwrap();
     for row in &ic {
-        assert!(row[0].as_text().contains("ok"), "integrity: {:?}", row[0].as_text());
+        assert!(
+            row[0].as_text().contains("ok"),
+            "integrity: {:?}",
+            row[0].as_text()
+        );
     }
 }

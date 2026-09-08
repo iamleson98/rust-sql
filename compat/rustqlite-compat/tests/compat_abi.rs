@@ -607,8 +607,14 @@ fn abi_relative_path_fresh_db_single_engine() {
 
     // The exact failing sequence from the migration log: DDL through A,
     // then DDL through B (a pooled statement may land on either).
-    exec(&a, "CREATE TABLE \"user\" (id INTEGER PRIMARY KEY, status TEXT)");
-    exec(&b, "CREATE INDEX \"User_status_idx\" ON \"user\" (\"status\")");
+    exec(
+        &a,
+        "CREATE TABLE \"user\" (id INTEGER PRIMARY KEY, status TEXT)",
+    );
+    exec(
+        &b,
+        "CREATE INDEX \"User_status_idx\" ON \"user\" (\"status\")",
+    );
     exec(&a, "INSERT INTO \"user\" VALUES (1, 'active')");
     let (mut q, _) = prepare(&b, "SELECT COUNT(*) FROM \"user\"");
     let rows = step_all_text(&mut q);
@@ -631,7 +637,10 @@ fn abi_relative_path_fresh_db_single_engine() {
     let c = Db(c);
     let (mut q, _) = prepare(&c, "SELECT COUNT(*) FROM \"user\"");
     let rows = step_all_text(&mut q);
-    assert_eq!(rows[0][0], "1", "\"./name\" shares the engine with \"name\"");
+    assert_eq!(
+        rows[0][0], "1",
+        "\"./name\" shares the engine with \"name\""
+    );
 
     let _ = std::fs::remove_file(&rel);
 }

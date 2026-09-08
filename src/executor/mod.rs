@@ -13990,7 +13990,8 @@ fn try_streaming_update(
         } => {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let key_values: Vec<Value> = key_exprs
                 .iter()
                 .map(|e| evaluate(e, &eval_ctx))
@@ -14016,7 +14017,8 @@ fn try_streaming_update(
         } => {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
             for e in key_exprs {
                 let v = evaluate(e, &eval_ctx)?;

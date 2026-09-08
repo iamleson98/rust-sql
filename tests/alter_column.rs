@@ -216,13 +216,12 @@ fn rename_rowid_alias_to_fallback_keyword_name() {
     // (This used to error only because the parser rejected keyword
     // column names — see the %fallback-ID rule in parse_ident.)
     let mut db = memdb();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
-        [],
-    )
-    .unwrap();
-    db.execute("ALTER TABLE t RENAME COLUMN id TO key", []).unwrap();
-    db.execute("INSERT INTO t (key, a) VALUES (5, 1)", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", [])
+        .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN id TO key", [])
+        .unwrap();
+    db.execute("INSERT INTO t (key, a) VALUES (5, 1)", [])
+        .unwrap();
     let rows = db.query("SELECT key, rowid, a FROM t", []).unwrap();
     assert_eq!(rows[0][0], rustqlite::Value::Integer(5));
     assert_eq!(

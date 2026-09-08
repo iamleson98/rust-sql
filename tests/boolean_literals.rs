@@ -23,8 +23,9 @@ fn mem() -> Database {
 
 #[test]
 fn boolean_literals_select() {
-    let mut db = mem();
-    let rows = db.query("SELECT TRUE, FALSE, typeof(TRUE), typeof(FALSE)", ())
+    let db = mem();
+    let rows = db
+        .query("SELECT TRUE, FALSE, typeof(TRUE), typeof(FALSE)", ())
         .unwrap();
     assert_eq!(
         rows[0],
@@ -41,14 +42,29 @@ fn boolean_literals_select() {
 fn boolean_literals_in_comparisons() {
     let mut db = mem();
     db.execute("CREATE TABLE t (a INTEGER)", ()).unwrap();
-    db.execute("INSERT INTO t VALUES (1), (0), (2)", ()).unwrap();
-
-    let rows = db.query("SELECT 1 = TRUE, 0 = FALSE, TRUE AND FALSE, TRUE OR FALSE", ())
+    db.execute("INSERT INTO t VALUES (1), (0), (2)", ())
         .unwrap();
-    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(1), Value::Integer(0), Value::Integer(1)]);
+
+    let rows = db
+        .query(
+            "SELECT 1 = TRUE, 0 = FALSE, TRUE AND FALSE, TRUE OR FALSE",
+            (),
+        )
+        .unwrap();
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(0),
+            Value::Integer(1)
+        ]
+    );
 
     // WHERE with the literal on either side.
-    let rows = db.query("SELECT COUNT(*) FROM t WHERE a = TRUE", ()).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM t WHERE a = TRUE", ())
+        .unwrap();
     assert_eq!(rows[0][0], Value::Integer(1));
     let rows = db.query("SELECT COUNT(*) FROM t WHERE TRUE", ()).unwrap();
     assert_eq!(rows[0][0], Value::Integer(3));
@@ -77,12 +93,19 @@ fn boolean_literal_mixed_with_binds_not_null() {
     db.execute(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
          VALUES (?1, ?2, TRUE, ?3, -1)",
-        [Value::Integer(1), Value::Text("create_users".into()), Value::Blob(vec![1, 2, 3])],
+        [
+            Value::Integer(1),
+            Value::Text("create_users".into()),
+            Value::Blob(vec![1, 2, 3]),
+        ],
     )
     .expect("mixed binds + TRUE literal must insert");
 
     let rows = db
-        .query("SELECT version, success, typeof(success) FROM _sqlx_migrations", ())
+        .query(
+            "SELECT version, success, typeof(success) FROM _sqlx_migrations",
+            (),
+        )
         .unwrap();
     assert_eq!(
         rows[0],
@@ -97,10 +120,15 @@ fn boolean_literal_mixed_with_binds_not_null() {
     db.execute(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
          VALUES (?1, ?2, FALSE, ?3, -1)",
-        [Value::Integer(2), Value::Text("failed".into()), Value::Blob(vec![9])],
+        [
+            Value::Integer(2),
+            Value::Text("failed".into()),
+            Value::Blob(vec![9]),
+        ],
     )
     .unwrap();
-    let rows = db.query("SELECT success FROM _sqlx_migrations WHERE version = 2", ())
+    let rows = db
+        .query("SELECT success FROM _sqlx_migrations WHERE version = 2", ())
         .unwrap();
     assert_eq!(rows[0][0], Value::Integer(0));
 }
@@ -118,11 +146,8 @@ fn boolean_literal_default_and_check() {
     assert_eq!(rows[0][0], Value::Integer(1), "DEFAULT TRUE fills 1");
 
     // CHECK constraint written with the keyword literal.
-    db.execute(
-        "CREATE TABLE c (x INTEGER CHECK (x > 0 OR FALSE))",
-        (),
-    )
-    .unwrap();
+    db.execute("CREATE TABLE c (x INTEGER CHECK (x > 0 OR FALSE))", ())
+        .unwrap();
     db.execute("INSERT INTO c VALUES (5)", ()).unwrap();
     let err = db.execute("INSERT INTO c VALUES (-5)", ()).unwrap_err();
     assert!(format!("{err}").contains("CHECK"), "CHECK fires: {err}");
@@ -136,7 +161,8 @@ fn boolean_literal_case_when_and_upsert() {
         .unwrap();
     assert_eq!(rows[0][0], Value::Text("yes".into()));
 
-    db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, a INTEGER)", ()).unwrap();
+    db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
     db.execute(
         "INSERT INTO t (k, a) VALUES (1, TRUE)
@@ -153,11 +179,9 @@ fn true_false_still_usable_as_column_names() {
     // SQLite's %fallback ID: TRUE/FALSE remain legal unquoted column
     // names in DDL (parse_ident_or_keyword accepts keyword tokens).
     let mut db = mem();
-    db.execute("CREATE TABLE t (true INTEGER, false TEXT)", ()).unwrap();
+    db.execute("CREATE TABLE t (true INTEGER, false TEXT)", ())
+        .unwrap();
     db.execute("INSERT INTO t VALUES (42, 'x')", ()).unwrap();
     let rows = db.query("SELECT \"true\", \"false\" FROM t", ()).unwrap();
-    assert_eq!(
-        rows[0],
-        vec![Value::Integer(42), Value::Text("x".into())]
-    );
+    assert_eq!(rows[0], vec![Value::Integer(42), Value::Text("x".into())]);
 }

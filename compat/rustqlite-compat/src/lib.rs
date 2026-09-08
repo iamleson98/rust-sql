@@ -787,10 +787,7 @@ fn engine_file_key(p: &std::path::Path) -> String {
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| p.as_os_str().to_os_string());
-    canonical_parent
-        .join(name)
-        .to_string_lossy()
-        .into_owned()
+    canonical_parent.join(name).to_string_lossy().into_owned()
 }
 
 fn open_engine(target: &OpenTarget, create: bool, readonly: bool) -> Result<Database, String> {
