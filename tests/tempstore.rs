@@ -16,6 +16,15 @@ fn force_spill_env() {
     std::env::set_var("RSQL_GROUP_SPILL_THRESHOLD", "4");
 }
 
+/// Serializes the spilling tests AND the temp-file counting test: the
+/// count is only deterministic when no other test's ephemeral file is
+/// alive at sampling time (CI caught the race — parallel test threads
+/// see each other's live spill files).
+fn spill_gate() -> &'static std::sync::Mutex<()> {
+    static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    M.get_or_init(std::sync::Mutex::default)
+}
+
 fn rows_sorted(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     rows.sort_by(|a, b| {
         for (x, y) in a.iter().zip(b.iter()) {
@@ -54,6 +63,7 @@ fn build_table(db: &mut Database) {
 #[test]
 fn group_by_spill_matches_ram_reference() {
     force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
     let mut spilled = Database::open_in_memory().unwrap();
     build_table(&mut spilled);
 
@@ -113,6 +123,7 @@ fn group_by_spill_matches_ram_reference() {
 #[test]
 fn group_by_spill_streaming_driver_matches_buffered() {
     force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
     let mut db = Database::open_in_memory().unwrap();
     build_table(&mut db);
 
@@ -140,6 +151,7 @@ fn group_by_spill_streaming_driver_matches_buffered() {
 #[test]
 fn group_by_spill_parallel_matches_serial() {
     force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
     let mut par = Database::open_in_memory().unwrap();
     build_table(&mut par);
     // parallel_scan = 8 → split any scan above 8 estimated rows.
@@ -172,6 +184,7 @@ fn group_by_spill_parallel_matches_serial() {
 #[test]
 fn group_by_spill_output_is_key_sorted() {
     force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
     let mut db = Database::open_in_memory().unwrap();
     build_table(&mut db);
     let rows = db
@@ -234,6 +247,7 @@ fn pragma_temp_store_round_trip() {
 #[test]
 fn spill_files_are_cleaned_up() {
     force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
     fn count_ephemeral() -> usize {
         std::fs::read_dir(std::env::temp_dir())
             .map(|rd| {
