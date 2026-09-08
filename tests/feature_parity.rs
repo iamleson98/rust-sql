@@ -1355,3 +1355,59 @@ fn vacuum_then_append_right_zero_interior() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&wal);
 }
+
+// ---------------------------------------------------------------------------
+// UPDATE on tables WITHOUT an INTEGER PRIMARY KEY alias (rowid-slot
+// resolution) — the "UPDATE target row disappeared" regression guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_table_without_integer_pk() {
+    let mut db = mem();
+    db.execute("CREATE TABLE t(a INTEGER, b TEXT)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (1, 'x')", ())
+        .unwrap();
+    // Plain UPDATE (no WHERE) over duplicate rows.
+    db.execute("UPDATE t SET b = 'z'", ()).unwrap();
+    let rows = db.query("SELECT a, b FROM t", ()).unwrap();
+    for r in &rows {
+        assert_eq!(r[1], rustqlite::Value::Text("z".into()));
+    }
+    // Predicate UPDATE.
+    db.execute("UPDATE t SET a = 9 WHERE b = 'z' AND a = 1", ())
+        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM t WHERE a = 9", ()).unwrap();
+    assert_eq!(rows[0][0], rustqlite::Value::Integer(2));
+    // STRICT typing errors still surface (not "row disappeared").
+    db.execute("CREATE TABLE ts (a INTEGER) STRICT", ())
+        .unwrap();
+    db.execute("INSERT INTO ts VALUES (1)", ()).unwrap();
+    let e = db
+        .execute("UPDATE ts SET a = 'not an int'", ())
+        .unwrap_err();
+    assert!(e.to_string().contains("cannot store"), "got: {e}");
+    // Expression-index maintenance across a no-alias UPDATE.
+    db.execute(
+        "CREATE TABLE ei(x INTEGER);
+         INSERT INTO ei VALUES (2), (3);
+         CREATE INDEX ei_lower ON ei(lower(hex(x)))",
+        (),
+    )
+    .unwrap();
+    db.execute("UPDATE ei SET x = x * 10", ()).unwrap();
+    // hex() of a numeric is the hex of its text form: hex(20) -> '3230'.
+    let rows = db
+        .query("SELECT x FROM ei WHERE lower(hex(x)) = '3230'", ())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], rustqlite::Value::Integer(20));
+    // TEXT PRIMARY KEY (autoindex, no rowid alias).
+    db.execute("CREATE TABLE tp(k TEXT PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO tp VALUES ('a', 1), ('b', 2)", ())
+        .unwrap();
+    db.execute("UPDATE tp SET v = v + 10 WHERE k = 'b'", ())
+        .unwrap();
+    let rows = db.query("SELECT v FROM tp WHERE k = 'b'", ()).unwrap();
+    assert_eq!(rows[0][0], rustqlite::Value::Integer(12));
+}

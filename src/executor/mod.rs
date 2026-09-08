@@ -13386,6 +13386,24 @@ fn find_rowids_for_rows(
     table: &Table,
     rows: &[Vec<Value>],
 ) -> Result<Vec<i64>> {
+    // Hidden rowid slot (planner::HIDDEN_ROWID): scan rows of a no-alias
+    // table carry the rowid as a trailing extra column — take it directly
+    // (exact, no matching pass over the B+tree).
+    let n = table.n_columns();
+    if crate::planner::wants_rowid_slot(table) {
+        let ids: Option<Vec<i64>> = rows
+            .iter()
+            .map(|r| r.get(n).map(|v| v.as_integer()))
+            .collect();
+        if let Some(ids) = ids {
+            return Ok(ids);
+        }
+    }
+    // Fallback (no hidden slot — e.g. a real column named "rowid"):
+    // match each source row against the stored rows by content. The
+    // first unused stored row whose leading n columns equal the wanted
+    // row's leading n columns wins; PRIMARY KEY columns take precedence
+    // as the match key.
     let root = ctx.table_root(table);
     let mut stored = Vec::new();
     let mut bt = Btree::new(ctx.pager, root, false);
@@ -13405,13 +13423,14 @@ fn find_rowids_for_rows(
         .collect();
     rows.iter()
         .map(|wanted| {
+            let wanted = &wanted[..n.min(wanted.len())];
             stored
                 .iter()
                 .enumerate()
                 .find(|(index, (_, row))| {
                     !used[*index]
                         && if key_columns.is_empty() {
-                            row == wanted
+                            row.as_slice() == wanted
                         } else {
                             key_columns
                                 .iter()
