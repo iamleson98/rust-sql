@@ -591,6 +591,11 @@ impl<'a> Statement<'a> {
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.merge_dml_maps();
                 self.db.sync_schema_roots_public()?;
+                // Auto-commit ledger: a DML statement stepped with no
+                // transaction open was its own implicit transaction.
+                if !self.db.in_transaction.load(std::sync::atomic::Ordering::Acquire) {
+                    self.db.pager.note_tx_autocommit();
+                }
             } else if self.deltas.max_rowids_changed && !self.db.pager.committed_reads_armed() {
                 // Committed-view reads never merge (see query()).
                 self.merge_max_rowids();
@@ -637,6 +642,8 @@ impl<'a> Statement<'a> {
         // and the change counters the same way Database::execute does.
         db.set_last_insert_rowid(ctx.last_insert_rowid);
         crate::executor::change_counters::record(ctx.changes);
+        // Engine-wide aggregate for the stats endpoint (any-thread read).
+        db.pager.note_rows_modified(ctx.changes);
         let out = out?;
         // Capture deltas (query()'s DML merge-back semantics).
         self.deltas = CtxDeltas {

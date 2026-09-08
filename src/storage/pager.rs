@@ -639,6 +639,26 @@ pub struct Pager {
     /// the per-row amortized cost is negligible — same trade SQLite's own
     /// SQLITE_STATUS counters make).
     cache_hits: std::sync::atomic::AtomicU64,
+    /// ENGINE-WIDE total row mutations (SQLite's `total_changes` aggregate).
+    /// `change_counters` (executor) are THREAD-LOCAL to preserve SQLite's
+    /// per-connection SQL-function semantics, which left the stats
+    /// endpoint — sampling from an HTTP worker thread that never executes
+    /// statements — reading a permanent 0. This atomic is bumped at the
+    /// same statement-completion sites and is readable from any thread.
+    rows_modified: std::sync::atomic::AtomicI64,
+    /// ENGINE-WIDE transaction ledger: EXPLICIT BEGIN/COMMIT/ROLLBACK
+    /// statements plus IMPLICIT (auto-commit) write transactions. A
+    /// statement executed with no transaction open is its own transaction
+    /// (SQLite's auto-commit semantics), so a workload driven entirely in
+    /// auto-commit mode — sea-orm's default through sqlx — still shows
+    /// begun/committed counts instead of a misleading all-zero ledger.
+    /// One relaxed fetch_add per transaction boundary, not per row.
+    tx_begun: std::sync::atomic::AtomicU64,
+    /// Committed transactions: explicit COMMITs + auto-commit writes.
+    tx_committed: std::sync::atomic::AtomicU64,
+    /// Rolled-back transactions: explicit ROLLBACKs (+ auto-rollback at
+    /// connection drop, where the C-ABI layer reports it).
+    tx_rolled_back: std::sync::atomic::AtomicU64,
     /// Unique id of this Pager instance within the process. Advisory
     /// caches (btree leaf hints) tag entries with (instance, version) so a
     /// new database opened on the same thread can never mistake stale
@@ -1486,6 +1506,10 @@ impl Pager {
             synchronous: std::sync::atomic::AtomicU8::new(2),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_hits: std::sync::atomic::AtomicU64::new(0),
+            rows_modified: std::sync::atomic::AtomicI64::new(0),
+            tx_begun: std::sync::atomic::AtomicU64::new(0),
+            tx_committed: std::sync::atomic::AtomicU64::new(0),
+            tx_rolled_back: std::sync::atomic::AtomicU64::new(0),
             instance_id: PAGER_INSTANCE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
@@ -1921,6 +1945,60 @@ impl Pager {
     /// the live cache hit rate.
     pub fn cache_hits(&self) -> u64 {
         self.cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Record `n` row mutations for the engine-wide total (see
+    /// [`Self::rows_modified`]). Called at the same statement-completion
+    /// sites as the executor's thread-local `change_counters::record`.
+    pub fn note_rows_modified(&self, n: i64) {
+        if n != 0 {
+            self.rows_modified.fetch_add(n.max(0), Ordering::Relaxed);
+        }
+    }
+
+    /// Engine-wide total row mutations since open — readable from ANY
+    /// thread (the stats endpoint samples from an HTTP worker).
+    pub fn rows_modified_total(&self) -> i64 {
+        self.rows_modified.load(Ordering::Relaxed)
+    }
+
+    /// Explicit BEGIN observed (see [`Self::tx_begun`]).
+    pub fn note_tx_begun(&self) {
+        self.tx_begun.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Explicit COMMIT observed.
+    pub fn note_tx_committed(&self) {
+        self.tx_committed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Explicit ROLLBACK observed.
+    pub fn note_tx_rolled_back(&self) {
+        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An auto-commit write statement completed with no transaction open:
+    /// SQLite treats the statement as its own implicit transaction, so it
+    /// counts as one begun + one committed transaction.
+    pub fn note_tx_autocommit(&self) {
+        self.tx_begun.fetch_add(1, Ordering::Relaxed);
+        self.tx_committed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total transactions begun: explicit BEGINs + implicit auto-commit
+    /// writes, since open.
+    pub fn tx_begun_total(&self) -> u64 {
+        self.tx_begun.load(Ordering::Relaxed)
+    }
+
+    /// Total transactions committed: explicit COMMITs + auto-commit writes.
+    pub fn tx_committed_total(&self) -> u64 {
+        self.tx_committed.load(Ordering::Relaxed)
+    }
+
+    /// Total transactions rolled back (explicit ROLLBACKs).
+    pub fn tx_rolled_back_total(&self) -> u64 {
+        self.tx_rolled_back.load(Ordering::Relaxed)
     }
 
     /// Number of frames currently in the write-ahead log (diagnostics;

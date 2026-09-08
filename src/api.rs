@@ -3559,8 +3559,13 @@ impl Database {
         // Counters (mirrors the general path's epilogue).
         self.set_last_insert_rowid(rowid);
         crate::executor::change_counters::record(1);
+        self.pager.note_rows_modified(1);
         // Auto-commit flush, exactly like `exec_fast_insert`'s tail.
         let in_txn = self.in_transaction.load(Ordering::Acquire);
+        if !in_txn {
+            // One auto-commit INSERT = one implicit transaction.
+            self.pager.note_tx_autocommit();
+        }
         let deferred = self.deferred_flush.load(Ordering::Acquire);
         if !in_txn && !deferred {
             self.pager.flush()?;
@@ -3849,6 +3854,11 @@ impl Database {
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         if let Ok(n) = result {
             crate::executor::change_counters::record(n);
+            self.pager.note_rows_modified(n);
+            // Auto-commit bulk INSERT: one implicit transaction.
+            if n > 0 && !ctx.in_transaction {
+                self.pager.note_tx_autocommit();
+            }
             self.note_alloc_burst(n as u64, 0);
         }
         // Merge overlays back regardless of success — a failed statement
@@ -4475,6 +4485,15 @@ impl Database {
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
         crate::executor::change_counters::record(ctx.changes);
+        // Engine-wide observability aggregate (thread-local counters
+        // above preserve SQL-function semantics; this one is readable by
+        // the admin stats endpoint from any thread).
+        self.pager.note_rows_modified(ctx.changes);
+        // Auto-commit ledger: a write statement that completed with no
+        // transaction open was its own implicit transaction.
+        if result.is_ok() && !ctx.in_transaction && (ctx.changes > 0 || is_ddl) {
+            self.pager.note_tx_autocommit();
+        }
         // Allocator-burst accounting (see `settle_allocator`): estimate the
         // blocks this statement freed — AST/plan teardown + per-row encode
         // buffers + newly-dirtied pages (index backfill, splits). The dirty
@@ -4881,6 +4900,14 @@ impl Database {
                     | crate::planner::plan::Plan::Update { .. }
                     | crate::planner::plan::Plan::Delete { .. }
             ) {
+                // Change accounting (mirrors execute's epilogue): DML via
+                // the query path must feed changes()/total_changes() and
+                // the engine-wide observability aggregates too.
+                crate::executor::change_counters::record(ctx.changes);
+                self.pager.note_rows_modified(ctx.changes);
+                if ctx.changes > 0 && !ctx.in_transaction {
+                    self.pager.note_tx_autocommit();
+                }
                 // DML via the query path bypasses `Database::execute` (and
                 // its unconditional write-epoch bump) — bump it HERE so
                 // memoized COUNT(*) answers can never outlive the write
@@ -6674,6 +6701,7 @@ impl Database {
                 ctx.pager.flush_before_snapshot()?;
                 ctx.pager.savepoint("__begin__");
                 ctx.in_transaction = true;
+                ctx.pager.note_tx_begun();
                 ctx.txn_snapshot = Some(ctx.pager.snapshot());
                 Ok(())
             }
@@ -6682,6 +6710,7 @@ impl Database {
                 ctx.txn_snapshot = None;
                 ctx.pager.clear_savepoints();
                 ctx.pager.flush()?;
+                ctx.pager.note_tx_committed();
                 Ok(())
             }
             Statement::Rollback(_) => {
@@ -6712,6 +6741,7 @@ impl Database {
                 ctx.index_roots.clear();
                 ctx.max_rowids.clear();
                 ctx.rolled_back = true;
+                ctx.pager.note_tx_rolled_back();
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
@@ -8192,16 +8222,26 @@ impl Database {
                 }
                 "cache_size" => {
                     // SQLite semantics: positive N = N pages, negative N =
-                    // N KiB (e.g. -2000 = ~2 MiB). Applied live — the next
-                    // cache insert's eviction pass trims an over-capacity
-                    // cache. In-memory databases ignore it (never evict).
+                    // N KiB (e.g. -2000 = 2000 KiB; -65536 = 64 MiB).
+                    // Applied live — the next cache insert's eviction pass
+                    // trims an over-capacity cache. In-memory databases
+                    // ignore it (never evict).
                     if let Value::Integer(k) = &v {
                         let pages = if *k >= 0 {
                             (*k as usize).max(1)
                         } else {
-                            // KiB -> pages (floor 1)
-                            let kib = (*k).unsigned_abs() as usize;
-                            (kib / (ctx.pager.page_size() as usize)).max(1)
+                            // KiB -> pages: convert KiB to BYTES first
+                            // (*1024), then divide by the page size in
+                            // bytes. The old form divided the KiB COUNT by
+                            // the byte page size, silently shrinking the
+                            // configured cache 1024x (a -65536 = 64 MiB
+                            // request resolved to 16 pages = 64 KiB, and
+                            // the page-cache hit rate collapsed to ~10%).
+                            // u64 math: the negative i64's magnitude fits
+                            // u63, so *1024 cannot overflow.
+                            let kib = (*k).unsigned_abs();
+                            let bytes = kib.saturating_mul(1024);
+                            ((bytes / (ctx.pager.page_size() as u64)).max(1)) as usize
                         };
                         ctx.pager.set_cache_capacity(pages);
                     }

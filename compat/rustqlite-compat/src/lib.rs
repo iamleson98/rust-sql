@@ -260,13 +260,27 @@ pub struct EngineStats {
 /// Takes the engines registry lock briefly and each engine's `Database`
 /// read lock briefly (pager counters). Safe to call from any thread at
 /// any cadence — nothing blocks statement execution for long.
+///
+/// Transaction ledger + row-mutation totals come from the ENGINE's
+/// per-pager counters (explicit BEGIN/COMMIT/ROLLBACK plus implicit
+/// auto-commit write transactions, readable from any thread) rather
+/// than the C-ABI step metrics: the C-ABI layer only sees statements
+/// that flow through THIS crate's calls, and `total_changes` as a
+/// thread-local would read 0 from a stats thread that never executes
+/// statements.
 pub fn engine_stats() -> EngineStats {
     use std::sync::atomic::Ordering::Relaxed;
     let mut files = Vec::new();
+    let mut tx_begun: u64 = 0;
+    let mut tx_committed: u64 = 0;
+    let mut tx_rolled_back: u64 = 0;
     if let Ok(map) = engines().lock() {
         for (name, engine) in map.iter() {
             let db = engine.db.read();
             let pager = db.pager();
+            tx_begun += pager.tx_begun_total();
+            tx_committed += pager.tx_committed_total();
+            tx_rolled_back += pager.tx_rolled_back_total();
             files.push(EngineFileStats {
                 name: name.clone(),
                 page_size: db.page_size(),
@@ -277,7 +291,7 @@ pub fn engine_stats() -> EngineStats {
                 cache_hits: pager.cache_hits(),
                 cache_misses: pager.cache_misses(),
                 wal_frames: pager.wal_frames(),
-                total_changes: db.total_changes(),
+                total_changes: pager.rows_modified_total(),
                 live_connections: engine.live_connections.load(Relaxed),
                 transaction_active: engine.tx_owner.load(std::sync::atomic::Ordering::Acquire) != 0,
             });
@@ -290,9 +304,9 @@ pub fn engine_stats() -> EngineStats {
         steps: metrics::STEPS.load(Relaxed),
         rows_returned: metrics::ROWS_RETURNED.load(Relaxed),
         writes_executed: metrics::WRITES_EXECUTED.load(Relaxed),
-        transactions_begun: metrics::TX_BEGUN.load(Relaxed),
-        transactions_committed: metrics::TX_COMMITTED.load(Relaxed),
-        transactions_rolled_back: metrics::TX_ROLLED_BACK.load(Relaxed),
+        transactions_begun: tx_begun,
+        transactions_committed: tx_committed,
+        transactions_rolled_back: tx_rolled_back,
         busy_waits: metrics::BUSY_WAITS.load(Relaxed),
         busy_timeouts: metrics::BUSY_TIMEOUTS.load(Relaxed),
         files,
