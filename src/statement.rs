@@ -593,7 +593,11 @@ impl<'a> Statement<'a> {
                 self.db.sync_schema_roots_public()?;
                 // Auto-commit ledger: a DML statement stepped with no
                 // transaction open was its own implicit transaction.
-                if !self.db.in_transaction.load(std::sync::atomic::Ordering::Acquire) {
+                if !self
+                    .db
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
                     self.db.pager.note_tx_autocommit();
                 }
             } else if self.deltas.max_rowids_changed && !self.db.pager.committed_reads_armed() {

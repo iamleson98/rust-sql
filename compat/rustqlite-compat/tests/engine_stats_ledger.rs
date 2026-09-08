@@ -72,22 +72,8 @@ fn run(db: &Db, sql: &str) {
     let csql = CString::new(sql).unwrap();
     let mut stmt: *mut compat::sqlite3_stmt = ptr::null_mut();
     let mut tail: *const c_char = ptr::null();
-    let rc = unsafe {
-        sqlite3_prepare_v3(
-            db.0,
-            csql.as_ptr(),
-            -1,
-            0,
-            &mut stmt,
-            &mut tail,
-        )
-    };
-    assert_eq!(
-        rc,
-        SQLITE_OK,
-        "prepare {sql:?} failed: {}",
-        errmsg(db.0)
-    );
+    let rc = unsafe { sqlite3_prepare_v3(db.0, csql.as_ptr(), -1, 0, &mut stmt, &mut tail) };
+    assert_eq!(rc, SQLITE_OK, "prepare {sql:?} failed: {}", errmsg(db.0));
     let rc = unsafe { sqlite3_step(stmt) };
     unsafe { sqlite3_finalize(stmt) };
     assert!(
@@ -158,7 +144,10 @@ fn engine_stats_ledger_and_cache_capacity_through_c_abi() {
     run(&db, "COMMIT");
     let after2 = compat::engine_stats();
     assert_eq!(after2.transactions_begun - after.transactions_begun, 1);
-    assert_eq!(after2.transactions_committed - after.transactions_committed, 1);
+    assert_eq!(
+        after2.transactions_committed - after.transactions_committed,
+        1
+    );
 
     // ── 4. rollback: begun + rolled_back ──
     run(&db, "BEGIN");

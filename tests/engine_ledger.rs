@@ -15,11 +15,8 @@
 use rustqlite::Database;
 
 fn temp_db_path(tag: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "engine-ledger-{}-{}.db",
-        tag,
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("engine-ledger-{}-{}.db", tag, std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
@@ -64,7 +61,8 @@ fn cache_size_negative_kib_converts_to_correct_page_count() {
     let cap_pages = read_int(&db, "PRAGMA cache_size");
     let cap_bytes = cap_pages * page_size;
     assert_eq!(
-        cap_bytes, 2_000 * 1024,
+        cap_bytes,
+        2_000 * 1024,
         "-2000 KiB must resolve to 2000 KiB ({cap_pages} pages x {page_size} B)"
     );
 
@@ -87,7 +85,11 @@ fn engine_ledger_counts_autocommit_and_explicit_transactions() {
     db.execute("INSERT INTO t VALUES (2)", []).unwrap();
     db.execute("INSERT INTO t VALUES (3),(4),(5)", []).unwrap();
 
-    assert_eq!(db.pager().tx_begun_total(), 4, "CREATE + 3 auto-commit INSERTs");
+    assert_eq!(
+        db.pager().tx_begun_total(),
+        4,
+        "CREATE + 3 auto-commit INSERTs"
+    );
     assert_eq!(db.pager().tx_committed_total(), 4);
     assert_eq!(db.pager().tx_rolled_back_total(), 0);
     assert_eq!(db.pager().rows_modified_total(), 5, "5 rows inserted");
@@ -165,7 +167,8 @@ fn cache_size_kib_updates_capacity_before_any_insert() {
     // Shrink below the current cache footprint: further inserts must trim
     // toward the new capacity (never exceed it by more than pin pressure).
     db.execute("PRAGMA cache_size=8", []).unwrap();
-    db.execute("INSERT INTO t VALUES (2),(3),(4),(5)", []).unwrap();
+    db.execute("INSERT INTO t VALUES (2),(3),(4),(5)", [])
+        .unwrap();
     assert_eq!(read_int(&db, "PRAGMA cache_size"), 8);
     assert!(
         db.pager().cache_size() <= 64,
