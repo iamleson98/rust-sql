@@ -3263,6 +3263,54 @@ fn exec_project(
     input: &Plan,
     columns: &[ProjectExpr],
 ) -> Result<ExecResult> {
+    // ---- Parallel sort + projection fusion -----------------------------
+    // `Project(Sort(Scan))` with a bare-column projection: push the
+    // projection INTO the parallel sort driver — workers decode only the
+    // projected + key columns (the serial path decodes every column of
+    // the scan, sorts the full rows, then drops the unprojected values;
+    // the projection is 1:1, so sorting the projected columns under the
+    // same (keys, rowid) total order yields the identical output).
+    // A star projection is the identity over the table's columns (the
+    // hidden-rowid slot stays excluded, exactly like apply_projection's
+    // star expansion). Declines (shape / threshold / config / txn) fall
+    // through to the serial path below, unchanged.
+    if let Plan::Sort {
+        input: sort_input,
+        terms,
+    } = input
+    {
+        if let Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } = &**sort_input
+        {
+            if table.vtab.is_none() && !columns.is_empty() {
+                let n_cols = table.n_columns();
+                let append_rowid = crate::planner::wants_rowid_slot(table);
+                let row_width = n_cols + append_rowid as usize;
+                if let Some(keys) = bare_sort_keys(terms, table, alias.as_deref(), row_width) {
+                    if let Some((proj, names)) = bare_column_projection(columns, table) {
+                        // Star: identity over the table's columns (the
+                        // hidden-rowid slot is NOT projected — apply_projection's
+                        // star expansion skips hidden columns).
+                        let project: Vec<usize> = proj.unwrap_or_else(|| (0..n_cols).collect());
+                        if let Some(res) = crate::executor::parallel::try_parallel_sort(
+                            ctx,
+                            table,
+                            &keys,
+                            Some(&project),
+                            false,
+                            names,
+                        )? {
+                            return Ok(res);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let inner = execute(input, ctx)?;
     apply_projection(inner, columns, ctx)
 }
@@ -3621,6 +3669,7 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
                     ctx,
                     table,
                     &keys,
+                    None,
                     append_rowid,
                     out_cols,
                 )? {

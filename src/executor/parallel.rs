@@ -1151,9 +1151,9 @@ fn sort_total_cmp(
 }
 
 /// One range worker's sorted chunk: (rowid, row) pairs in
-/// `sort_total_cmp` order. Rows carry the hidden-rowid trailing slot
-/// when the scan shape emits one, so chunk rows are byte-identical to
-/// the serial `exec_scan` output.
+/// `sort_total_cmp` order. Rows are in the caller's wanted-column
+/// layout (full scan columns with the hidden-rowid trailing slot when
+/// the scan shape emits one, or the fused projection's columns).
 struct SortChunk {
     rows: Vec<(i64, Row)>,
 }
@@ -1164,6 +1164,15 @@ struct SortChunk {
 /// its range with the SAME selective scanner the parallel top-N uses,
 /// sorts its chunk locally under the (keys, rowid) total order, and the
 /// main thread runs a k-way merge under the SAME order.
+///
+/// `project == None` decodes every table column (the Sort's own output
+/// shape, hidden-rowid slot appended when the scan emits one).
+/// `project == Some(indices)` fuses a 1:1 bare-column projection ABOVE
+/// the sort (the `Project(Sort(Scan))` shape): the worker decodes only
+/// the projected + key columns — the serial path decodes every column,
+/// sorts, and drops the unprojected values on the floor, so the fused
+/// decode skips exactly the work the projection would discard (wide
+/// TEXT columns a `SELECT id, val ... ORDER BY val` never needed).
 ///
 /// ## Why the merge is exactly the serial answer
 ///
@@ -1186,6 +1195,7 @@ pub(crate) fn try_parallel_sort(
     ctx: &ExecContext<'_>,
     table: &StdArc<Table>,
     keys: &[(usize, bool)],
+    project: Option<&[usize]>,
     append_rowid: bool,
     out_cols: StdArc<[String]>,
 ) -> Result<Option<ExecResult>> {
@@ -1197,17 +1207,76 @@ pub(crate) fn try_parallel_sort(
 
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
-    let wanted: Vec<usize> = (0..n_cols).collect();
+    let rowid_proj = crate::storage::row_codec::ROWID_PROJ;
+
+    // ---- Wanted-column + position mapping --------------------------------
+    // Full-row mode (project None): the decoder reads every table
+    // column (identity positions) and the callback appends the hidden
+    // rowid slot when the scan shape emits one, so a hidden-slot key
+    // (index == n_cols) addresses the appended value directly.
+    // Projection mode: wanted = projected columns + key columns (the
+    // projection is 1:1, so sorting the projected row under the same
+    // total order equals sorting the full row); a hidden-slot key maps
+    // to the ROWID_PROJ sentinel, which the selective decoder fills
+    // from the B+tree cell key.
+    let scan_wanted: Vec<usize> = match project {
+        Some(ps) => {
+            let mut w = ps.to_vec();
+            for &(k, _) in keys {
+                let k_eff = if k >= n_cols { rowid_proj } else { k };
+                if !w.contains(&k_eff) {
+                    w.push(k_eff);
+                }
+            }
+            w.sort_unstable();
+            w.dedup();
+            w
+        }
+        None => (0..n_cols).collect(),
+    };
+    // Key position in the WORKER row (post-append in full-row mode).
+    let row_keys: Vec<(usize, bool)> = match project {
+        Some(_) => keys
+            .iter()
+            .map(|&(k, d)| {
+                let k_eff = if k >= n_cols { rowid_proj } else { k };
+                (
+                    scan_wanted
+                        .iter()
+                        .position(|&w| w == k_eff)
+                        .expect("key column in wanted"),
+                    d,
+                )
+            })
+            .collect(),
+        None => keys.to_vec(),
+    };
+    // Output position mapping (projection mode only).
+    let project_map: Vec<usize> = match project {
+        Some(ps) => ps
+            .iter()
+            .map(|&p| {
+                scan_wanted
+                    .iter()
+                    .position(|&w| w == p)
+                    .expect("projected column in wanted")
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     let ranges = split.ranges;
     let pager = ctx.pager;
+    let append = append_rowid && project.is_none();
 
     // Workers: range scan + local sort. The rows move out of the chunk
-    // during the merge (mem::replace), so the chunk Vecs are drained
+    // during the merge (mem::take), so the chunk Vecs are drained
     // allocation-free on the emit side.
     let partials: Vec<Result<SortChunk>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
-            let wanted = &wanted;
+            let wanted = &scan_wanted;
+            let row_keys = &row_keys;
             handles.push(scope.spawn(move || -> Result<SortChunk> {
                 let mut bt = Btree::new(pager, root, false);
                 let mut rows: Vec<(i64, Row)> = Vec::new();
@@ -1218,14 +1287,14 @@ pub(crate) fn try_parallel_sort(
                     wanted,
                     rowid_alias,
                     |rowid, mut row| {
-                        if append_rowid {
+                        if append {
                             row.push(Value::Integer(rowid));
                         }
                         rows.push((rowid, row));
                         true
                     },
                 )?;
-                rows.sort_unstable_by(|a, b| sort_total_cmp(&a.1, a.0, &b.1, b.0, keys));
+                rows.sort_unstable_by(|a, b| sort_total_cmp(&a.1, a.0, &b.1, b.0, row_keys));
                 Ok(SortChunk { rows })
             }));
         }
@@ -1255,7 +1324,7 @@ pub(crate) fn try_parallel_sort(
     // ---- k-way merge under the same strict total order ----------------
     // A binary heap of chunk indices; chunk i's head is
     // chunks[i].rows[cursors[i]]. Rows MOVE out of their chunk via
-    // mem::replace (the output reuses each row's allocation).
+    // mem::take (the output reuses each row's allocation).
     let mut cursors: Vec<usize> = vec![0; chunks.len()];
     let mut heap: Vec<usize> = (0..chunks.len())
         .filter(|&c| !chunks[c].rows.is_empty())
@@ -1269,7 +1338,7 @@ pub(crate) fn try_parallel_sort(
         mut i: usize,
         chunks: &[SortChunk],
         cursors: &[usize],
-        keys: &[(usize, bool)],
+        row_keys: &[(usize, bool)],
     ) {
         loop {
             let n = heap.len();
@@ -1279,7 +1348,7 @@ pub(crate) fn try_parallel_sort(
             let lt = |a: usize, b: usize| -> bool {
                 let (pa, pb) = (cursors[a], cursors[b]);
                 let (ra, rb) = (&chunks[a].rows[pa].1, &chunks[b].rows[pb].1);
-                sort_total_cmp(ra, chunks[a].rows[pa].0, rb, chunks[b].rows[pb].0, keys)
+                sort_total_cmp(ra, chunks[a].rows[pa].0, rb, chunks[b].rows[pb].0, row_keys)
                     == std::cmp::Ordering::Less
             };
             if l < n && lt(heap[l], heap[m]) {
@@ -1297,24 +1366,32 @@ pub(crate) fn try_parallel_sort(
     }
     // Heapify (Floyd).
     for i in (0..heap.len() / 2).rev() {
-        sift_down(&mut heap, i, &chunks, &cursors, keys);
+        sift_down(&mut heap, i, &chunks, &cursors, &row_keys);
     }
 
     let mut out: Vec<Row> = Vec::with_capacity(total);
     while let Some(&c) = heap.first() {
         let pos = cursors[c];
         cursors[c] += 1;
-        let (_, row) = std::mem::take(&mut chunks[c].rows[pos]);
-        out.push(row);
+        let (_, mut row) = std::mem::take(&mut chunks[c].rows[pos]);
+        if project.is_some() {
+            let projected: Vec<Value> = project_map
+                .iter()
+                .map(|&p| std::mem::replace(&mut row[p], Value::Null))
+                .collect();
+            out.push(projected);
+        } else {
+            out.push(row);
+        }
         if cursors[c] >= chunks[c].rows.len() {
             // Chunk exhausted: remove the root (swap-with-last + pop).
             let last = heap.pop().unwrap();
             if !heap.is_empty() {
                 heap[0] = last;
-                sift_down(&mut heap, 0, &chunks, &cursors, keys);
+                sift_down(&mut heap, 0, &chunks, &cursors, &row_keys);
             }
         } else {
-            sift_down(&mut heap, 0, &chunks, &cursors, keys);
+            sift_down(&mut heap, 0, &chunks, &cursors, &row_keys);
         }
     }
 

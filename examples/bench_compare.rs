@@ -1596,6 +1596,35 @@ fn main() {
                 d_s.as_secs_f64() / d_r.as_secs_f64()
             );
         }
+        // Unbounded sort: chunk sort + k-way range-ordered merge (the
+        // serial path's stable sort answer, bit-identical).
+        {
+            let sql = "SELECT id, val FROM t ORDER BY val DESC";
+            // val = (j*37+11) mod 1e6 is a bijection — unique keys, so
+            // the FULL materialized order is deterministic on both sides.
+            let r = db_r.query(sql, []).unwrap();
+            let s: Vec<(i64, i64)> = conn_s
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
+            assert_eq!(r.len(), s.len(), "unbounded sort row counts must match");
+            for (a, b) in r.iter().zip(s.iter()) {
+                assert_eq!(a[0], rustqlite::Value::Integer(b.0));
+                assert_eq!(a[1], rustqlite::Value::Integer(b.1));
+            }
+            let d_r = rustqlite_big_topn(&db_r, sql);
+            let d_s = sqlite_big_topn(&conn_s, sql);
+            println!(
+                "{:<50} {:>12} {:>12}   {:>5.2}x",
+                "Big ORDER BY INT DESC (unbounded, 1M rows)",
+                fmt_dur(d_r),
+                fmt_dur(d_s),
+                d_s.as_secs_f64() / d_r.as_secs_f64()
+            );
+        }
     }
 
     println!();

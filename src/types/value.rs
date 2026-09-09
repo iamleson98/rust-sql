@@ -802,6 +802,12 @@ impl Ord for Value {
             (Null, Null) => Ordering::Equal,
             (Null, _) => Ordering::Less,
             (_, Null) => Ordering::Greater,
+            // Integer×Integer compares EXACTLY on i64 (SQLite semantics
+            // — the f64 route below would collapse integers beyond 2^53
+            // onto equal doubles) and skips the num_class/f64 dance on
+            // what is the hottest comparison shape in sorts and
+            // groupings.
+            (Integer(a), Integer(b)) => a.cmp(b),
             (Integer(_) | Real(_), Integer(_) | Real(_)) => {
                 let (ca, cb) = (num_class(self), num_class(other));
                 match ca.cmp(&cb) {
