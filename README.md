@@ -557,14 +557,24 @@ complete second format stack:
   committed `-wal` sidecar frames into the read view, walks table b-trees
   (rowid + `WITHOUT ROWID`), reassembles overflow chains with fileformat2's
   exact local-length formulas, and decodes records (serial types 0–9,
-  12+) into engine values.
+  12+) into engine values — in the file's text encoding (UTF-8,
+  UTF-16le, UTF-16be; header field 56), including the `sqlite_schema`
+  texts.
 - **Writer** (`src/storage/sqlitefmt/writer.rs`): bulk-builds dense
   b-trees bottom-up with SQLite's own separator invariants (rowid bounds
   copied up for table trees, real entries pushed up for index trees —
   verified empirically against 3.46/3.53 files), writes overflow chains
   with the exact `K = M + (P−M) % (U−4)` split, `sqlite_autoindex_*`
   rows with NULL sql, `sqlite_sequence`, views, triggers, and header
-  counters. Commits are atomic: temp file + fsync + rename.
+  counters. Commits are atomic: temp file + fsync + rename. Text is
+  written in the file's encoding; index keys and `WITHOUT ROWID`
+  records are ordered by memcmp of the ENCODED bytes — measured against
+  real SQLite: UTF-16le files order by raw little-endian unit bytes
+  (not code-point order), UTF-16be by code units — so the b-trees this
+  engine builds are binary-searchable by SQLite itself. `PRAGMA
+  encoding = 'UTF-16le' | 'UTF-16be'` on an empty database picks the
+  encoding of a new file (SQLite's set-before-first-content rules,
+  including silently ignoring the assignment once content exists).
 
 Opening a SQLite file decodes it into the engine's in-memory state (every
 SQL feature — planner, parallel scans, the C ABI, the sqlx driver — works
@@ -602,7 +612,14 @@ PRIMARY KEY` alias storage, `TEXT PRIMARY KEY` autoindexes, unique and
 expression indexes, `AUTOINCREMENT` + `sqlite_sequence` high-water
 preservation, `user_version` / `application_id`, views, triggers,
 `WITHOUT ROWID` records, explicit transactions, ROLLBACK, dump-on-drop,
-and a live-WAL-sidecar read. Every file the engine writes is re-opened by
+and a live-WAL-sidecar read. `tests/utf16_interop.rs` does the same for
+UTF-16le/UTF-16be files: adversarial code-point/astral text round-trips
+through records, indexes, `WITHOUT ROWID` PKs, NOCASE, overflow chains
+and non-ASCII schema identifiers; engine-created UTF-16 files are
+re-opened by SQLite, which binary-searches the engine-built index
+b-trees (proving the key ORDER matches SQLite's encoding-aware BINARY
+collation byte-for-byte) and `ORDER BY` on the engine's file returns
+SQLite's own UTF-16 order. Every file the engine writes is re-opened by
 SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
 (`interop`) additionally exercises the real `sqlite3` CLI against the
 `rustqlite` CLI on Linux and macOS.
@@ -619,8 +636,14 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
 - Non-BINARY/NOCASE collations in index definitions fall back to binary
   ordering in the written file.
 - `auto_vacuum` pointer-map pages are read fine but not written (output
-  is always fully dense); UTF-16-encoded files are rejected (the engine
-  is UTF-8 throughout).
+  is always fully dense). UTF-16 files read and write end-to-end, with
+  two engine-side sub-gaps on non-UTF-8 files only: the ENGINE's
+  `ORDER BY` / min / max / DISTINCT ordering for TEXT is code-point
+  order (SQLite on a UTF-16 file uses raw file-encoding byte order, so
+  row order can differ for mixed-script adversarial text — equality,
+  lookups, and the file's own b-tree order are exact), and
+  `CAST(text AS BLOB)` yields UTF-8 bytes (SQLite yields the file
+  encoding's bytes).
 
 ## Remaining gaps vs SQLite
 
@@ -724,8 +747,12 @@ compat surface. Every entry says what it costs and why it exists.
 - **Non-BINARY collations in written SQLite files**: index definitions
   with custom collations fall back to binary ordering in the written file;
   `auto_vacuum` pointer-map pages are read but not written (output is
-  always dense); UTF-16-encoded SQLite files are rejected (the engine is
-  UTF-8 throughout).
+  always dense). UTF-16 files read/write end-to-end; the two remaining
+  engine-side sub-gaps on non-UTF-8 files: TEXT `ORDER BY`/min/max use
+  code-point order where SQLite uses raw file-encoding byte order
+  (equality and the file's b-tree order are exact), and
+  `CAST(text AS BLOB)` yields UTF-8 bytes instead of the file encoding's
+  bytes.
 - **WAL for SQLite-format mode**: the SQLite-format writer commits
   atomically via temp-file + rename, not a real `-wal` sidecar — readers
   of a rustqlite-written file never see journal state, but a

@@ -22,8 +22,8 @@
 
 use std::path::Path;
 
-use super::header::build_header;
-use super::record::encode_record;
+use super::header::build_header_enc;
+use super::record::{encode_record_aliased_enc, encode_record_enc, TextEnc};
 use super::varint::write_varint;
 use crate::types::value::Value;
 
@@ -39,10 +39,14 @@ pub enum OutObject {
         rows: Vec<(i64, Vec<Value>)>,
     },
     /// WITHOUT ROWID table: values are full records with the PK columns
-    /// first (already reordered and sorted by the caller).
+    /// first (already reordered by the caller; re-sorted here when the
+    /// file's text encoding needs a different byte order).
+    /// `pk_collations` holds the PK columns' collations in RECORD order
+    /// (PK first, pk_seq order).
     WithoutRowid {
         name: String,
         sql: String,
+        pk_collations: Vec<Collation>,
         rows: Vec<Vec<Value>>,
     },
     /// Index b-tree (explicit or autoindex). `entries` are complete index
@@ -81,6 +85,10 @@ pub struct OutDb {
     pub application_id: u32,
     pub change_counter: u32,
     pub schema_cookie: u32,
+    /// Text encoding of the output file: every TEXT value — records,
+    /// index keys AND sqlite_schema — is written in it, and header field
+    /// 56 records it.
+    pub text_enc: TextEnc,
     pub objects: Vec<OutObject>,
 }
 
@@ -95,6 +103,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
         return Err(format!("invalid page size {page_size}"));
     }
     let usable = page_size as usize;
+    let enc = db.text_enc;
     let mut alloc = PageAllocator::new(page_size);
 
     let mut schema_cells: Vec<SchemaCell> = Vec::new();
@@ -106,7 +115,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 alias,
                 rows,
             } => {
-                let root = build_table_tree(&mut alloc, usable, rows, *alias, None)?;
+                let root = build_table_tree(&mut alloc, usable, rows, *alias, None, enc)?;
                 schema_cells.push(SchemaCell {
                     rowid: 0,
                     kind: "table".into(),
@@ -116,8 +125,24 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                     sql: Some(sql.clone()),
                 });
             }
-            OutObject::WithoutRowid { name, sql, rows } => {
-                let root = build_record_tree(&mut alloc, usable, rows, &[], &[])?;
+            OutObject::WithoutRowid {
+                name,
+                sql,
+                pk_collations,
+                rows,
+            } => {
+                // Rowid-less records are keyed by their PK: the file needs
+                // them in the PK order under the FILE encoding's byte
+                // comparison. For UTF-8 the caller's order (the engine's
+                // PK-ordered scan) is already correct — skip the sort.
+                // UTF-16 BINARY compares raw encoded bytes (code-unit /
+                // little-endian byte order — NOT code-point order), so
+                // non-UTF-8 files must re-sort.
+                let root = if enc.is_utf8() {
+                    build_record_tree(&mut alloc, usable, rows, &[], &[], enc)?
+                } else {
+                    build_record_tree(&mut alloc, usable, rows, &[], pk_collations, enc)?
+                };
                 schema_cells.push(SchemaCell {
                     rowid: 0,
                     kind: "table".into(),
@@ -135,7 +160,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 collations,
                 entries,
             } => {
-                let root = build_record_tree(&mut alloc, usable, entries, desc, collations)?;
+                let root = build_record_tree(&mut alloc, usable, entries, desc, collations, enc)?;
                 schema_cells.push(SchemaCell {
                     rowid: 0,
                     kind: "index".into(),
@@ -168,7 +193,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
     for (i, c) in schema_cells.iter_mut().enumerate() {
         c.rowid = (i + 1) as i64;
     }
-    build_schema_tree(&mut alloc, usable, &schema_cells)?;
+    build_schema_tree(&mut alloc, usable, &schema_cells, enc)?;
 
     // Assemble the page image.
     let n_pages = alloc.n_pages();
@@ -177,13 +202,14 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
         let off = (page_no as usize - 1) * page_size as usize;
         image[off..off + page_size as usize].copy_from_slice(bytes.as_slice());
     }
-    let header = build_header(
+    let header = build_header_enc(
         page_size,
         n_pages,
         db.change_counter,
         db.schema_cookie,
         db.user_version,
         db.application_id,
+        enc.as_u32(),
     );
     image[0..100].copy_from_slice(&header);
     Ok(image)
@@ -355,8 +381,8 @@ fn make_table_leaf_cell(usable: usize, rowid: i64, payload: &[u8]) -> Cell {
 /// Index cell (leaf or interior): `[varint P][local record][u32 next]`
 /// — interior cells additionally carry a 4-byte left-child pointer
 /// prepended at page-write time.
-fn make_index_cell(usable: usize, entry: &[Value]) -> Cell {
-    let payload = encode_record(entry);
+fn make_index_cell(usable: usize, entry: &[Value], enc: TextEnc) -> Cell {
+    let payload = encode_record_enc(entry, enc);
     let u = usable;
     let total = payload.len();
     let x = ((u - 12) * 64 / 255) - 23;
@@ -428,10 +454,11 @@ fn build_table_tree(
     rows: &[(i64, Vec<Value>)],
     alias: Option<usize>,
     fixed_root: Option<u32>,
+    enc: TextEnc,
 ) -> Result<u32, String> {
     let mut cells: Vec<Cell> = Vec::with_capacity(rows.len());
     for (rowid, values) in rows {
-        let payload = super::record::encode_record_aliased(values, alias);
+        let payload = encode_record_aliased_enc(values, alias, enc);
         cells.push(make_table_leaf_cell(usable, *rowid, &payload));
     }
     if cells.is_empty() {
@@ -450,15 +477,19 @@ fn build_record_tree(
     entries: &[Vec<Value>],
     desc: &[bool],
     collations: &[Collation],
+    enc: TextEnc,
 ) -> Result<u32, String> {
     let cells: Vec<Cell> = if desc.is_empty() && collations.is_empty() {
-        entries.iter().map(|e| make_index_cell(usable, e)).collect()
+        entries
+            .iter()
+            .map(|e| make_index_cell(usable, e, enc))
+            .collect()
     } else {
         let mut sorted: Vec<&Vec<Value>> = entries.iter().collect();
-        sorted.sort_by(|a, b| compare_index_keys(a, b, desc, collations));
+        sorted.sort_by(|a, b| compare_index_keys(a, b, desc, collations, enc));
         sorted
             .into_iter()
-            .map(|e| make_index_cell(usable, e))
+            .map(|e| make_index_cell(usable, e, enc))
             .collect()
     };
     if cells.is_empty() {
@@ -470,16 +501,24 @@ fn build_record_tree(
 /// SQLite index-key comparison: NULL < numbers < TEXT < BLOB, then
 /// per-column memcmp (or NOCASE), flipped for DESC columns. Trailing
 /// columns (the rowid / PK suffix) compare ascending.
+///
+/// TEXT under BINARY compares the raw bytes IN THE FILE'S ENCODING —
+/// measured against real SQLite: UTF-8 gives code-point order,
+/// UTF-16be gives code-unit order, UTF-16le gives raw little-endian
+/// byte order (which is neither). NOCASE folds ASCII and compares in
+/// UTF-8 space regardless of encoding (SQLite converts for its UTF-8-
+/// only nocase collation), so it is encoding-independent.
 pub fn compare_index_keys(
     a: &[Value],
     b: &[Value],
     desc: &[bool],
     collations: &[Collation],
+    enc: TextEnc,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering as O;
     let n = a.len().min(b.len());
     for i in 0..n {
-        let mut cmp = compare_values(&a[i], &b[i]);
+        let mut cmp = compare_values(&a[i], &b[i], enc);
         if let Some(Collation::NoCase) = collations.get(i) {
             if let (Value::Text(x), Value::Text(y)) = (&a[i], &b[i]) {
                 cmp = compare_nocase(x.as_str(), y.as_str());
@@ -495,7 +534,7 @@ pub fn compare_index_keys(
     a.len().cmp(&b.len())
 }
 
-fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+fn compare_values(a: &Value, b: &Value, enc: TextEnc) -> std::cmp::Ordering {
     use std::cmp::Ordering as O;
     let class = |v: &Value| match v {
         Value::Null => 0u8,
@@ -513,7 +552,34 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(O::Equal),
         (Value::Integer(x), Value::Real(y)) => (*x as f64).partial_cmp(y).unwrap_or(O::Equal),
         (Value::Real(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(O::Equal),
-        (Value::Text(x), Value::Text(y)) => x.as_str().as_bytes().cmp(y.as_str().as_bytes()),
+        (Value::Text(x), Value::Text(y)) => match enc {
+            TextEnc::Utf8 => x.as_str().as_bytes().cmp(y.as_str().as_bytes()),
+            TextEnc::Utf16Le | TextEnc::Utf16Be => {
+                // memcmp of the encoded units: exactly what SQLite's
+                // BINARY collation does on UTF-16 files.
+                let xa = x.as_str().encode_utf16();
+                let ya = y.as_str().encode_utf16();
+                let be = enc == TextEnc::Utf16Be;
+                for (u, v) in xa.zip(ya) {
+                    let (ub, vb) = if be {
+                        (u.to_be_bytes(), v.to_be_bytes())
+                    } else {
+                        (u.to_le_bytes(), v.to_le_bytes())
+                    };
+                    let c = ub.cmp(&vb);
+                    if c != O::Equal {
+                        return c;
+                    }
+                }
+                // Prefix tie: shorter text first (memcmp + length, the
+                // SQLite rule).
+                let (xn, yn) = (
+                    x.as_str().encode_utf16().count(),
+                    y.as_str().encode_utf16().count(),
+                );
+                xn.cmp(&yn)
+            }
+        },
         (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
         _ => O::Equal,
     }
@@ -979,6 +1045,7 @@ fn build_schema_tree(
     alloc: &mut PageAllocator,
     usable: usize,
     cells: &[SchemaCell],
+    enc: TextEnc,
 ) -> Result<u32, String> {
     let mut table_cells: Vec<Cell> = Vec::with_capacity(cells.len());
     for c in cells {
@@ -993,7 +1060,7 @@ fn build_schema_tree(
             Value::Integer(c.root as i64),
             sql_val,
         ];
-        let payload = encode_record(&vals);
+        let payload = encode_record_enc(&vals, enc);
         table_cells.push(make_table_leaf_cell(usable, c.rowid, &payload));
     }
     pack_table_tree(alloc, usable, table_cells, Some(1))

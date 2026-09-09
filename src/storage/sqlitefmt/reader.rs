@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::header::FileHeaderInfo;
-use super::record::decode_record;
+use super::record::{decode_record_enc, TextEnc};
 use super::varint::read_varint;
 use crate::types::value::Value;
 
@@ -46,6 +46,9 @@ pub struct SqliteDbImage {
     pub page_size: u32,
     pub user_version: u32,
     pub application_id: u32,
+    /// File text encoding (header field 56): UTF-8 / UTF-16le / UTF-16be.
+    /// Every TEXT value — records AND sqlite_schema — was read in it.
+    pub text_enc: TextEnc,
     pub schema: Vec<SchemaRow>,
     /// Table rows keyed by table name (lowercased).
     pub table_rows: HashMap<String, Vec<RawRow>>,
@@ -88,12 +91,7 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
         return Err("file smaller than the 100-byte SQLite header".into());
     }
     let hdr = FileHeaderInfo::parse(&data)?;
-    if hdr.text_encoding != 1 {
-        return Err(format!(
-            "unsupported text encoding {} (only UTF-8 SQLite files are supported)",
-            hdr.text_encoding
-        ));
-    }
+    let text_enc = TextEnc::from_u32(hdr.text_encoding)?;
     if !(hdr.reserved as u32) < hdr.page_size && hdr.reserved != 0 {
         return Err(format!("invalid reserved-bytes-per-page {}", hdr.reserved));
     }
@@ -135,6 +133,7 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
         page_size: hdr.page_size,
         user_version: hdr.user_version,
         application_id: hdr.application_id,
+        text_enc,
         schema: Vec::new(),
         table_rows: HashMap::new(),
         sequences: HashMap::new(),
@@ -142,9 +141,11 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
     };
 
     // --- Walk the schema b-tree (root page 1, header at offset 100).
+    // sqlite_schema text (names, SQL) is stored in the FILE's encoding.
     let schema_rows = walk_table_tree(&src, usable, 1, true)?;
     for (rowid, payload) in schema_rows {
-        let mut vals = decode_record(&payload, 5).map_err(|e| format!("sqlite_schema row: {e}"))?;
+        let mut vals = decode_record_enc(&payload, 5, text_enc)
+            .map_err(|e| format!("sqlite_schema row: {e}"))?;
         if vals.len() < 5 {
             return Err("sqlite_schema row shorter than 5 columns".into());
         }
@@ -185,8 +186,8 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
             let rows = walk_table_tree(&src, usable, row.rootpage, false)?;
             let mut seqs = Vec::new();
             for (_, payload) in rows {
-                let vals =
-                    decode_record(&payload, 2).map_err(|e| format!("sqlite_sequence row: {e}"))?;
+                let vals = decode_record_enc(&payload, 2, text_enc)
+                    .map_err(|e| format!("sqlite_sequence row: {e}"))?;
                 if vals.len() == 2 {
                     if let (Value::Text(n), Value::Integer(s)) = (&vals[0], &vals[1]) {
                         seqs.push((n.as_str().to_ascii_lowercase(), *s));
@@ -206,7 +207,7 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
             // column count (the record header defines it). The api layer
             // re-normalizes to the catalog's column count.
             let n = record_column_count(&payload);
-            let vals = decode_record(&payload, n)
+            let vals = decode_record_enc(&payload, n, text_enc)
                 .map_err(|e| format!("table {} row {}: {e}", row.name, rowid))?;
             out.push(RawRow {
                 rowid,

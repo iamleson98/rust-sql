@@ -90,6 +90,29 @@ pub fn build_header(
     user_version: u32,
     application_id: u32,
 ) -> [u8; 100] {
+    build_header_enc(
+        page_size,
+        db_size_pages,
+        change_counter,
+        schema_cookie,
+        user_version,
+        application_id,
+        1,
+    )
+}
+
+/// [`build_header`] with an explicit text encoding (1/2/3 — see
+/// fileformat2 header field 56).
+#[allow(clippy::too_many_arguments)]
+pub fn build_header_enc(
+    page_size: u32,
+    db_size_pages: u32,
+    change_counter: u32,
+    schema_cookie: u32,
+    user_version: u32,
+    application_id: u32,
+    text_encoding: u32,
+) -> [u8; 100] {
     let mut h = [0u8; 100];
     h[0..16].copy_from_slice(MAGIC);
     // Page size: big-endian u16; 65536 encoded as 1.
@@ -120,8 +143,8 @@ pub fn build_header(
     h[48..52].copy_from_slice(&0u32.to_be_bytes());
     // Largest root b-tree: 0 = no auto-vacuum pointer-map pages.
     h[52..56].copy_from_slice(&0u32.to_be_bytes());
-    // Text encoding: 1 = UTF-8.
-    h[56..60].copy_from_slice(&1u32.to_be_bytes());
+    // Text encoding: 1 = UTF-8, 2 = UTF-16le, 3 = UTF-16be.
+    h[56..60].copy_from_slice(&text_encoding.to_be_bytes());
     h[60..64].copy_from_slice(&user_version.to_be_bytes());
     // Incremental vacuum mode: 0.
     h[64..68].copy_from_slice(&0u32.to_be_bytes());

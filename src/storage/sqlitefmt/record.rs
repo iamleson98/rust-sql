@@ -11,10 +11,65 @@
 use super::varint::{read_varint, write_varint};
 use crate::types::value::Value;
 
+/// Text encoding of a SQLite file — fileformat2 header field 56.
+/// 1 = UTF-8, 2 = UTF-16le, 3 = UTF-16be. Every TEXT value in the file
+/// (records AND the sqlite_schema texts) uses this encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextEnc {
+    #[default]
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl TextEnc {
+    /// Header field value (1/2/3).
+    pub fn as_u32(self) -> u32 {
+        match self {
+            TextEnc::Utf8 => 1,
+            TextEnc::Utf16Le => 2,
+            TextEnc::Utf16Be => 3,
+        }
+    }
+
+    /// True for UTF-8 (the engine's native text encoding).
+    pub fn is_utf8(self) -> bool {
+        self == TextEnc::Utf8
+    }
+
+    /// From header field value; 0 (pre-header-format files) means UTF-8.
+    pub fn from_u32(v: u32) -> Result<Self, String> {
+        match v {
+            0 | 1 => Ok(TextEnc::Utf8),
+            2 => Ok(TextEnc::Utf16Le),
+            3 => Ok(TextEnc::Utf16Be),
+            other => Err(format!("invalid text encoding {other}")),
+        }
+    }
+
+    /// The string `PRAGMA encoding` reports (SQLite's exact spellings).
+    pub fn pragma_name(self) -> &'static str {
+        match self {
+            TextEnc::Utf8 => "UTF-8",
+            TextEnc::Utf16Le => "UTF-16le",
+            TextEnc::Utf16Be => "UTF-16be",
+        }
+    }
+}
+
 /// Decode a full record payload into `n_cols` values. Shorter records are
 /// NULL-padded (ALTER TABLE ADD COLUMN semantics); the rowid-alias column
 /// is stored as NULL on disk and resolved by the caller.
 pub fn decode_record(payload: &[u8], n_cols: usize) -> Result<Vec<Value>, String> {
+    decode_record_enc(payload, n_cols, TextEnc::Utf8)
+}
+
+/// Encoding-aware decode (see [`decode_record`]).
+pub fn decode_record_enc(
+    payload: &[u8],
+    n_cols: usize,
+    enc: TextEnc,
+) -> Result<Vec<Value>, String> {
     let (header_size, mut off) = read_varint(payload, 0).ok_or("truncated record header")?;
     let header_size = header_size as usize;
     if header_size > payload.len() || header_size == 0 {
@@ -36,7 +91,7 @@ pub fn decode_record(payload: &[u8], n_cols: usize) -> Result<Vec<Value>, String
         if st == 10 || st == 11 {
             return Err(format!("reserved serial type {st}"));
         }
-        values.push(decode_value(payload, &mut body, st)?);
+        values.push(decode_value(payload, &mut body, st, enc)?);
         if values.len() == n_cols {
             break; // extra columns beyond the table's are ignored
         }
@@ -47,7 +102,7 @@ pub fn decode_record(payload: &[u8], n_cols: usize) -> Result<Vec<Value>, String
     Ok(values)
 }
 
-fn decode_value(payload: &[u8], body: &mut usize, st: u64) -> Result<Value, String> {
+fn decode_value(payload: &[u8], body: &mut usize, st: u64, enc: TextEnc) -> Result<Value, String> {
     let be_int = |n: usize, body: &mut usize| -> Result<Value, String> {
         let end = *body + n;
         if end > payload.len() {
@@ -98,10 +153,12 @@ fn decode_value(payload: &[u8], body: &mut usize, st: u64) -> Result<Value, Stri
             if end > payload.len() {
                 return Err("truncated text body".into());
             }
-            // SQLite text is arbitrary bytes; the engine's TEXT is UTF-8.
-            // Invalid UTF-8 is repaired with a lossy conversion (matching
-            // the engine's in-memory semantics for imported text).
-            let s = String::from_utf8_lossy(&payload[*body..end]).into_owned();
+            // SQLite text is arbitrary bytes in the FILE's encoding; the
+            // engine's TEXT is UTF-8. Invalid sequences (bad UTF-8,
+            // unpaired surrogates, odd UTF-16 length) are repaired with a
+            // lossy conversion (matching the engine's in-memory semantics
+            // for imported text).
+            let s = decode_text_bytes(&payload[*body..end], enc);
             *body = end;
             Ok(Value::Text(s.into()))
         }
@@ -113,15 +170,25 @@ fn decode_value(payload: &[u8], body: &mut usize, st: u64) -> Result<Value, Stri
 /// `alias` values (INTEGER PRIMARY KEY columns) are encoded as NULL —
 /// the value lives in the cell's rowid key, not the record.
 pub fn encode_record(values: &[Value]) -> Vec<u8> {
+    encode_record_enc(values, TextEnc::Utf8)
+}
+
+/// Encoding-aware encode (see [`encode_record`]).
+pub fn encode_record_enc(values: &[Value], enc: TextEnc) -> Vec<u8> {
     // Pass 1: sizes.
     let mut out = Vec::with_capacity(values.len() * 4 + 8);
-    write_header_and_body(values, &mut out);
+    write_header_and_body(values, &mut out, enc);
     out
 }
 
 /// Encode with a value that is omitted entirely (the rowid-alias trick):
 /// the record stores NULL at the alias position.
 pub fn encode_record_aliased(values: &[Value], alias: Option<usize>) -> Vec<u8> {
+    encode_record_aliased_enc(values, alias, TextEnc::Utf8)
+}
+
+/// Encoding-aware alias encode (see [`encode_record_aliased`]).
+pub fn encode_record_aliased_enc(values: &[Value], alias: Option<usize>, enc: TextEnc) -> Vec<u8> {
     let mut tmp: Vec<Value> = Vec::with_capacity(values.len());
     for (i, v) in values.iter().enumerate() {
         if Some(i) == alias {
@@ -130,7 +197,7 @@ pub fn encode_record_aliased(values: &[Value], alias: Option<usize>) -> Vec<u8> 
             tmp.push(v.clone());
         }
     }
-    encode_record(&tmp)
+    encode_record_enc(&tmp, enc)
 }
 
 /// SQLite's int-as-real storage optimization: an integral double within
@@ -142,7 +209,7 @@ fn real_is_storable_as_int(f: f64) -> bool {
         && !(f == 0.0 && f.is_sign_negative())
 }
 
-fn serial_type_and_size(v: &Value) -> (u64, usize) {
+fn serial_type_and_size(v: &Value, enc: TextEnc) -> (u64, usize) {
     match v {
         Value::Null => (0, 0),
         Value::Integer(i) => {
@@ -172,20 +239,26 @@ fn serial_type_and_size(v: &Value) -> (u64, usize) {
         Value::Real(f) if f.is_nan() => (7, 8),
         Value::Real(f) => {
             if real_is_storable_as_int(*f) {
-                return serial_type_and_size(&Value::Integer(*f as i64));
+                return serial_type_and_size(&Value::Integer(*f as i64), enc);
             }
             (7, 8)
         }
-        Value::Text(t) => (13 + 2 * t.as_str().len() as u64, t.as_str().len()),
+        Value::Text(t) => {
+            let n = match enc {
+                TextEnc::Utf8 => t.as_str().len(),
+                TextEnc::Utf16Le | TextEnc::Utf16Be => t.as_str().encode_utf16().count() * 2,
+            };
+            (13 + 2 * n as u64, n)
+        }
         Value::Blob(b) => (12 + 2 * b.len() as u64, b.len()),
     }
 }
 
-fn write_header_and_body(values: &[Value], out: &mut Vec<u8>) {
+fn write_header_and_body(values: &[Value], out: &mut Vec<u8>, enc: TextEnc) {
     // First pass: header bytes.
     let mut header = Vec::with_capacity(values.len() + 4);
     for v in values {
-        let (st, _) = serial_type_and_size(v);
+        let (st, _) = serial_type_and_size(v, enc);
         write_varint(&mut header, st as i64);
     }
     // Total header size = 1 (for the size varint itself, may grow) + sum.
@@ -206,14 +279,14 @@ fn write_header_and_body(values: &[Value], out: &mut Vec<u8>) {
         match v {
             Value::Null => {}
             Value::Integer(i) => {
-                let (_, n) = serial_type_and_size(v);
+                let (_, n) = serial_type_and_size(v, enc);
                 if n > 0 {
                     write_be_int(out, *i, n);
                 }
             }
             Value::Real(f) => {
                 if real_is_storable_as_int(*f) {
-                    let (_, n) = serial_type_and_size(&Value::Integer(*f as i64));
+                    let (_, n) = serial_type_and_size(&Value::Integer(*f as i64), enc);
                     if n > 0 {
                         write_be_int(out, *f as i64, n);
                     }
@@ -221,7 +294,12 @@ fn write_header_and_body(values: &[Value], out: &mut Vec<u8>) {
                     out.extend_from_slice(&f.to_bits().to_be_bytes());
                 }
             }
-            Value::Text(t) => out.extend_from_slice(t.as_str().as_bytes()),
+            Value::Text(t) => match enc {
+                TextEnc::Utf8 => out.extend_from_slice(t.as_str().as_bytes()),
+                TextEnc::Utf16Le | TextEnc::Utf16Be => {
+                    out.extend_from_slice(&encode_text_bytes(t.as_str(), enc))
+                }
+            },
             Value::Blob(b) => out.extend_from_slice(b),
         }
     }
@@ -230,6 +308,38 @@ fn write_header_and_body(values: &[Value], out: &mut Vec<u8>) {
 fn write_be_int(out: &mut Vec<u8>, v: i64, n: usize) {
     let be = v.to_be_bytes(); // always 8 bytes
     out.extend_from_slice(&be[8 - n..]);
+}
+
+/// Decode raw file-encoded TEXT bytes into engine UTF-8 text (lossy on
+/// invalid input — unpaired surrogates become U+FFFD, odd-length UTF-16
+/// drops the trailing byte, matching SQLite's read-anything behavior).
+fn decode_text_bytes(bytes: &[u8], enc: TextEnc) -> String {
+    match enc {
+        TextEnc::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+        TextEnc::Utf16Le | TextEnc::Utf16Be => {
+            let be = enc == TextEnc::Utf16Be;
+            let n = bytes.len() / 2; // an odd trailing byte is corruption
+            let mut units = Vec::with_capacity(n);
+            for i in 0..n {
+                let (b0, b1) = if be {
+                    (bytes[i * 2], bytes[i * 2 + 1])
+                } else {
+                    (bytes[i * 2 + 1], bytes[i * 2])
+                };
+                units.push(u16::from_be_bytes([b0, b1]));
+            }
+            String::from_utf16_lossy(&units)
+        }
+    }
+}
+
+/// Encode engine text into the file's TEXT encoding.
+fn encode_text_bytes(s: &str, enc: TextEnc) -> Vec<u8> {
+    match enc {
+        TextEnc::Utf8 => s.as_bytes().to_vec(),
+        TextEnc::Utf16Le => s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect(),
+        TextEnc::Utf16Be => s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect(),
+    }
 }
 
 #[inline]

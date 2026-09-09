@@ -426,6 +426,11 @@ pub struct Database {
 pub(crate) struct ForeignSqlite {
     path: std::path::PathBuf,
     dirty: AtomicBool,
+    /// Text encoding of the interop file (header field 56: 1/2/3).
+    /// Interior-mutable so `PRAGMA encoding` can set it from the
+    /// read-only pragma path. Every dump writes records, index keys and
+    /// sqlite_schema text in this encoding.
+    text_enc: AtomicU32,
     /// Emit order for sqlite_schema rows: original rows in creation
     /// order, then objects first seen at a later dump.
     order: Mutex<Vec<SchemaOrderKey>>,
@@ -437,6 +442,20 @@ pub(crate) struct ForeignSqlite {
     change_counter: AtomicU32,
     schema_cookie: AtomicU32,
     had_wal: AtomicBool,
+}
+
+impl ForeignSqlite {
+    /// The file's text encoding.
+    fn text_enc(&self) -> crate::storage::sqlitefmt::record::TextEnc {
+        crate::storage::sqlitefmt::record::TextEnc::from_u32(self.text_enc.load(Ordering::Acquire))
+            .unwrap_or(crate::storage::sqlitefmt::record::TextEnc::Utf8)
+    }
+
+    /// Set the file's text encoding (see `apply_encoding`: only while
+    /// the database holds no schema content).
+    fn set_text_enc(&self, enc: crate::storage::sqlitefmt::record::TextEnc) {
+        self.text_enc.store(enc.as_u32(), Ordering::Release);
+    }
 }
 
 /// Identifies one sqlite_schema row for stable emit ordering.
@@ -486,6 +505,18 @@ fn without_rowid_record_map(table: &Table) -> Vec<usize> {
         }
     }
     map
+}
+
+/// Collations of a WITHOUT ROWID table's PK columns, in RECORD order
+/// (PK first, pk_seq order) — what the writer needs to order the records
+/// on disk when the file's text encoding is not UTF-8.
+fn without_rowid_pk_collations(table: &Table) -> Vec<crate::storage::sqlitefmt::Collation> {
+    let n_pk = table.columns.iter().filter(|c| c.pk_seq > 0).count();
+    without_rowid_record_map(table)
+        .into_iter()
+        .take(n_pk)
+        .map(|decl_i| collation_of(&table.columns[decl_i].collation, &table.name))
+        .collect()
 }
 
 fn order_key_name(k: &SchemaOrderKey) -> String {
@@ -2181,6 +2212,7 @@ impl Database {
         let foreign = ForeignSqlite {
             path: path.to_path_buf(),
             dirty: AtomicBool::new(false),
+            text_enc: AtomicU32::new(image.text_enc.as_u32()),
             order: Mutex::new(Vec::new()),
             next_rowid: Mutex::new(0),
             sequences: Mutex::new(image.sequences.clone()),
@@ -2220,6 +2252,7 @@ impl Database {
         db.foreign = Some(ForeignSqlite {
             path: path.to_path_buf(),
             dirty: AtomicBool::new(true),
+            text_enc: AtomicU32::new(1),
             order: Mutex::new(Vec::new()),
             next_rowid: Mutex::new(0),
             sequences: Mutex::new(HashMap::new()),
@@ -2558,6 +2591,7 @@ impl Database {
                         objects.push(OutObject::WithoutRowid {
                             name: table_name.clone(),
                             sql: table.create_sql.clone(),
+                            pk_collations: without_rowid_pk_collations(table),
                             rows,
                         });
                     } else {
@@ -2665,6 +2699,7 @@ impl Database {
             application_id: self.pager.application_id(),
             change_counter,
             schema_cookie,
+            text_enc: foreign.text_enc(),
             objects,
         })
     }
@@ -4348,6 +4383,19 @@ impl Database {
             let v = v.clone();
             drop(cached);
             return self.execute_vacuum(&v);
+        }
+        // `PRAGMA encoding = X` (write form): needs &self — ForeignSqlite
+        // owns the encoding and the executor context cannot reach it.
+        // The read/query paths handle it in `read_pragma`; this is the
+        // execute path. Result: empty (SQLite's write form returns no
+        // rows). Positional `?` values resolve against the bound params.
+        if let Statement::Pragma(p) = cached.stmt.as_ref() {
+            if p.value.is_some() && p.name.eq_ignore_ascii_case("encoding") {
+                let value = pragma_value_text(p, params.as_slice());
+                drop(cached);
+                apply_encoding(self, value.as_deref().unwrap_or(""))?;
+                return Ok(());
+            }
         }
         // WITH-clause SELECT via the execute path: same CTE machinery as
         // query(); the result rows are simply discarded.
@@ -8555,6 +8603,19 @@ fn pragma_foreign_key_list(
 
 fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let name = p.name.to_ascii_lowercase();
+    // `PRAGMA encoding = X`: the write form. SQLite's rules, verified
+    // against the bundled 3.46: effective only while the database holds
+    // no schema content (an empty/new file); once objects exist the
+    // assignment is silently ignored (no error, encoding unchanged).
+    // The result set is empty, matching SQLite's write form.
+    if p.value.is_some() && name == "encoding" {
+        let value = pragma_value_text(p, None);
+        apply_encoding(db, value.as_deref().unwrap_or("")).ok()?;
+        return Some(PragmaRows {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
     // `PRAGMA journal_mode = WAL` / `journal_mode(WAL)`: the write form
     // RETURNS the resulting mode as a row (SQLite behavior — rusqlite and
     // ORMs read it back). The mode word parses as a bare identifier
@@ -8701,10 +8762,38 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "user_version" => Value::Integer(pager.user_version() as i64),
         "application_id" => Value::Integer(pager.application_id() as i64),
         "auto_vacuum" => Value::Integer(0),
-        "encoding" => Value::Text("UTF-8".into()),
+        "encoding" => Value::Text(
+            db.foreign
+                .as_ref()
+                .map(|f| f.text_enc().pragma_name())
+                .unwrap_or("UTF-8")
+                .into(),
+        ),
         _ => return None,
     };
     Some(PragmaRows::single(&name, v))
+}
+
+/// Extract a PRAGMA's value as plain text: a string literal, a bare
+/// keyword/identifier word, or a positional `?` parameter resolved
+/// against the bound params (`None` when the caller has none).
+fn pragma_value_text(p: &PragmaStatement, params: Option<&[Value]>) -> Option<String> {
+    let v = value_as_expr(p.value.as_ref()?);
+    match v {
+        crate::sql::ast::Expr::Column { name, .. } => Some(name.clone()),
+        crate::sql::ast::Expr::Literal(Value::Text(t)) => Some(t.to_string()),
+        crate::sql::ast::Expr::Parameter(slot) => {
+            // The lexer stores the ZERO-BASED slot index as the name
+            // (bare `?` and `?1` are both slot "0" — SQLite's rule that
+            // `?` and `?1` are the same parameter).
+            let slot: usize = slot.trim_matches('?').parse().unwrap_or(0);
+            params?.get(slot).map(|val| match val {
+                Value::Text(t) => t.as_str().to_string(),
+                other => other.to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Apply a `PRAGMA journal_mode = X` mode switch from the read/query path
@@ -8715,6 +8804,57 @@ fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
         "delete" | "truncate" | "persist" | "memory" | "off" => db.pager.disable_wal(),
         _ => Ok(()),
     }
+}
+
+/// Apply a `PRAGMA encoding = X` assignment.
+///
+/// SQLite semantics (probed against the bundled 3.46):
+/// * Values: "UTF-8", "UTF-16" (= native byte order of the machine —
+///   little-endian on all realistic targets), "UTF-16le", "UTF-16be"
+///   (case-insensitive; `"UTF16"`/`"utf-8"` also accepted).
+/// * Only interop (SQLite-format) files carry an encoding; the engine's
+///   native container is always UTF-8, so non-UTF-8 requests on native
+///   databases are ignored (like SQLite ignoring an encoding change on
+///   an existing file).
+/// * Settable only while the schema is empty — `foreign.order` also
+///   keeps entries for dropped objects (the header was materialized
+///   once the first object existed), which matches SQLite's "the header
+///   was written, the encoding is fixed" behavior. After content, the
+///   assignment is silently ignored.
+fn apply_encoding(db: &Database, value: &str) -> Result<()> {
+    use crate::storage::sqlitefmt::record::TextEnc;
+    let norm = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "");
+    let requested = match norm.as_str() {
+        "utf8" => TextEnc::Utf8,
+        "utf16" => {
+            // SQLite maps bare "UTF-16" to the machine's native order.
+            if cfg!(target_endian = "big") {
+                TextEnc::Utf16Be
+            } else {
+                TextEnc::Utf16Le
+            }
+        }
+        "utf16le" => TextEnc::Utf16Le,
+        "utf16be" => TextEnc::Utf16Be,
+        // Unknown values are silently ignored (probed against 3.46:
+        // `PRAGMA encoding='CP1252'` returns Ok and changes nothing).
+        _ => return Ok(()),
+    };
+    if let Some(f) = &db.foreign {
+        if f.order.lock().is_empty() {
+            f.set_text_enc(requested);
+            // The next dump (next statement, drop, or explicit flush)
+            // rewrites the file — including header field 56.
+            f.dirty.store(true, Ordering::Release);
+        }
+        // Non-empty schema: silently ignored (SQLite behavior).
+    }
+    // Native-format databases: UTF-8 is the container's only encoding;
+    // the assignment is a no-op either way.
+    Ok(())
 }
 
 /// Extract the expression from a PRAGMA value (plain expr or parenthesized
