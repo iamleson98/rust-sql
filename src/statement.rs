@@ -121,6 +121,14 @@ pub struct Statement<'a> {
     stream: StreamState,
     /// Buffered rows from the last driver batch.
     pending: VecDeque<Row>,
+    /// Recycled row buffers for the streaming drivers: rows served to
+    /// the consumer come back here (capacity retained) and are popped
+    /// again by the drivers' next_batch — one heap allocation per row
+    /// SLOT for the statement's lifetime instead of one per ROW. The
+    /// borrow discipline of `row()`/`column_value()` (references die
+    /// before the next `step()`) makes recycling sound; `take_row()`
+    /// simply removes a row from circulation.
+    row_pool: Vec<Row>,
     columns: Option<Arc<[String]>>,
     current_row: Option<Row>,
     done: bool,
@@ -211,6 +219,7 @@ impl<'a> Statement<'a> {
             named_param_names,
             stream: StreamState::Fresh,
             pending: VecDeque::new(),
+            row_pool: Vec::new(),
             columns: prep_columns,
             current_row: None,
             done: false,
@@ -282,9 +291,15 @@ impl<'a> Statement<'a> {
     /// `sqlite3_reset`; see also [`Self::clear_bindings`]).
     pub fn reset(&mut self) {
         self.stream = StreamState::Fresh;
-        self.pending.clear();
+        for mut row in self.pending.drain(..) {
+            row.clear();
+            self.row_pool.push(row);
+        }
+        if let Some(mut r) = self.current_row.take() {
+            r.clear();
+            self.row_pool.push(r);
+        }
         self.columns = None;
-        self.current_row = None;
         self.done = false;
         self.deltas = CtxDeltas::default();
         self.changes_at_start = self.db.total_changes();
@@ -369,8 +384,19 @@ impl<'a> Statement<'a> {
             crate::executor::change_counters::note_conn_rowid(self.db.last_insert_rowid());
             self.start()?;
         }
-        // Serve one buffered row.
+        // Serve one buffered row. The PREVIOUS current_row's consumer
+        // reference is dead by now (row()/column_value() borrow self),
+        // so its buffer goes back to the pool for the next batch fill.
         if let Some(row) = self.pending.pop_front() {
+            if let Some(mut prev) = self.current_row.take() {
+                // Clear on return: the pool keeps the row's SLOT capacity
+                // (the alloc the drivers would otherwise repeat per row)
+                // but never its payload bytes — pooled blob/text bodies
+                // would otherwise pin up to a full batch's worth of wide
+                // rows in memory between batches.
+                prev.clear();
+                self.row_pool.push(prev);
+            }
             self.current_row = Some(row);
             return Ok(StepResult::Row);
         }
@@ -386,7 +412,7 @@ impl<'a> Statement<'a> {
                 // instead of 64. Wrapper drivers still receive exact
                 // budgets from THEIR callers, so LIMIT/OFFSET accounting
                 // is unaffected.
-                let batch = drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS)?;
+                let batch = drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS, &mut self.row_pool)?;
                 if batch.is_empty() {
                     self.done = true;
                     self.stream = StreamState::Exhausted;
@@ -408,6 +434,10 @@ impl<'a> Statement<'a> {
             }
             StreamState::Materialized(iter) => match iter.next() {
                 Some(row) => {
+                    if let Some(mut prev) = self.current_row.take() {
+                        prev.clear();
+                        self.row_pool.push(prev);
+                    }
                     self.current_row = Some(row);
                     Ok(StepResult::Row)
                 }
@@ -952,12 +982,18 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
 /// (given the statement's parameters); an empty result means EOF.
 trait Driver {
     fn columns(&self) -> Arc<[String]>;
+    /// `pool` is the statement's recycled row buffers: drivers that
+    /// materialize output rows POP cleared buffers from it (capacity
+    /// retained, one allocation per slot for the statement's lifetime)
+    /// and pass them through to their inner sources where applicable.
+    /// The statement returns consumed rows to the pool between batches.
     fn next_batch(
         &mut self,
         db: &Database,
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>>;
 }
 
@@ -1084,6 +1120,7 @@ impl Driver for GroupByDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        _pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.finished {
             return Ok(Vec::new());
@@ -1131,7 +1168,13 @@ impl Driver for GroupByDriver {
                     break;
                 }
             };
-            let mut row: Vec<Value> = Vec::with_capacity(self.proj.src.len().max(1));
+            let mut row: Vec<Value> = match _pool.pop() {
+                Some(mut r) => {
+                    r.clear();
+                    r
+                }
+                None => Vec::with_capacity(self.proj.src.len().max(1)),
+            };
             for &s in self.proj.src.iter() {
                 if s < n_group {
                     row.push(keys.get(s).cloned().unwrap_or(Value::Null));
@@ -1353,6 +1396,7 @@ impl Driver for ProjectedScanDriver {
         _params: &[Value],
         _named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.eof {
             return Ok(Vec::new());
@@ -1378,12 +1422,13 @@ impl Driver for ProjectedScanDriver {
         let mut last = self.last_rowid;
         let mut hit_end = true;
         let mut batch_bytes = 0usize;
-        bt.scan_table_range_selective(
+        bt.scan_table_range_selective_pooled(
             start,
             i64::MAX,
             n_cols,
             &self.project,
             rowid_alias,
+            pool,
             |rowid, row| {
                 if out.len() >= budget {
                     hit_end = false;
@@ -1461,6 +1506,7 @@ impl Driver for ProjectedRangeDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.eof {
             return Ok(Vec::new());
@@ -1511,7 +1557,7 @@ impl Driver for ProjectedRangeDriver {
         let mut last = self.last_rowid;
         let mut hit_end = true;
         let mut batch_bytes = 0usize;
-        bt.scan_table_range_selective(lo, hi, n_cols, &self.project, rowid_alias, |rowid, row| {
+        bt.scan_table_range_selective_pooled(lo, hi, n_cols, &self.project, rowid_alias, pool, |rowid, row| {
             if out.len() >= budget {
                 hit_end = false;
                 return false; // resume NEXT batch at this row
@@ -1579,6 +1625,7 @@ impl Driver for ScanDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.eof {
             return Ok(Vec::new());
@@ -1624,8 +1671,17 @@ impl Driver for ScanDriver {
                 hit_end = false;
                 return false; // stop the walk; resume next batch
             }
-            if let Ok(mut row) =
-                crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+            let mut row: Row = match pool.pop() {
+                Some(mut r) => {
+                    r.clear();
+                    r
+                }
+                None => Vec::with_capacity(n_cols + 1),
+            };
+            if crate::storage::row_codec::decode_row_into(
+                payload, n_cols, rowid, rowid_alias, &mut row,
+            )
+            .is_ok()
             {
                 // Hidden rowid slot BEFORE predicate eval: the predicate
                 // may itself reference rowid (name resolution happens
@@ -1638,6 +1694,8 @@ impl Driver for ScanDriver {
                         Ok(v) if v.is_truthy() => {}
                         _ => {
                             last = last.max(rowid);
+                            row.clear();
+                            pool.push(row);
                             return true;
                         }
                     }
@@ -1729,6 +1787,7 @@ impl Driver for FilteredScanDriver {
         params: &[Value],
         _named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.eof {
             return Ok(Vec::new());
@@ -1758,7 +1817,7 @@ impl Driver for FilteredScanDriver {
                 Box::new(ScanDriver::new(self.table.clone(), alias, None)),
                 self.predicate.clone(),
             );
-            return generic.next_batch(db, params, _named, budget);
+            return generic.next_batch(db, params, _named, budget, pool);
         };
         let root = ctx.table_root(&self.table);
         let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
@@ -1823,8 +1882,17 @@ impl Driver for FilteredScanDriver {
                         return false;
                     }
                     last = last.max(rowid);
-                    if let Ok(mut row) =
-                        crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+                    let mut row: Row = match pool.pop() {
+                        Some(mut r) => {
+                            r.clear();
+                            r
+                        }
+                        None => Vec::with_capacity(n_cols + 1),
+                    };
+                    if crate::storage::row_codec::decode_row_into(
+                        payload, n_cols, rowid, rowid_alias, &mut row,
+                    )
+                    .is_ok()
                     {
                         if append_rowid {
                             row.push(Value::Integer(rowid));
@@ -1869,12 +1937,18 @@ impl Driver for FilteredScanDriver {
                             if crate::storage::row_codec::real_ge_int(v, lo)
                                 && crate::storage::row_codec::real_le_int(v, hi) =>
                         {
-                            if let Ok(mut row) = crate::storage::row_codec::decode_row(
-                                payload,
-                                n_cols,
-                                rowid,
-                                rowid_alias,
-                            ) {
+                            let mut row: Row = match pool.pop() {
+                                Some(mut r) => {
+                                    r.clear();
+                                    r
+                                }
+                                None => Vec::with_capacity(n_cols + 1),
+                            };
+                            if crate::storage::row_codec::decode_row_into(
+                                payload, n_cols, rowid, rowid_alias, &mut row,
+                            )
+                            .is_ok()
+                            {
                                 if append_rowid {
                                     row.push(Value::Integer(rowid));
                                 }
@@ -1902,15 +1976,30 @@ impl Driver for FilteredScanDriver {
                     return false;
                 }
                 last = last.max(rowid);
-                if let Ok(mut row) =
-                    crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
-                {
-                    if sel_pred.eval(&row, &positions, params) {
-                        if self.append_rowid {
-                            row.push(Value::Integer(rowid));
-                        }
-                        out.push(row);
+                let mut row: Row = match pool.pop() {
+                    Some(mut r) => {
+                        r.clear();
+                        r
                     }
+                    None => Vec::with_capacity(n_cols + 1),
+                };
+                let keep = crate::storage::row_codec::decode_row_into(
+                    payload,
+                    n_cols,
+                    rowid,
+                    rowid_alias,
+                    &mut row,
+                )
+                .is_ok()
+                    && sel_pred.eval(&row, &positions, params);
+                if keep {
+                    if self.append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
+                    out.push(row);
+                } else {
+                    row.clear();
+                    pool.push(row);
                 }
                 true
             })?;
@@ -1945,13 +2034,25 @@ impl Driver for FilteredScanDriver {
                     return true; // non-matching row: selective decode only
                 }
                 // Matching row: materialize the full row for the chain above.
-                if let Ok(mut row) =
-                    crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+                let mut row: Row = match pool.pop() {
+                    Some(mut r) => {
+                        r.clear();
+                        r
+                    }
+                    None => Vec::with_capacity(n_cols + 1),
+                };
+                if crate::storage::row_codec::decode_row_into(
+                    payload, n_cols, rowid, rowid_alias, &mut row,
+                )
+                .is_ok()
                 {
                     if self.append_rowid {
                         row.push(Value::Integer(rowid));
                     }
                     out.push(row);
+                } else {
+                    row.clear();
+                    pool.push(row);
                 }
                 true
             })?;
@@ -2012,6 +2113,7 @@ impl Driver for RangeDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.eof {
             return Ok(Vec::new());
@@ -2079,8 +2181,17 @@ impl Driver for RangeDriver {
                 hit_end = false;
                 return false;
             }
-            if let Ok(mut row) =
-                crate::storage::row_codec::decode_row(payload, n_cols, rowid, rowid_alias)
+            let mut row: Row = match pool.pop() {
+                Some(mut r) => {
+                    r.clear();
+                    r
+                }
+                None => Vec::with_capacity(n_cols + 1),
+            };
+            if crate::storage::row_codec::decode_row_into(
+                payload, n_cols, rowid, rowid_alias, &mut row,
+            )
+            .is_ok()
             {
                 // Hidden rowid slot BEFORE residual eval (see ScanDriver).
                 if self.append_rowid {
@@ -2091,6 +2202,8 @@ impl Driver for RangeDriver {
                         Ok(v) if v.is_truthy() => {}
                         _ => {
                             last = last.max(rowid);
+                            row.clear();
+                            pool.push(row);
                             return true;
                         }
                     }
@@ -2150,6 +2263,7 @@ impl Driver for VtabDriver {
         _params: &[Value],
         _named: &HashMap<String, Value>,
         budget: usize,
+        _pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if self.eof {
             return Ok(Vec::new());
@@ -2222,6 +2336,7 @@ impl Driver for FilterDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if !self.leftover.is_empty() {
             let take = self.leftover.len().min(budget);
@@ -2238,7 +2353,7 @@ impl Driver for FilterDriver {
         while matched.len() < budget {
             let batch = self
                 .base
-                .next_batch(db, params, named, (budget * 4).max(BATCH))?;
+                .next_batch(db, params, named, (budget * 4).max(BATCH), pool)?;
             if batch.is_empty() {
                 self.base_eof = true;
                 break;
@@ -2307,6 +2422,7 @@ impl Driver for ProjectDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         let cols = self.base.columns();
         let col_names: Vec<String> = cols.iter().cloned().collect();
@@ -2319,10 +2435,16 @@ impl Driver for ProjectDriver {
             .count();
         let params_owned: Vec<Value> = params.to_vec();
         let exprs: Vec<Expr> = self.exprs.iter().map(|c| c.expr.clone()).collect();
-        let batch = self.base.next_batch(db, params, named, budget)?;
+        let batch = self.base.next_batch(db, params, named, budget, pool)?;
         let mut out = Vec::with_capacity(batch.len());
         for row in batch {
-            let mut projected = Vec::with_capacity(exprs.len());
+            let mut projected = match pool.pop() {
+                Some(mut r) => {
+                    r.clear();
+                    r
+                }
+                None => Vec::with_capacity(exprs.len()),
+            };
             for e in &exprs {
                 match e {
                     Expr::Column { name, .. } if name == "*" => {
@@ -2383,6 +2505,7 @@ impl Driver for LimitDriver {
         params: &[Value],
         named: &HashMap<String, Value>,
         budget: usize,
+        pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
         if !self.initialized {
             let empty_row: Vec<Value> = Vec::new();
@@ -2405,7 +2528,7 @@ impl Driver for LimitDriver {
             // offset_left > 0 here, so the value is already >= 1 — clamp
             // (not min/max pairs) documents the [1, BATCH] window.
             let want = (self.offset_left as usize).clamp(1, BATCH);
-            let batch = self.base.next_batch(db, params, named, want)?;
+            let batch = self.base.next_batch(db, params, named, want, pool)?;
             if batch.is_empty() {
                 self.base_eof = true;
                 return Ok(Vec::new());
@@ -2420,7 +2543,7 @@ impl Driver for LimitDriver {
         if want == 0 {
             return Ok(Vec::new());
         }
-        let batch = self.base.next_batch(db, params, named, want)?;
+        let batch = self.base.next_batch(db, params, named, want, pool)?;
         if batch.is_empty() {
             self.base_eof = true;
         }

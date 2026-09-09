@@ -14645,7 +14645,8 @@ fn exec_update(
             // win.
             //
             // When the payload size changes (e.g. TEXT column gets longer),
-            // we fall back to delete + insert.
+            // try the in-leaf cell REPLACEMENT (same leaf, one descent, no
+            // rebalance) before falling back to delete + insert.
             let did_in_place = bt.update_table(rowid, &payload).unwrap_or(false);
             if !did_in_place {
                 bt.delete_table(rowid)?;
@@ -15337,8 +15338,11 @@ fn try_streaming_update(
                 Ok(())
             })?;
             if fetch.is_some() && applied {
-                // Patch in place (leaf-hinted); size changes fall back to
-                // delete + insert.
+                // Patch in place (leaf-hinted); size changes try the
+                // in-leaf cell REPLACEMENT (same leaf, no re-descent /
+                // rebalance) before falling back to delete + insert.
+                // Patch / in-leaf replace (leaf-hinted); a grow that
+                // cannot fit the leaf falls back to delete + insert.
                 let did = bt.update_table(rowid, &payload_buf)?;
                 if !did {
                     bt.delete_table(rowid)?;

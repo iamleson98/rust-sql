@@ -2940,73 +2940,105 @@ impl<'a> Btree<'a> {
 
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
         // Notify the pager that a write is about to happen (in-place UPDATE).
-        // Same-size payload patches never change leaf bounds — use the
-        // non-invalidating variant so advisory leaf hints survive. Callers
-        // that fall back to delete+insert bump the epoch through those.
+        // Same-size payload patches and in-slot shrinks never move an
+        // offset — the non-invalidating variant keeps advisory leaf hints
+        // alive. The GROW branch of the in-leaf replace bumps the epoch
+        // itself; callers that fall back to delete+insert bump it there.
         self.pager.note_write_in_place();
         // Hint probe: try patching directly in the remembered leaf (the
         // epoch check guarantees the hint bounds are exact, so a completed
-        // binary search that misses means "not in this tree" — but a
-        // size-change still needs the caller's fallback, so miss here just
-        // falls through to the full descent).
+        // binary search that misses means "not in this tree"). Same-size
+        // payloads byte-patch; size changes take the IN-LEAF REPLACE
+        // (shrink into the old cell's slot, grow at the content start when
+        // the leaf has room); a grow that cannot fit returns false and the
+        // caller falls back to delete+insert.
         {
             let epoch = self.pager.write_epoch();
             if let Some((page_ref, _bias)) = table_hint_page(self.root, rowid, epoch) {
-                let mut borrowed = page_ref.lock();
-                if borrowed.page_type()? == PageType::LeafTable {
-                    let n = borrowed.n_cells() as usize;
-                    let mut lo = 0usize;
-                    let mut hi = n;
-                    let mut hit: Option<(usize, usize, usize)> = None; // (cell_ptr, payload_off, plen)
-                    while lo < hi {
-                        let mid = (lo + hi) / 2;
-                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
-                        let Some((cell_rowid, n_rid)) =
-                            decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
-                        else {
-                            break;
-                        };
-                        match cell_rowid.cmp(&rowid) {
-                            std::cmp::Ordering::Equal => {
-                                let plen_pos = cell_ptr + n_rid;
-                                let Some((plen, n_plen)) =
-                                    varint::decode(&borrowed.data[plen_pos..])
-                                else {
-                                    break;
-                                };
-                                hit = Some((cell_ptr, plen_pos + n_plen, plen as usize));
+                let geo = {
+                    let borrowed = page_ref.lock();
+                    if borrowed.page_type()? != PageType::LeafTable {
+                        None
+                    } else {
+                        let n = borrowed.n_cells() as usize;
+                        let mut lo = 0usize;
+                        let mut hi = n;
+                        // (pos, cell_ptr, n_rid, n_plen, payload_off, plen)
+                        let mut hit: Option<(usize, usize, usize, usize, usize, usize)> = None;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2;
+                            let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                            let Some((cell_rowid, n_rid)) =
+                                decode_rowid_only(borrowed.cell_slice_checked(cell_ptr)?)
+                            else {
                                 break;
+                            };
+                            match cell_rowid.cmp(&rowid) {
+                                std::cmp::Ordering::Equal => {
+                                    let plen_pos = cell_ptr + n_rid;
+                                    let Some((plen, n_plen)) =
+                                        varint::decode(&borrowed.data[plen_pos..])
+                                    else {
+                                        break;
+                                    };
+                                    hit = Some((
+                                        mid,
+                                        cell_ptr,
+                                        n_rid,
+                                        n_plen,
+                                        plen_pos + n_plen,
+                                        plen as usize,
+                                    ));
+                                    break;
+                                }
+                                std::cmp::Ordering::Less => lo = mid + 1,
+                                std::cmp::Ordering::Greater => hi = mid,
                             }
-                            std::cmp::Ordering::Less => lo = mid + 1,
-                            std::cmp::Ordering::Greater => hi = mid,
                         }
-                    }
-                    let page_id_now = borrowed.id;
-                    if let Some((_cp, off, plen)) = hit {
-                        // Spilled rows never take the in-place patch path
-                        // (their bytes span a chain, not the leaf).
                         let psz = borrowed.data.len();
-                        let local_len = overflow_local_len_for(plen, psz);
-                        if local_len != plen {
-                            return Ok(false);
-                        }
-                        if plen == new_payload.len()
-                            && off + new_payload.len() <= borrowed.data.len()
-                        {
-                            borrowed.data[off..off + new_payload.len()]
+                        hit.map(|(pos, cp, n_rid, n_plen, off, plen)| {
+                            (pos, cp, n_rid, n_rid + n_plen + plen, off, plen, psz)
+                        })
+                    }
+                };
+                let page_id_now = page_ref.lock().id;
+                if let Some((pos, cell_ptr, n_rid, old_cell_size, payload_off, old_plen, psz)) =
+                    geo
+                {
+                    // Spilled rows never take the in-place patch path
+                    // (their bytes span a chain, not the leaf).
+                    if overflow_local_len_for(old_plen, psz) != old_plen {
+                        return Ok(false);
+                    }
+                    if old_plen == new_payload.len() {
+                        let mut borrowed = page_ref.lock();
+                        if payload_off + new_payload.len() <= borrowed.data.len() {
+                            borrowed.data[payload_off..payload_off + new_payload.len()]
                                 .copy_from_slice(new_payload);
                             borrowed.dirty = true;
                             drop(borrowed);
                             self.pager.note_dirty(page_id_now);
                             return Ok(true);
                         }
-                        // Found but size differs — caller falls back.
                         return Ok(false);
                     }
-                    // Not in the hinted leaf and bounds are epoch-exact:
-                    // not in the tree at all.
-                    return Ok(false);
+                    // Size change — in-leaf replace (shrink / grow).
+                    return self.apply_leaf_replace(
+                        &page_ref,
+                        page_id_now,
+                        rowid,
+                        pos as u16,
+                        cell_ptr,
+                        n_rid,
+                        old_cell_size,
+                        old_plen,
+                        new_payload,
+                        psz,
+                    );
                 }
+                // Not in the hinted leaf and bounds are epoch-exact:
+                // not in the tree at all.
+                return Ok(false);
             }
         }
         let mut page_id = self.root;
@@ -3023,12 +3055,14 @@ impl<'a> Btree<'a> {
                     // ~1000 cells, so the linear scan cost ~500 allocations
                     // (~7 µs) per UPDATE-by-PK. Binary search needs ~10
                     // rowid reads.
-                    let (_cell_ptr, payload_offset, old_len) = {
+                    let geo = {
                         let borrowed = page.lock();
+                        let psz = borrowed.data.len();
                         let n = borrowed.n_cells() as usize;
                         let mut lo = 0usize;
                         let mut hi = n;
-                        let mut found: Option<usize> = None;
+                        // (pos, cell_ptr, n_rid, n_plen, payload_off, plen)
+                        let mut found: Option<(usize, usize, usize, usize, usize, usize)> = None;
                         while lo < hi {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
@@ -3039,46 +3073,63 @@ impl<'a> Btree<'a> {
                                     })?;
                             match cell_rowid.cmp(&rowid) {
                                 std::cmp::Ordering::Equal => {
-                                    found = Some(cell_ptr + n_rid);
+                                    let plen_pos = cell_ptr + n_rid;
+                                    let (plen, n_plen) =
+                                        varint::decode(&borrowed.data[plen_pos..]).ok_or_else(
+                                            || Error::corruption("truncated payload length in update"),
+                                        )?;
+                                    found = Some((
+                                        mid,
+                                        cell_ptr,
+                                        n_rid,
+                                        n_plen,
+                                        plen_pos + n_plen,
+                                        plen as usize,
+                                    ));
                                     break;
                                 }
                                 std::cmp::Ordering::Less => lo = mid + 1,
                                 std::cmp::Ordering::Greater => hi = mid,
                             }
                         }
-                        match found {
-                            None => return Ok(false), // rowid not present
-                            Some(payload_len_pos) => {
-                                // Decode the payload-length varint.
-                                let (plen, n_plen) =
-                                    varint::decode(&borrowed.data[payload_len_pos..]).ok_or_else(
-                                        || Error::corruption("truncated payload length in update"),
-                                    )?;
-                                (payload_len_pos, payload_len_pos + n_plen, plen as usize)
-                            }
-                        }
+                        found.map(|(pos, cp, n_rid, n_plen, off, plen)| {
+                            (pos, cp, n_rid, n_rid + n_plen + plen, off, plen, psz)
+                        })
                     };
-                    if old_len != new_payload.len() {
-                        // Size changed — caller must fall back to delete+insert.
+                    let Some((pos, cell_ptr, n_rid, old_cell_size, payload_off, old_plen, psz)) =
+                        geo
+                    else {
+                        return Ok(false); // rowid not present
+                    };
+                    // Spilled rows never take the in-place patch path.
+                    if overflow_local_len_for(old_plen, psz) != old_plen {
                         return Ok(false);
                     }
-                    // Spilled rows never take the in-place patch path.
-                    {
-                        let psz = page.lock().data.len();
-                        if overflow_local_len_for(old_len, psz) != old_len {
-                            return Ok(false);
+                    if old_plen == new_payload.len() {
+                        // Overwrite the payload bytes — single mutable
+                        // borrow, no immutable borrows outstanding.
+                        {
+                            let mut borrowed = page.lock();
+                            borrowed.data[payload_off..payload_off + new_payload.len()]
+                                .copy_from_slice(new_payload);
+                            borrowed.dirty = true;
                         }
+                        self.pager.note_dirty(page_id);
+                        return Ok(true);
                     }
-                    // Overwrite the payload bytes — single mutable borrow,
-                    // no immutable borrows outstanding.
-                    {
-                        let mut borrowed = page.lock();
-                        borrowed.data[payload_offset..payload_offset + new_payload.len()]
-                            .copy_from_slice(new_payload);
-                        borrowed.dirty = true;
-                    }
-                    self.pager.note_dirty(page_id);
-                    return Ok(true);
+                    // Size change — in-leaf replace (shrink / grow).
+                    return self.apply_leaf_replace(
+                        &page,
+                        page_id,
+                        rowid,
+                        pos as u16,
+                        cell_ptr,
+                        n_rid,
+                        old_cell_size,
+                        old_plen,
+                        new_payload,
+                        psz,
+                    );
                 }
                 PageType::InteriorTable => {
                     let borrowed = page.lock();
@@ -3108,6 +3159,150 @@ impl<'a> Btree<'a> {
                 }
             }
         }
+    }
+
+    /// Shape-changing in-leaf UPDATE, applied where the cell was already
+    /// FOUND by `update_table`'s hint probe or descent: replace the cell
+    /// for `rowid` with a new payload of a DIFFERENT size, entirely
+    /// within its leaf page — no delete/reinsert descent, no tree
+    /// rebalance, no split when the leaf has room. This is the b-tree
+    /// twin of SQLite's own in-cursor UPDATE (delete the old cell, insert
+    /// the new one into the SAME page when it fits); it closes the OLTP
+    /// gap where a payload that grows or shrinks by a few bytes (`score`
+    /// flipping between integral-int and X.5-real encodings) pushed the
+    /// row into the full delete+insert path — a second root descent,
+    /// cell shuffling, and leaf-split churn.
+    ///
+    /// Returns `Ok(true)` when the replacement was applied in-page.
+    /// `Ok(false)` = the caller must use the delete+insert fallback:
+    /// the new payload would spill to an overflow chain, or the leaf
+    /// cannot fit the grown cell (the old cell's BYTES become dead space
+    /// in the content area — reclaimed by the next split/rebuild
+    /// compaction, exactly like `delete_table`'s pointer drop).
+    ///
+    /// Hint/epoch contract: the SHRINK branch writes inside the old
+    /// cell's slot, so no offset moves and advisory leaf hints stay
+    /// valid (`note_write_in_place`); the GROW branch moves the content
+    /// start and bumps the write version (all advisory hints for the
+    /// tree die) through `note_write()`.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_leaf_replace(
+        &self,
+        page: &crate::storage::pager::PageRef,
+        page_id: PageId,
+        rowid: i64,
+        pos: u16,
+        cell_ptr: usize,
+        n_rid: usize,
+        old_cell_size: usize,
+        _old_plen: usize,
+        new_payload: &[u8],
+        psz: usize,
+    ) -> Result<bool> {
+        // A payload that would spill needs the overflow path's chain
+        // bookkeeping — bail to delete+insert (which builds/frees chains).
+        if overflow_local_len_for(new_payload.len(), psz) != new_payload.len() {
+            return Ok(false);
+        }
+        let new_cell_size = n_rid + varint::len_of(new_payload.len() as u64) + new_payload.len();
+        // ---- SHRINK / EQUAL-SLOT branch: the new cell fits inside the
+        // old cell's slot. Write it there — the pointer, the cell count,
+        // the content start, and every other cell's offset stay EXACTLY
+        // as they were, so advisory leaf hints remain valid. The tail
+        // bytes of the old slot become dead space, reclaimed by the next
+        // split/rebuild compaction — the same lifecycle delete_table's
+        // dead cells follow. This is the workhorse for the
+        // integral-<->-fractional REAL flips (codec v2 stores integral
+        // reals as 2-5 byte zigzags and fractional ones as 9-byte
+        // doubles) on APPEND-PACKED leaves, where the grow branch's
+        // free-space check would fail and the row would pay
+        // delete+insert.
+        if new_cell_size <= old_cell_size {
+            let mut borrowed = page.lock();
+            let head = cell_ptr + n_rid; // just past the (unchanged) rowid varint
+            let mut vb = [0u8; 10];
+            let n_plen = varint::encode(new_payload.len() as u64, &mut vb);
+            if head + n_plen + new_payload.len() > borrowed.data.len() {
+                return Err(Error::corruption(format!(
+                    "cell slot out of range in replace (page {})",
+                    page_id
+                )));
+            }
+            borrowed.data[head..head + n_plen].copy_from_slice(&vb[..n_plen]);
+            borrowed.data[head + n_plen..head + n_plen + new_payload.len()]
+                .copy_from_slice(new_payload);
+            // The pointer at `pos` already == cell_ptr.
+            borrowed.dirty = true;
+            drop(borrowed);
+            self.pager.note_write_in_place();
+            self.pager.note_dirty(page_id);
+            return Ok(true);
+        }
+        // ---- GROW branch: offsets move, so advisory hints die
+        // (note_write) and the insert needs the full new cell size + its
+        // 2-byte pointer out of CURRENT free space (the old cell's bytes
+        // become dead, not free).
+        let mut cell_buf = Vec::with_capacity(new_cell_size);
+        let mut vb = [0u8; 10];
+        let k = varint::encode_signed(rowid, &mut vb);
+        cell_buf.extend_from_slice(&vb[..k]);
+        let p = varint::encode(new_payload.len() as u64, &mut vb);
+        cell_buf.extend_from_slice(&vb[..p]);
+        cell_buf.extend_from_slice(new_payload);
+        debug_assert_eq!(cell_buf.len(), new_cell_size);
+        self.pager.note_write();
+        {
+            let borrowed = page.lock();
+            let free = borrowed.free_space();
+            if free < new_cell_size as u32 + 2 {
+                return Ok(false); // caller: delete + insert (may split)
+            }
+        }
+        // Apply: drop the old pointer (cell bytes become dead space),
+        // then insert the new cell at the content start with the pointer
+        // restored at the same slot.
+        let header_offset = if page_id == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+        {
+            let mut borrowed = page.lock();
+            let n = borrowed.n_cells();
+            let pos_usize = pos as usize;
+            // Remove old pointer.
+            borrowed.data.copy_within(
+                ptr_array_start + (pos_usize + 1) * 2..ptr_array_start + n as usize * 2,
+                ptr_array_start + pos_usize * 2,
+            );
+            // Insert new cell bytes at the content start.
+            let new_content_start = borrowed
+                .cell_content_start()
+                .saturating_sub(new_cell_size as u32);
+            let off = new_content_start as usize;
+            if off + new_cell_size > borrowed.data.len() {
+                return Err(Error::corruption(format!(
+                    "cell content area out of range in replace (page {})",
+                    page_id
+                )));
+            }
+            borrowed.data[off..off + new_cell_size].copy_from_slice(&cell_buf);
+            borrowed.set_cell_content_start(new_content_start);
+            // Re-open the pointer slot at `pos` (n is now the
+            // post-removal count; the memmove above closed it).
+            let n_now = n - 1;
+            borrowed.data.copy_within(
+                ptr_array_start + pos_usize * 2..ptr_array_start + n_now as usize * 2,
+                ptr_array_start + (pos_usize + 1) * 2,
+            );
+            let dst = ptr_array_start + pos_usize * 2;
+            borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
+            borrowed.set_n_cells(n);
+            borrowed.dirty = true;
+        }
+        self.pager.note_dirty(page_id);
+        Ok(true)
     }
 
     /// Insert a cell into a page (and propagate splits if needed).
@@ -5472,6 +5667,37 @@ impl<'a> Btree<'a> {
     where
         F: FnMut(i64, Vec<Value>) -> bool,
     {
+        // Pool-free entry (executor fused walks + parallel workers):
+        // an empty scratch vec behaves exactly like the fresh-allocation
+        // contract always did.
+        let mut no_pool: Vec<Vec<Value>> = Vec::new();
+        self.scan_table_range_selective_pooled(
+            start, end, n_cols, wanted, rowid_alias, &mut no_pool, f,
+        )
+    }
+
+    /// [`Self::scan_table_range_selective`] with a caller-owned ROW POOL:
+    /// every in-page row handed to `f` is popped from `pool` (cleared,
+    /// capacity retained) instead of freshly allocated, and the caller
+    /// returns rows to the pool after their consumer is done with them.
+    /// The streaming `Statement::step` path recycles its served rows
+    /// this way — one heap allocation per ROW SLOT for the whole
+    /// statement lifetime instead of one per row (the torture-S06 shape:
+    /// 100k-row range drains cost ~30% of their step time in small-alloc
+    /// churn).
+    pub fn scan_table_range_selective_pooled<F>(
+        &mut self,
+        start: i64,
+        end: i64,
+        n_cols: usize,
+        wanted: &[usize],
+        rowid_alias: Option<usize>,
+        row_pool: &mut Vec<Vec<Value>>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Vec<Value>) -> bool,
+    {
         // Trusted TEXT decode for in-memory pagers (payloads are this
         // process's own encoder output — see types::value). Saved +
         // restored so nested scans on other pagers behave correctly.
@@ -5488,6 +5714,7 @@ impl<'a> Btree<'a> {
                 n_cols,
                 wanted,
                 rowid_alias,
+                row_pool,
                 &mut f,
             )
             .map(|_| ());
@@ -5505,6 +5732,7 @@ impl<'a> Btree<'a> {
         n_cols: usize,
         wanted: &[usize],
         rowid_alias: Option<usize>,
+        row_pool: &mut Vec<Vec<Value>>,
         f: &mut F,
     ) -> Result<bool>
     where
@@ -5574,7 +5802,13 @@ impl<'a> Btree<'a> {
                             ));
                         }
                         let payload = &buf[payload_start..payload_start + plen];
-                        let mut row: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
+                        let mut row: Vec<Value> = match row_pool.pop() {
+                            Some(mut r) => {
+                                r.clear();
+                                r
+                            }
+                            None => Vec::with_capacity(wanted.len().max(1)),
+                        };
                         if crate::storage::row_codec::decode_row_selective(
                             payload,
                             n_cols,
@@ -5633,7 +5867,13 @@ impl<'a> Btree<'a> {
                                     chain,
                                     &mut full,
                                 )?;
-                                let mut row: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
+                                let mut row: Vec<Value> = match row_pool.pop() {
+                                    Some(mut r) => {
+                                        r.clear();
+                                        r
+                                    }
+                                    None => Vec::with_capacity(wanted.len().max(1)),
+                                };
                                 if crate::storage::row_codec::decode_row_selective(
                                     &full,
                                     n_cols,
@@ -5702,6 +5942,7 @@ impl<'a> Btree<'a> {
                         n_cols,
                         wanted,
                         rowid_alias,
+                        row_pool,
                         f,
                     )? {
                         return Ok(false);
