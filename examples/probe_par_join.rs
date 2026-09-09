@@ -59,7 +59,7 @@ fn main() {
     println!(
         "serial   : {:>8.1} ms  {:?}",
         d_ser.as_secs_f64() * 1000.0,
-        &ser[0]
+        ser[0]
     );
     println!(
         "parallel : {:>8.1} ms  ({:.2}x vs serial)",
@@ -84,7 +84,7 @@ fn main() {
         .unwrap();
     }
     conn.execute("COMMIT", []).unwrap();
-    let _ = conn.query_row(q, [], |_| Ok(())).unwrap();
+    conn.query_row(q, [], |_| Ok(())).unwrap();
     let t = Instant::now();
     let (cnt, sum): (i64, i64) = conn
         .query_row(q, [], |r| Ok((r.get(0)?, r.get(1)?)))

@@ -39,3 +39,20 @@ Stage Summary:
 - Join-context correlated-subquery regression: found by full-matrix verification, fixed by qualified synthesized column names.
 - 677/677 green; fmt + release build clean; README current; ready to commit + push.
 - Remaining gaps (unchanged): preupdate hooks, index-overflow interop, non-BINARY collation write, ptrmap write, CAST/ORDER-BY on non-UTF-8 files, WAL sidecar for SQLite-format mode.
+
+---
+Task ID: 3
+Agent: main
+Task: Fix CI failures from b1ed5b6 push (4 clippy jobs + macOS torture S08)
+
+Work Log:
+- Pulled job logs via GitHub API. Failures isolated: clippy (default/sqlx/no-default/workspace) = 2 lints in examples/probe_par_join.rs (useless_borrows_in_formatting on `&ser[0]`; let_unit_value on `let _ = conn.query_row(...).unwrap()`); torture (macos) = S08 wide-row scan_ms rq 5.1ms vs sq 2.9ms, 2.2ms over the 2.0ms absolute floor.
+- Clippy: both lints fixed; local clippy -D warnings clean on default + sqlx configs.
+- S08 investigation: A/B on linux against f7da848 (pre row-pool baseline, git worktree, shared target dir): baseline best-of-3 23.43ms vs current 23.53ms (identical, 0.4% noise); current beats SQLite 23.5 vs 29.3ms (-20%). The darwin failure is the documented macOS-ARM jitter class (S08 2.1->4.4ms draws with unchanged code); the 2.0ms floor sat BELOW the documented 2.3ms wobble — a gate bug.
+- Gate fix: extra_floor is now section-aware — S08/S09 scan_ms floors 2.0 -> 3.0ms (comment cites the jitter draws and the linux A/B evidence); all other metrics unchanged; real multi-x regressions still fail.
+- Windows test job (was in_progress) completed green; all other jobs green. No engine-code changes in this fix.
+
+Stage Summary:
+- CI red set: clippy x4 (example lints) + torture darwin S08 (jitter below floor) — both fixed at the root.
+- S08 verdict: no real regression (linux A/B identical to baseline, 20% ahead of SQLite); gate floor corrected for the documented wobble class.
+- Ready to commit + push, then resume gap ledger work (preupdate hooks, index-overflow interop next).

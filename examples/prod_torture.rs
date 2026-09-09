@@ -2128,10 +2128,25 @@ fn gated_with_floor(rq: f64, sq: f64, tolerance_pct: f64, floor_ms: f64) -> bool
 /// least 5 ms slower — still well inside the multi-10s-of-% margin a
 /// real first-query regression produces, but outside cross-runner
 /// cold-start jitter.
-fn extra_floor(metric: &str) -> f64 {
-    match metric {
-        "open_first_query_ms" => 5.0,
-        _ => 2.0,
+///
+/// Section-aware: the single-digit-ms wide-row/blob SCAN sections swing
+/// harder than the generic 2 ms floor admits — documented macOS-ARM
+/// draws with unchanged code include S08 scan_ms 2.1 -> 4.4 ms, S09
+/// 5.9 -> 3.7 ms, and a best-of-3 gate flip at rq 5.1 vs sq 2.9 ms
+/// (2026-09-09, b1ed5b6: linux A/B on the same code measured the
+/// pooled step path IDENTICAL to the pre-pool baseline — 23.5 vs
+/// 23.4 ms best-of-3 — and 20% AHEAD of SQLite, i.e. pure runner
+/// jitter, not a regression). A real scan regression at this scale is
+/// multi-x (+5 ms at 2x); 3 ms separates the jitter class from the
+/// regression class.
+fn extra_floor(section: &str, metric: &str) -> f64 {
+    match (section, metric) {
+        ("S08", "scan_ms") => 3.0,
+        ("S09", "scan_ms") => 3.0,
+        _ => match metric {
+            "open_first_query_ms" => 5.0,
+            _ => 2.0,
+        },
     }
 }
 
@@ -2242,7 +2257,7 @@ fn main() {
                 let v = verdict(rq.get(k), sq.get(k), true);
                 if v.contains("LOSS") {
                     losses.push(format!("{id} {title} ({k})"));
-                    if gated_with_floor(rq.get(k), sq.get(k), time_tol, extra_floor(k)) {
+                    if gated_with_floor(rq.get(k), sq.get(k), time_tol, extra_floor(id, k)) {
                         failures.push(format!(
                             "{id} {title} ({k}): rq {:.1}ms vs sq {:.1}ms (time > {time_tol:.0}% slower)",
                             rq.get(k),
