@@ -56,3 +56,21 @@ Stage Summary:
 - CI red set: clippy x4 (example lints) + torture darwin S08 (jitter below floor) — both fixed at the root.
 - S08 verdict: no real regression (linux A/B identical to baseline, 20% ahead of SQLite); gate floor corrected for the documented wobble class.
 - Ready to commit + push, then resume gap ledger work (preupdate hooks, index-overflow interop next).
+
+---
+Task ID: 4
+Agent: main
+Task: Close the index-overflow gap (native + interop) — SQLite files with >page index keys
+
+Work Log:
+- Reproduced: probe_idx_ovf (SQLite file, 9KB indexed TEXT) failed "indexed value too big" at CREATE INDEX; loader rebuilds indexes from table data, so the gap was engine-side insert_index + the native index b-tree.
+- Implemented IndexLeafOverflow/IndexInteriorOverflow cell variants (encode/decode/size, deterministic local-prefix split via overflow_local_len_for), chain build/free on insert/delete, overflow-aware comparisons in every binary search (find_index_child, insert positioning, scan/lookup/descents; ambiguous local-prefix cases resolved by chain reassembly), full-key separators in all split paths (fresh chain copies via index_interior_separator), leaf hint skip on overflow bounds, integrity_check via full-key scan.
+- Debug journey (in-memory 25-row repro): (1) root-split + slow-interior-promote paths built plain oversized IndexInterior cells -> fixed via separator helper; (2) SLOW REBUILD path unpatched (3 separator sites + propagate) -> fixed; (3) leaf slow-split separator sent the LOCAL PREFIX -> fixed; (4) THE BIG ONE: count-based mid=total/2 split points overloaded one half past the page budget -> insert_cell_into_page underflowed content_start to 0 and clobbered the page header with cell bytes (left_child be-bytes start 0x00 -> type byte 0 -> "invalid page type byte: 0x0"). FIX: byte_aware_mid (byte-sum-feasible split points) for leaf + interior slow splits, plus a no-clobber guard in insert_cell_into_page (clean corruption error instead of silent header clobber). Also fixed byte_aware_mid for single-cell pages (historic total/2=0 semantics — caught by boundary::huge_statements_and_identifiers).
+- Chain freeing on delete/recycle/splice/replacement sites; deleted chains return pages to the freelist and later inserts reuse them (churn test).
+- tests/index_overflow.rs (6 tests): scale insert/lookup/ORDER BY (60 x 9KB keys, multi-level tree), UPDATE moves chains, DELETE + churn with integrity_check, reopen persistence, UNIQUE + composite prefix lookups, SQLite-file interop roundtrip (load SQLite-built file, autocommit re-dump, real SQLite verifies integrity + bytes).
+- Full matrix: release 683/683 (49 binaries), dev profile 683/683, clippy clean (default + no-default), fmt clean.
+
+Stage Summary:
+- Index overflow chains: CLOSED (native + SQLite-file interop both directions; verified by real SQLite).
+- Bonus hardening: byte-aware split points fix a latent header-clobber corruption risk for ANY oversized cells, and insert_cell_into_page now fails cleanly instead of corrupting on overflow.
+- Remaining gaps: preupdate hooks, non-BINARY collation write, ptrmap write, CAST/ORDER-BY on non-UTF-8 files, WAL sidecar for SQLite-format mode.

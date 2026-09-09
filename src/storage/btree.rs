@@ -173,11 +173,33 @@ pub enum Cell {
     TableInterior { left_child: PageId, key: i64 },
     /// Index leaf: (key, rowid).
     IndexLeaf { key: Vec<u8>, rowid: i64 },
+    /// Index leaf with an overflow chain: oversized index keys spill the
+    /// tail to Overflow pages exactly like table payloads — the cell
+    /// keeps a LOCAL prefix + the first chain page; `total` is the FULL
+    /// key length. Split point derived from `total` via
+    /// `overflow_local_len_for` (same pure function as table cells), so
+    /// readers never need side tables to find it.
+    IndexLeafOverflow {
+        rowid: i64,
+        total: u64,
+        local: Vec<u8>,
+        overflow: PageId,
+    },
     /// Index interior: (left_child_page, key, rowid).
     IndexInterior {
         left_child: PageId,
         key: Vec<u8>,
         rowid: i64,
+    },
+    /// Index interior with an overflow-chained separator key (the
+    /// separator is a COPY of the left child's max entry — when that
+    /// entry's key is oversized, the copy gets its own chain).
+    IndexInteriorOverflow {
+        left_child: PageId,
+        rowid: i64,
+        total: u64,
+        local: Vec<u8>,
+        overflow: PageId,
     },
 }
 
@@ -188,7 +210,9 @@ impl Cell {
             Cell::TableLeafOverflow { rowid, .. } => *rowid,
             Cell::TableInterior { key, .. } => *key,
             Cell::IndexLeaf { rowid, .. } => *rowid,
+            Cell::IndexLeafOverflow { rowid, .. } => *rowid,
             Cell::IndexInterior { rowid, .. } => *rowid,
+            Cell::IndexInteriorOverflow { rowid, .. } => *rowid,
         }
     }
 
@@ -197,20 +221,39 @@ impl Cell {
         match self {
             Cell::TableInterior { left_child, .. } => *left_child,
             Cell::IndexInterior { left_child, .. } => *left_child,
+            Cell::IndexInteriorOverflow { left_child, .. } => *left_child,
             _ => 0,
         }
     }
 
-    /// Encoded key bytes of an index cell (empty for table cells).
+    /// Encoded key bytes of an index cell. For OVERFLOW index cells this
+    /// is the LOCAL prefix only — comparisons that must see the full key
+    /// go through `Btree::cell_index_key` (chain reassembly). Every
+    /// in-flight comparison site was audited to either use the full-key
+    /// helper or only need the prefix by construction.
     pub fn index_key(&self) -> &[u8] {
         match self {
             Cell::IndexLeaf { key, .. } | Cell::IndexInterior { key, .. } => key,
+            Cell::IndexLeafOverflow { local, .. } | Cell::IndexInteriorOverflow { local, .. } => {
+                local
+            }
             _ => &[],
         }
     }
 
+    /// Overflow chain head of an index cell (0 = fully in-page key).
+    pub fn index_overflow(&self) -> PageId {
+        match self {
+            Cell::IndexLeafOverflow { overflow, .. }
+            | Cell::IndexInteriorOverflow { overflow, .. } => *overflow,
+            _ => 0,
+        }
+    }
+
     /// Compare an index cell against a target (key, rowid).
-    /// Index pages are sorted by (key bytes, rowid).
+    /// Index pages are sorted by (key bytes, rowid). NOTE: for overflow
+    /// cells this compares the LOCAL prefix — callers needing total-order
+    /// fidelity must reassemble first (`Btree::cell_index_key`).
     pub fn cmp_index_target(&self, key: &[u8], rowid: i64) -> std::cmp::Ordering {
         self.index_key().cmp(key).then(self.key().cmp(&rowid))
     }
@@ -240,6 +283,17 @@ impl Cell {
                 let kl = varint::encode(key.len() as u64, &mut buf);
                 r + kl + key.len()
             }
+            Cell::IndexLeafOverflow {
+                rowid,
+                total,
+                local,
+                ..
+            } => {
+                // Format: varint(rowid) + varint(TOTAL key_len) + local + be_u32(chain)
+                let r = varint::encode_signed(*rowid, &mut buf);
+                let kl = varint::encode(*total, &mut buf);
+                r + kl + local.len() + 4
+            }
             Cell::IndexInterior {
                 left_child: _,
                 key,
@@ -249,6 +303,18 @@ impl Cell {
                 let r = varint::encode_signed(*rowid, &mut buf);
                 let kl = varint::encode(key.len() as u64, &mut buf);
                 4 + r + kl + key.len()
+            }
+            Cell::IndexInteriorOverflow {
+                left_child: _,
+                rowid,
+                total,
+                local,
+                ..
+            } => {
+                // Format: be_u32(left_child) + varint(rowid) + varint(TOTAL) + local + be_u32(chain)
+                let r = varint::encode_signed(*rowid, &mut buf);
+                let kl = varint::encode(*total, &mut buf);
+                4 + r + kl + local.len() + 4
             }
         }
     }
@@ -289,6 +355,19 @@ impl Cell {
                 out.extend_from_slice(&buf[..kl]);
                 out.extend_from_slice(key);
             }
+            Cell::IndexLeafOverflow {
+                rowid,
+                total,
+                local,
+                overflow,
+            } => {
+                let r = varint::encode_signed(*rowid, &mut buf);
+                out.extend_from_slice(&buf[..r]);
+                let kl = varint::encode(*total, &mut buf);
+                out.extend_from_slice(&buf[..kl]);
+                out.extend_from_slice(local);
+                out.extend_from_slice(&overflow.to_be_bytes());
+            }
             Cell::IndexInterior {
                 left_child,
                 key,
@@ -300,6 +379,21 @@ impl Cell {
                 let kl = varint::encode(key.len() as u64, &mut buf);
                 out.extend_from_slice(&buf[..kl]);
                 out.extend_from_slice(key);
+            }
+            Cell::IndexInteriorOverflow {
+                left_child,
+                rowid,
+                total,
+                local,
+                overflow,
+            } => {
+                out.extend_from_slice(&left_child.to_be_bytes());
+                let r = varint::encode_signed(*rowid, &mut buf);
+                out.extend_from_slice(&buf[..r]);
+                let kl = varint::encode(*total, &mut buf);
+                out.extend_from_slice(&buf[..kl]);
+                out.extend_from_slice(local);
+                out.extend_from_slice(&overflow.to_be_bytes());
             }
         }
     }
@@ -358,13 +452,30 @@ impl Cell {
                 let (key_len, m) = varint::decode(rest)
                     .ok_or_else(|| Error::corruption("truncated index leaf key length"))?;
                 let rest = &rest[m..];
-                if rest.len() < key_len as usize {
-                    return Err(Error::corruption("truncated index leaf key"));
+                let key_len_us = key_len as usize;
+                let local_len = overflow_local_len_for(key_len_us, page_size as usize);
+                if local_len == key_len_us {
+                    if rest.len() < key_len_us {
+                        return Err(Error::corruption("truncated index leaf key"));
+                    }
+                    Ok(Cell::IndexLeaf {
+                        key: rest[..key_len_us].to_vec(),
+                        rowid,
+                    })
+                } else {
+                    // Overflow-chained index key: local prefix + chain head.
+                    if rest.len() < local_len + 4 {
+                        return Err(Error::corruption("truncated index leaf overflow cell"));
+                    }
+                    let overflow =
+                        u32::from_be_bytes(rest[local_len..local_len + 4].try_into().unwrap());
+                    Ok(Cell::IndexLeafOverflow {
+                        rowid,
+                        total: key_len,
+                        local: rest[..local_len].to_vec(),
+                        overflow,
+                    })
                 }
-                Ok(Cell::IndexLeaf {
-                    key: rest[..key_len as usize].to_vec(),
-                    rowid,
-                })
             }
             PageType::InteriorIndex => {
                 if buf.len() < 4 {
@@ -377,14 +488,31 @@ impl Cell {
                 let (key_len, m) = varint::decode(rest)
                     .ok_or_else(|| Error::corruption("truncated index interior key length"))?;
                 let rest = &rest[m..];
-                if rest.len() < key_len as usize {
-                    return Err(Error::corruption("truncated index interior key"));
+                let key_len_us = key_len as usize;
+                let local_len = overflow_local_len_for(key_len_us, page_size as usize);
+                if local_len == key_len_us {
+                    if rest.len() < key_len_us {
+                        return Err(Error::corruption("truncated index interior key"));
+                    }
+                    Ok(Cell::IndexInterior {
+                        left_child,
+                        key: rest[..key_len_us].to_vec(),
+                        rowid,
+                    })
+                } else {
+                    if rest.len() < local_len + 4 {
+                        return Err(Error::corruption("truncated index interior overflow cell"));
+                    }
+                    let overflow =
+                        u32::from_be_bytes(rest[local_len..local_len + 4].try_into().unwrap());
+                    Ok(Cell::IndexInteriorOverflow {
+                        left_child,
+                        rowid,
+                        total: key_len,
+                        local: rest[..local_len].to_vec(),
+                        overflow,
+                    })
                 }
-                Ok(Cell::IndexInterior {
-                    left_child,
-                    key: rest[..key_len as usize].to_vec(),
-                    rowid,
-                })
             }
             PageType::Overflow => Err(Error::corruption(
                 "overflow page reached as a btree cell page",
@@ -409,18 +537,32 @@ impl Cell {
 /// search (the navigation loops were linear scans).
 #[derive(Clone, Copy)]
 struct IndexCellView<'a> {
+    /// Key bytes: the FULL key for in-page cells, the LOCAL prefix when
+    /// `overflow != 0` (the tail lives in the chain — reassemble via
+    /// `Btree::index_view_key_into` for total-order comparisons).
     key: &'a [u8],
     rowid: i64,
     left_child: u32,
+    /// Full key length (== key.len() for in-page cells).
+    total: u64,
+    /// Overflow chain head (0 = key fully in-page).
+    overflow: PageId,
 }
 
 /// Byte length of an INDEX leaf cell at `buf` (varint rowid + varint key
-/// length + key). Non-allocating; returns None on truncation.
-fn index_leaf_cell_size(buf: &[u8]) -> Option<usize> {
+/// length + key, or + local + be_u32 chain for overflow cells).
+/// Non-allocating; returns None on truncation.
+fn index_leaf_cell_size(buf: &[u8], page_size: u32) -> Option<usize> {
     let (_, n1) = varint::decode_signed(buf)?;
     let rest = &buf[n1..];
     let (klen, n2) = varint::decode(rest)?;
-    Some(n1 + n2 + klen as usize)
+    let klen = klen as usize;
+    let local = overflow_local_len_for(klen, page_size as usize);
+    if local == klen {
+        Some(n1 + n2 + klen)
+    } else {
+        Some(n1 + n2 + local + 4)
+    }
 }
 
 /// Byte length of a TABLE leaf cell at `buf` (varint rowid + varint payload
@@ -432,17 +574,22 @@ fn table_leaf_cell_size(buf: &[u8]) -> Option<usize> {
     Some(n1 + n2 + plen as usize)
 }
 
-fn decode_index_cell(buf: &[u8], interior: bool) -> Option<IndexCellView<'_>> {
-    if interior {
+fn decode_index_cell(buf: &[u8], interior: bool, page_size: u32) -> Option<IndexCellView<'_>> {
+    let (left_child, after_child) = if interior {
         if buf.len() < 4 {
             return None;
         }
-        let left_child = u32::from_be_bytes(buf[..4].try_into().unwrap());
-        let (rowid, n) = varint::decode_signed(&buf[4..])?;
-        let rest = &buf[4 + n..];
-        let (key_len, m) = varint::decode(rest)?;
-        let rest = &rest[m..];
-        let key_len = key_len as usize;
+        (u32::from_be_bytes(buf[..4].try_into().unwrap()), 4)
+    } else {
+        (0, 0)
+    };
+    let (rowid, n) = varint::decode_signed(&buf[after_child..])?;
+    let rest = &buf[after_child + n..];
+    let (key_len, m) = varint::decode(rest)?;
+    let rest = &rest[m..];
+    let key_len = key_len as usize;
+    let local_len = overflow_local_len_for(key_len, page_size as usize);
+    if local_len == key_len {
         if rest.len() < key_len {
             return None;
         }
@@ -450,20 +597,20 @@ fn decode_index_cell(buf: &[u8], interior: bool) -> Option<IndexCellView<'_>> {
             key: &rest[..key_len],
             rowid,
             left_child,
+            total: key_len as u64,
+            overflow: 0,
         })
     } else {
-        let (rowid, n) = varint::decode_signed(buf)?;
-        let rest = &buf[n..];
-        let (key_len, m) = varint::decode(rest)?;
-        let rest = &rest[m..];
-        let key_len = key_len as usize;
-        if rest.len() < key_len {
+        // Overflow cell: local prefix + be_u32 chain head.
+        if rest.len() < local_len + 4 {
             return None;
         }
         Some(IndexCellView {
-            key: &rest[..key_len],
+            key: &rest[..local_len],
             rowid,
-            left_child: 0,
+            left_child,
+            total: key_len as u64,
+            overflow: u32::from_be_bytes(rest[local_len..local_len + 4].try_into().unwrap()),
         })
     }
 }
@@ -485,55 +632,208 @@ fn decode_table_interior_child(buf: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(buf[..4].try_into().unwrap()))
 }
 
-/// Binary-search an interior INDEX page for the first cell whose
-/// (key, rowid) separator is >= the target (key, rowid). Returns
-/// (cell_index, that cell's left_child, n_cells, right_most). When all
-/// separators are < target, returns (n, right_most, n, right_most).
-fn find_index_child(
-    data: &[u8],
-    n: u16,
-    cell_pointer: impl Fn(u16) -> u16,
-    right_most: u32,
-    key: &[u8],
-    rowid: i64,
-) -> (usize, u32) {
-    let mut lo: u16 = 0;
-    let mut hi: u16 = n;
-    while lo < hi {
-        // usize arithmetic: a corrupt n_cells can push lo+hi past u16::MAX.
-        let mid = ((lo as usize + hi as usize) / 2) as u16;
-        let ptr = cell_pointer(mid) as usize;
-        // Corrupt cell pointer: out-of-range offsets must yield a miss,
-        // never a slice panic (SQLite policy: corrupt -> SQLITE_CORRUPT).
-        let Some(v) = data.get(ptr..).and_then(|c| decode_index_cell(c, true)) else {
-            break;
-        };
-        // (v.key, v.rowid) < (key, rowid)  → go right
-        let ord = v.key.cmp(key).then(v.rowid.cmp(&rowid));
-        if ord == std::cmp::Ordering::Less {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+impl<'a> Btree<'a> {
+    /// Byte-aware split point for the slow rebuild paths: the count-mid
+    /// when both halves fit, else the nearest feasible point. A cell
+    /// larger than half a page (oversized-key separators) makes the
+    /// 50/50-by-COUNT split put more bytes on one side than the page
+    /// holds — the in-page write then underflows the content start and
+    /// clobbers the page header (observed: type byte overwritten by a
+    /// left_child's leading 0x00 byte). Sizes include the 2-byte pointer
+    /// slot; `avail` is the page's writable budget (page_size - header).
+    /// Returns None only when a single cell exceeds `avail` (impossible
+    /// for legal cells: each is capped at max_cell_payload < avail).
+    fn byte_aware_mid(cells: &[Cell], avail: usize) -> Option<usize> {
+        let total = cells.len();
+        if total < 2 {
+            // Match the historic `total / 2` (= 0) semantics: a lone cell
+            // goes to the RIGHT half (leaf table split reads cells[mid]).
+            return Some(total / 2);
         }
-    }
-    if lo >= n {
-        if right_most != 0 || n == 0 {
-            (n as usize, right_most)
-        } else {
-            // right=0 ("no right-most child" — the state delete/rebalance
-            // leaves behind): the LAST cell's child is the de-facto right
-            // edge. Returning literal 0 would descend the SCHEMA page.
-            let ptr = cell_pointer(n - 1) as usize;
-            match data.get(ptr..).and_then(|c| decode_index_cell(c, true)) {
-                Some(v) => (n as usize, v.left_child),
-                None => (n as usize, 0),
+        let size = |c: &Cell| c.encoded_size() + 2;
+        let total_bytes: usize = cells.iter().map(size).sum();
+        if total_bytes <= avail {
+            // Everything fits on one side (caller splits anyway): keep the
+            // count-mid for balance.
+            return Some(total / 2);
+        }
+        // Feasible mid: left(bytes) <= avail AND right(bytes) <= avail.
+        // left grows monotonically with mid — scan from the count-mid
+        // outward, preferring the most balanced feasible point.
+        let count_mid = total / 2;
+        let left_bytes = |m: usize| cells.iter().take(m).map(size).sum::<usize>();
+        let feasible = |m: usize| {
+            m >= 1 && m < total && left_bytes(m) <= avail && total_bytes - left_bytes(m) <= avail
+        };
+        if feasible(count_mid) {
+            return Some(count_mid);
+        }
+        for d in 1..total {
+            if count_mid >= d && feasible(count_mid - d) {
+                return Some(count_mid - d);
+            }
+            if count_mid + d < total && feasible(count_mid + d) {
+                return Some(count_mid + d);
             }
         }
-    } else {
-        let ptr = cell_pointer(lo) as usize;
-        match data.get(ptr..).and_then(|c| decode_index_cell(c, true)) {
-            Some(v) => (lo as usize, v.left_child),
-            None => (n as usize, right_most),
+        // Last resort: 1 | rest (each single cell fits by construction).
+        if left_bytes(1) <= avail && total_bytes - left_bytes(1) <= avail {
+            return Some(1);
+        }
+        None
+    }
+
+    /// Interior index separator cell for (left_child, key, rowid). The
+    /// separator is a COPY of a leaf entry's key — when that key is
+    /// oversized the copy gets its OWN fresh overflow chain (the source
+    /// cell keeps the original). In-page keys take the ordinary variant.
+    fn index_interior_separator(
+        &mut self,
+        left_child: PageId,
+        key: &[u8],
+        rowid: i64,
+    ) -> Result<Cell> {
+        if key.len() <= self.max_cell_payload() {
+            Ok(Cell::IndexInterior {
+                left_child,
+                key: key.to_vec(),
+                rowid,
+            })
+        } else {
+            let local_len = overflow_local_len_for(key.len(), self.pager.page_size() as usize);
+            let chain = self.build_overflow_chain(key, local_len)?;
+            Ok(Cell::IndexInteriorOverflow {
+                left_child,
+                rowid,
+                total: key.len() as u64,
+                local: key[..local_len].to_vec(),
+                overflow: chain,
+            })
+        }
+    }
+
+    /// Full index key of a stored cell VIEW (in-page: the borrowed bytes
+    /// cloned; overflow: chain reassembly). Total-order comparison sites
+    /// call this only for overflow views — in-page cells stay on the
+    /// zero-copy fast path.
+    fn index_view_key(&mut self, v: &IndexCellView<'_>) -> Result<Vec<u8>> {
+        if v.overflow == 0 {
+            Ok(v.key.to_vec())
+        } else {
+            let mut out = Vec::with_capacity(v.total as usize);
+            self.assemble_overflow_payload_into(v.key, v.total, v.overflow, &mut out)?;
+            Ok(out)
+        }
+    }
+
+    /// Full index key of an owned `Cell`. Insert/split flows pass Cells
+    /// whose overflow variant carries only the local prefix — this
+    /// reassembles from the cell's own chain. (Insert keeps the source
+    /// key alive on the stack, but split-moved cells don't — hence the
+    /// chain walk rather than a transient cache field.)
+    fn cell_index_key(&mut self, cell: &Cell) -> Result<Vec<u8>> {
+        match cell {
+            Cell::IndexLeaf { key, .. } | Cell::IndexInterior { key, .. } => Ok(key.clone()),
+            Cell::IndexLeafOverflow {
+                local,
+                total,
+                overflow,
+                ..
+            }
+            | Cell::IndexInteriorOverflow {
+                local,
+                total,
+                overflow,
+                ..
+            } => {
+                let mut out = Vec::with_capacity(*total as usize);
+                self.assemble_overflow_payload_into(local, *total, *overflow, &mut out)?;
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Binary-search an interior INDEX page for the first cell whose
+    /// (key, rowid) separator is >= the target (key, rowid). Returns
+    /// (cell_index, that cell's left_child). When all separators are <
+    /// target, returns (n, right_most).
+    ///
+    /// Overflow-aware: for interior cells whose key spills to a chain, the
+    /// view's `key` is the LOCAL prefix. Byte-comparing a strict prefix of
+    /// the stored key K against the search key S is only inconclusive when
+    /// the prefix is ALSO a strict prefix of S (K vs S then depends on
+    /// K's tail) — in that one case the full key is reassembled from the
+    /// chain. Common only for oversized-key indexes, where search keys
+    /// are themselves oversized; in-page cells never pay anything.
+    fn find_index_child(
+        &mut self,
+        data: &[u8],
+        n: u16,
+        cell_pointer: impl Fn(u16) -> u16,
+        right_most: u32,
+        key: &[u8],
+        rowid: i64,
+    ) -> (usize, u32) {
+        let page_size = self.pager.page_size();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = n;
+        while lo < hi {
+            // usize arithmetic: a corrupt n_cells can push lo+hi past u16::MAX.
+            let mid = ((lo as usize + hi as usize) / 2) as u16;
+            let ptr = cell_pointer(mid) as usize;
+            // Corrupt cell pointer: out-of-range offsets must yield a miss,
+            // never a slice panic (SQLite policy: corrupt -> SQLITE_CORRUPT).
+            let Some(v) = data
+                .get(ptr..)
+                .and_then(|c| decode_index_cell(c, true, page_size))
+            else {
+                break;
+            };
+            // (v.key, v.rowid) < (key, rowid)  → go right. Ambiguous prefix
+            // case (local prefix ⊂ search key): resolve via the full key.
+            let go_right = if v.overflow != 0 && key.len() > v.key.len() && key.starts_with(v.key) {
+                let mut full = Vec::with_capacity(v.total as usize);
+                match self.assemble_overflow_payload_into(v.key, v.total, v.overflow, &mut full) {
+                    Ok(()) => (full.as_slice(), v.rowid) < (key, rowid),
+                    // Corrupt chain: treat as "go right" conservatively —
+                    // the leaf walk below reports the corruption.
+                    Err(_) => true,
+                }
+            } else {
+                (v.key, v.rowid) < (key, rowid)
+            };
+            if go_right {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= n {
+            if right_most != 0 || n == 0 {
+                (n as usize, right_most)
+            } else {
+                // right=0 ("no right-most child" — the state delete/rebalance
+                // leaves behind): the LAST cell's child is the de-facto right
+                // edge. Returning literal 0 would descend the SCHEMA page.
+                let ptr = cell_pointer(n - 1) as usize;
+                match data
+                    .get(ptr..)
+                    .and_then(|c| decode_index_cell(c, true, page_size))
+                {
+                    Some(v) => (n as usize, v.left_child),
+                    None => (n as usize, 0),
+                }
+            }
+        } else {
+            let ptr = cell_pointer(lo) as usize;
+            match data
+                .get(ptr..)
+                .and_then(|c| decode_index_cell(c, true, page_size))
+            {
+                Some(v) => (lo as usize, v.left_child),
+                None => (n as usize, right_most),
+            }
         }
     }
 }
@@ -1374,15 +1674,21 @@ impl<'a> Btree<'a> {
                     PageType::LeafIndex => {
                         let n = borrowed.n_cells() as usize;
                         if n > 0 {
+                            let psz = borrowed.page_size();
+                            // Overflow-bound keys are skipped (filter): a
+                            // truncated local prefix as a hint bound would
+                            // misroute lookups — no hint is strictly safe.
                             let lo = borrowed
                                 .cell_slice(0)
                                 .ok()
-                                .and_then(|s| decode_index_cell(s, false))
+                                .and_then(|s| decode_index_cell(s, false, psz))
+                                .filter(|c| c.overflow == 0)
                                 .map(|c| c.key.to_vec());
                             let hi = borrowed
                                 .cell_slice((n - 1) as u16)
                                 .ok()
-                                .and_then(|s| decode_index_cell(s, false))
+                                .and_then(|s| decode_index_cell(s, false, psz))
+                                .filter(|c| c.overflow == 0)
                                 .map(|c| c.key.to_vec());
                             if let (Some(lo), Some(hi)) = (lo, hi) {
                                 drop(borrowed);
@@ -2697,9 +3003,14 @@ impl<'a> Btree<'a> {
         let n = borrowed.n_cells();
         if n > 0 {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
-            if let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) {
+            let psz = borrowed.page_size();
+            if let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
+                .filter(|v| v.overflow == 0)
+            {
                 // Append requires (key, rowid) strictly after the last
                 // entry — index pages are sorted by (key, rowid).
+                // (Overflow last key: prefix-compare is inconclusive —
+                // decline the append fast path, take the general insert.)
                 if !(v.key < key || (v.key == key && v.rowid < rowid)) {
                     return Ok(None);
                 }
@@ -3339,8 +3650,16 @@ impl<'a> Btree<'a> {
                 let data = &borrowed.data;
                 let cp = |i: u16| borrowed.cell_pointer(i);
                 if is_idx {
-                    let (_, child) =
-                        find_index_child(data, n, cp, right_most, cell.index_key(), cell.key());
+                    // Full target key when the inserted cell overflows (the
+                    // variant's index_key() is only the local prefix).
+                    let nk_owned: Vec<u8>;
+                    let nk: &[u8] = if cell.index_overflow() != 0 {
+                        nk_owned = self.cell_index_key(&cell)?;
+                        &nk_owned
+                    } else {
+                        cell.index_key()
+                    };
+                    let (_, child) = self.find_index_child(data, n, cp, right_most, nk, cell.key());
                     child
                 } else {
                     // Table interior: [be_u32 child][varint key].
@@ -3431,10 +3750,11 @@ impl<'a> Btree<'a> {
                         let mut is_right_most = right_now == child_id && child_id != 0;
                         if !is_right_most {
                             let b = page.lock();
+                            let psz = b.page_size();
                             for i in 0..n_now {
                                 let ptr = b.cell_pointer(i) as usize;
                                 let child = if is_idx_now {
-                                    decode_index_cell(&b.data[ptr..], true)
+                                    decode_index_cell(&b.data[ptr..], true, psz)
                                         .map(|v| v.left_child)
                                         .unwrap_or(0)
                                 } else {
@@ -3476,11 +3796,11 @@ impl<'a> Btree<'a> {
                             // cell's separator instead — handled by the
                             // slow path (fast path declines below).
                             let cell1 = if is_idx_now {
-                                Cell::IndexInterior {
-                                    left_child: child_id,
-                                    key: split_key_bytes.clone().unwrap_or_default(),
-                                    rowid: split_key,
-                                }
+                                self.index_interior_separator(
+                                    child_id,
+                                    split_key_bytes.as_deref().unwrap_or_default(),
+                                    split_key,
+                                )?
                             } else {
                                 Cell::TableInterior {
                                     left_child: child_id,
@@ -3520,23 +3840,33 @@ impl<'a> Btree<'a> {
                         } else if let Some((idx, old_off)) = found {
                             // Build cell1/cell2 and splice them in place of
                             // the old cell at `idx`.
-                            let (cell1, cell2) = if is_idx_now {
-                                let (old_key, old_rowid) =
-                                    match decode_index_cell(&page.lock().data[old_off..], true) {
-                                        Some(v) => (v.key.to_vec(), v.rowid),
-                                        None => (Vec::new(), i64::MAX),
-                                    };
+                            let (cell1, cell2, old_chain) = if is_idx_now {
+                                let psz = page.lock().page_size();
+                                let (old_key, old_rowid, old_chain) = match decode_index_cell(
+                                    &page.lock().data[old_off..],
+                                    true,
+                                    psz,
+                                ) {
+                                    Some(v) => {
+                                        // The old separator's key is COPIED
+                                        // into cell2 — oversized keys need
+                                        // the FULL bytes (prefix would
+                                        // corrupt the tree order). The old
+                                        // cell's chain dies with it (the
+                                        // copy builds its own).
+                                        let full = self.index_view_key(&v)?;
+                                        (full, v.rowid, v.overflow)
+                                    }
+                                    None => (Vec::new(), i64::MAX, 0),
+                                };
                                 (
-                                    Cell::IndexInterior {
-                                        left_child: child_id,
-                                        key: split_key_bytes.clone().unwrap_or_default(),
-                                        rowid: split_key,
-                                    },
-                                    Cell::IndexInterior {
-                                        left_child: new_page,
-                                        key: old_key,
-                                        rowid: old_rowid,
-                                    },
+                                    self.index_interior_separator(
+                                        child_id,
+                                        split_key_bytes.as_deref().unwrap_or_default(),
+                                        split_key,
+                                    )?,
+                                    self.index_interior_separator(new_page, &old_key, old_rowid)?,
+                                    old_chain,
                                 )
                             } else {
                                 let old_key =
@@ -3551,6 +3881,7 @@ impl<'a> Btree<'a> {
                                         left_child: new_page,
                                         key: old_key,
                                     },
+                                    0u32,
                                 )
                             };
                             let s1 = cell1.encoded_size() as u32;
@@ -3596,6 +3927,12 @@ impl<'a> Btree<'a> {
                                     b.dirty = true;
                                 }
                                 self.pager.note_dirty(page_id);
+                                // The old separator cell was replaced by
+                                // cell1+cell2 (cell2 carries a fresh chain
+                                // copy) — free the old chain.
+                                if old_chain != 0 {
+                                    self.free_overflow_chain(old_chain)?;
+                                }
                                 return Ok(InsertResult::Done);
                             }
                         }
@@ -3643,12 +3980,23 @@ impl<'a> Btree<'a> {
                         right_most == 0 && found_idx == Some(cells.len() - 1);
 
                     if effective_right_most {
-                        let cell1 = if is_idx_page {
-                            Cell::IndexInterior {
-                                left_child: child_id,
-                                key: split_key_bytes.clone().unwrap_or_default(),
-                                rowid: split_key,
+                        // The replaced cell's overflow chain (if any) dies
+                        // with it — the copy builds a fresh chain.
+                        let dead_chain = if is_idx_page {
+                            if let Some(idx) = found_idx {
+                                cells[idx].index_overflow()
+                            } else {
+                                0
                             }
+                        } else {
+                            0
+                        };
+                        let cell1 = if is_idx_page {
+                            self.index_interior_separator(
+                                child_id,
+                                split_key_bytes.as_deref().unwrap_or_default(),
+                                split_key,
+                            )?
                         } else {
                             Cell::TableInterior {
                                 left_child: child_id,
@@ -3658,26 +4006,36 @@ impl<'a> Btree<'a> {
                         if let Some(idx) = found_idx {
                             cells[idx] = cell1;
                         }
+                        if dead_chain != 0 {
+                            self.free_overflow_chain(dead_chain)?;
+                        }
                         right_most = new_page;
                     } else if let Some(idx) = found_idx {
                         if is_idx_page {
-                            let (old_key, old_rowid) = match &cells[idx] {
-                                Cell::IndexInterior { key, rowid, .. } => (key.clone(), *rowid),
-                                _ => (Vec::new(), i64::MAX),
+                            // FULL old key (reassembled for overflow cells —
+                            // the local prefix would corrupt the order), and
+                            // the removed cell's chain dies (cell2's copy
+                            // builds its own).
+                            let (old_key, old_rowid, dead_chain) = {
+                                let c = &cells[idx];
+                                match self.cell_index_key(c) {
+                                    Ok(full) => (full, c.key(), c.index_overflow()),
+                                    Err(_) => (Vec::new(), i64::MAX, 0),
+                                }
                             };
-                            let cell1 = Cell::IndexInterior {
-                                left_child: child_id,
-                                key: split_key_bytes.clone().unwrap_or_default(),
-                                rowid: split_key,
-                            };
-                            let cell2 = Cell::IndexInterior {
-                                left_child: new_page,
-                                key: old_key,
-                                rowid: old_rowid,
-                            };
+                            let cell1 = self.index_interior_separator(
+                                child_id,
+                                split_key_bytes.as_deref().unwrap_or_default(),
+                                split_key,
+                            )?;
+                            let cell2 =
+                                self.index_interior_separator(new_page, &old_key, old_rowid)?;
                             cells.remove(idx);
                             cells.insert(idx, cell2);
                             cells.insert(idx, cell1);
+                            if dead_chain != 0 {
+                                self.free_overflow_chain(dead_chain)?;
+                            }
                         } else {
                             let old_key = if let Cell::TableInterior { key, .. } = &cells[idx] {
                                 *key
@@ -3699,11 +4057,11 @@ impl<'a> Btree<'a> {
                     } else {
                         // right_most case: child_id was right_most.
                         if is_idx_page {
-                            let cell1 = Cell::IndexInterior {
-                                left_child: child_id,
-                                key: split_key_bytes.clone().unwrap_or_default(),
-                                rowid: split_key,
-                            };
+                            let cell1 = self.index_interior_separator(
+                                child_id,
+                                split_key_bytes.as_deref().unwrap_or_default(),
+                                split_key,
+                            )?;
                             cells.push(cell1);
                             right_most = new_page;
                         } else {
@@ -3731,15 +4089,32 @@ impl<'a> Btree<'a> {
                         // the right half to a new page, and propagate the
                         // left half's LAST separator upward (the left page
                         // contains entries <= that separator).
-                        let total = cells.len();
-                        let mid = total / 2;
+                        // Byte-aware: a count-mid can overload one half
+                        // with oversized-key separators (see the helper).
+                        let psz_u = self.pager.page_size() as usize;
+                        let avail_i = psz_u
+                            - if page_id == 0 {
+                                crate::storage::page::DB_HEADER_SIZE as usize
+                            } else {
+                                0
+                            }
+                            - PAGE_HEADER_SIZE as usize;
+                        let mid = match Self::byte_aware_mid(&cells, avail_i) {
+                            Some(m) => m,
+                            None => {
+                                return Err(Error::corruption(format!(
+                                    "interior page {} cannot split: no feasible byte-aware point",
+                                    page_id
+                                )))
+                            }
+                        };
                         // Separator to propagate = cells[mid-1]'s separator.
                         let (prop_rowid, prop_key_bytes) = if is_idx_page {
-                            match &cells[mid - 1] {
-                                Cell::IndexInterior { key, rowid, .. } => {
-                                    (*rowid, Some(key.clone()))
-                                }
-                                _ => (cells[mid - 1].key(), None),
+                            // Overflow separators propagate their FULL key
+                            // (the parent builds a fresh chain copy).
+                            match self.cell_index_key(&cells[mid - 1]) {
+                                Ok(full) => (cells[mid - 1].key(), Some(full)),
+                                Err(_) => (cells[mid - 1].key(), None),
                             }
                         } else {
                             // For table pages the propagated value follows the
@@ -3829,18 +4204,37 @@ impl<'a> Btree<'a> {
             let mut lo: u16 = 0;
             let mut hi: u16 = n;
             if is_idx {
-                let nk = cell.index_key();
+                // Full key when the inserted cell is an overflow cell (the
+                // variant carries only the local prefix) — the binary
+                // search must see the total order. In-page cells keep the
+                // zero-copy slice.
+                let nk_owned: Vec<u8>;
+                let nk: &[u8] = if cell.index_overflow() != 0 {
+                    nk_owned = self.cell_index_key(cell)?;
+                    &nk_owned
+                } else {
+                    cell.index_key()
+                };
                 let nr = cell.key();
                 let interior = pt.is_interior();
+                let psz = borrowed.page_size();
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let cell_ptr = borrowed.cell_pointer(mid) as usize;
                     let Some(v) =
-                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, interior)
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, interior, psz)
                     else {
                         return Err(Error::corruption("truncated index cell in search"));
                     };
-                    if (v.key, v.rowid) < (nk, nr) {
+                    // Stored overflow cells: reassemble the full key (rare —
+                    // only oversized-key indexes; in-page cells compare free).
+                    let go_right = if v.overflow != 0 {
+                        let full = self.index_view_key(&v)?;
+                        (full.as_slice(), v.rowid) < (nk, nr)
+                    } else {
+                        (v.key, v.rowid) < (nk, nr)
+                    };
+                    if go_right {
                         lo = mid + 1;
                     } else {
                         hi = mid;
@@ -3882,6 +4276,22 @@ impl<'a> Btree<'a> {
             let mut buf = Vec::with_capacity(cell_size);
             cell.encode(&mut buf);
             let off = new_content_start as usize;
+            // No-clobber guard: a cell larger than the page's remaining
+            // content area would underflow the content start to 0 and
+            // overwrite the page HEADER with cell bytes (silent tree
+            // corruption). Callers guarantee fit (byte-aware splits); this
+            // turns any residual violation into a clean corruption error.
+            if new_content_start == 0
+                && cell_size > 0
+                && borrowed.cell_content_start() < cell_size as u32
+            {
+                return Err(Error::corruption(format!(
+                    "cell ({} bytes) does not fit page {} (content start {})",
+                    cell_size,
+                    page_id,
+                    borrowed.cell_content_start()
+                )));
+            }
             if off + cell_size > borrowed.data.len() {
                 // Corrupt page header (content start out of range): clean
                 // corruption error, never an out-of-bounds slice.
@@ -3954,10 +4364,11 @@ impl<'a> Btree<'a> {
         {
             let page = self.pager.get_page(page_id)?;
             let b = page.lock();
+            let psz = b.page_size();
             for i in 0..n {
                 let p = b.cell_pointer(i) as usize;
                 let size = if is_idx {
-                    index_leaf_cell_size(&b.data[p..])
+                    index_leaf_cell_size(&b.data[p..], psz)
                 } else {
                     table_leaf_cell_size(&b.data[p..])
                 };
@@ -3985,15 +4396,30 @@ impl<'a> Btree<'a> {
             let mut lo: u16 = 0;
             let mut hi: u16 = n;
             if is_idx {
-                let nk = new_cell.index_key();
+                // Total-order search: full keys when either side is an
+                // overflow cell (see insert_cell_into_page).
+                let nk_owned: Vec<u8>;
+                let nk: &[u8] = if new_cell.index_overflow() != 0 {
+                    nk_owned = self.cell_index_key(new_cell)?;
+                    &nk_owned
+                } else {
+                    new_cell.index_key()
+                };
                 let nr = new_cell.key();
+                let psz = b.page_size();
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let p = b.cell_pointer(mid) as usize;
-                    let Some(v) = decode_index_cell(&b.data[p..], false) else {
+                    let Some(v) = decode_index_cell(&b.data[p..], false, psz) else {
                         return Ok(None);
                     };
-                    if (v.key, v.rowid) < (nk, nr) {
+                    let go_right = if v.overflow != 0 {
+                        let full = self.index_view_key(&v)?;
+                        (full.as_slice(), v.rowid) < (nk, nr)
+                    } else {
+                        (v.key, v.rowid) < (nk, nr)
+                    };
+                    if go_right {
                         lo = mid + 1;
                     } else {
                         hi = mid;
@@ -4139,9 +4565,15 @@ impl<'a> Btree<'a> {
             let (sep_key, sep_rowid) = {
                 let page = self.pager.get_page(page_id)?;
                 let b = page.lock();
+                let psz = b.page_size();
                 let p = b.cell_pointer((mid - 1) as u16) as usize;
-                match decode_index_cell(&b.data[p..], false) {
-                    Some(v) => (v.key.to_vec(), v.rowid),
+                match decode_index_cell(&b.data[p..], false, psz) {
+                    // The FULL key flows up — the parent builds its own
+                    // overflow copy via index_interior_separator.
+                    Some(v) => {
+                        let full = self.index_view_key(&v)?;
+                        (full, v.rowid)
+                    }
                     None => return Ok(None),
                 }
             };
@@ -4202,10 +4634,19 @@ impl<'a> Btree<'a> {
             let n = page.lock().n_cells();
             let (sep_key, sep_rowid) = {
                 let borrowed = page.lock();
+                let psz = borrowed.page_size();
                 let last_ptr = borrowed.cell_pointer(n - 1) as usize;
-                match decode_index_cell(&borrowed.data[last_ptr..], false) {
-                    Some(v) => (v.key.to_vec(), v.rowid),
-                    None => (new_cell.index_key().to_vec(), new_cell.key()),
+                match decode_index_cell(&borrowed.data[last_ptr..], false, psz) {
+                    Some(v) => {
+                        // Full key up (parent separator copies get their
+                        // own chains via index_interior_separator).
+                        let full = self.index_view_key(&v)?;
+                        (full, v.rowid)
+                    }
+                    None => {
+                        let full = self.cell_index_key(&new_cell)?;
+                        (full, new_cell.key())
+                    }
                 }
             };
             Ok(InsertResult::Split {
@@ -4250,9 +4691,24 @@ impl<'a> Btree<'a> {
                 let borrowed = page.lock();
                 let last_ptr = borrowed.cell_pointer(n_existing - 1) as usize;
                 if is_idx_split {
-                    if let Some(last) = decode_index_cell(&borrowed.data[last_ptr..], false) {
-                        let nk = new_cell.index_key();
-                        nk > last.key || (nk == last.key && new_cell.key() > last.rowid)
+                    let psz = borrowed.page_size();
+                    if let Some(last) = decode_index_cell(&borrowed.data[last_ptr..], false, psz) {
+                        // Total order: full keys when either side overflows.
+                        let nk_owned: Vec<u8>;
+                        let nk: &[u8] = if new_cell.index_overflow() != 0 {
+                            nk_owned = self.cell_index_key(&new_cell)?;
+                            &nk_owned
+                        } else {
+                            new_cell.index_key()
+                        };
+                        let last_owned: Vec<u8>;
+                        let last_key: &[u8] = if last.overflow != 0 {
+                            last_owned = self.index_view_key(&last)?;
+                            &last_owned
+                        } else {
+                            last.key
+                        };
+                        nk > last_key || (nk == last_key && new_cell.key() > last.rowid)
                     } else {
                         false
                     }
@@ -4277,11 +4733,14 @@ impl<'a> Btree<'a> {
 
         // Capture the new cell's identity before the merge below moves it.
         let new_cell_key_rowid = new_cell.key();
-        let new_cell_key: Option<Vec<u8>> = if matches!(
-            new_cell,
-            Cell::IndexLeaf { .. } | Cell::IndexInterior { .. }
-        ) {
-            Some(new_cell.index_key().to_vec())
+        let new_cell_key: Option<Vec<u8>> = if new_cell.index_overflow() != 0
+            || matches!(
+                new_cell,
+                Cell::IndexLeaf { .. } | Cell::IndexInterior { .. }
+            ) {
+            // Overflow variants carry only the local prefix — the full key
+            // drives the merge order below.
+            Some(self.cell_index_key(&new_cell)?)
         } else {
             None
         };
@@ -4300,7 +4759,10 @@ impl<'a> Btree<'a> {
                 borrowed.page_size(),
             )?;
             let existing_before_new = if is_idx {
-                c.cmp_index_target(new_cell.index_key(), new_cell.key()) == std::cmp::Ordering::Less
+                // Total order: full keys when either cell overflows.
+                let c_full = self.cell_index_key(&c)?;
+                let nk: &[u8] = new_cell_key.as_deref().unwrap_or(&[]);
+                (c_full.as_slice(), c.key()) < (nk, new_cell.key())
             } else {
                 c.key() < new_cell.key()
             };
@@ -4356,8 +4818,18 @@ impl<'a> Btree<'a> {
                 .last()
                 .map(|c| {
                     if is_idx {
-                        c.index_key() == new_cell_key.as_deref().unwrap_or(&[])
-                            && c.key() == new_cell_key_rowid
+                        // Last cell IS the new cell iff its full key matches
+                        // (overflow cells compare by reassembled key).
+                        let same = if c.index_overflow() != 0 {
+                            self.cell_index_key(c)
+                                .ok()
+                                .as_deref()
+                                .map(|f| f == new_cell_key.as_deref().unwrap_or(&[]))
+                                .unwrap_or(false)
+                        } else {
+                            c.index_key() == new_cell_key.as_deref().unwrap_or(&[])
+                        };
+                        same && c.key() == new_cell_key_rowid
                     } else {
                         c.key() == new_cell_key_rowid
                     }
@@ -4404,7 +4876,25 @@ impl<'a> Btree<'a> {
         let mid = if is_append && total > 1 {
             total - 1
         } else {
-            total / 2
+            // Byte-aware: oversized index cells make the count-mid load
+            // one half past the page budget (header clobber otherwise).
+            let psz_u = self.pager.page_size() as usize;
+            let avail_l = psz_u
+                - if page_id == 0 {
+                    crate::storage::page::DB_HEADER_SIZE as usize
+                } else {
+                    0
+                }
+                - PAGE_HEADER_SIZE as usize;
+            match Self::byte_aware_mid(&cells, avail_l) {
+                Some(m) => m,
+                None => {
+                    return Err(Error::corruption(format!(
+                        "leaf page {} cannot split: no feasible byte-aware point",
+                        page_id
+                    )))
+                }
+            }
         };
 
         // Allocate a new leaf page.
@@ -4449,12 +4939,18 @@ impl<'a> Btree<'a> {
         if is_idx {
             // For index splits, return the EXACT separator: the last entry
             // of the left page. The parent uses it verbatim as the left
-            // child's separator.
+            // child's separator. OVERFLOW cells must send the FULL key
+            // (the local prefix would corrupt the parent's ordering).
             let left_max = &cells[mid - 1];
+            let sep_bytes = if left_max.index_overflow() != 0 {
+                self.cell_index_key(left_max)?
+            } else {
+                left_max.index_key().to_vec()
+            };
             Ok(InsertResult::Split {
                 new_page: new_page_id,
                 split_key: left_max.key(),
-                split_key_bytes: Some(left_max.index_key().to_vec()),
+                split_key_bytes: Some(sep_bytes),
             })
         } else {
             // The split key is the FIRST key of the new page (the min key in
@@ -4770,7 +5266,17 @@ impl<'a> Btree<'a> {
                         return Ok(false);
                     }
                 }
-                // Remove the separator cell slot.
+                // Remove the separator cell slot. An overflow separator's
+                // chain dies with it — capture it BEFORE the pointer shift.
+                let dead_chain = {
+                    let parent_ref = self.pager.get_page(parent_id)?;
+                    let borrowed = parent_ref.lock();
+                    let psz = borrowed.page_size();
+                    let cell_ptr = borrowed.cell_pointer(idx as u16) as usize;
+                    decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true, psz)
+                        .map(|v| v.overflow)
+                        .unwrap_or(0)
+                };
                 let parent_ref = self.pager.get_page(parent_id)?;
                 let mut borrowed = parent_ref.lock();
                 let n_usize = n_cells as usize;
@@ -4782,6 +5288,9 @@ impl<'a> Btree<'a> {
                 }
                 borrowed.set_n_cells(n_cells - 1);
                 borrowed.dirty = true;
+                if dead_chain != 0 {
+                    self.free_overflow_chain(dead_chain)?;
+                }
             }
             None => {
                 // Child is the rightmost. The last cell's left_child becomes
@@ -5210,7 +5719,12 @@ impl<'a> Btree<'a> {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
                         let k = if pt == PageType::LeafIndex {
-                            match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) {
+                            let psz = borrowed.page_size();
+                            match decode_index_cell(
+                                borrowed.cell_slice_checked(cell_ptr)?,
+                                false,
+                                psz,
+                            ) {
                                 Some(v) => v.rowid,
                                 None => return Err(Error::corruption("truncated index cell")),
                             }
@@ -5236,7 +5750,8 @@ impl<'a> Btree<'a> {
                     let borrowed = page.lock();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
                     if pt == PageType::LeafIndex {
-                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false)
+                        let psz = borrowed.page_size();
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
                             .map(|v| v.rowid == rowid)
                             .unwrap_or(false)
                     } else {
@@ -5305,7 +5820,12 @@ impl<'a> Btree<'a> {
                         // search; the child pointer is re-decoded once the
                         // position is found below, so skip it here.
                         let sep = if pt == PageType::InteriorIndex {
-                            match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true) {
+                            let psz = borrowed.page_size();
+                            match decode_index_cell(
+                                borrowed.cell_slice_checked(cell_ptr)?,
+                                true,
+                                psz,
+                            ) {
                                 Some(v) => v.rowid,
                                 None => {
                                     return Err(Error::corruption("truncated index interior cell"))
@@ -5329,7 +5849,8 @@ impl<'a> Btree<'a> {
                     } else {
                         let cell_ptr = borrowed.cell_pointer(lo) as usize;
                         if pt == PageType::InteriorIndex {
-                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
+                            let psz = borrowed.page_size();
+                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true, psz)
                                 .map(|v| v.left_child)
                                 .unwrap_or_else(|| borrowed.right_most_pointer())
                         } else {
@@ -6823,18 +7344,27 @@ impl<'a> Btree<'a> {
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
         // Notify the pager that a write is about to happen.
         self.pager.note_write();
-        if key.len() > self.max_cell_payload() {
-            return Err(Error::InvalidArgument(format!(
-                "indexed value too big ({} bytes; max in-page cell payload is {})",
-                key.len(),
-                self.max_cell_payload()
-            )));
-        }
         // Index entries are sorted by (key, rowid): the cell's btree order
         // is the byte-encoded key first, then the rowid as tiebreaker.
-        let cell = Cell::IndexLeaf {
-            key: key.to_vec(),
-            rowid,
+        // Oversized keys (larger than one page's payload budget) spill to
+        // an overflow chain — SQLite parity: indexing a >page TEXT/BLOB is
+        // legal. The cell keeps the deterministic local prefix + chain
+        // head; the split point is a pure function of the key length, so
+        // every reader derives it identically.
+        let cell = if key.len() > self.max_cell_payload() {
+            let local_len = overflow_local_len_for(key.len(), self.pager.page_size() as usize);
+            let chain = self.build_overflow_chain(key, local_len)?;
+            Cell::IndexLeafOverflow {
+                rowid,
+                total: key.len() as u64,
+                local: key[..local_len].to_vec(),
+                overflow: chain,
+            }
+        } else {
+            Cell::IndexLeaf {
+                key: key.to_vec(),
+                rowid,
+            }
         };
         match self.insert_into_page(self.root, cell)? {
             InsertResult::Done => Ok(()),
@@ -6853,11 +7383,12 @@ impl<'a> Btree<'a> {
                 }
                 // Cell (old_root, sep) where sep = the EXACT max entry of
                 // the old root after the split: (split_key_bytes, split_key).
-                let cell = Cell::IndexInterior {
-                    left_child: old_root,
-                    key: split_key_bytes.unwrap_or_default(),
-                    rowid: split_key,
-                };
+                // Oversized separators get their own chain copy.
+                let cell = self.index_interior_separator(
+                    old_root,
+                    split_key_bytes.as_deref().unwrap_or_default(),
+                    split_key,
+                )?;
                 self.insert_cell_into_page(new_root, &cell)?;
                 self.root = new_root;
                 Ok(())
@@ -6884,17 +7415,25 @@ impl<'a> Btree<'a> {
                 // allocation-free cell views.
                 let pos = {
                     let borrowed = page.lock();
+                    let psz = borrowed.page_size();
                     let mut lo = 0;
                     let mut hi = n;
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
                         let Some(v) =
-                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false)
+                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
                         else {
                             return Err(Error::corruption("truncated index leaf cell"));
                         };
-                        if (v.key, v.rowid) < (key, rowid) {
+                        // Total order: overflow cells compare by full key.
+                        let go_right = if v.overflow != 0 {
+                            let full = self.index_view_key(&v)?;
+                            (full.as_slice(), v.rowid) < (key, rowid)
+                        } else {
+                            (v.key, v.rowid) < (key, rowid)
+                        };
+                        if go_right {
                             lo = mid + 1;
                         } else {
                             hi = mid;
@@ -6905,19 +7444,35 @@ impl<'a> Btree<'a> {
                 if pos >= n {
                     return Ok(false);
                 }
-                let key_matches = {
+                // Verify the exact (key, rowid) — full key for overflow
+                // cells — and capture the chain to free on removal.
+                let (key_matches, dead_chain) = {
                     let borrowed = page.lock();
+                    let psz = borrowed.page_size();
                     let cell_ptr = borrowed.cell_pointer(pos) as usize;
-                    match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) {
-                        Some(v) => v.key == key && v.rowid == rowid,
-                        None => false,
+                    match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz) {
+                        Some(v) => {
+                            let matches = if v.overflow != 0 {
+                                let full = self.index_view_key(&v)?;
+                                full == key && v.rowid == rowid
+                            } else {
+                                v.key == key && v.rowid == rowid
+                            };
+                            (matches, v.overflow)
+                        }
+                        None => (false, 0),
                     }
                 };
                 if !key_matches {
                     return Ok(false);
                 }
                 drop(page);
-                self.remove_cell_at(page_id, pos, n)
+                let removed = self.remove_cell_at(page_id, pos, n)?;
+                if removed && dead_chain != 0 {
+                    // The removed cell spilled: its chain pages die too.
+                    self.free_overflow_chain(dead_chain)?;
+                }
+                Ok(removed)
             }
             PageType::InteriorIndex => {
                 // Binary-search the first separator >= (key, rowid) and
@@ -6929,8 +7484,14 @@ impl<'a> Btree<'a> {
                     let n = borrowed.n_cells();
                     let data = &borrowed.data;
                     let cp = |i: u16| borrowed.cell_pointer(i);
-                    let (_, child) =
-                        find_index_child(data, n, cp, borrowed.right_most_pointer(), key, rowid);
+                    let (_, child) = self.find_index_child(
+                        data,
+                        n,
+                        cp,
+                        borrowed.right_most_pointer(),
+                        key,
+                        rowid,
+                    );
                     child
                 };
                 drop(page);
@@ -7045,8 +7606,30 @@ impl<'a> Btree<'a> {
     /// back to an exact lower-bound search. Sequential key access
     /// (fixed-parameter loops, INLJ inner probes with ordered outer keys)
     /// resolves in 1-2 probes instead of log2(cells).
+    /// Key of leaf cell `i` for total-order comparisons: the borrowed
+    /// in-page bytes, or the reassembled full key for overflow cells.
+    /// (Reassembly walks the chain — only oversized-key indexes pay it.)
+    #[inline]
+    fn leaf_key_cow<'b>(
+        &mut self,
+        borrowed: &'b crate::storage::page::Page,
+        i: usize,
+    ) -> Result<std::borrow::Cow<'b, [u8]>> {
+        let ptr = borrowed.cell_pointer(i as u16) as usize;
+        let psz = borrowed.page_size();
+        let Some(v) = decode_index_cell(borrowed.cell_slice_checked(ptr)?, false, psz) else {
+            return Err(Error::corruption("corrupt index cell in biased search"));
+        };
+        if v.overflow == 0 {
+            Ok(std::borrow::Cow::Borrowed(v.key))
+        } else {
+            let full = self.index_view_key(&v)?;
+            Ok(std::borrow::Cow::Owned(full))
+        }
+    }
+
     fn lookup_index_leaf(
-        &self,
+        &mut self,
         page_ref: &PageRef,
         key: &[u8],
         out: &mut Vec<i64>,
@@ -7065,20 +7648,14 @@ impl<'a> Btree<'a> {
         // The caller already verified key ∈ [first, last] via the hint
         // bounds; with no mutation since, that check stands.
         // Read the key of cell i (borrow-only view).
-        #[inline]
-        fn cell_key<'a>(borrowed: &'a crate::storage::page::Page, i: usize) -> Result<&'a [u8]> {
-            let ptr = borrowed.cell_pointer(i as u16) as usize;
-            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(ptr)?, false) else {
-                return Err(Error::corruption("corrupt index cell in biased search"));
-            };
-            Ok(v.key)
-        }
+        // Key reads go through self.leaf_key_cow (borrowed slice for
+        // in-page cells, reassembled full key for overflow cells).
         // Lower-bound search for the first cell with key >= `key`,
         // biased at `bias`. Invariant: cells [0, lo) have key < `key`;
         // cells [hi, n) have key > `key`.
         let bias = (bias as usize).min(n - 1);
-        let bk = cell_key(&borrowed, bias)?;
-        let lo: usize = if bk >= key {
+        let bk = self.leaf_key_cow(&borrowed, bias)?;
+        let lo: usize = if bk.as_ref() >= key {
             // Target is at/left of the bias: binary search [0, bias],
             // then walk left over any equal-key run (bias may sit inside
             // the run — its key equals `key` exactly).
@@ -7086,8 +7663,8 @@ impl<'a> Btree<'a> {
             let mut h = bias + 1;
             while l < h {
                 let mid = (l + h) / 2;
-                let k = cell_key(&borrowed, mid)?;
-                if k < key {
+                let k = self.leaf_key_cow(&borrowed, mid)?;
+                if k.as_ref() < key {
                     l = mid + 1;
                 } else {
                     h = mid;
@@ -7102,8 +7679,8 @@ impl<'a> Btree<'a> {
             let mut lo_b = bias + 1;
             let mut hi_b = n;
             if lo_b < hi_b {
-                let k = cell_key(&borrowed, lo_b)?;
-                if k < key {
+                let k = self.leaf_key_cow(&borrowed, lo_b)?;
+                if k.as_ref() < key {
                     lo_b += 1;
                 } else {
                     hi_b = lo_b;
@@ -7115,8 +7692,8 @@ impl<'a> Btree<'a> {
             let mut h = hi_b;
             while l < h {
                 let mid = (l + h) / 2;
-                let k = cell_key(&borrowed, mid)?;
-                if k < key {
+                let k = self.leaf_key_cow(&borrowed, mid)?;
+                if k.as_ref() < key {
                     l = mid + 1;
                 } else {
                     h = mid;
@@ -7135,14 +7712,28 @@ impl<'a> Btree<'a> {
         if lo == 0 {
             return Ok((false, 0));
         }
-        // Collect the prefix run.
+        // Collect the prefix run. Overflow cells: the FULL key must
+        // start with the search key — reassemble into one scratch.
         let mut i = lo;
+        let mut scratch: Vec<u8> = Vec::new();
         while i < n {
             let cell_ptr = borrowed.cell_pointer(i as u16) as usize;
-            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false) else {
+            let psz = borrowed.page_size();
+            let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
+            else {
                 break;
             };
-            if v.key.starts_with(key) {
+            let matched = if v.overflow != 0 {
+                scratch.clear();
+                match self.assemble_overflow_payload_into(v.key, v.total, v.overflow, &mut scratch)
+                {
+                    Ok(()) => scratch.starts_with(key),
+                    Err(_) => false,
+                }
+            } else {
+                v.key.starts_with(key)
+            };
+            if matched {
                 out.push(v.rowid);
             } else {
                 break;
@@ -7196,23 +7787,31 @@ impl<'a> Btree<'a> {
         match pt {
             PageType::LeafIndex => {
                 let n = borrowed.n_cells();
+                let psz = borrowed.page_size();
                 let begin = if *started {
                     0
                 } else {
                     // Binary search for the first cell with key >= start_key
                     // (allocation-free views; (key, MIN) ordering means a
                     // cell is "less" iff its key is strictly less).
+                    // Overflow cells compare by their reassembled full key.
                     let mut lo = 0u16;
                     let mut hi = n;
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
                         let Some(v) =
-                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false)
+                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
                         else {
                             return Err(Error::corruption("truncated index leaf cell in scan"));
                         };
-                        if v.key < start_key {
+                        let go_right = if v.overflow != 0 {
+                            let full = self.index_view_key(&v)?;
+                            full.as_slice() < start_key
+                        } else {
+                            v.key < start_key
+                        };
+                        if go_right {
                             lo = mid + 1;
                         } else {
                             hi = mid;
@@ -7226,30 +7825,48 @@ impl<'a> Btree<'a> {
                 // non-matching cell, and the resulting early return skipped
                 // this — so every indexed point lookup paid a full root->
                 // interior->leaf descent forever (measured hit rate 0.2%).
+                // Overflow-bound keys are skipped (a truncated local prefix
+                // as a hint bound would misroute lookups).
                 if n > 0 {
                     if let (Some(a), Some(b)) = (
                         borrowed
                             .cell_slice(0)
                             .ok()
-                            .and_then(|s| decode_index_cell(s, false)),
+                            .and_then(|s| decode_index_cell(s, false, psz))
+                            .filter(|c| c.overflow == 0),
                         borrowed
                             .cell_slice(n - 1)
                             .ok()
-                            .and_then(|s| decode_index_cell(s, false)),
+                            .and_then(|s| decode_index_cell(s, false, psz))
+                            .filter(|c| c.overflow == 0),
                     ) {
                         self.record_index_hint(&page, a.key, b.key, self.pager.write_epoch());
                     }
                 }
                 // Iterate the leaf under the SAME lock, borrowing key slices
                 // straight from the page buffer (Cell::decode allocated a
-                // key Vec per cell here).
+                // key Vec per cell here). Overflow cells reassemble into a
+                // reusable scratch — the callback sees the FULL key.
+                let mut key_scratch: Vec<u8> = Vec::new();
                 for i in begin..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false)
+                    let Some(v) =
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
                     else {
                         continue;
                     };
-                    if !f(v.rowid, v.key) {
+                    if v.overflow != 0 {
+                        key_scratch.clear();
+                        self.assemble_overflow_payload_into(
+                            v.key,
+                            v.total,
+                            v.overflow,
+                            &mut key_scratch,
+                        )?;
+                        if !f(v.rowid, &key_scratch) {
+                            return Ok(false);
+                        }
+                    } else if !f(v.rowid, v.key) {
                         return Ok(false);
                     }
                 }
@@ -7273,17 +7890,29 @@ impl<'a> Btree<'a> {
                     // crosses an interior-sibling boundary.)
                     let mut first_cell_idx = if *started { 0 } else { n };
                     if !*started {
+                        let psz = borrowed.page_size();
                         let mut lo = 0u16;
                         let mut hi = n;
                         while lo < hi {
                             let mid = (lo + hi) / 2;
                             let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                            let Some(v) =
-                                decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
-                            else {
+                            let Some(v) = decode_index_cell(
+                                borrowed.cell_slice_checked(cell_ptr)?,
+                                true,
+                                psz,
+                            ) else {
                                 break;
                             };
-                            if v.key < start_key {
+                            // Overflow separators compare by full key.
+                            let go_right = if v.overflow != 0 {
+                                match self.index_view_key(&v) {
+                                    Ok(full) => full.as_slice() < start_key,
+                                    Err(_) => true, // corrupt chain: descend right
+                                }
+                            } else {
+                                v.key < start_key
+                            };
+                            if go_right {
                                 lo = mid + 1;
                             } else {
                                 hi = mid;
@@ -7293,8 +7922,9 @@ impl<'a> Btree<'a> {
                     }
                     // Read the FIRST child to descend under this same lock.
                     let first_child = if first_cell_idx < n {
+                        let psz = borrowed.page_size();
                         let cell_ptr = borrowed.cell_pointer(first_cell_idx) as usize;
-                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true, psz)
                             .map(|v| v.left_child)
                             .unwrap_or(0)
                     } else {
@@ -7321,12 +7951,16 @@ impl<'a> Btree<'a> {
                 for i in (first_cell_idx + if first_child != 0 { 1 } else { 0 })..n {
                     let page = self.pager.get_page(page_id)?;
                     let borrowed = page.lock();
+                    let psz = borrowed.page_size();
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let child =
-                        match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true) {
-                            Some(v) => v.left_child,
-                            None => break,
-                        };
+                    let child = match decode_index_cell(
+                        borrowed.cell_slice_checked(cell_ptr)?,
+                        true,
+                        psz,
+                    ) {
+                        Some(v) => v.left_child,
+                        None => break,
+                    };
                     drop(borrowed);
                     drop(page);
                     if !self.scan_index_range_subtree(child, start_key, f, started)? {
@@ -7362,15 +7996,31 @@ impl<'a> Btree<'a> {
         match pt {
             PageType::LeafIndex => {
                 // Allocation-free iteration: borrow key slices from the page.
+                // Overflow cells reassemble into a reusable scratch so the
+                // callback still sees the FULL key.
                 let borrowed = page.lock();
                 let n = borrowed.n_cells();
+                let psz = borrowed.page_size();
+                let mut key_scratch: Vec<u8> = Vec::new();
                 for i in 0..n {
                     let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false)
+                    let Some(v) =
+                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
                     else {
                         continue;
                     };
-                    if !f(v.rowid, v.key) {
+                    if v.overflow != 0 {
+                        key_scratch.clear();
+                        self.assemble_overflow_payload_into(
+                            v.key,
+                            v.total,
+                            v.overflow,
+                            &mut key_scratch,
+                        )?;
+                        if !f(v.rowid, &key_scratch) {
+                            return Ok(());
+                        }
+                    } else if !f(v.rowid, v.key) {
                         return Ok(());
                     }
                 }
@@ -7381,11 +8031,12 @@ impl<'a> Btree<'a> {
                     let borrowed = page.lock();
                     let n = borrowed.n_cells();
                     let right = borrowed.right_most_pointer();
+                    let psz = borrowed.page_size();
                     let mut v = Vec::with_capacity(n as usize + 1);
                     for i in 0..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
                         if let Some(c) =
-                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true)
+                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, true, psz)
                         {
                             v.push(c.left_child);
                         }

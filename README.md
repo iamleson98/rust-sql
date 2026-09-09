@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **675+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **683+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -83,7 +83,7 @@ for row in &rows {
 
 - **Page format**: 4 KiB pages (SQLite's default since 3.12, configurable 512 B–64 KiB via `PRAGMA page_size`), 100-byte file header on page 0, SQLite-identical varint encoding
 - **B+tree**: clustered table B+tree (key = rowid) and index B+tree sorted by (key, rowid) with an order-preserving key encoding — O(log N) index seeks, prefix lookups for composite indexes, and range scans
-- **Overflow chains**: rows larger than a page spill the payload tail to a linked chain of overflow pages (SQLite's overflow-cell layout: local prefix + first chain page) — megabyte BLOBs/TEXTs round-trip exactly, and `SELECT` streams them without buffering the chain
+- **Overflow chains**: rows larger than a page spill the payload tail to a linked chain of overflow pages (SQLite's overflow-cell layout: local prefix + first chain page) — megabyte BLOBs/TEXTs round-trip exactly, and `SELECT` streams them without buffering the chain. **Index keys larger than a page spill too** (the same chain layout, with overflow-capable interior separators and byte-aware split points): SQLite files with >page index keys load and query, oversized-key indexes work natively — point lookups, range scans, `ORDER BY`, UNIQUE enforcement, UPDATE/DELETE chain maintenance, reopen persistence, and byte-exact re-dump verified by real SQLite (`tests/index_overflow.rs`)
 - **Index range scans**: `WHERE indexed_col > ?` / `BETWEEN` plans an `IndexRange` (index seek + fetch only matching rows)
 - **Append-mode splits**: right-edge inserts keep the old leaf 100% full (SQLite's `balance_quick` behavior) — sequential loads fill pages ~2x denser than naive mid-splits
 - **Page recycling**: DELETE unlinks empty leaves onto the pager freelist; new allocations reuse freelist pages before growing the file; VACUUM reclaims the file tail at page granularity
@@ -634,8 +634,9 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
   boundary, not O(dirty pages)). Use the native format for hot
   write-heavy workloads; SQLite-format mode targets interchange.
 - Index keys larger than one page (huge TEXT/`WITHOUT ROWID` PK values)
-  cannot be loaded: the engine's native index b-tree has no overflow
-  chains. Table data of any size round-trips fine.
+  load and query — the index b-tree spills them to overflow chains, and
+  the SQLite-format writer emits the cells byte-exactly (verified by
+  real SQLite re-opening the dumped file).
 - Non-BINARY/NOCASE collations in index definitions fall back to binary
   ordering in the written file.
 - `auto_vacuum` pointer-map pages are read fine but not written (output
@@ -749,9 +750,6 @@ compat surface. Every entry says what it costs and why it exists.
 - **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
   approximations — tightened one at a time via differential tests against
   real SQLite.
-- **No index overflow chains in the native format**: index keys larger
-  than one page cannot load from SQLite files (table data of any size is
-  fine); the native index b-tree has no overflow-chain support.
 - **Non-BINARY collations in written SQLite files**: index definitions
   with custom collations fall back to binary ordering in the written file;
   `auto_vacuum` pointer-map pages are read but not written (output is
@@ -903,7 +901,7 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 675+ tests in the
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 683+ tests in the
 default matrix, all passing, plus the sqlx feature suite:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
