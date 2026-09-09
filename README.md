@@ -2,9 +2,10 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **620+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **650+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
-> against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks).
+> against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks, and
+> bit-exact f64 parity suites for SUM/AVG/window arithmetic against bundled SQLite).
 > **Beats SQLite on every benchmark row — win or statistical parity** (see
 > [Performance vs SQLite](#performance-vs-sqlite)). **Resource consumption at parity or
 > better** (byte-exact file size, lower peak RSS — see
@@ -225,13 +226,16 @@ Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a
 
 Walks a `Plan` tree and produces rows. OLTP plan shapes (Scan with rowid-resume, RowidRange, Filter, Project, Limit, vtab cursors) run as **resumable streaming drivers** — rows arrive in batches, `LIMIT k` stops the walk at the k-th match, non-matching rows decode only the predicate's columns (selective decode). Everything else executes once into materialized rows (still a single parse + plan per prepare). The expression evaluator walks `Expr` against the current row, qualified join columns, and bound parameters.
 
-**Intra-statement parallelism** (`src/executor/parallel.rs`) is the tier SQLite's single-threaded executor cannot follow: large single-table aggregates (COUNT/SUM/AVG/MIN/MAX, optional simple filters; GROUP BY bare/compiled), and bounded top-N (`ORDER BY ... LIMIT k [OFFSET n]`) split the table's rowid space across `std::thread::scope` workers:
+**Intra-statement parallelism** (`src/executor/parallel.rs`) is the tier SQLite's single-threaded executor cannot follow: large single-table aggregates (COUNT/SUM/AVG/MIN/MAX, optional simple filters — literals **or bound parameters**, materialized once at plan time), GROUP BY (bare/compiled), bounded top-N (`ORDER BY ... LIMIT k [OFFSET n]`), and **unbounded ORDER BY** all split the table's rowid space across `std::thread::scope` workers:
 
-- The rowid range tiles into inclusive ranges — worker 0's range extends to `i64::MIN` so explicit rowid-0/negative rows are never dropped. Each worker builds its own `Btree` handle over the shared `&Pager` and runs the serial path's own `FusedWalk` / `HashGrouper` / keep-heap machinery over its `[lo, hi]` range, so per-row semantics are identical by construction.
-- Aggregates merge partial accumulators in **range order** with **op-aware layouts** (SUM `(i_sum, sum, is_int)`, AVG `(count, sum)`, COUNT `count`, MIN/MAX min/max — the merge is not a byte-blit); GROUP BY first-seen group order is reproduced exactly; DISTINCT replays via set-union.
+- The rowid range tiles into inclusive ranges — worker 0's range extends to `i64::MIN` so explicit rowid-0/negative rows are never dropped. Each worker builds its own `Btree` handle over the shared `&Pager` and runs the serial path's own `FusedWalk` / `HashGrouper` / keep-heap / chunk-sort machinery over its `[lo, hi]` range, so per-row semantics are identical by construction.
+- Aggregates merge partial accumulators in **range order** with **op-aware layouts** (SUM `(i_sum, sum, sum_is_int, comp)`, AVG the same plus `count`, COUNT `count`, MIN/MAX min/max — the merge is not a byte-blit); GROUP BY first-seen group order is reproduced exactly; DISTINCT replays via set-union.
 - Top-N workers keep per-range bounded heaps under the same strict total order (equal keys break on rowid, ASC and DESC) and merge under that order — bit-identical to the serial streaming top-N, including OFFSET windows.
+- Unbounded sorts chunk-sort per range under the (keys, rowid) total order and k-way merge under the same order — bit-identical to the serial stable sort; a 1:1 bare-column projection above the sort fuses into the worker decode (only projected + key columns materialize).
 - Safety comes from the engine's aliasing model — a statement executes under `&Database` while writers need `&mut Database`, so no writer can interleave within one call — plus per-page locks. Workers decline while any transaction is open (they are foreign to the committed-view TLS) and any worker bail aborts the attempt and falls back to the serial path — answers can never diverge.
 - `PRAGMA parallel_scan` gates it (default ON, min-rows 131072; 0/OFF is bit-identical serial). The threshold sits above every existing test/bench table, so sub-threshold paths are unchanged.
+
+**Numeric parity with SQLite, bit-for-bit**: SUM / TOTAL / AVG / window-frame aggregates accumulate exactly the way SQLite's `sumStep` does — integers exactly in i64 (one conversion at finalize; `avg` over 2^53-scale integers keeps the exact bits), REAL inputs through Kahan–Babuška–Neumaier compensated summation folded once at finalize (`rSum + rErr`) — no rounding, `tests/numeric_parity.rs` pins f64 **bits** against bundled SQLite across plain / filtered / GROUP BY / window / worker-split shapes. Integer×Integer value ordering compares exactly on i64 too (no f64 collapse beyond 2^53).
 
 ### Public API
 
@@ -367,11 +371,12 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 
 | Workload (1M rows)                    | rustqlite   | SQLite     | Ratio            |
 |---------------------------------------|-------------|------------|------------------|
-| Big aggregate (COUNT/SUM/AVG/MIN/MAX) | **17.2 ms** | 132.4 ms   | **7.7x faster**  |
-| Filtered aggregate (val > 500000)     | **13.2 ms** | 74.4 ms    | **5.7x faster**  |
-| GROUP BY (10k buckets + SUM)          | **47.5 ms** | 282.5 ms   | **5.9x faster**  |
-| Top-25 ORDER BY REAL DESC (full rows) | **73.6 ms** | 214.8 ms   | **2.9x faster**  |
-| Top-50 ORDER BY INT DESC OFFSET 100   | **29.0 ms** | 68.5 ms    | **2.4x faster**  |
+| Big aggregate (COUNT/SUM/AVG/MIN/MAX) | **15.1 ms** | 133.2 ms   | **8.8x faster**  |
+| Filtered aggregate (val > 500000)     | **12.2 ms** | 74.5 ms    | **6.1x faster**  |
+| GROUP BY (10k buckets + SUM)          | **48.9 ms** | 285.3 ms   | **5.8x faster**  |
+| Top-25 ORDER BY REAL DESC (full rows) | **96.5 ms** | 214.9 ms   | **2.2x faster**  |
+| Top-50 ORDER BY INT DESC OFFSET 100   | **26.0 ms** | 68.7 ms    | **2.6x faster**  |
+| ORDER BY INT DESC (unbounded)         | **188.4 ms**| 261.1 ms   | **1.4x faster**  |
 
 ### Where the wins come from
 
@@ -381,6 +386,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **Rowid range scans**: `WHERE id BETWEEN ? AND ?` runs a dedicated fused range-probe path — no pipeline setup, binary-searched leaf descent, early stop at the first cell past the range end.
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index and touches only matching rows; UPDATE rewrites payloads in place where possible (payload-patch fast path). UPDATEs whose WHERE is an exact unique-index probe (`WHERE k = ?`, `WHERE k IN (...)`) take an index-point path — seek, rowid fetch, payload patch — and `IN` probes keep every key's matches in per-key scratch buffers.
 - **Top-N**: per-worker bounded keep-heaps under the statement's exact total order, merged range-ordered — the serial streaming top-N's own algorithm, split across workers.
+- **Unbounded sorts**: `ORDER BY` without a LIMIT splits the rowid space; each worker chunk-sorts its range under the statement's (keys, rowid) total order and the main thread k-way merges under the same order — bit-identical to the serial stable sort. A 1:1 bare-column projection above the sort (`SELECT id, val ... ORDER BY val`) is fused into the worker decode: only the projected + key columns are ever materialized, so wide TEXT columns the projection would discard are never decoded.
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
 - **Concurrency**: see the [concurrency section](#concurrency-vs-sqlite) — the 8.3x concurrent-read and 5.7–8.3x parallel-aggregate multipliers sit on top of these serial wins.
@@ -473,8 +479,9 @@ S16 7.12x).
 | 8-task one-pool (sqlx, same API)            | **5.1x faster**    | inline async execution vs worker thread + FFI   |
 | 8-conn concurrent reads (sqlx)              | **2.8x faster**    | MRMW shared pages                                |
 | Mixed 80/20 (sqlx, high write fan-out)      | 1.05x              | writer gate + commit fsync dominates; reads stay 2.8x |
-| Intra-statement parallel aggregates (1M)    | **5.9–8.3x faster**| worker-split rowid ranges + range-ordered merge — SQLite's executor is single-threaded **by design** |
-| Intra-statement parallel top-N (1M)         | **2.4–2.9x faster**| per-worker keep-heaps under the statement's total order, merged range-ordered |
+| Intra-statement parallel aggregates (1M)    | **5.8–8.8x faster**| worker-split rowid ranges + range-ordered merge — SQLite's executor is single-threaded **by design** |
+| Intra-statement parallel top-N (1M)         | **2.2–2.6x faster**| per-worker keep-heaps under the statement's total order, merged range-ordered |
+| Intra-statement parallel sort (1M, unbounded) | **1.4x faster** | chunk sort per rowid range + k-way range-ordered merge; projection fused into the worker decode |
 | Multi-connection writers                    | SQLite-equivalent | single-writer + BUSY + busy timeout, exactly SQLite's own contract |
 
 SQLite executes one query on one core, forever; a connection serializes every statement
@@ -489,9 +496,10 @@ through its mutex. rustqlite has three concurrency tiers, each beyond that envel
    task — no dedicated worker thread, no FFI ferry — 5.1x on 8-task pools, 2.0x on
    1-writer/7-reader, with snapshot isolation between connections (readers wait for the
    busy timeout then `SQLITE_BUSY`, exactly like SQLite).
-3. **Intra-statement (parallel executor)**: large single-table aggregates, GROUP BYs, and
-   top-N sorts split across worker threads with deterministic range-ordered merges —
-   5.9–8.3x on 1M-row aggregates, 2.2–2.4x on top-N. `PRAGMA parallel_scan` gates it
+3. **Intra-statement (parallel executor)**: large single-table aggregates, GROUP BYs, top-N
+   sorts, and unbounded ORDER BYs split across worker threads with deterministic
+   range-ordered merges — 5.8–8.8x on 1M-row aggregates, 2.2–2.6x on top-N, 1.4x on
+   unbounded sorts. `PRAGMA parallel_scan` gates it
    (default ON above 131072 estimated rows; 0/OFF is bit-identical serial). Workers
    decline while any transaction is open, and any worker bail falls back to the serial
    path — answers can never diverge.
@@ -645,15 +653,21 @@ compat surface. Every entry says what it costs and why it exists.
   declines unselective ones after `ANALYZE`, but SQLite's cost model makes
   better choices on a few adversarial join orders (a shape-level gap that
   statistics alone cannot fix).
-- **Parallel executor coverage**: unbounded parallel ORDER BY (chunk sort +
-  k-way range-ordered merge) and the compiled no-GROUP-BY aggregate path
-  with parameter filters still run serial. Complex predicates with bound
-  params take the generic (still fast, but not worker-split) path.
-- **Numeric precision**: `AVG` rounds to 10 decimals (SQLite rounds
-  differently in a few edge cases); parallel REAL SUMs merge partial sums
-  in range order, so the last ULP can differ from a serial scan (float
-  addition is not associative; every parallel SQL engine takes this
-  latitude, and SQLite's own float-SUM order is unspecified).
+- **Parallel executor coverage**: single-table shapes split (aggregates with
+  literal **or parameter** filters, GROUP BY bare/compiled, top-N, unbounded
+  ORDER BY with a fused 1:1 projection); what remains serial is the
+  multi-table / multi-node world — joins, subqueries, compound bodies,
+  DISTINCT aggregates, and sorts whose terms are expressions or carry
+  `COLLATE` (only bare-column and ordinal terms split).
+- **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
+  **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
+  compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled
+  SQLite at the f64-bit level). The remaining latitude is the worker-split
+  REAL merge: partial compensated sums merge in range order, so the last
+  ULP can differ from the serial scan on REAL columns (float addition is
+  not associative; every parallel SQL engine takes this latitude, and
+  SQLite's own float-SUM order is unspecified). INTEGER accumulation is
+  exact in both paths — no latitude.
 
 ### Resource-consumption gaps
 
@@ -854,7 +868,7 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 620+ tests in the
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 650+ tests in the
 default matrix, all passing, plus the sqlx feature suite:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
@@ -872,7 +886,8 @@ default matrix, all passing, plus the sqlx feature suite:
 | `integrity_check` | `tests/integrity_check.rs` | full structural walk: freelist chains, every b-tree, bidirectional index↔table cross-verification |
 | Soak / long-run | `concurrency_stress.rs`, `RUSTQLITE_FUZZ_ITERS` | 32-thread mixed workloads; long fuzz iterations |
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |
-| Intra-statement parallelism | `tests/parallel_scan.rs` | parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order, top-N order), 300k-row SQLite cross-check, transaction-decline + PRAGMA-gate contracts |
+| Intra-statement parallelism | `tests/parallel_scan.rs` | parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order, top-N order, unbounded ORDER BY with projections/ordinals/hidden-rowid, parameter-filtered fused aggregates), 300k-row SQLite cross-check, transaction-decline + PRAGMA-gate contracts |
+| Numeric parity | `tests/numeric_parity.rs` | SUM/TOTAL/AVG/window arithmetic vs bundled SQLite at the **f64-bit** level (integer-exact + Kahan–Babuška compensation, flip semantics, NULL rules, worker-split equality) |
 | Temp-store spill | `tests/tempstore.rs` | forced multi-chunk spills match the RAM reference for every aggregate family; streaming driver = buffered; parallel = serial; key-sorted spill order; `PRAGMA temp_store` round-trip; ephemeral files always cleaned up |
 | Statistics | `tests/analyze.rs` | sqlite_stat1 rows in SQLite's exact format, targeted ANALYZE, cost-based index choice (unselective indexes declined), reopen persistence, compound/expression-index prefixes |
 | SQL Logic Tests | `tests/slt_runner.rs` + `tests/slt/` | the SLT format SQLite's core team uses |
