@@ -60,6 +60,7 @@ use crate::schema::Table;
 use crate::sql::ast::Expr;
 use crate::storage::btree::Btree;
 use crate::types::Value;
+use crate::Row;
 
 use super::{
     agg_sep_at, fused_filter_of, fused_finalize, fused_merge_acc, fused_resolve_col, AggFunc,
@@ -181,13 +182,20 @@ fn fused_plan_of(
     prefix: &str,
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
+    params: &[Value],
+    named_params: &std::collections::HashMap<String, Value>,
 ) -> Option<FusedPlan> {
     if aggregates.is_empty() {
         return None;
     }
     let filter = match filter_predicate {
         None => None,
-        Some(p) => Some(fused_filter_of(p, table, prefix)?),
+        Some(p) => {
+            // Bound parameters resolve ONCE here against the statement's
+            // fixed parameter set (see fused_filter_lit): the worker-
+            // split walk and the serial fused walk see the same value.
+            Some(fused_filter_of(p, table, prefix, params, named_params)?)
+        }
     };
     let mut specs: Vec<FusedAggSpec> = Vec::with_capacity(aggregates.len());
     let mut wanted_cols: Vec<usize> = Vec::new();
@@ -214,7 +222,13 @@ fn fused_plan_of(
         };
         let col = match &agg.arg {
             None => None,
-            Some(arg) => fused_resolve_col(arg, table, prefix),
+            // An expression argument (`total(v * 1.0)`) must DECLINE
+            // (propagates None): slot None is the COUNT(*) placeholder
+            // (NumVal::I(1) per row), so a Sum/Total/Avg spec with no
+            // slot would accumulate 1-per-row — the serial fused path
+            // rejects this exact shape (None => return Ok(None)), and
+            // the parallel plan builder must keep the contract identical.
+            Some(arg) => Some(fused_resolve_col(arg, table, prefix)?),
         };
         if let Some(c) = col {
             if !wanted_cols.contains(&c) {
@@ -256,7 +270,14 @@ pub(crate) fn try_parallel_fused_aggregate(
     aggregates: &[AggExpr],
 ) -> Result<Option<ExecResult>> {
     let prefix = alias.unwrap_or(&table.name);
-    let plan = match fused_plan_of(table, prefix, filter_predicate, aggregates) {
+    let plan = match fused_plan_of(
+        table,
+        prefix,
+        filter_predicate,
+        aggregates,
+        &ctx.params,
+        &ctx.named_params,
+    ) {
         Some(p) => p,
         None => return Ok(None),
     };
@@ -569,11 +590,29 @@ pub(crate) fn merge_agg_state(
     }
     match func {
         AggFunc::Avg => {
-            // AVG's accumulator: (count, sum). The generic fold below
-            // would hit the SUM layout (int_sum/sum_is_int) and merge
-            // ZEROS — dropping the real sum on the floor.
+            // AVG's accumulator: (count, numeric-sum) with the numeric
+            // half on the SAME int-exact + KBN-compensated layout as
+            // Sum (int_sum/sum_is_int/comp — see the generic
+            // accumulate): count merges, then the sum folds int+int
+            // exactly and flips to the compensated merge on any float
+            // side.
             dst.count = dst.count.saturating_add(src.count);
-            dst.sum += src.sum;
+            if dst.sum_is_int && src.sum_is_int {
+                dst.int_sum = dst.int_sum.saturating_add(src.int_sum);
+            } else {
+                let b = if src.sum_is_int {
+                    src.int_sum as f64
+                } else {
+                    src.sum
+                };
+                if dst.sum_is_int {
+                    dst.sum = dst.int_sum as f64;
+                    dst.sum_is_int = false;
+                    dst.comp = 0.0;
+                }
+                super::kbn_step(&mut dst.sum, &mut dst.comp, b);
+                dst.comp += src.comp;
+            }
         }
         AggFunc::Count => {
             dst.count = dst.count.saturating_add(src.count);
@@ -640,22 +679,24 @@ pub(crate) fn merge_agg_state(
         _ => {
             dst.count = dst.count.saturating_add(src.count);
             dst.seen_value |= src.seen_value;
-            // SUM/Total: int+int exact; any float flips to f64 addition.
+            // SUM/Total: int+int exact; any float side flips to the
+            // KBN-compensated merge (step dst's running sum with src's,
+            // absorb both error terms).
             if dst.sum_is_int && src.sum_is_int {
                 dst.int_sum = dst.int_sum.saturating_add(src.int_sum);
             } else {
-                let a = if dst.sum_is_int {
-                    dst.int_sum as f64
-                } else {
-                    dst.sum
-                };
                 let b = if src.sum_is_int {
                     src.int_sum as f64
                 } else {
                     src.sum
                 };
-                dst.sum = a + b;
-                dst.sum_is_int = false;
+                if dst.sum_is_int {
+                    dst.sum = dst.int_sum as f64;
+                    dst.sum_is_int = false;
+                    dst.comp = 0.0;
+                }
+                super::kbn_step(&mut dst.sum, &mut dst.comp, b);
+                dst.comp += src.comp;
             }
             // MIN/MAX under SQL value ordering (update_agg_state's
             // comparator).
@@ -1079,5 +1120,206 @@ pub(crate) fn try_parallel_topn(
     Ok(Some(ExecResult {
         columns: out_cols,
         rows,
+    }))
+}
+
+// ============================================================================
+// Parallel unbounded ORDER BY — chunk sort + k-way range-ordered merge
+// ============================================================================
+
+/// Multi-term (keys, rowid) total-order comparator, shared verbatim by
+/// the worker local sorts and the main-thread merge. Terms compare with
+/// `Value::cmp` (the serial sort's `sort_key` comparator for bare
+/// columns) with DESC reversal; the rowid tiebreak makes the order
+/// STRICT, which is what makes the chunk/merge decomposition reproduce
+/// the serial answer bit-for-bit.
+fn sort_total_cmp(
+    a_row: &[Value],
+    a_rowid: i64,
+    b_row: &[Value],
+    b_rowid: i64,
+    keys: &[(usize, bool)],
+) -> std::cmp::Ordering {
+    for &(col, desc) in keys {
+        let ord = a_row[col].cmp(&b_row[col]);
+        let ord = if desc { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a_rowid.cmp(&b_rowid)
+}
+
+/// One range worker's sorted chunk: (rowid, row) pairs in
+/// `sort_total_cmp` order. Rows carry the hidden-rowid trailing slot
+/// when the scan shape emits one, so chunk rows are byte-identical to
+/// the serial `exec_scan` output.
+struct SortChunk {
+    rows: Vec<(i64, Row)>,
+}
+
+/// Parallel unbounded `ORDER BY a, b DESC, ...` over a bare full table
+/// scan (no predicate, no index, not a vtab): the rowid space splits
+/// across workers exactly like the aggregate paths; each worker decodes
+/// its range with the SAME selective scanner the parallel top-N uses,
+/// sorts its chunk locally under the (keys, rowid) total order, and the
+/// main thread runs a k-way merge under the SAME order.
+///
+/// ## Why the merge is exactly the serial answer
+///
+/// The serial path materializes the scan (rowid ASC — the B+tree walk
+/// order) and runs a STABLE sort with a per-term comparator that returns
+/// Equal on full ties, so tied rows keep scan order: the serial output
+/// is the (keys, rowid ASC) sequence. Each worker's chunk arrives in
+/// rowid ASC order (its range), and a local sort under the strict total
+/// order yields (keys, rowid ASC) within the range. The ranges tile the
+/// rowid space in ascending order with no overlap, so a k-way merge
+/// under the same strict total order emits the global (keys, rowid ASC)
+/// sequence — identical rows, identical order, no float latitude and no
+/// order-of-operations freedom. Corrupt rows are skipped by BOTH
+/// decoders (the selective scanner mirrors the inline scan's error
+/// tolerance), short rows NULL-pad in both.
+///
+/// `Ok(None)` = declined (shape below threshold / config off / txn
+/// open / a worker error) — the caller runs the serial path unchanged.
+pub(crate) fn try_parallel_sort(
+    ctx: &ExecContext<'_>,
+    table: &StdArc<Table>,
+    keys: &[(usize, bool)],
+    append_rowid: bool,
+    out_cols: StdArc<[String]>,
+) -> Result<Option<ExecResult>> {
+    let root = ctx.table_root(table);
+    let split = match plan_range_split(ctx, root)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let wanted: Vec<usize> = (0..n_cols).collect();
+    let ranges = split.ranges;
+    let pager = ctx.pager;
+
+    // Workers: range scan + local sort. The rows move out of the chunk
+    // during the merge (mem::replace), so the chunk Vecs are drained
+    // allocation-free on the emit side.
+    let partials: Vec<Result<SortChunk>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges.iter() {
+            let wanted = &wanted;
+            handles.push(scope.spawn(move || -> Result<SortChunk> {
+                let mut bt = Btree::new(pager, root, false);
+                let mut rows: Vec<(i64, Row)> = Vec::new();
+                bt.scan_table_range_selective(
+                    lo,
+                    hi,
+                    n_cols,
+                    wanted,
+                    rowid_alias,
+                    |rowid, mut row| {
+                        if append_rowid {
+                            row.push(Value::Integer(rowid));
+                        }
+                        rows.push((rowid, row));
+                        true
+                    },
+                )?;
+                rows.sort_unstable_by(|a, b| sort_total_cmp(&a.1, a.0, &b.1, b.0, keys));
+                Ok(SortChunk { rows })
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel sort worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    // Any worker error -> serial fallback (never a divergent answer).
+    let mut chunks: Vec<SortChunk> = Vec::with_capacity(partials.len());
+    let mut total: usize = 0;
+    for p in partials {
+        match p {
+            Ok(c) => {
+                total += c.rows.len();
+                chunks.push(c);
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    // ---- k-way merge under the same strict total order ----------------
+    // A binary heap of chunk indices; chunk i's head is
+    // chunks[i].rows[cursors[i]]. Rows MOVE out of their chunk via
+    // mem::replace (the output reuses each row's allocation).
+    let mut cursors: Vec<usize> = vec![0; chunks.len()];
+    let mut heap: Vec<usize> = (0..chunks.len())
+        .filter(|&c| !chunks[c].rows.is_empty())
+        .collect();
+
+    // Sift-down over the chunk-index heap; the comparator reads the
+    // current heads through `chunks`/`cursors` (immutable during the
+    // sift — mutations happen between sifts).
+    fn sift_down(
+        heap: &mut [usize],
+        mut i: usize,
+        chunks: &[SortChunk],
+        cursors: &[usize],
+        keys: &[(usize, bool)],
+    ) {
+        loop {
+            let n = heap.len();
+            let l = 2 * i + 1;
+            let r = l + 1;
+            let mut m = i;
+            let lt = |a: usize, b: usize| -> bool {
+                let (pa, pb) = (cursors[a], cursors[b]);
+                let (ra, rb) = (&chunks[a].rows[pa].1, &chunks[b].rows[pb].1);
+                sort_total_cmp(ra, chunks[a].rows[pa].0, rb, chunks[b].rows[pb].0, keys)
+                    == std::cmp::Ordering::Less
+            };
+            if l < n && lt(heap[l], heap[m]) {
+                m = l;
+            }
+            if r < n && lt(heap[r], heap[m]) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            heap.swap(i, m);
+            i = m;
+        }
+    }
+    // Heapify (Floyd).
+    for i in (0..heap.len() / 2).rev() {
+        sift_down(&mut heap, i, &chunks, &cursors, keys);
+    }
+
+    let mut out: Vec<Row> = Vec::with_capacity(total);
+    while let Some(&c) = heap.first() {
+        let pos = cursors[c];
+        cursors[c] += 1;
+        let (_, row) = std::mem::take(&mut chunks[c].rows[pos]);
+        out.push(row);
+        if cursors[c] >= chunks[c].rows.len() {
+            // Chunk exhausted: remove the root (swap-with-last + pop).
+            let last = heap.pop().unwrap();
+            if !heap.is_empty() {
+                heap[0] = last;
+                sift_down(&mut heap, 0, &chunks, &cursors, keys);
+            }
+        } else {
+            sift_down(&mut heap, 0, &chunks, &cursors, keys);
+        }
+    }
+
+    Ok(Some(ExecResult {
+        columns: out_cols,
+        rows: out,
     }))
 }

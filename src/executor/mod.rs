@@ -2920,36 +2920,9 @@ fn exec_scan(
     })?;
     // Column names: if there's an alias, prefix with "alias." so qualified
     // references in the planner/evaluator can find them. We also include
-    // the unqualified name for backward compat.
-    //
-    // FAST PATH: when the effective prefix equals the table name (no alias,
-    // or an alias identical to the table), return the cached
-    // `qualified_col_names` built once in `build_table` — one refcount bump
-    // instead of N `format!()` allocations per query.
-    let prefix = alias.as_deref().unwrap_or(&table.name);
-    let columns: Arc<[String]> = if append_rowid {
-        let base: Vec<String> = if prefix == table.name {
-            table.qualified_col_names.iter().cloned().collect()
-        } else {
-            table
-                .columns
-                .iter()
-                .map(|c| format!("{}.{}", prefix, c.name))
-                .collect()
-        };
-        let mut v = base;
-        v.push(crate::planner::HIDDEN_ROWID.to_string());
-        v.into()
-    } else if prefix == table.name {
-        table.qualified_col_names.clone()
-    } else {
-        table
-            .columns
-            .iter()
-            .map(|c| format!("{}.{}", prefix, c.name))
-            .collect::<Vec<String>>()
-            .into()
-    };
+    // the unqualified name for backward compat. Shared with the parallel
+    // sort driver (identical output shape, one definition).
+    let columns = scan_output_columns(&table, &alias, append_rowid);
     Ok(ExecResult { columns, rows })
 }
 
@@ -3622,6 +3595,40 @@ pub fn expr_display_name(e: &Expr) -> String {
 // ============================================================================
 
 fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Result<ExecResult> {
+    // ---- Intra-statement parallel split --------------------------------
+    // Unbounded (or huge-LIMIT) ORDER BY over a BARE full scan with
+    // all-bare-column / ordinal / rowid terms: each worker sorts its
+    // rowid range's chunk locally under the (keys, rowid) total order,
+    // then the main thread k-way merges under the SAME order —
+    // bit-identical to the serial stable sort over the scan (see
+    // parallel.rs for the proof). Declines below threshold / config
+    // off / txn open / expression or COLLATE terms — the serial path
+    // below is unchanged for every declined shape.
+    if let Plan::Scan {
+        table,
+        alias,
+        index: None,
+        predicate: None,
+    } = input
+    {
+        if table.vtab.is_none() {
+            let n_cols = table.n_columns();
+            let append_rowid = crate::planner::wants_rowid_slot(table);
+            let row_width = n_cols + append_rowid as usize;
+            if let Some(keys) = bare_sort_keys(terms, table, alias.as_deref(), row_width) {
+                let out_cols = scan_output_columns(table, alias, append_rowid);
+                if let Some(res) = crate::executor::parallel::try_parallel_sort(
+                    ctx,
+                    table,
+                    &keys,
+                    append_rowid,
+                    out_cols,
+                )? {
+                    return Ok(res);
+                }
+            }
+        }
+    }
     let mut inner = execute(input, ctx)?;
     // Borrow params directly from ctx — `inner` is a local value, and the
     // sort comparator only reads it, so no clone (1-2 allocs) is needed.
@@ -3679,6 +3686,94 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         std::cmp::Ordering::Equal
     });
     Ok(inner)
+}
+
+/// Resolve the parallel sort's key set: every ORDER BY term must be a
+/// bare (optionally table/alias-qualified) column of the scan's table —
+/// including the rowid alias and the hidden-rowid trailing slot — or an
+/// in-range positive ordinal. `None` declines (expression terms,
+/// COLLATE, out-of-range ordinals — the serial path errors on those;
+/// zero/negative literals are constants the serial path no-ops).
+fn bare_sort_keys(
+    terms: &[OrderTerm],
+    table: &Table,
+    alias: Option<&str>,
+    row_width: usize,
+) -> Option<Vec<(usize, bool)>> {
+    let mut keys: Vec<(usize, bool)> = Vec::with_capacity(terms.len());
+    for term in terms {
+        if matches!(term.expr, Expr::Collate { .. }) {
+            return None;
+        }
+        let idx = match &term.expr {
+            Expr::Literal(Value::Integer(k)) => {
+                if *k >= 1 && (*k as usize) <= row_width {
+                    *k as usize - 1
+                } else {
+                    return None;
+                }
+            }
+            e => match resolve_topn_key_col(e, table, alias) {
+                Some(i) => i,
+                None => {
+                    // The hidden-rowid trailing slot: the planner rewrites
+                    // bare rowid spellings to HIDDEN_ROWID; hand-built
+                    // ASTs can still carry the raw spelling.
+                    if let Expr::Column { table: None, name } = e {
+                        if name == crate::planner::HIDDEN_ROWID
+                            || name.eq_ignore_ascii_case("rowid")
+                            || name.eq_ignore_ascii_case("_rowid_")
+                            || name.eq_ignore_ascii_case("oid")
+                        {
+                            row_width - 1
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            },
+        };
+        keys.push((idx, term.order == Order::Desc));
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    Some(keys)
+}
+
+/// The scan operators' output column names, shared by `exec_scan` and
+/// the parallel sort driver (hidden-rowid slot appended last).
+fn scan_output_columns(
+    table: &Arc<Table>,
+    alias: &Option<String>,
+    append_rowid: bool,
+) -> Arc<[String]> {
+    let prefix = alias.as_deref().unwrap_or(&table.name);
+    if append_rowid {
+        let base: Vec<String> = if prefix == table.name {
+            table.qualified_col_names.iter().cloned().collect()
+        } else {
+            table
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", prefix, c.name))
+                .collect()
+        };
+        let mut v = base;
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.into()
+    } else if prefix == table.name {
+        table.qualified_col_names.clone()
+    } else {
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect::<Vec<String>>()
+            .into()
+    }
 }
 
 /// Evaluate one ORDER BY term for one row. Handles the two key shapes:
@@ -4259,6 +4354,9 @@ fn exec_limit(
 pub(crate) struct AggState {
     count: i64,
     sum: f64,
+    /// Kahan–Babuška–Neumaier compensation for `sum` (see `kbn_step`);
+    /// folded once at finalize. Zero while `sum_is_int`.
+    comp: f64,
     sum_is_int: bool,
     int_sum: i64,
     /// ALL rarely-used state, boxed behind ONE pointer (8 B inline):
@@ -4998,6 +5096,9 @@ fn encode_agg_state_into(buf: &mut Vec<u8>, s: &AggState) {
     buf.extend_from_slice(&s.count.to_le_bytes());
     buf.extend_from_slice(&s.sum.to_bits().to_le_bytes());
     buf.extend_from_slice(&s.int_sum.to_le_bytes());
+    // KBN compensation term (spill-safe: REAL group sums reload with
+    // the same bits they spilled with).
+    buf.extend_from_slice(&s.comp.to_bits().to_le_bytes());
     let mut flags = 0u8;
     flags |= u8::from(s.sum_is_int);
     flags |= u8::from(s.seen_value) << 1;
@@ -5096,6 +5197,7 @@ fn decode_agg_state(cur: &mut &[u8]) -> Option<AggState> {
     let count = take_u64(cur)? as i64;
     let sum = f64::from_bits(take_u64(cur)?);
     let int_sum = take_u64(cur)? as i64;
+    let comp = f64::from_bits(take_u64(cur)?);
     if cur.is_empty() {
         return None;
     }
@@ -5104,6 +5206,7 @@ fn decode_agg_state(cur: &mut &[u8]) -> Option<AggState> {
     let mut s = AggState {
         count,
         sum,
+        comp,
         int_sum,
         ..Default::default()
     };
@@ -5454,6 +5557,7 @@ impl Default for AggState {
         Self {
             count: 0,
             sum: 0.0,
+            comp: 0.0,
             sum_is_int: true, // Optimistic: assume int until we see a Real.
             int_sum: 0,
             cold: None,
@@ -6222,6 +6326,10 @@ struct FusedAcc {
     sum: f64,
     /// false once a REAL input flipped the SUM/Total accumulator to f64.
     sum_is_int: bool,
+    /// Kahan–Babuška–Neumaier compensation term for the f64 running
+    /// sum (see `kbn_step`) — folded ONCE at finalize, exactly as
+    /// SQLite's `rSum + rErr`. Zero while `sum_is_int`.
+    comp: f64,
     seen: bool,
     min: Option<NumVal>,
     max: Option<NumVal>,
@@ -6234,6 +6342,7 @@ impl FusedAcc {
             i_sum: 0,
             sum: 0.0,
             sum_is_int: true,
+            comp: 0.0,
             seen: false,
             min: None,
             max: None,
@@ -6252,22 +6361,57 @@ impl FusedAcc {
     }
 }
 
+/// One Kahan–Babuška–Neumaier compensated-summation step (SQLite's
+/// `kahanBabuskaNeumaierStep`, verbatim semantics): `t = sum + x`; the
+/// rounding error of the add — `(sum - t) + x` or `(x - t) + sum`,
+/// whichever operand was larger in magnitude — accumulates into `comp`
+/// EXACTLY (error terms are representable). Folding `sum + comp` once
+/// at finalize recovers the bits a naive left fold drops, which is how
+/// SQLite's REAL SUM/TOTAL/AVG (and its window re-aggregations) get
+/// their bit-exact results. rustqlite now runs the same discipline in
+/// every accumulator (fused, generic hash-grouper, window frames).
+#[inline]
+pub(crate) fn kbn_step(sum: &mut f64, comp: &mut f64, x: f64) {
+    let t = *sum + x;
+    if sum.abs() >= x.abs() {
+        *comp += (*sum - t) + x;
+    } else {
+        *comp += (x - t) + *sum;
+    }
+    *sum = t;
+}
+
 /// Fold `src` (a partial range's accumulator) into `dst`. The merge is
 /// OP-AWARE because `FusedAcc` overloads its fields per aggregate:
-/// Sum/Total use (i_sum, sum, sum_is_int); Avg uses (count, sum) with
-/// `sum` ALWAYS f64 and the int fields inert; Count uses only `count`;
-/// Min/Max use only min/max. Integer sums merge exactly; REAL sums merge
-/// in range order — float addition is not associative, so the last ULP
-/// can differ from a serial scan (the same latitude every parallel SQL
-/// engine takes; SQLite's own float-SUM order is unspecified).
+/// Sum/Total use (i_sum, sum, sum_is_int, comp); Avg uses (count, sum,
+/// sum_is_int, comp) — same numeric discipline as Sum plus the count;
+/// Count uses only `count`; Min/Max use only min/max. Integer sums
+/// merge exactly; REAL sums merge in range order with the SAME KBN
+/// compensation SQLite applies per row — the last ULP can still differ
+/// from a serial scan (float addition is not associative; every
+/// parallel SQL engine takes this latitude, and SQLite's own float-SUM
+/// order is unspecified).
 fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
     match op {
         FusedOp::Avg => {
-            // Avg's accumulator: (count, sum). A generic fold would hit
-            // the Sum/Total layout (i_sum/sum_is_int) and merge ZEROS —
-            // dropping the real sum on the floor.
+            // Avg's accumulator: (count, numeric-sum) where the numeric
+            // half uses the SAME int-exact + KBN-compensated layout as
+            // Sum (see the FusedOp::Avg accumulate comment): count
+            // merges, then the sum folds int+int exactly and flips to
+            // the compensated f64 merge on any float side.
             dst.count = dst.count.saturating_add(src.count);
-            dst.sum += src.sum;
+            if dst.sum_is_int && src.sum_is_int {
+                dst.i_sum = dst.i_sum.saturating_add(src.i_sum);
+            } else {
+                let b = src.sum_f64();
+                if dst.sum_is_int {
+                    dst.sum = dst.i_sum as f64;
+                    dst.sum_is_int = false;
+                    dst.comp = 0.0;
+                }
+                kbn_step(&mut dst.sum, &mut dst.comp, b);
+                dst.comp += src.comp;
+            }
         }
         FusedOp::CountStar | FusedOp::CountCol => {
             dst.count = dst.count.saturating_add(src.count);
@@ -6275,13 +6419,20 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
         FusedOp::Sum | FusedOp::Total | FusedOp::Min | FusedOp::Max => {
             dst.count = dst.count.saturating_add(src.count);
             dst.seen |= src.seen;
-            // SUM/Total: int+int stays exact; any float flips to f64 addition.
+            // SUM/Total: int+int stays exact; any float side flips to
+            // the KBN-compensated f64 merge (step the running sums,
+            // absorb both error terms).
             if dst.sum_is_int && src.sum_is_int {
                 dst.i_sum = dst.i_sum.saturating_add(src.i_sum);
             } else {
-                let a = dst.sum_f64();
-                dst.sum = a + src.sum_f64();
-                dst.sum_is_int = false;
+                let b = src.sum_f64();
+                if dst.sum_is_int {
+                    dst.sum = dst.i_sum as f64;
+                    dst.sum_is_int = false;
+                    dst.comp = 0.0;
+                }
+                kbn_step(&mut dst.sum, &mut dst.comp, b);
+                dst.comp += src.comp;
             }
             // MIN/MAX: cross-type compares as f64 (numval_lt — Value::Ord's
             // numeric path; NaN never reaches a fused accumulator).
@@ -6467,18 +6618,23 @@ impl FusedWalk {
                 FusedOp::Sum | FusedOp::Total => {
                     if non_null {
                         match v {
+                            // REAL inputs (and post-flip integers, as
+                            // doubles) go through the KBN step — the
+                            // same compensated discipline SQLite's
+                            // sumStep applies, folded at finalize.
                             NumVal::F(f) => {
                                 if acc.sum_is_int {
                                     acc.sum = acc.i_sum as f64;
+                                    acc.sum_is_int = false;
+                                    acc.comp = 0.0;
                                 }
-                                acc.sum_is_int = false;
-                                acc.sum += f;
+                                kbn_step(&mut acc.sum, &mut acc.comp, f);
                             }
                             NumVal::I(i) => {
                                 if acc.sum_is_int {
                                     acc.i_sum = acc.i_sum.saturating_add(i);
                                 } else {
-                                    acc.sum += i as f64;
+                                    kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
                                 }
                             }
                             NumVal::Null => {}
@@ -6486,9 +6642,33 @@ impl FusedWalk {
                     }
                 }
                 FusedOp::Avg => {
+                    // SQLite's avgStep is sumStep + count: integers
+                    // accumulate EXACTLY in i64 (one conversion at
+                    // finalize), the first REAL flips to the KBN-
+                    // compensated f64 accumulator (folding the integer
+                    // partial in once). Rounding to 10 decimals was a
+                    // divergence from SQLite — AVG now returns the raw
+                    // r/cnt double, bit-for-bit.
                     if non_null {
                         acc.count += 1;
-                        acc.sum += v.as_f64();
+                        match v {
+                            NumVal::F(f) => {
+                                if acc.sum_is_int {
+                                    acc.sum = acc.i_sum as f64;
+                                    acc.sum_is_int = false;
+                                    acc.comp = 0.0;
+                                }
+                                kbn_step(&mut acc.sum, &mut acc.comp, f);
+                            }
+                            NumVal::I(i) => {
+                                if acc.sum_is_int {
+                                    acc.i_sum = acc.i_sum.saturating_add(i);
+                                } else {
+                                    kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                }
+                            }
+                            NumVal::Null => {}
+                        }
                     }
                 }
                 FusedOp::Min => {
@@ -6751,7 +6931,47 @@ fn fused_resolve_col(expr: &Expr, table: &Table, prefix: &str) -> Option<usize> 
 
 /// Extract `col <op> numeric-literal` (either operand order) from a
 /// predicate. `None` = not a supported simple numeric comparison.
-fn fused_filter_of(pred: &Expr, table: &Table, prefix: &str) -> Option<FusedFilter> {
+/// Resolve the literal side of a fused filter. Numeric literals pass
+/// through; a bound parameter resolves ONCE against the statement's
+/// parameter set (positional `?`/`?N` names are 0-based indices — the
+/// lexer canonicalizes `?1` and the first `?` both to "0"; `:name`/
+/// `@name`/`$var` hit the named map). A parameter bound to NULL or a
+/// non-numeric value declines (the generic path owns those shapes).
+#[inline]
+fn fused_filter_lit(
+    e: &Expr,
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Option<NumVal> {
+    match e {
+        Expr::Literal(v) => match v {
+            Value::Integer(i) => Some(NumVal::I(*i)),
+            Value::Real(f) => Some(NumVal::F(*f)),
+            _ => None,
+        },
+        Expr::Parameter(name) => {
+            let v = if let Ok(idx) = name.parse::<usize>() {
+                params.get(idx)
+            } else {
+                named_params.get(name)
+            }?;
+            match v {
+                Value::Integer(i) => Some(NumVal::I(*i)),
+                Value::Real(f) => Some(NumVal::F(*f)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn fused_filter_of(
+    pred: &Expr,
+    table: &Table,
+    prefix: &str,
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Option<FusedFilter> {
     if let Expr::Binary { op, left, right } = pred {
         let cmp = match op {
             BinaryOp::Eq => FusedCmp::Eq,
@@ -6762,22 +6982,20 @@ fn fused_filter_of(pred: &Expr, table: &Table, prefix: &str) -> Option<FusedFilt
             BinaryOp::GtEq => FusedCmp::GtEq,
             _ => return None,
         };
-        // Literal side must be numeric.
-        let lit_of = |e: &Expr| -> Option<NumVal> {
-            if let Expr::Literal(v) = e {
-                match v {
-                    Value::Integer(i) => Some(NumVal::I(*i)),
-                    Value::Real(f) => Some(NumVal::F(*f)),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        };
-        if let (Some(col), Some(lit)) = (fused_resolve_col(left, table, prefix), lit_of(right)) {
+        // Literal side: numeric literal OR bound numeric parameter
+        // (resolved once here — parameters are fixed for the whole
+        // statement execution, so the materialized value is stable for
+        // every row of the walk, serial and worker-split alike).
+        if let (Some(col), Some(lit)) = (
+            fused_resolve_col(left, table, prefix),
+            fused_filter_lit(right, params, named_params),
+        ) {
             return Some(FusedFilter { col, lit, cmp });
         }
-        if let (Some(col), Some(lit)) = (fused_resolve_col(right, table, prefix), lit_of(left)) {
+        if let (Some(col), Some(lit)) = (
+            fused_resolve_col(right, table, prefix),
+            fused_filter_lit(left, params, named_params),
+        ) {
             // Operand order swapped: mirror the comparison.
             let cmp = match cmp {
                 FusedCmp::Lt => FusedCmp::Gt,
@@ -6909,7 +7127,7 @@ fn try_fused_aggregate(
     // ---- Shape checks -------------------------------------------------
     let filter = match filter_predicate {
         None => None,
-        Some(p) => match fused_filter_of(p, table, prefix) {
+        Some(p) => match fused_filter_of(p, table, prefix, &ctx.params, &ctx.named_params) {
             Some(f) => Some(f),
             None => return Ok(None),
         },
@@ -7007,19 +7225,30 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> ExecResult {
                 } else if acc.sum_is_int {
                     Value::Integer(acc.i_sum)
                 } else {
-                    Value::Real(acc.sum)
+                    // sumFinalize's approx arm: rSum + rErr.
+                    Value::Real(acc.sum + acc.comp)
                 }
             }
             AggFunc::Total => Value::Real(if acc.sum_is_int {
                 acc.i_sum as f64
             } else {
-                acc.sum
+                acc.sum + acc.comp
             }),
             AggFunc::Avg => {
                 if acc.count == 0 {
                     Value::Null
                 } else {
-                    Value::Real((acc.sum / acc.count as f64 * 1e10).round() / 1e10)
+                    // SQLite avgFinalize: r = (approx ? rSum + rErr :
+                    // (double)iSum); result r/(double)cnt — raw double,
+                    // no rounding. Integer inputs stay exact through
+                    // i_sum (one conversion), matching SQLite
+                    // bit-for-bit.
+                    let r = if acc.sum_is_int {
+                        acc.i_sum as f64
+                    } else {
+                        acc.sum + acc.comp
+                    };
+                    Value::Real(r / acc.count as f64)
                 }
             }
             AggFunc::Min => match acc.min {
@@ -8278,26 +8507,43 @@ fn update_agg_state(
         }
         AggFunc::Sum | AggFunc::Total => {
             if !v.is_null() {
+                // sumStep discipline: integers accumulate exactly in
+                // int_sum; the first REAL folds the integer partial into
+                // `sum` once and flips; every f64 add thereafter is a
+                // KBN step (comp folded at finalize, like SQLite).
                 if matches!(v, Value::Real(_)) {
-                    // Integer→float flip: sync `sum` from `int_sum` ONCE here
-                    // (was: a per-row f64 convert+store on the all-integer
-                    // hot path, only ever needed at this flip point).
                     if state.sum_is_int {
                         state.sum = state.int_sum as f64;
+                        state.sum_is_int = false;
+                        state.comp = 0.0;
                     }
-                    state.sum_is_int = false;
-                    state.sum += v.as_real();
+                    kbn_step(&mut state.sum, &mut state.comp, v.as_real());
                 } else if state.sum_is_int {
                     state.int_sum = state.int_sum.saturating_add(v.as_integer());
                 } else {
-                    state.sum += v.as_real();
+                    kbn_step(&mut state.sum, &mut state.comp, v.as_real());
                 }
             }
         }
         AggFunc::Avg => {
+            // sumStep discipline (see the Sum arm): integers accumulate
+            // EXACTLY in int_sum; the first REAL folds the integer
+            // partial into `sum` once and flips; finalize is the raw
+            // r/cnt double — no rounding, matching SQLite bit-for-bit.
             if !v.is_null() {
                 state.count += 1;
-                state.sum += v.as_real();
+                if matches!(v, Value::Real(_)) {
+                    if state.sum_is_int {
+                        state.sum = state.int_sum as f64;
+                        state.sum_is_int = false;
+                        state.comp = 0.0;
+                    }
+                    kbn_step(&mut state.sum, &mut state.comp, v.as_real());
+                } else if state.sum_is_int {
+                    state.int_sum = state.int_sum.saturating_add(v.as_integer());
+                } else {
+                    kbn_step(&mut state.sum, &mut state.comp, v.as_real());
+                }
             }
         }
         AggFunc::Min => {
@@ -8442,20 +8688,27 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
             } else if state.sum_is_int {
                 Value::Integer(state.int_sum)
             } else {
-                Value::Real(state.sum)
+                // sumFinalize's approx arm: rSum + rErr.
+                Value::Real(state.sum + state.comp)
             }
         }
         "total" => Value::Real(if state.sum_is_int {
             state.int_sum as f64
         } else {
-            state.sum
+            state.sum + state.comp
         }),
         "avg" => {
             if state.count == 0 {
                 Value::Null
             } else {
-                // Round to a reasonable precision to avoid IEEE-754 noise.
-                Value::Real((state.sum / state.count as f64 * 1e10).round() / 1e10)
+                // SQLite avgFinalize: (approx ? rSum + rErr :
+                // (double)iSum)/cnt — raw double, no rounding.
+                let r = if state.sum_is_int {
+                    state.int_sum as f64
+                } else {
+                    state.sum + state.comp
+                };
+                Value::Real(r / state.count as f64)
             }
         }
         "min" => state
@@ -9190,6 +9443,11 @@ fn compute_window_at(
             let mut sum = 0.0f64;
             let mut isum = 0i64;
             let mut int_exact = true;
+            // KBN compensation for the frame's f64 running sum — the
+            // window re-aggregation runs the SAME compensated sumStep
+            // discipline SQLite's window code replays per frame
+            // (verified bit-exact against bundled SQLite 3.46).
+            let mut comp = 0.0f64;
             let mut count = 0i64;
             let mut total_count = 0i64;
             let mut min: Option<Value> = None;
@@ -9206,15 +9464,29 @@ fn compute_window_at(
                     match &v {
                         Value::Integer(i) => {
                             isum += i;
-                            sum += *i as f64;
+                            if !int_exact {
+                                // Post-flip integers are doubles through
+                                // the KBN step (SQLite's sumStep).
+                                kbn_step(&mut sum, &mut comp, *i as f64);
+                            }
                         }
                         Value::Real(r) => {
-                            int_exact = false;
-                            sum += r;
+                            if int_exact {
+                                // The flip: (double)iSum folds in ONCE,
+                                // compensation starts from zero.
+                                int_exact = false;
+                                sum = isum as f64;
+                                comp = 0.0;
+                            }
+                            kbn_step(&mut sum, &mut comp, *r);
                         }
                         other => {
-                            int_exact = false;
-                            sum += value_as_f64(other);
+                            if int_exact {
+                                int_exact = false;
+                                sum = isum as f64;
+                                comp = 0.0;
+                            }
+                            kbn_step(&mut sum, &mut comp, value_as_f64(other));
                         }
                     }
                     match &min {
@@ -9251,15 +9523,24 @@ fn compute_window_at(
                     } else if int_exact {
                         Ok(Value::Integer(isum))
                     } else {
-                        Ok(Value::Real(sum))
+                        // sumFinalize's approx arm: rSum + rErr.
+                        Ok(Value::Real(sum + comp))
                     }
                 }
-                "total" => Ok(Value::Real(sum)),
+                "total" => Ok(Value::Real(if int_exact {
+                    isum as f64
+                } else {
+                    sum + comp
+                })),
                 "avg" => {
                     if count == 0 {
                         Ok(Value::Null)
                     } else {
-                        Ok(Value::Real(sum / count as f64))
+                        // SQLite avgFinalize over the frame: the
+                        // int-exact partial converts once, else the
+                        // compensated f64 sum; raw r/cnt, no rounding.
+                        let r = if int_exact { isum as f64 } else { sum + comp };
+                        Ok(Value::Real(r / count as f64))
                     }
                 }
                 "min" => Ok(min.unwrap_or(Value::Null)),

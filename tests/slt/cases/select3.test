@@ -68,7 +68,7 @@ SELECT SUM(qty) FROM sales
 query R
 SELECT AVG(qty) FROM sales
 ----
-6.8333333333
+6.833333333333333
 
 # MIN/MAX with NULLs.
 query II
@@ -269,6 +269,6 @@ SELECT 5, COUNT(*)
 query IIII
 SELECT COUNT(*), COUNT(qty), SUM(qty), AVG(qty) FROM sales
 ----
-7 6 41 6.8333333333
+7 6 41 6.833333333333333
 
 halt

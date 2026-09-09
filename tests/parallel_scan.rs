@@ -646,3 +646,269 @@ fn groupby_fused_projection_survives_wrappers() {
         assert_eq!(cols_q, cols_s, "columns mismatch for {sql}");
     }
 }
+
+// ============================================================================
+// Parallel unbounded ORDER BY — chunk sort + k-way range-ordered merge
+// ============================================================================
+
+#[test]
+fn parallel_order_by_matches_serial() {
+    // Unbounded, multi-term, mixed ASC/DESC, ties in v (v = id % 1000
+    // repeats), REAL and INTEGER key columns.
+    let (par, ser) = both_ways("SELECT id, v, r, cat FROM t ORDER BY v DESC, r ASC, id");
+    assert_eq!(par.len(), BIG as usize);
+    assert_eq!(
+        par, ser,
+        "parallel ORDER BY must equal the serial stable sort"
+    );
+}
+
+#[test]
+fn parallel_order_by_desc_single_key_with_ties() {
+    // Heavy ties: ORDER BY cat (100 buckets over 300k rows) — the rowid
+    // tiebreak must reproduce scan order inside every tie class.
+    let (par, ser) = both_ways("SELECT id, cat FROM t ORDER BY cat DESC");
+    assert_eq!(par.len(), BIG as usize);
+    assert_eq!(par, ser);
+
+    // Spot-check the tie discipline: within one cat class, rowids ascend.
+    let first_cat = match &par[0][1] {
+        Value::Integer(c) => *c,
+        other => panic!("cat must be INTEGER, got {other:?}"),
+    };
+    let mut prev_rowid = i64::MIN;
+    for row in par.iter().take_while(|r| r[1] == Value::Integer(first_cat)) {
+        let id = match &row[0] {
+            Value::Integer(i) => *i,
+            other => panic!("id must be INTEGER, got {other:?}"),
+        };
+        assert!(id >= prev_rowid, "ties must keep rowid (scan) order");
+        prev_rowid = id;
+    }
+}
+
+#[test]
+fn parallel_order_by_real_key_matches_serial() {
+    let (par, ser) = both_ways("SELECT id, r FROM t ORDER BY r, id DESC");
+    assert_eq!(par.len(), BIG as usize);
+    assert_eq!(par, ser);
+}
+
+#[test]
+fn parallel_order_by_ordinal_and_alias() {
+    // Ordinal keys + an aliased scan (prefix-qualified column refs).
+    let (par, ser) = both_ways("SELECT id, v FROM t AS x ORDER BY 2 DESC, 1");
+    assert_eq!(par, ser);
+    let (par, ser) = both_ways("SELECT x.id, x.v FROM t AS x ORDER BY x.v, x.id DESC");
+    assert_eq!(par, ser);
+}
+
+#[test]
+fn parallel_order_by_with_projection_above() {
+    // Project(Sort(Scan)) shape: the projection consumes the sorted scan.
+    let (par, ser) = both_ways("SELECT v, r FROM t ORDER BY v DESC, r, id");
+    assert_eq!(par.len(), BIG as usize);
+    assert_eq!(par, ser);
+}
+
+#[test]
+fn parallel_order_by_hidden_rowid_table() {
+    // No INTEGER PRIMARY KEY: the scan appends the hidden rowid slot;
+    // ORDER BY rowid exercises the trailing-slot key.
+    fn build() -> Database {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE h (a INTEGER, b TEXT)", [])
+            .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        let mut i = 0i64;
+        while i < BIG {
+            let hi = (i + 1000).min(BIG);
+            let mut sql = String::from("INSERT INTO h (a, b) VALUES ");
+            for j in i..hi {
+                if j > i {
+                    sql.push(',');
+                }
+                // a ties heavily (1000 distinct), b ties within a.
+                sql.push_str(&format!("({}, 'k{}')", j % 1000, j % 10));
+            }
+            db.execute(&sql, []).unwrap();
+            i = hi;
+        }
+        db.execute("COMMIT", []).unwrap();
+        db
+    }
+    let par = build();
+    let mut ser = build();
+    ser.execute("PRAGMA parallel_scan=0", []).unwrap();
+
+    let q1 = "SELECT a, b FROM h ORDER BY a, b";
+    assert_eq!(
+        rows_of(&par, q1),
+        rows_of(&ser, q1),
+        "hidden-rowid: ORDER BY a, b"
+    );
+
+    let q2 = "SELECT a, b FROM h ORDER BY rowid DESC";
+    assert_eq!(
+        rows_of(&par, q2),
+        rows_of(&ser, q2),
+        "hidden-rowid: ORDER BY rowid DESC"
+    );
+
+    let q3 = "SELECT a, b, rowid FROM h ORDER BY a DESC, rowid";
+    assert_eq!(
+        rows_of(&par, q3),
+        rows_of(&ser, q3),
+        "hidden-rowid: projected rowid"
+    );
+}
+
+// ============================================================================
+// Fused aggregate filters with bound parameters
+// ============================================================================
+
+fn both_ways_bound(sql: &str, params: [Value; 1]) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+    let par = big_db();
+    let mut ser = big_db();
+    ser.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let a = par.query(sql, params.clone()).unwrap();
+    let b = ser.query(sql, params).unwrap();
+    (a, b)
+}
+
+#[test]
+fn parallel_fused_aggregate_param_filter_matches_serial() {
+    // `WHERE v > ?`: the fused filter materializes the parameter ONCE
+    // (positional `?`), and the worker-split walk must return exactly
+    // the serial values.
+    let (a, b) = both_ways_bound(
+        "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t WHERE v > ?",
+        [Value::Integer(100_000)],
+    );
+    assert_eq!(a, b, "param-filtered fused aggregate: parallel == serial");
+    let n = match &a[0][0] {
+        Value::Integer(n) => *n,
+        other => panic!("COUNT(*) INTEGER expected, got {other:?}"),
+    };
+    assert!(n > 40_000 && n <= 50_000, "unexpected cardinality {n}");
+
+    // Same bound value, literal spelling — both paths must agree.
+    let (lit, _) = both_ways("SELECT COUNT(*), SUM(v), AVG(v) FROM t WHERE v > 100000");
+    assert_eq!(a[0][0], lit[0][0]);
+    assert_eq!(a[0][1], lit[0][1]);
+    assert_eq!(a[0][2], lit[0][2]);
+}
+
+#[test]
+fn fused_aggregate_param_filter_swapped_and_eq() {
+    // Swapped operand order (`? < v`) and an equality param filter.
+    let (a, b) = both_ways_bound(
+        "SELECT COUNT(*), AVG(v) FROM t WHERE 100000 < v",
+        [Value::Integer(0)], // unused — shapes use literals here
+    );
+    assert_eq!(a, b);
+
+    let (a, b) = both_ways_bound(
+        "SELECT COUNT(*), SUM(r), AVG(r) FROM t WHERE cat = ?",
+        [Value::Integer(42)],
+    );
+    assert_eq!(a, b, "param equality filter");
+    let n = match &a[0][0] {
+        Value::Integer(n) => *n,
+        other => panic!("COUNT(*) INTEGER expected, got {other:?}"),
+    };
+    assert_eq!(n, 3000, "cat = 42 over 300k rows in 100 buckets");
+}
+
+#[test]
+fn fused_aggregate_named_param_filter() {
+    // Named parameter materialization (`:lim`) through the prepared-
+    // statement bind path: the fused filter resolves the named value
+    // once, and parallel == serial.
+    use rustqlite::{StepResult, Value as V};
+
+    fn run(db: &mut Database, bind: fn(&mut rustqlite::Statement, V)) -> Vec<Vec<Value>> {
+        let mut stmt = db
+            .prepare("SELECT COUNT(*), SUM(v) FROM t WHERE v > :lim")
+            .unwrap();
+        bind(&mut stmt, V::Integer(50_000));
+        let mut rows = Vec::new();
+        while stmt.step().unwrap() == StepResult::Row {
+            rows.push(stmt_row(&stmt));
+        }
+        rows
+    }
+    fn stmt_row(stmt: &rustqlite::Statement) -> Vec<Value> {
+        (0..stmt.column_count())
+            .map(|i| stmt.column_value(i).cloned().unwrap_or(Value::Null))
+            .collect()
+    }
+
+    let mut par = big_db();
+    let mut ser = big_db();
+    ser.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let a = run(&mut par, |s, v| {
+        s.bind_named(":lim", v).unwrap();
+    });
+    let b = run(&mut ser, |s, v| {
+        s.bind_named(":lim", v).unwrap();
+    });
+    assert_eq!(a, b, "named-param fused filter: parallel == serial");
+    // v > 50000 over 300k rows = 100000 rows minus the sparse NULL-v
+    // rows the generator plants ((j % 100) >= 97 && j % 7 == 0).
+    let n = match &a[0][0] {
+        Value::Integer(n) => *n,
+        other => panic!("COUNT(*) INTEGER expected, got {other:?}"),
+    };
+    assert!((99_000..=100_000).contains(&n), "unexpected count {n}");
+    let _ = V::Null;
+}
+
+#[test]
+fn fused_aggregate_null_param_filter_declines_cleanly() {
+    // A NULL (or text) param filter must decline to the generic path and
+    // still produce the correct (empty) result, serial and parallel.
+    let par = big_db();
+    let mut ser = big_db();
+    ser.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let a = par
+        .query("SELECT COUNT(*), SUM(v) FROM t WHERE v > ?", [Value::Null])
+        .unwrap();
+    let b = ser
+        .query("SELECT COUNT(*), SUM(v) FROM t WHERE v > ?", [Value::Null])
+        .unwrap();
+    assert_eq!(a, b);
+    assert_eq!(
+        a[0][0],
+        Value::Integer(0),
+        "NULL comparison filters nothing"
+    );
+}
+
+#[test]
+fn parallel_fused_aggregate_expression_arg_declines() {
+    // `total(v * 1.0)` is not a bare-column arg: the fused machine must
+    // decline — the parallel plan once accepted it as a COUNT(*)-style
+    // placeholder (slot None = NumVal::I(1)) and summed 1-per-row,
+    // 300000 instead of ~0. Surfaced by the numeric-parity suite
+    // against real SQLite; the serial fused path always declined it.
+    let (par, ser) = both_ways("SELECT total(v * 1.0), sum(v + 0) FROM t");
+    assert_eq!(
+        par, ser,
+        "expression-arg aggregate must fall back identically"
+    );
+    let tot = match &par[0][0] {
+        Value::Real(f) => *f,
+        Value::Integer(i) => *i as f64,
+        other => panic!("total must be numeric, got {other:?}"),
+    };
+    assert!(
+        (tot - par[0][1].as_real()).abs() < 1e-6,
+        "total(v*1.0) must equal sum(v+0) numerically: {tot} vs {}",
+        par[0][1].as_real()
+    );
+    assert!(
+        tot.abs() > 1000.0,
+        "must not be a 1-per-row placeholder: {tot}"
+    );
+}
