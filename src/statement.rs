@@ -412,7 +412,8 @@ impl<'a> Statement<'a> {
                 // instead of 64. Wrapper drivers still receive exact
                 // budgets from THEIR callers, so LIMIT/OFFSET accounting
                 // is unaffected.
-                let batch = drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS, &mut self.row_pool)?;
+                let batch =
+                    drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS, &mut self.row_pool)?;
                 if batch.is_empty() {
                     self.done = true;
                     self.stream = StreamState::Exhausted;
@@ -1557,21 +1558,29 @@ impl Driver for ProjectedRangeDriver {
         let mut last = self.last_rowid;
         let mut hit_end = true;
         let mut batch_bytes = 0usize;
-        bt.scan_table_range_selective_pooled(lo, hi, n_cols, &self.project, rowid_alias, pool, |rowid, row| {
-            if out.len() >= budget {
-                hit_end = false;
-                return false; // resume NEXT batch at this row
-            }
-            batch_bytes += row_heap_bytes(&row);
-            out.push(row);
-            // `last` tracks only PUSHED rows (see ProjectedScanDriver).
-            last = rowid;
-            if batch_bytes >= MAX_BATCH_BYTES {
-                hit_end = false;
-                return false;
-            }
-            true
-        })?;
+        bt.scan_table_range_selective_pooled(
+            lo,
+            hi,
+            n_cols,
+            &self.project,
+            rowid_alias,
+            pool,
+            |rowid, row| {
+                if out.len() >= budget {
+                    hit_end = false;
+                    return false; // resume NEXT batch at this row
+                }
+                batch_bytes += row_heap_bytes(&row);
+                out.push(row);
+                // `last` tracks only PUSHED rows (see ProjectedScanDriver).
+                last = rowid;
+                if batch_bytes >= MAX_BATCH_BYTES {
+                    hit_end = false;
+                    return false;
+                }
+                true
+            },
+        )?;
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
         Ok(out)
@@ -1679,7 +1688,11 @@ impl Driver for ScanDriver {
                 None => Vec::with_capacity(n_cols + 1),
             };
             if crate::storage::row_codec::decode_row_into(
-                payload, n_cols, rowid, rowid_alias, &mut row,
+                payload,
+                n_cols,
+                rowid,
+                rowid_alias,
+                &mut row,
             )
             .is_ok()
             {
@@ -1890,7 +1903,11 @@ impl Driver for FilteredScanDriver {
                         None => Vec::with_capacity(n_cols + 1),
                     };
                     if crate::storage::row_codec::decode_row_into(
-                        payload, n_cols, rowid, rowid_alias, &mut row,
+                        payload,
+                        n_cols,
+                        rowid,
+                        rowid_alias,
+                        &mut row,
                     )
                     .is_ok()
                     {
@@ -1945,7 +1962,11 @@ impl Driver for FilteredScanDriver {
                                 None => Vec::with_capacity(n_cols + 1),
                             };
                             if crate::storage::row_codec::decode_row_into(
-                                payload, n_cols, rowid, rowid_alias, &mut row,
+                                payload,
+                                n_cols,
+                                rowid,
+                                rowid_alias,
+                                &mut row,
                             )
                             .is_ok()
                             {
@@ -2042,7 +2063,11 @@ impl Driver for FilteredScanDriver {
                     None => Vec::with_capacity(n_cols + 1),
                 };
                 if crate::storage::row_codec::decode_row_into(
-                    payload, n_cols, rowid, rowid_alias, &mut row,
+                    payload,
+                    n_cols,
+                    rowid,
+                    rowid_alias,
+                    &mut row,
                 )
                 .is_ok()
                 {
@@ -2189,7 +2214,11 @@ impl Driver for RangeDriver {
                 None => Vec::with_capacity(n_cols + 1),
             };
             if crate::storage::row_codec::decode_row_into(
-                payload, n_cols, rowid, rowid_alias, &mut row,
+                payload,
+                n_cols,
+                rowid,
+                rowid_alias,
+                &mut row,
             )
             .is_ok()
             {

@@ -20,3 +20,22 @@ Stage Summary:
 - S06 range scan step path: 0.92x LOSS → 1.43x+ WIN
 - New: tests/replace_cell.rs; btree.rs apply_leaf_replace + scan_table_range_selective_pooled; statement.rs row_pool.
 - Remaining gaps: parallel join (multi-table world), index overflow interop, preupdate hooks, CAST/ORDER-BY on non-UTF-8 files, ptrmap write.
+
+---
+Task ID: 2
+Agent: main
+Task: Verify parallel-join WIP, close the join-correlated regression, update README, push
+
+Work Log:
+- Rebuilt context after session outage; parallel-join probe (try_parallel_join_probe in executor/parallel.rs + mod.rs wiring) built clean; tests/parallel_join.rs 5/5 green.
+- Probe benchmark (this host, 2 cores): 1M x 1M join, 3M out — serial 468.4 ms, parallel 451.6 ms, SQLite 624.2 ms => 1.38x vs SQLite. Parallel split only 1.04x (2-core box; build side serial).
+- Full matrix run exposed a REGRESSION: correlated_with_join_context FAILED — the new no-Project fused-join path synthesized combined rows with UNQUALIFIED output names ("id" not "u.id"/"o.id"), so downstream correlated resolution of `o.id` bound to the FIRST same-named column (users.id) instead of orders.id.
+- FIX: synthesized ProjectExprs now carry alias: Some(qualified name) so the join's output columns are byte-identical to the materialized path's combined columns ("u.id", "o.id", ...). Correlated 7/7 green after fix.
+- Full matrix re-verified: 677 passed / 0 failed across 48 test binaries (release, fat-LTO). cargo fmt applied (new example/test files) and fmt --check clean; release build warning-free (unused_mut removed in btree.rs).
+- README updated to current state: 675+ tests (was 650+), UPDATE-by-PK table row 1.26 ms vs 1.90 ms (1.51x, post in-leaf replace), new 1M-row parallel table join row (1.38x), "Where the wins come from" parallel-join bullet, gap ledger rewritten (parallel executor coverage now includes join probe split; "two narrow serial rows" -> one).
+
+Stage Summary:
+- Parallel JOIN probe: verified, bit-identical to serial, 1.38x vs SQLite at 1M scale.
+- Join-context correlated-subquery regression: found by full-matrix verification, fixed by qualified synthesized column names.
+- 677/677 green; fmt + release build clean; README current; ready to commit + push.
+- Remaining gaps (unchanged): preupdate hooks, index-overflow interop, non-BINARY collation write, ptrmap write, CAST/ORDER-BY on non-UTF-8 files, WAL sidecar for SQLite-format mode.

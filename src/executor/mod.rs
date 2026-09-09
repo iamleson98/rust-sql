@@ -9740,17 +9740,41 @@ fn try_fused_scan_hash_join(
         } if table.vtab.is_none() => (table, alias),
         _ => return Ok(None),
     };
-    let columns = match projection {
-        Some(c) => c,
-        None => return Ok(None),
-    };
-    if columns.is_empty() {
-        return Ok(None);
-    }
     // Static column lists (identical to what exec_scan reports).
     let l_cols = scan_columns_static(l_table, l_alias);
     let r_cols = scan_columns_static(r_table, r_alias);
     let n_left = l_cols.len();
+    // None = no Project above the join: synthesize the FULL combined row
+    // (every column of both sides, left then right — exactly the
+    // materialized path's combined layout, minus materializing the sides).
+    let synthesized: Vec<crate::planner::plan::ProjectExpr>;
+    let columns: &[crate::planner::plan::ProjectExpr] = match projection {
+        Some(c) => c,
+        None => {
+            synthesized = l_cols
+                .iter()
+                .chain(r_cols.iter())
+                .map(|s| crate::planner::plan::ProjectExpr {
+                    expr: Expr::Column {
+                        table: None,
+                        name: s.to_string(),
+                    },
+                    // The synthesized rows must be scope-compatible with the
+                    // materialized path's combined columns: QUALIFIED names
+                    // ("u.id", "o.id"). Without the alias, the display-name
+                    // pass strips the qualifier and downstream nodes (a WHERE
+                    // with a correlated subquery binding `o.id`, an outer
+                    // Project, ORDER BY) resolve same-named columns to the
+                    // FIRST match — users.id instead of orders.id.
+                    alias: Some(s.to_string()),
+                })
+                .collect();
+            &synthesized
+        }
+    };
+    if columns.is_empty() {
+        return Ok(None);
+    }
     // Single pure equi-join key.
     let eq_pairs = extract_equi_join_keys(condition, &l_cols, &r_cols);
     if eq_pairs.len() != 1 {
@@ -10063,6 +10087,33 @@ fn try_fused_scan_hash_join(
     // Top-bits shift for multiplicative hashing (see the build comment).
     let hash_shift = 64 - table_cap.trailing_zeros();
 
+    // ---- PROBE (parallel split first): the build state is read-only
+    // now, so the probe side's rowid space can split across workers —
+    // the multi-table parallelism the single-table paths already have.
+    // Range-ordered partial concatenation reproduces the serial probe
+    // scan's row order exactly; any gate decline or worker error falls
+    // through to the serial walk below, unchanged.
+    {
+        let out_slots_plain: Vec<(bool, usize)> =
+            out_slots.iter().map(|s| (s.from_build, s.pos)).collect();
+        if let Some(rows) = crate::executor::parallel::try_parallel_join_probe(
+            ctx,
+            probe.root,
+            probe.n_cols,
+            &probe_wanted,
+            probe_alias,
+            probe_key_pos,
+            &built,
+            &out_slots_plain,
+            out_combined.len(),
+        )? {
+            let columns_out: std::sync::Arc<[String]> = out_names.into();
+            return Ok(Some(ExecResult {
+                columns: columns_out,
+                rows,
+            }));
+        }
+    }
     // ---- PROBE: stream scan + selective decode + emit -------------------
     let n_out = out_combined.len();
     let mut out_rows: Vec<Row> = Vec::with_capacity(probe.count.max(1));
@@ -10196,12 +10247,14 @@ fn exec_hash_join(
             join_type
         );
     }
-    if projection.is_some()
-        && matches!(
-            join_type,
-            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
-        )
-    {
+    if matches!(
+        join_type,
+        crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+    ) {
+        // None (no Project above the join — e.g. an Aggregate directly
+        // over the join) takes the fused path too: it emits FULL combined
+        // rows, still streaming — the materialized path below executes
+        // BOTH sides into Vec<Row> first.
         if let Some(res) = try_fused_scan_hash_join(ctx, left, right, condition, projection)? {
             return Ok(res);
         }

@@ -2,10 +2,11 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **650+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **675+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
-> against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks, and
-> bit-exact f64 parity suites for SUM/AVG/window arithmetic against bundled SQLite).
+> against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
+> sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
+> arithmetic against bundled SQLite).
 > **Beats SQLite on every benchmark row — win or statistical parity** (see
 > [Performance vs SQLite](#performance-vs-sqlite)). **Resource consumption at parity or
 > better** (byte-exact file size, lower peak RSS — see
@@ -360,7 +361,7 @@ The harness applies an **adaptive warmup** identically to both engines: `best_of
 | 2-table join (PK filter)              | 2.98 µs     | 2.94 µs    | parity (± noise) |
 | 3-table join (PK filter, 50 out)      | **16.0 µs** | 21.5 µs    | **1.35x faster** |
 | 2-table join + GROUP BY               | **1.73 ms** | 2.90 ms    | **1.68x faster** |
-| UPDATE by PK (1k ops)                 | **1.70 ms** | 1.85 ms    | **1.09x faster** |
+| UPDATE by PK (1k ops)                 | **1.26 ms** | 1.90 ms    | **1.51x faster** |
 | UPDATE range (val > 5000)             | **670 µs**  | 1.13 ms    | **1.69x faster** |
 | DELETE by PK (1k ops)                 | **636 µs**  | 1.37 ms    | **2.15x faster** |
 | Mixed 80/20 read/write (5k ops)       | **1.87 ms** | 2.45 ms    | **1.31x faster** |
@@ -377,6 +378,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 | Top-25 ORDER BY REAL DESC (full rows) | **96.5 ms** | 214.9 ms   | **2.2x faster**  |
 | Top-50 ORDER BY INT DESC OFFSET 100   | **26.0 ms** | 68.7 ms    | **2.6x faster**  |
 | ORDER BY INT DESC (unbounded)         | **188.4 ms**| 261.1 ms   | **1.4x faster**  |
+| 2-table equi-JOIN (1M × 1M, 3M out)   | **451.6 ms**| 624.2 ms  | **1.38x faster** |
 
 ### Where the wins come from
 
@@ -387,6 +389,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index and touches only matching rows; UPDATE rewrites payloads in place where possible (payload-patch fast path). UPDATEs whose WHERE is an exact unique-index probe (`WHERE k = ?`, `WHERE k IN (...)`) take an index-point path — seek, rowid fetch, payload patch — and `IN` probes keep every key's matches in per-key scratch buffers.
 - **Top-N**: per-worker bounded keep-heaps under the statement's exact total order, merged range-ordered — the serial streaming top-N's own algorithm, split across workers.
 - **Unbounded sorts**: `ORDER BY` without a LIMIT splits the rowid space; each worker chunk-sorts its range under the statement's (keys, rowid) total order and the main thread k-way merges under the same order — bit-identical to the serial stable sort. A 1:1 bare-column projection above the sort (`SELECT id, val ... ORDER BY val`) is fused into the worker decode: only the projected + key columns are ever materialized, so wide TEXT columns the projection would discard are never decoded.
+- **Joins (parallel probe)**: the fused streaming hash join builds the smaller side's hash table once, then splits the PROBE side's rowid space across workers — each worker selective-decodes its range and probes the read-only build state into its own buffer; partials concatenate in range order, reproducing the serial probe's row order bit for bit (`tests/parallel_join.rs` pins the equality). Aggregates directly over a join (`SELECT COUNT(*), SUM(a.x) FROM a JOIN b ON b.k = a.k`) ride the same fused path — no full-row materialization of either side. 1M×1M → 3M output rows: 1.38x vs SQLite on 2 cores.
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
 - **Concurrency**: see the [concurrency section](#concurrency-vs-sqlite) — the 8.3x concurrent-read and 5.7–8.3x parallel-aggregate multipliers sit on top of these serial wins.
@@ -653,10 +656,12 @@ compat surface. Every entry says what it costs and why it exists.
 
 ### Performance gaps
 
-- **Two narrow serial rows**: the unfiltered 2-table PK join sits at parity in
+- **One narrow serial row**: the unfiltered 2-table PK join sits at parity in
   the cold best-of-5 table (1.43x under proper warmup — see
-  [Performance](#performance-vs-sqlite)), and UPDATE by PK is 1.09x. Both
-  grow with table size and index selectivity.
+  [Performance](#performance-vs-sqlite)); at 1M-row scale the parallel probe
+  join takes it to 1.38x. UPDATE by PK cleared to **1.51x** (in-leaf
+  shape-changing replace: a payload that grows or shrinks no longer pays
+  delete+insert — the new cell is written into the old cell's slot).
 - **S06 range scan materializing 100k rows (0.72–1.13x by host)**: through
   the streaming prepared-statement path (`step` + per-row consume) rustqlite
   is near-parity on this shape — the per-row `Row` allocation in the step
@@ -678,10 +683,13 @@ compat surface. Every entry says what it costs and why it exists.
   statistics alone cannot fix).
 - **Parallel executor coverage**: single-table shapes split (aggregates with
   literal **or parameter** filters, GROUP BY bare/compiled, top-N, unbounded
-  ORDER BY with a fused 1:1 projection); what remains serial is the
-  multi-table / multi-node world — joins, subqueries, compound bodies,
-  DISTINCT aggregates, and sorts whose terms are expressions or carry
-  `COLLATE` (only bare-column and ordinal terms split).
+  ORDER BY with a fused 1:1 projection), and the **equi-JOIN probe side now
+  splits too** — the fused hash join's build state is read-only, so workers
+  probe disjoint rowid ranges and concatenate range-ordered (bit-identical
+  to serial; `tests/parallel_join.rs`). Still serial: subqueries, compound
+  bodies, DISTINCT aggregates, sorts whose terms are expressions or carry
+  `COLLATE` (only bare-column and ordinal terms split), and the non-fused
+  join shapes (outer joins, multi-key and non-equi conditions).
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled
@@ -895,7 +903,7 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 650+ tests in the
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 675+ tests in the
 default matrix, all passing, plus the sqlx feature suite:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |

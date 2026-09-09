@@ -142,12 +142,17 @@ fn replace_indexed_column_unchanged() {
     }
     for i in 1..=300i64 {
         let rows = db
-            .query("SELECT id, name FROM t WHERE val = ?", [Value::Integer(i * 3)])
+            .query(
+                "SELECT id, name FROM t WHERE val = ?",
+                [Value::Integer(i * 3)],
+            )
             .unwrap();
         assert_eq!(rows.len(), 1, "val={} missing after reindex", i * 3);
         assert_eq!(rows[0][1], Value::Text(format!("name-{}", i * 111).into()));
     }
-    let rows = db.query("SELECT COUNT(*) FROM t WHERE val > 0", []).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM t WHERE val > 0", [])
+        .unwrap();
     assert_eq!(rows[0][0], Value::Integer(300));
 }
 
@@ -158,7 +163,9 @@ fn replace_range_update_size_mix() {
     seed(&mut db, 2000);
     db.execute("UPDATE t SET score = score * 2.5 WHERE val > 100", [])
         .unwrap();
-    let rows = db.query("SELECT COUNT(*), SUM(score) FROM t WHERE val > 100", []).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*), SUM(score) FROM t WHERE val > 100", [])
+        .unwrap();
     assert_eq!(rows[0][0], Value::Integer(1950));
     let expect: f64 = (51..=2000).map(|i| i as f64 * 1.5 * 2.5).sum();
     assert_eq!(rows[0][1], Value::Real(expect));
@@ -197,13 +204,18 @@ fn replace_heavy_churn_persistence() {
     }
     let ic = db.query("PRAGMA integrity_check", []).unwrap();
     assert_eq!(ic[0][0], Value::Text("ok".into()));
-    let before = db.query("SELECT id, name, score FROM t ORDER BY id", []).unwrap();
+    let before = db
+        .query("SELECT id, name, score FROM t ORDER BY id", [])
+        .unwrap();
     drop(db);
     let mut db2 = Database::open(path.to_str().unwrap()).unwrap();
-    let after = db2.query("SELECT id, name, score FROM t ORDER BY id", []).unwrap();
+    let after = db2
+        .query("SELECT id, name, score FROM t ORDER BY id", [])
+        .unwrap();
     assert_eq!(before, after);
     // The reopened tree must still update fine (hints rebuilt).
-    db2.execute("UPDATE t SET score = 1.5 WHERE id = 10", []).unwrap();
+    db2.execute("UPDATE t SET score = 1.5 WHERE id = 10", [])
+        .unwrap();
     let rows = db2.query("SELECT score FROM t WHERE id = 10", []).unwrap();
     assert_eq!(rows[0][0], Value::Real(1.5));
     drop(db2);
@@ -227,7 +239,9 @@ fn replace_overflow_fallback() {
             [Value::Text("b".repeat(n).into())],
         )
         .unwrap();
-        let rows = db.query("SELECT LENGTH(name), val FROM t WHERE id = 1", []).unwrap();
+        let rows = db
+            .query("SELECT LENGTH(name), val FROM t WHERE id = 1", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(n as i64));
         assert_eq!(rows[0][1], Value::Integer(10));
         // Shrink back below page size (exercises both fallbacks).
@@ -236,7 +250,9 @@ fn replace_overflow_fallback() {
             [Value::Text("small".into())],
         )
         .unwrap();
-        let rows = db.query("SELECT LENGTH(name) FROM t WHERE id = 1", []).unwrap();
+        let rows = db
+            .query("SELECT LENGTH(name) FROM t WHERE id = 1", [])
+            .unwrap();
         assert_eq!(rows[0][0], Value::Integer(5));
     }
     let ic = db.query("PRAGMA integrity_check", []).unwrap();

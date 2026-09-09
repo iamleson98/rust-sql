@@ -3002,8 +3002,7 @@ impl<'a> Btree<'a> {
                     }
                 };
                 let page_id_now = page_ref.lock().id;
-                if let Some((pos, cell_ptr, n_rid, old_cell_size, payload_off, old_plen, psz)) =
-                    geo
+                if let Some((pos, cell_ptr, n_rid, old_cell_size, payload_off, old_plen, psz)) = geo
                 {
                     // Spilled rows never take the in-place patch path
                     // (their bytes span a chain, not the leaf).
@@ -3074,10 +3073,10 @@ impl<'a> Btree<'a> {
                             match cell_rowid.cmp(&rowid) {
                                 std::cmp::Ordering::Equal => {
                                     let plen_pos = cell_ptr + n_rid;
-                                    let (plen, n_plen) =
-                                        varint::decode(&borrowed.data[plen_pos..]).ok_or_else(
-                                            || Error::corruption("truncated payload length in update"),
-                                        )?;
+                                    let (plen, n_plen) = varint::decode(&borrowed.data[plen_pos..])
+                                        .ok_or_else(|| {
+                                            Error::corruption("truncated payload length in update")
+                                        })?;
                                     found = Some((
                                         mid,
                                         cell_ptr,
@@ -5662,7 +5661,7 @@ impl<'a> Btree<'a> {
         n_cols: usize,
         wanted: &[usize],
         rowid_alias: Option<usize>,
-        mut f: F,
+        f: F,
     ) -> Result<()>
     where
         F: FnMut(i64, Vec<Value>) -> bool,
@@ -5672,7 +5671,13 @@ impl<'a> Btree<'a> {
         // contract always did.
         let mut no_pool: Vec<Vec<Value>> = Vec::new();
         self.scan_table_range_selective_pooled(
-            start, end, n_cols, wanted, rowid_alias, &mut no_pool, f,
+            start,
+            end,
+            n_cols,
+            wanted,
+            rowid_alias,
+            &mut no_pool,
+            f,
         )
     }
 

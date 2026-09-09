@@ -1400,3 +1400,156 @@ pub(crate) fn try_parallel_sort(
         rows: out,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Parallel JOIN probe (the multi-table parallelism frontier)
+// ---------------------------------------------------------------------------
+
+/// One output-column source for the parallel probe: (from_build, pos).
+/// Mirrors the fused path's `OutSlot`.
+#[derive(Clone, Copy)]
+struct ProbeOutSlot {
+    from_build: bool,
+    pos: usize,
+}
+
+/// Fibonacci-hash slot for a u64 join key (same constants the build side
+/// uses — the two must agree or probes miss).
+#[inline]
+fn join_key_slot(k: u64, shift: u32, mask: usize) -> usize {
+    ((k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize) & mask
+}
+
+/// Parallel PROBE side of the fused scan-hash join
+/// (`try_fused_scan_hash_join`): the build state (`built`) is complete
+/// and read-only by now, so the probe table's rowid space can split
+/// across workers exactly like a single-table parallel aggregate — each
+/// worker selective-decodes its range, probes the shared open-addressing
+/// table, and emits joined rows into its own buffer. Partials
+/// concatenate in RANGE order, which is the serial probe scan's row
+/// order: identical output, bit for bit.
+///
+/// Gates beyond [`plan_range_split`]: no committed-view scope armed on
+/// this thread (workers would read LIVE pages inside a foreign write
+/// transaction — the serial path's BEGIN-time snapshot semantics would
+/// be lost), and the fused path has already declined TEXT/BLOB build
+/// keys, so worker probe keys are numeric-only by construction (the
+/// worker re-checks per row anyway).
+///
+/// Returns `None` when any gate fails or a worker errors — the caller's
+/// serial probe walk runs unchanged.
+pub(crate) fn try_parallel_join_probe(
+    ctx: &ExecContext<'_>,
+    probe_root: u32,
+    probe_n_cols: usize,
+    probe_wanted: &[usize],
+    probe_alias: Option<usize>,
+    probe_key_pos: usize,
+    built: &StdArc<crate::storage::join_cache::JoinBuildState>,
+    out_slots: &[(bool, usize)],
+    n_out: usize,
+) -> Result<Option<Vec<crate::Row>>> {
+    let pager = ctx.pager;
+    // Committed-view scope: workers are foreign to the TLS arming.
+    if pager.committed_reads_armed() {
+        return Ok(None);
+    }
+    let Some(split) = plan_range_split(ctx, probe_root)? else {
+        return Ok(None);
+    };
+    let ranges = split.ranges;
+    let slots: &[crate::storage::join_cache::JoinSlot] = &built.slots;
+    let table_cap = slots.len().max(2).next_power_of_two();
+    debug_assert_eq!(table_cap, slots.len());
+    let table_mask = table_cap.wrapping_sub(1);
+    let hash_shift = 64 - table_cap.trailing_zeros();
+
+    let built = StdArc::clone(built);
+    let wanted: StdArc<Vec<usize>> = StdArc::new(probe_wanted.to_vec());
+    let out_slots: StdArc<Vec<ProbeOutSlot>> = StdArc::new(
+        out_slots
+            .iter()
+            .map(|&(from_build, pos)| ProbeOutSlot { from_build, pos })
+            .collect(),
+    );
+    let n_workers = ranges.len();
+    let partials: Vec<Result<Vec<crate::Row>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(n_workers);
+        for &(lo, hi) in ranges.iter() {
+            let built = StdArc::clone(&built);
+            let wanted = StdArc::clone(&wanted);
+            let out_slots = StdArc::clone(&out_slots);
+            handles.push(scope.spawn(move || -> Result<Vec<crate::Row>> {
+                let mut out_rows: Vec<crate::Row> = Vec::new();
+                let mut pbuf: Vec<crate::types::Value> = Vec::new();
+                let mut bt = Btree::new(pager, probe_root, false);
+                bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+                    if crate::storage::row_codec::decode_row_selective_sorted(
+                        payload,
+                        probe_n_cols,
+                        &wanted,
+                        rowid,
+                        probe_alias,
+                        &mut pbuf,
+                    )
+                    .is_err()
+                    {
+                        return true; // corrupt row: skip (serial parity)
+                    }
+                    let k = match pbuf.get(probe_key_pos) {
+                        Some(crate::types::Value::Integer(i)) => {
+                            crate::types::value::double_order_key(*i as f64)
+                        }
+                        Some(crate::types::Value::Real(f)) => {
+                            crate::types::value::double_order_key(*f)
+                        }
+                        _ => return true, // NULL/TEXT/BLOB: no match
+                    };
+                    let mut next = {
+                        let mut slot = join_key_slot(k, hash_shift, table_mask);
+                        loop {
+                            let existing = slots[slot].key;
+                            if existing == u64::MAX {
+                                break u32::MAX;
+                            }
+                            if existing == k {
+                                break slots[slot].head;
+                            }
+                            slot = (slot + 1) & table_mask;
+                        }
+                    };
+                    let stride = built.stride;
+                    while next != u32::MAX {
+                        let ord = next as usize;
+                        let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
+                        for s in out_slots.iter() {
+                            let v = if s.from_build {
+                                &built.build_vals[ord * stride + s.pos]
+                            } else {
+                                &pbuf[s.pos]
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                        next = built.chain[ord];
+                    }
+                    true
+                })?;
+                Ok(out_rows)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel join-probe worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+    let mut rows: Vec<crate::Row> = Vec::new();
+    for p in partials {
+        match p {
+            Ok(mut part) => rows.append(&mut part),
+            Err(_) => return Ok(None), // worker error: serial fallback
+        }
+    }
+    Ok(Some(rows))
+}
