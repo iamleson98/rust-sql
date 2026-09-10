@@ -1541,3 +1541,46 @@ fn regression_column_pk_autoindex_numbering_matches_textual_order() {
         );
     }
 }
+
+// ===========================================================================
+// ON CONFLICT upserts must not weaken UNIQUE enforcement for later
+// statements (2026-09-10, found while verifying the column-PK fix):
+// after an upsert hits the DO UPDATE branch, a plain duplicate insert
+// on the same key must still be rejected — the conflict-update path
+// must not leave index roots/max-rowids stale for the next writer.
+// ===========================================================================
+
+#[test]
+fn regression_upsert_then_dup_insert_still_rejects() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE p (user_id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES ('k1', 'a')", []).unwrap();
+    let dup0 = db.execute("INSERT INTO p VALUES ('k1', 'b')", []);
+    assert!(dup0.is_err(), "baseline: dup rejected before any upsert");
+
+    // Conflict-target upsert (literal + bound-param shapes).
+    db.execute(
+        "INSERT INTO p (user_id, name) VALUES ('k1', 'u') \
+         ON CONFLICT (user_id) DO UPDATE SET name = 'u'",
+        [],
+    )
+    .unwrap();
+    let dup1 = db.execute("INSERT INTO p VALUES ('k1', 'c')", []);
+    assert!(dup1.is_err(), "dup must stay rejected after a literal upsert");
+
+    db.execute(
+        "INSERT INTO p (user_id, name) VALUES (?, ?) \
+         ON CONFLICT (user_id) DO UPDATE SET name = excluded.name",
+        [Value::Text("k1".into()), Value::Text("v2".into())],
+    )
+    .unwrap();
+    let dup2 = db.execute("INSERT INTO p VALUES ('k1', 'd')", []);
+    assert!(dup2.is_err(), "dup must stay rejected after a bound upsert");
+
+    let n = db.query("SELECT COUNT(*) FROM p", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(1));
+}
