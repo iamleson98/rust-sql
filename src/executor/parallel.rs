@@ -52,6 +52,7 @@
 //! Worker count: `available_parallelism()` capped at 16, and scaled down
 //! for smaller tables (one worker per >= 32768 estimated rows).
 
+use std::option::Option as StdOption;
 use std::sync::Arc as StdArc;
 
 use crate::error::Result;
@@ -1166,10 +1167,19 @@ fn sort_total_cmp(
     a_rowid: i64,
     b_row: &[Value],
     b_rowid: i64,
-    keys: &[(usize, bool)],
+    keys: &[(usize, bool, StdOption<String>)],
 ) -> std::cmp::Ordering {
-    for &(col, desc) in keys {
-        let ord = super::value_cmp_conn(&a_row[col], &b_row[col]);
+    for &(col, desc, ref coll) in keys {
+        // COLLATE terms compare TEXT through the named collation —
+        // the SAME per-comparison lookup + fallback the serial
+        // exec_sort comparator uses, so the orders cannot diverge (a
+        // missing collation falls back to the connection comparator in
+        // both paths). The registry is process-global, so workers
+        // resolve the same collations the main thread would.
+        let ord = match coll.as_deref().and_then(crate::plugin::lookup_collation) {
+            Some(c) => crate::plugin::compare_collated(&a_row[col], &b_row[col], c.as_ref()),
+            None => super::value_cmp_conn(&a_row[col], &b_row[col]),
+        };
         let ord = if desc { ord.reverse() } else { ord };
         if ord != std::cmp::Ordering::Equal {
             return ord;
@@ -1222,7 +1232,7 @@ struct SortChunk {
 pub(crate) fn try_parallel_sort(
     ctx: &ExecContext<'_>,
     table: &StdArc<Table>,
-    keys: &[(usize, bool)],
+    keys: &[(usize, bool, StdOption<String>)],
     project: Option<&[usize]>,
     append_rowid: bool,
     out_cols: StdArc<[String]>,
@@ -1250,7 +1260,7 @@ pub(crate) fn try_parallel_sort(
     let scan_wanted: Vec<usize> = match project {
         Some(ps) => {
             let mut w = ps.to_vec();
-            for &(k, _) in keys {
+            for &(k, ..) in keys {
                 let k_eff = if k >= n_cols { rowid_proj } else { k };
                 if !w.contains(&k_eff) {
                     w.push(k_eff);
@@ -1263,10 +1273,10 @@ pub(crate) fn try_parallel_sort(
         None => (0..n_cols).collect(),
     };
     // Key position in the WORKER row (post-append in full-row mode).
-    let row_keys: Vec<(usize, bool)> = match project {
+    let row_keys: Vec<(usize, bool, StdOption<String>)> = match project {
         Some(_) => keys
             .iter()
-            .map(|&(k, d)| {
+            .map(|&(k, d, ref c)| {
                 let k_eff = if k >= n_cols { rowid_proj } else { k };
                 (
                     scan_wanted
@@ -1274,6 +1284,7 @@ pub(crate) fn try_parallel_sort(
                         .position(|&w| w == k_eff)
                         .expect("key column in wanted"),
                     d,
+                    c.clone(),
                 )
             })
             .collect(),
@@ -1368,7 +1379,7 @@ pub(crate) fn try_parallel_sort(
         mut i: usize,
         chunks: &[SortChunk],
         cursors: &[usize],
-        row_keys: &[(usize, bool)],
+        row_keys: &[(usize, bool, StdOption<String>)],
     ) {
         loop {
             let n = heap.len();

@@ -709,10 +709,16 @@ compat surface. Every entry says what it costs and why it exists.
   ORDER BY with a fused 1:1 projection), and the **equi-JOIN probe side now
   splits too** — the fused hash join's build state is read-only, so workers
   probe disjoint rowid ranges and concatenate range-ordered (bit-identical
-  to serial; `tests/parallel_join.rs`). Still serial: subqueries, compound
-  bodies, DISTINCT aggregates, sorts whose terms are expressions or carry
-  `COLLATE` (only bare-column and ordinal terms split), and the non-fused
-  join shapes (outer joins, multi-key and non-equi conditions).
+  to serial; `tests/parallel_join.rs`). ORDER BY terms carrying
+  `COLLATE` over a bare column split too — the collation name rides the
+  key tuple and the worker-local comparator resolves it exactly like the
+  serial path's per-comparison lookup (missing collations fall back to
+  the connection comparator in both paths; `tests/parallel_scan.rs`,
+  5-query differential battery). Still serial: subqueries, compound
+  bodies, DISTINCT aggregates, sorts whose terms are expressions (only
+  bare-column, ordinal, and collated-bare-column terms split — the
+  top-N fusion declines COLLATE), and the non-fused join shapes (outer
+  joins, multi-key and non-equi conditions).
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled

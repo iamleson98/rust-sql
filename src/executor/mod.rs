@@ -3911,13 +3911,18 @@ fn bare_sort_keys(
     table: &Table,
     alias: Option<&str>,
     row_width: usize,
-) -> Option<Vec<(usize, bool)>> {
-    let mut keys: Vec<(usize, bool)> = Vec::with_capacity(terms.len());
+) -> Option<Vec<(usize, bool, Option<String>)>> {
+    let mut keys: Vec<(usize, bool, Option<String>)> = Vec::with_capacity(terms.len());
     for term in terms {
-        if matches!(term.expr, Expr::Collate { .. }) {
-            return None;
-        }
-        let idx = match &term.expr {
+        // COLLATE over a bare column splits too: the collation NAME
+        // travels with the key and the comparator resolves it exactly
+        // like the serial path (lookup + fallback). Any other shape of
+        // Collate (over an expression) still declines.
+        let (expr, collation): (&Expr, Option<String>) = match &term.expr {
+            Expr::Collate { expr, collation } => (expr, Some(collation.clone())),
+            e => (e, None),
+        };
+        let idx = match expr {
             Expr::Literal(Value::Integer(k)) => {
                 if *k >= 1 && (*k as usize) <= row_width {
                     *k as usize - 1
@@ -3947,7 +3952,7 @@ fn bare_sort_keys(
                 }
             },
         };
-        keys.push((idx, term.order == Order::Desc));
+        keys.push((idx, term.order == Order::Desc, collation));
     }
     if keys.is_empty() {
         return None;

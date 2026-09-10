@@ -912,3 +912,111 @@ fn parallel_fused_aggregate_expression_arg_declines() {
         "must not be a 1-per-row placeholder: {tot}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Parallel sort with COLLATE terms: `ORDER BY name COLLATE NOCASE, ...`
+// splits across workers exactly like the bare-column sort, with the
+// collation NAME riding the key tuple (the comparator resolves it per
+// comparison — the same lookup + fallback the serial path uses, so the
+// orders cannot diverge).
+// ---------------------------------------------------------------------------
+
+fn text_db() -> Database {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    {
+        let mut i = 0i64;
+        while i < BIG {
+            let hi = (i + 1000).min(BIG);
+            let mut sql = String::from("INSERT INTO t (id, name, v) VALUES ");
+            for j in i..hi {
+                if j > i {
+                    sql.push(',');
+                }
+                // Mixed case so NOCASE actually reorders vs BINARY;
+                // shared prefixes force multi-term tie-breaks.
+                let name = match j % 5 {
+                    0 => format!("'user-{:05}'", j % 1000),
+                    1 => format!("'USER-{:05}'", j % 1000),
+                    2 => format!("'User-{:05}'", j % 1000),
+                    3 => format!("'uSeR-{:05}'", j % 1000),
+                    _ => format!("'UsEr-{:05}'", j % 1000),
+                };
+                sql.push_str(&format!("({}, {}, {})", j, name, -j));
+            }
+            db.execute(&sql, []).unwrap();
+            i = hi;
+        }
+    }
+    db.execute("COMMIT", []).unwrap();
+    db
+}
+
+#[test]
+fn parallel_sort_collate_matches_serial() {
+    let queries = [
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE",
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE DESC",
+        "SELECT id, name, v FROM t ORDER BY name COLLATE NOCASE, v DESC",
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE DESC, id",
+        "SELECT id, name FROM t ORDER BY name COLLATE RTRIM, id",
+    ];
+    for sql in queries {
+        let par = text_db();
+        let ser = {
+            let mut s = text_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), BIG as usize, "{sql}: row count");
+        assert_eq!(a, b, "{sql}: parallel COLLATE sort must equal serial");
+        // The first block under NOCASE must group the mixed-case
+        // spellings of the same name together (a BINARY order would
+        // not) — spot-check the ordering actually used the collation.
+        let sql_head = format!("{sql} LIMIT 400");
+        let head = rows_of(&par, &sql_head);
+        let mut sorted_groups = 0;
+        let mut prev: Option<String> = None;
+        for r in &head {
+            let key = match &r[1] {
+                Value::Text(t) => t.as_str().to_lowercase(),
+                other => panic!("{sql}: TEXT expected, got {other:?}"),
+            };
+            if prev.as_deref() != Some(key.as_str()) {
+                sorted_groups += 1;
+            }
+            prev = Some(key);
+        }
+        // 400 rows over ~200 distinct no-case keys (j % 1000 with 5-case
+        // groups): NOCASE collapses each key's 5 spellings adjacently.
+        assert!(
+            sorted_groups < 400,
+            "{sql}: NOCASE must collapse mixed-case spellings (got {sorted_groups} groups in 400 rows)"
+        );
+    }
+}
+
+#[test]
+fn parallel_sort_unknown_collation_falls_back_like_serial() {
+    // A COLLATE name that is not registered: BOTH paths fall back to
+    // the connection comparator (the serial comparator's
+    // unwrap_or_else and the parallel comparator's None arm) — the
+    // results must still match each other.
+    let sql = "SELECT id, name FROM t ORDER BY name COLLATE NOSUCHCOLL, id";
+    let par = text_db();
+    let ser = {
+        let mut s = text_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "unknown collation fallback must match serial");
+}
