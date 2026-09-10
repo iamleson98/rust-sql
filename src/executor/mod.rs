@@ -11293,6 +11293,23 @@ fn col_index(expr: &Expr, cols: &[String]) -> Option<usize> {
                         }
                     }
                 }
+                // Fallback: the executor's own resolver
+                // (`resolve_column_index`) falls through to UNQUALIFIED
+                // resolution when a qualified reference matches no dotted
+                // name — the shape that arises when a join side is a
+                // pushed-down RowidLookup / IndexLookup (those report
+                // PLAIN column names: `b.id` vs `id`). EXACT matching
+                // only — the suffix pass stays out: `b.k` must not
+                // "resolve" against a same-named `a.k` on the OTHER side
+                // (the fused join's purity check and the pair extraction
+                // both rely on qualified references being prefix-strict
+                // across sides; the general evaluator resolves over the
+                // COMBINED list where the pass order differs).
+                for (i, c) in cols.iter().enumerate() {
+                    if c.eq_ignore_ascii_case(name) {
+                        return Some(i);
+                    }
+                }
                 None
             }
             // Unqualified: exact match first (handles names like "id" against

@@ -359,6 +359,14 @@ impl<'a> Planner<'a> {
             plan = self.apply_where(plan, pred);
         }
 
+        // Inner-join reordering: flatten maximal INNER/CROSS join spines
+        // (3+ relations), estimate each atom's cardinality from its pushed
+        // access path + sqlite_stat1, and greedily rebuild the spine
+        // smallest-filtered-first. Runs AFTER pushdown (estimates read the
+        // pushed access paths) and BEFORE the INLJ rewrite (the reordered
+        // tree is what INLJ converts).
+        plan = reorder_inner_joins(self.catalog, plan);
+
         // Post-pass: rewrite eligible Hash joins to IndexNestedLoopJoin when
         // the inner side has an index on the join key. This is the single
         // biggest perf win for filtered joins (closes the 240× gap on the
@@ -756,15 +764,19 @@ impl<'a> Planner<'a> {
                 };
                 // JoinType is shared with the AST — no conversion needed.
                 let jt = *join_type;
-                let algo = if matches!(
+                // Hash whenever the condition carries at least one
+                // column-to-column equality leaf (a single `l = r` OR an
+                // AND-chain like `ON a.x = b.x AND a.y = b.y` — the
+                // materialized hash join extracts every equi pair and
+                // evaluates the rest as a residual per matched pair, which
+                // strictly dominates the nested loop's O(n·m) condition
+                // evaluation). Pure residual conditions (no equi leaf)
+                // keep the nested loop.
+                let has_equi = matches!(
                     constraint,
                     JoinConstraint::Natural | JoinConstraint::Using(_)
-                ) {
-                    JoinAlgorithm::Hash
-                } else if let Some(Expr::Binary {
-                    op: BinaryOp::Eq, ..
-                }) = &condition
-                {
+                ) || condition.as_ref().is_some_and(condition_has_equi_leaf);
+                let algo = if has_equi {
                     JoinAlgorithm::Hash
                 } else {
                     JoinAlgorithm::NestedLoop
@@ -2680,26 +2692,86 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
             pushdown_filter(catalog, (**right).clone(), &combine_and(&right_preds))
         };
 
+        // INNER/CROSS joins: a top conjunct that references BOTH sides is a
+        // JOIN CONDITION in disguise (`FROM a, b WHERE a.x = b.x` is
+        // exactly `… JOIN b ON a.x = b.x`) — fuse it into the join's
+        // condition instead of leaving it as a post-filter over a cross
+        // product. With the multi-equi Hash rule that turns the classic
+        // implicit-join syntax into a hash join. Outer joins keep every
+        // predicate on top (their ON/WHERE semantics differ).
+        let (fusable, kept_top): (Vec<Expr>, Vec<Expr>) =
+            if matches!(join_type, JoinType::Inner | JoinType::Cross) {
+                top_preds.into_iter().partition(|c| {
+                    !crate::executor::expr_has_subquery(c)
+                        && conjunct_spans_both_sides(c, &left_cols, &right_cols)
+                })
+            } else {
+                (Vec::new(), top_preds)
+            };
+
+        let condition = if fusable.is_empty() {
+            condition.clone()
+        } else {
+            let mut parts: Vec<Expr> = condition.iter().cloned().collect();
+            parts.extend(fusable);
+            Some(combine_and(&parts))
+        };
+        // Recompute the algorithm over the (possibly extended) condition:
+        // Hash whenever an equi leaf appeared; a residual-only condition
+        // keeps the nested loop; an untouched Natural/None shape keeps its
+        // original algorithm.
+        let algorithm = match &condition {
+            Some(c) if condition_has_equi_leaf(c) => JoinAlgorithm::Hash,
+            Some(_) => JoinAlgorithm::NestedLoop,
+            None => *algorithm,
+        };
+
         let new_join = Plan::Join {
             left: Box::new(new_left),
             right: Box::new(new_right),
             join_type: *join_type,
-            condition: condition.clone(),
-            algorithm: *algorithm,
+            condition,
+            algorithm,
         };
 
-        if top_preds.is_empty() {
+        if kept_top.is_empty() {
             new_join
         } else {
-            // Wrap remaining (non-pushable) conjuncts in a top-level Filter,
-            // but try the cheap index/rowid path on the Join as a whole first.
-            apply_where_for_scan(catalog, new_join, &combine_and(&top_preds))
+            // Wrap remaining (non-pushable, non-fusable) conjuncts in a
+            // top-level Filter, but try the cheap index/rowid path on the
+            // Join as a whole first.
+            apply_where_for_scan(catalog, new_join, &combine_and(&kept_top))
         }
     } else {
         // Not a Join — let apply_where_for_scan handle the Scan + index path,
         // or wrap in a Filter for other plan shapes.
         apply_where_for_scan(catalog, plan, &combine_and(&conjuncts))
     }
+}
+
+/// True when the conjunct references at least one column of EACH side of
+/// a join — the marker of a join condition living in a WHERE clause.
+/// (Subquery-carrying conjuncts are excluded by the caller: their hidden
+/// outer references need the full combined row in scope.)
+fn conjunct_spans_both_sides(
+    c: &Expr,
+    left_cols: &[(Option<String>, String)],
+    right_cols: &[(Option<String>, String)],
+) -> bool {
+    let refs = collect_column_refs(c);
+    if refs.is_empty() {
+        return false;
+    }
+    let ref_bound = |r: &(Option<String>, String), cols: &[(Option<String>, String)]| match &r.0 {
+        Some(t) => cols.iter().any(|(p, n)| {
+            p.as_ref()
+                .map(|pv| pv.eq_ignore_ascii_case(t))
+                .unwrap_or(false)
+                && n.eq_ignore_ascii_case(&r.1)
+        }),
+        None => cols.iter().any(|(_, n)| n.eq_ignore_ascii_case(&r.1)),
+    };
+    refs.iter().any(|r| ref_bound(r, left_cols)) && refs.iter().any(|r| ref_bound(r, right_cols))
 }
 
 /// Heuristic: is the outer plan's output expected to be SMALL relative to the
@@ -2737,6 +2809,1036 @@ fn outer_is_selective(plan: &Plan) -> bool {
         | Plan::Limit { input, .. }
         | Plan::Distinct { input } => outer_is_selective(input),
         _ => false,
+    }
+}
+
+// ============================================================================
+// Inner-join reordering (greedy, cardinality-driven)
+// ============================================================================
+//
+// SQLite's planner SEARCHES join orders; a syntactic left-deep tree in
+// FROM-clause order is whatever the user happened to write. For INNER/CROSS
+// equi-join chains the join order decides the size of every intermediate
+// result — the single biggest cost lever on multi-table queries:
+// `big1 JOIN big2 ON … JOIN tiny ON … WHERE tiny.k = 5` computes the full
+// big1×big2 intermediate before tiny's five rows ever filter it, when
+// tiny-first would drive both bigs by index instead.
+//
+// `reorder_inner_joins` flattens maximal INNER/CROSS join spines of 3+
+// relation atoms, estimates each atom's output cardinality from its
+// (already pushed-down) access path plus `sqlite_stat1`, and greedily
+// rebuilds the spine left-deep: the smallest atom seeds, then the smallest
+// atom connected to the covered set by a pool conjunct joins next;
+// disconnected picks only happen for true cartesian products. The original
+// ON conditions — and the multi-relation WHERE conjuncts that pushdown
+// left on top, which for INNER joins ARE join conditions — are re-attached
+// to the first join node that covers their relations. Anything that can't
+// be attached safely (subquery-carrying conjuncts, unresolvable
+// references) stays in a Filter on top, exactly where it was.
+//
+// SEMANTICS: inner joins are commutative and associative — the multiset of
+// combined rows is order-independent. Column ORDER is preserved: every
+// pool conjunct's unqualified references are rewritten to their owning
+// atom's (unique) name at flatten time, and the reordered spine is wrapped
+// in a projection of bare column references that restores the original
+// column order (the fused executor's synthesized-project pattern), so
+// every consumer above the spine sees the same columns in the same order
+// as the syntactic tree.
+//
+// Safety gates (any miss → the spine keeps its syntactic shape):
+// - ≥ 3 atoms and ≤ REORDER_MAX_ATOMS. Two-atom spines are left alone:
+//   the executor's hash join already picks its own build side and the
+//   INLJ pass already tries both directions.
+// - Every atom's output column names are statically computable AND unique
+//   across the spine (visible names). Hidden rowid slots are exempt —
+//   they are name-unresolvable by design.
+// - Unqualified references in pool conjuncts must be unambiguous (exactly
+//   one owning atom) — otherwise name resolution could follow the
+//   reordering instead of the query.
+// - Pool conjuncts carry no subqueries (their hidden outer references
+//   must keep the full combined row in scope — the same rule pushdown
+//   applies).
+// - Outer-join boundaries PIN their subtrees: a LEFT/RIGHT/FULL join node
+//   is an atom like any other (its own inner sub-spines still reorder
+//   independently — the driver recurses into it), never re-associated
+//   across its boundary.
+
+/// SQLite's default table-size assumption when ANALYZE hasn't run
+/// (nRowLogEst 200 ≈ 2^20 rows).
+const UNANALYZED_ROWS: i64 = 1 << 20;
+
+/// Spine size cap: the greedy enumeration is O(n² · conjuncts) at plan
+/// time; beyond this the planning cost outweighs the reorder win.
+/// (SQLite's own join-search loop is capped similarly.)
+const REORDER_MAX_ATOMS: usize = 64;
+
+/// Driver: walk the plan; at every node recurse first, then (at Filter
+/// and spine-root positions) attempt a spine reorder.
+pub(crate) fn reorder_inner_joins(catalog: &Catalog, plan: Plan) -> Plan {
+    match plan {
+        Plan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            algorithm,
+        } => {
+            // Both children first: atoms and pinned subtrees get their own
+            // driver pass (nested spines reorder independently).
+            let node = walk_join_children(catalog, *left, *right, join_type, condition, algorithm);
+            // Reached by the driver, this node is the ROOT of a maximal
+            // inner spine (its parent is a non-inner-join or a wrapper).
+            if matches!(join_type, JoinType::Inner | JoinType::Cross) {
+                if let Some(reordered) = try_reorder_spine(catalog, &node, None) {
+                    return reordered;
+                }
+            }
+            node
+        }
+        Plan::Filter { input, predicate } => {
+            // A Filter directly above an inner-join spine root: pushdown
+            // already moved single-relation conjuncts into the atoms; the
+            // rest are multi-relation predicates — join conditions in
+            // disguise for INNER joins. Attempt the reorder WITH them in
+            // the pool BEFORE any plain spine attempt: a successful plain
+            // attempt would hide the spine behind a restoration Project
+            // and the conjuncts could never attach.
+            if let Plan::Join {
+                left,
+                right,
+                join_type: JoinType::Inner | JoinType::Cross,
+                condition,
+                algorithm,
+            } = *input
+            {
+                let node = walk_join_children(
+                    catalog,
+                    *left,
+                    *right,
+                    JoinType::Inner,
+                    condition,
+                    algorithm,
+                );
+                if let Some(reordered) = try_reorder_spine(catalog, &node, Some(&predicate)) {
+                    return reordered;
+                }
+                return Plan::Filter {
+                    input: Box::new(node),
+                    predicate,
+                };
+            }
+            let inner = reorder_inner_joins(catalog, *input);
+            Plan::Filter {
+                input: Box::new(inner),
+                predicate,
+            }
+        }
+        // Single-input wrappers: recurse via the driver (a spine may hide
+        // under any of them).
+        Plan::Project { input, columns } => Plan::Project {
+            input: Box::new(reorder_inner_joins(catalog, *input)),
+            columns,
+        },
+        Plan::Sort { input, terms } => Plan::Sort {
+            input: Box::new(reorder_inner_joins(catalog, *input)),
+            terms,
+        },
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => Plan::Limit {
+            input: Box::new(reorder_inner_joins(catalog, *input)),
+            count,
+            offset,
+        },
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Aggregate {
+            input: Box::new(reorder_inner_joins(catalog, *input)),
+            group_by,
+            aggregates,
+        },
+        Plan::Window { input, windows } => Plan::Window {
+            input: Box::new(reorder_inner_joins(catalog, *input)),
+            windows,
+        },
+        Plan::Distinct { input } => Plan::Distinct {
+            input: Box::new(reorder_inner_joins(catalog, *input)),
+        },
+        Plan::Subquery { plan } => Plan::Subquery {
+            plan: Box::new(reorder_inner_joins(catalog, *plan)),
+        },
+        Plan::Union { left, right, all } => Plan::Union {
+            left: Box::new(reorder_inner_joins(catalog, *left)),
+            right: Box::new(reorder_inner_joins(catalog, *right)),
+            all,
+        },
+        Plan::Intersect { left, right } => Plan::Intersect {
+            left: Box::new(reorder_inner_joins(catalog, *left)),
+            right: Box::new(reorder_inner_joins(catalog, *right)),
+        },
+        Plan::Except { left, right } => Plan::Except {
+            left: Box::new(reorder_inner_joins(catalog, *left)),
+            right: Box::new(reorder_inner_joins(catalog, *right)),
+        },
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            inner_index,
+            outer_key_col,
+        } => Plan::IndexNestedLoopJoin {
+            outer: Box::new(reorder_inner_joins(catalog, *outer)),
+            inner_table,
+            inner_alias,
+            inner_index,
+            outer_key_col,
+        },
+        // Leaves and everything else pass through untouched.
+        other => other,
+    }
+}
+
+/// Shared prologue of both reorder attempts: walk a Join node's children
+/// (Inner/Cross children continue the spine; anything else is an atom
+/// whose internal plan gets the full driver pass) and rebuild the node.
+fn walk_join_children(
+    catalog: &Catalog,
+    left: Plan,
+    right: Plan,
+    join_type: JoinType,
+    condition: Option<Expr>,
+    algorithm: JoinAlgorithm,
+) -> Plan {
+    Plan::Join {
+        left: Box::new(reorder_spine_child(catalog, left)),
+        right: Box::new(reorder_spine_child(catalog, right)),
+        join_type,
+        condition,
+        algorithm,
+    }
+}
+
+/// Walk INSIDE a spine (the driver committed to flattening it at the
+/// root): Inner/Cross join children continue the spine — their
+/// reassociation is the root's job, so no local reorder attempt — while
+/// every other child is an ATOM whose internal plan gets the full driver
+/// pass (nested spines inside pinned outer-join subtrees or subqueries
+/// still reorder on their own).
+fn reorder_spine_child(catalog: &Catalog, plan: Plan) -> Plan {
+    match plan {
+        Plan::Join {
+            left,
+            right,
+            join_type: JoinType::Inner | JoinType::Cross,
+            condition,
+            algorithm,
+        } => Plan::Join {
+            left: Box::new(reorder_spine_child(catalog, *left)),
+            right: Box::new(reorder_spine_child(catalog, *right)),
+            join_type: JoinType::Inner,
+            condition,
+            algorithm,
+        },
+        other => reorder_inner_joins(catalog, other),
+    }
+}
+
+/// The output column names an atom's executor reports — must mirror each
+/// executor EXACTLY (qualified for Scan / IndexRange, plain for the
+/// lookup variants, hidden rowid slots where the executor adds them, CTE
+/// columns for CteRows, left+right concatenation for pinned join
+/// subtrees). `None` for plans whose names aren't statically computable
+/// (Subquery, TableFunction, Project-wrapped views) — the caller aborts
+/// the reorder.
+fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
+    let cols = match plan {
+        Plan::Scan { table, alias, .. } => {
+            let mut v = scan_qualified_cols(table, alias);
+            if wants_rowid_slot(table) {
+                v.push(HIDDEN_ROWID.to_string());
+            }
+            v
+        }
+        Plan::RowidRange { table, .. } | Plan::IndexLookup { table, .. } => {
+            let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+            if wants_rowid_slot(table) {
+                v.push(HIDDEN_ROWID.to_string());
+            }
+            v
+        }
+        Plan::RowidLookup { table, .. }
+        | Plan::RowidIn { table, .. }
+        | Plan::IndexIn { table, .. } => table.col_names.iter().cloned().collect(),
+        Plan::IndexRange { table, alias, .. } => scan_qualified_cols(table, alias),
+        Plan::Filter { input, .. } | Plan::Subquery { plan: input } => return atom_out_cols(input),
+        Plan::Join { left, right, .. } => {
+            let mut v = atom_out_cols(left)?;
+            v.extend(atom_out_cols(right)?);
+            v
+        }
+        Plan::CteRows { columns, .. } => columns.iter().cloned().collect(),
+        _ => return None,
+    };
+    Some(cols)
+}
+
+/// Qualified scan column names ("prefix.col"), mirroring
+/// `scan_output_columns` without the hidden slot (the caller appends it
+/// itself where the executor does).
+fn scan_qualified_cols(table: &Arc<Table>, alias: &Option<String>) -> Vec<String> {
+    let prefix = alias.as_deref().unwrap_or(&table.name);
+    if prefix == table.name {
+        table.qualified_col_names.iter().cloned().collect()
+    } else {
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect()
+    }
+}
+
+/// Table row-count hint from `sqlite_stat1` (any index of the table
+/// carries the table's row count), else SQLite's unanalyzed default.
+fn table_rows_hint(catalog: &Catalog, table: &Table) -> i64 {
+    catalog
+        .indexes_on_table(&table.name)
+        .iter()
+        .find_map(|idx| catalog.index_stats(&idx.name))
+        .and_then(|s| if s.rows > 0 { Some(s.rows) } else { None })
+        .unwrap_or(UNANALYZED_ROWS)
+}
+
+/// Estimated OUTPUT rows of an atom (planning-time only: stat1 + the
+/// pushed access path; never a b-tree walk — plans are cached).
+fn atom_est_rows(catalog: &Catalog, plan: &Plan) -> i64 {
+    match plan {
+        Plan::RowidLookup { .. } => 1,
+        Plan::RowidIn { values, .. } => (values.len() as i64).max(1),
+        Plan::RowidRange {
+            table, start, end, ..
+        } => {
+            // Literal integer bounds: the exact span (clamped to the table
+            // hint); parameterized bounds: SQLite's rows/4 range guess.
+            let lit = |e: &Option<Expr>| match e.as_ref() {
+                Some(Expr::Literal(Value::Integer(i))) => Some(*i),
+                _ => None,
+            };
+            match (lit(start), lit(end)) {
+                (Some(s), Some(e)) if e >= s => (e - s + 1).min(table_rows_hint(catalog, table)),
+                _ => (table_rows_hint(catalog, table) / 4).max(1),
+            }
+        }
+        Plan::IndexLookup {
+            index, key_exprs, ..
+        } => {
+            let k = key_exprs.len();
+            catalog
+                .index_stats(&index.name)
+                .map(|s| s.estimate_eq(k))
+                .filter(|&e| e > 0)
+                .unwrap_or(10)
+        }
+        Plan::IndexIn {
+            index, key_exprs, ..
+        } => {
+            // key_exprs is the IN-list itself (single-column index IN);
+            // the member count scales the lookup fan-out.
+            let members = key_exprs.len() as i64;
+            let base = catalog
+                .index_stats(&index.name)
+                .map(|s| s.estimate_eq(1))
+                .filter(|&e| e > 0)
+                .unwrap_or(10);
+            base.saturating_mul(members).max(1)
+        }
+        Plan::IndexRange { index, .. } => catalog
+            .index_stats(&index.name)
+            .map(|s| s.rows / 4)
+            .filter(|&e| e > 0)
+            .unwrap_or(UNANALYZED_ROWS / 4),
+        Plan::Filter { input, predicate } => {
+            let base = atom_est_rows(catalog, input);
+            filter_output_est(base, predicate)
+        }
+        Plan::Scan { table, .. } => table_rows_hint(catalog, table),
+        Plan::CteRows { rows, .. } => (rows.len() as i64).max(1),
+        // Pinned outer-join subtrees and anything exotic: unknown (the
+        // unanalyzed default — big enough to lose every size contest).
+        _ => UNANALYZED_ROWS,
+    }
+}
+
+/// SQLite-style blind selectivity: each AND conjunct shrinks the output
+/// (equity 1/10, range 1/3, IN-list k/10 capped at 1, unknown 1/2).
+fn filter_output_est(rows: i64, predicate: &Expr) -> i64 {
+    let mut est = rows as f64;
+    for c in split_and_chain(predicate) {
+        est *= conjunct_selectivity(&c);
+    }
+    est.max(1.0) as i64
+}
+
+fn conjunct_selectivity(c: &Expr) -> f64 {
+    match c {
+        Expr::Binary {
+            op: BinaryOp::Eq, ..
+        } => 0.1,
+        Expr::Binary {
+            op:
+                op @ (BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::NotEq),
+            ..
+        } => {
+            let _ = op;
+            1.0 / 3.0
+        }
+        Expr::Between { .. } => 1.0 / 3.0,
+        Expr::In {
+            source: crate::sql::ast::InSource::List(es),
+            ..
+        } => (es.len() as f64 / 10.0).min(1.0),
+        Expr::Like { .. } => 0.25,
+        _ => 0.5,
+    }
+}
+
+/// One pooled join conjunct: the expression (unqualified refs rewritten
+/// to owning-atom names) and the atom set it references.
+struct PooledConjunct {
+    expr: Expr,
+    /// Atom indices the conjunct's references resolve to.
+    rels: Vec<usize>,
+}
+
+/// One flattened spine condition: an AND-leaf plus the atom window of
+/// the join node it came from (lo..hi) and its split point (mid: the
+/// left subtree covered lo..mid, the right mid..hi).
+struct SpineCond {
+    leaf: Expr,
+    lo: usize,
+    mid: usize,
+    hi: usize,
+}
+
+/// Flatten the spine (left-to-right atom order, matching the executor's
+/// combined-column order) while recording each ON condition's original
+/// atom window — the evaluation context its references resolved against.
+fn flatten_collect(
+    plan: &Plan,
+    base: usize,
+    atoms: &mut Vec<Plan>,
+    conds: &mut Vec<SpineCond>,
+) -> usize {
+    if let Plan::Join {
+        left,
+        right,
+        join_type: JoinType::Inner | JoinType::Cross,
+        condition,
+        ..
+    } = plan
+    {
+        let ln = flatten_collect(left, base, atoms, conds);
+        let rn = flatten_collect(right, base + ln, atoms, conds);
+        if let Some(c) = condition {
+            for leaf in split_and_chain(c) {
+                conds.push(SpineCond {
+                    leaf,
+                    lo: base,
+                    mid: base + ln,
+                    hi: base + ln + rn,
+                });
+            }
+        }
+        ln + rn
+    } else {
+        atoms.push(plan.clone());
+        1
+    }
+}
+
+/// Resolve a column reference against atoms [lo, hi) — mirroring
+/// `resolve_column_index`'s pass order (qualified-exact over the whole
+/// window, then exact, then suffix; first match wins) — returning the
+/// owning atom and its canonical column name. Hidden rowid slots never
+/// match (same as the executor's resolver).
+fn resolve_ref_window(
+    table: &Option<String>,
+    name: &str,
+    lo: usize,
+    hi: usize,
+    atom_cols: &[Vec<String>],
+) -> Option<(usize, String)> {
+    if let Some(t) = table {
+        // Qualified reference: dotted-name exact match, then PLAIN-name
+        // exact match (the lookup-family atoms report unqualified
+        // columns). NO suffix fallback — `small.k` must never bind to a
+        // same-named `big1.k`: this is SIDE-SCOPED binding, not the
+        // combined-list resolution of the general evaluator, and a wrong
+        // window binding would silently rewrite the join key.
+        for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
+            let i = i + lo;
+            for c in cols {
+                if is_hidden_rowid(c.as_str()) {
+                    continue;
+                }
+                if let Some(pos) = c.rfind('.') {
+                    if c[..pos].eq_ignore_ascii_case(t) && c[pos + 1..].eq_ignore_ascii_case(name) {
+                        return Some((i, c.clone()));
+                    }
+                }
+            }
+        }
+        for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
+            let i = i + lo;
+            for c in cols {
+                if is_hidden_rowid(c.as_str()) {
+                    continue;
+                }
+                if c.eq_ignore_ascii_case(name) {
+                    return Some((i, c.clone()));
+                }
+            }
+        }
+        return None;
+    }
+    for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
+        let i = i + lo;
+        for c in cols {
+            if is_hidden_rowid(c.as_str()) {
+                continue;
+            }
+            if c.eq_ignore_ascii_case(name) {
+                return Some((i, c.clone()));
+            }
+        }
+    }
+    for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
+        let i = i + lo;
+        for c in cols {
+            if is_hidden_rowid(c.as_str()) {
+                continue;
+            }
+            if let Some(pos) = c.rfind('.') {
+                if c[pos + 1..].eq_ignore_ascii_case(name) {
+                    return Some((i, c.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite every `Expr::Column` reference in `e` to its owning atom's
+/// canonical name (qualified refs included — the canonical form makes
+/// resolution order-independent), collecting the atoms referenced.
+/// Returns false when any reference fails to resolve in the window.
+/// `atom_names[i]` carries atom i's (table name, alias) pair for the
+/// qualifier-preservation rule on plain canonical names.
+fn rewrite_all_refs(
+    e: &mut Expr,
+    lo: usize,
+    hi: usize,
+    atom_cols: &[Vec<String>],
+    atom_names: &[(String, Option<String>)],
+    rels: &mut Vec<usize>,
+) -> bool {
+    match e {
+        Expr::Column { table, name } => match resolve_ref_window(table, name, lo, hi, atom_cols) {
+            Some((atom, canon)) => {
+                // Keep the QUALIFIED form (Some("alias"), "col") when the
+                // canonical name is dotted: the INLJ pass's key extraction
+                // and every qualified-resolution path expect a real
+                // qualifier, not a dotted unqualified name. For a PLAIN
+                // canonical (lookup-family atoms report unqualified
+                // columns) keep the original qualifier when it names the
+                // owning atom — qualified references still resolve on
+                // plain-named outputs through the exact-match fallback,
+                // and the qualifier is what the INLJ key extraction needs.
+                let (q, n) = canonical_ref(&canon, table, atom, atom_names);
+                *table = q;
+                *name = n;
+                if !rels.contains(&atom) {
+                    rels.push(atom);
+                }
+                true
+            }
+            None => false,
+        },
+        Expr::Collate { expr, .. } => rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels),
+        Expr::Binary { left, right, .. } => {
+            rewrite_all_refs(left, lo, hi, atom_cols, atom_names, rels)
+                & rewrite_all_refs(right, lo, hi, atom_cols, atom_names, rels)
+        }
+        Expr::Unary { expr, .. } => rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels)
+                & rewrite_all_refs(low, lo, hi, atom_cols, atom_names, rels)
+                & rewrite_all_refs(high, lo, hi, atom_cols, atom_names, rels)
+        }
+        Expr::In { expr, source, .. } => {
+            let mut ok = rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels);
+            if let crate::sql::ast::InSource::List(es) = &*source {
+                let mut new_members = Vec::with_capacity(es.len());
+                for m in es.iter() {
+                    let mut mc = m.clone();
+                    ok &= rewrite_all_refs(&mut mc, lo, hi, atom_cols, atom_names, rels);
+                    new_members.push(mc);
+                }
+                *source = crate::sql::ast::InSource::List(std::sync::Arc::new(new_members));
+            }
+            ok
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            let mut ok = rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels)
+                & rewrite_all_refs(pattern, lo, hi, atom_cols, atom_names, rels);
+            if let Some(x) = escape {
+                ok &= rewrite_all_refs(x, lo, hi, atom_cols, atom_names, rels);
+            }
+            ok
+        }
+        Expr::IsNull { expr, .. } => rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels),
+        Expr::Is { left, right, .. } => {
+            rewrite_all_refs(left, lo, hi, atom_cols, atom_names, rels)
+                & rewrite_all_refs(right, lo, hi, atom_cols, atom_names, rels)
+        }
+        Expr::Function { args, filter, .. } => {
+            let mut ok = true;
+            for a in args {
+                ok &= rewrite_all_refs(a, lo, hi, atom_cols, atom_names, rels);
+            }
+            if let Some(f) = filter {
+                ok &= rewrite_all_refs(f, lo, hi, atom_cols, atom_names, rels);
+            }
+            ok
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+            ..
+        } => {
+            let mut ok = true;
+            if let Some(o) = operand {
+                ok &= rewrite_all_refs(o, lo, hi, atom_cols, atom_names, rels);
+            }
+            for (w, t) in whens {
+                ok &= rewrite_all_refs(w, lo, hi, atom_cols, atom_names, rels);
+                ok &= rewrite_all_refs(t, lo, hi, atom_cols, atom_names, rels);
+            }
+            if let Some(x) = else_ {
+                ok &= rewrite_all_refs(x, lo, hi, atom_cols, atom_names, rels);
+            }
+            ok
+        }
+        Expr::Row(es) => {
+            let mut ok = true;
+            for x in es {
+                ok &= rewrite_all_refs(x, lo, hi, atom_cols, atom_names, rels);
+            }
+            ok
+        }
+        Expr::Cast { expr, .. } => rewrite_all_refs(expr, lo, hi, atom_cols, atom_names, rels),
+        Expr::Raise {
+            message: Some(m), ..
+        } => rewrite_all_refs(m, lo, hi, atom_cols, atom_names, rels),
+        Expr::Raise { message: None, .. } => true,
+        // Literal / Parameter / Subquery / Exists: pool conjuncts are
+        // subquery-free by the caller's guard; literals carry no refs.
+        _ => true,
+    }
+}
+
+/// Bind one spine ON-condition leaf against its ORIGINAL node window:
+/// an `l = r` leaf with column operands on both sides binds POSITIONALLY
+/// (left operand against the node's left subtree, right against the
+/// right — replicating the executor's `collect_eq_pairs`, including the
+/// swapped retry). This is what makes `JOIN … USING (id)`-style
+/// unqualified `id = id` leaves survive reassociation: each operand
+/// rewrites to ITS side's column instead of both falling to the same
+/// first-match name. Everything else resolves against the whole window.
+fn bind_leaf(
+    leaf: &Expr,
+    sc: &SpineCond,
+    atom_cols: &[Vec<String>],
+    atom_names: &[(String, Option<String>)],
+) -> PooledConjunct {
+    if let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = leaf
+    {
+        if column_name_of(left).is_some() && column_name_of(right).is_some() {
+            // Positional try 1: l in left window, r in right window.
+            let l_ref = column_ref_of(left);
+            let r_ref = column_ref_of(right);
+            let try_bind = |l_lo: usize, l_hi: usize, r_lo: usize, r_hi: usize| match (
+                resolve_ref_window(&l_ref.0, &l_ref.1, l_lo, l_hi, atom_cols),
+                resolve_ref_window(&r_ref.0, &r_ref.1, r_lo, r_hi, atom_cols),
+            ) {
+                (Some((la, ln)), Some((ra, rn))) => Some(((la, ln), (ra, rn))),
+                _ => None,
+            };
+            let bound = try_bind(sc.lo, sc.mid, sc.mid, sc.hi)
+                .or_else(|| try_bind(sc.mid, sc.hi, sc.lo, sc.mid));
+            if let Some(((la, ln), (ra, rn))) = bound {
+                let mut expr = leaf.clone();
+                if let Expr::Binary { left, right, .. } = &mut expr {
+                    rewrite_column_operand(left, &ln, la, atom_names);
+                    rewrite_column_operand(right, &rn, ra, atom_names);
+                }
+                return PooledConjunct {
+                    expr,
+                    rels: vec![la, ra],
+                };
+            }
+        }
+    }
+    // General path: whole-window resolution, refs rewritten to canonical
+    // names. Unresolvable references (e.g. `rowid` pseudo-refs) leave the
+    // rels empty — the caller keeps such conjuncts at the top.
+    let mut expr = leaf.clone();
+    let mut rels = Vec::new();
+    if !rewrite_all_refs(&mut expr, sc.lo, sc.hi, atom_cols, atom_names, &mut rels) {
+        rels.clear();
+        return PooledConjunct {
+            expr: leaf.clone(),
+            rels,
+        };
+    }
+    PooledConjunct { expr, rels }
+}
+
+/// Extract (table, name) from a column operand, seeing through COLLATE.
+fn column_ref_of(e: &Expr) -> (Option<String>, String) {
+    match e {
+        Expr::Column { table, name } => (table.clone(), name.clone()),
+        Expr::Collate { expr, .. } => column_ref_of(expr),
+        _ => (None, String::new()),
+    }
+}
+
+/// The qualified-reference form for a canonical column name:
+/// "alias.col" → (Some("alias"), "col"). A plain canonical name (the
+/// lookup-family atoms report unqualified columns) keeps the reference's
+/// ORIGINAL qualifier when it names the owning atom (its table name or
+/// alias) — that qualifier still resolves on plain-named outputs via the
+/// exact-match fallback and is what the INLJ key extraction matches on.
+fn canonical_ref(
+    canon: &str,
+    orig: &Option<String>,
+    owner: usize,
+    atom_names: &[(String, Option<String>)],
+) -> (Option<String>, String) {
+    if let Some(pos) = canon.rfind('.') {
+        return (Some(canon[..pos].to_string()), canon[pos + 1..].to_string());
+    }
+    let keep = match (orig, atom_names.get(owner)) {
+        (Some(t), Some((table_name, alias))) => {
+            t.eq_ignore_ascii_case(table_name)
+                || alias
+                    .as_ref()
+                    .map(|a| t.eq_ignore_ascii_case(a))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    };
+    if keep {
+        (orig.clone(), canon.to_string())
+    } else {
+        (None, canon.to_string())
+    }
+}
+
+/// An atom's (table name, alias) pair — the names a qualifier may refer
+/// to it by. Lookup-family atoms report plain columns, so the alias
+/// information lives here rather than in the column names themselves.
+fn atom_name_pair(plan: &Plan) -> (String, Option<String>) {
+    let unknown = (String::new(), None);
+    match plan {
+        Plan::Scan { table, alias, .. }
+        | Plan::RowidLookup { table, alias, .. }
+        | Plan::RowidIn { table, alias, .. }
+        | Plan::RowidRange { table, alias, .. }
+        | Plan::IndexIn { table, alias, .. }
+        | Plan::IndexLookup { table, alias, .. }
+        | Plan::IndexRange { table, alias, .. } => (table.name.clone(), alias.clone()),
+        Plan::Filter { input, .. } => atom_name_pair(input),
+        _ => unknown,
+    }
+}
+
+/// Rewrite the column operand in place (through COLLATE wrappers) to
+/// its canonical, qualifier-preserving reference form.
+fn rewrite_column_operand(
+    op: &mut Expr,
+    canonical: &str,
+    owner: usize,
+    atom_names: &[(String, Option<String>)],
+) {
+    match op {
+        Expr::Column { table, name } => {
+            let (q, n) = canonical_ref(canonical, table, owner, atom_names);
+            *table = q;
+            *name = n;
+        }
+        Expr::Collate { expr, .. } => rewrite_column_operand(expr, canonical, owner, atom_names),
+        _ => {}
+    }
+}
+
+/// True when the condition contains at least one column-to-column
+/// equality leaf (through COLLATE wrappers) — the marker for the Hash
+/// join algorithm.
+fn condition_has_equi_leaf(cond: &Expr) -> bool {
+    match cond {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => condition_has_equi_leaf(left) || condition_has_equi_leaf(right),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => column_name_of(left).is_some() && column_name_of(right).is_some(),
+        _ => false,
+    }
+}
+
+/// Attempt one spine reorder. Returns None (caller keeps the syntactic
+/// tree) whenever a safety gate trips or the greedy outcome is the
+/// syntactic order itself with nothing new pooled from the filter.
+fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>) -> Option<Plan> {
+    let dbg = std::env::var_os("RSQL_DBG_REORDER").is_some();
+    // ---- Flatten (atoms + conditions with their original windows) ------
+    let mut atom_plans: Vec<Plan> = Vec::new();
+    let mut spine_conds: Vec<SpineCond> = Vec::new();
+    flatten_collect(spine, 0, &mut atom_plans, &mut spine_conds);
+    let n = atom_plans.len();
+    if dbg {
+        eprintln!(
+            "[reorder] spine: {n} atoms, filter={}",
+            top_filter.is_some()
+        );
+    }
+    if !(3..=REORDER_MAX_ATOMS).contains(&n) {
+        if dbg {
+            eprintln!("[reorder] bail: atom count {n}");
+        }
+        return None;
+    }
+
+    // ---- Static output names + uniqueness gate --------------------------
+    let mut atom_cols: Vec<Vec<String>> = Vec::with_capacity(n);
+    for a in &atom_plans {
+        atom_cols.push(atom_out_cols(a)?);
+    }
+    // (table name, alias) per atom — the names a qualifier may refer to
+    // it by (lookup-family atoms report plain column names).
+    let atom_names: Vec<(String, Option<String>)> = atom_plans.iter().map(atom_name_pair).collect();
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cols in &atom_cols {
+            for c in cols {
+                if is_hidden_rowid(c) {
+                    continue; // name-unresolvable by design
+                }
+                if !seen.insert(c.to_ascii_lowercase()) {
+                    return None; // duplicate visible name: restoration by
+                                 // name is unsafe — keep the syntactic tree
+                }
+            }
+        }
+    }
+
+    // ---- Pool: spine conditions (bound to their original windows) ------
+    let mut pool: Vec<PooledConjunct> = spine_conds
+        .iter()
+        .map(|sc| bind_leaf(&sc.leaf, sc, &atom_cols, &atom_names))
+        .collect();
+    // Unresolvable spine conditions (empty rels) never attach — evaluate
+    // them once over the final combined row instead, exactly like a top
+    // Filter. (Their references resolve — or fail — identically there:
+    // same names, same first-match order.)
+    let mut top_conjuncts: Vec<Expr> = pool
+        .iter()
+        .filter(|pc| pc.rels.is_empty())
+        .map(|pc| pc.expr.clone())
+        .collect();
+    pool.retain(|pc| !pc.rels.is_empty());
+
+    // ---- Eligible filter conjuncts join the pool ------------------------
+    // For INNER joins a multi-relation WHERE conjunct IS a join condition.
+    // Subquery-carrying conjuncts stay at the top (their hidden outer
+    // references need the full combined row — pushdown's rule).
+    let mut pooled_from_filter = 0usize;
+    if let Some(f) = top_filter {
+        for c in split_and_chain(f) {
+            if crate::executor::expr_has_subquery(&c) {
+                top_conjuncts.push(c);
+                continue;
+            }
+            let mut expr = c.clone();
+            let mut rels = Vec::new();
+            if rewrite_all_refs(&mut expr, 0, n, &atom_cols, &atom_names, &mut rels)
+                && rels.len() >= 2
+            {
+                pool.push(PooledConjunct { expr, rels });
+                pooled_from_filter += 1;
+            } else {
+                top_conjuncts.push(c);
+            }
+        }
+    }
+
+    // Nothing pooled at all (a pure cross-product spine with no WHERE):
+    // there is no join order to improve — the greedy would just shuffle
+    // cartesian factors and pay a restoration Project for nothing.
+    if pool.is_empty() {
+        if dbg {
+            eprintln!("[reorder] bail: empty pool");
+        }
+        return None;
+    }
+    if dbg {
+        eprintln!("[reorder] pool: {} conjuncts", pool.len());
+        for pc in &pool {
+            eprintln!("[reorder]   rels={:?}", pc.rels);
+        }
+    }
+
+    // ---- Estimates ------------------------------------------------------
+    let ests: Vec<i64> = atom_plans
+        .iter()
+        .map(|a| atom_est_rows(catalog, a))
+        .collect();
+
+    // ---- Greedy connected left-deep rebuild ------------------------------
+    let mut covered = vec![false; n];
+    let seed = (0..n).min_by_key(|&i| (ests[i], i))?;
+    covered[seed] = true;
+    let mut order: Vec<usize> = vec![seed];
+    let mut acc = atom_plans[seed].clone();
+
+    while order.len() < n {
+        // Prefer the smallest atom CONNECTED to the covered set by a live
+        // pool conjunct; fall back to the smallest overall (true cross
+        // product region).
+        let connected: Vec<usize> = (0..n)
+            .filter(|&i| {
+                !covered[i]
+                    && pool
+                        .iter()
+                        .any(|pc| pc.rels.contains(&i) && pc.rels.iter().any(|&r| covered[r]))
+            })
+            .collect();
+        let candidates: Vec<usize> = if connected.is_empty() {
+            (0..n).filter(|&i| !covered[i]).collect()
+        } else {
+            connected
+        };
+        let next = *candidates.iter().min_by_key(|&&i| (ests[i], i))?;
+
+        covered[next] = true;
+        order.push(next);
+
+        // Attach every pool conjunct whose relations just became covered —
+        // the earliest join node that can evaluate it.
+        let mut attach: Vec<Expr> = Vec::new();
+        let mut rest: Vec<PooledConjunct> = Vec::with_capacity(pool.len());
+        for pc in pool.drain(..) {
+            if pc.rels.iter().all(|&r| covered[r]) {
+                attach.push(pc.expr);
+            } else {
+                rest.push(pc);
+            }
+        }
+        pool = rest;
+
+        let condition = if attach.is_empty() {
+            None
+        } else {
+            Some(combine_and(&attach))
+        };
+        let join_type = if condition.is_none() {
+            JoinType::Cross
+        } else {
+            JoinType::Inner
+        };
+        let algorithm = if condition.as_ref().is_some_and(condition_has_equi_leaf) {
+            JoinAlgorithm::Hash
+        } else {
+            JoinAlgorithm::NestedLoop
+        };
+        acc = Plan::Join {
+            left: Box::new(acc),
+            right: Box::new(atom_plans[next].clone()),
+            join_type,
+            condition,
+            algorithm,
+        };
+    }
+
+    // ---- No-op detection -------------------------------------------------
+    if order == (0..n).collect::<Vec<usize>>() && pooled_from_filter == 0 {
+        // Greedy outcome is the syntactic order and the filter contributed
+        // nothing new: the rebuilt tree would be an expensive clone of the
+        // original — keep the original plan object.
+        return None;
+    }
+
+    // ---- Column-order restoration -----------------------------------------
+    // The rebuilt spine's combined columns are the same names in a
+    // different order; wrap in a projection of bare column references
+    // (unique by the gate, so exact-match resolution is order-independent)
+    // restoring the original FROM order.
+    let original_names: Vec<String> = atom_cols.iter().flatten().cloned().collect();
+    let new_order_names: Vec<String> = order
+        .iter()
+        .flat_map(|&i| atom_cols[i].iter().cloned())
+        .collect();
+    let restored = if original_names == new_order_names {
+        acc
+    } else {
+        let columns: Vec<crate::planner::plan::ProjectExpr> = original_names
+            .iter()
+            .map(|name| crate::planner::plan::ProjectExpr {
+                expr: Expr::Column {
+                    table: None,
+                    name: name.clone(),
+                },
+                alias: Some(name.clone()),
+            })
+            .collect();
+        Plan::Project {
+            input: Box::new(acc),
+            columns,
+        }
+    };
+
+    // Leftover pool conjuncts (relations outside the spine — unreachable
+    // in valid SQL, but kept verbatim rather than dropped) + top filter.
+    top_conjuncts.extend(pool.into_iter().map(|pc| pc.expr));
+
+    if top_conjuncts.is_empty() {
+        Some(restored)
+    } else {
+        Some(Plan::Filter {
+            input: Box::new(restored),
+            predicate: combine_and(&top_conjuncts),
+        })
     }
 }
 

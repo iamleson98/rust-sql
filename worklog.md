@@ -68,3 +68,30 @@ Stage Summary:
 - WR PK ledger entry closed with file-format interop proven in both directions.
 - Preupdate CI (250ed29): 20/21 jobs green at last poll (only windows test in flight).
 - Ready to commit + push; remaining ledger: ptrmap writes, non-UTF-8 CAST/ORDER BY byte order, WAL sidecar writes for SQLite-format mode.
+
+---
+Task ID: 8
+Agent: main (Super Z)
+Task: Close the join-reordering gap (planner plan shapes) — greedy cardinality-driven INNER-join spine reordering + WHERE-conjunct fusion into join conditions
+
+Work Log:
+- Workspace wiped again (sandbox reset): re-cloned from GitHub (token via API), reinstalled rust 1.98.1 + clippy + rustfmt, re-fetched deps. Remote state: master 5892d4c, CI GREEN on HEAD (the earlier CI failure on a738eb6 was already fixed by 31ca53e/2b50cea lineage — nothing to push, all ledger items 1-6 of the original gap list closed through 5892d4c).
+- Chose the ledger's own "Planner plan shapes" entry as the next highest-value item: joins were planned in syntactic left-deep FROM order.
+- NEW `reorder_inner_joins` (planner): flattens maximal INNER/CROSS join spines of 3+ relation atoms (2-atom spines untouched — the executor's hash join already picks its build side, INLJ tries both directions); per-atom cardinality estimates from the pushed access path + sqlite_stat1 (RowidLookup=1, RowidIn=n, literal rowid-range span, IndexLookup stat1-est or 10, IndexIn members×est, Filter SQLite-style blind selectivities 1/10 / 1/3 / k/10, Scan stat1 rows or 2^20 unanalyzed default, CteRows len); greedy smallest-first with connectivity preference (disconnected picks = true cartesian regions); conditions re-attach to the FIRST join node covering their relations; column order restored with a bare-column projection (unique-names gate; hidden rowid slots exempt); subquery atoms / non-static names abort safely; outer joins PIN their subtrees (their own inner sub-spines still reorder).
+- `pushdown_filter` (Join arm): INNER/CROSS cross-side WHERE conjuncts now FUSE into the join's ON condition (`FROM a, b WHERE a.x = b.x` == `... JOIN b ON a.x = b.x`) — implicit-join syntax was executing as a cross product + post-filter before; with the fusion + Hash algorithm it hash-joins. Outer joins keep every predicate on top.
+- Multi-equi ON conditions (`ON a.x = b.x AND a.y = b.y`) now plan as Hash (condition_has_equi_leaf) — they previously took the NestedLoop path and never hashed.
+- Executor `col_index`: qualified references now fall back to PLAIN-NAME exact matching (no suffix) — a pushed RowidLookup/IndexLookup side reports unqualified columns, so `a.x = b.id` extracts its key pair instead of degrading to a per-pair nested loop.
+- THREE binding bugs found and fixed during the differential bring-up (all in the new code):
+  1. The driver's Join arm consumed the spine WITHOUT the top filter, hiding it behind the restoration Project so WHERE conjuncts could never pool — the Filter arm now attempts WITH the filter first (walk_join_children shared prologue).
+  2. `resolve_ref_window`'s suffix fallback let QUALIFIED refs bind to same-named columns of OTHER atoms in side-scoped windows (`small.k` → `big1.k`), silently swapping join keys — qualified refs now match dotted-exact + plain-exact only.
+  3. Rewritten refs for plain-named (lookup) atoms dropped their qualifier, breaking the INLJ pass's side-aware key extraction — canonical_ref keeps the original qualifier when it names the owning atom (table name or alias).
+- Probe (examples/probe_join_order.rs + subquery-atom control): adversarial 3-join (50k×50k×5, point filter on the LAST table) 482 ms → 5.3 ms (~90x), now matching the benign order's 4.5 ms; 100k scale 40k rows out: 63→22 ms; implicit 2-join 50k now hash-joins (was cross+filter); row counts identical to SQLite throughout.
+- tests/join_reorder.rs: 13 differential suites vs bundled SQLite — adversarial 3/4-table chains, SELECT * column-order preservation, USING (unqualified `id = id` positional binding), multi-key + mixed-residual ON, LEFT-JOIN boundary pinning (incl. LEFT JOIN (inner spine) and null-extended-side WHERE), subquery atoms declining safely, correlated-subquery WHERE staying on top, self-joins, RowidLookup-driven plans (EXPLAIN asserts SEARCH-first), aggregates/GROUP BY/HAVING/ORDER BY over reordered spines, multiplicity, empties, ANALYZE-estimate-driven reordering, implicit-join fusion (equi + residual-only), CTE atoms.
+- Also updated the stale README ledger line for non-UTF-8 files (9636c09 had already closed WHERE range comparisons; index seeks decline-by-design on non-UTF-8 connections).
+- Verification: dev matrix 758/758 (lib + all 54 integration suites), fmt clean, clippy -D warnings clean in all 4 configs (default / sqlx / no-default / workspace).
+
+Stage Summary:
+- Join reordering + implicit-join WHERE fusion + multi-equi Hash closed: the planner's join orders are now cardinality-driven for INNER spines of 3+ tables, with a ~90x engine-side win on the adversarial order and implicit-join syntax on the hash path.
+- 3 latent engine perf bugs fixed on the way: implicit joins as cross+filter, multi-equi ON as nested loops, lookup-side join keys never extracting.
+- Remaining planner ledger: predicate pushdown into all scan shapes, subquery decorrelation, bushy/cost-searched plans (greedy can't see everything SQLite's cost model sees).
+- Ready to commit + push.

@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **735+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **758+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -379,6 +379,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 | Top-50 ORDER BY INT DESC OFFSET 100   | **26.0 ms** | 68.7 ms    | **2.6x faster**  |
 | ORDER BY INT DESC (unbounded)         | **188.4 ms**| 261.1 ms   | **1.4x faster**  |
 | 2-table equi-JOIN (1M × 1M, 3M out)   | **451.6 ms**| 624.2 ms  | **1.38x faster** |
+| 3-table adversarial ORDER (50k×50k×5) | **5.3 ms**  | 0.7 ms     | 0.13x — was 482 ms before the reorder (**~90x engine-side**) |
 
 ### Where the wins come from
 
@@ -390,6 +391,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **Top-N**: per-worker bounded keep-heaps under the statement's exact total order, merged range-ordered — the serial streaming top-N's own algorithm, split across workers.
 - **Unbounded sorts**: `ORDER BY` without a LIMIT splits the rowid space; each worker chunk-sorts its range under the statement's (keys, rowid) total order and the main thread k-way merges under the same order — bit-identical to the serial stable sort. A 1:1 bare-column projection above the sort (`SELECT id, val ... ORDER BY val`) is fused into the worker decode: only the projected + key columns are ever materialized, so wide TEXT columns the projection would discard are never decoded.
 - **Joins (parallel probe)**: the fused streaming hash join builds the smaller side's hash table once, then splits the PROBE side's rowid space across workers — each worker selective-decodes its range and probes the read-only build state into its own buffer; partials concatenate in range order, reproducing the serial probe's row order bit for bit (`tests/parallel_join.rs` pins the equality). Aggregates directly over a join (`SELECT COUNT(*), SUM(a.x) FROM a JOIN b ON b.k = a.k`) ride the same fused path — no full-row materialization of either side. 1M×1M → 3M output rows: 1.38x vs SQLite on 2 cores.
+- **Join reordering**: multi-table INNER-join spines flatten and rebuild smallest-filtered-first (`reorder_inner_joins` — greedy, connectivity-preferring, stat1 + access-path cardinalities); the WHERE's cross-relation conjuncts FUSE into join conditions, so implicit-join syntax hash-joins instead of crossing + filtering. The adversarial order (`big1 JOIN big2 … JOIN small WHERE small.id = ?`) drove the point-filtered table first and turned a 482 ms big×big intermediate into a 5.3 ms point-lookup chain — matching the benign order's plan. Multi-key AND-chain ON conditions take the hash path (they used to plan as nested loops), and pushed-lookup join sides keep their key extraction (`col_index`'s plain-name fallback).
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
 - **Concurrency**: see the [concurrency section](#concurrency-vs-sqlite) — the 8.3x concurrent-read and 5.7–8.3x parallel-aggregate multipliers sit on top of these serial wins.
@@ -698,12 +700,26 @@ compat surface. Every entry says what it costs and why it exists.
   verdict is host-fsync-dominated (394 ms vs 6.33 s for SQLite across host
   families — see the note in the sqlx section); the CI bench gate treats it
   as an explicitly-marked parity guard. Same shape as SQLite's own WAL.
-- **Planner plan shapes**: predicate pushdown into all scan shapes, join
-  reordering, and subquery decorrelation are not implemented — plan shapes
-  are rule-based. The stat1-driven cost model ranks index candidates and
-  declines unselective ones after `ANALYZE`, but SQLite's cost model makes
-  better choices on a few adversarial join orders (a shape-level gap that
-  statistics alone cannot fix).
+- **Planner plan shapes**: **join reordering is REAL now** — maximal
+  INNER/CROSS equi-join spines of 3+ relations flatten, take each
+  atom's cardinality estimate (pushed access path + `sqlite_stat1`,
+  point lookups = 1, unanalyzed tables = SQLite's 2^20 default), and
+  rebuild greedily smallest-filtered-first with connectivity
+  preference; ON conditions and the multi-relation WHERE conjuncts
+  (join conditions in disguise for INNER joins — `FROM a, b WHERE
+  a.x = b.x` now FUSES into the join condition and hash-joins instead
+  of a cross product + post-filter) re-attach to the first join node
+  covering their relations; column order is restored with a projection
+  so every consumer sees the FROM-clause layout (differential-pinned
+  against real SQLite in `tests/join_reorder.rs`, 13 suites: adversarial
+  4-table chains, USING/multi-key/mixed-residual ON, LEFT-JOIN boundary
+  pinning, self-joins, CTE atoms, subquery atoms declining safely,
+  multiplicity, ANALYZE-driven estimates — the adversarial 3-join
+  shape went 482 ms → 5.3 ms, ~90x, now matching the benign order).
+  Still rule-based rather than cost-searched: predicate pushdown into
+  all scan shapes and subquery decorrelation remain unimplemented, and
+  SQLite's full cost model still wins a few orders the greedy can't
+  see (bushy plans, multi-alternative costing).
 - **Parallel executor coverage**: single-table shapes split (aggregates with
   literal **or parameter** filters, GROUP BY bare/compiled, top-N, unbounded
   ORDER BY with a fused 1:1 projection), and the **equi-JOIN probe side now
@@ -833,9 +849,11 @@ compat surface. Every entry says what it costs and why it exists.
   UTF-16 files read/write end-to-end and the engine's `ORDER BY` / min /
   max / `CAST(text AS BLOB)` follow the file's raw-encoding byte order
   exactly like SQLite (differential-tested on supplementary-plane text);
-  the one remaining engine-side sub-gap on non-UTF-8 files: WHERE range
-  comparisons and in-memory index range seeks still use code-point order
-  (equality and the file's own b-tree order are exact).
+  WHERE range comparisons dispatch TEXT×TEXT pairs through the
+  connection's BINARY collation (memcmp of the encoded bytes) and
+  in-memory index range SEEKS decline on non-UTF-8 connections (the
+  range conjunct stays a scan filter — correct, just not seek-fast;
+  equality and the file's own b-tree order are exact).
 - **WAL for SQLite-format mode**: COMMITTED through a REAL `-wal`
   sidecar. The first write of a session establishes the main file
   (full atomic rewrite, which also checkpoints whatever sidecar the
