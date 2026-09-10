@@ -2314,6 +2314,18 @@ impl Database {
         }
     }
 
+    /// The connection's SQLite-format text encoding (UTF-8 for native
+    /// and in-memory databases). Installed into the executor's
+    /// value-ordering TLS at every statement entry so ORDER BY /
+    /// min / max / CAST follow the file's BINARY-collation byte order
+    /// (see executor::conn_enc).
+    pub(crate) fn conn_text_enc(&self) -> crate::storage::sqlitefmt::record::TextEnc {
+        self.foreign
+            .as_ref()
+            .map(|f| f.text_enc())
+            .unwrap_or(crate::storage::sqlitefmt::record::TextEnc::Utf8)
+    }
+
     /// Load a decoded SQLite image into the engine: tables first, then
     /// rows, then indexes (backfilling from the rows), then views and
     /// triggers last (triggers must not fire during the load).
@@ -4389,6 +4401,10 @@ impl Database {
         // `last_insert_rowid()` (SQLite: the value is per-connection; the
         // evaluator reads the TLS, which every statement entry refreshes).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        // File text encoding for value ordering / CAST (RAII: restored on
+        // exit so a nested statement from another connection never leaks
+        // its encoding into this one).
+        let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.conn_text_enc());
         // Multi-statement scripts (sqlite3_exec semantics): a `;`-separated
         // script with NO bound parameters runs each statement through the
         // full single-statement machinery in order, stopping at the first
@@ -4922,6 +4938,8 @@ impl Database {
         };
         // Per-connection snapshot for `last_insert_rowid()` (see execute).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        // File text encoding for value ordering / CAST (RAII restore).
+        let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.conn_text_enc());
         // A hot INSERT chain owns the table's live root / max-rowid while
         // the shared maps hold stale values — break (flush) it before this
         // read consults the maps.

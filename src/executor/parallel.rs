@@ -300,6 +300,9 @@ pub(crate) fn try_parallel_fused_aggregate(
 
     // Scoped threads: workers borrow `pager`, the plan and `col_slot`
     // immutably; the main thread is quiescent until the scope joins.
+    // TLS (conn text encoding) does not cross threads: each worker
+    // re-installs the tag copied on the spawning thread.
+    let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<FusedWalk>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -308,6 +311,7 @@ pub(crate) fn try_parallel_fused_aggregate(
             let filter = plan.filter.as_ref();
             let filter_slot = plan.filter_slot;
             handles.push(scope.spawn(move || -> Result<FusedWalk> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut bt = Btree::new(pager, root, false);
                 let mut walk = FusedWalk::new(
                     col_slot.clone(),
@@ -431,6 +435,7 @@ pub(crate) fn try_parallel_groupby_selective(
     let ranges = split.ranges;
     let pager = ctx.pager;
 
+    let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<HashGrouper>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -450,6 +455,7 @@ pub(crate) fn try_parallel_groupby_selective(
             let spill_ok = !ctx.pager.temp_store_memory();
             let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> Result<HashGrouper> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut bt = Btree::new(pager, root, false);
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
@@ -797,6 +803,7 @@ pub(crate) fn try_parallel_groupby_compiled(
 
     let ranges = split.ranges;
     let pager = ctx.pager;
+    let conn_enc_tag = super::conn_enc::current();
 
     let partials: Vec<Result<HashGrouper>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
@@ -812,6 +819,7 @@ pub(crate) fn try_parallel_groupby_compiled(
             let spill_ok = !ctx.pager.temp_store_memory();
             let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> Result<HashGrouper> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut bt = Btree::new(pager, root, false);
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
@@ -968,10 +976,12 @@ pub(crate) fn try_parallel_count(
     };
     let ranges = split.ranges;
     let pager = ctx.pager;
+    let conn_enc_tag = super::conn_enc::current();
     let counts: Vec<Result<u64>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
             handles.push(scope.spawn(move || -> Result<u64> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut bt = Btree::new(pager, root, false);
                 bt.count_rows_range(lo, hi)
             }));
@@ -1063,11 +1073,13 @@ pub(crate) fn try_parallel_topn(
     // Workers: the serial top-N loop over each range (identical heap
     // discipline — sift-up on insert, root-replace + sift-down when the
     // candidate beats the worst survivor).
+    let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
             let wanted = wanted.clone();
             handles.push(scope.spawn(move || -> Result<Vec<super::TopnSel>> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
                 bt.scan_table_range_selective(
@@ -1157,7 +1169,7 @@ fn sort_total_cmp(
     keys: &[(usize, bool)],
 ) -> std::cmp::Ordering {
     for &(col, desc) in keys {
-        let ord = a_row[col].cmp(&b_row[col]);
+        let ord = super::value_cmp_conn(&a_row[col], &b_row[col]);
         let ord = if desc { ord.reverse() } else { ord };
         if ord != std::cmp::Ordering::Equal {
             return ord;
@@ -1288,12 +1300,14 @@ pub(crate) fn try_parallel_sort(
     // Workers: range scan + local sort. The rows move out of the chunk
     // during the merge (mem::take), so the chunk Vecs are drained
     // allocation-free on the emit side.
+    let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<SortChunk>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
             let wanted = &scan_wanted;
             let row_keys = &row_keys;
             handles.push(scope.spawn(move || -> Result<SortChunk> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut bt = Btree::new(pager, root, false);
                 let mut rows: Vec<(i64, Row)> = Vec::new();
                 bt.scan_table_range_selective(
@@ -1489,6 +1503,7 @@ pub(crate) fn try_parallel_join_probe(
             .collect(),
     );
     let n_workers = ranges.len();
+    let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<Vec<crate::Row>>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(n_workers);
         for &(lo, hi) in ranges.iter() {
@@ -1496,6 +1511,7 @@ pub(crate) fn try_parallel_join_probe(
             let wanted = StdArc::clone(&wanted);
             let out_slots = StdArc::clone(&out_slots);
             handles.push(scope.spawn(move || -> Result<Vec<crate::Row>> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut out_rows: Vec<crate::Row> = Vec::new();
                 let mut pbuf: Vec<crate::types::Value> = Vec::new();
                 let mut bt = Btree::new(pager, probe_root, false);

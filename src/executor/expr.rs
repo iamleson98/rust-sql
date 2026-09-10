@@ -112,7 +112,24 @@ fn cast_value(v: Value, type_name: &str) -> Value {
         Affinity::Blob => match v {
             Value::Null => Value::Null,
             Value::Blob(b) => Value::Blob(b),
-            other => Value::Blob(other.as_text().into_bytes()),
+            other => {
+                // SQLite's CAST(text AS BLOB) yields the DATABASE
+                // ENCODING's bytes — on a UTF-16 file that is the UTF-16
+                // code units, not the engine's UTF-8. The connection's
+                // encoding rides the statement-entry TLS (see
+                // executor::conn_enc); parallel workers never evaluate
+                // CAST, so the tag is always current here.
+                let text = other.as_text();
+                let enc = crate::executor::conn_enc::current();
+                if enc == crate::storage::sqlitefmt::record::TextEnc::Utf8 {
+                    Value::Blob(text.into_bytes())
+                } else {
+                    Value::Blob(crate::storage::sqlitefmt::record::text_encoded_bytes(
+                        text.as_str(),
+                        enc,
+                    ))
+                }
+            }
         },
         // No declared type (CAST(x AS) is a syntax error anyway): no-op.
         Affinity::None => v,
@@ -1163,7 +1180,10 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             }
             let mut best: Option<Value> = None;
             for v in args {
-                if best.is_none() || v < best.as_ref().unwrap() {
+                if best.is_none()
+                    || crate::executor::value_cmp_conn(v, best.as_ref().unwrap())
+                        == std::cmp::Ordering::Less
+                {
                     best = Some(v.clone());
                 }
             }
@@ -1177,7 +1197,10 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             }
             let mut best: Option<Value> = None;
             for v in args {
-                if best.is_none() || v > best.as_ref().unwrap() {
+                if best.is_none()
+                    || crate::executor::value_cmp_conn(v, best.as_ref().unwrap())
+                        == std::cmp::Ordering::Greater
+                {
                     best = Some(v.clone());
                 }
             }

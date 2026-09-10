@@ -698,34 +698,12 @@ fn compare_values(a: &Value, b: &Value, enc: TextEnc) -> std::cmp::Ordering {
         (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(O::Equal),
         (Value::Integer(x), Value::Real(y)) => (*x as f64).partial_cmp(y).unwrap_or(O::Equal),
         (Value::Real(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(O::Equal),
-        (Value::Text(x), Value::Text(y)) => match enc {
-            TextEnc::Utf8 => x.as_str().as_bytes().cmp(y.as_str().as_bytes()),
-            TextEnc::Utf16Le | TextEnc::Utf16Be => {
-                // memcmp of the encoded units: exactly what SQLite's
-                // BINARY collation does on UTF-16 files.
-                let xa = x.as_str().encode_utf16();
-                let ya = y.as_str().encode_utf16();
-                let be = enc == TextEnc::Utf16Be;
-                for (u, v) in xa.zip(ya) {
-                    let (ub, vb) = if be {
-                        (u.to_be_bytes(), v.to_be_bytes())
-                    } else {
-                        (u.to_le_bytes(), v.to_le_bytes())
-                    };
-                    let c = ub.cmp(&vb);
-                    if c != O::Equal {
-                        return c;
-                    }
-                }
-                // Prefix tie: shorter text first (memcmp + length, the
-                // SQLite rule).
-                let (xn, yn) = (
-                    x.as_str().encode_utf16().count(),
-                    y.as_str().encode_utf16().count(),
-                );
-                xn.cmp(&yn)
-            }
-        },
+        (Value::Text(x), Value::Text(y)) => {
+            // memcmp of the encoded units: exactly what SQLite's BINARY
+            // collation does on UTF-16 files (shared with the executor's
+            // ORDER BY/min/max comparator — see record::text_order_cmp).
+            super::record::text_order_cmp(x.as_str(), y.as_str(), enc)
+        }
         (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
         _ => O::Equal,
     }

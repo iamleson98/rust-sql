@@ -57,6 +57,56 @@ impl TextEnc {
     }
 }
 
+/// BINARY-collation TEXT ordering under the FILE's encoding — what
+/// SQLite's `sqlite3MemCompare` does for same-class TEXT values: memcmp
+/// over the raw encoded bytes. UTF-8 gives code-point order; UTF-16be
+/// gives code-unit order; UTF-16le gives raw little-endian BYTE order
+/// (neither code-unit nor code-point — e.g. U+FFFD sorts between
+/// surrogate-pair high and low halves). A memcmp-equal prefix ties by
+/// encoded length. This is the exact comparator the file writer uses
+/// for b-tree keys (`writer::compare_values`) and the one the executor
+/// mirrors for ORDER BY / min / max on non-UTF-8 files.
+pub fn text_order_cmp(a: &str, b: &str, enc: TextEnc) -> std::cmp::Ordering {
+    use std::cmp::Ordering as O;
+    if enc == TextEnc::Utf8 {
+        return a.cmp(b);
+    }
+    let be = enc == TextEnc::Utf16Be;
+    let xa = a.encode_utf16();
+    let xb = b.encode_utf16();
+    for (u, v) in xa.zip(xb) {
+        let (ub, vb) = if be {
+            (u.to_be_bytes(), v.to_be_bytes())
+        } else {
+            (u.to_le_bytes(), v.to_le_bytes())
+        };
+        let c = ub.cmp(&vb);
+        if c != O::Equal {
+            return c;
+        }
+    }
+    // Prefix tie: shorter text first (memcmp + length, the SQLite rule).
+    let (an, bn) = (a.encode_utf16().count(), b.encode_utf16().count());
+    an.cmp(&bn)
+}
+
+/// A TEXT value's bytes in the file's encoding — what
+/// `CAST(text AS BLOB)` yields on a non-UTF-8 file (SQLite returns the
+/// database encoding's bytes, not UTF-8).
+pub fn text_encoded_bytes(s: &str, enc: TextEnc) -> Vec<u8> {
+    match enc {
+        TextEnc::Utf8 => s.as_bytes().to_vec(),
+        TextEnc::Utf16Le => s
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>(),
+        TextEnc::Utf16Be => s
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<u8>>(),
+    }
+}
+
 /// Decode a full record payload into `n_cols` values. Shorter records are
 /// NULL-padded (ALTER TABLE ADD COLUMN semantics); the rowid-alias column
 /// is stored as NULL on disk and resolved by the caller.

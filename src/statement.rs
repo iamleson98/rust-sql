@@ -382,6 +382,9 @@ impl<'a> Statement<'a> {
             // Per-connection snapshot for `last_insert_rowid()` (see
             // Database::execute).
             crate::executor::change_counters::note_conn_rowid(self.db.last_insert_rowid());
+            // File text encoding for value ordering / CAST (RAII restore;
+            // see Database::query).
+            let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.db.conn_text_enc());
             self.start()?;
         }
         // Serve one buffered row. The PREVIOUS current_row's consumer

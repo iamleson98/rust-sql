@@ -300,6 +300,101 @@ mod corr {
 
 pub(crate) use corr::Guard as CorrGuard;
 
+/// Per-connection TEXT ENCODING for value ordering and CAST — the
+/// file-format encoding (UTF-8 / UTF-16le / UTF-16be) of the database a
+/// statement runs against, mirrored into a thread-local at statement
+/// entry (the `change_counters::note_conn_rowid` pattern).
+///
+/// WHY: SQLite's BINARY collation memcmps the database encoding's raw
+/// bytes, so on a UTF-16 file `ORDER BY` / `min()` / `max()` follow
+/// code-UNIT (le: raw byte) order — which diverges from the engine's
+/// UTF-8 code-point order exactly for supplementary-plane characters —
+/// and `CAST(text AS BLOB)` yields the encoding's bytes. Comparator
+/// call sites that cannot reach an `ExecContext` (free functions like
+/// `topn_total_cmp`, aggregate Min/Max accumulators, `cast_value`)
+/// read this instead of threading a parameter through a dozen
+/// signatures.
+///
+/// NESTED statements (a query opened inside another statement — vtab
+/// callbacks): the guard saves and RESTORES the outer encoding, so the
+/// inner connection's encoding never leaks into the outer statement.
+/// WORKER threads: TLS does not propagate across `scope::spawn`, so
+/// every parallel worker closure re-installs the tag it copied on the
+/// spawning thread before comparing (see executor/parallel.rs).
+mod conn_enc {
+    use crate::storage::sqlitefmt::record::TextEnc;
+    use std::cell::Cell;
+
+    thread_local! {
+        static TAG: Cell<u8> = const { Cell::new(1) }; // 1 = UTF-8
+    }
+
+    fn enc_to_tag(enc: TextEnc) -> u8 {
+        match enc {
+            TextEnc::Utf8 => 1,
+            TextEnc::Utf16Le => 2,
+            TextEnc::Utf16Be => 3,
+        }
+    }
+
+    fn tag_to_enc(tag: u8) -> TextEnc {
+        match tag {
+            2 => TextEnc::Utf16Le,
+            3 => TextEnc::Utf16Be,
+            _ => TextEnc::Utf8,
+        }
+    }
+
+    /// Install `enc` for the current statement; restores the previous
+    /// tag on Drop (RAII — see the module docs).
+    pub(crate) struct Guard {
+        prev: u8,
+    }
+
+    impl Guard {
+        pub(crate) fn install(enc: TextEnc) -> Guard {
+            let prev = TAG.with(|t| t.replace(enc_to_tag(enc)));
+            Guard { prev }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TAG.with(|t| t.set(self.prev));
+        }
+    }
+
+    /// The current statement's encoding (worker closures call this
+    /// BEFORE spawning to copy the tag across threads).
+    pub(crate) fn current() -> TextEnc {
+        TAG.with(|t| tag_to_enc(t.get()))
+    }
+
+    /// Re-install a tag captured on the spawning thread (inside worker
+    /// closures only — restores on Drop like a statement guard).
+    pub(crate) fn reinstall(enc: TextEnc) -> Guard {
+        Guard::install(enc)
+    }
+}
+
+pub(crate) use conn_enc::Guard as ConnEncGuard;
+
+/// SQL value ordering under the CURRENT statement's file encoding:
+/// identical to [`Value::cmp`] except TEXT×TEXT pairs compare the
+/// encoding's raw bytes (SQLite's BINARY collation on UTF-16 files —
+/// see [`crate::storage::sqlitefmt::record::text_order_cmp`]). UTF-8
+/// connections take the untouched `Value::cmp` fast path.
+#[inline]
+pub(crate) fn value_cmp_conn(a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let (Value::Text(x), Value::Text(y)) = (a, b) {
+        let enc = conn_enc::current();
+        if enc != crate::storage::sqlitefmt::record::TextEnc::Utf8 {
+            return crate::storage::sqlitefmt::record::text_order_cmp(x.as_str(), y.as_str(), enc);
+        }
+    }
+    a.cmp(b)
+}
+
 /// Evaluator-facing wrapper: execute a correlated scalar subquery with the
 /// given EvalContext as the outer scope.
 pub(crate) fn corr_exec_scalar(sel: &SelectStatement, eval_ctx: &EvalContext<'_>) -> Result<Value> {
@@ -3774,9 +3869,9 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
             let ord = if let Expr::Collate { collation, .. } = &term.expr {
                 crate::plugin::lookup_collation(collation)
                     .map(|c| crate::plugin::compare_collated(&va, &vb, c.as_ref()))
-                    .unwrap_or_else(|| va.cmp(&vb))
+                    .unwrap_or_else(|| value_cmp_conn(&va, &vb))
             } else {
-                va.cmp(&vb)
+                value_cmp_conn(&va, &vb)
             };
             let ord = if term.order == Order::Desc {
                 ord.reverse()
@@ -3950,9 +4045,9 @@ fn exec_topn(
             let ord = if let Expr::Collate { collation, .. } = term_expr {
                 crate::plugin::lookup_collation(collation)
                     .map(|c| crate::plugin::compare_collated(&va, &vb, c.as_ref()))
-                    .unwrap_or_else(|| va.cmp(&vb))
+                    .unwrap_or_else(|| value_cmp_conn(&va, &vb))
             } else {
-                va.cmp(&vb)
+                value_cmp_conn(&va, &vb)
             };
             if term.order == Order::Desc {
                 ord.reverse()
@@ -4025,7 +4120,7 @@ fn exec_topn(
         let (ka, kb) = (&keys[*a as usize], &keys[*b as usize]);
         let ord = match coll.as_deref() {
             Some(c) => crate::plugin::compare_collated(ka, kb, c),
-            None => ka.cmp(kb),
+            None => value_cmp_conn(ka, kb),
         };
         let ord = if desc { ord.reverse() } else { ord };
         ord.then(a.cmp(b))
@@ -4058,7 +4153,7 @@ pub(super) fn topn_total_cmp(
     bi: i64,
     desc: bool,
 ) -> std::cmp::Ordering {
-    let ord = a.cmp(b);
+    let ord = value_cmp_conn(a, b);
     let ord = if desc { ord.reverse() } else { ord };
     ord.then(ai.cmp(&bi))
 }
@@ -5768,7 +5863,7 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
 fn cmp_keys(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     let n = a.len().min(b.len());
     for i in 0..n {
-        match a[i].cmp(&b[i]) {
+        match value_cmp_conn(&a[i], &b[i]) {
             std::cmp::Ordering::Equal => continue,
             ord => return ord,
         }
@@ -8924,13 +9019,19 @@ fn update_agg_state(
         }
         AggFunc::Min => {
             let c = state.cold_mut();
-            if !v.is_null() && (c.min.is_none() || v < c.min.as_ref().unwrap()) {
+            if !v.is_null()
+                && (c.min.is_none()
+                    || value_cmp_conn(v, c.min.as_ref().unwrap()) == std::cmp::Ordering::Less)
+            {
                 c.min = Some(v.clone());
             }
         }
         AggFunc::Max => {
             let c = state.cold_mut();
-            if !v.is_null() && (c.max.is_none() || v > c.max.as_ref().unwrap()) {
+            if !v.is_null()
+                && (c.max.is_none()
+                    || value_cmp_conn(v, c.max.as_ref().unwrap()) == std::cmp::Ordering::Greater)
+            {
                 c.max = Some(v.clone());
             }
         }
@@ -9308,7 +9409,7 @@ fn exec_one_window(
                 let ka = &key_cache[&a];
                 let kb = &key_cache[&b];
                 for (i, t) in w.order_by.iter().enumerate() {
-                    let mut ord = ka[i].cmp(&kb[i]);
+                    let mut ord = value_cmp_conn(&ka[i], &kb[i]);
                     if t.order == Order::Desc {
                         ord = ord.reverse();
                     }

@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **713+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **715+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -651,14 +651,17 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
   `integrity_check`); the output stays fully dense (no freelist, no
   truncation of free pages — `freelist_count` is always 0). Native-format
   databases keep no per-file auto-vacuum state (the container is always
-  dense). UTF-16 files read and write end-to-end, with
-  two engine-side sub-gaps on non-UTF-8 files only: the ENGINE's
-  `ORDER BY` / min / max / DISTINCT ordering for TEXT is code-point
-  order (SQLite on a UTF-16 file uses raw file-encoding byte order, so
-  row order can differ for mixed-script adversarial text — equality,
-  lookups, and the file's own b-tree order are exact), and
-  `CAST(text AS BLOB)` yields UTF-8 bytes (SQLite yields the file
-  encoding's bytes).
+  dense). UTF-16 files read and write end-to-end, and the ENGINE now
+  follows the file's BINARY-collation byte order exactly like SQLite:
+  `ORDER BY` (serial, streaming top-N, parallel worker splits), `min()` /
+  `max()` (aggregate and scalar), spill-merge `GROUP BY` emission order,
+  and `CAST(text AS BLOB)` (the encoding's bytes, not UTF-8) all
+  differential-tested against real SQLite on both UTF-16le and UTF-16be
+  files with adversarial supplementary-plane text
+  (`tests/utf16_interop.rs`). The remaining engine-side sub-gap on
+  non-UTF-8 files: WHERE range comparisons (`v > '…'`) and in-memory
+  index range seeks still use code-point order (equality, lookups, and
+  the file's own b-tree order are exact).
 
 ## Remaining gaps vs SQLite
 
@@ -813,12 +816,12 @@ compat surface. Every entry says what it costs and why it exists.
   CREATE TABLE from SQLite lands on largest-root+1 without collision
   (`tests/sqlite_interop.rs`, 5 suites: FULL round-trip, INCREMENTAL
   round-trip, engine-created files, pragma gating, map-page geometry).
-  UTF-16 files read/write end-to-end; the two remaining
-  engine-side sub-gaps on non-UTF-8 files: TEXT `ORDER BY`/min/max use
-  code-point order where SQLite uses raw file-encoding byte order
-  (equality and the file's b-tree order are exact), and
-  `CAST(text AS BLOB)` yields UTF-8 bytes instead of the file encoding's
-  bytes.
+  UTF-16 files read/write end-to-end and the engine's `ORDER BY` / min /
+  max / `CAST(text AS BLOB)` follow the file's raw-encoding byte order
+  exactly like SQLite (differential-tested on supplementary-plane text);
+  the one remaining engine-side sub-gap on non-UTF-8 files: WHERE range
+  comparisons and in-memory index range seeks still use code-point order
+  (equality and the file's own b-tree order are exact).
 - **WAL for SQLite-format mode**: the SQLite-format writer commits
   atomically via temp-file + rename, not a real `-wal` sidecar — readers
   of a rustqlite-written file never see journal state, but a

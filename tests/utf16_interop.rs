@@ -339,11 +339,13 @@ fn engine_creates_utf16_file_verified_by_sqlite() {
 
 #[test]
 fn engine_utf16_order_by_matches_sqlite_byte_order() {
-    // The engine's own ORDER BY is code-point order; SQLite's on a
-    // UTF-16 file is raw-encoding-byte order. The FILE's b-tree order
-    // must follow SQLITE's comparator — so ORDER BY through SQLite's
-    // index scan on the engine-created file must equal SQLite's own
-    // reference order for the same data.
+    // SQLite's on a UTF-16 file is raw-encoding-byte order — and the
+    // ENGINE's own ORDER BY now follows the same comparator (BINARY
+    // text pairs compare the connection's file encoding — see
+    // executor::conn_enc), not code-point order. The FILE's b-tree
+    // order must follow SQLITE's comparator too — so ORDER BY through
+    // SQLite's index scan on the engine-created file must equal
+    // SQLite's own reference order for the same data.
     let data = ADVERSARIAL;
     for pragma_name in ["UTF-16le", "UTF-16be"] {
         let engine_path = temp_path(&format!("b_order_{pragma_name}"));
@@ -379,6 +381,23 @@ fn engine_utf16_order_by_matches_sqlite_byte_order() {
                 db.execute("INSERT INTO t VALUES (?)", [Value::Text(s.into())])
                     .unwrap();
             }
+            // THE ENGINE's OWN comparator (reopened: the pragma-era
+            // connection also works, reopen proves the header's encoding
+            // feeds the ordering).
+            let engine_order: Vec<String> = {
+                let db = Database::open(&engine_path).unwrap();
+                let rows = db.query("SELECT v FROM t ORDER BY v", ()).unwrap();
+                rows.iter()
+                    .map(|r| match &r[0] {
+                        Value::Text(t) => t.as_str().to_string(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                engine_order, reference,
+                "{pragma_name}: the ENGINE's ORDER BY must follow SQLite's byte order"
+            );
         }
 
         // SQLite sorts the ENGINE's file: the same order as its own.
@@ -412,6 +431,129 @@ fn engine_utf16_order_by_matches_sqlite_byte_order() {
         let _ = std::fs::remove_file(&engine_path);
         let _ = std::fs::remove_file(&sqlite_path);
     }
+}
+
+#[test]
+fn engine_utf16_min_max_cast_match_sqlite() {
+    // Aggregate min()/max(), the scalar forms, DESC ORDER BY and
+    // CAST(v AS BLOB) — all compare/yield the FILE encoding's bytes on
+    // a UTF-16 file; the engine must match real SQLite exactly.
+    let data = ADVERSARIAL;
+    for pragma_name in ["UTF-16le", "UTF-16be"] {
+        let path = temp_path(&format!("b_mmc_{pragma_name}"));
+        {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            con.pragma_update(None, "encoding", pragma_name).unwrap();
+            con.execute_batch("CREATE TABLE t(v TEXT);").unwrap();
+            let mut stmt = con.prepare("INSERT INTO t VALUES (?)").unwrap();
+            for s in data {
+                stmt.execute([s]).unwrap();
+            }
+        }
+        // SQLite's answers.
+        let (sq_min, sq_max, sq_desc, sq_cast): (String, String, Vec<String>, Vec<Vec<u8>>) = {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            let mn: String = con
+                .query_row("SELECT min(v) FROM t", [], |r| r.get(0))
+                .unwrap();
+            let mx: String = con
+                .query_row("SELECT max(v) FROM t", [], |r| r.get(0))
+                .unwrap();
+            let mut stmt = con.prepare("SELECT v FROM t ORDER BY v DESC").unwrap();
+            let desc: Vec<String> = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let mut stmt = con
+                .prepare("SELECT hex(CAST(v AS BLOB)) FROM t ORDER BY v")
+                .unwrap();
+            let casts: Vec<Vec<u8>> = stmt
+                .query_map([], |r| {
+                    let h: String = r.get(0).unwrap();
+                    Ok((0..h.len() / 2)
+                        .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                        .collect::<Vec<u8>>())
+                })
+                .unwrap()
+                .map(|r: Result<Vec<u8>, rusqlite::Error>| r.unwrap())
+                .collect();
+            (mn, mx, desc, casts)
+        };
+        // The engine's answers on the same file.
+        let (e_min, e_max, e_desc, e_cast): (String, String, Vec<String>, Vec<Vec<u8>>) = {
+            let db = Database::open(&path).unwrap();
+            let q1 = db.query("SELECT min(v) FROM t", ()).unwrap();
+            let q2 = db.query("SELECT max(v) FROM t", ()).unwrap();
+            let q3 = db.query("SELECT v FROM t ORDER BY v DESC", ()).unwrap();
+            let q4 = db
+                .query("SELECT CAST(v AS BLOB) FROM t ORDER BY v", ())
+                .unwrap();
+            let as_str = |v: &Value| match v {
+                Value::Text(t) => t.as_str().to_string(),
+                other => format!("{other:?}"),
+            };
+            (
+                as_str(&q1[0][0]),
+                as_str(&q2[0][0]),
+                q3.iter().map(|r| as_str(&r[0])).collect(),
+                q4.iter()
+                    .map(|r| match &r[0] {
+                        Value::Blob(b) => b.clone(),
+                        other => format!("{other:?}").into_bytes(),
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(e_min, sq_min, "{pragma_name}: min()");
+        assert_eq!(e_max, sq_max, "{pragma_name}: max()");
+        assert_eq!(e_desc, sq_desc, "{pragma_name}: ORDER BY DESC");
+        assert_eq!(e_cast, sq_cast, "{pragma_name}: CAST(v AS BLOB) bytes");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn engine_utf16_parallel_sort_serial_equality() {
+    // The parallel ORDER BY worker split must stay bit-identical to the
+    // serial sort under UTF-16 byte-order comparisons: worker threads
+    // re-install the connection's encoding tag (TLS does not cross
+    // threads) — a regression here means a worker sorted code-point
+    // order while the main-thread merge compared UTF-16 order.
+    let path = temp_path("b_par_sort");
+    let n = 60_000; // above the parallel-sort threshold
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        con.pragma_update(None, "encoding", "UTF-16le").unwrap();
+        con.execute_batch("CREATE TABLE t(v TEXT);").unwrap();
+        let mut stmt = con.prepare("INSERT INTO t VALUES (?)").unwrap();
+        // Mixed-script adversarial values cycling with distinct rowids.
+        for i in 0..n {
+            let v = format!("{}{}", ADVERSARIAL[i % ADVERSARIAL.len()], i);
+            stmt.execute([v]).unwrap();
+        }
+    }
+    let db = Database::open(&path).unwrap();
+    // Parallel path (bare-column ORDER BY over a full scan, no predicate).
+    let parallel = db.query("SELECT v FROM t ORDER BY v", ()).unwrap();
+    // Oracle: SQLite's own order for the same file.
+    let reference: Vec<String> = {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = con.prepare("SELECT v FROM t ORDER BY v").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    let got: Vec<String> = parallel
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(got, reference, "parallel UTF-16 ORDER BY must equal SQLite");
+    let _ = std::fs::remove_file(&path);
 }
 
 // ---------------------------------------------------------------------------
