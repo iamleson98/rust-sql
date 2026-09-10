@@ -1457,11 +1457,8 @@ fn regression_column_pk_autoindex_survives_reopen() {
             [],
         )
         .unwrap();
-        db.execute(
-            "INSERT INTO p VALUES ('u-1', 'first')",
-            [],
-        )
-        .unwrap();
+        db.execute("INSERT INTO p VALUES ('u-1', 'first')", [])
+            .unwrap();
     }
     {
         let mut db = Database::open(&path).unwrap();
@@ -1491,7 +1488,10 @@ fn regression_column_pk_autoindex_survives_reopen() {
         assert!(dup.is_err(), "PK enforcement must survive a 2nd reopen too");
         // The autoindex must be visible to introspection.
         let idx = db
-            .query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='p'", [])
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='p'",
+                [],
+            )
             .unwrap();
         assert!(
             idx.iter()
@@ -1519,17 +1519,22 @@ fn regression_column_pk_autoindex_numbering_matches_textual_order() {
             [],
         )
         .unwrap();
-        db.execute("INSERT INTO n VALUES ('k1', 'b1', 'x')", []).unwrap();
+        db.execute("INSERT INTO n VALUES ('k1', 'b1', 'x')", [])
+            .unwrap();
     }
     let mut db = Database::open(&path).unwrap();
     let dup = db.execute("INSERT INTO n VALUES ('k1', 'other', 'y')", []);
-    assert!(dup.is_err(), "PK autoindex must pair with the right rootpage");
+    assert!(
+        dup.is_err(),
+        "PK autoindex must pair with the right rootpage"
+    );
     let dup2 = db.execute("INSERT INTO n VALUES ('k2', 'b1', 'y')", []);
     assert!(
         dup2.is_err(),
         "UNIQUE autoindex must pair with the right rootpage"
     );
-    db.execute("INSERT INTO n VALUES ('k2', 'b2', 'y')", []).unwrap();
+    db.execute("INSERT INTO n VALUES ('k2', 'b2', 'y')", [])
+        .unwrap();
     let n = db.query("SELECT COUNT(*) FROM n", []).unwrap();
     assert_eq!(n[0][0], Value::Integer(2));
     let ic = db.query("PRAGMA integrity_check", []).unwrap();
@@ -1570,7 +1575,10 @@ fn regression_upsert_then_dup_insert_still_rejects() {
     )
     .unwrap();
     let dup1 = db.execute("INSERT INTO p VALUES ('k1', 'c')", []);
-    assert!(dup1.is_err(), "dup must stay rejected after a literal upsert");
+    assert!(
+        dup1.is_err(),
+        "dup must stay rejected after a literal upsert"
+    );
 
     db.execute(
         "INSERT INTO p (user_id, name) VALUES (?, ?) \
