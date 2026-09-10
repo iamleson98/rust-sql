@@ -667,7 +667,7 @@ fn sqlite_wal_mode_file_reads() {
 /// overflow chains (types 3/4), an index, a WITHOUT ROWID table (roots =
 /// type 1) — then return the expected row checksum.
 fn build_av_source(path: &std::path::Path, mode: &str) -> i64 {
-    let con = rusqlite::Connection::open(path).unwrap();
+    let mut con = rusqlite::Connection::open(path).unwrap();
     con.execute_batch(&format!("PRAGMA auto_vacuum = {mode};"))
         .unwrap();
     con.execute_batch(
@@ -679,14 +679,21 @@ fn build_av_source(path: &std::path::Path, mode: &str) -> i64 {
     )
     .unwrap();
     let mut big_sum = 0i64;
-    for i in 1..=2500i64 {
-        let pad = format!("p{:04}", i % 97);
-        con.execute(
-            "INSERT INTO big(id, pad) VALUES (?1, ?2)",
-            rusqlite::params![i, pad],
-        )
-        .unwrap();
-        big_sum += i;
+    {
+        // One transaction: 2500 per-row autocommit fsyncs would run for
+        // minutes on CI's Windows runners (~100ms per fsync there).
+        let tx = con.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO big(id, pad) VALUES (?1, ?2)")
+                .unwrap();
+            for i in 1..=2500i64 {
+                let pad = format!("p{:04}", i % 97);
+                stmt.execute(rusqlite::params![i, pad]).unwrap();
+                big_sum += i;
+            }
+        }
+        tx.commit().unwrap();
     }
     // Overflow: 9 KB of text spans 3+ overflow pages (4 KiB page size).
     let wide = "A".repeat(9217);
@@ -910,12 +917,16 @@ fn engine_wal_sidecar_sqlite_reads_incremental_commits() {
     // First dump after the initial empty full write: a WAL commit.
     let w1 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
     assert!(w1 > 32, "CREATE TABLE commit must be WAL frames (got {w1})");
-    for i in 1..=25 {
-        db.execute(
-            "INSERT INTO t VALUES (?1, ?2)",
-            [Value::Integer(i), Value::Text(format!("v{i}").into())],
-        )
-        .unwrap();
+    for base in (0..25).step_by(5) {
+        // Multi-row statements: five WAL commits (five fsyncs), not 25.
+        let values: Vec<String> = (1..=5)
+            .map(|k| {
+                let i = base + k;
+                format!("({i}, 'v{i}')")
+            })
+            .collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
+            .unwrap();
     }
     let w2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
     assert!(w2 > w1, "inserts append frames incrementally");
@@ -971,14 +982,20 @@ fn engine_wal_growth_beyond_main_file() {
     db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, pad TEXT)", ())
         .unwrap();
     let main0 = std::fs::metadata(&path).unwrap().len();
-    // ~300-byte pads: 300 rows stay well under the 1000-frame
-    // autocheckpoint threshold, so the growth lives ONLY in the
-    // sidecar and the main file is genuinely untouched.
-    for i in 0..300 {
-        let pad = format!("pad-{i:04}-{}", "x".repeat(280));
+    // ~300-byte pads, 300 rows in 3 multi-row commits: ~100 changed
+    // pages per commit stays well under the 1000-frame autocheckpoint
+    // threshold, so the growth lives ONLY in the sidecar and the main
+    // file is genuinely untouched (and only 3 fsyncs on slow runners).
+    for base in (0..300).step_by(100) {
+        let values: Vec<String> = (0..100)
+            .map(|k| {
+                let i = base + k;
+                format!("({}, 'pad-{i:04}-{}')", i + 1, "x".repeat(280))
+            })
+            .collect();
         db.execute(
-            "INSERT INTO t(id, pad) VALUES (?1, ?2)",
-            [Value::Integer(i + 1), Value::Text(pad.into())],
+            &format!("INSERT INTO t(id, pad) VALUES {}", values.join(",")),
+            (),
         )
         .unwrap();
     }
@@ -1039,11 +1056,14 @@ fn engine_wal_torn_tail_stops_at_commit_boundary() {
     let mut db = Database::open_sqlite_format(&path).unwrap();
     db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
         .unwrap();
-    for i in 1..=10 {
-        db.execute("INSERT INTO t VALUES (?1)", [Value::Integer(i)])
+    // Four multi-row commits: the torn tail must roll back exactly the
+    // last one.
+    for base in (0..8).step_by(2) {
+        let values: Vec<String> = (1..=2).map(|k| format!("({})", base + k)).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
             .unwrap();
     }
-    let committed = 10i64;
+    let committed = 8i64;
     // Torn tail: cut the last frame's final 100 bytes.
     {
         let len = std::fs::metadata(&wal).unwrap().len() as usize;
@@ -1057,12 +1077,16 @@ fn engine_wal_torn_tail_stops_at_commit_boundary() {
         let n: i64 = con
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, committed - 1, "SQLite sees the last complete commit");
+        assert_eq!(
+            n,
+            committed - 2,
+            "SQLite sees the last complete commit (the torn one held 2 rows)"
+        );
     }
     {
         let db2 = Database::open(&path).unwrap();
         let n: i64 = db2.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, committed - 1, "engine sees the same boundary");
+        assert_eq!(n, committed - 2, "engine sees the same boundary");
     }
     // The writer's close-time checkpoint HEALS the torn sidecar from
     // its authoritative committed image (the torn frame was durable in
@@ -1083,23 +1107,39 @@ fn engine_wal_torn_tail_stops_at_commit_boundary() {
 fn engine_wal_checkpoint_pressure_folds_back() {
     // Crossing the 1000-frame autocheckpoint pressure folds the sidecar
     // into the main file (full atomic write) and starts fresh salts.
+    // Frame pressure is built with BULK statements: an UPDATE that
+    // appends 2 KiB to every row rewrites every leaf page — hundreds
+    // of frames per single commit (and a single fsync), instead of
+    // thousands of per-row autocommit fsyncs.
     let path = temp_path("wal_ckpt");
     let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
     {
         let mut db = Database::open_sqlite_format(&path).unwrap();
         db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
             .unwrap();
-        // 1200 single-row commits: each is one frame (page 1 + the
-        // touched leaf) — well past 1000 frames total.
-        for i in 1..=1200 {
+        // 900 rows in 3 multi-row commits.
+        for base in (0..900).step_by(300) {
+            let values: Vec<String> = (0..300)
+                .map(|k| {
+                    let i = base + k + 1;
+                    format!("({i}, 'v{i}-{}')", "y".repeat(40))
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
+                .unwrap();
+        }
+        // Six bulk UPDATEs, each growing every row by 2 KiB: the image
+        // doubles repeatedly and the cumulative frame count crosses
+        // the 1000-frame threshold within a handful of commits.
+        for _ in 0..6 {
             db.execute(
-                "INSERT INTO t VALUES (?1, ?2)",
-                [Value::Integer(i), Value::Text(format!("v{i}").into())],
+                "UPDATE t SET v = v || ?1",
+                [Value::Text("z".repeat(2048).into())],
             )
             .unwrap();
         }
         let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, 1200);
+        assert_eq!(n, 900);
     }
     // After the fold the sidecar is either absent or tiny; the main
     // file holds everything.
@@ -1114,7 +1154,7 @@ fn engine_wal_checkpoint_pressure_folds_back() {
         let n: i64 = con
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1200);
+        assert_eq!(n, 900);
     }
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&wal);

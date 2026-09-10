@@ -523,15 +523,21 @@ fn engine_utf16_parallel_sort_serial_equality() {
     let path = temp_path("b_par_sort");
     let n = 60_000; // above the parallel-sort threshold
     {
-        let con = rusqlite::Connection::open(&path).unwrap();
+        let mut con = rusqlite::Connection::open(&path).unwrap();
         con.pragma_update(None, "encoding", "UTF-16le").unwrap();
         con.execute_batch("CREATE TABLE t(v TEXT);").unwrap();
-        let mut stmt = con.prepare("INSERT INTO t VALUES (?)").unwrap();
-        // Mixed-script adversarial values cycling with distinct rowids.
-        for i in 0..n {
-            let v = format!("{}{}", ADVERSARIAL[i % ADVERSARIAL.len()], i);
-            stmt.execute([v]).unwrap();
+        // One transaction: 60k per-row autocommit fsyncs would run for
+        // many minutes on CI's Windows runners (~100ms per fsync there).
+        let tx = con.transaction().unwrap();
+        {
+            let mut stmt = tx.prepare("INSERT INTO t VALUES (?)").unwrap();
+            // Mixed-script adversarial values cycling with distinct rowids.
+            for i in 0..n {
+                let v = format!("{}{}", ADVERSARIAL[i % ADVERSARIAL.len()], i);
+                stmt.execute([v]).unwrap();
+            }
         }
+        tx.commit().unwrap();
     }
     let db = Database::open(&path).unwrap();
     // Parallel path (bare-column ORDER BY over a full scan, no predicate).
