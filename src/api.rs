@@ -25,7 +25,7 @@ use crate::types::{Row, Value};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -448,6 +448,11 @@ pub(crate) struct ForeignSqlite {
     change_counter: AtomicU32,
     schema_cookie: AtomicU32,
     had_wal: AtomicBool,
+    /// Auto-vacuum mode written into every dump (0 = none, 1 = FULL,
+    /// 2 = INCREMENTAL). Captured from the source file's header (52/64)
+    /// at open; `PRAGMA auto_vacuum` can still change it while the
+    /// schema is empty (SQLite's rule — silently ignored afterwards).
+    auto_vacuum: AtomicU8,
 }
 
 impl ForeignSqlite {
@@ -461,6 +466,11 @@ impl ForeignSqlite {
     /// the database holds no schema content).
     fn set_text_enc(&self, enc: crate::storage::sqlitefmt::record::TextEnc) {
         self.text_enc.store(enc.as_u32(), Ordering::Release);
+    }
+
+    /// The file's auto-vacuum mode (see `apply_auto_vacuum`).
+    fn auto_vacuum(&self) -> u8 {
+        self.auto_vacuum.load(Ordering::Acquire)
     }
 }
 
@@ -2246,6 +2256,7 @@ impl Database {
             change_counter: AtomicU32::new(0),
             schema_cookie: AtomicU32::new(0),
             had_wal: AtomicBool::new(image.had_wal),
+            auto_vacuum: AtomicU8::new(image.auto_vacuum),
         };
         db.foreign = Some(foreign);
         db.load_foreign_image(image)?;
@@ -2286,6 +2297,7 @@ impl Database {
             change_counter: AtomicU32::new(1),
             schema_cookie: AtomicU32::new(1),
             had_wal: AtomicBool::new(false),
+            auto_vacuum: AtomicU8::new(0),
         });
         db.dump_foreign()?;
         Ok(db)
@@ -2732,6 +2744,7 @@ impl Database {
             change_counter,
             schema_cookie,
             text_enc: foreign.text_enc(),
+            auto_vacuum: foreign.auto_vacuum(),
             objects,
         })
     }
@@ -4474,6 +4487,16 @@ impl Database {
                 let value = pragma_value_text(p, params.as_slice());
                 drop(cached);
                 apply_encoding(self, value.as_deref().unwrap_or(""))?;
+                return Ok(());
+            }
+            // `PRAGMA auto_vacuum = X` (write form): same routing as
+            // encoding — ForeignSqlite owns the mode; empty result.
+            if p.value.is_some() && p.name.eq_ignore_ascii_case("auto_vacuum") {
+                let mode = auto_vacuum_value(p, params.as_slice());
+                drop(cached);
+                if let Some(mode) = mode {
+                    apply_auto_vacuum(self, mode)?;
+                }
                 return Ok(());
             }
         }
@@ -8812,6 +8835,20 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             rows: Vec::new(),
         });
     }
+    // `PRAGMA auto_vacuum = X`: the write form (NONE/0, FULL/1,
+    // INCREMENTAL/2 — anything else parses as NONE, SQLite's
+    // getAutoVacuum clamp). Effective only while the schema is empty;
+    // afterwards silently ignored (probed against real SQLite 3.53).
+    // Empty result set, like the encoding write form.
+    if p.value.is_some() && name == "auto_vacuum" {
+        if let Some(mode) = auto_vacuum_value(p, None) {
+            apply_auto_vacuum(db, mode).ok()?;
+        }
+        return Some(PragmaRows {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
     // `PRAGMA journal_mode = WAL` / `journal_mode(WAL)`: the write form
     // RETURNS the resulting mode as a row (SQLite behavior — rusqlite and
     // ORMs read it back). The mode word parses as a bare identifier
@@ -8957,7 +8994,12 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         }),
         "user_version" => Value::Integer(pager.user_version() as i64),
         "application_id" => Value::Integer(pager.application_id() as i64),
-        "auto_vacuum" => Value::Integer(0),
+        "auto_vacuum" => Value::Integer(
+            db.foreign
+                .as_ref()
+                .map(|f| f.auto_vacuum() as i64)
+                .unwrap_or(0),
+        ),
         "encoding" => Value::Text(
             db.foreign
                 .as_ref()
@@ -9002,6 +9044,88 @@ fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
     }
 }
 
+/// Apply a `PRAGMA auto_vacuum = X` assignment — see
+/// [`auto_vacuum_value`] for the accepted values.
+///
+/// SQLite semantics (probed against the bundled 3.53): the mode is
+/// stored while the schema is EMPTY (a fresh file whose header has not
+/// materialized); once objects exist the assignment is silently ignored
+/// — reads keep returning the file's mode. The next dump then writes
+/// pointer-map pages (header 52/64 + one 5-byte entry per page), which
+/// real SQLite's integrity_check validates entry by entry. Native-format
+/// databases have no pointer-map concept (always dense): no-op.
+fn apply_auto_vacuum(db: &Database, mode: u8) -> Result<()> {
+    if let Some(f) = &db.foreign {
+        if !foreign_schema_materialized(db) {
+            f.auto_vacuum.store(mode, Ordering::Release);
+            // The next dump (next statement or explicit flush) rewrites
+            // the file — including pointer-map pages and header 52/64.
+            f.dirty.store(true, Ordering::Release);
+        }
+        // Materialized schema: silently ignored (SQLite behavior).
+    }
+    Ok(())
+}
+
+/// True once the SQLite-format header has materialized: any schema
+/// object exists, in the SOURCE's row order (`foreign.order`, populated
+/// at open — entries persist through drops, matching SQLite's "the
+/// header was written, the mode is fixed") or in the live catalog
+/// (engine-created objects on a fresh file, which never passed through
+/// a load). Until then, format-affecting pragmas (encoding,
+/// auto_vacuum) may still reshape the file.
+fn foreign_schema_materialized(db: &Database) -> bool {
+    if let Some(f) = &db.foreign {
+        if !f.order.lock().is_empty() {
+            return true;
+        }
+    }
+    let tables = db.catalog.all_tables();
+    tables
+        .iter()
+        .any(|(n, _)| n != "sqlite_master" && n != "sqlite_schema")
+        || !db.catalog.all_indexes().is_empty()
+        || !db.catalog.all_views().is_empty()
+        || !db.catalog.all_triggers().is_empty()
+}
+
+/// `PRAGMA auto_vacuum = X` value → mode, mirroring sqlite3.c's
+/// `getAutoVacuum`: "NONE"/"FULL"/"INCREMENTAL" (case-insensitive) map
+/// to 0/1/2; anything else falls back to SQLite's atoi-then-clamp
+/// semantics ("9"/"BANANA"/"-1" all land on 0 = NONE). Integer literals
+/// 0/1/2 pass through. `None` = no parsable value at all.
+fn auto_vacuum_value(p: &PragmaStatement, params: Option<&[Value]>) -> Option<u8> {
+    let word = |s: &str| -> Option<u8> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(0),
+            "full" => Some(1),
+            "incremental" => Some(2),
+            other => {
+                // atoi semantics: leading digits, else 0, clamped to
+                // NONE outside 0..=2.
+                let i: i64 = other.parse().unwrap_or(0);
+                Some(if (0..=2).contains(&i) { i as u8 } else { 0 })
+            }
+        }
+    };
+    match value_as_expr(p.value.as_ref()?) {
+        crate::sql::ast::Expr::Column { name, .. } => word(name),
+        crate::sql::ast::Expr::Literal(Value::Text(t)) => word(t.as_str()),
+        crate::sql::ast::Expr::Literal(Value::Integer(i)) => {
+            Some(if (0..=2).contains(i) { *i as u8 } else { 0 })
+        }
+        crate::sql::ast::Expr::Parameter(slot) => {
+            let slot: usize = slot.trim_matches('?').parse().unwrap_or(0);
+            match params?.get(slot)? {
+                Value::Text(t) => word(t.as_str()),
+                Value::Integer(i) => Some(if (0..=2).contains(i) { *i as u8 } else { 0 }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Apply a `PRAGMA encoding = X` assignment.
 ///
 /// SQLite semantics (probed against the bundled 3.46):
@@ -9040,13 +9164,15 @@ fn apply_encoding(db: &Database, value: &str) -> Result<()> {
         _ => return Ok(()),
     };
     if let Some(f) = &db.foreign {
-        if f.order.lock().is_empty() {
+        // Same materialized-schema gate as auto_vacuum: the source's row
+        // order OR any live catalog object fixes the header's shape.
+        if !foreign_schema_materialized(db) {
             f.set_text_enc(requested);
             // The next dump (next statement, drop, or explicit flush)
             // rewrites the file — including header field 56.
             f.dirty.store(true, Ordering::Release);
         }
-        // Non-empty schema: silently ignored (SQLite behavior).
+        // Materialized schema: silently ignored (SQLite behavior).
     }
     // Native-format databases: UTF-8 is the container's only encoding;
     // the assignment is a no-op either way.

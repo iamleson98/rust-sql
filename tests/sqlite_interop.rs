@@ -655,3 +655,235 @@ fn sqlite_wal_mode_file_reads() {
         assert_eq!(n, 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// auto_vacuum pointer-map pages: SQLite creates an auto-vacuum database,
+// the engine reads + rewrites it (mode preserved, ptrmap pages emitted),
+// and real SQLite verifies every pointer-map entry via integrity_check.
+// ---------------------------------------------------------------------------
+
+/// Build a source auto-vacuum database exercising every ptrmap entry
+/// type: multi-level table trees (type 5 non-root pages), wide rows with
+/// overflow chains (types 3/4), an index, a WITHOUT ROWID table (roots =
+/// type 1) — then return the expected row checksum.
+fn build_av_source(path: &std::path::Path, mode: &str) -> i64 {
+    let con = rusqlite::Connection::open(path).unwrap();
+    con.execute_batch(&format!("PRAGMA auto_vacuum = {mode};"))
+        .unwrap();
+    con.execute_batch(
+        "CREATE TABLE big(id INTEGER PRIMARY KEY, pad TEXT);
+         CREATE INDEX idx_big_pad ON big(pad);
+         CREATE TABLE wr(k TEXT PRIMARY KEY, v INT) WITHOUT ROWID;
+         CREATE TABLE ovr(id INTEGER PRIMARY KEY, wide TEXT);
+         INSERT INTO ovr VALUES (1, 'x');",
+    )
+    .unwrap();
+    let mut big_sum = 0i64;
+    for i in 1..=2500i64 {
+        let pad = format!("p{:04}", i % 97);
+        con.execute(
+            "INSERT INTO big(id, pad) VALUES (?1, ?2)",
+            rusqlite::params![i, pad],
+        )
+        .unwrap();
+        big_sum += i;
+    }
+    // Overflow: 9 KB of text spans 3+ overflow pages (4 KiB page size).
+    let wide = "A".repeat(9217);
+    con.execute(
+        "INSERT INTO ovr(id, wide) VALUES (2, ?1)",
+        rusqlite::params![wide],
+    )
+    .unwrap();
+    con.execute_batch("INSERT INTO wr VALUES ('a', 1), ('b', 2), ('C', 3);")
+        .unwrap();
+    let ck: i64 = con
+        .query_row("SELECT sum(id) FROM big", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ck, big_sum);
+    drop(con);
+    big_sum
+}
+
+fn verify_av_file(path: &std::path::Path, expect_mode: i64, big_sum: i64, wr_sum: i64) {
+    let con = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(integrity_check(&con), "ok", "ptrmap entries must validate");
+    let av: i64 = con
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(av, expect_mode, "auto_vacuum mode must round-trip");
+    let fl: i64 = con
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fl, 0, "engine output stays dense");
+    let ck: i64 = con
+        .query_row("SELECT sum(id) FROM big", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ck, big_sum);
+    let n: i64 = con
+        .query_row("SELECT count(*) FROM ovr", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "overflow rows survive");
+    let wide_len: i64 = con
+        .query_row("SELECT length(wide) FROM ovr WHERE id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(wide_len, 9217, "overflow chain content is byte-exact");
+    let w: i64 = con
+        .query_row("SELECT sum(v) FROM wr", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(w, wr_sum);
+    // A follow-up CREATE TABLE takes largest-root+1: must not collide.
+    con.execute_batch("CREATE TABLE late(x); INSERT INTO late VALUES (42);")
+        .unwrap();
+    assert_eq!(
+        integrity_check(&con),
+        "ok",
+        "next-root allocation stays clean"
+    );
+    drop(con);
+}
+
+#[test]
+fn autovacuum_full_roundtrip() {
+    let path = temp_path("av_full");
+    let big_sum = build_av_source(&path, "FULL");
+    // The source itself must be a well-formed av db.
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        let av = con
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(av, 1);
+        assert_eq!(integrity_check(&con), "ok");
+    }
+    // Engine: read, mutate, write back (mode preserved + ptrmap pages).
+    {
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.disk_format(), "sqlite");
+        let av: Vec<Vec<Value>> = db.query("PRAGMA auto_vacuum", ()).unwrap();
+        assert_eq!(av[0][0], Value::Integer(1));
+        let rows = rows_of(&db, "SELECT sum(id) FROM big");
+        assert_eq!(rows[0][0], Value::Integer(big_sum));
+        db.execute("INSERT INTO big(id, pad) VALUES (100000, 'zz')", ())
+            .unwrap();
+        db.execute("DELETE FROM big WHERE id = 100000", ()).unwrap();
+        db.execute("INSERT INTO wr VALUES ('d', 4)", ()).unwrap();
+        db.execute("UPDATE ovr SET wide = 'y' WHERE id = 1", ())
+            .unwrap();
+    }
+    verify_av_file(&path, 1, big_sum, 10);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn autovacuum_incremental_roundtrip() {
+    let path = temp_path("av_incr");
+    let big_sum = build_av_source(&path, "INCREMENTAL");
+    {
+        let mut db = Database::open(&path).unwrap();
+        let av = rows_of(&db, "PRAGMA auto_vacuum");
+        assert_eq!(av[0][0], Value::Integer(2), "INCREMENTAL reports mode 2");
+        db.execute("INSERT INTO big(id, pad) VALUES (200000, 'q')", ())
+            .unwrap();
+    }
+    // Header 64 (incremental flag) must be set: mode 2 round-trips.
+    let data = std::fs::read(&path).unwrap();
+    let be32 = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    assert_ne!(be32(52), 0, "largest root set");
+    assert_eq!(be32(64), 1, "incremental-vacuum flag");
+    // The engine INSERT added id 200000 to the sum.
+    verify_av_file(&path, 2, big_sum + 200_000, 6);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn autovacuum_pragma_roundtrip_on_empty_engine_file() {
+    let path = temp_path("av_empty");
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        // Fresh file: default none.
+        assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(0));
+        // Write form (bare keyword and integer) on the EMPTY schema.
+        db.execute("PRAGMA auto_vacuum = FULL", ()).unwrap();
+        assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(1));
+        db.execute("PRAGMA auto_vacuum = 2", ()).unwrap();
+        assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(2));
+        db.execute("PRAGMA auto_vacuum = INCREMENTAL", ()).unwrap();
+        assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(2));
+        // Invalid values parse as NONE (SQLite's getAutoVacuum clamp).
+        db.execute("PRAGMA auto_vacuum = BANANA", ()).unwrap();
+        assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(0));
+        db.execute("PRAGMA auto_vacuum = FULL", ()).unwrap();
+        // Now build content: the file materializes as auto-vacuum.
+        db.execute("CREATE TABLE t(a TEXT, b INT)", ()).unwrap();
+        db.execute("INSERT INTO t VALUES ('x', 1)", ()).unwrap();
+        // Once content exists, the assignment is silently ignored.
+        db.execute("PRAGMA auto_vacuum = NONE", ()).unwrap();
+        assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(1));
+    }
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let av: i64 = con
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(av, 1, "engine-created av file is verified by SQLite");
+        let b: i64 = con
+            .query_row("SELECT b FROM t WHERE a = 'x'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(b, 1);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn non_autovacuum_rewrite_stays_dense() {
+    // Regression guard: plain files must NOT gain pointer-map pages.
+    let path = temp_path("av_none");
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        con.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES (1),(2),(3);")
+            .unwrap();
+    }
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("INSERT INTO t VALUES (4)", ()).unwrap();
+    }
+    let data = std::fs::read(&path).unwrap();
+    let be32 = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    assert_eq!(be32(52), 0, "no largest-root without auto_vacuum");
+    // Page 2 is the first object root, not a zeroed pointer-map page.
+    assert_eq!(data[4096], 0x0d, "page 2 is a table leaf");
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn autovacuum_ptrmap_entry_geometry() {
+    // Byte-level spot check of the emitted map: page 2 is the first
+    // pointer-map page; its first entry (page 3, the first object root)
+    // is type 1 with parent 0.
+    let path = temp_path("av_geom");
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("PRAGMA auto_vacuum = FULL", ()).unwrap();
+        db.execute("CREATE TABLE t(a)", ()).unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    }
+    let data = std::fs::read(&path).unwrap();
+    assert_eq!(data.len() % 4096, 0);
+    let page2 = &data[4096..8192];
+    // First entry: 5 bytes at offset 0 = page 3 (the table root).
+    assert_eq!(page2[0], 1, "entry type 1 (b-tree root) for page 3");
+    assert_eq!(&page2[1..5], &[0, 0, 0, 0], "root parent is 0");
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+    }
+    let _ = std::fs::remove_file(&path);
+}

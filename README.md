@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **707+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **713+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -646,8 +646,12 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
   (`tests/collate_semantics.rs` + the file-roundtrip probes). Custom
   (plugin-registered) collations still fall back to binary ordering in
   the written file — the file format has no portable encoding for them.
-- `auto_vacuum` pointer-map pages are read fine but not written (output
-  is always fully dense). UTF-16 files read and write end-to-end, with
+- `auto_vacuum` pointer-map pages are read fine and now WRITTEN too
+  (mode preserved, `PRAGMA` round-trip, entries verified by SQLite's
+  `integrity_check`); the output stays fully dense (no freelist, no
+  truncation of free pages — `freelist_count` is always 0). Native-format
+  databases keep no per-file auto-vacuum state (the container is always
+  dense). UTF-16 files read and write end-to-end, with
   two engine-side sub-gaps on non-UTF-8 files only: the ENGINE's
   `ORDER BY` / min / max / DISTINCT ordering for TEXT is code-point
   order (SQLite on a UTF-16 file uses raw file-encoding byte order, so
@@ -796,9 +800,20 @@ compat surface. Every entry says what it costs and why it exists.
   (fast paths, IN-lists, ranges, UPDATE/DELETE), and `GROUP BY` under
   the term's collation with SQLite's first-seen representative — serial,
   parallel (300k-row worker-split equality), and spill paths
-  (`tests/collate_semantics.rs`, 19 suites). `auto_vacuum` pointer-map
-  pages are read but not written (output is
-  always dense). UTF-16 files read/write end-to-end; the two remaining
+  (`tests/collate_semantics.rs`, 19 suites). `auto_vacuum`
+  pointer-map pages are now WRITTEN, not just read: the mode is
+  preserved across engine rewrites (header 52/64), `PRAGMA auto_vacuum`
+  round-trips (NONE/0, FULL/1, INCREMENTAL/2 — settable only while
+  the schema is empty, silently ignored afterwards, exactly SQLite's
+  rules as probed against 3.53), and every dump of an auto-vacuum file
+  reserves the map pages (page 2 first, then every usable/5+1 pages),
+  filling one 5-byte entry per page (type 1 root / 3 first-overflow /
+  4 later-overflow / 5 b-tree node, each with its parent) — real
+  SQLite's `integrity_check` validates every entry, and a follow-up
+  CREATE TABLE from SQLite lands on largest-root+1 without collision
+  (`tests/sqlite_interop.rs`, 5 suites: FULL round-trip, INCREMENTAL
+  round-trip, engine-created files, pragma gating, map-page geometry).
+  UTF-16 files read/write end-to-end; the two remaining
   engine-side sub-gaps on non-UTF-8 files: TEXT `ORDER BY`/min/max use
   code-point order where SQLite uses raw file-encoding byte order
   (equality and the file's b-tree order are exact), and

@@ -89,6 +89,15 @@ pub struct OutDb {
     /// index keys AND sqlite_schema — is written in it, and header field
     /// 56 records it.
     pub text_enc: TextEnc,
+    /// Auto-vacuum mode: 0 = none, 1 = FULL, 2 = INCREMENTAL.
+    /// 0 emits no pointer-map pages (header 52 = 0); 1/2 reserve map
+    /// pages (first at page 2), fill one 5-byte entry per non-map page
+    /// (type 1 root / 3 first-overflow / 4 later-overflow / 5 b-tree
+    /// node, each with its parent), and set header 52 (largest root =
+    /// the page count, so SQLite's next-root allocation lands past the
+    /// end) and header 64 (incremental flag) — verified by real
+    /// SQLite's integrity_check, which validates every entry.
+    pub auto_vacuum: u8,
     pub objects: Vec<OutObject>,
 }
 
@@ -104,7 +113,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
     }
     let usable = page_size as usize;
     let enc = db.text_enc;
-    let mut alloc = PageAllocator::new(page_size);
+    let mut alloc = PageAllocator::new(page_size, db.auto_vacuum != 0);
 
     let mut schema_cells: Vec<SchemaCell> = Vec::new();
     for obj in &db.objects {
@@ -116,6 +125,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 rows,
             } => {
                 let root = build_table_tree(&mut alloc, usable, rows, *alias, None, enc)?;
+                alloc.note_root(root);
                 schema_cells.push(SchemaCell {
                     rowid: 0,
                     kind: "table".into(),
@@ -147,6 +157,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 } else {
                     build_record_tree(&mut alloc, usable, rows, &[], pk_collations, enc)?
                 };
+                alloc.note_root(root);
                 schema_cells.push(SchemaCell {
                     rowid: 0,
                     kind: "table".into(),
@@ -165,6 +176,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 entries,
             } => {
                 let root = build_record_tree(&mut alloc, usable, entries, desc, collations, enc)?;
+                alloc.note_root(root);
                 schema_cells.push(SchemaCell {
                     rowid: 0,
                     kind: "index".into(),
@@ -197,7 +209,22 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
     for (i, c) in schema_cells.iter_mut().enumerate() {
         c.rowid = (i + 1) as i64;
     }
-    build_schema_tree(&mut alloc, usable, &schema_cells, enc)?;
+    let schema_root = build_schema_tree(&mut alloc, usable, &schema_cells, enc)?;
+
+    // Pointer-map pages (auto-vacuum): every b-tree root / child /
+    // overflow page recorded during the build gets its 5-byte entry.
+    let largest_root = if alloc.auto_vacuum {
+        alloc.emit_ptrmaps()?;
+        // Largest root = the page count: SQLite's next CREATE TABLE
+        // takes meta+1, which must not collide with any existing page
+        // (verified against real SQLite: integrity_check passes and a
+        // subsequent CREATE TABLE + INSERT stays clean — probe 7 of
+        // examples/probe_av_semantics.rs).
+        alloc.n_pages()
+    } else {
+        let _ = schema_root;
+        0
+    };
 
     // Assemble the page image.
     let n_pages = alloc.n_pages();
@@ -214,6 +241,8 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
         db.user_version,
         db.application_id,
         enc.as_u32(),
+        largest_root,
+        u32::from(db.auto_vacuum == 2),
     );
     image[0..100].copy_from_slice(&header);
     Ok(image)
@@ -299,20 +328,70 @@ struct PageAllocator {
     /// root; the first dynamic page is 2.
     next: u32,
     pages: Vec<(u32, Vec<u8>)>,
+    /// Auto-vacuum output: pointer-map pages are reserved during the
+    /// sequential walk (page 2 first, then every `n_per_map` pages) and
+    /// filled by `emit_ptrmaps` once all page numbers are final.
+    auto_vacuum: bool,
+    /// Entries per map page: usable_size/5 + 1 (the +1 is the map page
+    /// itself, which carries no entry).
+    n_per_map: u32,
+    /// The PENDING_BYTE page (0x40000000/page_size + 1): never allocated,
+    /// never carries an entry (fileformat2; only reachable in >1 GiB
+    /// files, but the guard is exact).
+    pending_page: u32,
+    /// Reserved map page numbers, in walk order.
+    map_pages: Vec<u32>,
+    /// `(type, parent)` per page number (index 0/1 unused). Types:
+    /// 1 = b-tree root, 3 = first overflow page, 4 = later overflow
+    /// page, 5 = non-root b-tree page. (0, 0) = not yet noted.
+    meta: Vec<(u8, u32)>,
 }
 
 impl PageAllocator {
-    fn new(page_size: u32) -> Self {
+    fn new(page_size: u32, auto_vacuum: bool) -> Self {
+        let usable = page_size; // reserved bytes per page = 0
         Self {
             page_size,
             next: 2,
             pages: Vec::new(),
+            auto_vacuum,
+            n_per_map: usable / 5 + 1,
+            pending_page: 0x4000_0000 / page_size + 1,
+            map_pages: Vec::new(),
+            meta: vec![(0, 0), (0, 0)], // pages 0 and 1
         }
     }
 
+    /// sqlite3.c `ptrmapPageno`: the map page covering `pgno` (>= 2),
+    /// bumped past the PENDING_BYTE page when the formula lands on it.
+    fn map_page_of(&self, pgno: u32) -> u32 {
+        let i = (pgno - 2) / self.n_per_map;
+        let mut ret = i * self.n_per_map + 2;
+        if ret == self.pending_page {
+            ret += 1;
+        }
+        ret
+    }
+
+    fn is_map_page(&self, pgno: u32) -> bool {
+        pgno >= 2 && self.map_page_of(pgno) == pgno
+    }
+
     fn alloc(&mut self) -> u32 {
+        // Auto-vacuum: map pages and the pending-byte page are structural
+        // holes — skip them (and remember them) during the walk. Page 2
+        // is the first map page, so the first user page is 3 — exactly
+        // SQLite's `assert(pgnoRoot>=3)` geometry.
+        while self.auto_vacuum && (self.is_map_page(self.next) || self.next == self.pending_page) {
+            if self.is_map_page(self.next) {
+                self.map_pages.push(self.next);
+            }
+            self.next += 1;
+        }
         let n = self.next;
         self.next += 1;
+        self.meta.resize(self.next as usize, (0, 0));
+        debug_assert_eq!(self.meta[n as usize], (0, 0));
         n
     }
 
@@ -328,6 +407,66 @@ impl PageAllocator {
 
     fn finished(self) -> Vec<(u32, Vec<u8>)> {
         self.pages
+    }
+
+    // ---- pointer-map metadata (auto-vacuum) ----
+
+    /// A b-tree root page (type 1, no parent).
+    fn note_root(&mut self, page: u32) {
+        if page > 1 && self.auto_vacuum {
+            self.meta[page as usize] = (1, 0);
+        }
+    }
+
+    /// A child b-tree page (type 5, parent = the interior page).
+    fn note_btree(&mut self, child: u32, parent: u32) {
+        if self.auto_vacuum {
+            debug_assert_eq!(self.meta[child as usize], (0, 0));
+            self.meta[child as usize] = (5, parent);
+        }
+    }
+
+    /// An overflow chain belonging to `owner`: the first page is type 3
+    /// (parent = the page holding the cell), later pages type 4 (parent
+    /// = the previous overflow page).
+    fn note_overflow(&mut self, chain: &[u32], owner: u32) {
+        if chain.is_empty() || !self.auto_vacuum {
+            return;
+        }
+        self.meta[chain[0] as usize] = (3, owner);
+        for w in chain.windows(2) {
+            self.meta[w[1] as usize] = (4, w[0]);
+        }
+    }
+
+    /// Emit the reserved pointer-map pages. Every non-map page from 3
+    /// to the page count must carry exactly one entry — a hole means the
+    /// build was inconsistent, which surfaces as an error (never a
+    /// corrupt file).
+    fn emit_ptrmaps(&mut self) -> Result<(), String> {
+        let page_size = self.page_size as usize;
+        let n_pages = self.n_pages();
+        let map_pages = self.map_pages.clone();
+        for m in map_pages {
+            let mut page = vec![0u8; page_size];
+            let last = (m + self.n_per_map - 1).min(n_pages);
+            for pgno in (m + 1)..=last {
+                if self.is_map_page(pgno) || pgno == self.pending_page {
+                    continue;
+                }
+                let (ty, parent) = self.meta[pgno as usize];
+                if ty == 0 {
+                    return Err(format!(
+                        "ptrmap: page {pgno} has no b-tree/overflow parent (inconsistent build)"
+                    ));
+                }
+                let off = 5 * (pgno - m - 1) as usize;
+                page[off] = ty;
+                page[off + 1..off + 5].copy_from_slice(&parent.to_be_bytes());
+            }
+            self.store(m, page);
+        }
+        Ok(())
     }
 }
 
@@ -421,13 +560,16 @@ fn make_index_cell(usable: usize, entry: &[Value], enc: TextEnc) -> Cell {
 }
 
 /// Build the overflow chain for a cell (when it has one), patching the
-/// pointer inside `head`. Returns the final on-page cell bytes.
-fn finish_cell(alloc: &mut PageAllocator, cell: Cell) -> Vec<u8> {
+/// pointer inside `head`. Returns the final on-page cell bytes and the
+/// chain's page numbers (empty when the cell did not overflow) — the
+/// caller binds the chain's pointer-map parent once its own page number
+/// is allocated.
+fn finish_cell(alloc: &mut PageAllocator, cell: Cell) -> (Vec<u8>, Vec<u32>) {
     let Some(ptr_pos) = cell.ptr_pos else {
-        return cell.head;
+        return (cell.head, Vec::new());
     };
     if cell.tail.is_empty() {
-        return cell.head;
+        return (cell.head, Vec::new());
     }
     let page_size = alloc.page_size as usize;
     let cap = page_size - 4;
@@ -444,7 +586,7 @@ fn finish_cell(alloc: &mut PageAllocator, cell: Cell) -> Vec<u8> {
         page[4..4 + (end - start)].copy_from_slice(&cell.tail[start..end]);
         alloc.store(page_nos[i], page);
     }
-    head
+    (head, page_nos)
 }
 
 // ---------------------------------------------------------------------------
@@ -877,8 +1019,15 @@ fn write_leaf_page(
     let page1 = fixed == Some(1);
     let hoff: usize = if page1 { 100 } else { 0 };
     let n = cells.len();
-    // Resolve overflow chains first (head size is unaffected).
-    let final_cells: Vec<Vec<u8>> = cells.into_iter().map(|c| finish_cell(alloc, c)).collect();
+    // Resolve overflow chains first (head size is unaffected); the
+    // chain's pointer-map parent binds once this page's number is known.
+    let mut final_cells: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut chains: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for c in cells {
+        let (b, ch) = finish_cell(alloc, c);
+        final_cells.push(b);
+        chains.push(ch);
+    }
     let mut offsets = Vec::with_capacity(n);
     let mut content = page_size;
     for cell in &final_cells {
@@ -886,6 +1035,9 @@ fn write_leaf_page(
         offsets.push(content);
     }
     let page_no = fixed.unwrap_or_else(|| alloc.alloc());
+    for ch in &chains {
+        alloc.note_overflow(ch, page_no);
+    }
     let mut page = vec![0u8; page_size];
     page[hoff] = ptype;
     page[hoff + 1..hoff + 3].copy_from_slice(&0u16.to_be_bytes()); // first freeblock
@@ -938,6 +1090,9 @@ fn write_interior_table_page(
         offsets.push(content);
     }
     let page_no = fixed.unwrap_or_else(|| alloc.alloc());
+    for &i in group {
+        alloc.note_btree(children[i], page_no);
+    }
     let mut page = vec![0u8; page_size];
     page[hoff] = 0x05;
     page[hoff + 1..hoff + 3].copy_from_slice(&0u16.to_be_bytes());
@@ -979,8 +1134,10 @@ fn write_interior_index_page(
     }
     let right = children[*group.last().unwrap()];
     // Materialize cell bytes (4-byte child prefix + separator head with
-    // any overflow chain resolved).
+    // any overflow chain resolved); the separator chains' pointer-map
+    // parents bind once this page's number is allocated.
     let mut cells: Vec<Vec<u8>> = Vec::with_capacity(cell_specs.len());
+    let mut chains: Vec<Vec<u32>> = Vec::with_capacity(cell_specs.len());
     for (i, sep) in cell_specs {
         let mut c = Vec::with_capacity(4 + sep.head.len());
         c.extend_from_slice(&children[i].to_be_bytes());
@@ -995,9 +1152,12 @@ fn write_interior_index_page(
                 ptr_pos: sep.ptr_pos.map(|p| p + 4),
                 rowid: 0,
             };
-            cells.push(finish_cell(alloc, clone));
+            let (b, ch) = finish_cell(alloc, clone);
+            cells.push(b);
+            chains.push(ch);
         } else {
             cells.push(c);
+            chains.push(Vec::new());
         }
     }
     let n = cells.len();
@@ -1008,6 +1168,12 @@ fn write_interior_index_page(
         offsets.push(content);
     }
     let page_no = alloc.alloc();
+    for &i in group {
+        alloc.note_btree(children[i], page_no);
+    }
+    for ch in &chains {
+        alloc.note_overflow(ch, page_no);
+    }
     let mut page = vec![0u8; page_size];
     page[0] = 0x02;
     page[1..3].copy_from_slice(&0u16.to_be_bytes());

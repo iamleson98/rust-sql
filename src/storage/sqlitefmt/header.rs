@@ -98,11 +98,15 @@ pub fn build_header(
         user_version,
         application_id,
         1,
+        0,
+        0,
     )
 }
 
 /// [`build_header`] with an explicit text encoding (1/2/3 — see
-/// fileformat2 header field 56).
+/// fileformat2 header field 56), auto-vacuum largest-root page (field
+/// 52: non-zero = pointer-map pages exist) and incremental-vacuum flag
+/// (field 64: 1 = INCREMENTAL mode).
 #[allow(clippy::too_many_arguments)]
 pub fn build_header_enc(
     page_size: u32,
@@ -112,6 +116,8 @@ pub fn build_header_enc(
     user_version: u32,
     application_id: u32,
     text_encoding: u32,
+    largest_root_btree: u32,
+    incremental_vacuum: u32,
 ) -> [u8; 100] {
     let mut h = [0u8; 100];
     h[0..16].copy_from_slice(MAGIC);
@@ -141,13 +147,14 @@ pub fn build_header_enc(
     h[44..48].copy_from_slice(&4u32.to_be_bytes());
     // Default page cache size: 0 (unspecified).
     h[48..52].copy_from_slice(&0u32.to_be_bytes());
-    // Largest root b-tree: 0 = no auto-vacuum pointer-map pages.
-    h[52..56].copy_from_slice(&0u32.to_be_bytes());
+    // Largest root b-tree: 0 = no auto-vacuum pointer-map pages;
+    // non-zero = the largest root page (auto-vacuum capable).
+    h[52..56].copy_from_slice(&largest_root_btree.to_be_bytes());
     // Text encoding: 1 = UTF-8, 2 = UTF-16le, 3 = UTF-16be.
     h[56..60].copy_from_slice(&text_encoding.to_be_bytes());
     h[60..64].copy_from_slice(&user_version.to_be_bytes());
-    // Incremental vacuum mode: 0.
-    h[64..68].copy_from_slice(&0u32.to_be_bytes());
+    // Incremental vacuum mode: 0 = FULL auto-vacuum, 1 = INCREMENTAL.
+    h[64..68].copy_from_slice(&incremental_vacuum.to_be_bytes());
     h[68..72].copy_from_slice(&application_id.to_be_bytes());
     // 72..92 reserved zeros.
     // Version-valid-for must equal the change counter.
@@ -180,6 +187,20 @@ mod tests {
         assert_eq!(info.application_id, 12345);
         assert_eq!(info.version_valid_for, 7);
         assert_eq!(info.freelist_head, 0);
+        assert_eq!(info.largest_root_btree, 0);
+    }
+
+    #[test]
+    fn header_auto_vacuum_fields() {
+        // FULL: largest root non-zero, incremental 0.
+        let h = build_header_enc(4096, 9, 1, 1, 0, 0, 1, 9, 0);
+        let info = FileHeaderInfo::parse(&h).unwrap();
+        assert_eq!(info.largest_root_btree, 9);
+        assert_eq!(h[64..68], 0u32.to_be_bytes());
+        // INCREMENTAL: flag byte set.
+        let h = build_header_enc(4096, 9, 1, 1, 0, 0, 1, 9, 1);
+        assert_eq!(h[64..68], 1u32.to_be_bytes());
+        assert_eq!(FileHeaderInfo::parse(&h).unwrap().largest_root_btree, 9);
     }
 
     #[test]

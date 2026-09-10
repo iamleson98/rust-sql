@@ -56,6 +56,10 @@ pub struct SqliteDbImage {
     pub sequences: HashMap<String, i64>,
     /// True when a `-wal` sidecar contributed frames to the read view.
     pub had_wal: bool,
+    /// Auto-vacuum mode of the source file (header 52/64): 0 = none,
+    /// 1 = FULL, 2 = INCREMENTAL. Preserved across engine rewrites so
+    /// the output file keeps its pointer-map structure.
+    pub auto_vacuum: u8,
 }
 
 /// A page view over the file + applied WAL frames.
@@ -92,6 +96,17 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
     }
     let hdr = FileHeaderInfo::parse(&data)?;
     let text_enc = TextEnc::from_u32(hdr.text_encoding)?;
+    // Auto-vacuum mode: enabled iff largest-root (header 52) is set;
+    // INCREMENTAL when the incremental flag (header 64) is set.
+    let auto_vacuum: u8 = if hdr.largest_root_btree != 0 {
+        if data[64..68] != [0, 0, 0, 0] {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    };
     if !(hdr.reserved as u32) < hdr.page_size && hdr.reserved != 0 {
         return Err(format!("invalid reserved-bytes-per-page {}", hdr.reserved));
     }
@@ -138,6 +153,7 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
         table_rows: HashMap::new(),
         sequences: HashMap::new(),
         had_wal,
+        auto_vacuum,
     };
 
     // --- Walk the schema b-tree (root page 1, header at offset 100).
