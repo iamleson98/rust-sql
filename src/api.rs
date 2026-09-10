@@ -9950,25 +9950,48 @@ fn rebuild_implicit_indexes(
     catalog: &mut Catalog,
 ) {
     let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
-    for col in columns {
-        if col
-            .constraints
-            .iter()
-            .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique))
-        {
-            let collate = col.constraints.iter().find_map(|c| {
-                if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
-                    Some(name.clone())
-                } else {
-                    None
+    // Mirror `execute_create`'s collection order EXACTLY (SQLite numbers
+    // autoindexes in textual constraint order): per column, constraints in
+    // declaration order — column-level UNIQUE **and** column-level
+    // PRIMARY KEY that is not the rowid alias — then table-level UNIQUE,
+    // then table-level non-alias PRIMARY KEY.
+    //
+    // The column-level `PrimaryKey` arm is the critical one: a TEXT-PK
+    // (e.g. `user_id uuid_text NOT NULL PRIMARY KEY`) gets an implicit
+    // autoindex at CREATE time; skipping it here meant that after ANY
+    // reopen the table's PK autoindex vanished from the catalog —
+    // breaking `INSERT … ON CONFLICT (pk)` upserts AND, worse, silently
+    // disabling PK uniqueness enforcement for the whole session.
+    for (ci, col) in columns.iter().enumerate() {
+        let collate = col.constraints.iter().find_map(|c| {
+            if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
+                Some(name.clone())
+            } else {
+                None
+            }
+        });
+        for constraint in &col.constraints {
+            match constraint {
+                crate::sql::ast::ColumnConstraint::Unique => {
+                    implicit.push(vec![crate::sql::ast::IndexedColumn {
+                        name: col.name.clone(),
+                        order: crate::sql::ast::Order::Asc,
+                        collation: collate.clone(),
+                        expr: None,
+                    }]);
                 }
-            });
-            implicit.push(vec![crate::sql::ast::IndexedColumn {
-                name: col.name.clone(),
-                order: crate::sql::ast::Order::Asc,
-                collation: collate,
-                expr: None,
-            }]);
+                crate::sql::ast::ColumnConstraint::PrimaryKey { order, .. }
+                    if !table.without_rowid && table.rowid_alias != Some(ci) =>
+                {
+                    implicit.push(vec![crate::sql::ast::IndexedColumn {
+                        name: col.name.clone(),
+                        order: *order,
+                        collation: collate.clone(),
+                        expr: None,
+                    }]);
+                }
+                _ => {}
+            }
         }
     }
     for c in constraints {

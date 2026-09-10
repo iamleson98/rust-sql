@@ -1432,3 +1432,112 @@ fn regression_streaming_update_deferred_mask_index_order() {
         );
     }
 }
+
+// ===========================================================================
+// Column-level PRIMARY KEY autoindex lost on reopen (2026-09-10, prod
+// datxevui): `rebuild_implicit_indexes` only collected column-level UNIQUE
+// and TABLE-level constraints — never column-level `PRIMARY KEY`. A TEXT
+// PK (`user_id uuid_text NOT NULL PRIMARY KEY`) got its implicit
+// `sqlite_autoindex_<t>_1` written at CREATE time, but after the next
+// open the catalog dropped it, so (a) `INSERT … ON CONFLICT (pk)` failed
+// with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+// constraint" and (b) duplicate PK rows were silently ACCEPTED for the
+// whole session (the unique check only walks loaded indexes). Fixed by
+// mirroring `execute_create`'s per-column textual constraint order.
+// ===========================================================================
+
+#[test]
+fn regression_column_pk_autoindex_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("reg-col-pk-reopen.db");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE p (user_id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO p VALUES ('u-1', 'first')",
+            [],
+        )
+        .unwrap();
+    }
+    {
+        let mut db = Database::open(&path).unwrap();
+        // (a) PK uniqueness must be enforced after reopen.
+        let dup = db.execute("INSERT INTO p VALUES ('u-1', 'dupe')", []);
+        assert!(
+            dup.is_err(),
+            "duplicate column-level TEXT PK must be rejected after reopen"
+        );
+        // (b) Upserts targeting the PK must find the implicit index.
+        db.execute(
+            "INSERT INTO p (user_id, name) VALUES ('u-1', 'upd') \
+             ON CONFLICT (user_id) DO UPDATE SET name = 'upd'",
+            [],
+        )
+        .expect("ON CONFLICT (pk) upsert must work after reopen");
+        let rows = db
+            .query("SELECT user_id, name FROM p ORDER BY user_id", [])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "upsert must update in place, not append");
+        assert_eq!(rows[0][1], Value::Text("upd".into()));
+        // (c) Same for a SECOND reopen (catalog must rebuild every time).
+    }
+    {
+        let mut db = Database::open(&path).unwrap();
+        let dup = db.execute("INSERT INTO p VALUES ('u-1', 'dupe2')", []);
+        assert!(dup.is_err(), "PK enforcement must survive a 2nd reopen too");
+        // The autoindex must be visible to introspection.
+        let idx = db
+            .query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='p'", [])
+            .unwrap();
+        assert!(
+            idx.iter()
+                .any(|r| r[0].as_text().contains("sqlite_autoindex_p_1")),
+            "implicit autoindex row must exist: {:?}",
+            idx
+        );
+    }
+}
+
+// Mixed constraint order (PK before UNIQUE in textual order on different
+// columns) — autoindex NUMBERING must match create-time numbering, or the
+// wrong rootpage pairs with the wrong index after reopen.
+#[test]
+fn regression_column_pk_autoindex_numbering_matches_textual_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("reg-col-pk-numbering.db");
+    {
+        let mut db = Database::open(&path).unwrap();
+        // a is the PK (autoindex 1), b UNIQUE (autoindex 2) — by textual
+        // constraint order, NOT by column position (b's UNIQUE comes after
+        // a's PK in the statement).
+        db.execute(
+            "CREATE TABLE n (a TEXT PRIMARY KEY, b TEXT UNIQUE, c TEXT)",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO n VALUES ('k1', 'b1', 'x')", []).unwrap();
+    }
+    let mut db = Database::open(&path).unwrap();
+    let dup = db.execute("INSERT INTO n VALUES ('k1', 'other', 'y')", []);
+    assert!(dup.is_err(), "PK autoindex must pair with the right rootpage");
+    let dup2 = db.execute("INSERT INTO n VALUES ('k2', 'b1', 'y')", []);
+    assert!(
+        dup2.is_err(),
+        "UNIQUE autoindex must pair with the right rootpage"
+    );
+    db.execute("INSERT INTO n VALUES ('k2', 'b2', 'y')", []).unwrap();
+    let n = db.query("SELECT COUNT(*) FROM n", []).unwrap();
+    assert_eq!(n[0][0], Value::Integer(2));
+    let ic = db.query("PRAGMA integrity_check", []).unwrap();
+    for row in &ic {
+        assert!(
+            row[0].as_text().contains("ok"),
+            "integrity: {}",
+            row[0].as_text()
+        );
+    }
+}
