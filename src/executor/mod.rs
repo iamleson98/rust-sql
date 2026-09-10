@@ -471,6 +471,13 @@ pub struct ExecContext<'a> {
     pub ctes: Option<HashMap<String, crate::types::CteMaterialization>>,
     /// Current trigger-firing depth (guards runaway recursion).
     pub trigger_depth: u32,
+    /// Trigger names currently executing (a stack). SQLite's
+    /// `recursive_triggers = OFF` stops a trigger from firing ITSELF —
+    /// directly or through a chain — but NOT different triggers chained
+    /// at depth 2+ (pinned by the preupdate differential suite: a log
+    /// trigger firing a log2 trigger must run at depth 2). This stack
+    /// is the "is this trigger already active" check.
+    pub trigger_stack: Vec<String>,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -500,6 +507,7 @@ impl<'a> ExecContext<'a> {
             table_append_hint: None,
             ctes: None,
             trigger_depth: 0,
+            trigger_stack: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -538,6 +546,7 @@ impl<'a> ExecContext<'a> {
             table_append_hint: None,
             ctes: None,
             trigger_depth: 0,
+            trigger_stack: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -1454,14 +1463,21 @@ fn enforce_parent_delete_fks(
     if !ctx.pager.foreign_keys_enabled() || depth > 16 {
         return Ok(());
     }
-    // Every table whose FK references `parent` (case-insensitive).
+    // Preupdate depth: FK actions count as one nesting level per cascade
+    // step (SQLite: children of a top-level DELETE fire at depth 1,
+    // grandchildren at 2 — pinned by the differential suite).
+    let _preupdate_depth = crate::preupdate::enter_nested_change();
+    // Every table whose FK references `parent` (case-insensitive). A
+    // table may reference ITSELF (tree-shaped schemas: parent links in
+    // the same table) — SQLite cascades those too (pinned by the
+    // preupdate differential suite), the depth guard below stops cycles.
     // (Collected first: the loop below mutates ctx, and `catalog()` borrows
     // it immutably — collecting the Arc clones up-front detaches the borrow.)
     let referencing: Vec<(Arc<Table>, Vec<crate::schema::ForeignKeyClause>)> = ctx
         .catalog()
         .all_tables()
         .into_iter()
-        .filter(|(_, t)| !t.name.eq_ignore_ascii_case(&parent.name) && !t.foreign_keys.is_empty())
+        .filter(|(_, t)| !t.foreign_keys.is_empty())
         .filter(|(_, t)| {
             t.foreign_keys
                 .iter()
@@ -1477,6 +1493,16 @@ fn enforce_parent_delete_fks(
             (t, fks)
         })
         .collect();
+    // SQLite applies FK actions in REVERSE declaration order (pinned by
+    // the preupdate differential suite): last-created referencing table
+    // first.
+    let mut referencing = referencing;
+    referencing.sort_by_key(|(t, _)| {
+        std::cmp::Reverse(
+            ctx.catalog()
+                .table_creation_seq(&t.name.to_ascii_lowercase()),
+        )
+    });
     for (child, fks) in referencing {
         for fk in &fks {
             // Resolve the parent-side columns this FK points at.
@@ -1514,12 +1540,24 @@ fn enforce_parent_delete_fks(
                 ForeignKeyAction::Cascade => {
                     // Recursively delete each child row (children may be
                     // parents themselves — nested FKs cascade too).
+                    // SQLite's observable order: the child's event fires
+                    // (and the row is deleted) BEFORE its own children
+                    // cascade — pinned by the preupdate differential
+                    // suite (grandchild events follow the child's).
                     for (rowid, crow) in children {
                         let child2 = child.clone();
-                        enforce_parent_delete_fks(ctx, &child2, &crow, rowid, depth + 1)?;
                         let root = ctx.table_root(&child2);
                         let new_root;
                         {
+                            // Preupdate: the child row is about to be
+                            // deleted (depth = this cascade level).
+                            crate::preupdate::fire(
+                                crate::preupdate::PreupdateOp::Delete,
+                                &child2,
+                                rowid,
+                                Some(&crow),
+                                None,
+                            );
                             let mut bt = Btree::new(ctx.pager, root, false);
                             bt.delete_table(rowid)?;
                             new_root = bt.root;
@@ -1537,11 +1575,19 @@ fn enforce_parent_delete_fks(
                                 ctx.invalidate_max_rowid(&lc);
                             }
                         }
+                        // Grandchildren (this row may itself be a parent).
+                        enforce_parent_delete_fks(ctx, &child2, &crow, rowid, depth + 1)?;
                     }
                 }
                 ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
                     // Rewrite each child row's FK columns to NULL / defaults.
                     for (rowid, mut crow) in children {
+                        // Preupdate: keep the pre-rewrite row for the event.
+                        let pre_row = if crate::preupdate::hook_installed() {
+                            Some(crow.clone())
+                        } else {
+                            None
+                        };
                         for &ci in &fk.columns {
                             crow[ci] = if fk.on_delete == ForeignKeyAction::SetNull {
                                 Value::Null
@@ -1559,6 +1605,15 @@ fn enforce_parent_delete_fks(
                         let root = ctx.table_root(&child);
                         let new_root;
                         {
+                            // Preupdate: the child row is about to be
+                            // rewritten (SET NULL / SET DEFAULT).
+                            crate::preupdate::fire(
+                                crate::preupdate::PreupdateOp::Update,
+                                child.as_ref(),
+                                rowid,
+                                pre_row.as_deref(),
+                                Some(&crow),
+                            );
                             let mut bt = Btree::new(ctx.pager, root, false);
                             let updated = bt.update_table(rowid, &payload).unwrap_or(false);
                             if !updated {
@@ -13919,6 +13974,13 @@ fn exec_insert_one_row(
                     LookupResult::Found(p) => Some(p),
                     LookupResult::NotFound => None,
                 };
+                // Preupdate: the conflicting row is about to be deleted
+                // (the new row's INSERT event fires in the write block
+                // below, matching SQLite's DELETE-then-INSERT pair for
+                // INSERT OR REPLACE).
+                if let Some(p) = old_payload_opt.as_ref() {
+                    crate::preupdate::fire_delete_payload(table, existing_rowid, p);
+                }
                 bt.delete_table(existing_rowid)?;
                 *current_root = bt.root;
                 ctx.set_table_root_lc(table_name_lc, *current_root);
@@ -13995,6 +14057,15 @@ fn exec_insert_one_row(
             && on_conflict != ConflictResolution::Replace
         {
             old_payload_opt = None;
+            // Preupdate: the row is about to be appended (fresh rowid,
+            // no conflict possible — see the comment above).
+            crate::preupdate::fire(
+                crate::preupdate::PreupdateOp::Insert,
+                table,
+                rowid,
+                None,
+                Some(full_row),
+            );
             // BTREE_APPEND fast path: for sequential auto-rowids,
             // skip the binary search per insert. Falls back to the
             // normal path automatically if the leaf is full or the
@@ -14077,6 +14148,18 @@ fn exec_insert_one_row(
                     match on_conflict {
                         ConflictResolution::Replace => {
                             old_payload_opt = Some(existing_payload);
+                            crate::preupdate::fire_delete_payload(
+                                table,
+                                rowid,
+                                old_payload_opt.as_ref().unwrap(),
+                            );
+                            crate::preupdate::fire(
+                                crate::preupdate::PreupdateOp::Insert,
+                                table,
+                                rowid,
+                                None,
+                                Some(full_row),
+                            );
                             bt.delete_table(rowid)?;
                             bt.insert_table(rowid, payload)?;
                         }
@@ -14095,6 +14178,13 @@ fn exec_insert_one_row(
                 }
                 LookupResult::NotFound => {
                     old_payload_opt = None;
+                    crate::preupdate::fire(
+                        crate::preupdate::PreupdateOp::Insert,
+                        table,
+                        rowid,
+                        None,
+                        Some(full_row),
+                    );
                     bt.insert_table(rowid, payload)?;
                 }
             }
@@ -14257,6 +14347,16 @@ fn exec_upsert_row(
             // otherwise delete + insert.
             payload_buf.clear();
             encode_row_aliased_into(&new_row, table.rowid_alias, payload_buf);
+            // Preupdate: UPSERT's DO UPDATE is a row UPDATE (old = the
+            // stored row, new = the merged row — SQLite fires exactly one
+            // UPDATE event per upserted row).
+            crate::preupdate::fire(
+                crate::preupdate::PreupdateOp::Update,
+                table,
+                existing_rowid,
+                Some(old_row.as_slice()),
+                Some(new_row.as_slice()),
+            );
             {
                 let mut bt = Btree::new(ctx.pager, *current_root, false);
                 let did_in_place = bt
@@ -14509,17 +14609,50 @@ pub(crate) fn delete_rows_by_rowid(
     table: &Table,
     rowids: &[i64],
 ) -> Result<()> {
+    delete_rows_by_rowid_inner(ctx, table, rowids, true)
+}
+
+/// `fire_hook = false` skips the preupdate events — for INTERNAL moves
+/// (a rowid-alias UPDATE's delete of the old position: SQLite reports
+/// the whole move as ONE UPDATE event, fired by the caller).
+pub(crate) fn delete_rows_by_rowid_inner(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowids: &[i64],
+    fire_hook: bool,
+) -> Result<()> {
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let table_name_lc = table.name.to_ascii_lowercase();
     let n_cols = table.n_columns();
     for &rowid in rowids {
         let root = ctx.table_root(table);
+        // Preupdate: fire this row's DELETE before the FK actions
+        // (SQLite's order: the parent's event first, then cascaded
+        // children at depth+1) and before the write.
+        let mut pre_payload: Option<Vec<u8>> = None;
         if ctx.pager.foreign_keys_enabled() {
             let mut bt = Btree::new(ctx.pager, root, false);
             if let LookupResult::Found(payload) = bt.lookup_table(rowid)? {
-                if let Ok(old_row) = decode_row(&payload, n_cols, rowid, table.rowid_alias) {
+                pre_payload = Some(payload);
+                if let Ok(old_row) = decode_row(
+                    pre_payload.as_ref().unwrap(),
+                    n_cols,
+                    rowid,
+                    table.rowid_alias,
+                ) {
                     enforce_parent_delete_fks(ctx, table, &old_row, rowid, 0)?;
                 }
+            }
+        }
+        if pre_payload.is_none() && fire_hook && crate::preupdate::hook_installed() {
+            let mut bt = Btree::new(ctx.pager, root, false);
+            if let LookupResult::Found(payload) = bt.lookup_table(rowid)? {
+                pre_payload = Some(payload);
+            }
+        }
+        if fire_hook {
+            if let Some(p) = pre_payload.as_ref() {
+                crate::preupdate::fire_delete_payload(table, rowid, p);
             }
         }
         let root = ctx.table_root(table);
@@ -14601,8 +14734,10 @@ fn apply_rowid_alias_move(
         }
     }
     // Move = delete the old cell (+ index entries, FK parent checks)
-    // then insert at the new rowid (+ index entries).
-    delete_rows_by_rowid(ctx, table, &[rowid])?;
+    // then insert at the new rowid (+ index entries). No preupdate
+    // events here: the caller fired the whole move as ONE UPDATE event
+    // (SQLite's observable semantics for a rowid-changing UPDATE).
+    delete_rows_by_rowid_inner(ctx, table, &[rowid], false)?;
     {
         let root = ctx.table_root(table);
         let mut bt = Btree::new(ctx.pager, root, false);
@@ -14921,6 +15056,16 @@ fn exec_update(
         if plan.skip.contains(&pos) {
             continue; // OR IGNORE: row keeps its old values
         }
+        // Preupdate: one UPDATE event per applied row (the alias-move
+        // below is an internal delete+insert — SQLite reports the whole
+        // rowid-changing UPDATE as ONE event).
+        crate::preupdate::fire(
+            crate::preupdate::PreupdateOp::Update,
+            &table,
+            rowid,
+            Some(row.as_slice()),
+            Some(new_row.as_slice()),
+        );
         // Rowid-alias move (`UPDATE t SET id = X`): the B+tree cell key
         // changes — delete + reinsert at the new rowid with uniqueness.
         if let Some(alias_idx) = table.rowid_alias {
@@ -15151,6 +15296,16 @@ fn exec_update_from(
         if plan.skip.contains(&pos) {
             continue; // OR IGNORE: row keeps its old values
         }
+        // Preupdate: one UPDATE event per applied row (the alias-move
+        // below is an internal delete+insert — SQLite reports the whole
+        // rowid-changing UPDATE as ONE event).
+        crate::preupdate::fire(
+            crate::preupdate::PreupdateOp::Update,
+            table,
+            rowid,
+            Some(row.as_slice()),
+            Some(new_row.as_slice()),
+        );
         // Rowid-alias move (`UPDATE t SET id = X`).
         if let Some(alias_idx) = table.rowid_alias {
             if let Some(new_alias) = new_row.get(alias_idx) {
@@ -15668,6 +15823,16 @@ fn try_streaming_update(
                 // rebalance) before falling back to delete + insert.
                 // Patch / in-leaf replace (leaf-hinted); a grow that
                 // cannot fit the leaf falls back to delete + insert.
+                // Preupdate: this path bypasses process_update_row —
+                // fire here (row_buf/new_row still hold the row's
+                // values from the fetch closure above).
+                crate::preupdate::fire(
+                    crate::preupdate::PreupdateOp::Update,
+                    table,
+                    rowid,
+                    Some(row_buf.as_slice()),
+                    Some(new_row.as_slice()),
+                );
                 let did = bt.update_table(rowid, &payload_buf)?;
                 if !did {
                     bt.delete_table(rowid)?;
@@ -15741,7 +15906,14 @@ fn try_streaming_update(
         // row, zero payload copies, and phase 2's second table walk
         // disappears entirely. Overflow-payload / size-change rows fall
         // back to the ordinary collect path below.
-        if patch_ctx.is_some() && touched_indexes.is_empty() && !has_update_triggers {
+        if patch_ctx.is_some()
+            && touched_indexes.is_empty()
+            && !has_update_triggers
+            // A preupdate hook needs per-row old/new values; the fused
+            // in-place patch never materializes them. Fall to the
+            // collect path (fires at collect, same event stream).
+            && !crate::preupdate::hook_installed()
+        {
             #[allow(clippy::option_if_let_else)]
             let Some(pc) = patch_ctx.as_mut() else {
                 unreachable!("eligibility checked is_some above")
@@ -15966,7 +16138,14 @@ fn try_streaming_update(
             // Fused membership+patch walk: same walk bounds / bitset /
             // sorted-pointer membership as below, but members are patched
             // IN PLACE (see the RowidRange branch for eligibility notes).
-            if patch_ctx.is_some() && touched_indexes.is_empty() && !has_update_triggers {
+            if patch_ctx.is_some()
+            && touched_indexes.is_empty()
+            && !has_update_triggers
+            // A preupdate hook needs per-row old/new values; the fused
+            // in-place patch never materializes them. Fall to the
+            // collect path (fires at collect, same event stream).
+            && !crate::preupdate::hook_installed()
+            {
                 #[allow(clippy::option_if_let_else)]
                 let Some(pc) = patch_ctx.as_mut() else {
                     unreachable!("eligibility checked is_some above")
@@ -16248,7 +16427,14 @@ fn try_streaming_update(
     } else {
         // Full scan (optionally filtered). Fused single-pass patch when
         // eligible (see the RowidRange branch for the conditions).
-        if patch_ctx.is_some() && touched_indexes.is_empty() && !has_update_triggers {
+        if patch_ctx.is_some()
+            && touched_indexes.is_empty()
+            && !has_update_triggers
+            // A preupdate hook needs per-row old/new values; the fused
+            // in-place patch never materializes them. Fall to the
+            // collect path (fires at collect, same event stream).
+            && !crate::preupdate::hook_installed()
+        {
             #[allow(clippy::option_if_let_else)]
             let Some(pc) = patch_ctx.as_mut() else {
                 unreachable!("eligibility checked is_some above")
@@ -16928,6 +17114,33 @@ fn process_update_row(
                                 .copy_from_slice(&pc.staging[soff..soff + slen]);
                         }
                     }
+                    // Preupdate: fire at COLLECT time (SQLite's event order
+                    // = row-visit order). The patch path never materializes
+                    // full rows — decode both sides from the payloads (cold
+                    // path, only when a hook is installed).
+                    if crate::preupdate::hook_installed() {
+                        if let Ok(old_row) = crate::storage::row_codec::decode_row(
+                            payload,
+                            n_cols,
+                            rowid,
+                            table.rowid_alias,
+                        ) {
+                            if let Ok(new_row) = crate::storage::row_codec::decode_row(
+                                &update_arena[start..update_arena.len()],
+                                n_cols,
+                                rowid,
+                                table.rowid_alias,
+                            ) {
+                                crate::preupdate::fire(
+                                    crate::preupdate::PreupdateOp::Update,
+                                    table,
+                                    rowid,
+                                    Some(&old_row),
+                                    Some(&new_row),
+                                );
+                            }
+                        }
+                    }
                     updates.push((rowid, start..update_arena.len(), old_payload_stash));
                     return Ok(());
                 }
@@ -16998,6 +17211,15 @@ fn process_update_row(
     }
     // Stash the (rowid, new payload, old payload) for phase 2. The new
     // payload goes into the shared arena — no per-row allocation.
+    // Preupdate: fire at COLLECT time (SQLite's event order = row-visit
+    // order, and the bulk/deferred apply below would reorder them).
+    crate::preupdate::fire(
+        crate::preupdate::PreupdateOp::Update,
+        table,
+        rowid,
+        Some(row_buf),
+        Some(new_row),
+    );
     let start = update_arena.len();
     update_arena.extend_from_slice(payload_buf);
     updates.push((rowid, start..update_arena.len(), old_payload_stash));
@@ -17433,6 +17655,9 @@ fn try_streaming_delete(
         && !ctx.pager.foreign_keys_enabled()
         && rowids_in_table_order
         && !has_delete_triggers
+        // A preupdate hook needs per-row old values — the bulk path has
+        // none; the per-row loop below fetches + fires them.
+        && !crate::preupdate::hook_installed()
     {
         let mut bt = Btree::new(ctx.pager, new_root, false);
         let n = bt.delete_rowids_inorder(&rowids)?;
@@ -17449,6 +17674,22 @@ fn try_streaming_delete(
         }));
     }
     for rid in rowids {
+        // Preupdate: fire this row's DELETE event BEFORE the FK actions
+        // (SQLite's order: the parent's event first, then cascaded
+        // children at depth+1) and before the write. The fetch runs only
+        // when a hook is installed (cold path).
+        let pre_payload: Option<Vec<u8>> = if crate::preupdate::hook_installed() {
+            let mut bt = Btree::new(ctx.pager, new_root, false);
+            match bt.lookup_table(rid)? {
+                LookupResult::Found(payload) => Some(payload),
+                LookupResult::NotFound => None,
+            }
+        } else {
+            None
+        };
+        if let Some(p) = pre_payload.as_ref() {
+            crate::preupdate::fire_delete_payload(table, rid, p);
+        }
         // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
         // row goes away. The old row is fetched first (needed for the key
         // comparison and for CASCADE/SET NULL rewrites of child rows).
@@ -17569,6 +17810,22 @@ fn exec_delete(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let rowid_val = evaluate(rowid, &eval_ctx)?.as_integer();
             let root = ctx.table_root(&table);
+            // Preupdate: fire BEFORE the FK actions (SQLite's order: the
+            // parent's DELETE event first, then cascaded children at
+            // depth+1) and before the write. The fetch runs only when a
+            // hook is installed (cold path).
+            let pre_payload: Option<Vec<u8>> = if crate::preupdate::hook_installed() {
+                let mut bt = Btree::new(ctx.pager, root, false);
+                match bt.lookup_table(rowid_val)? {
+                    LookupResult::Found(payload) => Some(payload),
+                    LookupResult::NotFound => None,
+                }
+            } else {
+                None
+            };
+            if let Some(p) = pre_payload.as_ref() {
+                crate::preupdate::fire_delete_payload(&table, rowid_val, p);
+            }
             // FOREIGN KEY (parent side): check BEFORE deleting — the row's
             // key values are needed for the child-reference scan and for
             // CASCADE / SET NULL rewrites.

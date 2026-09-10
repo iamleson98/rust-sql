@@ -193,6 +193,13 @@ pub struct Catalog {
     indexes: HashMap<String, Arc<Index>>,
     views: HashMap<String, Arc<View>>,
     triggers: HashMap<String, Arc<Trigger>>,
+    /// Table creation sequence (name-lc -> order of addition). The
+    /// HashMap above iterates in arbitrary hash order; this preserves
+    /// DDL order for anything whose observable behavior depends on it
+    /// (SQLite's FK actions fire in REVERSE declaration order — pinned
+    /// by the preupdate differential suite).
+    table_seq: HashMap<String, u64>,
+    next_table_seq: u64,
     /// Indexes grouped by table name (for fast lookup during query planning).
     indexes_by_table: HashMap<String, Vec<Arc<Index>>>,
     /// Triggers grouped by table name.
@@ -440,10 +447,17 @@ impl Catalog {
         let key = table.name.to_ascii_lowercase();
         let idx_key = table.name.to_ascii_lowercase();
         let table_arc = Arc::new(table);
+        self.next_table_seq = self.next_table_seq.wrapping_add(1);
+        self.table_seq.insert(key.clone(), self.next_table_seq);
         // IndexesByTable entry for the table (will be populated by add_index).
         self.indexes_by_table.entry(idx_key).or_default();
         self.tables.insert(key, table_arc);
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
+    }
+
+    /// Creation sequence of a table (0 = unknown). DDL order.
+    pub fn table_creation_seq(&self, name_lc: &str) -> u64 {
+        self.table_seq.get(name_lc).copied().unwrap_or(0)
     }
 
     pub fn add_index(&mut self, index: Index) {

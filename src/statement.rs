@@ -671,6 +671,11 @@ impl<'a> Statement<'a> {
         }
         let _plugin_guard = db.plugin_scope();
         let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        // Preupdate hook scope (DML with RETURNING steps through here,
+        // bypassing Database::execute): install the Database's hook for
+        // the closure's duration. No-op when none is registered or when
+        // an outer scope on this thread already covers this Database.
+        let _preupdate_guard = db.preupdate_scope();
         let out = f(&mut ctx);
         // sqlite3_last_insert_rowid / sqlite3_changes bookkeeping: DML
         // through the streaming-statement path must update the Database

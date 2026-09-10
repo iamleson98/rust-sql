@@ -22,3 +22,28 @@ Stage Summary:
 - Collation ledger entry closed: NOCASE/RTRIM writes (explicit, column-declared, autoindex, WITHOUT ROWID PK, DESC) + engine-side collation semantics (ORDER BY, index gating, probe folding, GROUP BY incl. parallel/spill, DML WHERE). Remaining: custom collations still binary in written files (no portable encoding).
 - 3 pre-existing correctness bugs found by the new differential suite: FastPath aggregate-value-as-count, UPDATE/DELETE collation-blind WHERE, NOCASE index probing with unfolded keys.
 - 702 tests; ready to commit + push (README + worklog updated).
+
+---
+Task ID: 6
+Agent: main (Super Z)
+Task: Close the preupdate-hook C ABI gap (engine + compat) with SQLite-differential proof
+
+Work Log:
+- CI status on 3f9df95 (non-BINARY collation work): ALL GREEN (22/22 jobs incl. bench gates + torture on 3 OSes) — the earlier CI failures (clippy lints + torture jitter) were already fixed by 31ca53e/2b50cea.
+- Oracle pinning (examples/preupdate_oracle.rs, rusqlite preupdate_hook + bundled SQLite): WITHOUT ROWID events fire with rowid=0; INSERT OR REPLACE = DELETE(old)+INSERT(new); upsert DO UPDATE = one UPDATE; rowid-changing UPDATE = ONE UPDATE; trigger bodies fire at depth 1, nested triggers at 2; FK actions fire at depth 1+, CASCADE chains increment per level, table order = REVERSE declaration; DDL fires nothing; defaults materialize into event values.
+- Engine infrastructure: new src/preupdate.rs (PreupdateEvent {op, db, table, rowid, old, new, depth}, PreupdateOp::code() = 18/9/23, thread-local sink with Borrowed{mutex,db-id}/Owned variants, depth counter, unwind-safe guards). Database::set_preupdate_hook (Mutex slot; fire locks per event so shared-&Database statement stepping is race-free); execute() + statement::exec_with_ctx install the sink per statement; nested same-Database execute detected by sink identity (no mutex re-entry).
+- Fire sites: exec_insert_one_row (append fast path, buffered plain, rowid-conflict REPLACE pair, UNIQUE-conflict REPLACE), exec_upsert_row, both UPDATE apply loops (alias-move = ONE event), process_update_row collect-time fires (patch + generic paths), single-row OLTP fast path, streaming DELETE per-row + RowidLookup fast path (parent event BEFORE FK actions), delete_rows_by_rowid (+ no-fire inner variant for internal alias moves), FK CASCADE/SET NULL child events, api.rs exec_chain_row fast insert. Fused in-place patch + bulk delete fast paths gated off when a hook is installed (need per-row old values).
+- triggers.rs: recursion gate now SQLite's name-on-stack semantics (a trigger re-firing ITSELF is stopped; DIFFERENT chained triggers run at depth 2+).
+- enforce_parent_delete_fks: self-referencing tables no longer excluded (tree-shaped schemas cascade, depth guard stops cycles); FK actions now apply in REVERSE declaration order (SQLite parity, catalog gained table_creation_seq); cascade recursion moved after the child's fire+delete (grandchild events follow the child's).
+- Differential suite tests/preupdate_differential.rs: same battery through rusqlite + engine, event streams must be IDENTICAL — 41 events, now passing. Also pinned op codes + hook removal + WR rowid=0.
+- Compat C ABI: sqlite3_preupdate_hook/count/depth/old/new with CORRECT signatures (sqlite3* handle, not stmt — the old stubs had them wrong), per-connection bridge (install_owned around the DML step path; Weak<Conn> capture; event stash + value pool freed at event end), SQLITE_MISUSE/SQLITE_RANGE error sides. 4 C-ABI tests in compat/rustqlite-compat/tests/preupdate.rs (event stream incl. FK reverse-decl order + trigger depth, accessor errors, step-path firing, WR rowid=0).
+- Fix from the C-ABI tests: compat's scan_stmt_end was not trigger-body-aware — CREATE TRIGGER through sqlite3_exec mis-split at the body's internal ';' (port of split_script's CREATE/TRIGGER + BEGIN/END depth tracking).
+- rusqlite preupdate_hook oracle needs libclang via upstream's preupdate_hook->buildtime_bindgen feature edge; vendored libsqlite3-sys 0.30.1 at vendor/ with that ONE edge removed (pre-generated bindings already declare the sqlite3_preupdate_* family; build.rs still adds -DSQLITE_ENABLE_PREUPDATE_HOOK) + [patch.crates-io] in the root workspace. No libclang dependency anywhere.
+- Differential battery ALSO surfaced (not fixed, ledger'd): WITHOUT ROWID PK uniqueness is unenforced on the internal path (dup PKs accepted; ON CONFLICT (pk) errors) — needs an engine-internal unique index over the PK excluded from the file-format dump.
+- Verification: fmt clean; clippy -D warnings clean in all 4 configs; dev matrix 704/704 (lib+integration) + compat 56/56 + doc 5/5; full-suite exit 0.
+
+Stage Summary:
+- Preupdate-hook family fully real on both the native API and the C ABI, with the event stream differentially proven against real SQLite (41 events).
+- 4 engine/compat bugs found by the differential and fixed: nested-trigger suppression, self-referential FK cascade exclusion, compat trigger-DDL script splitting, FK action order (now reverse-declaration like SQLite).
+- New gap documented: WITHOUT ROWID PK uniqueness (internal path).
+- Ready to commit + push.

@@ -25,6 +25,18 @@ members = ["compat/rustqlite-compat"]
 # its directory does not collide with this workspace.
 exclude = ["compat/libsqlite3-sys", "sqlx-interop", "plugins/rust"]
 
+# Vendored upstream libsqlite3-sys with ONE feature-edge change: the
+# `preupdate_hook` feature no longer implies `buildtime_bindgen` (libclang
+# dependency) — the pre-generated bindings already declare the
+# sqlite3_preupdate_* family, and build.rs still adds the
+# -DSQLITE_ENABLE_PREUPDATE_HOOK amalgamation define. This lets the
+# differential oracle (rusqlite with `preupdate_hook`, the real-SQLite
+# side of tests/preupdate_differential.rs) build without libclang, on
+# every machine and every CI runner. Behavior is otherwise byte-identical
+# to crates.io 0.30.1.
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+
 [lib]
 name = "rustqlite"
 path = "src/lib.rs"
@@ -144,7 +156,9 @@ serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# preupdate_hook: differential oracle for the row-level pre-change event
+# stream (tests/preupdate_differential.rs + examples/preupdate_oracle.rs).
+rusqlite = { version = "0.32", features = ["bundled", "preupdate_hook"] }
 tempfile = "3"
 rand = "0.8"
 # For tests/sqlx_driver.rs: the real sqlx facade + a runtime (proves

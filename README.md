@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **702+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **704+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -143,7 +143,7 @@ let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES (?) RETURNING 
 ### sqlx & sea-orm compatibility (drop-in `libsqlite3`)
 
 - **`compat/`** exports the real `sqlite3_*` C ABI (124 symbols) on the engine and ships a drop-in `libsqlite3-sys` replacement, so **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line
-- **`sqlite3_serialize` / `sqlite3_deserialize` are real**: the full database image in a `sqlite3_free`-able buffer (the native container round-trips), and deserialize accepts BOTH native images and real SQLite-format buffers (loaded through the fileformat2 bridge with full read/write semantics — serialize with real SQLite, deserialize here, query it). `tests/compat_abi.rs` pins the round-trip, the cross-engine image case, post-deserialize writes, and re-serialization; the remaining compat stubs are the preupdate-hook family (unlock-notify is a functional immediate-notify)
+- **`sqlite3_serialize` / `sqlite3_deserialize` are real**: the full database image in a `sqlite3_free`-able buffer (the native container round-trips), and deserialize accepts BOTH native images and real SQLite-format buffers (loaded through the fileformat2 bridge with full read/write semantics — serialize with real SQLite, deserialize here, query it). `tests/compat_abi.rs` pins the round-trip, the cross-engine image case, post-deserialize writes, and re-serialization; **`sqlite3_preupdate_hook` / `_old` / `_new` / `_count` / `_depth` are fully real too** — per-row pre-change events with old/new column values, trigger/FK-action depth counting, WITHOUT ROWID `rowid=0`, per-connection scoping through the shared engine, and a 41-event differential battery against bundled SQLite (`tests/preupdate_differential.rs` + `compat/.../tests/preupdate.rs`); `sqlite3_unlock_notify` is a functional immediate-notify
 - **Schema tooling works end to end**: table-valued PRAGMAs (`PRAGMA table_info('t')` and friends) return rows through the prepared-statement path with SQLite's prepare-time column layout, so sea-schema / sea-orm-cli discovery, sea-orm-codegen entity generation, and `sqlx::migrate!` (fresh + idempotent re-run + atomic rollback + cross-pool visibility) all run unmodified
 - **C ABI throughput & observability**: read statements stream 64-row chunks under a single read-lock acquisition per chunk (concurrent readers stop trading cache-line ping-pong on the lock); `BEGIN`/`COMMIT`/`ROLLBACK` are classified once at prepare time instead of re-parsed on every execution; `engine_stats()` exposes process-global atomic counters (connections open/close/live, prepares, steps, rows, writes, transactions begun/committed/rolled back, busy waits/timeouts) and per-file snapshots (page size/count, freelist, cache pages/capacity/hits/misses, WAL frames, `total_changes`, live connections) at ~1 ns per event — always on, not sampled
 - SQLite-exact error messages + extended result codes (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_MISMATCH`, …) — what sqlx's `error_kind()` and sea-orm's `DbErr` classify on
@@ -748,12 +748,34 @@ compat surface. Every entry says what it costs and why it exists.
 
 ### Missing parts (feature & compat surface)
 
-- **Compat C ABI stubs**: the preupdate-hook family
-  (`sqlite3_preupdate_hook/old/new/count/depth`) remain stubs;
-  `sqlite3_unlock_notify` is a functional immediate-notify (the engine
-  never blocks a reader, so it never needs SQLite's blocking path — but it
-  is not SQLite's exact blocking semantic); `sqlite3_serialize` /
-  `sqlite3_deserialize` are fully real.
+- **Preupdate hooks are REAL**: `sqlite3_preupdate_hook` / `_old` /
+  `_new` / `_count` / `_depth` are fully implemented on both sides —
+  `Database::set_preupdate_hook` (engine) and the C ABI (compat), with
+  the event stream differential-proven against bundled SQLite
+  (`tests/preupdate_differential.rs`: 41 events across rowid tables,
+  WITHOUT ROWID (`rowid=0`), upsert, `INSERT OR REPLACE`, rowid-moving
+  UPDATEs, nested triggers (depth 1/2), FK CASCADE/SET NULL (reverse
+  declaration order, depth 1+, self-referential chains), defaults, and
+  DDL silence). The differential battery surfaced and fixed three real
+  engine bugs: nested triggers of DIFFERENT tables never fired (the
+  recursion gate was one-size-fits-all — now SQLite's name-on-stack
+  semantics), self-referential FK `ON DELETE CASCADE` never fired (the
+  parent table excluded itself from the referencing scan), and the
+  compat layer's script splitter mis-split `CREATE TRIGGER` bodies at
+  their internal `;`. Remaining: `sqlite3_unlock_notify` is a
+  functional immediate-notify (the engine never blocks a reader, so it
+  never needs SQLite's blocking path — but it is not SQLite's exact
+  blocking semantic); `sqlite3_serialize` / `sqlite3_deserialize` are
+  fully real.
+- **WITHOUT ROWID PRIMARY KEY uniqueness is not enforced on the
+  internal path**: the engine stores WITHOUT ROWID tables as rowid
+  tables internally (the file-format layer re-lays them out PK-first),
+  and the implicit PK uniqueness constraint has no index backing it —
+  duplicate PK inserts are silently accepted and `ON CONFLICT (pk)`
+  upserts error with "does not match any PRIMARY KEY or UNIQUE
+  constraint". Found by the preupdate differential battery; the fix
+  needs an engine-internal unique index over the PK (excluded from the
+  file-format dump, where the table b-tree itself is the PK index).
 - **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
   approximations — tightened one at a time via differential tests against
   real SQLite.

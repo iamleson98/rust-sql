@@ -40,13 +40,11 @@ pub(crate) fn fire_triggers(
             MAX_TRIGGER_DEPTH, table.name
         )));
     }
-    // SQLite's default (PRAGMA recursive_triggers = OFF): a statement
-    // running inside another trigger's body does NOT fire triggers. This
-    // is what keeps self-inserting AFTER INSERT triggers (audit logs,
-    // derived rows) from exploding into infinite recursion.
-    if ctx.trigger_depth > 0 && !ctx.pager.recursive_triggers_enabled() {
-        return Ok(());
-    }
+    // SQLite's default (PRAGMA recursive_triggers = OFF): a trigger does
+    // not fire ITSELF, directly or indirectly — but DIFFERENT triggers
+    // chained at depth 2+ still run (SQLite's name-on-stack semantics;
+    // pinned by the preupdate differential suite). The per-trigger
+    // check lives in the loop below (trigger_stack).
     let triggers = ctx.catalog().triggers_on_table(&table.name);
     if triggers.is_empty() {
         return Ok(());
@@ -78,8 +76,25 @@ pub(crate) fn fire_triggers(
                 continue;
             }
         }
+        // Recursive-trigger gate: with recursive_triggers OFF (SQLite's
+        // default), a trigger already on the execution stack does not
+        // re-fire (directly or through a chain) — but OTHER triggers at
+        // this depth still run.
+        if ctx
+            .trigger_stack
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&trig.name))
+            && !ctx.pager.recursive_triggers_enabled()
+        {
+            continue;
+        }
         // Execute the body with NEW/OLD substituted to literals.
         ctx.trigger_depth += 1;
+        ctx.trigger_stack.push(trig.name.clone());
+        // Preupdate depth: rows written by the trigger body are one
+        // nesting level deeper than the statement's own rows (SQLite:
+        // top-level triggers fire their rows at depth 1, nested at 2).
+        let _preupdate_depth = crate::preupdate::enter_nested_change();
         let result = (|| {
             for stmt in &trig.body {
                 let mut s = stmt.clone();
@@ -108,6 +123,7 @@ pub(crate) fn fire_triggers(
             Ok(())
         })();
         ctx.trigger_depth -= 1;
+        ctx.trigger_stack.pop();
         result?;
     }
     Ok(())

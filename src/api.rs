@@ -242,6 +242,12 @@ pub struct Database {
     /// True when the open transaction was started by SAVEPOINT (not
     /// BEGIN) — releasing the outermost savepoint then COMMITS.
     savepoint_txn: AtomicBool,
+    /// Row-level pre-change hook (SQLite's preupdate family). Set via
+    /// [`Database::set_preupdate_hook`]; `execute` / statement `step`
+    /// install it into the engine's thread-local sink for the duration
+    /// of each statement (see `preupdate::HookSlot` for the locking
+    /// design).
+    preupdate_hook: crate::preupdate::HookSlot,
     /// Thread id (see `current_tid`) that owns the open write
     /// transaction — the thread that executed BEGIN. READ entry points
     /// (`query`, statement `step` on selects) compare it against the
@@ -2052,6 +2058,7 @@ impl Database {
             txn_maps_snap: RwLock::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
+            preupdate_hook: crate::preupdate::HookSlot::new(None),
             txn_owner_tid: AtomicU64::new(0),
             txn_has_ddl: AtomicBool::new(false),
             schema_epoch: AtomicU64::new(0),
@@ -2180,6 +2187,7 @@ impl Database {
             txn_maps_snap: RwLock::new(None),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
+            preupdate_hook: crate::preupdate::HookSlot::new(None),
             txn_owner_tid: AtomicU64::new(0),
             txn_has_ddl: AtomicBool::new(false),
             schema_epoch: AtomicU64::new(0),
@@ -3469,6 +3477,39 @@ impl Database {
         self.pager.set_foreign_keys_enabled(enabled);
     }
 
+    /// Register (or clear, with `None`) the row-level pre-change hook —
+    /// the engine side of SQLite's `sqlite3_preupdate_hook` family. The
+    /// closure runs BEFORE each row is written by INSERT/UPDATE/DELETE
+    /// (including rows changed by trigger bodies and FK actions, whose
+    /// events carry a `depth` > 0), with the row's old and new column
+    /// values. Semantics are differential-tested against real SQLite:
+    /// see `tests/preupdate_differential.rs`.
+    ///
+    /// The hook fires on the executing thread; `execute` scopes it to
+    /// each statement. When no hook is installed the write paths carry
+    /// no measurable cost (one thread-local flag check per row).
+    pub fn set_preupdate_hook(&mut self, hook: Option<crate::preupdate::PreupdateHook>) {
+        *self.preupdate_hook.lock().unwrap() = hook;
+    }
+
+    /// Install this Database's preupdate hook (when present) into the
+    /// engine's thread-local sink for the duration of a statement.
+    /// Returns None when no hook is registered OR when this thread
+    /// already installed THIS Database's slot (nested `execute` on the
+    /// same connection — the outer scope is still active). The guard
+    /// restores the previous sink on drop, including on unwind.
+    pub(crate) fn preupdate_scope(&self) -> Option<crate::preupdate::SinkGuard> {
+        let db_id = self as *const _ as usize;
+        if crate::preupdate::sink_for_db(db_id) {
+            return None;
+        }
+        if self.preupdate_hook.lock().ok()?.is_none() {
+            return None;
+        }
+        let mutex: *const crate::preupdate::HookSlot = &self.preupdate_hook;
+        Some(crate::preupdate::install_borrowed(mutex, db_id))
+    }
+
     /// Current FOREIGN KEY enforcement state.
     pub fn foreign_keys_enabled(&self) -> bool {
         self.pager.foreign_keys_enabled()
@@ -3593,6 +3634,15 @@ impl Database {
             &ch.full_row,
             ch.rowid_alias,
             &mut ch.payload_buf,
+        );
+        // Preupdate (the execute() scope installed the sink): the row is
+        // about to be appended.
+        crate::preupdate::fire(
+            crate::preupdate::PreupdateOp::Insert,
+            &ch.table,
+            rowid,
+            None,
+            Some(&ch.full_row),
         );
         // B+tree append with the cross-statement leaf hint.
         let mut bt = Btree::new(&self.pager, ch.root, false);
@@ -4347,6 +4397,12 @@ impl Database {
         // reader scope by construction.
         set_read_view_pref(ReadView::Auto);
         self.pager.disarm_reader_scope();
+        // Preupdate hook scope: install the Database's hook (if any) into
+        // the engine's thread-local sink for the duration of this
+        // statement. `preupdate_scope` handles the nested-execute case
+        // (script split, hook re-entry) and restores the previous sink on
+        // exit, including on unwind.
+        let _preupdate_guard = self.preupdate_scope();
         // Write-epoch bump: `execute` is the gateway for every mutating
         // statement (DML, DDL, transaction control, fast-path inserts),
         // so ONE bump here invalidates the memoized COUNT(*) answers for

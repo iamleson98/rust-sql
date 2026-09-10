@@ -210,6 +210,9 @@ pub mod planner;
 /// Plugin system: user functions, aggregates, collations, virtual-table
 /// modules, page codecs (static Rust + dynamic C/C++/Zig/Rust extensions).
 pub mod plugin;
+/// Row-level pre-change events (SQLite's preupdate-hook family): see
+/// `Database::set_preupdate_hook` and [`preupdate::PreupdateEvent`].
+pub mod preupdate;
 pub mod schema;
 pub mod sql;
 /// Native sqlx driver: sqlx-core's `Database` traits implemented directly

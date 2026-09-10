@@ -420,6 +420,19 @@ struct Conn {
     /// (C callback, user-data pointer) pairs — raw pointers are the sqlite3
     /// hook ABI; each slot is mutex-guarded.
     update_hook: StdMutex<UpdateHook>,
+    /// sqlite3_preupdate_hook slot: (user-data, callback). The
+    /// preupdate family is fully implemented (per-row old/new values,
+    /// depth, WITHOUT ROWID rowid=0 — engine events are differential-
+    /// proven against real SQLite, see tests/preupdate_differential.rs
+    /// on the engine side and tests/preupdate.rs here).
+    preupdate_hook: StdMutex<PreupdateSlot>,
+    /// The CURRENT event's stash — set while its C callback runs; the
+    /// sqlite3_preupdate_count/depth/old/new accessors read it.
+    preupdate_current: StdMutex<Option<CurrentPreupdate>>,
+    /// sqlite3_value objects handed out by preupdate_old/new — freed
+    /// when the event's callback returns (SQLite: valid only inside the
+    /// callback).
+    preupdate_values: StdMutex<Vec<*mut sqlite3_value>>,
     commit_hook: StdMutex<
         Option<(
             *mut c_void,
@@ -450,6 +463,86 @@ type UpdateHook = Option<(
     *mut c_void,
     Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, i64)>,
 )>;
+
+/// sqlite3_preupdate_hook slot: (user-data, callback). Same shape as
+/// `UpdateHook` but with the preupdate signature (db handle + op code +
+/// db/table names + rowid).
+type PreupdateSlot = Option<(
+    *mut c_void,
+    Option<
+        unsafe extern "C" fn(*mut c_void, *mut sqlite3, c_int, *const c_char, *const c_char, i64),
+    >,
+)>;
+
+/// The current preupdate event, stashed while its C callback runs so
+/// sqlite3_preupdate_count/depth/old/new can serve it.
+#[derive(Clone)]
+struct CurrentPreupdate {
+    count: usize,
+    depth: u32,
+    old: Option<Vec<Value>>,
+    new: Option<Vec<Value>>,
+}
+
+/// Install the per-connection preupdate bridge around one execution
+/// scope (the DML step path): the engine's row events drive this
+/// connection's C callback. None when no callback is registered.
+fn preupdate_bridge(conn: &Arc<Conn>) -> Option<rustqlite::preupdate::SinkGuard> {
+    {
+        let h = conn.preupdate_hook.lock().unwrap();
+        match h.as_ref() {
+            Some((_, Some(_))) => {}
+            _ => return None,
+        }
+    }
+    let weak = Arc::downgrade(conn);
+    Some(rustqlite::preupdate::install_owned(Box::new(
+        move |e: &rustqlite::preupdate::PreupdateEvent| {
+            let Some(conn) = weak.upgrade() else { return };
+            let count = e
+                .old
+                .as_ref()
+                .or(e.new.as_ref())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            // Free any values left over from a previous event, then
+            // stash for the accessors.
+            free_preupdate_values(&conn);
+            *conn.preupdate_current.lock().unwrap() = Some(CurrentPreupdate {
+                count,
+                depth: e.depth,
+                old: e.old.clone(),
+                new: e.new.clone(),
+            });
+            // Invoke the C callback (db = this connection's handle).
+            let (ctx, cb) = match conn.preupdate_hook.lock().unwrap().as_ref().copied() {
+                Some((ctx, Some(cb))) => (ctx, cb),
+                _ => return,
+            };
+            let db_handle = Arc::as_ptr(&conn) as *mut sqlite3;
+            let z_db = b"main\0".as_ptr() as *const c_char;
+            let z_table = match std::ffi::CString::new(e.table.clone()) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            unsafe { cb(ctx, db_handle, e.op.code(), z_db, z_table.as_ptr(), e.rowid) };
+            // End of the event: the stash and its handed-out values are
+            // gone with it (SQLite: valid only inside the callback).
+            *conn.preupdate_current.lock().unwrap() = None;
+            free_preupdate_values(&conn);
+        },
+    )))
+}
+
+/// Free the sqlite3_value objects handed out by preupdate_old/new.
+fn free_preupdate_values(conn: &Arc<Conn>) {
+    let mut vals = conn.preupdate_values.lock().unwrap();
+    for v in vals.drain(..) {
+        if !v.is_null() {
+            drop(unsafe { Box::from_raw(v as *mut Value) });
+        }
+    }
+}
 
 impl Conn {
     fn set_err(&self, code: c_int, msg: &str) -> c_int {
@@ -774,10 +867,49 @@ fn engine_err_msg(e: &rustqlite::Error) -> String {
 
 /// Byte offset just past the first top-level `;` (outside strings and
 /// comments), or the end of input. Skips nothing else.
+///
+/// Trigger bodies (`CREATE TRIGGER ... BEGIN stmt; stmt; END;`) contain
+/// semicolons that do NOT end the statement — the same CREATE/TRIGGER
+/// word-pair + BEGIN/END depth tracking the engine's `split_script`
+/// uses (trigger DDL through sqlite3_exec previously mis-split at the
+/// body's first `;` and failed with a parse error).
 fn scan_stmt_end(sql: &[u8]) -> usize {
     let mut i = 0usize;
+    // Word-level state for trigger-body detection (see the comment).
+    let mut prev_word: Option<String> = None;
+    let mut in_trigger_block = false;
+    let mut block_depth = 0usize;
     while i < sql.len() {
         let c = sql[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let w_start = i;
+            while i < sql.len() && (sql[i].is_ascii_alphanumeric() || sql[i] == b'_') {
+                i += 1;
+            }
+            let word = String::from_utf8_lossy(&sql[w_start..i]).to_ascii_uppercase();
+            if let Some(pw) = &prev_word {
+                if pw == "CREATE" && word == "TRIGGER" {
+                    in_trigger_block = true;
+                }
+            }
+            if in_trigger_block || block_depth > 0 {
+                if word == "BEGIN" {
+                    block_depth += 1;
+                } else if word == "END" && block_depth > 0 {
+                    block_depth -= 1;
+                    if block_depth == 0 {
+                        in_trigger_block = false;
+                    }
+                }
+            }
+            prev_word = Some(word);
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        prev_word = None;
         match c {
             b'\'' | b'"' => {
                 let quote = c;
@@ -806,7 +938,14 @@ fn scan_stmt_end(sql: &[u8]) -> usize {
                 }
                 i += 2.min(sql.len() - i);
             }
-            b';' => return i + 1,
+            b';' => {
+                if in_trigger_block || block_depth > 0 {
+                    // Inside a trigger body — not a statement end.
+                    i += 1;
+                } else {
+                    return i + 1;
+                }
+            }
             _ => i += 1,
         }
     }
@@ -1120,6 +1259,9 @@ fn new_conn(engine: Option<Arc<Engine>>, readonly: bool) -> Arc<Conn> {
         live_statements: AtomicUsize::new(0),
         progress: StdMutex::new((0, None, std::ptr::null_mut())),
         update_hook: StdMutex::new(None),
+        preupdate_hook: StdMutex::new(None),
+        preupdate_current: StdMutex::new(None),
+        preupdate_values: StdMutex::new(Vec::new()),
         commit_hook: StdMutex::new(None),
         rollback_hook: StdMutex::new(None),
         _unused: (),
@@ -2360,6 +2502,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
                 let before = engine.total_changes();
                 let outcome = {
                     let _w = engine.db.write();
+                    // Preupdate bridge: this connection's C hook fires
+                    // for the engine's row events of this step (per-
+                    // connection semantics with one engine per file).
+                    let _pu = preupdate_bridge(&conn);
                     eng.step()
                 };
                 let after = engine.total_changes();
@@ -3598,7 +3744,8 @@ pub unsafe extern "C" fn sqlite3_enable_load_extension(_db: *mut sqlite3, _on: c
 }
 
 // ---------------------------------------------------------------------------
-// unlock-notify / preupdate / serialize stubs (link-complete, minimal)
+// unlock-notify / preupdate / serialize (preupdate: fully real; the
+// rest: link-complete, minimal)
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
@@ -3618,37 +3765,104 @@ pub unsafe extern "C" fn sqlite3_unlock_notify(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_preupdate_hook(
-    _db: *mut sqlite3,
-    _cb: Option<
+    db: *mut sqlite3,
+    cb: Option<
         unsafe extern "C" fn(*mut c_void, *mut sqlite3, c_int, *const c_char, *const c_char, i64),
     >,
-    _ctx: *mut c_void,
+    ctx: *mut c_void,
 ) {
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return;
+    };
+    *conn.preupdate_hook.lock().unwrap() = Some((ctx, cb));
 }
 
+/// Row count of the current preupdate event (the table's column count).
+/// Valid only inside the preupdate callback; 0 outside it.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_preupdate_count(_stmt: *mut sqlite3_stmt) -> c_int {
-    0
+pub unsafe extern "C" fn sqlite3_preupdate_count(db: *mut sqlite3) -> c_int {
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return 0;
+    };
+    conn.preupdate_current
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.count as c_int)
+        .unwrap_or(0)
 }
+
+/// Trigger/FK-action nesting depth of the current event (0 = direct
+/// statement change). Valid only inside the preupdate callback.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_preupdate_depth(_stmt: *mut sqlite3_stmt) -> c_int {
-    0
+pub unsafe extern "C" fn sqlite3_preupdate_depth(db: *mut sqlite3) -> c_int {
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return 0;
+    };
+    conn.preupdate_current
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.depth as c_int)
+        .unwrap_or(0)
 }
+
+/// Pre-change value of column `i` of the row being deleted/updated.
+/// Valid only inside the preupdate callback (the value object lives
+/// until the callback returns). SQLITE_MISUSE when no event is active
+/// or the event is an INSERT (no old row); SQLITE_RANGE when `i` is out
+/// of bounds.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_preupdate_old(
-    _stmt: *mut sqlite3_stmt,
-    _i: c_int,
-    _pp: *mut *mut sqlite3_value,
+    db: *mut sqlite3,
+    i: c_int,
+    pp: *mut *mut sqlite3_value,
 ) -> c_int {
-    SQLITE_ERROR
+    preupdate_side(db, i, pp, false)
 }
+
+/// Post-change value of column `i` of the row being inserted/updated.
+/// Same lifetime and error contract as [`sqlite3_preupdate_old`];
+/// SQLITE_MISUSE when the event is a DELETE (no new row).
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_preupdate_new(
-    _stmt: *mut sqlite3_stmt,
-    _i: c_int,
-    _pp: *mut *mut sqlite3_value,
+    db: *mut sqlite3,
+    i: c_int,
+    pp: *mut *mut sqlite3_value,
 ) -> c_int {
-    SQLITE_ERROR
+    preupdate_side(db, i, pp, true)
+}
+
+/// Shared body of preupdate_old/new: `new_side` picks the stash's side.
+unsafe fn preupdate_side(
+    db: *mut sqlite3,
+    i: c_int,
+    pp: *mut *mut sqlite3_value,
+    new_side: bool,
+) -> c_int {
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return SQLITE_MISUSE;
+    };
+    if pp.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let guard = conn.preupdate_current.lock().unwrap();
+    let Some(cur) = guard.as_ref() else {
+        return SQLITE_MISUSE;
+    };
+    let side = if new_side { &cur.new } else { &cur.old };
+    let Some(row) = side.as_ref() else {
+        return SQLITE_MISUSE; // wrong op for this side
+    };
+    if i < 0 || i as usize >= row.len() {
+        return SQLITE_RANGE;
+    }
+    let boxed = Box::new(row[i as usize].clone());
+    let p = Box::into_raw(boxed) as *mut sqlite3_value;
+    drop(guard);
+    conn.preupdate_values.lock().unwrap().push(p);
+    *pp = p;
+    SQLITE_OK
 }
 
 /// `sqlite3_serialize` — the complete database image in a buffer the
