@@ -47,3 +47,24 @@ Stage Summary:
 - 4 engine/compat bugs found by the differential and fixed: nested-trigger suppression, self-referential FK cascade exclusion, compat trigger-DDL script splitting, FK action order (now reverse-declaration like SQLite).
 - New gap documented: WITHOUT ROWID PK uniqueness (internal path).
 - Ready to commit + push.
+
+---
+Task ID: 7
+Agent: main (Super Z)
+Task: Close the WITHOUT ROWID PK uniqueness gap (found by the preupdate differential)
+
+Work Log:
+- Gap: the engine stores WITHOUT ROWID tables as rowid tables internally; the PK had no index backing — duplicate PKs silently accepted, `ON CONFLICT (pk)` errored "does not match any PRIMARY KEY or UNIQUE constraint" (probe-confirmed before the fix).
+- Schema: `IndexOrigin` enum (CreateIndex / Autoindex / WithoutRowidPk) on the catalog Index — provenance for the internal WR-PK index. New `without_rowid_pk_columns` helper (PK columns in pk_seq order, collation + order carried). `Catalog::rename_table` now also re-keys autoindex NAMES to the new table (pre-existing staleness fixed).
+- CREATE TABLE: synthesizes `sqlite_autoindex_<t>_0` (the _0 slot — SQLite numbering starts at _1) over the PK columns, unique, origin WithoutRowidPk, NO schema row, no order-map entry. load_foreign_image / the sqlitefmt reader replay DDL through this path, so SQL-format opens get the index for free.
+- Native reopen (load_schema): `rebuild_without_rowid_pk_index` — fresh root allocation + full row backfill (scan table, encode PK keys, insert), root moves tracked.
+- ALTER RENAME COLUMN: the WR-PK index updates its catalog entry only (no schema-row delete/insert — it has none).
+- Dump filter: `collect_foreign_dump` excludes origin WithoutRowidPk — SQLite files never carry a PK autoindex for WR tables (the table b-tree is the PK index there); real SQLite re-opens the dump and enforces the PK itself.
+- Upsert target resolution now finds the PK index (name/column match) → `ON CONFLICT (pk)` works on WR tables; the preupdate differential's WR-upsert scenario restored (engine stream still SQLite-identical, 42 events).
+- tests/without_rowid_pk.rs (3 suites, differential): single/composite PK duplicates with SQLite's exact messages, upsert/DO NOTHING/REPLACE/conflicting UPDATE, final-state equality, sqlite_master invisibility, PRAGMA index_list origin 'pk', native-format reopen backfill, SQLite-format dump round-trip (real SQLite opens + enforces; engine re-opens its own dump + enforces).
+- Verification: full dev matrix 707/707, compat 56/56, fmt clean, clippy -D warnings clean in all 4 configs.
+
+Stage Summary:
+- WR PK ledger entry closed with file-format interop proven in both directions.
+- Preupdate CI (250ed29): 20/21 jobs green at last poll (only windows test in flight).
+- Ready to commit + push; remaining ledger: ptrmap writes, non-UTF-8 CAST/ORDER BY byte order, WAL sidecar writes for SQLite-format mode.

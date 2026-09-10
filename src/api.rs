@@ -2569,8 +2569,14 @@ impl Database {
                 n != "sqlite_master" && n != "sqlite_schema"
             })
             .collect();
-        let indexes: HashMap<String, std::sync::Arc<Index>> =
-            self.catalog.all_indexes().into_iter().collect();
+        let indexes: HashMap<String, std::sync::Arc<Index>> = self
+            .catalog
+            .all_indexes()
+            .into_iter()
+            // The WITHOUT ROWID PK index is engine-internal: SQLite files
+            // never carry one (the table b-tree is the PK index there).
+            .filter(|(_, i)| i.origin != crate::schema::IndexOrigin::WithoutRowidPk)
+            .collect();
         let views: HashMap<String, std::sync::Arc<crate::schema::View>> =
             self.catalog.all_views().into_iter().collect();
         let triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>> =
@@ -7204,6 +7210,7 @@ impl Database {
                         unique: true,
                         partial_expr: None,
                         create_sql: idx_sql.clone(),
+                        origin: crate::schema::IndexOrigin::Autoindex,
                     };
                     // SQLite stores NULL sql for auto-indexes; the catalog
                     // keeps the synthesized DDL for reopen (load_schema
@@ -7218,6 +7225,58 @@ impl Database {
                     );
                     insert_schema_row(ctx.pager, &schema_row)?;
                     catalog.add_index(index);
+                }
+                // WITHOUT ROWID PRIMARY KEY uniqueness: the internal
+                // storage is a rowid table, so the PK needs an index
+                // backing it. SQLite files never carry one (the table
+                // b-tree IS the PK index there) — this index is
+                // engine-internal (`IndexOrigin::WithoutRowidPk`): no
+                // schema row, hidden from sqlite_master and every
+                // file-format dump, rebuilt from the DDL on reopen.
+                // SQLite-faithful effects: duplicate PK inserts fail with
+                // UNIQUE, upsert `ON CONFLICT (pk)` resolves, REPLACE
+                // works, PRAGMA index_list reports it with origin 'pk'.
+                if table.without_rowid {
+                    let pk_cols = crate::schema::without_rowid_pk_columns(&table);
+                    if !pk_cols.is_empty() {
+                        let idx_name = format!("sqlite_autoindex_{}_0", name.name);
+                        let col_list = pk_cols
+                            .iter()
+                            .map(|c| {
+                                let coll = match &c.collation {
+                                    Some(c) => format!(" COLLATE \"{}\"", c),
+                                    None => String::new(),
+                                };
+                                let ord = if c.order == crate::sql::ast::Order::Desc {
+                                    " DESC"
+                                } else {
+                                    ""
+                                };
+                                format!("\"{}\"{}{}", c.name, coll, ord)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let idx_sql = format!(
+                            "CREATE UNIQUE INDEX \"{}\" ON \"{}\"({})",
+                            idx_name, name.name, col_list
+                        );
+                        let idx_root = ctx.pager.allocate_page()?;
+                        {
+                            let page = ctx.pager.get_page(idx_root)?;
+                            page.lock().init_leaf_index();
+                        }
+                        let idx_columns = crate::schema::build_index_columns(&pk_cols, &table)?;
+                        catalog.add_index(crate::schema::Index {
+                            name: idx_name,
+                            table: table.name.clone(),
+                            columns: idx_columns,
+                            root_page: idx_root,
+                            unique: true,
+                            partial_expr: None,
+                            create_sql: idx_sql,
+                            origin: crate::schema::IndexOrigin::WithoutRowidPk,
+                        });
+                    }
                 }
                 // CTAS: the materialized result rows become INSERT VALUES
                 // literals. Executing through the normal insert path gives
@@ -7279,6 +7338,7 @@ impl Database {
                     unique,
                     partial_expr: where_clause,
                     create_sql: original_sql.to_string(),
+                    origin: crate::schema::IndexOrigin::CreateIndex,
                 };
                 // ---- BACKFILL ----
                 // Populate the index from rows that already exist in the
@@ -7945,16 +8005,22 @@ impl Database {
                             rebuilt_idx.create_sql = new_idx_sql.clone();
                             let idx_root = ctx.index_root(&idx);
                             let display_name = idx.name.clone();
+                            let internal_wr_pk =
+                                idx.origin == crate::schema::IndexOrigin::WithoutRowidPk;
                             catalog.replace_index(&idx_name, rebuilt_idx);
-                            delete_schema_row(ctx.pager, "index", &display_name)?;
-                            let schema_row = crate::schema::encode_schema_row(
-                                "index",
-                                &display_name,
-                                &table_name,
-                                idx_root,
-                                &new_idx_sql,
-                            );
-                            insert_schema_row(ctx.pager, &schema_row)?;
+                            // The WITHOUT ROWID PK index has no schema row
+                            // (engine-internal) — catalog-only rename.
+                            if !internal_wr_pk {
+                                delete_schema_row(ctx.pager, "index", &display_name)?;
+                                let schema_row = crate::schema::encode_schema_row(
+                                    "index",
+                                    &display_name,
+                                    &table_name,
+                                    idx_root,
+                                    &new_idx_sql,
+                                );
+                                insert_schema_row(ctx.pager, &schema_row)?;
+                            }
                         }
                     }
                 }
@@ -9410,6 +9476,15 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             &index_row_by_name,
                             catalog,
                         );
+                        // WITHOUT ROWID PK uniqueness (engine-internal
+                        // index, no schema row): allocate a fresh root and
+                        // backfill it from the table's rows.
+                        if table.without_rowid {
+                            let pk_cols = crate::schema::without_rowid_pk_columns(&table);
+                            if !pk_cols.is_empty() {
+                                rebuild_without_rowid_pk_index(pager, &table, &pk_cols, catalog)?;
+                            }
+                        }
                     } else if let Ok(Statement::Create(CreateStatement::VirtualTable {
                         name: tn,
                         module,
@@ -9459,6 +9534,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             unique,
                             partial_expr: where_clause,
                             create_sql: sql.to_string(),
+                            origin: crate::schema::IndexOrigin::CreateIndex,
                         });
                     }
                 }
@@ -9519,6 +9595,70 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
             catalog.set_stat1(stats);
         }
     }
+    Ok(())
+}
+
+/// Rebuild a WITHOUT ROWID table's engine-internal PK index on reopen
+/// (`IndexOrigin::WithoutRowidPk` — no schema row, fresh root page):
+/// scan the table's rows and insert one index entry per row.
+fn rebuild_without_rowid_pk_index(
+    pager: &Pager,
+    table: &crate::schema::Table,
+    pk_cols: &[crate::sql::ast::IndexedColumn],
+    catalog: &mut Catalog,
+) -> Result<()> {
+    let idx_name = format!("sqlite_autoindex_{}_0", table.name);
+    let idx_root = pager.allocate_page()?;
+    {
+        let page = pager.get_page(idx_root)?;
+        page.lock().init_leaf_index();
+    }
+    let idx_columns = crate::schema::build_index_columns(pk_cols, table)?;
+    let index = crate::schema::Index {
+        name: idx_name,
+        table: table.name.clone(),
+        columns: idx_columns,
+        root_page: idx_root,
+        unique: true,
+        partial_expr: None,
+        create_sql: String::new(),
+        origin: crate::schema::IndexOrigin::WithoutRowidPk,
+    };
+    // Backfill from the table's existing rows (native-format files keep
+    // the index pages; this index is invisible, so its pages are not in
+    // the file — every row is re-keyed here).
+    let final_root;
+    {
+        let n_cols = table.n_columns();
+        let table_root = table.root_page;
+        let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
+        let mut table_bt = crate::storage::btree::Btree::new(pager, table_root, false);
+        let mut index_bt = crate::storage::btree::Btree::new(pager, idx_root, true);
+        let table = table.clone();
+        let index = index.clone();
+        table_bt.scan_table_borrowed(|rowid, payload| {
+            if crate::storage::row_codec::decode_row_into(
+                payload,
+                n_cols,
+                rowid,
+                table.rowid_alias,
+                &mut row_buf,
+            )
+            .is_err()
+            {
+                return true; // skip corrupt rows
+            }
+            let key = crate::executor::encode_index_key(&index, &table, &row_buf);
+            let _ = index_bt.insert_index(&key, rowid);
+            true
+        })?;
+        final_root = index_bt.root;
+    }
+    let index = crate::schema::Index {
+        root_page: final_root,
+        ..index
+    };
+    catalog.add_index(index);
     Ok(())
 }
 
@@ -9613,6 +9753,7 @@ fn rebuild_implicit_indexes(
             unique: true,
             partial_expr: None,
             create_sql: idx_sql,
+            origin: crate::schema::IndexOrigin::Autoindex,
         });
     }
 }

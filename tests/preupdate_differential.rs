@@ -60,6 +60,7 @@ const SCRIPT: &[&str] = &[
     "DELETE FROM ipk WHERE id = 99",
     "CREATE TABLE wr (k TEXT PRIMARY KEY, v INT) WITHOUT ROWID",
     "INSERT INTO wr VALUES ('a', 1), ('b', 2)",
+    "INSERT INTO wr VALUES ('a', 5) ON CONFLICT (k) DO UPDATE SET v = 5",
     "UPDATE wr SET v = 2 WHERE k = 'a'",
     "DELETE FROM wr WHERE k = 'a'",
     "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)",

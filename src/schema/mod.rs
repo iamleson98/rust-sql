@@ -145,6 +145,29 @@ pub struct Index {
     pub unique: bool,
     pub partial_expr: Option<crate::sql::ast::Expr>,
     pub create_sql: String,
+    /// Where this index came from — filters the engine-internal WITHOUT
+    /// ROWID PK index (uniqueness backing for the internal rowid-table
+    /// storage; never dumped to the SQLite-format file, where the
+    /// table b-tree IS the PK index, and never listed in sqlite_master).
+    pub origin: IndexOrigin,
+}
+
+/// Provenance of a catalog index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IndexOrigin {
+    /// A `CREATE INDEX` statement (explicit, listed in sqlite_master).
+    #[default]
+    CreateIndex,
+    /// An implicit `sqlite_autoindex_<table>_<n>` of a ROWID table's
+    /// UNIQUE / non-alias PK constraint (listed in sqlite_master with
+    /// NULL sql, real in the file format).
+    Autoindex,
+    /// The ENGINE-INTERNAL PK index of a WITHOUT ROWID table: the
+    /// internal storage is a rowid table, so the PK's uniqueness needs
+    /// an index backing it — but SQLite files never carry one (the
+    /// table b-tree is keyed by the PK there). Hidden from sqlite_master
+    /// and every file-format dump; rebuilt from the table DDL on reopen.
+    WithoutRowidPk,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +179,35 @@ pub struct IndexColumn {
     /// evaluated from this expression per row instead of reading the
     /// named column. `name` holds the rendered expression text.
     pub expr: Option<crate::sql::ast::Expr>,
+}
+
+/// The WITHOUT ROWID table's PRIMARY KEY columns in PK order, as
+/// indexed columns (collation + order carried) — the column set of the
+/// engine-internal PK uniqueness index (`IndexOrigin::WithoutRowidPk`).
+pub fn without_rowid_pk_columns(table: &Table) -> Vec<crate::sql::ast::IndexedColumn> {
+    let mut pk: Vec<(u8, usize)> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.pk_seq > 0)
+        .map(|(i, c)| (c.pk_seq, i))
+        .collect();
+    pk.sort_by_key(|(seq, _)| *seq);
+    pk.into_iter()
+        .map(|(_, i)| {
+            let c = &table.columns[i];
+            crate::sql::ast::IndexedColumn {
+                name: c.name.clone(),
+                order: c.primary_key_order,
+                collation: if c.collation.is_empty() {
+                    None
+                } else {
+                    Some(c.collation.clone())
+                },
+                expr: None,
+            }
+        })
+        .collect()
 }
 
 impl Index {
@@ -541,9 +593,19 @@ impl Catalog {
             for idx in &idx_list {
                 self.indexes.remove(&idx.name.to_ascii_lowercase());
                 // Re-key the index's table field by cloning with the new
-                // table name.
+                // table name. Implicit autoindexes also carry the table
+                // name IN their name (sqlite_autoindex_<table>_<n>) —
+                // follow the rename (SQLite does).
                 let mut i2 = (**idx).clone();
                 i2.table = new_name.to_string();
+                let old_prefix = format!("sqlite_autoindex_{}_", old_name);
+                if idx.name.starts_with(&old_prefix) {
+                    i2.name = format!(
+                        "sqlite_autoindex_{}_{}",
+                        new_name,
+                        &idx.name[old_prefix.len()..]
+                    );
+                }
                 let i2 = Arc::new(i2);
                 self.indexes
                     .insert(i2.name.to_ascii_lowercase(), i2.clone());

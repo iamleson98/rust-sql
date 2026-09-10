@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **704+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **707+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -767,15 +767,20 @@ compat surface. Every entry says what it costs and why it exists.
   never needs SQLite's blocking path — but it is not SQLite's exact
   blocking semantic); `sqlite3_serialize` / `sqlite3_deserialize` are
   fully real.
-- **WITHOUT ROWID PRIMARY KEY uniqueness is not enforced on the
-  internal path**: the engine stores WITHOUT ROWID tables as rowid
-  tables internally (the file-format layer re-lays them out PK-first),
-  and the implicit PK uniqueness constraint has no index backing it —
-  duplicate PK inserts are silently accepted and `ON CONFLICT (pk)`
-  upserts error with "does not match any PRIMARY KEY or UNIQUE
-  constraint". Found by the preupdate differential battery; the fix
-  needs an engine-internal unique index over the PK (excluded from the
-  file-format dump, where the table b-tree itself is the PK index).
+- **WITHOUT ROWID PRIMARY KEY uniqueness is fully enforced**: the
+  engine stores WITHOUT ROWID tables as rowid tables internally, so the
+  PK's uniqueness is backed by an engine-internal index
+  (`IndexOrigin::WithoutRowidPk` — no schema row, hidden from
+  sqlite_master and every file-format dump, because in a real SQLite
+  file the table b-tree IS the PK index; rebuilt from the DDL with a
+  full row backfill on reopen). Differential-pinned against real SQLite
+  (`tests/without_rowid_pk.rs`): duplicate PKs fail with SQLite's exact
+  `UNIQUE constraint failed: <t>.<pk>` message (single and composite
+  PKs), `ON CONFLICT (pk)` upserts resolve, `INSERT OR REPLACE`
+  displaces, conflicting PK UPDATEs fail, `PRAGMA index_list` reports
+  origin 'pk', and a dumped SQLite-format file round-trips with real
+  SQLite re-opening it and enforcing the PK itself. Found by the
+  preupdate differential battery (the gap it surfaced).
 - **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
   approximations — tightened one at a time via differential tests against
   real SQLite.
