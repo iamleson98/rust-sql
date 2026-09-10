@@ -169,6 +169,12 @@ impl WalWriter {
         self.ckpt_seq
     }
 
+    /// True once frames exist under the current salts (a clean-close
+    /// checkpoint only fires when there is something to fold).
+    pub fn has_frames(&self) -> bool {
+        self.n_frames > 0
+    }
+
     /// Raw salt bytes (header fields 16..24) for the sidecar identity
     /// check in [`append_wal`].
     fn salt_bytes(&self) -> [u8; 8] {

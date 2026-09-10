@@ -902,33 +902,33 @@ fn autovacuum_ptrmap_entry_geometry() {
 fn engine_wal_sidecar_sqlite_reads_incremental_commits() {
     let path = temp_path("wal_writer");
     let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
-            .unwrap();
-        // First dump after the initial empty full write: a WAL commit.
-        let w1 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-        assert!(w1 > 32, "CREATE TABLE commit must be WAL frames (got {w1})");
-        for i in 1..=25 {
-            db.execute(
-                "INSERT INTO t VALUES (?1, ?2)",
-                [Value::Integer(i), Value::Text(format!("v{i}").into())],
-            )
-            .unwrap();
-        }
-        let w2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-        assert!(w2 > w1, "inserts append frames incrementally");
-        // The main file must NOT have been rewritten (still the initial
-        // full write): its size is unchanged while the sidecar grew.
-        let main = std::fs::metadata(&path).unwrap().len();
-        assert!(
-            main > 0 && main <= 4096 * 2,
-            "main file stays small: {main}"
-        );
-        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, 25);
+    // Keep the engine ALIVE so the sidecar is the live commit log: a
+    // CONCURRENT SQLite reader must recover it.
+    let mut db = Database::open_sqlite_format(&path).unwrap();
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    // First dump after the initial empty full write: a WAL commit.
+    let w1 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(w1 > 32, "CREATE TABLE commit must be WAL frames (got {w1})");
+    for i in 1..=25 {
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            [Value::Integer(i), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
     }
-    // REAL SQLite reads the WAL-committed state via recovery.
+    let w2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(w2 > w1, "inserts append frames incrementally");
+    // The main file must NOT have been rewritten (still the initial
+    // full write): its size is unchanged while the sidecar grew.
+    let main = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        main > 0 && main <= 4096 * 2,
+        "main file stays small: {main}"
+    );
+    let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+    assert_eq!(n, 25);
+    // CONCURRENT real SQLite: recovers the engine's WAL frames.
     {
         let con = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(integrity_check(&con), "ok");
@@ -941,25 +941,22 @@ fn engine_wal_sidecar_sqlite_reads_incremental_commits() {
             .unwrap();
         assert_eq!(v, "v25");
     }
-    // The engine's own reader folds the same frames (reopened session:
-    // next dump re-establishes with a full write, data intact).
-    {
-        let mut db = Database::open(&path).unwrap();
-        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, 25);
-        db.execute("INSERT INTO t VALUES (100, 'after-reopen')", ())
-            .unwrap();
-    }
+    // Clean close (SQLite semantics): checkpoint + sidecar removal,
+    // leaving a self-contained main file.
+    drop(db);
+    assert!(
+        !wal.exists(),
+        "clean close must fold and remove the sidecar"
+    );
     {
         let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
         let n: i64 = con
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 26, "post-reopen commit also visible to SQLite");
-        assert_eq!(integrity_check(&con), "ok");
+        assert_eq!(n, 25, "post-checkpoint main file holds everything");
     }
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&wal);
 }
 
 #[test]
@@ -970,35 +967,33 @@ fn engine_wal_growth_beyond_main_file() {
     // db-size field.
     let path = temp_path("wal_growth");
     let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, pad TEXT)", ())
-            .unwrap();
-        let main0 = std::fs::metadata(&path).unwrap().len();
-        // ~300-byte pads: 300 rows stay well under the 1000-frame
-        // autocheckpoint threshold, so the growth lives ONLY in the
-        // sidecar and the main file is genuinely untouched.
-        for i in 0..300 {
-            let pad = format!("pad-{i:04}-{}", "x".repeat(280));
-            db.execute(
-                "INSERT INTO t(id, pad) VALUES (?1, ?2)",
-                [Value::Integer(i + 1), Value::Text(pad.into())],
-            )
-            .unwrap();
-        }
-        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, 300);
-        // WAL exists and the main file was NOT rewritten (checkpoint
-        // threshold is 1000 frames; this workload stays below it).
-        assert!(std::fs::metadata(&wal)
-            .map(|m| m.len() > 32)
-            .unwrap_or(false));
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            main0,
-            "main untouched"
-        );
+    let mut db = Database::open_sqlite_format(&path).unwrap();
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, pad TEXT)", ())
+        .unwrap();
+    let main0 = std::fs::metadata(&path).unwrap().len();
+    // ~300-byte pads: 300 rows stay well under the 1000-frame
+    // autocheckpoint threshold, so the growth lives ONLY in the
+    // sidecar and the main file is genuinely untouched.
+    for i in 0..300 {
+        let pad = format!("pad-{i:04}-{}", "x".repeat(280));
+        db.execute(
+            "INSERT INTO t(id, pad) VALUES (?1, ?2)",
+            [Value::Integer(i + 1), Value::Text(pad.into())],
+        )
+        .unwrap();
     }
+    let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+    assert_eq!(n, 300);
+    // WAL exists and the main file was NOT rewritten.
+    assert!(std::fs::metadata(&wal)
+        .map(|m| m.len() > 32)
+        .unwrap_or(false));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        main0,
+        "main untouched"
+    );
+    // Concurrent SQLite sees the grown pages through the sidecar.
     {
         let con = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(integrity_check(&con), "ok");
@@ -1011,35 +1006,46 @@ fn engine_wal_growth_beyond_main_file() {
             .unwrap();
         assert!(!pad.is_empty());
     }
+    // The engine's own reader folds the same frames (a SECOND engine
+    // connection while the writer is alive).
     {
-        let db = Database::open(&path).unwrap();
-        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        let db2 = Database::open(&path).unwrap();
+        let n: i64 = db2.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
         assert_eq!(n, 300, "engine's own reader folds grown WAL pages");
     }
+    // Clean close: the main file grows to hold everything.
+    drop(db);
+    let main1 = std::fs::metadata(&path).unwrap().len();
+    assert!(main1 > main0, "checkpoint materializes the growth");
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 300);
+        assert_eq!(integrity_check(&con), "ok");
+    }
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&wal);
 }
 
 #[test]
 fn engine_wal_torn_tail_stops_at_commit_boundary() {
-    // Crash simulation: chop the sidecar mid-frame. Readers must see
-    // the last COMPLETE commit, never a torn one (SQLite: frame
-    // checksum/size validation; engine: full-frame + commit marker).
+    // Crash simulation: chop the sidecar mid-frame while the writer is
+    // NOT running. Readers must see the last COMPLETE commit, never a
+    // torn one (SQLite: frame checksum/size validation; engine:
+    // full-frame + commit marker).
     let path = temp_path("wal_torn");
     let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    let mut committed = 0i64;
-    {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
+    let mut db = Database::open_sqlite_format(&path).unwrap();
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    for i in 1..=10 {
+        db.execute("INSERT INTO t VALUES (?1)", [Value::Integer(i)])
             .unwrap();
-        for i in 1..=10 {
-            db.execute("INSERT INTO t VALUES (?1)", [Value::Integer(i)])
-                .unwrap();
-            committed = i;
-        }
     }
+    let committed = 10i64;
+    // Torn tail: cut the last frame's final 100 bytes.
     {
-        // Torn tail: cut the last frame's final 100 bytes.
         let len = std::fs::metadata(&wal).unwrap().len() as usize;
         let mut data = std::fs::read(&wal).unwrap();
         data.truncate(len - 100);
@@ -1054,12 +1060,23 @@ fn engine_wal_torn_tail_stops_at_commit_boundary() {
         assert_eq!(n, committed - 1, "SQLite sees the last complete commit");
     }
     {
-        let db = Database::open(&path).unwrap();
-        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        let db2 = Database::open(&path).unwrap();
+        let n: i64 = db2.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
         assert_eq!(n, committed - 1, "engine sees the same boundary");
     }
+    // The writer's close-time checkpoint HEALS the torn sidecar from
+    // its authoritative committed image (the torn frame was durable in
+    // the writer; only the sidecar's tail was damaged).
+    drop(db);
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, committed, "checkpoint restores the writer's commit");
+        assert_eq!(integrity_check(&con), "ok");
+    }
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&wal);
 }
 
 #[test]

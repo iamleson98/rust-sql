@@ -612,6 +612,23 @@ impl Drop for Database {
             if f.dirty.load(Ordering::Acquire) || f.had_wal.load(Ordering::Acquire) {
                 let _ = self.dump_foreign();
             }
+            // SQLite's clean-close semantics: the LAST connection
+            // checkpoints the WAL and removes the sidecar, leaving a
+            // self-contained .db (plain file copies stay valid). Mirror
+            // it — fold any live sidecar into the main file.
+            let mut session = f.wal.lock();
+            if let Some(sess) = session.as_mut() {
+                if sess.writer.has_frames() {
+                    let path = f.path.clone();
+                    let _ = crate::storage::sqlitefmt::writer::write_image_atomic(
+                        &path,
+                        &sess.last_image,
+                    );
+                    let ckpt = sess.writer.ckpt_seq() + 1;
+                    let ps = sess.writer.page_size();
+                    sess.writer = crate::storage::sqlitefmt::wal::WalWriter::new(ps, ckpt);
+                }
+            }
         }
     }
 }
