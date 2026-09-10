@@ -375,9 +375,22 @@ mod conn_enc {
     pub(crate) fn reinstall(enc: TextEnc) -> Guard {
         Guard::install(enc)
     }
+
+    /// The raw current tag (1 = UTF-8). Planning gates read this — a
+    /// single TLS byte read, cheaper than the enum round-trip when the
+    /// UTF-8 fast answer (no gate) is all that is needed.
+    pub(crate) fn tag() -> u8 {
+        TAG.with(|t| t.get())
+    }
 }
 
 pub(crate) use conn_enc::Guard as ConnEncGuard;
+
+/// Current connection-encoding tag (1 = UTF-8) — see [`conn_enc`].
+#[inline]
+pub(crate) fn conn_enc_tag() -> u8 {
+    conn_enc::tag()
+}
 
 /// SQL value ordering under the CURRENT statement's file encoding:
 /// identical to [`Value::cmp`] except TEXT×TEXT pairs compare the

@@ -4189,6 +4189,12 @@ impl Database {
         // how expressions are planned — see is_aggregate_call). One
         // read-lock + refcount bump + thread-local install.
         let _plugin_guard = self.plugin_scope();
+        // Planning is also encoding-aware: IndexRange planning is gated on
+        // the file's text encoding (the in-memory index byte order is
+        // code-point — see try_index_range), so prepare-time plans must
+        // see THIS database's encoding, not the TLS default. RAII: nested
+        // statements from other connections never leak their tag.
+        let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.conn_text_enc());
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let t0 = profile::now();

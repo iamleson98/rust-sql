@@ -2198,6 +2198,19 @@ fn try_index_range(
     table: &Arc<Table>,
     alias: &Option<String>,
 ) -> Option<Plan> {
+    // Encoding gate: the in-memory index b-trees order TEXT keys by the
+    // engine's order-preserving key encoding (code-point order), but on
+    // non-UTF-8 files range comparisons follow the FILE's byte order
+    // (SQLite's BINARY collation — see value_cmp_conn). The two orders
+    // disagree for supplementary-plane text, so an index seek bounded in
+    // code-point space would over- AND under-select relative to the
+    // byte-order predicate. Decline the index: the range conjunct stays
+    // a scan filter, evaluated with the encoding-aware comparator.
+    // Equality lookups (IndexPoint / IndexNestedLoopJoin / IN) are
+    // unaffected — both orders induce the same equality relation.
+    if crate::executor::conn_enc_tag() != 1 {
+        return None;
+    }
     let indexes = catalog.indexes_on_table(&table.name);
     if indexes.is_empty() {
         return None;

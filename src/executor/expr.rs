@@ -457,7 +457,11 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                     != std::cmp::Ordering::Greater;
                 ge && le
             } else {
-                v >= lo && v <= hi
+                // Encoding-aware bounds: TEXT×TEXT pairs order under the
+                // connection's file encoding (same rule as the binary
+                // comparison operators — see apply_binary).
+                crate::executor::value_cmp_conn(&v, &lo) != std::cmp::Ordering::Less
+                    && crate::executor::value_cmp_conn(&v, &hi) != std::cmp::Ordering::Greater
             };
             Ok(Value::Integer(if in_range ^ negated { 1 } else { 0 }))
         }
@@ -1744,32 +1748,63 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
                 Value::Integer(if l != r { 1 } else { 0 })
             }
         }
+        // Range comparisons order TEXT×TEXT pairs under the connection's
+        // file encoding (SQLite's BINARY collation: memcmp of the encoded
+        // bytes — on UTF-16 files that is neither code-unit nor code-point
+        // order). UTF-8 connections take `Value::cmp` untouched; other
+        // type classes order identically under both (class-first).
+        // Equality is NOT re-routed: both orders induce the same equality
+        // relation, and `PartialEq` is the cheaper test.
         Lt => {
             if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
-                Value::Integer(if l < r { 1 } else { 0 })
+                Value::Integer(
+                    if crate::executor::value_cmp_conn(l, r) == std::cmp::Ordering::Less {
+                        1
+                    } else {
+                        0
+                    },
+                )
             }
         }
         LtEq => {
             if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
-                Value::Integer(if l <= r { 1 } else { 0 })
+                Value::Integer(
+                    if crate::executor::value_cmp_conn(l, r) != std::cmp::Ordering::Greater {
+                        1
+                    } else {
+                        0
+                    },
+                )
             }
         }
         Gt => {
             if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
-                Value::Integer(if l > r { 1 } else { 0 })
+                Value::Integer(
+                    if crate::executor::value_cmp_conn(l, r) == std::cmp::Ordering::Greater {
+                        1
+                    } else {
+                        0
+                    },
+                )
             }
         }
         GtEq => {
             if cmp_operand_missing(l) || cmp_operand_missing(r) {
                 Value::Null
             } else {
-                Value::Integer(if l >= r { 1 } else { 0 })
+                Value::Integer(
+                    if crate::executor::value_cmp_conn(l, r) != std::cmp::Ordering::Less {
+                        1
+                    } else {
+                        0
+                    },
+                )
             }
         }
         And => Value::Integer(if l.is_truthy() && r.is_truthy() { 1 } else { 0 }),

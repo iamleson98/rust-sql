@@ -172,6 +172,17 @@ pub struct Statement<'a> {
     /// BEGIN-time bookkeeping). Held for the statement's lifetime so the
     /// streaming drivers' `next_batch` calls stay inside the scope.
     view_guard: Option<crate::storage::pager::CommittedViewGuard<'a>>,
+    /// The file text encoding armed for this statement's WHOLE streaming
+    /// lifetime (RAII: dropped on reset/finalize, restoring the previous
+    /// tag). The first `step()`'s `start()` runs comparisons under it,
+    /// but the DRIVERS keep evaluating filters / sorts / decodes on every
+    /// later `step()` call — a block-scoped guard would leave those
+    /// comparisons on the thread's default tag (code-point order on
+    /// UTF-16 files). Between `step()` calls the tag stays armed on this
+    /// thread; nested statements from other connections save + restore
+    /// around themselves (the ConnEncGuard discipline), so an armed tag
+    /// never leaks into another connection's execution.
+    enc_guard: Option<crate::executor::ConnEncGuard>,
 }
 
 #[derive(Default)]
@@ -265,6 +276,7 @@ impl<'a> Statement<'a> {
             deltas: CtxDeltas::default(),
             changes_at_start: db.total_changes(),
             view_guard: None,
+            enc_guard: None,
         })
     }
 
@@ -354,8 +366,10 @@ impl<'a> Statement<'a> {
         self.changes_at_start = self.db.total_changes();
         // Drop the committed-view scope: a re-executed statement re-arms
         // (or not) against the CURRENT transaction state at its next
-        // start().
+        // start(). The encoding guard drops with it — restored tag, and
+        // the next first step() re-arms.
         self.view_guard = None;
+        self.enc_guard = None;
     }
 
     /// Clear all bound parameters (back to NULL).
@@ -454,9 +468,13 @@ impl<'a> Statement<'a> {
             // Per-connection snapshot for `last_insert_rowid()` (see
             // Database::execute).
             crate::executor::change_counters::note_conn_rowid(self.db.last_insert_rowid());
-            // File text encoding for value ordering / CAST (RAII restore;
-            // see Database::query).
-            let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.db.conn_text_enc());
+            // File text encoding for value ordering / CAST — armed for the
+            // statement's WHOLE streaming lifetime (the drivers keep
+            // evaluating predicates on every later step; see the field
+            // docs). Dropped (restoring) on reset / finalize.
+            self.enc_guard = Some(crate::executor::ConnEncGuard::install(
+                self.db.conn_text_enc(),
+            ));
             self.start()?;
         }
         // Serve one buffered row. The PREVIOUS current_row's consumer

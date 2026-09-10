@@ -658,10 +658,15 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
   and `CAST(text AS BLOB)` (the encoding's bytes, not UTF-8) all
   differential-tested against real SQLite on both UTF-16le and UTF-16be
   files with adversarial supplementary-plane text
-  (`tests/utf16_interop.rs`). The remaining engine-side sub-gap on
-  non-UTF-8 files: WHERE range comparisons (`v > '…'`) and in-memory
-  index range seeks still use code-point order (equality, lookups, and
-  the file's own b-tree order are exact).
+  (`tests/utf16_interop.rs`). WHERE range comparisons (`v > '…'`,
+  `BETWEEN`, DML range predicates, the prepared-statement streaming
+  path) follow the file's byte order too — differential-pinned against
+  real SQLite on both encodings, including queries with an INDEX on the
+  ranged column (the engine declines the index-range plan there and
+  evaluates the predicate with the encoding-aware comparator, because
+  the in-memory index byte order is code-point while the predicate is
+  byte-ordered — the two orders disagree only for supplementary-plane
+  text).
 
 ## Remaining gaps vs SQLite
 

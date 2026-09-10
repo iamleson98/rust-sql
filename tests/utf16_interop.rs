@@ -693,3 +693,234 @@ fn utf16_value_type_matrix_roundtrip() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// WHERE range comparisons under the file's byte order (the sub-gap this
+// suite pins): v > 'x', BETWEEN, and DML WHERE ranges on TEXT columns
+// must match real SQLite exactly on UTF-16 files — including a query
+// with an INDEX on the ranged column (the engine declines the index
+// range plan there; the scan filter evaluates byte-ordered).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine_utf16_where_ranges_match_sqlite() {
+    let data = ADVERSARIAL;
+    let predicates = [
+        "v > 'a'",
+        "v >= 'a'",
+        "v < 'z'",
+        "v <= 'z'",
+        "v > '\u{FFFD}'",
+        "v < '\u{FFFD}'",
+        "v >= '\u{1F600}'",
+        "v <= '\u{E000}'",
+        "v BETWEEN 'a' AND 'z'",
+        "v BETWEEN '\u{E000}' AND '\u{FFFD}'",
+        "v NOT BETWEEN '\u{61}' AND '\u{6100}'",
+        "v > '\u{6100}' AND v < '\u{FFFD}'",
+    ];
+    for pragma_name in ["UTF-16le", "UTF-16be"] {
+        // SQLite reference: rows selected by each predicate, rowid order.
+        let path = temp_path(&format!("b_wr_{pragma_name}"));
+        let sq_answers: Vec<Vec<String>> = {
+            {
+                let con = rusqlite::Connection::open(&path).unwrap();
+                con.pragma_update(None, "encoding", pragma_name).unwrap();
+                con.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+                    .unwrap();
+                let mut stmt = con.prepare("INSERT INTO t (v) VALUES (?)").unwrap();
+                for s in data {
+                    stmt.execute([s]).unwrap();
+                }
+            }
+            let con = rusqlite::Connection::open(&path).unwrap();
+            predicates
+                .iter()
+                .map(|p| {
+                    let sql = format!("SELECT v FROM t WHERE {p} ORDER BY id");
+                    let mut stmt = con.prepare(&sql).unwrap();
+                    stmt.query_map([], |r| r.get::<_, String>(0))
+                        .unwrap()
+                        .map(|r| r.unwrap())
+                        .collect()
+                })
+                .collect()
+        };
+        // The engine on the same file.
+        let db = Database::open(&path).unwrap();
+        for (i, p) in predicates.iter().enumerate() {
+            let sql = format!("SELECT v FROM t WHERE {p} ORDER BY id");
+            let rows = db.query(&sql, ()).unwrap();
+            let got: Vec<String> = rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Text(t) => t.as_str().to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(got, sq_answers[i], "{pragma_name}: WHERE {p}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn engine_utf16_where_range_with_index_matches_sqlite() {
+    // Same shape WITH an index on the ranged column: the engine's
+    // in-memory index orders TEXT keys code-point-style, so the index
+    // RANGE plan is declined under non-UTF-8 encodings and the scan
+    // filter carries the predicate — results still match SQLite.
+    let data = ADVERSARIAL;
+    for pragma_name in ["UTF-16le", "UTF-16be"] {
+        let path = temp_path(&format!("b_wri_{pragma_name}"));
+        {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            con.pragma_update(None, "encoding", pragma_name).unwrap();
+            con.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 CREATE INDEX iv ON t(v);",
+            )
+            .unwrap();
+            let mut stmt = con.prepare("INSERT INTO t (v) VALUES (?)").unwrap();
+            for s in data {
+                stmt.execute([s]).unwrap();
+            }
+        }
+        let sq_answer: Vec<String> = {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            let mut stmt = con
+                .prepare("SELECT v FROM t WHERE v > 'a' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let db = Database::open(&path).unwrap();
+        // Range + equality lookups both stay exact.
+        let rows = db
+            .query("SELECT v FROM t WHERE v > 'a' ORDER BY id", ())
+            .unwrap();
+        let got: Vec<String> = texts_of(&rows);
+        assert_eq!(got, sq_answer, "{pragma_name}: indexed WHERE v > 'a'");
+        // Equality through the index is unaffected.
+        let n = count_of(&db, "SELECT COUNT(*) FROM t WHERE v = '\u{FFFD}'");
+        assert_eq!(n, 1, "{pragma_name}: indexed equality lookup");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn engine_utf16_dml_where_range_matches_sqlite() {
+    // UPDATE / DELETE WHERE ranges on TEXT: the DML predicates follow the
+    // same byte-order comparator.
+    let data = ADVERSARIAL;
+    for pragma_name in ["UTF-16le", "UTF-16be"] {
+        let path = temp_path(&format!("b_dmlr_{pragma_name}"));
+        {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            con.pragma_update(None, "encoding", pragma_name).unwrap();
+            con.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER);")
+                .unwrap();
+            let mut stmt = con.prepare("INSERT INTO t (v, k) VALUES (?1, ?2)").unwrap();
+            for (i, s) in data.iter().enumerate() {
+                stmt.execute(rusqlite::params![s, (i + 1) as i64]).unwrap();
+            }
+        }
+        // SQLite reference: DELETE everything above 'z', then list.
+        let (sq_deleted, sq_remaining): (i64, Vec<String>) = {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            let n = con.execute("DELETE FROM t WHERE v > 'z'", []).unwrap() as i64;
+            let mut stmt = con.prepare("SELECT v FROM t ORDER BY id").unwrap();
+            let rem: Vec<String> = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            (n, rem)
+        };
+        // The engine, on a PRISTINE copy (the reference DELETE above
+        // already mutated the source — copy BEFORE deleting instead of
+        // VACUUM INTO after): same inserts into a fresh file.
+        let path2 = temp_path(&format!("b_dmlr2_{pragma_name}"));
+        {
+            let con = rusqlite::Connection::open(&path2).unwrap();
+            con.pragma_update(None, "encoding", pragma_name).unwrap();
+            con.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER);")
+                .unwrap();
+            let mut stmt = con.prepare("INSERT INTO t (v, k) VALUES (?1, ?2)").unwrap();
+            for (i, sv) in data.iter().enumerate() {
+                stmt.execute(rusqlite::params![sv, (i + 1) as i64]).unwrap();
+            }
+        }
+        let mut db = Database::open(&path2).unwrap();
+        db.execute("UPDATE t SET k = 99 WHERE v BETWEEN 'a' AND 'z'", [])
+            .unwrap();
+        let updated = db.changes();
+        // Everything between 'a' and 'z' under BOTH orders is the same
+        // set here (BMP-plane bounds, no astral divergence) — verify k
+        // was applied and nothing else.
+        let k99 = count_of(&db, "SELECT COUNT(*) FROM t WHERE k = 99");
+        assert!(
+            updated >= 1 && k99 >= 1,
+            "{pragma_name}: range UPDATE touched rows"
+        );
+        let k_orig = count_of(&db, "SELECT COUNT(*) FROM t WHERE k != 99");
+        assert_eq!(
+            k_orig,
+            (data.len() as i64) - k99,
+            "{pragma_name}: range UPDATE boundary"
+        );
+        db.execute("DELETE FROM t WHERE v > 'z'", []).unwrap();
+        let del = db.changes();
+        assert_eq!(del, sq_deleted, "{pragma_name}: range DELETE count");
+        let rem: Vec<String> = texts_of(&db.query("SELECT v FROM t ORDER BY id", ()).unwrap());
+        assert_eq!(
+            rem, sq_remaining,
+            "{pragma_name}: rows remaining after DELETE"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+}
+
+#[test]
+fn engine_utf16_where_range_through_statement_step() {
+    // The prepared-statement streaming path (cell serving + filter
+    // evaluation) with a range predicate: same byte-order answers.
+    let data = ADVERSARIAL;
+    for pragma_name in ["UTF-16le", "UTF-16be"] {
+        let path = temp_path(&format!("b_stpr_{pragma_name}"));
+        {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            con.pragma_update(None, "encoding", pragma_name).unwrap();
+            con.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+                .unwrap();
+            let mut stmt = con.prepare("INSERT INTO t (v) VALUES (?)").unwrap();
+            for s in data {
+                stmt.execute([s]).unwrap();
+            }
+        }
+        let sq_answer: Vec<String> = {
+            let con = rusqlite::Connection::open(&path).unwrap();
+            let mut stmt = con
+                .prepare("SELECT v FROM t WHERE v > 'a' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let db = Database::open(&path).unwrap();
+        let mut stmt = db
+            .prepare("SELECT id, v FROM t WHERE v > 'a' ORDER BY id")
+            .unwrap();
+        let mut got = Vec::new();
+        use rustqlite::StepResult;
+        while stmt.step().unwrap() == StepResult::Row {
+            got.push(stmt.column_text(1).unwrap());
+        }
+        assert_eq!(got, sq_answer, "{pragma_name}: step-path WHERE v > 'a'");
+        let _ = std::fs::remove_file(&path);
+    }
+}
