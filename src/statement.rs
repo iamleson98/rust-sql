@@ -534,7 +534,17 @@ impl<'a> Statement<'a> {
                         let (plan, _outcome) = match pull {
                             Some(p) => p,
                             None => {
+                                // Refusal (wrapper shape, or an
+                                // overflow-stop after in-page rows were
+                                // served): disarm cell mode so the
+                                // accessors read the materialized path's
+                                // current_row/pending from here on, and
+                                // drop the batch state.
                                 self.cells_refused = true;
+                                self.cell_mode = false;
+                                self.cell_row_live = false;
+                                self.cells.clear();
+                                self.cell_arena.clear();
                                 break;
                             }
                         };
@@ -1657,6 +1667,10 @@ struct ProjectedScanDriver {
     project: Vec<usize>,
     last_rowid: i64,
     eof: bool,
+    /// Cell serving permanently refused after an overflow-stop (see
+    /// CellScanOutcome::overflow_stop): the rest of the stream is served
+    /// materialized, where overflow rows pay ONE targeted span gather.
+    cells_dead: bool,
 }
 
 impl ProjectedScanDriver {
@@ -1667,6 +1681,7 @@ impl ProjectedScanDriver {
             project,
             last_rowid: i64::MIN,
             eof: false,
+            cells_dead: false,
         }
     }
 }
@@ -1749,6 +1764,9 @@ impl Driver for ProjectedScanDriver {
         arena: &mut Vec<u8>,
         entries: &mut Vec<crate::storage::btree::CellEntry>,
     ) -> Result<Option<(CellPlan, crate::storage::btree::CellScanOutcome)>> {
+        if self.cells_dead {
+            return Ok(None);
+        }
         if self.eof {
             // Exhausted: an empty pull with hit_end lets the statement
             // conclude Done (same contract as next_batch's empty Vec —
@@ -1760,6 +1778,7 @@ impl Driver for ProjectedScanDriver {
                 CellPlan::new(&self.table, &self.project, db.pager.is_memory()),
                 crate::storage::btree::CellScanOutcome {
                     hit_end: true,
+                    overflow_stop: false,
                     last_rowid: self.last_rowid,
                 },
             )));
@@ -1778,6 +1797,23 @@ impl Driver for ProjectedScanDriver {
             bt.scan_table_range_cells(start, i64::MAX, budget, MAX_BATCH_BYTES, arena, entries)?;
         self.eof = outcome.hit_end && entries.len() < budget;
         self.last_rowid = outcome.last_rowid;
+        if outcome.overflow_stop && entries.is_empty() {
+            // The very next row is an overflow cell: nothing was copied
+            // (nothing advanced) — refuse outright; the materialized path
+            // re-scans from the current resume point with the targeted
+            // span gather.
+            self.cells_dead = true;
+            entries.clear();
+            arena.clear();
+            return Ok(None);
+        }
+        if outcome.overflow_stop {
+            // In-page rows were served; the overflow row (and everything
+            // past it) switches to the materialized path on the next
+            // pull. No rows are skipped: next_batch resumes at
+            // last_rowid + 1, ON the overflow row.
+            self.cells_dead = true;
+        }
         let plan = CellPlan::new(&self.table, &self.project, db.pager.is_memory());
         Ok(Some((plan, outcome)))
     }
@@ -1800,6 +1836,10 @@ struct ProjectedRangeDriver {
     end: Option<Expr>,
     last_rowid: i64,
     eof: bool,
+    /// Cell serving permanently refused after an overflow-stop — the
+    /// rest of the range is served materialized (one targeted span
+    /// gather per overflow row instead of an arena triple-copy).
+    cells_dead: bool,
 }
 
 impl ProjectedRangeDriver {
@@ -1818,6 +1858,7 @@ impl ProjectedRangeDriver {
             end,
             last_rowid: i64::MIN,
             eof: false,
+            cells_dead: false,
         }
     }
 }
@@ -1919,6 +1960,9 @@ impl Driver for ProjectedRangeDriver {
         arena: &mut Vec<u8>,
         entries: &mut Vec<crate::storage::btree::CellEntry>,
     ) -> Result<Option<(CellPlan, crate::storage::btree::CellScanOutcome)>> {
+        if self.cells_dead {
+            return Ok(None);
+        }
         if self.eof {
             entries.clear();
             arena.clear();
@@ -1926,6 +1970,7 @@ impl Driver for ProjectedRangeDriver {
                 CellPlan::new(&self.table, &self.project, db.pager.is_memory()),
                 crate::storage::btree::CellScanOutcome {
                     hit_end: true,
+                    overflow_stop: false,
                     last_rowid: self.last_rowid,
                 },
             )));
@@ -1965,6 +2010,7 @@ impl Driver for ProjectedRangeDriver {
                 CellPlan::new(&self.table, &self.project, db.pager.is_memory()),
                 crate::storage::btree::CellScanOutcome {
                     hit_end: true,
+                    overflow_stop: false,
                     last_rowid: self.last_rowid,
                 },
             )));
@@ -1977,6 +2023,22 @@ impl Driver for ProjectedRangeDriver {
         let outcome = bt.scan_table_range_cells(lo, hi, budget, MAX_BATCH_BYTES, arena, entries)?;
         self.eof = outcome.hit_end && entries.len() < budget;
         self.last_rowid = outcome.last_rowid;
+        if outcome.overflow_stop && entries.is_empty() {
+            // The very next row in the range is an overflow cell: refuse
+            // outright (nothing advanced — the materialized path resumes
+            // exactly here).
+            self.cells_dead = true;
+            entries.clear();
+            arena.clear();
+            return Ok(None);
+        }
+        if outcome.overflow_stop {
+            // In-range in-page rows were served; the overflow row and
+            // everything past it switches to the materialized path (no
+            // rows skipped: next_batch resumes at last_rowid + 1, ON the
+            // overflow row).
+            self.cells_dead = true;
+        }
         let plan = CellPlan::new(&self.table, &self.project, db.pager.is_memory());
         Ok(Some((plan, outcome)))
     }

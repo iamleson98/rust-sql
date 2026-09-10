@@ -172,6 +172,13 @@ pub struct CellEntry {
 #[derive(Clone, Copy, Debug)]
 pub struct CellScanOutcome {
     pub hit_end: bool,
+    /// The walk stopped BEFORE an overflow cell (arena-copying a
+    /// multi-page payload costs 2-3x the bytes of the materialized
+    /// path's targeted span gather — the torture S09 shape: 64 KB
+    /// blobs regressed 5x). The driver then declines cell serving and
+    /// the statement continues on the materialized path; the resume
+    /// (last_rowid + 1) lands ON the overflow row.
+    pub overflow_stop: bool,
     pub last_rowid: i64,
 }
 
@@ -183,12 +190,11 @@ struct CellsWalk<'a> {
     max_bytes: usize,
     /// False once a budget stop interrupted the walk.
     hit_end: bool,
+    /// True when the walk stopped at an overflow cell (see
+    /// CellScanOutcome::overflow_stop).
+    overflow_stop: bool,
     /// rowid of the last COPIED row (i64::MIN = none yet this pull).
     last: i64,
-    /// Overflow reassembly scratch — reused across overflow cells, grown
-    /// to the widest row (an owned buffer so the leaf guard can stay
-    /// held while the chain is gathered).
-    scratch: Vec<u8>,
 }
 
 impl CellsWalk<'_> {
@@ -206,17 +212,6 @@ impl CellsWalk<'_> {
             off,
             len: bytes.len() as u32,
         });
-        self.last = rowid;
-    }
-
-    /// Copy the overflow scratch (split-field borrows: the arena is
-    /// mutable while the scratch is read — one struct, two fields).
-    #[inline]
-    fn copy_scratch(&mut self, rowid: i64) {
-        let off = self.arena.len() as u32;
-        let len = self.scratch.len() as u32;
-        self.arena.extend_from_slice(&self.scratch);
-        self.entries.push(CellEntry { rowid, off, len });
         self.last = rowid;
     }
 }
@@ -6353,12 +6348,13 @@ impl<'a> Btree<'a> {
             budget: budget.max(1),
             max_bytes: max_arena_bytes.max(1),
             hit_end: true,
+            overflow_stop: false,
             last: i64::MIN,
-            scratch: Vec::new(),
         };
         self.scan_range_subtree_cells(self.root, start, end, &mut walk)?;
         Ok(CellScanOutcome {
             hit_end: walk.hit_end,
+            overflow_stop: walk.overflow_stop,
             last_rowid: walk.last,
         })
     }
@@ -6446,29 +6442,17 @@ impl<'a> Btree<'a> {
                         let payload = &buf[payload_start..payload_start + plen];
                         walk.copy(rowid, payload);
                     } else {
-                        // Overflow cell: reassemble the full payload into
-                        // the walk's scratch, then copy into the arena.
-                        // The leaf lock STAYS held — `page` is an owned
-                        // Arc clone (no borrow of self survives get_page),
-                        // and the lock order leaf -> overflow is global
-                        // (chains are only entered from leaf cells), same
-                        // as scan_subtree_borrowed.
-                        if local_len + 4 > buf.len() - payload_start {
-                            return Err(Error::corruption("truncated overflow cell in scan_cells"));
-                        }
-                        let local = &buf[payload_start..payload_start + local_len];
-                        let chain = u32::from_be_bytes(
-                            buf[payload_start + local_len..payload_start + local_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        self.assemble_overflow_payload_into(
-                            local,
-                            plen as u64,
-                            chain,
-                            &mut walk.scratch,
-                        )?;
-                        walk.copy_scratch(rowid);
+                        // Overflow cell: STOP the walk without copying it
+                        // (see CellScanOutcome::overflow_stop). The
+                        // materialized path's decode_overflow_selective
+                        // gathers only the WANTED column spans directly
+                        // into the value's own buffer — ONE payload copy;
+                        // arena-copying would pay chain reassembly +
+                        // arena + decode (three). The resume
+                        // (last_rowid + 1) lands ON this row.
+                        walk.hit_end = false;
+                        walk.overflow_stop = true;
+                        return Ok(false);
                     }
                 }
                 Ok(true)
