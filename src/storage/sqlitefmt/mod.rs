@@ -26,6 +26,7 @@ pub mod header;
 pub mod reader;
 pub mod record;
 pub mod varint;
+pub mod wal;
 pub mod writer;
 
 pub use reader::{read_sqlite_file, RawRow, SchemaRow, SqliteDbImage};

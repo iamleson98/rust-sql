@@ -453,6 +453,18 @@ pub(crate) struct ForeignSqlite {
     /// at open; `PRAGMA auto_vacuum` can still change it while the
     /// schema is empty (SQLite's rule — silently ignored afterwards).
     auto_vacuum: AtomicU8,
+    /// Live WAL-append session for the sidecar writer: established by
+    /// the first full write of a session (which also checkpoints any
+    /// source sidecar), then every later commit appends only the pages
+    /// that changed. `None` until then (and after VACUUM resets it).
+    wal: Mutex<Option<ForeignWalSession>>,
+}
+
+/// One WAL-append session: the frame writer plus the last committed
+/// page image (the diff base — main file + sidecar state).
+struct ForeignWalSession {
+    writer: crate::storage::sqlitefmt::wal::WalWriter,
+    last_image: Vec<u8>,
 }
 
 impl ForeignSqlite {
@@ -2257,6 +2269,7 @@ impl Database {
             schema_cookie: AtomicU32::new(0),
             had_wal: AtomicBool::new(image.had_wal),
             auto_vacuum: AtomicU8::new(image.auto_vacuum),
+            wal: Mutex::new(None),
         };
         db.foreign = Some(foreign);
         db.load_foreign_image(image)?;
@@ -2298,6 +2311,7 @@ impl Database {
             schema_cookie: AtomicU32::new(1),
             had_wal: AtomicBool::new(false),
             auto_vacuum: AtomicU8::new(0),
+            wal: Mutex::new(None),
         });
         db.dump_foreign()?;
         Ok(db)
@@ -2555,8 +2569,22 @@ impl Database {
     }
 
     /// Rewrite the persistent file in SQLite's disk format when the
-    /// in-memory state has committed writes. Atomic: temp + fsync +
-    /// rename. No-op when clean.
+    /// in-memory state has committed writes. No-op when clean.
+    ///
+    /// TWO commit paths:
+    /// * **Full atomic write** (temp + fsync + rename) — the FIRST
+    ///   write of a session (it also checkpoints whatever sidecar the
+    ///   source left behind) and the fallback whenever the WAL state
+    ///   is unavailable (right after open, after VACUUM, when the
+    ///   sidecar was tampered with).
+    /// * **WAL append** — every later commit: only the pages that
+    ///   changed since the last commit become checksum-chained frames
+    ///   in a real `<db>-wal` sidecar (recovery-compatible with SQLite
+    ///   itself), so live readers — SQLite or another engine process —
+    ///   see committed state without the file being rewritten under
+    ///   them. The sidecar is checkpointed back into the main file
+    ///   (full write + sidecar removal) when it crosses SQLite's
+    ///   1000-frame autocheckpoint pressure.
     pub fn dump_foreign(&self) -> Result<()> {
         let Some(foreign) = self.foreign.as_ref() else {
             return Ok(());
@@ -2566,8 +2594,82 @@ impl Database {
         }
         let out = self.collect_foreign_dump()?;
         let path = foreign.path.clone();
-        crate::storage::sqlitefmt::write_sqlite_file(&path, &out)
+        let bytes = crate::storage::sqlitefmt::build_bytes(&out)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+
+        // WAL-append attempt: only with an established session and no
+        // source sidecar left to fold (had_wal implies the first dump
+        // must fully rewrite the file anyway).
+        let mut session = foreign.wal.lock();
+        if foreign.had_wal.load(Ordering::Acquire) {
+            session.take();
+        }
+        let mut wal_err: Option<String> = None;
+        if let Some(sess) = session.as_mut() {
+            let ps = sess.writer.page_size();
+            if ps as usize != 0 && bytes.len() % ps as usize == 0 {
+                let changed =
+                    crate::storage::sqlitefmt::wal::diff_pages(&sess.last_image, &bytes, ps);
+                if changed.is_empty() {
+                    // Byte-identical rebuild: nothing to commit — the
+                    // file already holds this state.
+                    foreign.dirty.store(false, Ordering::Release);
+                    foreign.had_wal.store(false, Ordering::Release);
+                    return Ok(());
+                }
+                let db_size = (bytes.len() / ps as usize) as u32;
+                // Capture the PRE-commit sidecar length before the
+                // encoder counts its own pending frames.
+                let pre_len = sess.writer.wal_len();
+                let frames = sess.writer.encode_commit(&changed, db_size);
+                let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(&path);
+                match crate::storage::sqlitefmt::wal::append_wal(
+                    &wal_path,
+                    &sess.writer,
+                    pre_len,
+                    &frames,
+                ) {
+                    Ok(()) => {
+                        sess.last_image = bytes;
+                        if sess.writer.should_checkpoint() {
+                            // Fold the sidecar into the main file (full
+                            // atomic write clears it) and reset the
+                            // salts; the diff base is now the main file.
+                            crate::storage::sqlitefmt::writer::write_image_atomic(
+                                &path,
+                                &sess.last_image,
+                            )
+                            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                            let ckpt = sess.writer.ckpt_seq() + 1;
+                            sess.writer = crate::storage::sqlitefmt::wal::WalWriter::new(ps, ckpt);
+                        }
+                        foreign.dirty.store(false, Ordering::Release);
+                        foreign.had_wal.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(e) => wal_err = Some(e),
+                }
+            }
+        }
+        if let Some(e) = wal_err {
+            // A replaced/tampered sidecar: fall back to the full write
+            // (which removes it) — the error is only diagnostic.
+            let _ = e;
+        }
+        drop(session);
+
+        // Full atomic write + establish the WAL session.
+        crate::storage::sqlitefmt::writer::write_image_atomic(&path, &bytes)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let ps = if out.page_size == 0 {
+            4096
+        } else {
+            out.page_size
+        };
+        *foreign.wal.lock() = Some(ForeignWalSession {
+            writer: crate::storage::sqlitefmt::wal::WalWriter::new(ps, 0),
+            last_image: bytes,
+        });
         foreign.dirty.store(false, Ordering::Release);
         // had_wal referred to the SOURCE's sidecar, removed by the write.
         foreign.had_wal.store(false, Ordering::Release);
@@ -2976,6 +3078,10 @@ impl Database {
             }
             let foreign = self.foreign.as_ref();
             if let Some(foreign) = foreign {
+                // VACUUM rebuilds the page layout wholesale: take the
+                // full-write path (every page would differ anyway) and
+                // re-establish the WAL session afterwards.
+                *foreign.wal.lock() = None;
                 foreign.dirty.store(true, Ordering::Release);
             }
             self.dump_foreign()?;

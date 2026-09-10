@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **715+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **722+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -822,11 +822,24 @@ compat surface. Every entry says what it costs and why it exists.
   the one remaining engine-side sub-gap on non-UTF-8 files: WHERE range
   comparisons and in-memory index range seeks still use code-point order
   (equality and the file's own b-tree order are exact).
-- **WAL for SQLite-format mode**: the SQLite-format writer commits
-  atomically via temp-file + rename, not a real `-wal` sidecar — readers
-  of a rustqlite-written file never see journal state, but a
-  rustqlite-opened SQLite file's own live `-wal` is folded into the read
-  view only (writes rewrite the file).
+- **WAL for SQLite-format mode**: COMMITTED through a REAL `-wal`
+  sidecar. The first write of a session establishes the main file
+  (full atomic rewrite, which also checkpoints whatever sidecar the
+  source left); every later commit appends only the pages that changed
+  as checksum-chained WAL frames — byte-exact SQLite WAL format
+  (header salts, per-frame cumulative checksums, commit frames with
+  the new database size), so real SQLite recovers the sidecar and
+  sees committed state WITHOUT the file being rewritten under live
+  readers, and the engine's own reader folds the same frames. The
+  sidecar auto-checkpoints (full write + reset) at SQLite's 1000-frame
+  pressure; a torn tail stops every reader at the last complete commit
+  boundary; VACUUM takes the full-rewrite path (`tests/sqlite_interop.rs`,
+  4 suites: incremental commits read by SQLite, growth beyond the main
+  file, torn-tail crash boundary, checkpoint pressure). Reader-side
+  subtlety handled: page 1 can be rewritten by WAL frames, so the
+  header (encoding / auto-vacuum / user-version) re-parses from the
+  merged view, and the commit frame's db-size extends the page range
+  past the main file's length.
 
 ## Usage
 

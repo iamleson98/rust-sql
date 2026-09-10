@@ -269,12 +269,20 @@ fn clear_sidecar(path: &std::path::Path) {
 /// handle.
 pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
     let bytes = build_bytes(db)?;
+    write_image_atomic(path, &bytes)
+}
+
+/// Atomic full-image write (checkpoint semantics): temp + fsync +
+/// rename with Windows in-place fallbacks, then stale sidecar removal
+/// so a subsequent SQLite open (or the engine's own reader) never
+/// replays pre-checkpoint frames.
+pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("rsqltmp{}", std::process::id()));
     {
         use std::io::Write;
         let mut f =
             std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-        f.write_all(&bytes)
+        f.write_all(bytes)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
@@ -299,7 +307,7 @@ pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
                 .truncate(true)
                 .open(path)
                 .map_err(|e| format!("in-place open {}: {e}", path.display()))?;
-            f.write_all(&bytes)
+            f.write_all(bytes)
                 .map_err(|e| format!("in-place write {}: {e}", path.display()))?;
             f.sync_all()
                 .map_err(|e| format!("in-place fsync {}: {e}", path.display()))?;

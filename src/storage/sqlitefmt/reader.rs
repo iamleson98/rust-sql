@@ -95,24 +95,12 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
         return Err("file smaller than the 100-byte SQLite header".into());
     }
     let hdr = FileHeaderInfo::parse(&data)?;
-    let text_enc = TextEnc::from_u32(hdr.text_encoding)?;
-    // Auto-vacuum mode: enabled iff largest-root (header 52) is set;
-    // INCREMENTAL when the incremental flag (header 64) is set.
-    let auto_vacuum: u8 = if hdr.largest_root_btree != 0 {
-        if data[64..68] != [0, 0, 0, 0] {
-            2
-        } else {
-            1
-        }
-    } else {
-        0
-    };
     if !(hdr.reserved as u32) < hdr.page_size && hdr.reserved != 0 {
         return Err(format!("invalid reserved-bytes-per-page {}", hdr.reserved));
     }
     let file_pages = (data.len() / hdr.page_size as usize) as u32;
     // Trust the header's size only when it is sane vs the file.
-    let n_pages = if hdr.db_size_pages != 0 && hdr.db_size_pages <= file_pages {
+    let mut n_pages = if hdr.db_size_pages != 0 && hdr.db_size_pages <= file_pages {
         hdr.db_size_pages
     } else {
         file_pages
@@ -121,11 +109,19 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
     // --- WAL sidecar: apply the last committed frames on top.
     let mut overrides: HashMap<u32, Vec<u8>> = HashMap::new();
     let mut had_wal = false;
+    // A WAL commit can GROW the database past the main file's length
+    // (new pages live only in the sidecar until a checkpoint) — the
+    // commit frame's db-size extends the page view.
     let wal_path = wal_path_of(path);
     if let Ok(wal) = std::fs::read(&wal_path) {
         if wal.len() >= 32 {
             match apply_wal(&wal, hdr.page_size, n_pages, &mut overrides) {
-                Ok(applied) => had_wal = applied,
+                Ok((applied, commit_db_size)) => {
+                    had_wal = applied;
+                    if commit_db_size > n_pages {
+                        n_pages = commit_db_size;
+                    }
+                }
                 Err(e) => {
                     // An unreadable WAL is ignored: the main file view is
                     // still a consistent pre-WAL snapshot (the writer
@@ -141,6 +137,28 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
         page_size: hdr.page_size,
         overrides,
         n_pages,
+    };
+
+    // The WAL can have rewritten page 1 (schema, change counter,
+    // encoding, auto-vacuum header fields): re-parse the header from
+    // the MERGED view so the image reflects the committed state, not
+    // the stale main file. Identical to `hdr` when no frames applied.
+    let hdr = match src.page(1) {
+        Ok(p1) => FileHeaderInfo::parse(p1).unwrap_or(hdr),
+        Err(_) => hdr,
+    };
+    let page1: &[u8] = src.page(1).unwrap_or(&[0u8; 100]);
+    let text_enc = TextEnc::from_u32(hdr.text_encoding)?;
+    // Auto-vacuum mode: enabled iff largest-root (header 52) is set;
+    // INCREMENTAL when the incremental flag (header 64) is set.
+    let auto_vacuum: u8 = if hdr.largest_root_btree != 0 {
+        if page1[64..68] != [0, 0, 0, 0] {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
     };
 
     let usable = hdr.usable();
@@ -460,7 +478,7 @@ fn apply_wal(
     page_size: u32,
     _n_pages: u32,
     overrides: &mut HashMap<u32, Vec<u8>>,
-) -> Result<bool, String> {
+) -> Result<(bool, u32), String> {
     let magic = u32::from_be_bytes([wal[0], wal[1], wal[2], wal[3]]);
     if magic != 0x377f0682 && magic != 0x377f0683 {
         return Err("bad WAL magic".into());
@@ -475,6 +493,10 @@ fn apply_wal(
     // from a prefix ending in a commit frame.
     let mut pending: HashMap<u32, Vec<u8>> = HashMap::new();
     let mut applied_any = false;
+    // The LAST valid commit frame's database size (in pages) — a WAL can
+    // grow the database beyond the main file's length (new pages live
+    // only in the sidecar until a checkpoint).
+    let mut commit_db_size: u32 = 0;
     while off + frame_size <= wal.len() {
         let hdr = &wal[off..off + 24];
         let page_no = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
@@ -495,10 +517,11 @@ fn apply_wal(
             // Commit frame: the pending set becomes durable.
             overrides.extend(pending.drain());
             applied_any = true;
+            commit_db_size = db_size;
         }
         off += frame_size;
     }
-    Ok(applied_any)
+    Ok((applied_any, commit_db_size))
 }
 
 /// `<path>-wal` sidecar path.

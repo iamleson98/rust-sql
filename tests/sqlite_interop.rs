@@ -874,6 +874,9 @@ fn autovacuum_ptrmap_entry_geometry() {
         db.execute("PRAGMA auto_vacuum = FULL", ()).unwrap();
         db.execute("CREATE TABLE t(a)", ()).unwrap();
         db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        // Later commits append WAL frames; VACUUM forces the full
+        // materialization (page map + header) into the main file.
+        db.execute("VACUUM", ()).unwrap();
     }
     let data = std::fs::read(&path).unwrap();
     assert_eq!(data.len() % 4096, 0);
@@ -886,4 +889,216 @@ fn autovacuum_ptrmap_entry_geometry() {
         assert_eq!(integrity_check(&con), "ok");
     }
     let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// REAL WAL sidecar writes: after the first full write of a session,
+// later commits append checksum-chained frames to <db>-wal. Real SQLite
+// recovers and sees the committed state; the engine's own reader folds
+// the same frames; torn tails stop at the last commit boundary.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine_wal_sidecar_sqlite_reads_incremental_commits() {
+    let path = temp_path("wal_writer");
+    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
+            .unwrap();
+        // First dump after the initial empty full write: a WAL commit.
+        let w1 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(w1 > 32, "CREATE TABLE commit must be WAL frames (got {w1})");
+        for i in 1..=25 {
+            db.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                [Value::Integer(i), Value::Text(format!("v{i}").into())],
+            )
+            .unwrap();
+        }
+        let w2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(w2 > w1, "inserts append frames incrementally");
+        // The main file must NOT have been rewritten (still the initial
+        // full write): its size is unchanged while the sidecar grew.
+        let main = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            main > 0 && main <= 4096 * 2,
+            "main file stays small: {main}"
+        );
+        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        assert_eq!(n, 25);
+    }
+    // REAL SQLite reads the WAL-committed state via recovery.
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 25, "SQLite must recover the engine's WAL frames");
+        let v: String = con
+            .query_row("SELECT v FROM t WHERE id = 25", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "v25");
+    }
+    // The engine's own reader folds the same frames (reopened session:
+    // next dump re-establishes with a full write, data intact).
+    {
+        let mut db = Database::open(&path).unwrap();
+        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        assert_eq!(n, 25);
+        db.execute("INSERT INTO t VALUES (100, 'after-reopen')", ())
+            .unwrap();
+    }
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 26, "post-reopen commit also visible to SQLite");
+        assert_eq!(integrity_check(&con), "ok");
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+}
+
+#[test]
+fn engine_wal_growth_beyond_main_file() {
+    // A WAL commit that GROWS the database past the main file's length:
+    // new pages live only in the sidecar; both SQLite and the engine's
+    // reader must extend their page view from the commit frame's
+    // db-size field.
+    let path = temp_path("wal_growth");
+    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, pad TEXT)", ())
+            .unwrap();
+        let main0 = std::fs::metadata(&path).unwrap().len();
+        // ~300-byte pads: 300 rows stay well under the 1000-frame
+        // autocheckpoint threshold, so the growth lives ONLY in the
+        // sidecar and the main file is genuinely untouched.
+        for i in 0..300 {
+            let pad = format!("pad-{i:04}-{}", "x".repeat(280));
+            db.execute(
+                "INSERT INTO t(id, pad) VALUES (?1, ?2)",
+                [Value::Integer(i + 1), Value::Text(pad.into())],
+            )
+            .unwrap();
+        }
+        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        assert_eq!(n, 300);
+        // WAL exists and the main file was NOT rewritten (checkpoint
+        // threshold is 1000 frames; this workload stays below it).
+        assert!(std::fs::metadata(&wal)
+            .map(|m| m.len() > 32)
+            .unwrap_or(false));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            main0,
+            "main untouched"
+        );
+    }
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 300, "grown pages visible through the sidecar");
+        let pad: String = con
+            .query_row("SELECT pad FROM t WHERE id = 300", [], |r| r.get(0))
+            .unwrap();
+        assert!(!pad.is_empty());
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        assert_eq!(n, 300, "engine's own reader folds grown WAL pages");
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+}
+
+#[test]
+fn engine_wal_torn_tail_stops_at_commit_boundary() {
+    // Crash simulation: chop the sidecar mid-frame. Readers must see
+    // the last COMPLETE commit, never a torn one (SQLite: frame
+    // checksum/size validation; engine: full-frame + commit marker).
+    let path = temp_path("wal_torn");
+    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
+    let mut committed = 0i64;
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        for i in 1..=10 {
+            db.execute("INSERT INTO t VALUES (?1)", [Value::Integer(i)])
+                .unwrap();
+            committed = i;
+        }
+    }
+    {
+        // Torn tail: cut the last frame's final 100 bytes.
+        let len = std::fs::metadata(&wal).unwrap().len() as usize;
+        let mut data = std::fs::read(&wal).unwrap();
+        data.truncate(len - 100);
+        std::fs::write(&wal, &data).unwrap();
+    }
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, committed - 1, "SQLite sees the last complete commit");
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        assert_eq!(n, committed - 1, "engine sees the same boundary");
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+}
+
+#[test]
+fn engine_wal_checkpoint_pressure_folds_back() {
+    // Crossing the 1000-frame autocheckpoint pressure folds the sidecar
+    // into the main file (full atomic write) and starts fresh salts.
+    let path = temp_path("wal_ckpt");
+    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
+            .unwrap();
+        // 1200 single-row commits: each is one frame (page 1 + the
+        // touched leaf) — well past 1000 frames total.
+        for i in 1..=1200 {
+            db.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                [Value::Integer(i), Value::Text(format!("v{i}").into())],
+            )
+            .unwrap();
+        }
+        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
+        assert_eq!(n, 1200);
+    }
+    // After the fold the sidecar is either absent or tiny; the main
+    // file holds everything.
+    let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        wal_len < 1000 * 4120,
+        "sidecar must not grow unbounded: {wal_len}"
+    );
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1200);
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
 }
