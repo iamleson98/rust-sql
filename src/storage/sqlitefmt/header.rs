@@ -91,6 +91,7 @@ pub fn build_header(
     application_id: u32,
 ) -> [u8; 100] {
     build_header_enc(
+        false,
         page_size,
         db_size_pages,
         change_counter,
@@ -109,6 +110,7 @@ pub fn build_header(
 /// (field 64: 1 = INCREMENTAL mode).
 #[allow(clippy::too_many_arguments)]
 pub fn build_header_enc(
+    journal_wal: bool,
     page_size: u32,
     db_size_pages: u32,
     change_counter: u32,
@@ -128,9 +130,10 @@ pub fn build_header_enc(
         page_size as u16
     };
     h[16..18].copy_from_slice(&ps.to_be_bytes());
-    // Write/read version: 1/1 = legacy rollback journal mode.
-    h[18] = 1;
-    h[19] = 1;
+    // Write/read version: 2/2 = persistent WAL (SQLite reports wal
+    // even with no sidecar); 1/1 = legacy rollback journal mode.
+    h[18] = if journal_wal { 2 } else { 1 };
+    h[19] = h[18];
     // Reserved bytes per page: 0 (dense pages).
     h[20] = 0;
     // Payload fractions (fixed by the format).
@@ -193,12 +196,12 @@ mod tests {
     #[test]
     fn header_auto_vacuum_fields() {
         // FULL: largest root non-zero, incremental 0.
-        let h = build_header_enc(4096, 9, 1, 1, 0, 0, 1, 9, 0);
+        let h = build_header_enc(false, 4096, 9, 1, 1, 0, 0, 1, 9, 0);
         let info = FileHeaderInfo::parse(&h).unwrap();
         assert_eq!(info.largest_root_btree, 9);
         assert_eq!(h[64..68], 0u32.to_be_bytes());
         // INCREMENTAL: flag byte set.
-        let h = build_header_enc(4096, 9, 1, 1, 0, 0, 1, 9, 1);
+        let h = build_header_enc(false, 4096, 9, 1, 1, 0, 0, 1, 9, 1);
         assert_eq!(h[64..68], 1u32.to_be_bytes());
         assert_eq!(FileHeaderInfo::parse(&h).unwrap().largest_root_btree, 9);
     }

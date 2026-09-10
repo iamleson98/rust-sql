@@ -56,6 +56,12 @@ pub struct SqliteDbImage {
     pub sequences: HashMap<String, i64>,
     /// True when a `-wal` sidecar contributed frames to the read view.
     pub had_wal: bool,
+    /// The file's journal mode marker: header write/read versions 2/2
+    /// (persistent WAL, per SQLite) or a live sidecar => WAL; 1/1 =>
+    /// legacy rollback. `PRAGMA journal_mode` reports it, and the
+    /// writer preserves it (the engine's own commits go through the
+    /// WAL sidecar, so a written file is WAL-mode).
+    pub journal_wal: bool,
     /// Auto-vacuum mode of the source file (header 52/64): 0 = none,
     /// 1 = FULL, 2 = INCREMENTAL. Preserved across engine rewrites so
     /// the output file keeps its pointer-map structure.
@@ -162,6 +168,9 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
     };
 
     let usable = hdr.usable();
+    // Journal-mode marker: WAL when the (merged-view) header's write
+    // version is 2 or a sidecar contributed frames.
+    let journal_wal = had_wal || hdr.write_version == 2;
     let mut image = SqliteDbImage {
         page_size: hdr.page_size,
         user_version: hdr.user_version,
@@ -171,6 +180,7 @@ pub fn read_sqlite_file(path: &Path) -> Result<SqliteDbImage, String> {
         table_rows: HashMap::new(),
         sequences: HashMap::new(),
         had_wal,
+        journal_wal,
         auto_vacuum,
     };
 

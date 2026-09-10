@@ -448,6 +448,10 @@ pub(crate) struct ForeignSqlite {
     change_counter: AtomicU32,
     schema_cookie: AtomicU32,
     had_wal: AtomicBool,
+    /// The file's journal mode (header 18/19 == 2, a live source
+    /// sidecar, or an established engine WAL session). Read by
+    /// `PRAGMA journal_mode`; the writer emits 18/19 accordingly.
+    journal_wal: AtomicBool,
     /// Auto-vacuum mode written into every dump (0 = none, 1 = FULL,
     /// 2 = INCREMENTAL). Captured from the source file's header (52/64)
     /// at open; `PRAGMA auto_vacuum` can still change it while the
@@ -2285,6 +2289,7 @@ impl Database {
             change_counter: AtomicU32::new(0),
             schema_cookie: AtomicU32::new(0),
             had_wal: AtomicBool::new(image.had_wal),
+            journal_wal: AtomicBool::new(image.journal_wal),
             auto_vacuum: AtomicU8::new(image.auto_vacuum),
             wal: Mutex::new(None),
         };
@@ -2327,6 +2332,11 @@ impl Database {
             change_counter: AtomicU32::new(1),
             schema_cookie: AtomicU32::new(1),
             had_wal: AtomicBool::new(false),
+            // Engine-created interop files are WAL-managed by design:
+            // the sidecar is the commit mechanism (header 18/19 = 2/2,
+            // `PRAGMA journal_mode` reports wal, incremental commits
+            // from the first dump — pinned by the WAL suites).
+            journal_wal: AtomicBool::new(true),
             auto_vacuum: AtomicU8::new(0),
             wal: Mutex::new(None),
         });
@@ -2675,18 +2685,28 @@ impl Database {
         }
         drop(session);
 
-        // Full atomic write + establish the WAL session.
-        crate::storage::sqlitefmt::writer::write_image_atomic(&path, &bytes)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        let ps = if out.page_size == 0 {
-            4096
+        // Full atomic write + establish the WAL session (WAL-mode files
+        // only — a rollback-mode file set via `PRAGMA journal_mode =
+        // delete` keeps full-rewrite commits, SQLite's mode semantics).
+        // A loaded rollback-mode source converts here: the engine's
+        // commits are WAL frames from this point on, so the file's
+        // persistent marker (header 18/19) becomes 2/2.
+        if foreign.journal_wal.load(Ordering::Acquire) {
+            let ps = if out.page_size == 0 {
+                4096
+            } else {
+                out.page_size
+            };
+            crate::storage::sqlitefmt::writer::write_image_atomic(&path, &bytes)
+                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+            *foreign.wal.lock() = Some(ForeignWalSession {
+                writer: crate::storage::sqlitefmt::wal::WalWriter::new(ps, 0),
+                last_image: bytes,
+            });
         } else {
-            out.page_size
-        };
-        *foreign.wal.lock() = Some(ForeignWalSession {
-            writer: crate::storage::sqlitefmt::wal::WalWriter::new(ps, 0),
-            last_image: bytes,
-        });
+            crate::storage::sqlitefmt::writer::write_image_atomic(&path, &bytes)
+                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        }
         foreign.dirty.store(false, Ordering::Release);
         // had_wal referred to the SOURCE's sidecar, removed by the write.
         foreign.had_wal.store(false, Ordering::Release);
@@ -2876,6 +2896,7 @@ impl Database {
             schema_cookie,
             text_enc: foreign.text_enc(),
             auto_vacuum: foreign.auto_vacuum(),
+            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
             objects,
         })
     }
@@ -4773,7 +4794,13 @@ impl Database {
             // No cached plan — DDL statement. execute_statement_static
             // handles DDL directly (CREATE/DROP/ALTER/ATTACH/DETACH/
             // VACUUM/PRAGMA) without a Plan.
-            Self::execute_statement_static(stmt_ref, &mut ctx, &mut self.catalog, sql)
+            Self::execute_statement_static(
+                stmt_ref,
+                &mut ctx,
+                &mut self.catalog,
+                sql,
+                self.foreign.as_ref(),
+            )
         };
         profile::span(t_exec, &profile::EXEC_NS);
         self.in_transaction
@@ -6912,7 +6939,7 @@ impl Database {
         const STAT1_DDL: &str =
             "CREATE TABLE IF NOT EXISTS sqlite_stat1 (tbl TEXT, idx TEXT, stat TEXT)";
         let ddl = parse(STAT1_DDL)?;
-        Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL)?;
+        Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL, None)?;
         // Clear this run's rows (a targeted ANALYZE keeps other tables'
         // rows — SQLite only replaces the analyzed tables' entries).
         let clear_sql = match &target {
@@ -6929,7 +6956,7 @@ impl Database {
             None => "DELETE FROM sqlite_stat1".to_string(),
         };
         let del = parse(&clear_sql)?;
-        Self::execute_statement_static(&del, ctx, catalog, &clear_sql)?;
+        Self::execute_statement_static(&del, ctx, catalog, &clear_sql, None)?;
 
         // Collect: row count per table (memoized cell-count walk) +
         // distinct-prefix counts per index (GROUP BY counting through the
@@ -6985,7 +7012,7 @@ impl Database {
         }
         for sql in &insert_sqls {
             let stmt = parse(sql)?;
-            Self::execute_statement_static(&stmt, ctx, catalog, sql)?;
+            Self::execute_statement_static(&stmt, ctx, catalog, sql, None)?;
         }
         // Keep other tables' in-memory rows on a targeted run.
         if target.is_some() {
@@ -7022,6 +7049,7 @@ impl Database {
         ctx: &mut ExecContext,
         catalog: &mut Catalog,
         original_sql: &str,
+        foreign: Option<&ForeignSqlite>,
     ) -> Result<()> {
         match stmt {
             Statement::Create(c) => Self::execute_create(c.clone(), ctx, catalog, original_sql),
@@ -7098,7 +7126,7 @@ impl Database {
                 ctx.pager.note_tx_rolled_back();
                 Ok(())
             }
-            Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
+            Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx, foreign),
             Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
             Statement::Analyze { target } => Self::execute_analyze(target.clone(), ctx, catalog),
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
@@ -8457,7 +8485,11 @@ impl Database {
         }
     }
 
-    fn execute_pragma(p: PragmaStatement, ctx: &mut ExecContext) -> Result<()> {
+    fn execute_pragma(
+        p: PragmaStatement,
+        ctx: &mut ExecContext,
+        foreign: Option<&ForeignSqlite>,
+    ) -> Result<()> {
         // Honored pragmas:
         //   foreign_keys = 0/1/on/off   — toggle FK enforcement (SQLite
         //                                 default: off)
@@ -8575,6 +8607,15 @@ impl Database {
                         _ => String::new(),
                     };
                     match mode.as_str() {
+                        // A foreign SQLite-format file's mode is the
+                        // FILE's (header 18/19 + sidecar session) —
+                        // apply_journal_mode owns that switch; the
+                        // native pager is irrelevant there.
+                        "wal" | "delete" | "truncate" | "persist" | "memory" | "off"
+                            if foreign.is_some() =>
+                        {
+                            let _ = apply_journal_mode_foreign(foreign, &mode);
+                        }
                         "wal" => ctx.pager.enable_wal()?,
                         "delete" | "truncate" | "persist" | "memory" | "off" => {
                             ctx.pager.disable_wal()?;
@@ -9013,10 +9054,13 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         });
         if let Some(mode) = mode {
             apply_journal_mode(db, &mode).ok()?;
-            let pager = &db.pager;
+            let wal = match &db.foreign {
+                Some(f) => f.journal_wal.load(Ordering::Acquire),
+                None => db.pager.wal_enabled(),
+            };
             return Some(PragmaRows::single(
                 "journal_mode",
-                Value::Text(if pager.wal_enabled() { "wal" } else { "delete" }.into()),
+                Value::Text(if wal { "wal" } else { "delete" }.into()),
             ));
         }
         return None;
@@ -9121,11 +9165,16 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "freelist_count" => Value::Integer(pager.freelist_count() as i64),
         "cache_size" => Value::Integer(pager.cache_capacity() as i64),
         "schema_version" => Value::Integer(pager.schema_cookie() as i64),
-        "journal_mode" => Value::Text(if pager.wal_enabled() {
-            "wal".into()
-        } else {
-            "delete".into()
-        }),
+        "journal_mode" => {
+            // Foreign SQLite-format files carry their own mode: the
+            // persistent header marker (18/19 = 2/2) or a live sidecar
+            // session — the native pager's mode is irrelevant there.
+            let wal = match &db.foreign {
+                Some(f) => f.journal_wal.load(Ordering::Acquire),
+                None => pager.wal_enabled(),
+            };
+            Value::Text(if wal { "wal".into() } else { "delete".into() })
+        }
         "codec" => Value::Text(
             pager
                 .codec_name()
@@ -9183,7 +9232,43 @@ fn pragma_value_text(p: &PragmaStatement, params: Option<&[Value]>) -> Option<St
 
 /// Apply a `PRAGMA journal_mode = X` mode switch from the read/query path
 /// (the pager methods take `&self` — interior mutability).
+/// The foreign-file half of [`apply_journal_mode`] (the execute-pragma
+/// path holds only the ForeignSqlite state, not the Database).
+fn apply_journal_mode_foreign(f: Option<&ForeignSqlite>, mode: &str) -> Result<()> {
+    if let Some(f) = f {
+        apply_foreign_journal_mode(f, mode);
+    }
+    Ok(())
+}
+
+/// Foreign journal-mode switch: `wal` arms the sidecar commit path (or
+/// keeps it); the rollback family drops any live session — the next
+/// commit is a full atomic write with a 1/1 header (SQLite's
+/// WAL -> delete checkpoint + downgrade).
+fn apply_foreign_journal_mode(f: &ForeignSqlite, mode: &str) {
+    // A live session's sidecar is superseded by the next full write
+    // (write_image_atomic clears sidecars).
+    let downgrade = matches!(mode, "delete" | "truncate" | "persist" | "memory" | "off");
+    if downgrade && f.journal_wal.swap(false, Ordering::AcqRel) {
+        f.wal.lock().take();
+        f.dirty.store(true, Ordering::Release);
+    } else if mode == "wal" {
+        f.journal_wal.store(true, Ordering::Release);
+    }
+}
+
 fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
+    // Foreign SQLite-format files: the mode is the FILE's (header
+    // 18/19 + the sidecar session), not the native pager's. `wal`
+    // arms the sidecar commit path (or keeps it); the rollback family
+    // drops any live session — the next commit is a full atomic write
+    // with a 1/1 header, exactly SQLite's WAL -> delete checkpoint +
+    // downgrade (minus the "no other connections" rule: this engine
+    // is single-writer by construction).
+    if let Some(f) = &db.foreign {
+        apply_foreign_journal_mode(f, mode);
+        return Ok(());
+    }
     match mode {
         "wal" => db.pager.enable_wal(),
         "delete" | "truncate" | "persist" | "memory" | "off" => db.pager.disable_wal(),

@@ -98,6 +98,11 @@ pub struct OutDb {
     /// end) and header 64 (incremental flag) — verified by real
     /// SQLite's integrity_check, which validates every entry.
     pub auto_vacuum: u8,
+    /// Journal mode marker: true writes the persistent WAL header
+    /// (bytes 18/19 = 2/2 — SQLite reports `journal_mode = wal` for
+    /// such a file even with no sidecar, probed against 3.46/3.53);
+    /// false writes 1/1 (legacy rollback).
+    pub journal_wal: bool,
     pub objects: Vec<OutObject>,
 }
 
@@ -234,6 +239,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
         image[off..off + page_size as usize].copy_from_slice(bytes.as_slice());
     }
     let header = build_header_enc(
+        db.journal_wal,
         page_size,
         n_pages,
         db.change_counter,

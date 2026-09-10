@@ -847,7 +847,16 @@ compat surface. Every entry says what it costs and why it exists.
   subtlety handled: page 1 can be rewritten by WAL frames, so the
   header (encoding / auto-vacuum / user-version) re-parses from the
   merged view, and the commit frame's db-size extends the page range
-  past the main file's length.
+  past the main file's length. `PRAGMA journal_mode` reports the FILE's
+  mode, not the native pager's: the persistent header marker (bytes
+  18/19 = 2/2, which real SQLite reports as `wal` even with no
+  sidecar — probed) or a live sidecar session. Loaded rollback-mode
+  files stay rollback-mode under engine writes (SQLite's mode
+  preservation — full atomic rewrites per commit), engine-created
+  SQLite-format files are WAL-managed by design, and
+  `PRAGMA journal_mode = delete` / `= WAL` switch a foreign file's mode
+  both ways with real SQLite verifying the result
+  (`tests/sqlite_interop.rs`).
 
 ## Usage
 

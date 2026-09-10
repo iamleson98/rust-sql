@@ -1159,3 +1159,162 @@ fn engine_wal_checkpoint_pressure_folds_back() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&wal);
 }
+
+// ---------------------------------------------------------------------------
+// PRAGMA journal_mode for foreign SQLite-format files: the mode is the
+// FILE's (header 18/19 marker + live sidecar session), not the native
+// pager's. Loaded rollback-mode files report delete until the engine's
+// first write converts them to the WAL-managed path (2/2 header);
+// `PRAGMA journal_mode = delete` downgrades back (full-rewrite commits,
+// 1/1 header) — SQLite's mode semantics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn foreign_journal_mode_reports_the_file_mode() {
+    fn mode_of(db: &Database) -> String {
+        match &db.query("PRAGMA journal_mode", ()).unwrap()[0][0] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("journal_mode should be TEXT, got {other:?}"),
+        }
+    }
+
+    // A WAL-mode source (clean close leaves the persistent 2/2 marker).
+    let wal_path = temp_path("jm_wal_src");
+    {
+        let con = rusqlite::Connection::open(&wal_path).unwrap();
+        con.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(a);")
+            .unwrap();
+    }
+    let db = Database::open(&wal_path).unwrap();
+    assert_eq!(mode_of(&db), "wal", "WAL-mode source file reports wal");
+    drop(db);
+
+    // A rollback-mode source.
+    let del_path = temp_path("jm_del_src");
+    {
+        let con = rusqlite::Connection::open(&del_path).unwrap();
+        con.execute_batch("CREATE TABLE t(a INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        con.execute_batch("INSERT INTO t VALUES (1, 'one');")
+            .unwrap();
+    }
+    {
+        let mut db = Database::open(&del_path).unwrap();
+        assert_eq!(
+            mode_of(&db),
+            "delete",
+            "rollback-mode source reports delete"
+        );
+        // Writing PRESERVES the mode (SQLite: opening a rollback-mode
+        // database and writing does not convert it): full atomic
+        // rewrites, header marker stays 1/1.
+        db.execute("INSERT INTO t VALUES (2, 'two')", ()).unwrap();
+        assert_eq!(mode_of(&db), "delete", "writes preserve the file's mode");
+        let bytes = std::fs::read(&del_path).unwrap();
+        assert_eq!(
+            (&bytes[18], &bytes[19]),
+            (&1, &1),
+            "rollback marker preserved"
+        );
+    }
+    // SQLite verifies the written file.
+    {
+        let con = rusqlite::Connection::open(&del_path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        let m: String = con
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(m, "delete", "SQLite sees the preserved rollback mode");
+    }
+    // The EXPLICIT upgrade: PRAGMA journal_mode = WAL on the engine
+    // connection converts the file (2/2 marker + sidecar commits).
+    {
+        let mut db = Database::open(&del_path).unwrap();
+        let res = db.query("PRAGMA journal_mode = WAL", ()).unwrap();
+        match &res[0][0] {
+            Value::Text(t) => assert_eq!(t.as_str(), "wal"),
+            other => panic!("upgrade should return wal, got {other:?}"),
+        }
+        db.execute("INSERT INTO t VALUES (5, 'five')", ()).unwrap();
+        assert_eq!(mode_of(&db), "wal");
+        let bytes = std::fs::read(&del_path).unwrap();
+        assert_eq!((&bytes[18], &bytes[19]), (&2, &2), "upgraded WAL marker");
+    }
+
+    // Downgrade: PRAGMA journal_mode = delete on the engine connection.
+    {
+        let mut db = Database::open(&del_path).unwrap();
+        let res = db.query("PRAGMA journal_mode = delete", ()).unwrap();
+        match &res[0][0] {
+            Value::Text(t) => assert_eq!(t.as_str(), "delete"),
+            other => panic!("downgrade should return delete, got {other:?}"),
+        }
+        // The next commit is a full atomic rewrite: 1/1 header, no sidecar.
+        db.execute("INSERT INTO t VALUES (3, 'three')", ()).unwrap();
+        assert_eq!(mode_of(&db), "delete");
+        let bytes = std::fs::read(&del_path).unwrap();
+        assert_eq!(
+            (&bytes[18], &bytes[19]),
+            (&1, &1),
+            "downgraded header marker"
+        );
+        assert!(
+            !rustqlite::storage::sqlitefmt::reader::wal_path_of(&del_path).exists(),
+            "no sidecar after the downgrade write"
+        );
+    }
+    {
+        let con = rusqlite::Connection::open(&del_path).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 4, "1,2,5 from before + 3 from the downgrade write");
+    }
+
+    // Re-upgrade: journal_mode = WAL arms the sidecar again.
+    {
+        let mut db = Database::open(&del_path).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'four')", ()).unwrap();
+        assert_eq!(mode_of(&db), "wal");
+        let bytes = std::fs::read(&del_path).unwrap();
+        assert_eq!((&bytes[18], &bytes[19]), (&2, &2));
+        let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&del_path);
+        assert!(wal.exists(), "sidecar live after re-upgrade");
+    }
+    {
+        let con = rusqlite::Connection::open(&del_path).unwrap();
+        let n: i64 = con
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 5, "SQLite recovers the re-upgraded sidecar");
+        assert_eq!(integrity_check(&con), "ok");
+    }
+
+    // Engine-created sqlite-format files are WAL-managed by design.
+    let fresh = temp_path("jm_fresh");
+    {
+        let mut db = Database::open_sqlite_format(&fresh).unwrap();
+        db.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        assert_eq!(mode_of(&db), "wal");
+        let bytes = std::fs::read(&fresh).unwrap();
+        assert_eq!((&bytes[18], &bytes[19]), (&2, &2));
+    }
+    {
+        let con = rusqlite::Connection::open(&fresh).unwrap();
+        let m: String = con
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(m, "wal");
+    }
+
+    let _ = std::fs::remove_file(&wal_path);
+    let _ = std::fs::remove_file(&del_path);
+    let _ = std::fs::remove_file(&fresh);
+}
