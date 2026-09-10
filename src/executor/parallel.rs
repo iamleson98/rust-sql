@@ -370,6 +370,7 @@ pub(crate) fn try_parallel_groupby_selective(
     agg_col_indices: &[Option<usize>],
     aggregates: &[AggExpr],
     n_cols: usize,
+    key_collations: &[Option<String>],
 ) -> Result<Option<HashGrouper>> {
     // Shape gates: the serial selective branch requires every key and
     // arg to be a resolved bare column (or COUNT(*) with no arg).
@@ -438,6 +439,7 @@ pub(crate) fn try_parallel_groupby_selective(
             let agg_pos = &agg_pos;
             let agg_count_star = &agg_count_star;
             let agg_funcs = &agg_funcs;
+            let key_collations = key_collations.to_vec();
             let distincts: Vec<bool> = aggregates.iter().map(|a| a.distinct).collect();
             let seps: Vec<Option<String>> = (0..aggregates.len())
                 .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
@@ -457,6 +459,9 @@ pub(crate) fn try_parallel_groupby_selective(
                 } else {
                     HashGrouper::with_aggs(n_aggs)
                 };
+                // Collated GROUP BY: workers fold keys exactly like the
+                // serial path (bit-identical groups after the merge).
+                grouper.set_key_collations(key_collations);
                 let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
                 let mut key_buf: Vec<Value> = Vec::with_capacity(key_pos.len());
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
@@ -532,6 +537,10 @@ pub(crate) fn try_parallel_groupby_selective(
     } else {
         HashGrouper::with_aggs(n_aggs)
     };
+    // The partials' RAM iterations emit FIRST-SEEN ORIGINAL keys (the
+    // display form); re-folding at the merge reproduces the serial
+    // grouper's groups AND its representatives exactly.
+    merged.set_key_collations(key_collations.to_vec());
     for g in groupers {
         let mut iter = g.into_group_iter();
         while let Some((keys, states)) = iter.next_group() {
@@ -746,6 +755,7 @@ pub(crate) fn try_parallel_groupby_compiled(
     aggregates: &[AggExpr],
     group_by_len: usize,
     n_cols: usize,
+    key_collations: &[Option<String>],
 ) -> Result<Option<HashGrouper>> {
     // Aggregate-function gates (order-dependent / exotic shapes decline).
     for agg in aggregates {
@@ -793,6 +803,7 @@ pub(crate) fn try_parallel_groupby_compiled(
         for &(lo, hi) in ranges.iter() {
             let agg_funcs = &agg_funcs;
             let identity = &identity;
+            let key_collations = key_collations.to_vec();
             let distincts: Vec<bool> = aggregates.iter().map(|a| a.distinct).collect();
             let seps: Vec<Option<String>> = (0..aggregates.len())
                 .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
@@ -810,6 +821,8 @@ pub(crate) fn try_parallel_groupby_compiled(
                 } else {
                     HashGrouper::with_aggs(n_aggs)
                 };
+                // Collated GROUP BY: fold like the serial compiled branch.
+                grouper.set_key_collations(key_collations);
                 let mut wide: Vec<Value> = vec![Value::Null; n_cols];
                 let mut key_buf: Vec<Value> = Vec::with_capacity(group_by_len.max(1));
                 let mut owned_key: Value = Value::Null;
@@ -912,6 +925,9 @@ pub(crate) fn try_parallel_groupby_compiled(
     } else {
         HashGrouper::with_aggs(n_aggs)
     };
+    // Collated GROUP BY: partials emit first-seen ORIGINAL keys; the
+    // merge re-folds them (bit-identical groups + representatives).
+    merged.set_key_collations(key_collations.to_vec());
     for g in groupers {
         let mut iter = g.into_group_iter();
         while let Some((keys, states)) = iter.next_group() {

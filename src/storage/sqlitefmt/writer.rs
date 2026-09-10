@@ -133,12 +133,16 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
             } => {
                 // Rowid-less records are keyed by their PK: the file needs
                 // them in the PK order under the FILE encoding's byte
-                // comparison. For UTF-8 the caller's order (the engine's
-                // PK-ordered scan) is already correct — skip the sort.
-                // UTF-16 BINARY compares raw encoded bytes (code-unit /
-                // little-endian byte order — NOT code-point order), so
-                // non-UTF-8 files must re-sort.
-                let root = if enc.is_utf8() {
+                // comparison AND the PK columns' collations. A BINARY-PK
+                // UTF-8 file's caller order (the engine's key-ordered
+                // scan) is already correct — skip the sort; everything
+                // else (NOCASE / RTRIM PKs, non-UTF-8 files where BINARY
+                // compares raw encoded bytes, not code-point order)
+                // re-sorts here so the written b-tree satisfies SQLite's
+                // "row in PRIMARY KEY order" integrity invariant.
+                let root = if enc.is_utf8()
+                    && pk_collations.iter().all(|c| matches!(c, Collation::Binary))
+                {
                     build_record_tree(&mut alloc, usable, rows, &[], &[], enc)?
                 } else {
                     build_record_tree(&mut alloc, usable, rows, &[], pk_collations, enc)?

@@ -790,17 +790,35 @@ impl FastPath {
 /// Pre-encode the index key for an IndexPoint fast path when every bound
 /// key is a literal (constants in the SQL text). Returns None when any
 /// key is a parameter (re-encoded per call against the param values).
-fn pre_encode_literal_keys(keys: &[FastBound]) -> Option<Arc<[u8]>> {
+fn pre_encode_literal_keys(keys: &[FastBound], index: &Index) -> Option<Arc<[u8]>> {
     if !keys.iter().all(|k| matches!(k, FastBound::Literal(_))) {
         return None;
     }
     let mut buf = Vec::with_capacity(keys.len() * 8);
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         if let FastBound::Literal(v) = k {
-            v.encode_order_key_into(&mut buf);
+            // The index b-tree stores COLLATED keys (NOCASE / RTRIM fold
+            // TEXT at maintenance time); the probe key must fold the
+            // same way or uppercase / trailing-space probes miss.
+            match index.columns.get(i) {
+                Some(c) => {
+                    crate::plugin::collation_fold_key_ref(&c.collation, v)
+                        .encode_order_key_into(&mut buf);
+                }
+                None => v.encode_order_key_into(&mut buf),
+            }
         }
     }
     Some(buf.into())
+}
+
+/// Does any index column use a non-BINARY collation (probe keys must be
+/// folded through it)?
+fn index_has_collated_columns(index: &Index) -> bool {
+    index
+        .columns
+        .iter()
+        .any(|c| !c.collation.is_empty() && !c.collation.eq_ignore_ascii_case("BINARY"))
 }
 
 fn decode_projected(
@@ -5908,7 +5926,7 @@ impl Database {
                         .iter()
                         .map(bind_expr)
                         .collect::<Option<Vec<_>>>()?;
-                    let pre_encoded = pre_encode_literal_keys(&keys);
+                    let pre_encoded = pre_encode_literal_keys(&keys, index);
                     Some(FastPath::IndexCount {
                         table: table.clone(),
                         index: index.clone(),
@@ -6017,7 +6035,7 @@ impl Database {
                         .map(bind_expr)
                         .collect::<Option<Vec<_>>>()?;
                     let (project, cols) = resolve_projection(columns, table)?;
-                    let pre_encoded = pre_encode_literal_keys(&keys);
+                    let pre_encoded = pre_encode_literal_keys(&keys, index);
                     Some(FastPath::IndexPoint {
                         table: table.clone(),
                         index: index.clone(),
@@ -6054,6 +6072,13 @@ impl Database {
                     group_by,
                     aggregates,
                 } if group_by.is_empty() && aggregates.len() == 1 => {
+                    // COUNT-only (the IndexCount fast path answers the
+                    // MATCHED-ENTRY COUNT; sum/min/max/group_concat over
+                    // an index equality must take the general pipeline —
+                    // they previously returned the count as their value).
+                    let is_bare_count = aggregates[0].func.eq_ignore_ascii_case("count")
+                        && aggregates[0].arg.is_none()
+                        && !aggregates[0].distinct;
                     // Only when the projection is the trivial single-column
                     // pass-through of the aggregate output.
                     let trivial = columns.len() == 1
@@ -6062,27 +6087,35 @@ impl Database {
                     if !trivial {
                         return None;
                     }
-                    if let Plan::IndexLookup {
-                        table,
-                        index,
-                        key_exprs,
-                        ..
-                    } = input.as_ref()
-                    {
-                        let keys = key_exprs
-                            .iter()
-                            .map(bind_expr)
-                            .collect::<Option<Vec<_>>>()?;
-                        let pre_encoded = pre_encode_literal_keys(&keys);
-                        Some(FastPath::IndexCount {
-                            table: table.clone(),
-                            index: index.clone(),
-                            keys,
-                            pre_encoded,
-                            columns: std::sync::Arc::from(vec![aggregates[0].display_name.clone()]),
-                        })
+                    if is_bare_count {
+                        if let Plan::IndexLookup {
+                            table,
+                            index,
+                            key_exprs,
+                            ..
+                        } = input.as_ref()
+                        {
+                            let keys = key_exprs
+                                .iter()
+                                .map(bind_expr)
+                                .collect::<Option<Vec<_>>>()?;
+                            let pre_encoded = pre_encode_literal_keys(&keys, index);
+                            Some(FastPath::IndexCount {
+                                table: table.clone(),
+                                index: index.clone(),
+                                keys,
+                                pre_encoded,
+                                columns: std::sync::Arc::from(vec![aggregates[0]
+                                    .display_name
+                                    .clone()]),
+                            })
+                        } else {
+                            bare_count_star_fp(input, group_by, aggregates)
+                        }
                     } else {
-                        bare_count_star_fp(input, group_by, aggregates)
+                        // Non-COUNT aggregate over an index equality:
+                        // no fast path (the general pipeline computes it).
+                        None
                     }
                 }
                 _ => None,
@@ -6185,8 +6218,15 @@ impl Database {
                     Some(pre) => &pre[..],
                     None => {
                         key_scratch = Vec::with_capacity(keys.len() * 8);
-                        for k in keys {
-                            k.resolve(params).encode_order_key_into(&mut key_scratch);
+                        for (i, k) in keys.iter().enumerate() {
+                            let v = k.resolve(params);
+                            match index.columns.get(i) {
+                                // Collated index: fold the probe key the
+                                // way maintenance folds stored keys.
+                                Some(c) => crate::plugin::collation_fold_key_ref(&c.collation, v)
+                                    .encode_order_key_into(&mut key_scratch),
+                                None => v.encode_order_key_into(&mut key_scratch),
+                            }
                         }
                         &key_scratch
                     }
@@ -6243,6 +6283,24 @@ impl Database {
                 let mut key_stack_len = 0usize;
                 let key_bytes: &[u8] = match pre_encoded {
                     Some(pre) => &pre[..],
+                    None if index_has_collated_columns(index) => {
+                        // Collated index (NOCASE / RTRIM / custom): the
+                        // probe key must FOLD the way index maintenance
+                        // folds stored keys — an unfolded 'APPLE' probe
+                        // misses the folded 'apple' entries. Folded values
+                        // may change length, so this path always uses the
+                        // heap buffer.
+                        key_heap = Vec::with_capacity(keys.len() * 8);
+                        for (i, k) in keys.iter().enumerate() {
+                            let v = k.resolve(params);
+                            match index.columns.get(i) {
+                                Some(c) => crate::plugin::collation_fold_key_ref(&c.collation, v)
+                                    .encode_order_key_into(&mut key_heap),
+                                None => v.encode_order_key_into(&mut key_heap),
+                            }
+                        }
+                        &key_heap
+                    }
                     None => {
                         // Resolve + encode each bound into the stack slice;
                         // spill to a heap Vec if any key doesn't fit.
@@ -6454,8 +6512,17 @@ impl Database {
         // built a Filter{Scan, predicate} which forced an O(n) scan per
         // UPDATE — a ~743x regression on the UPDATE-by-PK benchmark.
         // (Skipped for UPDATE...FROM: the WHERE spans both sides.)
+        // The predicate passes through collation resolution first: a
+        // comparison on a column with a DECLARED collation (NOCASE /
+        // RTRIM) must compare through it — and the index-selection gate
+        // below needs the comparison's collation to match the index's.
         let source = if let (Some(pred), None) = (&upd.where_clause, &from) {
-            crate::planner::apply_where_for_scan(catalog, scan, pred)
+            let coll_scope = vec![(
+                table.clone(),
+                upd.alias.clone().unwrap_or_else(|| upd.table.clone()),
+            )];
+            let rewritten = crate::planner::rewrite_column_collations(catalog, pred, &coll_scope);
+            crate::planner::apply_where_for_scan(catalog, scan, &rewritten)
         } else {
             scan
         };
@@ -6536,7 +6603,14 @@ impl Database {
         let source = if let Some(pred) = &del.where_clause {
             // Same fix as plan_update: route through apply_where_for_scan so
             // `DELETE FROM t WHERE id = ?` uses RowidLookup, not a full scan.
-            crate::planner::apply_where_for_scan(catalog, scan, pred)
+            // Collation resolution first (declared NOCASE/RTRIM columns
+            // compare through them; the index gate needs the match).
+            let coll_scope = vec![(
+                table.clone(),
+                del.alias.clone().unwrap_or_else(|| del.from.clone()),
+            )];
+            let rewritten = crate::planner::rewrite_column_collations(catalog, pred, &coll_scope);
+            crate::planner::apply_where_for_scan(catalog, scan, &rewritten)
         } else {
             scan
         };

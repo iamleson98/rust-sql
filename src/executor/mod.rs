@@ -4640,6 +4640,8 @@ impl Default for HashGrouper {
             mask: 0,
             keys_flat: None,
             keys_multi: Vec::new(),
+            key_collations: Vec::new(),
+            display_keys: Vec::new(),
             states: ChunkVec::new(7, AggState::default()),
             n_aggs: 0,
             agg_ctx: Vec::new(),
@@ -4667,6 +4669,23 @@ pub(crate) struct HashGrouper {
     keys_flat: Option<ChunkVec<Value>>,
     /// Multi-key mode: per-group key Vecs in first-seen order.
     keys_multi: Vec<Vec<Value>>,
+    /// COLLATED GROUP BY (SQLite semantics: a group term that is a bare
+    /// column with a DECLARED collation, or carries an explicit COLLATE,
+    /// groups case-/space-insensitively): per-term collation, `None` =
+    /// BINARY (no folding — the zero-cost common case). When any entry is
+    /// set, the stored key in `keys_flat` / `keys_multi` is the FOLDED
+    /// form (hash + equality + the spill codec all see folded keys, so
+    /// cross-epoch / cross-worker merges coalesce correctly), while
+    /// `display_keys` keeps each group's FIRST-SEEN ORIGINAL value —
+    /// SQLite outputs the representative (first row's) value.
+    key_collations: Vec<Option<String>>,
+    /// First-seen ORIGINAL key per group (parallel to `keys_flat` /
+    /// `keys_multi`), populated only when `key_collations` is active.
+    /// Cleared on freeze: spilled groups re-materialize from the folded
+    /// records, so their representative is the folded form (the tie
+    /// representative is implementation-defined territory in SQLite
+    /// itself).
+    display_keys: Vec<Vec<Value>>,
     /// Flat aggregate states: `gi * n_aggs + agg_idx`.
     states: ChunkVec<AggState>,
     n_aggs: usize,
@@ -4727,6 +4746,30 @@ impl HashGrouper {
     /// a similar working-set scale. `RSQL_GROUP_SPILL_THRESHOLD` (env)
     /// overrides — the knob tests and ops tuning use.
     pub(crate) const GROUP_SPILL_THRESHOLD: usize = 1 << 16;
+
+    /// Declare the GROUP BY terms' collations (None = BINARY). Must be
+    /// called BEFORE the first `intern_*` — the fold shapes every key
+    /// the grouper will ever see. Empty / all-None is a no-op (the
+    /// zero-cost common case).
+    pub(crate) fn set_key_collations(&mut self, collations: Vec<Option<String>>) {
+        if collations.iter().any(|c| c.is_some()) {
+            self.key_collations = collations;
+        }
+    }
+
+    /// Fold one key value through term `i`'s collation (BINARY/absent =
+    /// identity, borrowed — no allocation on the common path).
+    fn fold_key_at<'a>(&self, i: usize, v: &'a Value) -> std::borrow::Cow<'a, Value> {
+        match self.key_collations.get(i).and_then(|c| c.as_deref()) {
+            Some(coll) => crate::plugin::collation_fold_key_ref(coll, v),
+            None => std::borrow::Cow::Borrowed(v),
+        }
+    }
+
+    /// Is collation folding active for this grouper?
+    fn collated(&self) -> bool {
+        !self.key_collations.is_empty()
+    }
 
     /// Prepare a SPILL-ARMED grouper from the statement's aggregate
     /// list: once [`GROUP_SPILL_THRESHOLD`] groups are live, the epoch
@@ -4844,6 +4887,7 @@ impl HashGrouper {
         self.mask = 15;
         self.keys_flat = None;
         self.keys_multi.clear();
+        self.display_keys.clear();
         self.states.clear();
         self.epoch_seq_base += n as u64;
     }
@@ -4956,12 +5000,41 @@ impl HashGrouper {
         if self.n_aggs == 0 {
             self.n_aggs = 1;
         }
+        // Collated GROUP BY: hash + equality run on the FOLDED key form
+        // (fold twice for the probe — the existing side re-folds), the
+        // stored key is the folded form (spill codec consistency), and
+        // the ORIGINAL is kept for display.
+        let folded: Vec<std::borrow::Cow<'_, Value>> = if self.collated() {
+            key.iter()
+                .enumerate()
+                .map(|(i, v)| self.fold_key_at(i, v))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut hasher = crate::api::FxHasher::default();
-        for v in key {
-            hash_sql_value(v, &mut hasher);
+        if self.collated() {
+            for v in &folded {
+                hash_sql_value(v, &mut hasher);
+            }
+        } else {
+            for v in key {
+                hash_sql_value(v, &mut hasher);
+            }
         }
         let h = hasher.finish();
-        if let Some(gi) = self.probe(h, |gi| {
+        if self.collated() {
+            if let Some(gi) = self.probe(h, |gi| {
+                let existing = &self.keys_multi[gi];
+                existing.len() == key.len()
+                    && existing
+                        .iter()
+                        .zip(folded.iter())
+                        .all(|(a, b)| crate::types::values_sql_equal(a, b))
+            }) {
+                return gi;
+            }
+        } else if let Some(gi) = self.probe(h, |gi| {
             let existing = &self.keys_multi[gi];
             existing.len() == key.len()
                 && existing
@@ -4978,7 +5051,13 @@ impl HashGrouper {
         }
         // New group.
         let gi = self.keys_multi.len();
-        self.keys_multi.push(key.to_vec());
+        if self.collated() {
+            self.keys_multi
+                .push(folded.iter().map(|v| v.clone().into_owned()).collect());
+            self.display_keys.push(key.to_vec());
+        } else {
+            self.keys_multi.push(key.to_vec());
+        }
         let init = AggState::default();
         for _ in 0..self.n_aggs {
             self.states.push(AggState::default(), &init);
@@ -4996,11 +5075,14 @@ impl HashGrouper {
         if self.n_aggs == 0 {
             self.n_aggs = 1;
         }
+        // Collated GROUP BY (see `intern`): hash + equality on the folded
+        // form, folded stored, ORIGINAL kept for display.
+        let folded = self.fold_key_at(0, key);
         let mut hasher = crate::api::FxHasher::default();
-        hash_sql_value(key, &mut hasher);
+        hash_sql_value(&folded, &mut hasher);
         let h = hasher.finish();
         if let Some(gi) = self.probe(h, |gi| {
-            crate::types::values_sql_equal(self.keys_flat.as_ref().unwrap().get(gi), key)
+            crate::types::values_sql_equal(self.keys_flat.as_ref().unwrap().get(gi), &folded)
         }) {
             return gi;
         }
@@ -5013,7 +5095,10 @@ impl HashGrouper {
             .keys_flat
             .get_or_insert_with(|| ChunkVec::new(9, Value::Null));
         let gi = keys.len();
-        keys.push(key.clone(), &Value::Null);
+        keys.push(folded.into_owned(), &Value::Null);
+        if self.collated() {
+            self.display_keys.push(vec![key.clone()]);
+        }
         let init = AggState::default();
         for _ in 0..self.n_aggs {
             self.states.push(AggState::default(), &init);
@@ -5389,7 +5474,11 @@ enum GroupIterMode {
 
 struct SpilledGroup {
     seq: u64,
+    /// MERGE key: the FOLDED form (cross-stream equality + ordering).
     keys: Vec<Value>,
+    /// Collated GROUP BY: the group's FIRST-SEEN ORIGINAL representative
+    /// (RamTail epochs only — frozen chunks re-materialize folded).
+    display: Option<Vec<Value>>,
     states: Vec<AggState>,
 }
 
@@ -5404,6 +5493,10 @@ enum StreamSrc {
     RamTail {
         keys_flat: Option<ChunkVec<Value>>,
         keys_multi: Vec<Vec<Value>>,
+        /// Collated GROUP BY: first-seen ORIGINAL keys per group of this
+        /// (post-last-freeze) epoch — substituted for the folded stored
+        /// keys as the emitted representative (see `next_group`).
+        display_keys: Vec<Vec<Value>>,
         states: ChunkVec<AggState>,
         gi: usize,
         base: u64,
@@ -5436,6 +5529,7 @@ impl GroupIter {
                     src: StreamSrc::RamTail {
                         keys_flat: grouper.keys_flat,
                         keys_multi: grouper.keys_multi,
+                        display_keys: grouper.display_keys,
                         states: grouper.states,
                         gi: 0,
                         base: grouper.epoch_seq_base,
@@ -5467,9 +5561,16 @@ impl GroupIter {
                 if *gi >= n {
                     return None;
                 }
-                let keys = match &grouper.keys_flat {
-                    Some(flat) => vec![flat.get(*gi).clone()],
-                    None => grouper.keys_multi[*gi].clone(),
+                // Collated GROUP BY: the group's representative value is
+                // its FIRST-SEEN ORIGINAL key (SQLite's output), not the
+                // folded equality form stored in keys_*.
+                let keys = if !grouper.display_keys.is_empty() && *gi < grouper.display_keys.len() {
+                    grouper.display_keys[*gi].clone()
+                } else {
+                    match &grouper.keys_flat {
+                        Some(flat) => vec![flat.get(*gi).clone()],
+                        None => grouper.keys_multi[*gi].clone(),
+                    }
                 };
                 let n_aggs = self.n_aggs;
                 let mut states = Vec::with_capacity(n_aggs);
@@ -5538,7 +5639,11 @@ impl GroupIter {
                         }
                     }
                 }
-                Some((winner.keys, winner.states))
+                // Collated GROUP BY: emit the first-seen ORIGINAL
+                // representative when the winning stream carries one
+                // (RamTail epochs); frozen chunks emit the folded form.
+                let keys = winner.display.take().unwrap_or(winner.keys);
+                Some((keys, winner.states))
             }
         }
     }
@@ -5551,13 +5656,19 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
         StreamSrc::Chunk(r) => {
             if let Ok(Some(())) = r.next_record(rec_buf) {
                 if let Some((seq, keys, states)) = decode_group(rec_buf, n_aggs) {
-                    s.head = Some(SpilledGroup { seq, keys, states });
+                    s.head = Some(SpilledGroup {
+                        seq,
+                        keys,
+                        display: None,
+                        states,
+                    });
                 }
             }
         }
         StreamSrc::RamTail {
             keys_flat,
             keys_multi,
+            display_keys,
             states,
             gi,
             base,
@@ -5569,6 +5680,14 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
             if *gi >= n {
                 return;
             }
+            // Collated GROUP BY: the merge key stays the FOLDED stored
+            // form (cross-stream equality below); the FIRST-SEEN ORIGINAL
+            // rides along as the emitted representative.
+            let display = if !display_keys.is_empty() && *gi < display_keys.len() {
+                Some(display_keys[*gi].clone())
+            } else {
+                None
+            };
             let keys = match keys_flat {
                 Some(flat) => vec![flat.get(*gi).clone()],
                 None => keys_multi[*gi].clone(),
@@ -5580,6 +5699,7 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
             s.head = Some(SpilledGroup {
                 seq: *base + *gi as u64,
                 keys,
+                display,
                 states: st,
             });
             *gi += 1;
@@ -5659,6 +5779,98 @@ fn exec_aggregate_streaming_scan(
 /// (`statement.rs`'s `GroupByDriver`) finalizes groups in serving-sized
 /// batches from this grouper, so a 100k-group query never materializes a
 /// 100k-row result set — the grouper state IS the necessary state.
+/// Effective collation of each GROUP BY term (SQLite semantics): an
+/// explicit `COLLATE` on the term wins; else a bare column reference
+/// carries the column's DECLARED collation; expressions are BINARY.
+/// Returns `None` per BINARY term — the grouper's zero-cost path.
+pub(crate) fn group_term_collations(
+    group_by: &[Expr],
+    table: &crate::schema::Table,
+) -> Vec<Option<String>> {
+    group_by
+        .iter()
+        .map(|g| match g {
+            Expr::Collate { collation, .. } => {
+                if collation.is_empty() || collation.eq_ignore_ascii_case("BINARY") {
+                    None
+                } else {
+                    Some(collation.clone())
+                }
+            }
+            Expr::Column { name, .. } => table
+                .find_column(name)
+                .and_then(|i| table.columns.get(i))
+                .map(|c| c.collation.clone())
+                .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect (effective prefix, table) pairs from every base-table access
+/// in a plan (alias-aware) — the generic aggregate path's GROUP BY
+/// collation scope.
+fn collect_plan_tables(
+    plan: &crate::planner::plan::Plan,
+    out: &mut Vec<(String, Arc<crate::schema::Table>)>,
+) {
+    use crate::planner::plan::Plan;
+    match plan {
+        Plan::Scan { table, alias, .. } => {
+            out.push((
+                alias.clone().unwrap_or_else(|| table.name.clone()),
+                table.clone(),
+            ));
+        }
+        Plan::RowidLookup { table, alias, .. } | Plan::RowidRange { table, alias, .. } => {
+            // These carry Option<String> aliases.
+            out.push((
+                alias
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| table.name.clone()),
+                table.clone(),
+            ));
+        }
+        Plan::IndexIn { table, alias, .. }
+        | Plan::IndexLookup { table, alias, .. }
+        | Plan::IndexRange { table, alias, .. } => {
+            out.push((
+                alias
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| table.name.clone()),
+                table.clone(),
+            ));
+        }
+        Plan::IndexNestedLoopJoin {
+            inner_table,
+            inner_alias,
+            ..
+        } => {
+            out.push((
+                inner_alias
+                    .clone()
+                    .unwrap_or_else(|| inner_table.name.clone()),
+                inner_table.clone(),
+            ));
+        }
+        Plan::Filter { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Distinct { input }
+        | Plan::Subquery { plan: input }
+        | Plan::Aggregate { input, .. }
+        | Plan::Window { input, .. } => collect_plan_tables(input, out),
+        Plan::Join { left, right, .. } => {
+            collect_plan_tables(left, out);
+            collect_plan_tables(right, out);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn scan_groupby_grouper(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -5690,6 +5902,12 @@ pub(crate) fn scan_groupby_grouper(
 
     // ---- Vectorized setup: resolve everything ONCE before the scan ----
     //
+    // 0. GROUP BY terms' collations (SQLite: a group term that is a bare
+    //    column with a DECLARED collation, or carries an explicit
+    //    COLLATE, groups case-/space-insensitively — `v TEXT COLLATE
+    //    NOCASE` puts 'APPLE' and 'apple' in ONE group). Computed BEFORE
+    //    the parallel/serial split so both paths fold identically.
+    let key_collations = group_term_collations(group_by, &table);
     // 1. Group-by expressions → column indices (when they're bare Column
     //    refs — the overwhelmingly common `GROUP BY cat` case).
     // 2. Aggregate args → column indices (same).
@@ -5774,6 +5992,7 @@ pub(crate) fn scan_groupby_grouper(
     };
 
     let mut grouper = HashGrouper::armed_grouper(ctx, aggregates);
+    grouper.set_key_collations(key_collations.clone());
 
     // Scratch buffers, reused across rows.
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
@@ -5798,6 +6017,7 @@ pub(crate) fn scan_groupby_grouper(
             &agg_col_indices,
             aggregates,
             n_cols,
+            &key_collations,
         )? {
             drop(bt);
             return Ok(g);
@@ -5937,6 +6157,7 @@ pub(crate) fn scan_groupby_grouper(
                     aggregates,
                     group_by.len(),
                     n_cols,
+                    &key_collations,
                 )? {
                     drop(bt);
                     return Ok(g);
@@ -8197,6 +8418,53 @@ fn exec_aggregate(
 
     let n_aggs = aggregates.len();
     let mut grouper = HashGrouper::with_aggs(n_aggs);
+    // Collated GROUP BY over non-scan inputs (filtered scans / joins /
+    // subqueries / CTEs): explicit COLLATE terms always fold; a column
+    // reference folds through its TABLE's declared collation, resolved by
+    // walking the input plan's scans (alias-aware prefix -> table). An
+    // unqualified name resolves when EXACTLY ONE in-scope table carries
+    // that column.
+    {
+        let mut scopes: Vec<(String, Arc<crate::schema::Table>)> = Vec::new();
+        collect_plan_tables(input, &mut scopes);
+        let resolve = |t: Option<&str>, name: &str| -> Option<String> {
+            let tables: Vec<&Arc<crate::schema::Table>> = scopes
+                .iter()
+                .filter(|(prefix, _)| t.map(|q| q.eq_ignore_ascii_case(prefix)).unwrap_or(true))
+                .filter(|(_, tbl)| tbl.find_column(name).is_some())
+                .map(|(_, tbl)| tbl)
+                .collect();
+            // Qualified: one prefix match. Unqualified: unambiguous only.
+            let tbl = if t.is_some() {
+                tables.into_iter().next()
+            } else if tables.len() == 1 {
+                Some(tables[0])
+            } else {
+                None
+            };
+            tbl.and_then(|tbl| {
+                tbl.find_column(name)
+                    .and_then(|i| tbl.columns.get(i))
+                    .map(|c| c.collation.clone())
+                    .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"))
+            })
+        };
+        let collations: Vec<Option<String>> = group_by
+            .iter()
+            .map(|g| match g {
+                Expr::Collate { collation, .. } => {
+                    if collation.is_empty() || collation.eq_ignore_ascii_case("BINARY") {
+                        None
+                    } else {
+                        Some(collation.clone())
+                    }
+                }
+                Expr::Column { table, name } => resolve(table.as_deref(), name),
+                _ => None,
+            })
+            .collect();
+        grouper.set_key_collations(collations);
+    }
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
 
     for row in &inner.rows {
@@ -8250,7 +8518,11 @@ fn exec_aggregate(
     for gi in 0..n_groups {
         // Exact capacity: key width + one slot per aggregate.
         let mut row: Vec<Value> = Vec::with_capacity(n_out.max(1));
-        if let Some(keys) = &grouper.keys_flat {
+        // Collated GROUP BY: emit the group's FIRST-SEEN ORIGINAL
+        // representative (SQLite's output), not the folded stored form.
+        if !grouper.display_keys.is_empty() && gi < grouper.display_keys.len() {
+            row.extend(grouper.display_keys[gi].iter().cloned());
+        } else if let Some(keys) = &grouper.keys_flat {
             row.push(keys.get(gi).clone());
         } else {
             row.extend(grouper.keys_multi[gi].iter().cloned());

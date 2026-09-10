@@ -256,6 +256,37 @@ impl<'a> Planner<'a> {
                         resolved_group_by.len(),
                     );
                 }
+                // 3. Collation attachment (SQLite): the ORDER BY term's
+                //    own collation — an explicit COLLATE on the term
+                //    (checked on the ORIGINAL term: the aggregate
+                //    rewrite above replaces the term with a group-key
+                //    column reference and would otherwise lose it), else
+                //    a bare-column term's DECLARED collation. Attached
+                //    AFTER alias / aggregate resolution so terms that
+                //    resolved to an expression keep the expression's own
+                //    semantics; every sort comparator (serial exec_sort,
+                //    top-N, and the parallel path's Collate declination)
+                //    honors the wrapper.
+                if !matches!(&expr, Expr::Collate { .. }) {
+                    let term_coll = if let Expr::Collate { collation, .. } = &t.expr {
+                        Some(collation.clone())
+                    } else if let Expr::Column { .. } = &expr {
+                        s.from.as_ref().and_then(|from| {
+                            let scope = collect_collation_scope(self.catalog, from);
+                            column_declared_collation(self.catalog, &expr, &scope)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(coll) =
+                        term_coll.filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"))
+                    {
+                        expr = Expr::Collate {
+                            expr: Box::new(expr),
+                            collation: coll,
+                        };
+                    }
+                }
                 OrderTerm {
                     expr,
                     order: t.order,
@@ -833,7 +864,15 @@ pub fn rewrite_aggregates_and_groups(
     let e_display = format!("{:?}", e);
     for (i, g) in group_by.iter().enumerate() {
         let g_display = format!("{:?}", g);
-        if g_display == e_display {
+        // A group term may carry an explicit COLLATE (`GROUP BY v COLLATE
+        // NOCASE`) — the collation shapes grouping, not the term's VALUE:
+        // a projection / ORDER BY reference to the bare `v` still means
+        // this group key. Unwrap one Collate level for the match.
+        let inner_display = match g {
+            Expr::Collate { expr, .. } => format!("{:?}", expr),
+            _ => g_display.clone(),
+        };
+        if g_display == e_display || inner_display == e_display {
             // Match the column-naming convention used by exec_aggregate
             // (named after the source expression, falling back to "colN").
             // Without this consistency, the rewritten column reference
@@ -1597,17 +1636,22 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
         right,
     } = predicate
     {
+        // Column operands may carry a COLLATE wrapper from collation
+        // resolution (declared column collations / explicit COLLATE) —
+        // see-through it for the column name; the VALUE side is returned
+        // verbatim. Index-selection callers gate on the conjunct's own
+        // collation (index_column_serves_conjunct) before using the pair.
         // Try left = literal
-        if let Expr::Column { table: _, name } = left.as_ref() {
+        if let Some(name) = column_name_of(left.as_ref()) {
             // Right side must not be a column ref (we want literal/param/value).
-            if !matches!(right.as_ref(), Expr::Column { .. }) {
-                return Some((name.clone(), *right.clone()));
+            if column_name_of(right.as_ref()).is_none() {
+                return Some((name.to_string(), *right.clone()));
             }
         }
         // Try right = literal
-        if let Expr::Column { table: _, name } = right.as_ref() {
-            if !matches!(left.as_ref(), Expr::Column { .. }) {
-                return Some((name.clone(), *left.clone()));
+        if let Some(name) = column_name_of(right.as_ref()) {
+            if column_name_of(left.as_ref()).is_none() {
+                return Some((name.to_string(), *left.clone()));
             }
         }
     }
@@ -1771,23 +1815,38 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 if !first_col.name.eq_ignore_ascii_case(&col_name) {
                     continue;
                 }
+                // Collation gate: the index's first column must carry the
+                // comparison's collation (SQLite rule). A NOCASE index
+                // can't seek a BINARY equality — folding the probe key
+                // would match case variants the BINARY comparison
+                // excludes; a BINARY index can't seek a NOCASE /
+                // RTRIM / custom comparison either. Mismatch falls back
+                // to the scan + Filter path below.
+                if !index_column_serves_conjunct(conjunct, first_col) {
+                    continue;
+                }
                 // Bind index prefix columns 1.. from OTHER equality
                 // conjuncts, in INDEX column order.
                 let mut key_exprs = vec![value_expr.clone()];
                 let mut bound_cols = vec![first_col.name.to_ascii_lowercase()];
                 for ci in 1..index.columns.len() {
-                    let want = &index.columns[ci].name;
+                    let want = &index.columns[ci];
                     let hit = conjuncts.iter().find_map(|oc| {
                         if exprs_equal_conjunct(oc, conjunct) {
                             return None;
                         }
                         let (cn, ve) = extract_eq_predicate(oc)?;
-                        cn.eq_ignore_ascii_case(want).then_some(ve.clone())
+                        // Prefix columns bind only same-collation
+                        // conjuncts (same rule as the first column).
+                        if !index_column_serves_conjunct(oc, want) {
+                            return None;
+                        }
+                        cn.eq_ignore_ascii_case(&want.name).then_some(ve.clone())
                     });
                     match hit {
                         Some(ve) => {
                             key_exprs.push(ve);
-                            bound_cols.push(want.to_ascii_lowercase());
+                            bound_cols.push(want.name.to_ascii_lowercase());
                         }
                         None => break,
                     }
@@ -1912,11 +1971,29 @@ fn try_index_in(
             negated: false,
         } = conjunct
         {
-            if let Expr::Column { table: None, name } = expr.as_ref() {
+            // Unqualified column reference, possibly COLLATE-wrapped by
+            // collation resolution (declared column collation / explicit
+            // COLLATE).
+            let unqualified_col = |e: &Expr| -> Option<String> {
+                let inner = match e {
+                    Expr::Collate { expr, .. } => expr.as_ref(),
+                    other => other,
+                };
+                if let Expr::Column { table: None, name } = inner {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(name) = unqualified_col(expr.as_ref()) {
                 for index in catalog.indexes_on_table(&table.name) {
                     // Single-column index whose (only) column matches: each
-                    // list member becomes one equality seek.
-                    if index.columns.len() == 1 && index.columns[0].name.eq_ignore_ascii_case(name)
+                    // list member becomes one equality seek. The IN's
+                    // comparison collation must match the index column's
+                    // (same rule as equality seeks).
+                    if index.columns.len() == 1
+                        && index.columns[0].name.eq_ignore_ascii_case(&name)
+                        && index_column_serves_conjunct(conjunct, &index.columns[0])
                     {
                         let others: Vec<Expr> = conjuncts
                             .iter()
@@ -2137,9 +2214,12 @@ fn try_index_range(
         for conjunct in conjuncts {
             let bare_col =
                 |s: &str| -> String { s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase() };
-            // BETWEEN.
+            // BETWEEN (collation must match the index column's — same
+            // gate as equality: a NOCASE index can't bound a BINARY range
+            // and vice versa).
             if let Some((col, lo, hi)) = extract_between(conjunct) {
-                if bare_col(&col) == first_name {
+                if bare_col(&col) == first_name && index_column_serves_conjunct(conjunct, first_col)
+                {
                     matched = true;
                     start = Some((lo, true));
                     end = Some((hi, true));
@@ -2148,7 +2228,8 @@ fn try_index_range(
             }
             // Range ops.
             if let Some((col, op, val)) = extract_range(conjunct) {
-                if bare_col(&col) == first_name {
+                if bare_col(&col) == first_name && index_column_serves_conjunct(conjunct, first_col)
+                {
                     matched = true;
                     match op.as_str() {
                         ">" => start = Some((val, false)),
@@ -2190,8 +2271,8 @@ fn extract_between(expr: &Expr) -> Option<(String, Expr, Expr)> {
         expr, low, high, ..
     } = expr
     {
-        if let Expr::Column { name, .. } = expr.as_ref() {
-            return Some((name.clone(), *low.clone(), *high.clone()));
+        if let Some(name) = column_name_of(expr.as_ref()) {
+            return Some((name.to_string(), *low.clone(), *high.clone()));
         }
     }
     None
@@ -2208,15 +2289,16 @@ fn extract_range(expr: &Expr) -> Option<(String, String, Expr)> {
             BinaryOp::GtEq => ">=",
             _ => return None,
         };
-        // `col OP value`
-        if let (Expr::Column { name: col, .. }, rhs) = (left.as_ref(), right.as_ref()) {
-            if !matches!(rhs, Expr::Column { .. }) {
-                return Some((col.clone(), op_str.to_string(), *right.clone()));
+        // `col OP value` (col possibly COLLATE-wrapped — see
+        // extract_eq_predicate)
+        if let (Some(col), rhs) = (column_name_of(left.as_ref()), right.as_ref()) {
+            if column_name_of(rhs).is_none() {
+                return Some((col.to_string(), op_str.to_string(), *right.clone()));
             }
         }
         // `value OP col` — flip the direction.
-        if let (Expr::Column { name: col, .. }, lhs) = (right.as_ref(), left.as_ref()) {
-            if !matches!(lhs, Expr::Column { .. }) {
+        if let (Some(col), lhs) = (column_name_of(right.as_ref()), left.as_ref()) {
+            if column_name_of(lhs).is_none() {
                 let flipped = match op_str {
                     "<" => ">",
                     "<=" => ">=",
@@ -2224,7 +2306,7 @@ fn extract_range(expr: &Expr) -> Option<(String, String, Expr)> {
                     ">=" => "<=",
                     _ => return None,
                 };
-                return Some((col.clone(), flipped.to_string(), *left.clone()));
+                return Some((col.to_string(), flipped.to_string(), *left.clone()));
             }
         }
     }
@@ -3595,6 +3677,73 @@ fn has_explicit_collate(e: &Expr) -> bool {
             has_explicit_collate(left) || has_explicit_collate(right)
         }
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index-selection collation gating
+// ---------------------------------------------------------------------------
+
+/// The effective collation a comparison conjunct compares under, or `None`
+/// for BINARY. WHERE / HAVING / join predicates pass through
+/// `rewrite_column_collations` BEFORE index selection, so a comparison
+/// that involves a column with a DECLARED collation (or an explicit
+/// `COLLATE`) carries an `Expr::Collate` on an operand here — recover it.
+/// SQLite's rule: explicit COLLATE on either operand wins, else the
+/// column's declared collation, else BINARY.
+pub(crate) fn conjunct_collation(conjunct: &Expr) -> Option<String> {
+    match conjunct {
+        Expr::Binary { left, right, .. } => {
+            operand_collation(left.as_ref()).or_else(|| operand_collation(right.as_ref()))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => operand_collation(expr.as_ref())
+            .or_else(|| operand_collation(low.as_ref()))
+            .or_else(|| operand_collation(high.as_ref())),
+        Expr::In { expr, .. } => operand_collation(expr.as_ref()),
+        _ => None,
+    }
+}
+
+fn operand_collation(e: &Expr) -> Option<String> {
+    if let Expr::Collate { collation, .. } = e {
+        Some(collation.clone())
+    } else {
+        None
+    }
+}
+
+/// Can an index column serve a comparison conjunct? SQLite uses an index
+/// to satisfy a WHERE term only when the index column's collation MATCHES
+/// the comparison's collation: a NOCASE index cannot seek a BINARY
+/// equality (its key order folds case — `v = 'apple'` would wrongly match
+/// 'APPLE'), and a BINARY index cannot seek a NOCASE comparison (the
+/// probe misses case variants). Mismatched pairs fall back to the scan +
+/// Filter paths, which evaluate the comparison under its own collation.
+pub(crate) fn index_column_serves_conjunct(
+    conjunct: &Expr,
+    index_col: &crate::schema::IndexColumn,
+) -> bool {
+    match conjunct_collation(conjunct) {
+        Some(c) => c.eq_ignore_ascii_case(&index_col.collation),
+        None => {
+            index_col.collation.is_empty() || index_col.collation.eq_ignore_ascii_case("BINARY")
+        }
+    }
+}
+
+/// Column name of a (possibly COLLATE-wrapped) operand: collation
+/// rewriting wraps the COLUMN operand of a comparison in `Expr::Collate`,
+/// leaving the column identity unchanged underneath. The collation is
+/// recovered from the ORIGINAL conjunct via `conjunct_collation`, so the
+/// unwrap loses nothing. Returns `None` for non-column operands
+/// (literals, expressions).
+fn column_name_of(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Column { name, .. } => Some(name.as_str()),
+        Expr::Collate { expr, .. } => column_name_of(expr),
+        _ => None,
     }
 }
 

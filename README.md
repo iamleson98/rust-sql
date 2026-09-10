@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **683+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **702+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -637,8 +637,15 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
   load and query — the index b-tree spills them to overflow chains, and
   the SQLite-format writer emits the cells byte-exactly (verified by
   real SQLite re-opening the dumped file).
-- Non-BINARY/NOCASE collations in index definitions fall back to binary
-  ordering in the written file.
+- Non-BINARY collations in written SQLite files: `NOCASE` and `RTRIM`
+  index columns (explicit `COLLATE`, column-DECLARED collations inherited
+  by `CREATE INDEX`, `UNIQUE`/PK autoindexes, `WITHOUT ROWID` PKs, and
+  DESC keys) are ordered under their collation in the written file —
+  real SQLite re-opens every shape, `PRAGMA integrity_check` passes, and
+  its index binary-searches / `ORDER BY` agree with the engine's
+  (`tests/collate_semantics.rs` + the file-roundtrip probes). Custom
+  (plugin-registered) collations still fall back to binary ordering in
+  the written file — the file format has no portable encoding for them.
 - `auto_vacuum` pointer-map pages are read fine but not written (output
   is always fully dense). UTF-16 files read and write end-to-end, with
   two engine-side sub-gaps on non-UTF-8 files only: the ENGINE's
@@ -750,9 +757,20 @@ compat surface. Every entry says what it costs and why it exists.
 - **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
   approximations — tightened one at a time via differential tests against
   real SQLite.
-- **Non-BINARY collations in written SQLite files**: index definitions
-  with custom collations fall back to binary ordering in the written file;
-  `auto_vacuum` pointer-map pages are read but not written (output is
+- **Custom collations in written SQLite files**: `NOCASE` / `RTRIM`
+  index columns (explicit, column-declared, autoindex, `WITHOUT ROWID`
+  PK, DESC) now write in their collation's order with SQLite verifying
+  the file; plugin-registered CUSTOM collations still fall back to binary
+  ordering in the written file (no portable file-format encoding).
+  Engine-side collation semantics are now differential-tested end-to-end:
+  `ORDER BY` under declared collations (alias/ordinal/explicit forms),
+  index selection gated on collation match (a BINARY equality never seeks
+  a NOCASE index and vice versa), probe-key folding on every index path
+  (fast paths, IN-lists, ranges, UPDATE/DELETE), and `GROUP BY` under
+  the term's collation with SQLite's first-seen representative — serial,
+  parallel (300k-row worker-split equality), and spill paths
+  (`tests/collate_semantics.rs`, 19 suites). `auto_vacuum` pointer-map
+  pages are read but not written (output is
   always dense). UTF-16 files read/write end-to-end; the two remaining
   engine-side sub-gaps on non-UTF-8 files: TEXT `ORDER BY`/min/max use
   code-point order where SQLite uses raw file-encoding byte order
@@ -901,7 +919,7 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 683+ tests in the
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 702+ tests in the
 default matrix, all passing, plus the sqlx feature suite:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
