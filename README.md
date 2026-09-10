@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **722+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **735+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -110,7 +110,7 @@ for row in &rows {
 - **Page codecs**: pluggable page encode/decode (`PRAGMA codec`), the SEE/ZIPVFS-style hook — XOR codec included as a working example with file markers and safe-refuse-on-wrong-codec
 - **Dynamic extensions in any language**: compile against `include/rustqlite_ext.h`, export `rustqlite_extension_init`, load with `Database::load_extension` — working examples in **C, C++, Zig, and Rust** (`plugins/`)
 - **SQLite-shaped C ABI**: the `rustqlite_*` family (`open`/`exec`/`prepare_v2`/`step`/`bind`/`column`/`load_extension`, …) mirroring `sqlite3_*` argument order and semantics — the binding layer for drop-in compatibility
-- **Prepared statements** (`Database::prepare` + `Statement::bind/step/reset`): parsed and planned once, rebindable, and **streaming** — scans/ranges/filters/projections/limits (and vtab scans) deliver rows in batches of 64 without materializing the result set, with early termination
+- **Prepared statements** (`Database::prepare` + `Statement::bind/step/reset`): parsed and planned once, rebindable, and **streaming** — scans/ranges/filters/projections/limits (and vtab scans) deliver rows in batches without materializing the result set, with early termination. The fused scan/range shapes go further: **cell serving** — the b-tree hands the statement RAW record bytes (one memcpy per row into a reused arena) and each `step` decodes the projected columns into ONE reused serve buffer: no per-row `Vec<Value>`, no row pool, no row moves. A 100k-row range drain through prepare/step dropped from ~59 to ~47 ns/row (all-rowid projections like `SELECT id WHERE id BETWEEN …` from ~44 to ~30 — the record bytes are never parsed); differential-pinned against the materialized path across batch boundaries, projection permutations, duplicates, NULLs, overflow rows, and fallback shapes (`tests/cell_serving.rs`)
 
 ### sqlx: native Rust driver (`features = ["sqlx"]`)
 
@@ -677,13 +677,16 @@ compat surface. Every entry says what it costs and why it exists.
   join takes it to 1.38x. UPDATE by PK cleared to **1.51x** (in-leaf
   shape-changing replace: a payload that grows or shrinks no longer pays
   delete+insert — the new cell is written into the old cell's slot).
-- **S06 range scan materializing 100k rows (0.72–1.13x by host)**: through
-  the streaming prepared-statement path (`step` + per-row consume) rustqlite
-  is near-parity on this shape — the per-row `Row` allocation in the step
-  path is the remaining cost (torture S06: 0.92x linux, 0.72–0.87x
-  macOS-ARM, 1.08–1.13x Windows, tracked LOSS). Short ranges where setup
-  dominates stay 2–2.3x faster (the table above); a borrowed-accessor step
-  path is the fix shape.
+- **S06 range scan materializing 100k rows**: the step path's per-row
+  `Row` materialization is GONE — the fused scan/range drivers now serve
+  RAW record bytes and each `step` decodes into one reused buffer (cell
+  serving, see [Prepared statements](#features)). The S06 shape
+  (`SELECT id, val … WHERE id BETWEEN …`) measured ~20% faster
+  step-path (59→47 ns/row vs SQLite's 78 on the same host, 1.32x→1.66x;
+  all-rowid projections ~33% faster), which should pull the historical
+  0.92x linux / 0.72–0.87x macOS-ARM draws back over parity — the CI
+  torture matrix tracks the residual. Short ranges where setup dominates
+  stay 2–2.3x faster (the table above).
 - **8-conn mixed R/W 80/20 (parity-class)**: at high write fan-out the writer
   gate + commit fsync set the floor; reads stay 2.8x throughout. The row
   compares a shared-memory engine against SQLite's file-backed WAL, so its

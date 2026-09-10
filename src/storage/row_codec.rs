@@ -308,11 +308,21 @@ pub fn decode_row_selective(
     alias: Option<usize>,
     out: &mut Vec<Value>,
 ) -> Result<()> {
-    out.clear();
-    out.resize(col_indices.len(), Value::Null);
-
-    if col_indices.is_empty() {
+    let n = col_indices.len();
+    if n == 0 {
+        out.clear();
         return Ok(());
+    }
+    // Slot preparation WITHOUT the per-call clear + Null-refill: when
+    // `out` already holds n slots (the cell-mode serve buffer, index
+    // accumulators), the walk overwrites in place (assignment drops the
+    // old value) and only SHORT-ROW trailing targets need a post-fill —
+    // one branch instead of 2n Value writes per row. The pooled path
+    // (cleared rows, len 0) still gets the Null prefill via resize.
+    if out.len() < n {
+        out.resize(n, Value::Null);
+    } else if out.len() > n {
+        out.truncate(n);
     }
 
     // The single-cursor column walk below requires `col_indices` to be in
@@ -326,6 +336,11 @@ pub fn decode_row_selective(
     // reordered projections like `SELECT name, id ... WHERE id = ?`.
     // (Dedup happens implicitly: duplicate columns hit the run
     // placement below, same as before.)
+    // The single-cursor column walk requires `col_indices` in ascending
+    // order. The ASCENDING majority — every pooled/cell step-path row —
+    // takes the direct walk: the two [usize; 16] permutation stacks are
+    // initialized ONLY in the non-ascending branch (two 128-byte memsets
+    // per row were ~10 ns of pure hot-path waste).
     const SMALL: usize = 16;
     let mut ascending = true;
     for w in 1..col_indices.len() {
@@ -335,20 +350,13 @@ pub fn decode_row_selective(
         }
     }
 
-    let mut sorted_stack = [usize::MAX; SMALL];
-    let mut order_stack = [usize::MAX; SMALL];
-    // Initial `None` is only ever replaced in the >SMALL branch below.
-    #[allow(unused_assignments)]
-    let mut perm_heap: Option<(Vec<usize>, Vec<usize>)> = None;
-
-    // Sorted index list + slot permutation for the walk. `slot_of(k)`
-    // gives the output position for sorted position k.
-    let indices: &[usize];
-    let mut slots_ref: &[usize] = &[];
     if ascending {
-        indices = col_indices;
-    } else if col_indices.len() <= SMALL {
+        return decode_selective_walk(buf, n_cols_total, col_indices, rowid, alias, out, None);
+    }
+    if col_indices.len() <= SMALL {
         let n = col_indices.len();
+        let mut sorted_stack = [usize::MAX; SMALL];
+        let mut order_stack = [usize::MAX; SMALL];
         sorted_stack[..n].copy_from_slice(col_indices);
         for (k, o) in order_stack.iter_mut().enumerate().take(n) {
             *o = k;
@@ -366,25 +374,41 @@ pub fn decode_row_selective(
             sorted_stack[j] = sk;
             order_stack[j] = ok;
         }
-        indices = &sorted_stack[..n];
-        slots_ref = &order_stack[..n];
-    } else {
-        // > 16 projected columns: the rare wide-schema case; heap perm.
-        let mut order: Vec<usize> = (0..col_indices.len()).collect();
-        order.sort_unstable_by_key(|&slot| col_indices[slot]);
-        let sorted: Vec<usize> = order.iter().map(|&slot| col_indices[slot]).collect();
-        perm_heap = Some((sorted, order));
-        let (s, o) = perm_heap.as_ref().unwrap();
-        indices = s;
-        slots_ref = o;
+        return decode_selective_walk(
+            buf,
+            n_cols_total,
+            &sorted_stack[..n],
+            rowid,
+            alias,
+            out,
+            Some(&order_stack[..n]),
+        );
     }
+    // > 16 projected columns: the rare wide-schema case; heap perm.
+    let mut order: Vec<usize> = (0..col_indices.len()).collect();
+    order.sort_unstable_by_key(|&slot| col_indices[slot]);
+    let sorted: Vec<usize> = order.iter().map(|&slot| col_indices[slot]).collect();
+    decode_selective_walk(buf, n_cols_total, &sorted, rowid, alias, out, Some(&order))
+}
+
+/// The shared single-cursor walk behind [`decode_row_selective`]:
+/// `indices` MUST be ascending; `slots` maps each sorted position k to
+/// its output slot (None = identity, the ascending fast path).
+fn decode_selective_walk(
+    buf: &[u8],
+    n_cols_total: usize,
+    indices: &[usize],
+    rowid: i64,
+    alias: Option<usize>,
+    out: &mut [Value],
+    slots: Option<&[usize]>,
+) -> Result<()> {
     // Output slot for sorted position `k` (identity when ascending).
     #[inline]
-    fn slot_of(ascending: bool, slots: &[usize], k: usize) -> usize {
-        if ascending {
-            k
-        } else {
-            slots[k]
+    fn slot_of(slots: Option<&[usize]>, k: usize) -> usize {
+        match slots {
+            None => k,
+            Some(s) => s[k],
         }
     }
 
@@ -400,7 +424,7 @@ pub fn decode_row_selective(
     // not try: it is not a payload column) — fill it up front instead.
     for (k, &ci) in indices.iter().enumerate() {
         if ci == ROWID_PROJ {
-            out[slot_of(ascending, slots_ref, k)] = Value::Integer(rowid);
+            out[slot_of(slots, k)] = Value::Integer(rowid);
         }
     }
 
@@ -430,7 +454,7 @@ pub fn decode_row_selective(
                     ));
                 }
                 for k in wanted_idx..run_end {
-                    out[slot_of(ascending, slots_ref, k)] = Value::Integer(rowid);
+                    out[slot_of(slots, k)] = Value::Integer(rowid);
                 }
                 pos += 1;
             } else {
@@ -438,10 +462,10 @@ pub fn decode_row_selective(
                     .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
                 if run_end - wanted_idx == 1 {
                     // Common case: one slot — move the value, no clone.
-                    out[slot_of(ascending, slots_ref, wanted_idx)] = v;
+                    out[slot_of(slots, wanted_idx)] = v;
                 } else {
                     for k in wanted_idx..run_end {
-                        out[slot_of(ascending, slots_ref, k)] = v.clone();
+                        out[slot_of(slots, k)] = v.clone();
                     }
                 }
                 pos += n;
@@ -456,6 +480,17 @@ pub fn decode_row_selective(
             pos += n;
         }
         col += 1;
+    }
+    // Short-row trailing slots: the record holds fewer columns than the
+    // projection wants — NULL them (the ROWID_PROJ sentinel slots were
+    // already written by the prefill above). For full-coverage rows (the
+    // hot path) wanted_idx == len and this is one predicted branch.
+    let mut k = wanted_idx;
+    while k < indices.len() {
+        if indices[k] != ROWID_PROJ {
+            out[slot_of(slots, k)] = Value::Null;
+        }
+        k += 1;
     }
     Ok(())
 }

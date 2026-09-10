@@ -153,6 +153,74 @@ pub(crate) fn overflow_local_len_for(total: usize, page_size: usize) -> usize {
     }
 }
 
+/// One RAW-record entry for the cell-serving step path
+/// ([`Btree::scan_table_range_cells`]): the record's bytes live in the
+/// caller's arena at `[off, off+len)`; `rowid` is the b-tree cell key.
+/// The statement decodes the projected columns on demand (one reused
+/// serve buffer) instead of materializing a `Vec<Value>` per row.
+#[derive(Clone, Copy, Debug)]
+pub struct CellEntry {
+    pub rowid: i64,
+    pub off: u32,
+    pub len: u32,
+}
+
+/// Outcome of one cells pull: `hit_end` is true when the scan ran off
+/// the range end or EOF (as opposed to a budget stop); `last_rowid` is
+/// the last COPIED row's rowid — the next pull resumes at
+/// `last_rowid + 1`, which lands ON a budget-stopped row.
+#[derive(Clone, Copy, Debug)]
+pub struct CellScanOutcome {
+    pub hit_end: bool,
+    pub last_rowid: i64,
+}
+
+/// Mutable walk state threaded through the cells-scan recursion.
+struct CellsWalk<'a> {
+    arena: &'a mut Vec<u8>,
+    entries: &'a mut Vec<CellEntry>,
+    budget: usize,
+    max_bytes: usize,
+    /// False once a budget stop interrupted the walk.
+    hit_end: bool,
+    /// rowid of the last COPIED row (i64::MIN = none yet this pull).
+    last: i64,
+    /// Overflow reassembly scratch — reused across overflow cells, grown
+    /// to the widest row (an owned buffer so the leaf guard can stay
+    /// held while the chain is gathered).
+    scratch: Vec<u8>,
+}
+
+impl CellsWalk<'_> {
+    #[inline]
+    fn full(&self) -> bool {
+        self.entries.len() >= self.budget || self.arena.len() >= self.max_bytes
+    }
+
+    #[inline]
+    fn copy(&mut self, rowid: i64, bytes: &[u8]) {
+        let off = self.arena.len() as u32;
+        self.arena.extend_from_slice(bytes);
+        self.entries.push(CellEntry {
+            rowid,
+            off,
+            len: bytes.len() as u32,
+        });
+        self.last = rowid;
+    }
+
+    /// Copy the overflow scratch (split-field borrows: the arena is
+    /// mutable while the scratch is read — one struct, two fields).
+    #[inline]
+    fn copy_scratch(&mut self, rowid: i64) {
+        let off = self.arena.len() as u32;
+        let len = self.scratch.len() as u32;
+        self.arena.extend_from_slice(&self.scratch);
+        self.entries.push(CellEntry { rowid, off, len });
+        self.last = rowid;
+    }
+}
+
 /// A cell in a B+tree. This is a logical representation; on-disk format
 /// is varint-encoded.
 #[derive(Clone, Debug)]
@@ -6248,6 +6316,207 @@ impl<'a> Btree<'a> {
             crate::types::value::set_text_decode_trusted(saved_trust);
         }
         r
+    }
+
+    /// Raw-record cell scan: the rowid-range twin of
+    /// [`Self::scan_table_range_selective_pooled`] that copies each cell's
+    /// record BYTES into `arena` and notes `(rowid, off, len)` entries —
+    /// NO value decoding here. The statement's step path decodes each row
+    /// into ONE reused serve buffer (see `statement.rs`'s cell mode), so a
+    /// 100k-row range drain pays a per-row record memcpy + one fixed
+    /// decode instead of pool-pop / per-row Vec / VecDeque / pool-return
+    /// churn. Overflow cells are reassembled into the arena (rare, and
+    /// bounded by `max_arena_bytes`).
+    ///
+    /// Resume contract mirrors the pooled scan: stops at `budget` entries
+    /// or `max_arena_bytes` cumulative arena bytes WITHOUT copying the
+    /// stopped-on cell; `last_rowid` is the last COPIED row's rowid (the
+    /// next call passes `start = last_rowid + 1`, which lands ON the
+    /// stopped row). `hit_end` stays true when the scan ran off the range
+    /// end or EOF (caller's eof = `hit_end && entries.len() < budget`).
+    pub fn scan_table_range_cells(
+        &mut self,
+        start: i64,
+        end: i64,
+        budget: usize,
+        max_arena_bytes: usize,
+        arena: &mut Vec<u8>,
+        entries: &mut Vec<CellEntry>,
+    ) -> Result<CellScanOutcome> {
+        // Caller clears per pull; keep the invariant local so a stale
+        // caller cannot corrupt offsets.
+        arena.clear();
+        entries.clear();
+        let mut walk = CellsWalk {
+            arena,
+            entries,
+            budget: budget.max(1),
+            max_bytes: max_arena_bytes.max(1),
+            hit_end: true,
+            last: i64::MIN,
+            scratch: Vec::new(),
+        };
+        self.scan_range_subtree_cells(self.root, start, end, &mut walk)?;
+        Ok(CellScanOutcome {
+            hit_end: walk.hit_end,
+            last_rowid: walk.last,
+        })
+    }
+
+    fn scan_range_subtree_cells(
+        &mut self,
+        page_id: PageId,
+        start: i64,
+        end: i64,
+        walk: &mut CellsWalk<'_>,
+    ) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let borrowed = page.lock();
+        prefetch_search_lines(&borrowed.data);
+        let pt = borrowed.page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                let n = borrowed.n_cells();
+                let psz = borrowed.data.len();
+                // Binary search for the first cell with rowid >= start
+                // (same resumable-batch skip as the selective scan).
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
+                        Some((rowid, _)) if rowid < start => lo = mid + 1,
+                        _ => hi = mid,
+                    }
+                }
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if cell_ptr >= psz {
+                        return Err(Error::corruption(format!(
+                            "cell pointer {} out of range",
+                            cell_ptr
+                        )));
+                    }
+                    let buf = borrowed.cell_slice_checked(cell_ptr)?;
+                    let (rowid, n1) = varint::decode_signed(buf)
+                        .ok_or_else(|| Error::corruption("truncated leaf rowid in scan_cells"))?;
+                    if rowid > end {
+                        // Sorted: everything after is past the range too
+                        // (hit_end stays true — the RANGE ended, not the
+                        // budget).
+                        return Ok(false);
+                    }
+                    let rest = &buf[n1..];
+                    let (plen, n2) = varint::decode(rest).ok_or_else(|| {
+                        Error::corruption("truncated leaf payload len in scan_cells")
+                    })?;
+                    let payload_start = n1 + n2;
+                    let plen = plen as usize;
+                    // Budget stop BEFORE copying: the resume (last+1) must
+                    // land ON this row, so it must NOT be in this batch.
+                    if walk.full() {
+                        walk.hit_end = false;
+                        return Ok(false);
+                    }
+                    if plen > u32::MAX as usize {
+                        // A >4 GiB record cannot be represented by the
+                        // u32 (off, len) entry contract — and no valid
+                        // engine/SQlite row is that large. Corruption.
+                        return Err(Error::corruption(format!(
+                            "record payload {} too large for cell serving",
+                            plen
+                        )));
+                    }
+                    let local_len = overflow_local_len_for(plen, psz);
+                    if local_len == plen {
+                        // In-page payload: one slice copy into the arena.
+                        if payload_start
+                            .checked_add(plen)
+                            .map_or(true, |end| end > buf.len())
+                        {
+                            return Err(Error::corruption("truncated leaf payload in scan_cells"));
+                        }
+                        let payload = &buf[payload_start..payload_start + plen];
+                        walk.copy(rowid, payload);
+                    } else {
+                        // Overflow cell: reassemble the full payload into
+                        // the walk's scratch, then copy into the arena.
+                        // The leaf lock STAYS held — `page` is an owned
+                        // Arc clone (no borrow of self survives get_page),
+                        // and the lock order leaf -> overflow is global
+                        // (chains are only entered from leaf cells), same
+                        // as scan_subtree_borrowed.
+                        if local_len + 4 > buf.len() - payload_start {
+                            return Err(Error::corruption("truncated overflow cell in scan_cells"));
+                        }
+                        let local = &buf[payload_start..payload_start + local_len];
+                        let chain = u32::from_be_bytes(
+                            buf[payload_start + local_len..payload_start + local_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        self.assemble_overflow_payload_into(
+                            local,
+                            plen as u64,
+                            chain,
+                            &mut walk.scratch,
+                        )?;
+                        walk.copy_scratch(rowid);
+                    }
+                }
+                Ok(true)
+            }
+            PageType::InteriorTable => {
+                let n = borrowed.n_cells();
+                let right = borrowed.right_most_pointer();
+                let mut lo: u16 = 0;
+                let mut hi: u16 = n;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                    let key = decode_table_interior_key(borrowed.cell_slice_checked(cell_ptr)?)
+                        .ok_or_else(|| {
+                            Error::corruption("truncated interior cell in cells scan")
+                        })?;
+                    if key < start {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let mut children: Vec<PageId> = Vec::with_capacity((n - lo) as usize + 1);
+                for i in lo..n {
+                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                    if let Some(child) =
+                        decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
+                    {
+                        children.push(child);
+                    }
+                }
+                if right != 0 {
+                    children.push(right);
+                }
+                drop(borrowed);
+                drop(page);
+                for child in children {
+                    if !self.scan_range_subtree_cells(child, start, end, walk)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in scan_cells: {:?}",
+                pt
+            ))),
+        }
     }
 
     fn scan_range_subtree_selective<F>(

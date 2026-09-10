@@ -3,7 +3,7 @@
 //!
 //! This is the `sqlite3_prepare_v2` + `sqlite3_step` model on top of the
 //! engine: a statement is parsed and planned ONCE, parameters are bound
-//! any number of times, and rows arrive ONE AT A TIME (batches of 64
+//! any number of times, and rows arrive ONE AT A TIME (1024-row batches
 //! internally) without materializing the whole result set.
 //!
 //! ```no_run
@@ -29,6 +29,14 @@
 //! - bare `Scan` (+ pushed predicate, incl. virtual tables)
 //! - `RowidRange`
 //! - `Filter` / `Project` / `Limit` over any of the above
+//!
+//! The fused scan/range shapes (bare-column projection, no predicate)
+//! go one step further — **cell serving**: the b-tree copies each cell's
+//! RAW record bytes into a reused arena (one memcpy per row) and every
+//! `step()` decodes the projected columns into ONE reused serve buffer.
+//! No per-row `Vec<Value>`, no row pool, no row moves — the accessors
+//! (`row()` / `column_value()` / …) read the serve buffer directly
+//! (`Row = Vec<Value>`).
 //!
 //! Everything else (aggregates, joins, sorts, set ops, CTEs, index
 //! lookups) executes once and then serves rows from the materialized
@@ -129,6 +137,29 @@ pub struct Statement<'a> {
     /// before the next `step()`) makes recycling sound; `take_row()`
     /// simply removes a row from circulation.
     row_pool: Vec<Row>,
+    /// CELL-MODE state (zero-materialize serving, see `step`): raw
+    /// record bytes for the current batch, copied while the b-tree held
+    /// the leaf lock. `scan_table_range_cells` clears both per pull.
+    cell_arena: Vec<u8>,
+    /// Current batch's raw entries; `cell_idx` is the next-to-serve.
+    cells: Vec<crate::storage::btree::CellEntry>,
+    cell_idx: usize,
+    /// Decode plan carried by the last cell pull.
+    cell_plan: Option<CellPlan>,
+    /// Armed once a driver pull succeeds; the row accessors then read
+    /// `serve_row` instead of `current_row`.
+    cell_mode: bool,
+    /// No live cell row (none served yet, or the last was taken): the
+    /// accessors return None until the next `step()`.
+    cell_row_live: bool,
+    /// The driver refused cell serving once (wrapper / filtered shape):
+    /// stop asking and use materialized batches for the rest of the
+    /// statement's lifetime.
+    cells_refused: bool,
+    /// THE row serve buffer (cell mode): the current row decoded in
+    /// place — capacity retained across rows, cleared per decode. `Row =
+    /// Vec<Value>`, so `row()` hands out `&serve_row` directly.
+    serve_row: Vec<Value>,
     columns: Option<Arc<[String]>>,
     current_row: Option<Row>,
     done: bool,
@@ -220,6 +251,14 @@ impl<'a> Statement<'a> {
             stream: StreamState::Fresh,
             pending: VecDeque::new(),
             row_pool: Vec::new(),
+            cell_arena: Vec::new(),
+            cells: Vec::new(),
+            cell_idx: 0,
+            cell_plan: None,
+            cell_mode: false,
+            cell_row_live: false,
+            cells_refused: false,
+            serve_row: Vec::new(),
             columns: prep_columns,
             current_row: None,
             done: false,
@@ -299,6 +338,16 @@ impl<'a> Statement<'a> {
             r.clear();
             self.row_pool.push(r);
         }
+        // Cell mode: the arena/entries/serve buffer are THIS statement's
+        // own reusable storage — drop the batch contents, keep capacity.
+        self.cell_arena.clear();
+        self.cells.clear();
+        self.cell_idx = 0;
+        self.cell_plan = None;
+        self.cell_mode = false;
+        self.cell_row_live = false;
+        self.cells_refused = false;
+        self.serve_row.clear();
         self.columns = None;
         self.done = false;
         self.deltas = CtxDeltas::default();
@@ -329,20 +378,43 @@ impl<'a> Statement<'a> {
 
     /// The current row (valid between a `Row` step and the next step).
     pub fn row(&self) -> Option<&Row> {
-        self.current_row.as_ref()
+        if self.cell_mode {
+            if self.cell_row_live {
+                Some(&self.serve_row)
+            } else {
+                None
+            }
+        } else {
+            self.current_row.as_ref()
+        }
     }
 
     /// TAKE the current row's ownership (the next `step()` sees None and
     /// serves fresh rows normally). For single-row consumers — the sqlx
     /// driver's `fetch_optional` — this replaces a full row clone with a
-    /// move.
+    /// move. Cell mode clones the serve buffer (the taken row must be
+    /// independent of the statement's reused storage).
     pub fn take_row(&mut self) -> Option<Row> {
+        if self.cell_mode {
+            if !self.cell_row_live {
+                return None;
+            }
+            self.cell_row_live = false;
+            return Some(self.serve_row.clone());
+        }
         self.current_row.take()
     }
 
     /// The current row's value at `idx`.
     pub fn column_value(&self, idx: usize) -> Option<&Value> {
-        self.current_row.as_ref()?.get(idx)
+        if self.cell_mode {
+            if !self.cell_row_live {
+                return None;
+            }
+            self.serve_row.get(idx)
+        } else {
+            self.current_row.as_ref()?.get(idx)
+        }
     }
 
     pub fn column_int(&self, idx: usize) -> i64 {
@@ -406,8 +478,79 @@ impl<'a> Statement<'a> {
         match &mut self.stream {
             StreamState::Driver(drv) => {
                 let db = self.db;
+                // (1) Serve from a live cell batch: decode the next entry
+                // into the serve buffer (zero row materialization). The
+                // accessors read serve_row until the batch drains.
+                if self.cell_mode && self.cell_idx < self.cells.len() {
+                    let plan = self.cell_plan.as_ref().expect("cell pull installed a plan");
+                    if serve_cell_row(
+                        plan,
+                        &self.cell_arena,
+                        &self.cells,
+                        &mut self.cell_idx,
+                        &mut self.serve_row,
+                    ) {
+                        self.cell_row_live = true;
+                        return Ok(StepResult::Row);
+                    }
+                    // Rest of the batch failed to decode (corrupt rows
+                    // skip, mirroring the pooled scan's tolerance): pull
+                    // the next cell batch below — NOT the materialized
+                    // path, which would double-advance the driver cursor.
+                    self.cell_row_live = false;
+                }
                 let params = self.params.clone();
                 let named = self.named.clone();
+                // (2) Undecoded-cell pulls — only while the driver has
+                // not refused (wrapper / filtered shapes materialize).
+                // A whole-batch decode failure pulls the NEXT batch (the
+                // driver already advanced past those rows; corrupt rows
+                // are never served, same as the pooled scan).
+                if !self.cells_refused {
+                    loop {
+                        let pull = {
+                            let arena = &mut self.cell_arena;
+                            let entries = &mut self.cells;
+                            drv.next_cells(db, &params, &named, SCAN_BATCH_ROWS, arena, entries)?
+                        };
+                        let (plan, _outcome) = match pull {
+                            Some(p) => p,
+                            None => {
+                                self.cells_refused = true;
+                                break;
+                            }
+                        };
+                        self.cell_plan = Some(plan);
+                        self.cell_idx = 0;
+                        if self.cells.is_empty() {
+                            // Driver EOF (hit_end): the pull contract ends
+                            // the stream exactly like next_batch's empty
+                            // Vec would.
+                            self.cell_mode = true;
+                            self.done = true;
+                            self.stream = StreamState::Exhausted;
+                            db.maybe_drain_read_burst();
+                            return Ok(StepResult::Done);
+                        }
+                        self.columns.get_or_insert_with(|| drv.columns());
+                        let plan = self.cell_plan.as_ref().expect("just installed");
+                        if serve_cell_row(
+                            plan,
+                            &self.cell_arena,
+                            &self.cells,
+                            &mut self.cell_idx,
+                            &mut self.serve_row,
+                        ) {
+                            self.cell_mode = true;
+                            self.cell_row_live = true;
+                            return Ok(StepResult::Row);
+                        }
+                        // Whole batch undecodable: loop and pull again.
+                    }
+                }
+                // (3) Materialized batch (existing path — reached only
+                // when the driver refused cell serving).
+                //
                 // Pull WIDE batches for sequential scans: the driver stack
                 // clamps correctly (LimitDriver caps at limit_left,
                 // FilterDriver banks leftovers), and each batch amortizes
@@ -469,7 +612,7 @@ impl<'a> Statement<'a> {
     pub fn query_all(&mut self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         while self.step()? == StepResult::Row {
-            if let Some(r) = &self.current_row {
+            if let Some(r) = self.row() {
                 rows.push(r.clone());
             }
         }
@@ -1004,6 +1147,121 @@ trait Driver {
         budget: usize,
         pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>>;
+    /// Undecoded-cell serving (the step path's zero-materialize mode):
+    /// append raw record bytes to `arena` + `(rowid, off, len)` entries
+    /// with the SAME resume semantics as `next_batch`, plus the decode
+    /// plan the statement needs to turn each entry into the current row
+    /// in ONE reused serve buffer (no per-row Vec, no pool, no row
+    /// moves). The default returns None — drivers (and wrappers) that
+    /// must materialize rows refuse, and the statement stops asking for
+    /// the rest of its lifetime.
+    fn next_cells(
+        &mut self,
+        _db: &Database,
+        _params: &[Value],
+        _named: &HashMap<String, Value>,
+        _budget: usize,
+        _arena: &mut Vec<u8>,
+        _entries: &mut Vec<crate::storage::btree::CellEntry>,
+    ) -> Result<Option<(CellPlan, crate::storage::btree::CellScanOutcome)>> {
+        Ok(None)
+    }
+}
+
+/// How to decode one raw arena entry into the serve buffer. Plain data
+/// (no table handle) so the statement can hold it while serving with
+/// disjoint-field borrows.
+struct CellPlan {
+    /// Table column count (the record's schema width).
+    n_cols: usize,
+    /// Table column that aliases the rowid (INTEGER PRIMARY KEY).
+    rowid_alias: Option<usize>,
+    /// Output col j -> table col index (or the ROWID_PROJ sentinel).
+    project: Vec<usize>,
+    /// Every output column is the rowid (alias or sentinel): the decode
+    /// is Integer writes only — the record bytes are never parsed
+    /// (`SELECT id FROM t WHERE id BETWEEN …`, the OLTP point/range
+    /// drains).
+    all_rowid: bool,
+    /// In-memory pager: TEXT decode arms the trusted mode around each
+    /// row (mirrors the pooled scan family's save/restore).
+    mem_pager: bool,
+}
+
+impl CellPlan {
+    fn new(table: &crate::schema::Table, project: &[usize], mem_pager: bool) -> Self {
+        let rowid_alias = table.rowid_alias;
+        let all_rowid = project
+            .iter()
+            .all(|&c| c == crate::storage::row_codec::ROWID_PROJ || Some(c) == rowid_alias);
+        Self {
+            n_cols: table.n_columns(),
+            rowid_alias,
+            project: project.to_vec(),
+            all_rowid,
+            mem_pager,
+        }
+    }
+}
+
+/// Decode the next decodable arena entry into the serve buffer. Returns
+/// false when the batch is exhausted (corrupt entries are SKIPPED — the
+/// same tolerance the pooled b-tree scan always had). A free function so
+/// `step` can hand it disjoint statement fields (plan / arena / cells /
+/// idx / serve buffer) while the driver borrow is live.
+fn serve_cell_row(
+    plan: &CellPlan,
+    arena: &[u8],
+    cells: &[crate::storage::btree::CellEntry],
+    cell_idx: &mut usize,
+    serve_row: &mut Vec<Value>,
+) -> bool {
+    while *cell_idx < cells.len() {
+        let entry = cells[*cell_idx];
+        *cell_idx += 1;
+        if plan.all_rowid {
+            // Every output column is the rowid (alias or sentinel): the
+            // record bytes are never parsed — `SELECT id FROM t …`
+            // degenerates to Integer writes.
+            serve_row.clear();
+            serve_row.resize(plan.project.len(), Value::Integer(entry.rowid));
+            return true;
+        }
+        let start = entry.off as usize;
+        let end = start + entry.len as usize;
+        let record = arena.get(start..end).unwrap_or(&[]);
+        let decoded = if plan.mem_pager {
+            // In-memory payloads are this process's own encoder output:
+            // arm trusted TEXT decode around this row (save/restore —
+            // the same discipline the pooled scans use per walk).
+            let saved = crate::types::value::text_decode_trusted();
+            crate::types::value::set_text_decode_trusted(true);
+            let r = crate::storage::row_codec::decode_row_selective(
+                record,
+                plan.n_cols,
+                &plan.project,
+                entry.rowid,
+                plan.rowid_alias,
+                serve_row,
+            );
+            crate::types::value::set_text_decode_trusted(saved);
+            r
+        } else {
+            crate::storage::row_codec::decode_row_selective(
+                record,
+                plan.n_cols,
+                &plan.project,
+                entry.rowid,
+                plan.rowid_alias,
+                serve_row,
+            )
+        };
+        if decoded.is_ok() {
+            return true;
+        }
+        // Corrupt entry: skip (mirrors the pooled scan's tolerance).
+    }
+    false
 }
 
 /// Output column names for a scan driver (mirrors exec_scan).
@@ -1464,6 +1722,47 @@ impl Driver for ProjectedScanDriver {
         self.last_rowid = last;
         Ok(out)
     }
+    fn next_cells(
+        &mut self,
+        db: &Database,
+        _params: &[Value],
+        _named: &HashMap<String, Value>,
+        budget: usize,
+        arena: &mut Vec<u8>,
+        entries: &mut Vec<crate::storage::btree::CellEntry>,
+    ) -> Result<Option<(CellPlan, crate::storage::btree::CellScanOutcome)>> {
+        if self.eof {
+            // Exhausted: an empty pull with hit_end lets the statement
+            // conclude Done (same contract as next_batch's empty Vec —
+            // including the "caller's buffers hold THIS pull only"
+            // invariant, so the previous batch cannot replay).
+            entries.clear();
+            arena.clear();
+            return Ok(Some((
+                CellPlan::new(&self.table, &self.project, db.pager.is_memory()),
+                crate::storage::btree::CellScanOutcome {
+                    hit_end: true,
+                    last_rowid: self.last_rowid,
+                },
+            )));
+        }
+        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let shared = db.read_maps();
+        let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+        let root = ctx.table_root(&self.table);
+        let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
+        let start = if self.last_rowid == i64::MIN {
+            i64::MIN
+        } else {
+            self.last_rowid + 1
+        };
+        let outcome =
+            bt.scan_table_range_cells(start, i64::MAX, budget, MAX_BATCH_BYTES, arena, entries)?;
+        self.eof = outcome.hit_end && entries.len() < budget;
+        self.last_rowid = outcome.last_rowid;
+        let plan = CellPlan::new(&self.table, &self.project, db.pager.is_memory());
+        Ok(Some((plan, outcome)))
+    }
 }
 
 /// FUSED ProjectedRangeDriver: `Project(RowidRange)` with a bare-column
@@ -1592,6 +1891,76 @@ impl Driver for ProjectedRangeDriver {
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
         Ok(out)
+    }
+    fn next_cells(
+        &mut self,
+        db: &Database,
+        params: &[Value],
+        named: &HashMap<String, Value>,
+        budget: usize,
+        arena: &mut Vec<u8>,
+        entries: &mut Vec<crate::storage::btree::CellEntry>,
+    ) -> Result<Option<(CellPlan, crate::storage::btree::CellScanOutcome)>> {
+        if self.eof {
+            entries.clear();
+            arena.clear();
+            return Ok(Some((
+                CellPlan::new(&self.table, &self.project, db.pager.is_memory()),
+                crate::storage::btree::CellScanOutcome {
+                    hit_end: true,
+                    last_rowid: self.last_rowid,
+                },
+            )));
+        }
+        // Bounds: the SAME evaluation as next_batch (re-evaluated per
+        // pull — parameters may change between executions; the resume
+        // clamp keeps mid-range pulls from re-reading rows).
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+        let lo = match &self.start {
+            Some(e) => {
+                let v = crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer();
+                if self.last_rowid != i64::MIN && self.last_rowid + 1 > v {
+                    self.last_rowid + 1
+                } else {
+                    v
+                }
+            }
+            None => {
+                if self.last_rowid == i64::MIN {
+                    i64::MIN
+                } else {
+                    self.last_rowid + 1
+                }
+            }
+        };
+        let hi = match &self.end {
+            Some(e) => crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer(),
+            None => i64::MAX,
+        };
+        if lo > hi {
+            self.eof = true;
+            entries.clear();
+            arena.clear();
+            return Ok(Some((
+                CellPlan::new(&self.table, &self.project, db.pager.is_memory()),
+                crate::storage::btree::CellScanOutcome {
+                    hit_end: true,
+                    last_rowid: self.last_rowid,
+                },
+            )));
+        }
+        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let shared = db.read_maps();
+        let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
+        let root = ctx.table_root(&self.table);
+        let mut bt = crate::storage::btree::Btree::new(ctx.pager, root, false);
+        let outcome = bt.scan_table_range_cells(lo, hi, budget, MAX_BATCH_BYTES, arena, entries)?;
+        self.eof = outcome.hit_end && entries.len() < budget;
+        self.last_rowid = outcome.last_rowid;
+        let plan = CellPlan::new(&self.table, &self.project, db.pager.is_memory());
+        Ok(Some((plan, outcome)))
     }
 }
 
