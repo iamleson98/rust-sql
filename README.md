@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **805+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **807+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -394,6 +394,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **Join reordering**: multi-table INNER-join spines flatten and rebuild smallest-filtered-first (`reorder_inner_joins` — greedy, connectivity-preferring, stat1 + access-path cardinalities); the WHERE's cross-relation conjuncts FUSE into join conditions, so implicit-join syntax hash-joins instead of crossing + filtering. The adversarial order (`big1 JOIN big2 … JOIN small WHERE small.id = ?`) drove the point-filtered table first and turned a 482 ms big×big intermediate into a 5.3 ms point-lookup chain — matching the benign order's plan. Multi-key AND-chain ON conditions take the hash path (they used to plan as nested loops), and pushed-lookup join sides keep their key extraction (`col_index`'s plain-name fallback).
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
+- **ON-conjunct pushdown**: single-table ON conjuncts route into the side scans (index selection included — the same machinery the WHERE clause uses), closing the old 100x-class asymmetry between `ON a.y > 997 AND a.y < b.y` (75M-pair sweep) and the equivalent WHERE form (2 ms).
 - **Non-equi joins (compiled + parallel)**: `ON a.x < b.y`-shaped conditions compile to a positional term (column positions split at the join boundary, comparisons over borrowed values, zero allocation for rejected pairs — the old loop built a combined `Vec<Value>` per PAIR); above the threshold the outer side splits across workers over the shared right rows (75M-pair sweep: 1.5x on 2 cores). Implicit-join forms (`FROM a, b WHERE a.y < b.y`) ride the same path instead of materializing the cross product.
 - **Concurrency**: see the [concurrency section](#concurrency-vs-sqlite) — the 8.3x concurrent-read and 5.7–8.3x parallel-aggregate multipliers sit on top of these serial wins.
 
@@ -717,10 +718,10 @@ compat surface. Every entry says what it costs and why it exists.
   pinning, self-joins, CTE atoms, subquery atoms declining safely,
   multiplicity, ANALYZE-driven estimates — the adversarial 3-join
   shape went 482 ms → 5.3 ms, ~90x, now matching the benign order).
-  Still rule-based rather than cost-searched: predicate pushdown into
-  all scan shapes and subquery decorrelation remain unimplemented, and
-  SQLite's full cost model still wins a few orders the greedy can't
-  see (bushy plans, multi-alternative costing).
+  Still rule-based rather than cost-searched: subquery decorrelation
+  remains unimplemented, and SQLite's full cost model still wins a few
+  orders the greedy can't see (bushy plans, multi-alternative
+  costing).
 - **Parallel executor coverage**: single-table shapes split (aggregates with
   literal **or parameter** filters, GROUP BY bare/compiled, top-N, unbounded
   ORDER BY with a fused 1:1 projection), and the **equi-JOIN probe side now
@@ -778,7 +779,14 @@ compat surface. Every entry says what it costs and why it exists.
   already-materialized sides (no double execution), and a Filter over a
   condition-less CROSS join (`FROM a, b WHERE a.y < b.y`) evaluates the
   predicate as the join condition — same rows, same order, no
-  cross-product materialization (`tests/nested_join.rs`).
+  cross-product materialization (`tests/nested_join.rs`). **Single-table
+  ON conjuncts push into the sides now too** (`ON a.y > 997 AND
+  a.y < b.y` becomes a filtered/indexed scan of a plus the spanning
+  condition — the explicit-ON form used to sweep every pair while the
+  implicit-WHERE form pushed the conjunct into the scan; INNER/CROSS
+  push both sides, LEFT the non-preserved right, RIGHT the
+  non-preserved left, FULL neither — differential-pinned against
+  SQLite). A 75M-pair probe dropped from ~1.5 s to 2 ms.
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled

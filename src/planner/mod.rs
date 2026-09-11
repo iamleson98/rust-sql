@@ -782,6 +782,33 @@ impl<'a> Planner<'a> {
                 };
                 // JoinType is shared with the AST — no conversion needed.
                 let jt = *join_type;
+                // ---- Single-table ON conjuncts push into the sides ----
+                // For INNER/CROSS joins, ON and WHERE are semantically
+                // interchangeable (SQLite's planner pushes single-table
+                // ON conjuncts into the scans too): `ON a.y > 997 AND
+                // a.y < b.y` becomes a filtered/indexed scan of a plus a
+                // spanning join condition — instead of sweeping every
+                // pair with a condition the nested loop re-evaluates per
+                // pair. For OUTER joins only the NON-preserved side is
+                // pushable, and only when that side has no unmatched-row
+                // tail: LEFT keeps its right side pushable (a failing b
+                // row can only ever null-extend), RIGHT its left side
+                // (an unmatched a row emits nothing); FULL keeps nothing
+                // (both sides feed tails).
+                let (l, r, condition) = {
+                    let push_left =
+                        matches!(jt, JoinType::Inner | JoinType::Cross | JoinType::Right);
+                    let push_right =
+                        matches!(jt, JoinType::Inner | JoinType::Cross | JoinType::Left);
+                    push_on_conjuncts_into_sides(
+                        self.catalog,
+                        l,
+                        r,
+                        condition,
+                        push_left,
+                        push_right,
+                    )
+                };
                 // Hash whenever the condition carries at least one
                 // column-to-column equality leaf (a single `l = r` OR an
                 // AND-chain like `ON a.x = b.x AND a.y = b.y` — the
@@ -2600,6 +2627,69 @@ pub fn top_level_output_names(sel: &SelectStatement) -> Option<Vec<String>> {
         }
         _ => None, // compound selects: defer to execution-time names
     }
+}
+
+/// Push an ON condition's single-table conjuncts into the join's side
+/// plans (the WHERE side of the same machinery — `pushdown_filter` /
+/// `apply_where_for_scan`, so index selection, rowid ranges and IN
+/// lookups all light up for ON predicates too). The caller gates the
+/// sides by join type (see the Join arm: INNER/CROSS push both, LEFT
+/// pushes the non-preserved right, RIGHT the non-preserved left, FULL
+/// neither). Ambiguous conjuncts (unqualified refs that bind BOTH
+/// sides' same-named columns), subquery-carrying conjuncts and
+/// unresolvable side shapes stay in the ON condition — correctness by
+/// fallback. Returns the (left, right, condition) triple.
+fn push_on_conjuncts_into_sides(
+    catalog: &Catalog,
+    left: Plan,
+    right: Plan,
+    condition: Option<Expr>,
+    push_left: bool,
+    push_right: bool,
+) -> (Plan, Plan, Option<Expr>) {
+    let Some(cond) = condition else {
+        return (left, right, None);
+    };
+    // Subquery conjuncts keep the full combined-row scope.
+    if crate::executor::expr_has_subquery(&cond) {
+        return (left, right, Some(cond));
+    }
+    let l_cols = plan_column_refs(&left);
+    let r_cols = plan_column_refs(&right);
+    if l_cols.is_empty() || r_cols.is_empty() {
+        return (left, right, Some(cond));
+    }
+    let conjuncts = split_and_chain(&cond);
+    let mut left_preds: Vec<Expr> = Vec::new();
+    let mut right_preds: Vec<Expr> = Vec::new();
+    let mut kept: Vec<Expr> = Vec::new();
+    for c in conjuncts {
+        let bound_l = conjunct_bound_by(&c, &l_cols);
+        let bound_r = conjunct_bound_by(&c, &r_cols);
+        if bound_l && !bound_r && push_left {
+            left_preds.push(c);
+        } else if bound_r && !bound_l && push_right {
+            right_preds.push(c);
+        } else {
+            kept.push(c);
+        }
+    }
+    let new_left = if left_preds.is_empty() {
+        left
+    } else {
+        pushdown_filter(catalog, left, &combine_and(&left_preds))
+    };
+    let new_right = if right_preds.is_empty() {
+        right
+    } else {
+        pushdown_filter(catalog, right, &combine_and(&right_preds))
+    };
+    let new_cond = if kept.is_empty() {
+        None
+    } else {
+        Some(combine_and(&kept))
+    };
+    (new_left, new_right, new_cond)
 }
 
 pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {

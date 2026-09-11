@@ -327,3 +327,98 @@ fn boolean_truthiness_matches_sqlite() {
         "SELECT a.x, b.z FROM a JOIN b ON NOT (a.y >= b.y) ORDER BY 1,2",
     );
 }
+
+/// Single-table ON conjuncts push into the join's sides (INNER/CROSS:
+/// both; LEFT: the non-preserved right; RIGHT: the non-preserved left;
+/// FULL: neither — both sides feed tails). The explicit-ON form now
+/// produces the same plan shape as the implicit-WHERE form (index
+/// selection included) instead of sweeping every pair.
+#[test]
+fn on_conjunct_pushdown_matches_sqlite() {
+    let setup = &[
+        "CREATE TABLE a (x INT, y INT)",
+        "CREATE TABLE b (y INT, z TEXT)",
+        "INSERT INTO a VALUES (1,1),(2,2),(5,5),(9,NULL)",
+        "INSERT INTO b VALUES (1,'x'),(3,'y'),(4,'w'),(NULL,'n')",
+    ];
+    for q in [
+        // INNER: both sides pushable
+        "SELECT a.x, b.z FROM a JOIN b ON a.y < b.y AND a.x > 1 ORDER BY 1,2",
+        "SELECT a.x, b.z FROM a JOIN b ON a.y < b.y AND b.y > 1 ORDER BY 1,2",
+        "SELECT a.x, b.z FROM a JOIN b ON a.y = b.y AND a.x = 1 ORDER BY 1,2",
+        "SELECT a.x FROM a JOIN b ON a.x = 1 ORDER BY 1",
+        // LEFT: non-preserved (right) side pushes; preserved-side
+        // conjuncts MUST stay in the ON (they control null-extension
+        // survival, not row survival)
+        "SELECT a.x, b.z FROM a LEFT JOIN b ON a.y < b.y AND b.y > 1 ORDER BY 1,2",
+        "SELECT a.x, b.z FROM a LEFT JOIN b ON a.y < b.y AND a.x > 1 ORDER BY 1,2",
+        "SELECT count(*) FROM a LEFT JOIN b ON a.y = b.y AND b.y > 1",
+        "SELECT count(*) FROM a LEFT JOIN b ON a.y = b.y AND a.x > 1",
+        // RIGHT: non-preserved (left) side pushes; right side feeds the
+        // tail so its conjuncts stay
+        "SELECT a.x, b.z FROM a RIGHT JOIN b ON a.y < b.y AND a.y > 1 ORDER BY 1,2",
+        "SELECT a.x, b.z FROM a RIGHT JOIN b ON a.y < b.y AND b.y > 1 ORDER BY 1,2",
+        // FULL: neither side pushes
+        "SELECT a.x, b.z FROM a FULL JOIN b ON a.y < b.y AND a.x > 1 ORDER BY 1,2",
+        "SELECT a.x, b.z FROM a FULL JOIN b ON a.y < b.y AND b.y > 1 ORDER BY 1,2",
+        // (Unqualified refs that bind BOTH sides' same-named columns
+        // are ambiguous — SQLite errors "ambiguous column name" at
+        // prepare; the engine resolves first-match and keeps the
+        // conjunct in the ON. A documented latitude, not compared here.)
+        // the pushdown must not change which rows survive anywhere
+        "SELECT count(*), sum(a.x), sum(b.y) FROM a JOIN b ON a.y < b.y AND a.x > 1",
+        "SELECT count(*), sum(a.x), sum(b.y) FROM a LEFT JOIN b ON a.y < b.y AND b.y > 1",
+    ] {
+        differential(setup, q);
+    }
+}
+
+/// The plan-shape win: the explicit-ON form with a single-table
+/// conjunct answers identically to the implicit-WHERE form (both route
+/// the conjunct into the scan) — and at row scale the pair sweep is
+/// gone. (Note: for LEFT joins `ON ... AND p` and `WHERE p` are
+/// semantically DIFFERENT — a null-rejecting WHERE drops the
+/// null-extended rows — so the equivalence pairs are INNER-only; the
+/// OUTER gating lives in `on_conjunct_pushdown_matches_sqlite`.)
+#[test]
+fn on_pushdown_equals_where_form_at_scale() {
+    let mut db = rustqlite::Database::open(":memory:").unwrap();
+    db.execute("CREATE TABLE l (y INT, tag TEXT)", vec![])
+        .unwrap();
+    db.execute("CREATE TABLE r (y INT, z TEXT)", vec![])
+        .unwrap();
+    let mut batch = String::from("INSERT INTO l VALUES ");
+    for i in 0..50_000i64 {
+        if i > 0 {
+            batch.push(',');
+        }
+        batch.push_str(&format!("({}, 't{}')", i % 331, i % 97));
+    }
+    db.execute(&batch, vec![]).unwrap();
+    let mut batch = String::from("INSERT INTO r VALUES ");
+    for i in 0..300i64 {
+        if i > 0 {
+            batch.push(',');
+        }
+        batch.push_str(&format!("({}, 'z{}')", i, i % 53));
+    }
+    db.execute(&batch, vec![]).unwrap();
+    for (on, wh) in [
+        (
+            "SELECT count(*) FROM l JOIN r ON l.y < r.y AND l.y > 300",
+            "SELECT count(*) FROM l, r WHERE l.y < r.y AND l.y > 300",
+        ),
+        (
+            "SELECT count(*) FROM l JOIN r ON l.y = r.y AND l.y > 300",
+            "SELECT count(*) FROM l, r WHERE l.y = r.y AND l.y > 300",
+        ),
+    ] {
+        let a = db.query(on, vec![]).unwrap();
+        let b = db.query(wh, vec![]).unwrap();
+        assert_eq!(
+            format!("{:?}", a),
+            format!("{:?}", b),
+            "ON form and WHERE form disagree:\n  {on}\n  {wh}"
+        );
+    }
+}
