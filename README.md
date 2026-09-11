@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **788+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **799+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -221,7 +221,7 @@ The catalog is an in-memory map of name → `Arc<Table>` / `Arc<Index>` / `Arc<V
 
 ### Planner
 
-Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot, and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Not yet: predicate pushdown into all scan shapes, join reordering, subquery decorrelation.
+Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot (side-qualified inside joins so `a.rowid`/`b.rowid` bind their own sides), and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Not yet: predicate pushdown into all scan shapes, join reordering, subquery decorrelation.
 
 ### Executor
 
@@ -1068,6 +1068,7 @@ default matrix, all passing, plus the sqlx feature suite:
 | Soak / long-run | `concurrency_stress.rs`, `RUSTQLITE_FUZZ_ITERS` | 32-thread mixed workloads; long fuzz iterations |
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |
 | Intra-statement parallelism | `tests/parallel_scan.rs` | parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order, top-N order, unbounded ORDER BY with projections/ordinals/hidden-rowid, parameter-filtered fused aggregates), 300k-row SQLite cross-check, transaction-decline + PRAGMA-gate contracts |
+| Rowid in joins | `tests/rowid_join.rs` | rowid pseudo-column refs in join conditions/projections/filters differential-pinned vs bundled SQLite (rowid↔rowid, rowid↔column, outer-join NULL semantics, 3-table chains, self-joins, INTEGER-PK alias tables, `COLLATE BINARY` as the default collation, `:memory:` purity) |
 | Numeric parity | `tests/numeric_parity.rs` | SUM/TOTAL/AVG/window arithmetic vs bundled SQLite at the **f64-bit** level (integer-exact + Kahan–Babuška compensation, flip semantics, NULL rules, worker-split equality) |
 | Temp-store spill | `tests/tempstore.rs` | forced multi-chunk spills match the RAM reference for every aggregate family; streaming driver = buffered; parallel = serial; key-sorted spill order; `PRAGMA temp_store` round-trip; ephemeral files always cleaned up |
 | Statistics | `tests/analyze.rs` | sqlite_stat1 rows in SQLite's exact format, targeted ANALYZE, cost-based index choice (unselective indexes declined), reopen persistence, compound/expression-index prefixes |

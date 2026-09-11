@@ -1318,7 +1318,9 @@ fn scan_columns_with_rowid(
         return scan_columns(table, alias);
     }
     let mut cols: Vec<String> = scan_columns(table, alias).iter().cloned().collect();
-    cols.push(crate::planner::HIDDEN_ROWID.to_string());
+    cols.push(crate::planner::hidden_rowid_slot(
+        alias.unwrap_or(&table.name),
+    ));
     cols.into()
 }
 

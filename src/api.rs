@@ -2070,6 +2070,16 @@ impl Database {
             }
             return Self::from_sqlite_file(&path);
         }
+        // SQLite convention: the exact string ":memory:" is a PURE
+        // in-memory database — no file is ever created, opened, or
+        // touched in the CWD (sqlite3_open(":memory:") semantics).
+        // Previously this fell through to `Pager::open_opts`, which
+        // happily created a regular file literally NAMED ":memory:" in
+        // the working directory — data silently persisted across runs
+        // (and collided with `CREATE TABLE` on re-open).
+        if !memory && path.as_os_str() == ":memory:" && codec.is_none() {
+            return Self::open_memory_inner();
+        }
         let pager = Pager::open_opts(&path, DEFAULT_CACHE_PAGES, memory)?;
         if let Some(c) = &codec {
             pager.set_codec(Some(c.clone()))?;

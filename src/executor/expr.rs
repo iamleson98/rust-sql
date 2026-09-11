@@ -323,6 +323,23 @@ impl<'a> EvalContext<'a> {
                     return self.row.get(i).cloned().unwrap_or(Value::Null);
                 }
             }
+            // Qualified rowid spelling that matched no real column: the
+            // side's hidden rowid slot, named "<prefix>.\0rowid". This
+            // is what makes `a.rowid` / `b.rowid` bind to the CORRECT
+            // side in a join's combined column list (both sides carry a
+            // trailing slot; a bare-name fallback would always bind the
+            // first one).
+            if crate::planner::is_rowid_spelling(name) {
+                for (i, n) in self.column_names.iter().enumerate() {
+                    if crate::planner::is_hidden_rowid(n) {
+                        if let Some(pos) = n.rfind('.') {
+                            if n[..pos].eq_ignore_ascii_case(t) {
+                                return self.row.get(i).cloned().unwrap_or(Value::Null);
+                            }
+                        }
+                    }
+                }
+            }
             // Qualified ref that doesn't match a local qualified name: if an
             // outer scope knows "qual.column", it is a correlated reference
             // (SQL scope rules — the qualifier names an outer table). This
@@ -343,8 +360,10 @@ impl<'a> EvalContext<'a> {
         // rewritten hidden name (no-alias tables; see
         // planner::HIDDEN_ROWID). The trailing pseudo-rowid slot may be
         // registered under EITHER name (legacy eval contexts append
-        // "rowid", driver output columns append the hidden name): match
-        // both.
+        // "rowid", driver output columns append the hidden name):
+        // match both — including the side-qualified "a.\0rowid"
+        // spelling (first slot wins = leftmost source, SQLite's
+        // left-to-right resolution for bare names).
         if name.eq_ignore_ascii_case("rowid")
             || name.eq_ignore_ascii_case("_rowid_")
             || name.eq_ignore_ascii_case("oid")
@@ -353,7 +372,7 @@ impl<'a> EvalContext<'a> {
             if let Some(idx) = self
                 .column_names
                 .iter()
-                .position(|c| c.eq_ignore_ascii_case("rowid") || c == crate::planner::HIDDEN_ROWID)
+                .position(|c| c.eq_ignore_ascii_case("rowid") || crate::planner::is_hidden_rowid(c))
             {
                 return self.row.get(idx).cloned().unwrap_or(Value::Null);
             }
@@ -413,6 +432,12 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             if let Some(coll_name) =
                 comparison_collation(left).or_else(|| comparison_collation(right))
             {
+                // BINARY is the DEFAULT collation (SQLite accepts
+                // `COLLATE BINARY` everywhere) — plain apply_binary, no
+                // lookup (lookup_collation maps "binary" to None).
+                if coll_name.eq_ignore_ascii_case("binary") {
+                    return Ok(apply_binary(*op, &l, &r));
+                }
                 if let Some(coll) = crate::plugin::lookup_collation(&coll_name) {
                     return Ok(apply_binary_collated(*op, &l, &r, coll.as_ref()));
                 }

@@ -118,16 +118,34 @@ impl<'a> Planner<'a> {
         // rowid has no in-row value to rewrite to).
         let mut plan = plan;
         if let SelectBody::Simple(s) = &stmt.body {
-            if let Some(TableExpression::Table {
-                name,
-                schema: None,
-                alias,
-                ..
-            }) = &s.from
-            {
-                if let Some(table) = self.catalog.get_table(name) {
-                    rewrite_rowid_refs_in_plan(&mut plan, &table, alias.as_deref());
+            match &s.from {
+                Some(TableExpression::Table {
+                    name,
+                    schema: None,
+                    alias,
+                    ..
+                }) => {
+                    if let Some(table) = self.catalog.get_table(name) {
+                        rewrite_rowid_refs_in_plan(&mut plan, &table, alias.as_deref());
+                    }
                 }
+                // MULTI-SIDE (join) FROM: every qualified rowid ref
+                // (`u.rowid = o.u_id`) rewrites through the side it
+                // names — the single-table hook above never fires for
+                // these shapes, so the refs previously evaluated NULL
+                // (alias tables) or mis-bound (slot tables).
+                Some(from) => {
+                    let mut names: Vec<(String, Option<String>)> = Vec::new();
+                    collect_from_sides(from, &mut names);
+                    let sides: Vec<(std::sync::Arc<Table>, Option<String>)> = names
+                        .into_iter()
+                        .filter_map(|(n, a)| self.catalog.get_table(&n).map(|t| (t, a)))
+                        .collect();
+                    if sides.len() > 1 {
+                        rewrite_rowid_refs_in_plan_multi(&mut plan, &sides);
+                    }
+                }
+                None => {}
             }
         }
 
@@ -3059,14 +3077,18 @@ fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
         Plan::Scan { table, alias, .. } => {
             let mut v = scan_qualified_cols(table, alias);
             if wants_rowid_slot(table) {
-                v.push(HIDDEN_ROWID.to_string());
+                // Mirrors the executor: side-qualified hidden slot
+                // (`prefix.\0rowid`) — see hidden_rowid_slot.
+                v.push(hidden_rowid_slot(alias.as_deref().unwrap_or(&table.name)));
             }
             v
         }
         Plan::RowidRange { table, .. } | Plan::IndexLookup { table, .. } => {
             let mut v: Vec<String> = table.col_names.iter().cloned().collect();
             if wants_rowid_slot(table) {
-                v.push(HIDDEN_ROWID.to_string());
+                // Mirrors the executors: alias-less drivers qualify the
+                // hidden slot with the table name.
+                v.push(hidden_rowid_slot(&table.name));
             }
             v
         }
@@ -4328,8 +4350,31 @@ fn try_elide_rowid_order_sort(plan: Plan) -> Plan {
 pub(crate) const HIDDEN_ROWID: &str = "\u{0}rowid";
 
 /// True for names that are internal hidden slots (star expansion filter).
+/// Accepts BOTH spellings: the legacy bare `"\0rowid"` and the
+/// side-qualified `"a.\0rowid"` (see `hidden_rowid_slot` — joins need
+/// each side's slot distinguishable by name, or `a.rowid` and `b.rowid`
+/// both bind to the FIRST hidden slot in the combined list).
 pub(crate) fn is_hidden_rowid(name: &str) -> bool {
-    name.starts_with('\u{0}')
+    name.starts_with('\u{0}') || name.contains(".\u{0}rowid")
+}
+
+/// The hidden rowid slot's name for a scan of `table` under the
+/// effective prefix (alias or table name): `"prefix.\0rowid"`. The
+/// qualifier makes the slot resolvable per-SIDE in a join's combined
+/// column list — `a.rowid` binds to `a.\0rowid`, `b.rowid` to
+/// `b.\0rowid` — while the NUL marker keeps it unparseable as a user
+/// identifier and filtered out of star expansions.
+pub(crate) fn hidden_rowid_slot(prefix: &str) -> String {
+    format!("{}.{}", prefix, HIDDEN_ROWID)
+}
+
+/// Is `name` one of the rowid pseudo-column spellings (`rowid`,
+/// `_rowid_`, `oid`, or the hidden slot's own name)?
+pub(crate) fn is_rowid_spelling(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+        || name == HIDDEN_ROWID
 }
 
 /// Do rows from this table's scans carry the hidden rowid slot? Only
@@ -4462,16 +4507,183 @@ fn rewrite_rowid_refs_in_plan(plan: &mut Plan, table: &Arc<Table>, alias: Option
     }
 }
 
+/// MULTI-SIDE rowid-in-expression rewrite: a join's FROM clause
+/// contributes several (table, alias) sides, and a QUALIFIED rowid ref
+/// (`u.rowid`, `o.oid`) names exactly one of them. Each expression site
+/// in the plan rewrites through every side; the qualifier check inside
+/// makes non-matching sides no-ops. Bare spellings are left alone (bare
+/// `rowid` across join sides is ambiguous — the evaluator's first-slot
+/// rule and SQLite's ambiguity latitude apply).
+///
+/// This is what makes `ON u.rowid = o.u_id` (an INTEGER-PK alias table
+/// on one side) resolve inside joins: the single-table hook never fires
+/// for a multi-source FROM, so the ref previously evaluated NULL.
+/// Scope boundaries (subquery plans) are not descended into — their own
+/// plan_select pass fires with their own FROM sides.
+fn rewrite_rowid_refs_in_plan_multi(
+    plan: &mut Plan,
+    sides: &[(std::sync::Arc<Table>, Option<String>)],
+) {
+    let exprs: Vec<&mut Expr> = match plan {
+        Plan::Scan { predicate, .. } => predicate.iter_mut().collect(),
+        Plan::RowidLookup { rowid, .. } => vec![rowid],
+        Plan::RowidIn {
+            values, residual, ..
+        } => std::sync::Arc::make_mut(values)
+            .iter_mut()
+            .chain(residual.iter_mut())
+            .collect(),
+        Plan::RowidRange {
+            start,
+            end,
+            residual,
+            ..
+        } => start
+            .iter_mut()
+            .chain(end.iter_mut())
+            .chain(residual.iter_mut())
+            .collect(),
+        Plan::IndexIn {
+            key_exprs,
+            residual,
+            ..
+        } => std::sync::Arc::make_mut(key_exprs)
+            .iter_mut()
+            .chain(residual.iter_mut())
+            .collect(),
+        Plan::IndexLookup { key_exprs, .. } => key_exprs.iter_mut().collect(),
+        Plan::IndexRange {
+            start,
+            end,
+            residual,
+            ..
+        } => start
+            .iter_mut()
+            .map(|(e, _)| e)
+            .chain(end.iter_mut().map(|(e, _)| e))
+            .chain(residual.iter_mut())
+            .collect(),
+        Plan::Values { rows } => rows.iter_mut().flatten().collect(),
+        Plan::Filter { input, predicate } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            vec![predicate]
+        }
+        Plan::Project { input, columns } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            columns.iter_mut().map(|c| &mut c.expr).collect()
+        }
+        Plan::Sort { input, terms } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            terms.iter_mut().map(|t| &mut t.expr).collect()
+        }
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            group_by
+                .iter_mut()
+                .chain(aggregates.iter_mut().filter_map(|a| a.arg.as_mut()))
+                .collect()
+        }
+        Plan::Window { input, windows } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            let mut out: Vec<&mut Expr> = Vec::new();
+            for w in windows.iter_mut() {
+                if let Some(a) = w.arg.as_mut() {
+                    out.push(a);
+                }
+                out.extend(w.extra_args.iter_mut());
+                out.extend(w.partition_by.iter_mut());
+                out.extend(w.order_by.iter_mut().map(|t| &mut t.expr));
+            }
+            out
+        }
+        Plan::TableFunction { args, .. } => args.iter_mut().collect(),
+        Plan::Distinct { input } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            Vec::new()
+        }
+        // Subquery plans are their own FROM scope.
+        Plan::Subquery { .. } => Vec::new(),
+        Plan::Limit { input, .. } => {
+            rewrite_rowid_refs_in_plan_multi(input, sides);
+            Vec::new()
+        }
+        Plan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            rewrite_rowid_refs_in_plan_multi(left, sides);
+            rewrite_rowid_refs_in_plan_multi(right, sides);
+            condition.iter_mut().collect()
+        }
+        Plan::IndexNestedLoopJoin { outer, .. } => {
+            rewrite_rowid_refs_in_plan_multi(outer, sides);
+            Vec::new()
+        }
+        // DML / CTE rows / set operations: not reachable from a plain
+        // SELECT plan walk.
+        _ => Vec::new(),
+    };
+    for e in exprs {
+        for (t, a) in sides {
+            rewrite_rowid_in_expr_qual(e, t, a.as_deref());
+        }
+    }
+}
+
+/// Collect every base-table (name, alias) side of a FROM expression
+/// tree — walking Join nodes, skipping subqueries and table functions
+/// (their output columns carry no rowid slots; a same-named qualifier
+/// simply matches nothing in the rewrite).
+fn collect_from_sides(from: &TableExpression, out: &mut Vec<(String, Option<String>)>) {
+    match from {
+        TableExpression::Table { name, alias, .. } => {
+            out.push((name.clone(), alias.clone()));
+        }
+        TableExpression::Join { left, right, .. } => {
+            collect_from_sides(left, out);
+            collect_from_sides(right, out);
+        }
+        TableExpression::Subquery { .. } | TableExpression::Function { .. } => {}
+    }
+}
+
 /// One expression tree: rewrite rowid spellings everywhere EXCEPT inside
 /// subquery bodies (scope boundary — see the plan-level doc above).
 fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) {
+    rewrite_rowid_in_expr_inner(e, table, alias, false)
+}
+
+/// Qualified-only variant for MULTI-SIDE (join) scopes: bare `rowid` is
+/// ambiguous across join sides, so only refs that name a side are
+/// rewritten — bare refs stay for the evaluator's first-slot rule.
+fn rewrite_rowid_in_expr_qual(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) {
+    rewrite_rowid_in_expr_inner(e, table, alias, true)
+}
+
+fn rewrite_rowid_in_expr_inner(
+    e: &mut Expr,
+    table: &Arc<Table>,
+    alias: Option<&str>,
+    qual_only: bool,
+) {
     match e {
         Expr::Column { table: qual, name } => {
-            if let Some(q) = qual {
-                let effective = alias.unwrap_or(&table.name);
-                if !q.eq_ignore_ascii_case(&table.name) && !q.eq_ignore_ascii_case(effective) {
-                    return;
+            match qual {
+                Some(q) => {
+                    let effective = alias.unwrap_or(&table.name);
+                    if !q.eq_ignore_ascii_case(&table.name) && !q.eq_ignore_ascii_case(effective) {
+                        return;
+                    }
                 }
+                // Multi-side scope: bare spellings are ambiguous — skip.
+                None if qual_only => return,
+                None => {}
             }
             let is_spelling = name.eq_ignore_ascii_case("rowid")
                 || name.eq_ignore_ascii_case("_rowid_")
@@ -4485,42 +4697,56 @@ fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) 
                 return;
             }
             if let Some(idx) = table.rowid_alias {
-                *e = Expr::Column {
-                    table: None,
-                    name: table.columns[idx].name.clone(),
+                // Multi-side scope: keep the side's EFFECTIVE prefix as
+                // the qualifier — a bare alias-column name would be
+                // ambiguous against the other side's same-named column
+                // (`u.rowid`/`o.rowid` over two INTEGER-PK tables both
+                // rewriting to bare "id").
+                *e = if qual_only {
+                    Expr::Column {
+                        table: Some(alias.unwrap_or(&table.name).to_string()),
+                        name: table.columns[idx].name.clone(),
+                    }
+                } else {
+                    Expr::Column {
+                        table: None,
+                        name: table.columns[idx].name.clone(),
+                    }
                 };
             } else if !table.without_rowid {
                 // No alias column: the scan drivers append the rowid as a
-                // trailing slot named HIDDEN_ROWID (see plan_select's
-                // hook) — expression evaluation resolves it by exact
-                // match. Materialized paths without the slot evaluate
-                // NULL (a documented limitation of the fallback path).
+                // trailing slot named "<prefix>.\0rowid" (see
+                // plan_select's hook and `hidden_rowid_slot`) — the
+                // QUALIFIED name resolves both in single-table scopes
+                // (suffix pass) and inside JOINs, where the combined
+                // column list carries BOTH sides' slots and a bare
+                // "\0rowid" ref would always bind the first one.
                 *e = Expr::Column {
                     table: None,
-                    name: HIDDEN_ROWID.to_string(),
+                    name: hidden_rowid_slot(alias.unwrap_or(&table.name)),
                 };
             }
         }
         Expr::Binary { left, right, .. } => {
-            rewrite_rowid_in_expr(left, table, alias);
-            rewrite_rowid_in_expr(right, table, alias);
+            rewrite_rowid_in_expr_inner(left, table, alias, qual_only);
+            rewrite_rowid_in_expr_inner(right, table, alias, qual_only);
         }
-        Expr::Unary { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        Expr::Unary { expr, .. } => rewrite_rowid_in_expr_inner(expr, table, alias, qual_only),
         Expr::Between {
             expr, low, high, ..
         } => {
-            rewrite_rowid_in_expr(expr, table, alias);
-            rewrite_rowid_in_expr(low, table, alias);
-            rewrite_rowid_in_expr(high, table, alias);
+            rewrite_rowid_in_expr_inner(expr, table, alias, qual_only);
+            rewrite_rowid_in_expr_inner(low, table, alias, qual_only);
+            rewrite_rowid_in_expr_inner(high, table, alias, qual_only);
         }
         Expr::In {
             expr,
             source: InSource::List(values),
             ..
         } => {
-            rewrite_rowid_in_expr(expr, table, alias);
+            rewrite_rowid_in_expr_inner(expr, table, alias, qual_only);
             for v in std::sync::Arc::make_mut(values).iter_mut() {
-                rewrite_rowid_in_expr(v, table, alias);
+                rewrite_rowid_in_expr_inner(v, table, alias, qual_only);
             }
         }
         Expr::Like {
@@ -4529,23 +4755,23 @@ fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) 
             escape,
             ..
         } => {
-            rewrite_rowid_in_expr(expr, table, alias);
-            rewrite_rowid_in_expr(pattern, table, alias);
+            rewrite_rowid_in_expr_inner(expr, table, alias, qual_only);
+            rewrite_rowid_in_expr_inner(pattern, table, alias, qual_only);
             if let Some(es) = escape.as_mut() {
-                rewrite_rowid_in_expr(es, table, alias);
+                rewrite_rowid_in_expr_inner(es, table, alias, qual_only);
             }
         }
-        Expr::IsNull { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        Expr::IsNull { expr, .. } => rewrite_rowid_in_expr_inner(expr, table, alias, qual_only),
         Expr::Is { left, right, .. } => {
-            rewrite_rowid_in_expr(left, table, alias);
-            rewrite_rowid_in_expr(right, table, alias);
+            rewrite_rowid_in_expr_inner(left, table, alias, qual_only);
+            rewrite_rowid_in_expr_inner(right, table, alias, qual_only);
         }
         Expr::Function { args, filter, .. } => {
             for a in args.iter_mut() {
-                rewrite_rowid_in_expr(a, table, alias);
+                rewrite_rowid_in_expr_inner(a, table, alias, qual_only);
             }
             if let Some(f) = filter.as_mut() {
-                rewrite_rowid_in_expr(f, table, alias);
+                rewrite_rowid_in_expr_inner(f, table, alias, qual_only);
             }
         }
         Expr::Case {
@@ -4554,23 +4780,23 @@ fn rewrite_rowid_in_expr(e: &mut Expr, table: &Arc<Table>, alias: Option<&str>) 
             else_,
         } => {
             if let Some(o) = operand.as_mut() {
-                rewrite_rowid_in_expr(o, table, alias);
+                rewrite_rowid_in_expr_inner(o, table, alias, qual_only);
             }
             for (w, t) in whens.iter_mut() {
-                rewrite_rowid_in_expr(w, table, alias);
-                rewrite_rowid_in_expr(t, table, alias);
+                rewrite_rowid_in_expr_inner(w, table, alias, qual_only);
+                rewrite_rowid_in_expr_inner(t, table, alias, qual_only);
             }
             if let Some(el) = else_.as_mut() {
-                rewrite_rowid_in_expr(el, table, alias);
+                rewrite_rowid_in_expr_inner(el, table, alias, qual_only);
             }
         }
         Expr::Row(exprs) => {
             for x in exprs.iter_mut() {
-                rewrite_rowid_in_expr(x, table, alias);
+                rewrite_rowid_in_expr_inner(x, table, alias, qual_only);
             }
         }
-        Expr::Cast { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
-        Expr::Collate { expr, .. } => rewrite_rowid_in_expr(expr, table, alias),
+        Expr::Cast { expr, .. } => rewrite_rowid_in_expr_inner(expr, table, alias, qual_only),
+        Expr::Collate { expr, .. } => rewrite_rowid_in_expr_inner(expr, table, alias, qual_only),
         // Scope boundaries: subqueries plan their own rowid scope.
         Expr::Subquery(_) | Expr::Exists(_) => {}
         Expr::In {

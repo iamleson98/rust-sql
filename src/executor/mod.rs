@@ -3408,8 +3408,12 @@ fn scan_filter_limit(
         }
     }
     let columns: Arc<[String]> = if append_rowid {
+        // Side-qualified hidden slot: `a.rowid` / `b.rowid` refs in
+        // projections and join conditions above must bind to THIS
+        // scan's slot, not the first same-named slot in a combined list.
+        let slot = crate::planner::hidden_rowid_slot(alias.as_deref().unwrap_or(&table.name));
         let mut v: Vec<String> = columns.iter().cloned().collect();
-        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.push(slot);
         v.into()
     } else {
         columns
@@ -3597,6 +3601,16 @@ fn apply_projection(
     }
 
     let mut out_rows = Vec::with_capacity(inner.rows.len());
+    // Star positions: hidden slots can sit anywhere in the row now (a
+    // join's combined layout interleaves each side's trailing slot),
+    // so stars select by NAME, never by trailing-trim.
+    let star_positions: Vec<usize> = inner
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !crate::planner::is_hidden_rowid(c))
+        .map(|(i, _)| i)
+        .collect();
     if all_resolved {
         for row in &inner.rows {
             let mut out = Vec::with_capacity(out_columns.len());
@@ -3616,8 +3630,9 @@ fn apply_projection(
                 }
                 if let Expr::Column { name, .. } = &c.expr {
                     if name == "*" {
-                        let take = row.len().saturating_sub(hidden_count);
-                        out.extend(row[..take].iter().cloned());
+                        for &i in &star_positions {
+                            out.push(row[i].clone());
+                        }
                         continue;
                     }
                 }
@@ -3750,6 +3765,22 @@ fn resolve_column_index<T: AsRef<str>>(
                 return Some(i);
             }
         }
+        // Qualified rowid spelling with no real column match: the side's
+        // hidden slot "<prefix>.\0rowid" (the JOIN-correctness pass —
+        // `a.rowid` / `b.rowid` must bind to their own sides; the bare
+        // fallback would always take the first slot).
+        if crate::planner::is_rowid_spelling(name) {
+            for (i, n) in col_names.iter().enumerate() {
+                let n = n.as_ref();
+                if crate::planner::is_hidden_rowid(n) {
+                    if let Some(pos) = n.rfind('.') {
+                        if n[..pos].eq_ignore_ascii_case(t) {
+                            return Some(i);
+                        }
+                    }
+                }
+            }
+        }
         // Fall through to unqualified resolution (mirrors lookup()).
     }
     // Exact match first.
@@ -3763,6 +3794,15 @@ fn resolve_column_index<T: AsRef<str>>(
         let n = n.as_ref();
         if let Some(pos) = n.rfind('.') {
             if n[pos + 1..].eq_ignore_ascii_case(name) {
+                return Some(i);
+            }
+        }
+    }
+    // Bare rowid spelling with no real column match: the first hidden
+    // rowid slot (leftmost source — SQLite's left-to-right resolution).
+    if table.is_none() && crate::planner::is_rowid_spelling(name) {
+        for (i, n) in col_names.iter().enumerate() {
+            if crate::planner::is_hidden_rowid(n.as_ref()) {
                 return Some(i);
             }
         }
@@ -4103,7 +4143,7 @@ fn scan_output_columns(
                 .collect()
         };
         let mut v = base;
-        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.push(crate::planner::hidden_rowid_slot(prefix));
         v.into()
     } else if prefix == table.name {
         table.qualified_col_names.clone()
@@ -8234,7 +8274,7 @@ fn exec_aggregate_no_group_by(
             .map(|c| format!("{}.{}", prefix, c.name))
             .collect();
         if append_rowid {
-            v.push(crate::planner::HIDDEN_ROWID.to_string());
+            v.push(crate::planner::hidden_rowid_slot(prefix));
         }
         Some(v)
     };
@@ -10698,6 +10738,20 @@ fn try_fused_scan_hash_join(
     let l_cols = scan_columns_static(l_table, l_alias);
     let r_cols = scan_columns_static(r_table, r_alias);
     let n_left = l_cols.len();
+    // Hidden rowid slots: the materialized path's combined rows carry
+    // each side's trailing slot (the scans append them), so the fused
+    // output must carry them too — interleaved at the same positions
+    // (left's after the left columns, right's after the right) — or
+    // upper operators resolve `a.rowid` refs differently depending on
+    // which path ran (NULLs from the fused path, values from the
+    // materialized one).
+    let l_slot = crate::planner::wants_rowid_slot(l_table);
+    let r_slot = crate::planner::wants_rowid_slot(r_table);
+    let left_width = n_left + l_slot as usize;
+    let l_slot_name = l_slot
+        .then(|| crate::planner::hidden_rowid_slot(l_alias.as_deref().unwrap_or(&l_table.name)));
+    let r_slot_name = r_slot
+        .then(|| crate::planner::hidden_rowid_slot(r_alias.as_deref().unwrap_or(&r_table.name)));
     // None = no Project above the join: synthesize the FULL combined row
     // (every column of both sides, left then right — exactly the
     // materialized path's combined layout, minus materializing the sides).
@@ -10705,24 +10759,38 @@ fn try_fused_scan_hash_join(
     let columns: &[crate::planner::plan::ProjectExpr] = match projection {
         Some(c) => c,
         None => {
-            synthesized = l_cols
-                .iter()
-                .chain(r_cols.iter())
-                .map(|s| crate::planner::plan::ProjectExpr {
-                    expr: Expr::Column {
-                        table: None,
-                        name: s.to_string(),
-                    },
-                    // The synthesized rows must be scope-compatible with the
-                    // materialized path's combined columns: QUALIFIED names
-                    // ("u.id", "o.id"). Without the alias, the display-name
-                    // pass strips the qualifier and downstream nodes (a WHERE
-                    // with a correlated subquery binding `o.id`, an outer
-                    // Project, ORDER BY) resolve same-named columns to the
-                    // FIRST match — users.id instead of orders.id.
-                    alias: Some(s.to_string()),
-                })
-                .collect();
+            let synth_cols = |cols: &std::sync::Arc<[String]>, slot: &Option<String>| {
+                let mut v: Vec<crate::planner::plan::ProjectExpr> = cols
+                    .iter()
+                    .map(|s| crate::planner::plan::ProjectExpr {
+                        expr: Expr::Column {
+                            table: None,
+                            name: s.to_string(),
+                        },
+                        // The synthesized rows must be scope-compatible with the
+                        // materialized path's combined columns: QUALIFIED names
+                        // ("u.id", "o.id"). Without the alias, the display-name
+                        // pass strips the qualifier and downstream nodes (a WHERE
+                        // with a correlated subquery binding `o.id`, an outer
+                        // Project, ORDER BY) resolve same-named columns to the
+                        // FIRST match — users.id instead of orders.id.
+                        alias: Some(s.to_string()),
+                    })
+                    .collect();
+                if let Some(sn) = slot {
+                    v.push(crate::planner::plan::ProjectExpr {
+                        expr: Expr::Column {
+                            table: None,
+                            name: sn.clone(),
+                        },
+                        alias: Some(sn.clone()),
+                    });
+                }
+                v
+            };
+            let mut v = synth_cols(&l_cols, &l_slot_name);
+            v.extend(synth_cols(&r_cols, &r_slot_name));
+            synthesized = v;
             &synthesized
         }
     };
@@ -10751,15 +10819,19 @@ fn try_fused_scan_hash_join(
 
     // ---- Projection resolution (bare columns only) --------------------
     // Combined column list as BORROWED strings (left then right — exactly
-    // the layout the materialized path's combined list has). One small
-    // Vec<&str>, no per-column String clones. Resolution pass ORDER
-    // (qualified-exact across both sides BEFORE any suffix fallback) is
-    // what makes `b.id` resolve to the b side, not a same-named `a.id`.
-    let combined: Vec<&str> = l_cols
-        .iter()
-        .map(|s| s.as_str())
-        .chain(r_cols.iter().map(|s| s.as_str()))
-        .collect();
+    // the layout the materialized path's combined list has, including the
+    // hidden rowid slots). One small Vec<&str>, no per-column String
+    // clones. Resolution pass ORDER (qualified-exact across both sides
+    // BEFORE any suffix fallback) is what makes `b.id` resolve to the b
+    // side, not a same-named `a.id`.
+    let mut combined: Vec<&str> = l_cols.iter().map(|s| s.as_str()).collect();
+    if let Some(sn) = &l_slot_name {
+        combined.push(sn.as_str());
+    }
+    combined.extend(r_cols.iter().map(|s| s.as_str()));
+    if let Some(sn) = &r_slot_name {
+        combined.push(sn.as_str());
+    }
     let mut out_combined: Vec<usize> = Vec::with_capacity(columns.len());
     let mut out_names: Vec<String> = Vec::with_capacity(columns.len());
     for c in columns {
@@ -10841,10 +10913,27 @@ fn try_fused_scan_hash_join(
     let mut out_side_build: Vec<bool> = Vec::with_capacity(out_combined.len());
     let mut out_local: Vec<usize> = Vec::with_capacity(out_combined.len());
     for &p in &out_combined {
-        let from_left = p < n_left;
+        // The left region includes its trailing hidden slot: left_width.
+        let from_left = p < left_width;
         out_side_build.push(from_left == build_is_left);
-        out_local.push(if from_left { p } else { p - n_left });
+        out_local.push(if from_left { p } else { p - left_width });
     }
+    // A side's hidden-slot local position (== the side's real column
+    // count) maps to the ROWID_PROJ sentinel in the decode wanted list —
+    // the codec decodes the trailing slot from the B+tree key. Only a
+    // side that HAS a slot can produce that local, so the mapping is
+    // unambiguous.
+    let build_real = build.n_cols;
+    let build_slot = if build_is_left { l_slot } else { r_slot };
+    let probe_real = probe.n_cols;
+    let probe_slot = if build_is_left { r_slot } else { l_slot };
+    let wanted_of = |l: usize, real: usize, slot: bool| -> usize {
+        if l == real && slot {
+            crate::storage::row_codec::ROWID_PROJ
+        } else {
+            l
+        }
+    };
     // Build side wanted columns: every key + every build-side projected
     // local. Sorted + deduplicated so `decode_row_selective` takes its
     // allocation-free ascending path (an unsorted list costs a
@@ -10852,7 +10941,7 @@ fn try_fused_scan_hash_join(
     let mut build_wanted: Vec<usize> = build.keys_local.clone();
     for (i, &is_build) in out_side_build.iter().enumerate() {
         if is_build {
-            build_wanted.push(out_local[i]);
+            build_wanted.push(wanted_of(out_local[i], build_real, build_slot));
         }
     }
     build_wanted.sort_unstable();
@@ -10869,7 +10958,7 @@ fn try_fused_scan_hash_join(
     let mut probe_wanted: Vec<usize> = probe.keys_local.clone();
     for (i, &is_build) in out_side_build.iter().enumerate() {
         if !is_build {
-            probe_wanted.push(out_local[i]);
+            probe_wanted.push(wanted_of(out_local[i], probe_real, probe_slot));
         }
     }
     probe_wanted.sort_unstable();
@@ -10886,14 +10975,16 @@ fn try_fused_scan_hash_join(
         .zip(out_local.iter())
         .map(|(&is_build, &local)| {
             if is_build {
+                let needle = wanted_of(local, build_real, build_slot);
                 OutSlot {
                     from_build: true,
-                    pos: build_wanted.iter().position(|&c| c == local).unwrap_or(0),
+                    pos: build_wanted.iter().position(|&c| c == needle).unwrap_or(0),
                 }
             } else {
+                let needle = wanted_of(local, probe_real, probe_slot);
                 OutSlot {
                     from_build: false,
-                    pos: probe_wanted.iter().position(|&c| c == local).unwrap_or(0),
+                    pos: probe_wanted.iter().position(|&c| c == needle).unwrap_or(0),
                 }
             }
         })
@@ -12003,6 +12094,21 @@ fn col_index(expr: &Expr, cols: &[String]) -> Option<usize> {
                         }
                     }
                 }
+                // Qualified rowid spelling: the side's hidden slot
+                // "<t>.\0rowid" (so `ON a.rowid = b.rowid` extracts real
+                // equi keys instead of degrading to the nested loop —
+                // where both refs used to bind to the LEFT slot).
+                if crate::planner::is_rowid_spelling(name) {
+                    for (i, c) in cols.iter().enumerate() {
+                        if crate::planner::is_hidden_rowid(c) {
+                            if let Some(pos) = c.rfind('.') {
+                                if c[..pos].eq_ignore_ascii_case(t) {
+                                    return Some(i);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Fallback: the executor's own resolver
                 // (`resolve_column_index`) falls through to UNQUALIFIED
                 // resolution when a qualified reference matches no dotted
@@ -12652,7 +12758,10 @@ fn exec_rowid_range(
         // Bare "rowid" — satisfies both `rowid` and qualified `t.rowid`
         // references through the evaluator's exact + suffix matching.
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push("rowid".to_string());
+        // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
+        // bare `rowid` refs still resolve through lookup's rowid special
+        // case (is_hidden_rowid matches the qualified spelling).
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
         v
     } else {
         Vec::new()
@@ -12682,8 +12791,10 @@ fn exec_rowid_range(
     })?;
 
     let columns: Arc<[String]> = if append_rowid {
+        // Side-qualified hidden slot (this driver is alias-less — the
+        // table name is the prefix; atom_out_cols mirrors exactly).
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
         v.into()
     } else {
         table.col_names.clone()
@@ -12796,7 +12907,10 @@ fn exec_rowid_range_projected_impl(
     let residual = residual.filter(|_| !table.without_rowid && !has_real_rowid_col);
     let eval_cols: Vec<String> = if residual.is_some() {
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push("rowid".to_string());
+        // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
+        // bare `rowid` refs still resolve through lookup's rowid special
+        // case (is_hidden_rowid matches the qualified spelling).
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
         v
     } else {
         Vec::new()
@@ -12910,8 +13024,10 @@ fn exec_index_lookup(
     // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
     // full-row fetches carry the trailing rowid.
     let out_cols: Arc<[String]> = if crate::planner::wants_rowid_slot(&table) {
+        // Side-qualified hidden slot (alias-less driver — table name is
+        // the prefix; atom_out_cols mirrors exactly).
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
         v.into()
     } else {
         table.col_names.clone()
@@ -13199,7 +13315,7 @@ fn exec_index_range(
         let append_rowid = crate::planner::wants_rowid_slot(&table);
         let eval_names: Vec<String> = if residual_pred.is_some() && append_rowid {
             let mut v: Vec<String> = plain_names.iter().cloned().collect();
-            v.push("rowid".to_string());
+            v.push(crate::planner::hidden_rowid_slot(&table.name));
             v
         } else {
             Vec::new()
@@ -13248,7 +13364,7 @@ fn exec_index_range(
         let append_rowid = crate::planner::wants_rowid_slot(&table);
         let eval_names: Vec<String> = if residual.is_some() && append_rowid {
             let mut v: Vec<String> = plain_names.iter().cloned().collect();
-            v.push("rowid".to_string());
+            v.push(crate::planner::hidden_rowid_slot(&table.name));
             v
         } else {
             Vec::new()
@@ -13289,8 +13405,10 @@ fn exec_index_range(
 
     // Output columns gain the hidden rowid slot (no-alias tables).
     if crate::planner::wants_rowid_slot(&table) {
+        // Side-qualified hidden slot (alias-less driver — table name is
+        // the prefix; atom_out_cols mirrors exactly).
         let mut v: Vec<String> = columns.iter().cloned().collect();
-        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
         let cols: Arc<[String]> = v.into();
         return Ok(ExecResult {
             columns: cols,
@@ -13387,7 +13505,10 @@ fn exec_index_range_projected(
     let residual = residual.filter(|_| !table.without_rowid && !has_real_rowid_col);
     let eval_cols: Vec<String> = if residual.is_some() {
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push("rowid".to_string());
+        // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
+        // bare `rowid` refs still resolve through lookup's rowid special
+        // case (is_hidden_rowid matches the qualified spelling).
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
         v
     } else {
         Vec::new()
@@ -15833,7 +15954,7 @@ fn exec_update(
         && source_res
             .columns
             .last()
-            .is_some_and(|c| c.as_str() == crate::planner::HIDDEN_ROWID);
+            .is_some_and(|c| crate::planner::is_hidden_rowid(c));
     let n_cols = table.n_columns();
 
     let indexes = ctx.catalog().indexes_on_table(&table.name);
