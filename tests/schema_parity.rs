@@ -483,7 +483,7 @@ fn pragma_list_is_the_portable_core() {
     // core. The differential contract: every name the engine reports is
     // a pragma real SQLite knows (subset), the shape is one text column
     // per row, and the stable core members are present.
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let ours: Vec<String> = db
         .query("PRAGMA pragma_list", [])
         .unwrap()
