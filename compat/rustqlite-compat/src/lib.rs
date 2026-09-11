@@ -354,11 +354,72 @@ struct Engine {
     db: parking_lot::RwLock<Database>,
     /// Connection id that currently owns the engine-level transaction
     /// (0 = none). Serializes cross-connection transactions with
-    /// SQLite-style BUSY/busy_timeout semantics.
+    /// SQLite-style BUSY/busy_timeout semantics (private-cache mode) or
+    /// SQLITE_LOCKED + unlock_notify (shared-cache mode).
     tx_owner: AtomicUsize,
     /// Live C-ABI connections sharing this engine — the "concurrency"
     /// stat on the admin dashboard (each sqlx pool connection = one).
     live_connections: AtomicUsize,
+    /// Shared-cache connections blocked on the current transaction, with
+    /// their unlock_notify registrations (SQLite's deferred-callback
+    /// machinery: step returns SQLITE_LOCKED, the app registers, the
+    /// holder's COMMIT/ROLLBACK delivers the callbacks on ITS thread).
+    unlock_waiters: StdMutex<Vec<UnlockWaiter>>,
+}
+
+/// One sqlite3_unlock_notify registration, keyed by connection.
+struct UnlockWaiter {
+    conn: *mut sqlite3,
+    notify: unsafe extern "C" fn(*mut *mut c_void, c_int),
+    arg: *mut c_void,
+}
+
+// SAFETY: the raw pointers are only ferried through the engine's waiter
+// list (mutex-guarded) and dereferenced at delivery while the waiting
+// connection is provably alive — it is blocked inside sqlite3_step /
+// sqlite3_unlock_notify (pinned through the live-statement machinery)
+// or holds an Arc via a live statement. A closing connection cancels
+// its registrations in Drop before the Arc frees.
+unsafe impl Send for UnlockWaiter {}
+unsafe impl Sync for UnlockWaiter {}
+
+/// Fire the pending unlock-notify registrations — grouped per connection
+/// (SQLite batches a connection's args into ONE callback invocation with
+/// apArg = [arg1, arg2, ...] and nArg = count). Runs on the RELEASER's
+/// thread, exactly SQLite's documented delivery model. Safe against
+/// re-entrant registration (the waiter list is drained under its lock
+/// first).
+unsafe fn fire_unlock_waiters(engine: &Arc<Engine>) {
+    let drained: Vec<UnlockWaiter> = {
+        let mut w = engine.unlock_waiters.lock().unwrap();
+        std::mem::take(&mut *w)
+    };
+    if drained.is_empty() {
+        return;
+    }
+    // Group by conn, preserving registration order within each group.
+    let mut by_conn: Vec<(usize, Vec<UnlockWaiter>)> = Vec::new();
+    for reg in drained {
+        let key = reg.conn as usize;
+        match by_conn.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(reg),
+            None => by_conn.push((key, vec![reg])),
+        }
+    }
+    for (_, regs) in by_conn {
+        let args: Vec<*mut c_void> = regs.iter().map(|r| r.arg).collect();
+        let notify = regs[0].notify;
+        let mut argv = args.clone();
+        notify(argv.as_mut_ptr(), argv.len() as c_int);
+    }
+}
+
+/// Cancel a closing connection's pending registrations (its callback +
+/// arg are about to become invalid). Called from Conn::drop BEFORE the
+/// Arc machinery frees the connection.
+unsafe fn cancel_unlock_waiters(engine: &Arc<Engine>, conn: *mut sqlite3) {
+    let mut w = engine.unlock_waiters.lock().unwrap();
+    w.retain(|r| r.conn != conn);
 }
 
 impl Engine {
@@ -389,6 +450,11 @@ struct ConnState {
     /// True between BEGIN and COMMIT/ROLLBACK (per CONNECTION — what
     /// `sqlite3_get_autocommit` reports).
     in_tx: AtomicBool,
+    /// SQLITE_OPEN_SHAREDCACHE discipline: write conflicts with another
+    /// connection's transaction return SQLITE_LOCKED immediately (no
+    /// BUSY polling) and sqlite3_unlock_notify registrations defer until
+    /// the holder's COMMIT/ROLLBACK — SQLite's shared-cache contract.
+    shared_cache: bool,
     busy_timeout_ms: AtomicI64,
     /// `sqlite3_changes` — row count of the most recently completed
     /// statement on this connection.
@@ -569,6 +635,11 @@ impl Drop for Conn {
             engine.live_connections.fetch_sub(1, Ordering::Relaxed);
             metrics::bump(&metrics::CONNECTIONS_CLOSED);
         }
+        // Cancel this connection's pending unlock-notify registrations
+        // first (their callback + arg are about to become invalid).
+        if let Some(engine) = self.engine.as_ref() {
+            unsafe { cancel_unlock_waiters(engine, self as *const Conn as *mut sqlite3) };
+        }
         // Auto-rollback of an abandoned transaction (SQLite rolls back at
         // close when the connection had an open tx).
         if let Some(engine) = self
@@ -580,6 +651,9 @@ impl Drop for Conn {
             let _ = engine.db.write().execute("ROLLBACK", []);
             engine.tx_owner.store(0, Ordering::Release);
             metrics::bump(&metrics::TX_ROLLED_BACK);
+            // The abandoned transaction's locks released: deliver the
+            // other blocked connections' callbacks.
+            unsafe { fire_unlock_waiters(engine) };
         }
     }
 }
@@ -1190,6 +1264,7 @@ fn acquire_engine(
                     db: parking_lot::RwLock::new(db),
                     tx_owner: AtomicUsize::new(0),
                     live_connections: AtomicUsize::new(0),
+                    unlock_waiters: StdMutex::new(Vec::new()),
                 })),
                 true,
             ))
@@ -1204,6 +1279,7 @@ fn acquire_engine(
                     db: parking_lot::RwLock::new(db),
                     tx_owner: AtomicUsize::new(0),
                     live_connections: AtomicUsize::new(0),
+                    unlock_waiters: StdMutex::new(Vec::new()),
                 });
                 map.insert(key.clone(), e.clone());
                 Ok((Some(e), false))
@@ -1224,6 +1300,7 @@ fn acquire_engine(
                     db: parking_lot::RwLock::new(db),
                     tx_owner: AtomicUsize::new(0),
                     live_connections: AtomicUsize::new(0),
+                    unlock_waiters: StdMutex::new(Vec::new()),
                 });
                 map.insert(key, e.clone());
                 Ok((Some(e), false))
@@ -1237,6 +1314,12 @@ fn acquire_engine(
 // ---------------------------------------------------------------------------
 
 fn new_conn(engine: Option<Arc<Engine>>, readonly: bool) -> Arc<Conn> {
+    new_conn_opts(engine, readonly, false)
+}
+
+/// `new_conn` with the shared-cache discipline flag (SQLITE_OPEN_
+/// SHAREDCACHE from sqlite3_open_v2).
+fn new_conn_opts(engine: Option<Arc<Engine>>, readonly: bool, shared_cache: bool) -> Arc<Conn> {
     // Connection accounting: one live connection on its engine + the
     // process-wide opened counter (decremented exactly once in Drop).
     if let Some(e) = engine.as_ref() {
@@ -1249,6 +1332,7 @@ fn new_conn(engine: Option<Arc<Engine>>, readonly: bool) -> Arc<Conn> {
         readonly,
         state: ConnState {
             in_tx: AtomicBool::new(false),
+            shared_cache,
             busy_timeout_ms: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
@@ -1332,7 +1416,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         // Seed connection counters from the shared engine.
         let _ = e.total_changes();
     }
-    let conn = new_conn(engine, readonly);
+    let conn = new_conn_opts(engine, readonly, flags & SQLITE_OPEN_SHAREDCACHE != 0);
     *ppdb = Arc::into_raw(conn) as *mut sqlite3;
     SQLITE_OK
 }
@@ -1555,8 +1639,15 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 /// Sleep waiting for the engine-level transaction lock, honoring
 /// busy_timeout. Returns true if acquired.
 fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    // SQLite's busy_timeout semantics: 0 (or negative) = no wait budget
+    // — SQLITE_BUSY right away. This used to poll FOREVER on 0 (the
+    // deadline check required timeout_ms > 0), deadlocking any default
+    // connection that wrote behind a foreign transaction.
+    if timeout_ms <= 0 {
+        let owner = engine.tx_owner.load(Ordering::Acquire);
+        return owner == 0 || owner == conn_id;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     let mut waited = false;
     loop {
         let owner = engine.tx_owner.load(Ordering::Acquire);
@@ -1571,7 +1662,7 @@ fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool 
         if !waited {
             waited = true;
         }
-        if timeout_ms > 0 && std::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             metrics::bump(&metrics::BUSY_TIMEOUTS);
             return false;
         }
@@ -2274,6 +2365,16 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                     "cannot start a transaction within a transaction",
                 );
             }
+            // Shared-cache discipline: a foreign transaction returns
+            // SQLITE_LOCKED NOW (SQLite's table-lock semantics — the
+            // busy handler never runs; unlock_notify is the sanctioned
+            // wait). Private-cache connections keep BUSY polling.
+            if conn.state.shared_cache {
+                let owner = engine.tx_owner.load(Ordering::Acquire);
+                if owner != 0 && owner != conn.id {
+                    return conn.set_err(SQLITE_LOCKED, "database table is locked");
+                }
+            }
             let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
             if !await_tx_slot(&engine, conn.id, timeout) {
                 return conn.set_err(SQLITE_BUSY, "database is locked");
@@ -2295,12 +2396,18 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                         engine.tx_owner.store(0, Ordering::Release);
                         conn.state.in_tx.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_COMMITTED);
+                        // The committed transaction released its table
+                        // locks: deliver the blocked shared-cache
+                        // connections' unlock-notify callbacks (on THIS
+                        // thread — SQLite's documented delivery).
+                        unsafe { fire_unlock_waiters(&engine) };
                         fire_commit_hook(&conn);
                     }
                     TxKind::Rollback => {
                         engine.tx_owner.store(0, Ordering::Release);
                         conn.state.in_tx.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_ROLLED_BACK);
+                        unsafe { fire_unlock_waiters(&engine) };
                         fire_rollback_hook(&conn);
                     }
                     TxKind::SavepointOrRelease => {}
@@ -2315,6 +2422,12 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         // this statement writes, wait (SQLite: BUSY during a foreign tx).
         let writes = stmt.is_write;
         if writes {
+            if conn.state.shared_cache {
+                let owner = engine.tx_owner.load(Ordering::Acquire);
+                if owner != 0 && owner != conn.id {
+                    return conn.set_err(SQLITE_LOCKED, "database table is locked");
+                }
+            }
             let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
             if !await_tx_slot(&engine, conn.id, timeout) {
                 return conn.set_err(SQLITE_BUSY, "database is locked");
@@ -2495,6 +2608,25 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
         Exec::Rows(eng) => {
             let engine = s.engine.as_ref().unwrap().clone();
             if s.is_write {
+                // ── Cross-connection transaction gate (mirrors run_once's)
+                // ──: a foreign BEGIN holder owns the engine's
+                // transaction — this connection's write must NOT join it
+                // (its rows would commit under the foreign COMMIT, and
+                // the engine's own writer gate deadlocks a concurrent
+                // step). Private-cache connections BUSY-wait through
+                // busy_timeout; shared-cache connections get SQLite's
+                // table-lock discipline: SQLITE_LOCKED immediately, with
+                // unlock_notify as the sanctioned wait.
+                let owner = engine.tx_owner.load(Ordering::Acquire);
+                if owner != 0 && owner != conn.id {
+                    if conn.state.shared_cache {
+                        return conn.set_err(SQLITE_LOCKED, "database table is locked");
+                    }
+                    let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
+                    if !await_tx_slot(&engine, conn.id, timeout) {
+                        return conn.set_err(SQLITE_BUSY, "database is locked");
+                    }
+                }
                 // ── DML / write statements: per-step write lock ────────
                 // (unchanged — writes serialize on the engine write lock,
                 // and the changes()/rowid bookkeeping below needs the
@@ -3748,15 +3880,50 @@ pub unsafe extern "C" fn sqlite3_enable_load_extension(_db: *mut sqlite3, _on: c
 // rest: link-complete, minimal)
 // ---------------------------------------------------------------------------
 
+/// sqlite3_unlock_notify — SQLite's shared-cache wait machinery.
+///
+/// Contract (SQLite's unlock_notify.html): when the connection is
+/// currently blocked (its last statement returned SQLITE_LOCKED behind
+/// another connection's transaction), the callback is REGISTERED and
+/// fires later, from the thread that concludes the blocking transaction
+/// (COMMIT/ROLLBACK here — exactly SQLite's model). When the connection
+/// is NOT blocked, the callback fires immediately from within this
+/// call. Delivery batches a connection's pending args into one
+/// invocation: xNotify(apArg, nArg) with apArg = [arg, ...].
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_unlock_notify(
-    _db: *mut sqlite3,
+    db: *mut sqlite3,
     x_notify: Option<unsafe extern "C" fn(*mut *mut c_void, c_int)>,
     p_arg: *mut c_void,
 ) -> c_int {
-    // The engine never blocks a reader behind shared-cache locks, so
-    // notify immediately (the condition is already satisfied).
-    if let Some(cb) = x_notify {
+    let Some(cb) = x_notify else {
+        // SQLite: a NULL callback is a no-op returning SQLITE_OK.
+        return SQLITE_OK;
+    };
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return SQLITE_MISUSE;
+    };
+    let Some(engine) = &conn.engine else {
+        // Error-state handle: nothing to wait on — fire immediately.
+        let mut arg = p_arg;
+        cb(&mut arg as *mut *mut c_void, 1);
+        return SQLITE_OK;
+    };
+    // Blocked = a SHARED-CACHE connection behind a foreign transaction
+    // (SQLite arms its unlock-notify state only on SQLITE_LOCKED — the
+    // table-lock block; a private-cache connection's BUSY wait is not a
+    // block in this sense and fires immediately). Registration defers;
+    // the releaser fires it (see the COMMIT/ROLLBACK arms). Otherwise
+    // the connection is already unblocked — the immediate-invocation
+    // contract.
+    let owner = engine.tx_owner.load(Ordering::Acquire);
+    if conn.state.shared_cache && owner != 0 && owner != conn.id {
+        engine.unlock_waiters.lock().unwrap().push(UnlockWaiter {
+            conn: db,
+            notify: cb,
+            arg: p_arg,
+        });
+    } else {
         let mut arg = p_arg;
         cb(&mut arg as *mut *mut c_void, 1);
     }
