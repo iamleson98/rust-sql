@@ -213,19 +213,20 @@ impl Value {
         }
     }
 
-    /// True if value is truthy (non-zero, non-null, non-empty).
+    /// Truthiness in a boolean context (WHERE / ON / HAVING / CHECK /
+    /// trigger WHEN). SQLite's rules, probed empirically against 3.45+:
+    /// NULL is never true; INTEGER/REAL compare against 0; TEXT is
+    /// numerically coerced with the `sqlite3AtoF` PREFIX semantics
+    /// (`'abc'` -> 0 = false, `'1x'` -> 1 = true, `'inf'` -> 0 = false);
+    /// a non-empty BLOB is TRUE and an empty blob is FALSE (a blob is
+    /// "something", not a number — `SELECT 1 WHERE x'31'` passes while
+    /// `SELECT 1 WHERE x''` does not).
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Null => false,
             Value::Integer(i) => *i != 0,
             Value::Real(f) => *f != 0.0,
-            Value::Text(s) => {
-                // SQLite: numeric strings are parsed; "0" is false, anything else true.
-                match s.trim().parse::<f64>() {
-                    Ok(f) => f != 0.0,
-                    Err(_) => !s.is_empty(),
-                }
-            }
+            Value::Text(s) => parse_real_prefix(s) != 0.0,
             Value::Blob(b) => !b.is_empty(),
         }
     }
@@ -945,6 +946,53 @@ pub fn format_real_sig(v: f64, sig: usize) -> String {
 /// A row is an ordered sequence of values.
 pub type Row = Vec<Value>;
 
+/// SQLite `sqlite3AtoF` prefix semantics for CAST(... AS REAL):
+/// optional whitespace and sign, digits with optional fraction, and an
+/// optional exponent that only counts when at least one digit follows.
+/// `inf`/`nan` are NOT accepted by CAST (they yield 0.0).
+pub(crate) fn parse_real_prefix(s: &str) -> f64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let mut mantissa_digits = 0usize;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        mantissa_digits += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            mantissa_digits += 1;
+        }
+    }
+    if mantissa_digits == 0 {
+        return 0.0;
+    }
+    let mut end = i;
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let mut exp_digits = 0usize;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+            exp_digits += 1;
+        }
+        if exp_digits > 0 {
+            end = j;
+        }
+    }
+    s[start..end].parse::<f64>().unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1113,16 @@ mod tests {
         assert!(Value::Integer(1).is_truthy());
         assert!(!Value::Text("0".into()).is_truthy());
         assert!(Value::Text("1".into()).is_truthy());
-        assert!(Value::Text("abc".into()).is_truthy());
+        // SQLite numeric-coerces TEXT in boolean contexts with
+        // sqlite3AtoF PREFIX semantics: 'abc' -> 0 (false), '1x' -> 1
+        // (true). Pinned by tests/nested_join.rs::boolean_truthiness.
+        assert!(!Value::Text("abc".into()).is_truthy());
+        assert!(Value::Text("1x".into()).is_truthy());
+        assert!(!Value::Text("inf".into()).is_truthy());
+        assert!(Value::Text(".5".into()).is_truthy());
+        // A non-empty blob is TRUE in a boolean context (probed against
+        // SQLite: `SELECT 1 WHERE x'31'` passes).
+        assert!(Value::Blob(vec![0x31]).is_truthy());
+        assert!(!Value::Blob(vec![]).is_truthy());
     }
 }

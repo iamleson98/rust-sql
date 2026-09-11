@@ -166,10 +166,47 @@ impl PredValue {
 
 // A shared NULL singleton for the borrow-unfriendly cases above.
 static NULL_VALUE: Value = Value::Null;
+/// Membership probe shared by the InList eval and `eval_null` (NOT's
+/// three-valued logic): returns (found, saw_null). `saw_null` marks the
+/// value-NULL case OR any NULL member encountered before a match.
 #[inline]
+fn in_list_probe(
+    v: &Value,
+    vals: &[PredValue],
+    int_set: &Option<std::collections::HashSet<i64>>,
+    row: &[Value],
+    positions: &[usize],
+    params: &[Value],
+) -> (bool, bool) {
+    if let Some(set) = int_set {
+        // All-integer-literal fast path: one probe. Reals match
+        // numerically when exactly representable (1.0 in (1,2)); a real
+        // outside the exact range falls to the linear path for full
+        // cross-type semantics.
+        match v {
+            Value::Integer(i) => (set.contains(i), false),
+            Value::Real(x) => {
+                if x.is_finite() && x.fract() == 0.0 && x.abs() < 9.007_199_254_740_992e15 {
+                    (set.contains(&(*x as i64)), false)
+                } else {
+                    in_linear(v, vals, row, positions, params)
+                }
+            }
+            // NULL value: never a member; NOT IN yields NULL (filtered) —
+            // saw_null = true mirrors the linear path's initial condition.
+            Value::Null => (false, true),
+            // TEXT/BLOB never equals an integer member.
+            _ => (false, false),
+        }
+    } else {
+        in_linear(v, vals, row, positions, params)
+    }
+}
+
 /// Linear IN membership over `vals` (the general path): returns
 /// (found, saw_null). Kept as a helper so the integer-set fast path can
 /// fall back to it for cross-type values (huge/NaN reals).
+#[inline]
 fn in_linear(
     v: &Value,
     vals: &[PredValue],
@@ -360,6 +397,57 @@ pub(crate) fn compiled_columns(p: &CompiledPredicate, out: &mut Vec<usize>) {
 }
 
 impl CompiledPredicate {
+    /// Would this predicate's VALUE be NULL for the row? (Three-valued
+    /// logic for `NOT` — NOT NULL is NULL, and the row is filtered.)
+    /// AND/OR flatten to 0/1 integers in the evaluator; IS NULL is
+    /// always 0/1.
+    #[inline]
+    fn eval_null(&self, row: &[Value], positions: &[usize], params: &[Value]) -> bool {
+        match self {
+            CompiledPredicate::Cmp { lhs, rhs, .. } => {
+                let l = lhs.eval(row, positions, params);
+                if matches!(&*l, Value::Null) {
+                    return true;
+                }
+                let r = rhs.eval(row, positions, params);
+                matches!(&*r, Value::Null)
+            }
+            CompiledPredicate::And(..) | CompiledPredicate::Or(..) => false,
+            CompiledPredicate::Not(a) => a.eval_null(row, positions, params),
+            CompiledPredicate::IsNull { .. } => false,
+            CompiledPredicate::Between { col, lo, hi, .. } => {
+                let v = row.get(positions[*col]).unwrap_or(null_ref());
+                if matches!(v, Value::Null) {
+                    return true;
+                }
+                let l = lo.eval(row, positions, params);
+                if matches!(&*l, Value::Null) {
+                    return true;
+                }
+                let h = hi.eval(row, positions, params);
+                matches!(&*h, Value::Null)
+            }
+            CompiledPredicate::InList {
+                col, vals, int_set, ..
+            } => {
+                let v = row.get(positions[*col]).unwrap_or(null_ref());
+                let (found, saw_null) = in_list_probe(v, vals, int_set, row, positions, params);
+                !found && saw_null
+            }
+            CompiledPredicate::Like { col, pattern, .. } => {
+                matches!(row.get(positions[*col]), None | Some(Value::Null))
+                    || matches!(&*pattern.eval(row, positions, params), Value::Null)
+            }
+            CompiledPredicate::TextEq { col, rhs } => {
+                matches!(row.get(positions[*col]), None | Some(Value::Null))
+                    || matches!(&*rhs.eval(row, positions, params), Value::Null)
+            }
+            CompiledPredicate::LikeSubstr { col, .. } => {
+                matches!(row.get(positions[*col]), None | Some(Value::Null))
+            }
+        }
+    }
+
     /// Evaluate the predicate against a selectively-decoded row slice.
     /// `positions[i]` is the position of table column `i` within `row`
     /// (usize::MAX when absent — treated as NULL).
@@ -398,7 +486,17 @@ impl CompiledPredicate {
             CompiledPredicate::Or(a, b) => {
                 a.eval(row, positions, params) || b.eval(row, positions, params)
             }
-            CompiledPredicate::Not(a) => !a.eval(row, positions, params),
+            CompiledPredicate::Not(a) => {
+                // SQLite three-valued logic: the inner's VALUE may be
+                // NULL (NULL comparison, IN with NULL members, LIKE on
+                // NULL) — NOT NULL is NULL, and the row is filtered. The
+                // old boolean inversion emitted those rows
+                // (`WHERE NOT (x >= 5)` with NULL x included the row).
+                if a.eval_null(row, positions, params) {
+                    return false;
+                }
+                !a.eval(row, positions, params)
+            }
             CompiledPredicate::IsNull { col, negated } => {
                 let is_null = matches!(row.get(positions[*col]), None | Some(Value::Null));
                 is_null != *negated
@@ -448,37 +546,11 @@ impl CompiledPredicate {
                 int_set,
             } => {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
+                // Membership probe shared with eval_null (NOT's
+                // three-valued logic): (found, saw_null).
+                let (found, saw_null) = in_list_probe(v, vals, int_set, row, positions, params);
                 // SQL IN semantics: NULL never matches; NOT IN with any
-                // NULL member yields NULL (not true). We mirror eval's
-                // behavior conservatively: membership = any equality true;
-                // negation inverts truthiness only when no NULLs involved.
-                let (found, saw_null) = if let Some(set) = int_set {
-                    // All-integer-literal fast path: one probe. Reals match
-                    // numerically when exactly representable (1.0 in (1,2));
-                    // a real outside the exact range falls to the linear
-                    // path below for full cross-type semantics.
-                    match v {
-                        Value::Integer(i) => (set.contains(i), false),
-                        Value::Real(x) => {
-                            if x.is_finite()
-                                && x.fract() == 0.0
-                                && x.abs() < 9.007_199_254_740_992e15
-                            {
-                                (set.contains(&(*x as i64)), false)
-                            } else {
-                                in_linear(v, vals, row, positions, params)
-                            }
-                        }
-                        // NULL value: never a member; NOT IN yields NULL
-                        // (filtered) — saw_null = true mirrors the linear
-                        // path's initial condition.
-                        Value::Null => (false, true),
-                        // TEXT/BLOB never equals an integer member.
-                        _ => (false, false),
-                    }
-                } else {
-                    in_linear(v, vals, row, positions, params)
-                };
+                // NULL member yields NULL (not true) — filtered out.
                 if *negated {
                     if saw_null {
                         false // NOT IN with NULL members: never true
@@ -651,7 +723,7 @@ fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<Pre
     }
 }
 
-fn is_cmp_op(op: BinaryOp) -> bool {
+pub(crate) fn is_cmp_op(op: BinaryOp) -> bool {
     matches!(
         op,
         BinaryOp::Eq

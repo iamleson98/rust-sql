@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **799+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **805+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -394,6 +394,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **Join reordering**: multi-table INNER-join spines flatten and rebuild smallest-filtered-first (`reorder_inner_joins` — greedy, connectivity-preferring, stat1 + access-path cardinalities); the WHERE's cross-relation conjuncts FUSE into join conditions, so implicit-join syntax hash-joins instead of crossing + filtering. The adversarial order (`big1 JOIN big2 … JOIN small WHERE small.id = ?`) drove the point-filtered table first and turned a 482 ms big×big intermediate into a 5.3 ms point-lookup chain — matching the benign order's plan. Multi-key AND-chain ON conditions take the hash path (they used to plan as nested loops), and pushed-lookup join sides keep their key extraction (`col_index`'s plain-name fallback).
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
+- **Non-equi joins (compiled + parallel)**: `ON a.x < b.y`-shaped conditions compile to a positional term (column positions split at the join boundary, comparisons over borrowed values, zero allocation for rejected pairs — the old loop built a combined `Vec<Value>` per PAIR); above the threshold the outer side splits across workers over the shared right rows (75M-pair sweep: 1.5x on 2 cores). Implicit-join forms (`FROM a, b WHERE a.y < b.y`) ride the same path instead of materializing the cross product.
 - **Concurrency**: see the [concurrency section](#concurrency-vs-sqlite) — the 8.3x concurrent-read and 5.7–8.3x parallel-aggregate multipliers sit on top of these serial wins.
 
 Run the benchmarks yourself:
@@ -764,8 +765,20 @@ compat surface. Every entry says what it costs and why it exists.
   BY over materialized inputs** too: per-chunk HashGroupers with the
   same collation folding, chunk-ordered merge reproducing the serial
   first-seen group order and display keys, the merged grouper dropping
-  into the unchanged emission path. Still serial: non-equi join
-  conditions.
+  into the unchanged emission path. **Non-equi join conditions run
+  compiled + parallel now too** (`ON a.x < b.y`, arithmetic sides,
+  AND/OR/NOT trees, COLLATE operands): the nested loop evaluates a
+  positional `JTerm` split-scoped at `n_left` — no combined row, no name
+  resolution, borrowed-operand comparisons (rejected pairs cost
+  nothing), collations resolved once on the main thread — and above the
+  threshold the LEFT (outer) side splits across workers over the shared
+  read-only right rows (range-ordered concatenation = the serial
+  left-driven order; RIGHT/FULL tails merge per-worker bitmaps). The
+  hash join's no-equi fallback runs the nested loop over its
+  already-materialized sides (no double execution), and a Filter over a
+  condition-less CROSS join (`FROM a, b WHERE a.y < b.y`) evaluates the
+  predicate as the join condition — same rows, same order, no
+  cross-product materialization (`tests/nested_join.rs`).
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled
@@ -1069,6 +1082,7 @@ default matrix, all passing, plus the sqlx feature suite:
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |
 | Intra-statement parallelism | `tests/parallel_scan.rs` | parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order, top-N order, unbounded ORDER BY with projections/ordinals/hidden-rowid, parameter-filtered fused aggregates), 300k-row SQLite cross-check, transaction-decline + PRAGMA-gate contracts |
 | Rowid in joins | `tests/rowid_join.rs` | rowid pseudo-column refs in join conditions/projections/filters differential-pinned vs bundled SQLite (rowid↔rowid, rowid↔column, outer-join NULL semantics, 3-table chains, self-joins, INTEGER-PK alias tables, `COLLATE BINARY` as the default collation, `:memory:` purity) |
+| Non-equi joins | `tests/nested_join.rs` | compiled nested-loop conditions differential-pinned vs bundled SQLite (every join flavor × comparison/arithmetic/collate/AND-OR-NOT/NULL shapes, implicit-join fusion), 150k-row parallel==serial equality for INNER/LEFT/RIGHT/FULL, transaction-decline + PRAGMA gates, SQLite cross-checks at scale, and SQLite-exact boolean truthiness (`'abc'`/`'1x'` prefix coercion, blob rules, `NOT NULL` three-valued logic) |
 | Numeric parity | `tests/numeric_parity.rs` | SUM/TOTAL/AVG/window arithmetic vs bundled SQLite at the **f64-bit** level (integer-exact + Kahan–Babuška compensation, flip semantics, NULL rules, worker-split equality) |
 | Temp-store spill | `tests/tempstore.rs` | forced multi-chunk spills match the RAM reference for every aggregate family; streaming driver = buffered; parallel = serial; key-sorted spill order; `PRAGMA temp_store` round-trip; ephemeral files always cleaned up |
 | Statistics | `tests/analyze.rs` | sqlite_stat1 rows in SQLite's exact format, targeted ANALYZE, cost-based index choice (unselective indexes declined), reopen persistence, compound/expression-index prefixes |

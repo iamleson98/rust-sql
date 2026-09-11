@@ -3012,3 +3012,160 @@ pub(crate) fn try_parallel_join_probe(
     }
     Ok(Some(rows))
 }
+
+/// Split the NESTED-LOOP join's LEFT (outer) side across workers.
+///
+/// The generic nested loop (`exec_join_rows`' compiled path) drives from
+/// the left: for each left row, every right row is tested against the
+/// compiled `JTerm` and matches emit in right-scan order. The right side
+/// is materialized and READ-ONLY here, so workers can run the IDENTICAL
+/// loop over disjoint left-row chunks:
+///
+/// - worker k owns left rows `[lo, hi)` — its output stream is exactly
+///   what the serial loop would emit for those rows (matches in right
+///   order, LEFT/FULL NULL-extended rows inline per unmatched left row);
+/// - concatenation in chunk order reproduces the serial left-driven
+///   order bit for bit (the same proof as every other range split);
+/// - RIGHT/FULL tails: each worker carries a matched-bitmap over right
+///   row indices; the main thread OR-merges them and emits the
+///   `[NULL left..., right values]` tail in right-scan order — the
+///   serial path's trailing emission.
+///
+/// Gates (all must hold, else `None` = serial):
+/// - `PRAGMA parallel_scan` enabled and the LEFT row count >= the
+///   min-rows threshold (the row count IS the estimate);
+/// - no transaction open (workers are foreign to the committed-view
+///   TLS) and the committed-view reader scope is not armed;
+/// - the condition COMPILED (it did — the caller only reaches the
+///   split with a `JTerm`; the compiled subset is worker-safe by
+///   construction: no functions, no subqueries, collations resolved on
+///   the main thread, `conn_enc` reinstalled per worker).
+pub(crate) fn try_parallel_nested_join(
+    ctx: &ExecContext<'_>,
+    left_rows: &[Row],
+    right_rows: &[Row],
+    n_left: usize,
+    n_right: usize,
+    join_type: crate::sql::ast::JoinType,
+    cond: &super::JTerm,
+) -> Result<Option<Vec<Row>>> {
+    // Gate 1: config (PRAGMA parallel_scan; 0 = disabled).
+    let min_rows = ctx.pager.parallel_scan_min_rows();
+    if min_rows <= 0 || (left_rows.len() as i64) < min_rows {
+        return Ok(None);
+    }
+    // Gate 2: no open transaction (worker TLS is foreign to it).
+    if ctx.in_transaction {
+        return Ok(None);
+    }
+    // Gate 3: committed-view scope (workers are foreign to the TLS
+    // arming).
+    if ctx.pager.committed_reads_armed() {
+        return Ok(None);
+    }
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let by_rows = (left_rows.len() / MIN_ROWS_PER_WORKER as usize).max(1);
+    let n_workers = hw.min(by_rows).clamp(1, MAX_WORKERS);
+    if n_workers < 2 {
+        return Ok(None);
+    }
+
+    let left_outer = matches!(
+        join_type,
+        crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+    );
+    let right_tail = matches!(
+        join_type,
+        crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+    );
+    let right_words = right_rows.len().div_ceil(64);
+    let params: &[Value] = &ctx.params;
+    let n = left_rows.len();
+    let chunk = n.div_ceil(n_workers);
+    // Contiguous [lo, hi) chunks (the last takes the remainder).
+    let ranges: Vec<(usize, usize)> = {
+        let mut v = Vec::with_capacity(n_workers);
+        let mut lo = 0usize;
+        while lo < n {
+            let hi = (lo + chunk).min(n);
+            v.push((lo, hi));
+            lo = hi;
+        }
+        v
+    };
+
+    type WorkerOut = (Vec<Row>, Vec<u64>);
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<WorkerOut> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges.iter() {
+            handles.push(scope.spawn(move || -> WorkerOut {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let mut out_rows: Vec<Row> = Vec::new();
+                let mut bitmap: Vec<u64> = if right_tail {
+                    vec![0u64; right_words]
+                } else {
+                    Vec::new()
+                };
+                for left_row in &left_rows[lo..hi] {
+                    let mut matched = false;
+                    for (ri, right_row) in right_rows.iter().enumerate() {
+                        if cond.truthy(left_row, right_row, params) {
+                            let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                            combined.extend_from_slice(left_row);
+                            combined.extend_from_slice(right_row);
+                            out_rows.push(combined);
+                            matched = true;
+                            if right_tail {
+                                bitmap[ri / 64] |= 1u64 << (ri % 64);
+                            }
+                        }
+                    }
+                    if !matched && left_outer {
+                        let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                        combined.extend_from_slice(left_row);
+                        combined.extend(std::iter::repeat(Value::Null).take(n_right));
+                        out_rows.push(combined);
+                    }
+                }
+                (out_rows, bitmap)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("nested-join worker"))
+            .collect()
+    });
+
+    // Range-ordered concatenation = the serial left-driven order.
+    let cap: usize = partials.iter().map(|(r, _)| r.len()).sum();
+    let mut rows: Vec<Row> = Vec::with_capacity(cap);
+    let mut matched: Vec<u64> = if right_tail {
+        vec![0u64; right_words]
+    } else {
+        Vec::new()
+    };
+    for (part, bitmap) in partials {
+        rows.extend(part);
+        if right_tail {
+            for (dst, src) in matched.iter_mut().zip(bitmap.iter()) {
+                *dst |= src;
+            }
+        }
+    }
+    // RIGHT/FULL: the unmatched-right tail — [NULL left..., right
+    // values] in right-scan order, the serial path's trailing emission.
+    if right_tail {
+        for (ri, right_row) in right_rows.iter().enumerate() {
+            if matched[ri / 64] & (1u64 << (ri % 64)) == 0 {
+                let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                combined.extend(std::iter::repeat(Value::Null).take(n_left));
+                combined.extend_from_slice(right_row);
+                rows.push(combined);
+            }
+        }
+    }
+    Ok(Some(rows))
+}

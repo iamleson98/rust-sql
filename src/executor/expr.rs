@@ -103,7 +103,9 @@ fn cast_value(v: Value, type_name: &str) -> Value {
             Value::Null => Value::Null,
             Value::Integer(i) => Value::Real(i as f64),
             Value::Real(f) => Value::Real(f),
-            Value::Text(_) | Value::Blob(_) => Value::Real(parse_real_prefix(&v.as_text())),
+            Value::Text(_) | Value::Blob(_) => {
+                Value::Real(crate::types::value::parse_real_prefix(&v.as_text()))
+            }
         },
         Affinity::Text => match v {
             Value::Null => Value::Null,
@@ -173,53 +175,6 @@ fn parse_int_prefix(s: &str) -> i64 {
     } else {
         v
     }
-}
-
-/// SQLite `sqlite3AtoF` prefix semantics for CAST(... AS REAL):
-/// optional whitespace and sign, digits with optional fraction, and an
-/// optional exponent that only counts when at least one digit follows.
-/// `inf`/`nan` are NOT accepted by CAST (they yield 0.0).
-fn parse_real_prefix(s: &str) -> f64 {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let start = i;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let mut mantissa_digits = 0usize;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-        mantissa_digits += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-            mantissa_digits += 1;
-        }
-    }
-    if mantissa_digits == 0 {
-        return 0.0;
-    }
-    let mut end = i;
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        let mut exp_digits = 0usize;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-            exp_digits += 1;
-        }
-        if exp_digits > 0 {
-            end = j;
-        }
-    }
-    s[start..end].parse::<f64>().unwrap_or(0.0)
 }
 
 /// SQLite's `round(X, N)`: round the EXACT binary value of X to N digits,
@@ -1670,7 +1625,7 @@ fn rand_i64() -> i64 {
 /// Extract a COLLATE name from one side of a comparison (SQLite allows
 /// `a COLLATE X < b` and `a < b COLLATE X`; the RHS wins when both sides
 /// specify one).
-fn comparison_collation(e: &Expr) -> Option<String> {
+pub(crate) fn comparison_collation(e: &Expr) -> Option<String> {
     if let Expr::Collate { collation, .. } = e {
         return Some(collation.clone());
     }
@@ -1680,7 +1635,7 @@ fn comparison_collation(e: &Expr) -> Option<String> {
 /// Comparison through a collation (text-text pairs only; other types keep
 /// the engine's total order). Result mirrors `apply_binary` for the six
 /// comparison operators.
-fn apply_binary_collated(
+pub(crate) fn apply_binary_collated(
     op: BinaryOp,
     l: &Value,
     r: &Value,
@@ -1876,7 +1831,15 @@ pub fn apply_unary(op: UnaryOp, v: &Value) -> Value {
             }
         }
         UnaryOp::Pos => v.clone(),
-        UnaryOp::Not => Value::Integer(if v.is_truthy() { 0 } else { 1 }),
+        // SQLite three-valued logic: NOT NULL is NULL (the row is
+        // filtered — the old Integer(1) included rows SQLite excludes,
+        // e.g. `WHERE NOT (x >= 5)` with NULL x). Every other value
+        // flips under the SAME truthiness rule WHERE uses (probed:
+        // NOT x'31' is 0 — a non-empty blob is truthy under NOT too).
+        UnaryOp::Not => match v {
+            Value::Null => Value::Null,
+            v => Value::Integer(if v.is_truthy() { 0 } else { 1 }),
+        },
         UnaryOp::BitNot => {
             if v.is_null() {
                 Value::Null

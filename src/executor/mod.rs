@@ -3191,6 +3191,31 @@ fn exec_values(ctx: &mut ExecContext<'_>, rows: &[Vec<Expr>]) -> Result<ExecResu
 // ============================================================================
 
 fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Result<ExecResult> {
+    // FUSED PATH: Filter over a condition-less CROSS/INNER join (the
+    // implicit-join shape `FROM a, b WHERE a.y < b.y` after the planner's
+    // equi fusion took what it could). Evaluating the predicate as the
+    // JOIN CONDITION instead of a post-cross-product filter is the same
+    // INNER-semantics row set in the same left-driven order — minus the
+    // combined-row allocation PER PAIR (the compiled nested loop rejects
+    // pairs at zero cost; the generic path materialized every pair first).
+    if let Plan::Join {
+        left,
+        right,
+        join_type,
+        condition: None,
+        ..
+    } = input
+    {
+        if matches!(
+            join_type,
+            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+        ) {
+            let cond = Some(predicate.clone());
+            let left_res = execute(left, ctx)?;
+            let right_res = execute(right, ctx)?;
+            return exec_join_rows(ctx, left_res, right_res, *join_type, &cond);
+        }
+    }
     // FUSED PATH: Filter over a bare table Scan with a compilable predicate.
     // Scans with the predicate evaluated positionally (compiled once) and
     // skips materializing rows that fail it — non-matching rows cost a
@@ -10566,6 +10591,262 @@ fn value_as_f64(v: &Value) -> f64 {
 // Join (nested-loop)
 // ============================================================================
 
+// ---- Compiled join conditions over MATERIALIZED (left ++ right) rows ----
+//
+// The generic nested loop evaluates its ON condition through `eval_row`
+// per (left, right) pair: full `Expr` walk + name resolution (string
+// hashing) + a `Value` clone per operand, plus a combined-row Vec
+// allocation PER PAIR (`left_row.clone()` + `extend(right_row.clone())`)
+// even when the condition rejects the pair. For a 100k x 100k join that
+// is 10^10 allocations worth of work before a single row is emitted.
+//
+// The compiled form splits the column space at `n_left` (positions
+// below read the left row, the rest the right row — no combined row is
+// ever built), evaluates comparisons over BORROWED values for the
+// simple-operand shapes (col op col / col op literal / col op param —
+// zero allocation per pair), threads COLLATE collations resolved ONCE
+// on the main thread (custom collations live in a thread-local
+// statement scope — a worker-side lookup silently degrades to BINARY),
+// and keeps eager AND/OR semantics identical to the serial evaluator's
+// (which evaluates both operands before `apply_binary`).
+
+/// Value expression over the two materialized sides.
+pub(crate) enum JExpr {
+    /// Column of the LEFT row (combined position < n_left).
+    LCol(usize),
+    /// Column of the RIGHT row (combined position >= n_left).
+    RCol(usize),
+    Param(usize),
+    Literal(Value),
+    Unary(crate::sql::ast::UnaryOp, Box<JExpr>),
+    /// Non-comparison binary (arithmetic, concat, bitwise; AND/OR ride
+    /// along as eager value ops exactly like `apply_binary`).
+    Bin(crate::sql::ast::BinaryOp, Box<JExpr>, Box<JExpr>),
+}
+
+impl JExpr {
+    /// Borrowed operand for the simple shapes — the zero-allocation
+    /// comparison fast path.
+    fn eval_ref<'a>(
+        &'a self,
+        lrow: &'a [Value],
+        rrow: &'a [Value],
+        params: &'a [Value],
+    ) -> Option<&'a Value> {
+        match self {
+            JExpr::LCol(i) => lrow.get(*i),
+            JExpr::RCol(i) => rrow.get(*i),
+            JExpr::Param(i) => params.get(*i),
+            JExpr::Literal(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn eval(&self, lrow: &[Value], rrow: &[Value], params: &[Value]) -> Value {
+        match self {
+            JExpr::LCol(i) => lrow.get(*i).cloned().unwrap_or(Value::Null),
+            JExpr::RCol(i) => rrow.get(*i).cloned().unwrap_or(Value::Null),
+            JExpr::Param(i) => params.get(*i).cloned().unwrap_or(Value::Null),
+            JExpr::Literal(v) => v.clone(),
+            JExpr::Unary(op, e) => {
+                let v = e.eval(lrow, rrow, params);
+                crate::executor::expr::apply_unary(*op, &v)
+            }
+            JExpr::Bin(op, l, r) => {
+                let lv = l.eval(lrow, rrow, params);
+                let rv = r.eval(lrow, rrow, params);
+                crate::executor::expr::apply_binary(*op, &lv, &rv)
+            }
+        }
+    }
+}
+
+/// Boolean condition tree. `Truth` covers non-comparison leaves;
+/// comparisons carry an optional RESOLVED collation (None = the
+/// connection's default order, exactly `apply_binary`).
+pub(crate) enum JTerm {
+    Truth(JExpr),
+    Cmp(
+        crate::sql::ast::BinaryOp,
+        JExpr,
+        JExpr,
+        Option<std::sync::Arc<dyn crate::plugin::Collation>>,
+    ),
+    And(Box<JTerm>, Box<JTerm>),
+    Or(Box<JTerm>, Box<JTerm>),
+    Not(Box<JTerm>),
+}
+
+impl JTerm {
+    /// The condition's VALUE for one (left, right) pair — the exact
+    /// value the serial evaluator produces (NULL for NULL comparisons,
+    /// 0/1 integers from AND/OR/NOT), so truthiness filtering is
+    /// identical by construction. Eager AND/OR matches the serial
+    /// evaluator (`apply_binary` sees BOTH operand values); NOT goes
+    /// through `apply_unary`'s three-valued semantics (NOT NULL is
+    /// NULL, numerically coerced otherwise).
+    pub(crate) fn eval_value(&self, lrow: &[Value], rrow: &[Value], params: &[Value]) -> Value {
+        use crate::executor::expr::{apply_binary, apply_binary_collated};
+        match self {
+            JTerm::Truth(e) => e.eval(lrow, rrow, params),
+            JTerm::Cmp(op, l, r, coll) => {
+                // Borrowed-operand fast path for col/literal/param sides.
+                if let (Some(lv), Some(rv)) = (
+                    l.eval_ref(lrow, rrow, params),
+                    r.eval_ref(lrow, rrow, params),
+                ) {
+                    return match coll {
+                        Some(c) => apply_binary_collated(*op, lv, rv, c.as_ref()),
+                        None => apply_binary(*op, lv, rv),
+                    };
+                }
+                let lv = l.eval(lrow, rrow, params);
+                let rv = r.eval(lrow, rrow, params);
+                match coll {
+                    Some(c) => apply_binary_collated(*op, &lv, &rv, c.as_ref()),
+                    None => apply_binary(*op, &lv, &rv),
+                }
+            }
+            JTerm::And(a, b) => Value::Integer(
+                if a.eval_value(lrow, rrow, params).is_truthy()
+                    && b.eval_value(lrow, rrow, params).is_truthy()
+                {
+                    1
+                } else {
+                    0
+                },
+            ),
+            JTerm::Or(a, b) => Value::Integer(
+                if a.eval_value(lrow, rrow, params).is_truthy()
+                    || b.eval_value(lrow, rrow, params).is_truthy()
+                {
+                    1
+                } else {
+                    0
+                },
+            ),
+            JTerm::Not(a) => crate::executor::expr::apply_unary(
+                crate::sql::ast::UnaryOp::Not,
+                &a.eval_value(lrow, rrow, params),
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn truthy(&self, lrow: &[Value], rrow: &[Value], params: &[Value]) -> bool {
+        self.eval_value(lrow, rrow, params).is_truthy()
+    }
+}
+
+/// Compile a join condition against the combined column list. Returns
+/// None for anything outside the compiled set (functions, CASE, CAST,
+/// BETWEEN, IN, IS NULL, subqueries, named parameters, JSON arrows) —
+/// the caller keeps the serial `eval_row` loop, so semantics are
+/// identical by fallback. Unknown column refs also decline: the serial
+/// evaluator resolves them to NULL (not an error), and decline is the
+/// only way to reproduce that exactly.
+fn compile_join_term(
+    e: &Expr,
+    combined: &[String],
+    n_left: usize,
+    params_len: usize,
+) -> Option<JTerm> {
+    match e {
+        Expr::Binary { op, left, right } => match op {
+            crate::sql::ast::BinaryOp::And => Some(JTerm::And(
+                Box::new(compile_join_term(left, combined, n_left, params_len)?),
+                Box::new(compile_join_term(right, combined, n_left, params_len)?),
+            )),
+            crate::sql::ast::BinaryOp::Or => Some(JTerm::Or(
+                Box::new(compile_join_term(left, combined, n_left, params_len)?),
+                Box::new(compile_join_term(right, combined, n_left, params_len)?),
+            )),
+            op if crate::executor::predicate::is_cmp_op(*op) => {
+                // COLLATE on either comparison operand (mirrors the
+                // serial evaluator: left operand's name wins, BINARY is
+                // the default = no collation). Unknown collation
+                // sequences DECLINE — the serial path errors, and only
+                // it may.
+                let coll_name = crate::executor::expr::comparison_collation(left)
+                    .or_else(|| crate::executor::expr::comparison_collation(right));
+                let coll = match coll_name.as_deref() {
+                    None => None,
+                    Some(n) if n.eq_ignore_ascii_case("binary") => None,
+                    Some(n) => Some(crate::plugin::lookup_collation(n)?),
+                };
+                let l = compile_join_jexpr(left, combined, n_left, params_len)?;
+                let r = compile_join_jexpr(right, combined, n_left, params_len)?;
+                Some(JTerm::Cmp(*op, l, r, coll))
+            }
+            _ => Some(JTerm::Truth(compile_join_jexpr(
+                e, combined, n_left, params_len,
+            )?)),
+        },
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Not,
+            expr,
+        } => Some(JTerm::Not(Box::new(compile_join_term(
+            expr, combined, n_left, params_len,
+        )?))),
+        _ => Some(JTerm::Truth(compile_join_jexpr(
+            e, combined, n_left, params_len,
+        )?)),
+    }
+}
+
+fn compile_join_jexpr(
+    e: &Expr,
+    combined: &[String],
+    n_left: usize,
+    params_len: usize,
+) -> Option<JExpr> {
+    match e {
+        Expr::Literal(v) => Some(JExpr::Literal(v.clone())),
+        Expr::Column { table, name } => {
+            let p = resolve_column_index(combined, table.as_deref(), name)?;
+            Some(if p < n_left {
+                JExpr::LCol(p)
+            } else {
+                JExpr::RCol(p - n_left)
+            })
+        }
+        Expr::Parameter(name) => {
+            if name == "?" || name.is_empty() {
+                return Some(JExpr::Param(0));
+            }
+            let idx = name.parse::<usize>().ok()?;
+            if idx < params_len || params_len == 0 {
+                Some(JExpr::Param(idx))
+            } else {
+                None
+            }
+        }
+        Expr::Unary { op, expr } => Some(JExpr::Unary(
+            *op,
+            Box::new(compile_join_jexpr(expr, combined, n_left, params_len)?),
+        )),
+        Expr::Binary { op, left, right } => {
+            // JSON path operators can RAISE in the serial evaluator —
+            // decline (the compiled set must be infallible).
+            if matches!(
+                op,
+                crate::sql::ast::BinaryOp::Arrow | crate::sql::ast::BinaryOp::ArrowText
+            ) {
+                return None;
+            }
+            Some(JExpr::Bin(
+                *op,
+                Box::new(compile_join_jexpr(left, combined, n_left, params_len)?),
+                Box::new(compile_join_jexpr(right, combined, n_left, params_len)?),
+            ))
+        }
+        // COLLATE is transparent for evaluation (the collation is
+        // consumed by the comparison operator — handled above).
+        Expr::Collate { expr, .. } => compile_join_jexpr(expr, combined, n_left, params_len),
+        _ => None,
+    }
+}
+
 fn exec_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -10575,6 +10856,20 @@ fn exec_join(
 ) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
+    exec_join_rows(ctx, left_res, right_res, join_type, condition)
+}
+
+/// The nested-loop join over ALREADY-MATERIALIZED side results (the
+/// plain `exec_join` executes both sides then lands here; the hash
+/// join's no-equi-keys fallback reuses this with its own results so the
+/// sides are never executed twice).
+fn exec_join_rows(
+    ctx: &mut ExecContext<'_>,
+    left_res: ExecResult,
+    right_res: ExecResult,
+    join_type: crate::sql::ast::JoinType,
+    condition: &Option<Expr>,
+) -> Result<ExecResult> {
     let mut combined_cols: Vec<String> = left_res.columns.to_vec();
     combined_cols.extend(right_res.columns.iter().cloned());
     let n_left = left_res.columns.len();
@@ -10585,6 +10880,80 @@ fn exec_join(
     let mut out_rows = Vec::new();
     let mut right_matched = vec![false; right_res.rows.len()];
 
+    // ---- COMPILED fast path (conditions in the compiled set) ----------
+    // Positional split-scope evaluation — no combined row, no name
+    // resolution, borrowed-operand comparisons; matches that emit build
+    // the output row directly (non-matching pairs cost NOTHING). The
+    // parallel split below takes this exact same `JTerm`.
+    let compiled = condition
+        .as_ref()
+        .and_then(|c| compile_join_term(c, &combined_cols, n_left, params.len()));
+    if let Some(jt) = compiled {
+        // ---- Intra-statement parallel split: the LEFT (outer) side's
+        // row range splits across workers; each worker runs the
+        // identical nested loop over the SHARED read-only right rows,
+        // concatenation in range order = the serial left-driven order
+        // bit for bit; RIGHT/FULL tails merge through per-worker
+        // bitmaps. Gates + proof commentary in parallel.rs.
+        if let Some(rows) = crate::executor::parallel::try_parallel_nested_join(
+            ctx,
+            &left_res.rows,
+            &right_res.rows,
+            n_left,
+            n_right,
+            join_type,
+            &jt,
+        )? {
+            return Ok(ExecResult {
+                columns: combined_cols.into(),
+                rows,
+            });
+        }
+        let left_outer = matches!(
+            join_type,
+            crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+        );
+        let right_tail = matches!(
+            join_type,
+            crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+        );
+        let p: &[Value] = &params;
+        for left_row in &left_res.rows {
+            let mut matched = false;
+            for (ri, right_row) in right_res.rows.iter().enumerate() {
+                if jt.truthy(left_row, right_row, p) {
+                    let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                    combined.extend_from_slice(left_row);
+                    combined.extend_from_slice(right_row);
+                    out_rows.push(combined);
+                    matched = true;
+                    right_matched[ri] = true;
+                }
+            }
+            if !matched && left_outer {
+                let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                combined.extend_from_slice(left_row);
+                combined.extend(std::iter::repeat(Value::Null).take(n_right));
+                out_rows.push(combined);
+            }
+        }
+        if right_tail {
+            for (ri, right_row) in right_res.rows.iter().enumerate() {
+                if !right_matched[ri] {
+                    let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                    combined.extend(std::iter::repeat(Value::Null).take(n_left));
+                    combined.extend_from_slice(right_row);
+                    out_rows.push(combined);
+                }
+            }
+        }
+        return Ok(ExecResult {
+            columns: combined_cols.into(),
+            rows: out_rows,
+        });
+    }
+
+    // ---- Generic path (CROSS joins and non-compilable conditions) ------
     for left_row in &left_res.rows {
         let mut matched = false;
         for (ri, right_row) in right_res.rows.iter().enumerate() {
@@ -11520,8 +11889,11 @@ fn exec_hash_join(
     let eq_pairs = extract_equi_join_keys(condition, &left_res.columns, &right_res.columns);
 
     if eq_pairs.is_empty() {
-        // No equi-join keys — fall back to nested-loop (+ optional projection).
-        let res = exec_join(ctx, left, right, join_type, condition)?;
+        // No equi-join keys — fall back to nested-loop (+ optional
+        // projection). The sides are ALREADY materialized above: run the
+        // nested loop over them directly (exec_join_rows) — the old
+        // call re-executed BOTH sides a second time.
+        let res = exec_join_rows(ctx, left_res, right_res, join_type, condition)?;
         return match projection {
             Some(cols) => apply_projection(res, cols, ctx),
             None => Ok(res),
