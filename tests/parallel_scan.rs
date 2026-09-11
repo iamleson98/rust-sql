@@ -1567,3 +1567,137 @@ fn parallel_sort_custom_collation_matches_serial() {
     let b2 = rows_of(&ser, sql2);
     assert_eq!(a2, b2, "REVORD DESC + rowid term must match serial");
 }
+
+// ---------------------------------------------------------------------------
+// Worker-safe EXPRESSION ORDER BY terms: every term compiles to a
+// positional expression, workers materialize key values once per row,
+// local chunk sorts + the k-way merge run under the strict (keys, rowid)
+// total order (parallel::try_parallel_sort_expr).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_sort_expression_terms_match_serial() {
+    let queries = [
+        // unique keys (v = -id, so v * -1 = id ascending)
+        "SELECT id, name, v FROM t ORDER BY v * -1",
+        // fused Project(Sort(Scan)) with an expression term
+        "SELECT id, v FROM t ORDER BY v + 1000000",
+        // mass ties (300k rows over 97 keys)
+        "SELECT id, v FROM t ORDER BY v % 97 DESC",
+        // multi-term: expression + bare column
+        "SELECT id, v FROM t ORDER BY v * 2, id",
+        // all-equal keys (v + id = -j + j = 0) -> pure rowid order
+        "SELECT id, v FROM t ORDER BY v + id",
+        // two expression terms
+        "SELECT id, name, v FROM t ORDER BY -v, v % 7",
+        // COLLATE over an EXPRESSION (the term root is a Collate wrapper
+        // around a binary concat — bare_sort_keys declines, the compiled
+        // path unwraps)
+        "SELECT id, name FROM t ORDER BY (name || '') COLLATE NOCASE",
+        // runtime ordinal + expression (star projection keeps the literal)
+        "SELECT * FROM t ORDER BY 2, v * -1",
+        // unknown collation over an expression: both paths fall back to
+        // the connection comparator
+        "SELECT id, name FROM t ORDER BY (name || '') COLLATE NOSUCHCOLL",
+    ];
+    for sql in queries {
+        let par = text_db();
+        let ser = {
+            let mut s = text_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), BIG as usize, "{sql}: row count");
+        assert_eq!(a, b, "{sql}: expression-term sort must equal serial");
+    }
+    // Spot checks pin the ORDER (not just equivalence):
+    // v * -1 = id ascending -> first row is rowid 0.
+    let par = text_db();
+    let a = rows_of(&par, "SELECT id, v FROM t ORDER BY v * -1 LIMIT 2");
+    assert_eq!(a[0][0], Value::Integer(0));
+    assert_eq!(a[1][0], Value::Integer(1));
+    // v + id = 0 for every row: total tie -> rowid order.
+    let a = rows_of(&par, "SELECT id FROM t ORDER BY v + id LIMIT 3");
+    assert_eq!(
+        a,
+        vec![
+            vec![Value::Integer(0)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)]
+        ]
+    );
+    // v % 97 DESC: the maximum key is 0 (the j % 97 == 0 rows), which
+    // includes rowid 0 and 97 — ties keep rowid ASC.
+    let a = rows_of(&par, "SELECT id FROM t ORDER BY v % 97 DESC LIMIT 2");
+    assert_eq!(a, vec![vec![Value::Integer(0)], vec![Value::Integer(97)]]);
+    // NOCASE over (name || ''): the minimum no-case key is user-00000
+    // (its one spelling, all lowercase), whose rows are ids 0, 1000, ....
+    let a = rows_of(
+        &par,
+        "SELECT id, name FROM t ORDER BY (name || '') COLLATE NOCASE LIMIT 2",
+    );
+    assert_eq!(a[0][0], Value::Integer(0));
+    assert_eq!(a[1][0], Value::Integer(1000));
+    match &a[0][1] {
+        Value::Text(t) => assert_eq!(t.as_str(), "user-00000"),
+        other => panic!("TEXT expected, got {other:?}"),
+    }
+}
+
+#[test]
+fn parallel_sort_expression_params_and_nulls() {
+    // Bound parameter inside the expression key: the compiled Param
+    // evaluates against the statement's fixed parameter set in every
+    // worker (the same value the serial comparator sees).
+    let par = text_db();
+    let ser = {
+        let mut s = text_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql = "SELECT id, v FROM t ORDER BY v + ?";
+    let a = par.query(sql, [Value::Integer(5)]).unwrap();
+    let b = ser.query(sql, [Value::Integer(5)]).unwrap();
+    assert_eq!(a, b, "param expression-term sort must equal serial");
+    // (v + 5) has the same order as v: descending rowids.
+    assert_eq!(a[0][0], Value::Integer(299_999));
+
+    // NULL keys on big_db (v is NULL on a sparse row set): NULLs sort
+    // FIRST under the value order, ties among NULLs keep rowid ASC.
+    let par = big_db();
+    let ser = {
+        let mut s = big_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql = "SELECT id, v FROM t ORDER BY v * 2";
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "NULL-key expression sort must equal serial");
+    let nulls: Vec<&Vec<Value>> = a.iter().filter(|r| matches!(r[1], Value::Null)).collect();
+    let n_null = nulls.len();
+    assert!(
+        n_null > 1000,
+        "expected the sparse NULL cluster, got {n_null}"
+    );
+    // All NULL-key rows precede every integer key, in rowid order.
+    for (i, r) in nulls.iter().enumerate() {
+        assert_eq!(r[1], Value::Null);
+        if i > 0 {
+            let prev = nulls[i - 1][0].as_integer();
+            assert!(r[0].as_integer() > prev, "NULL tie block must be rowid ASC");
+        }
+    }
+    // The first rowid with v NULL: j % 100 >= 97 && j % 7 == 0 -> j = 98.
+    assert_eq!(a[0][0], Value::Integer(98));
+
+    // Out-of-range runtime ordinal under an expression mix: the split
+    // declines and the SERIAL path raises the semantic error (both
+    // connections agree).
+    let err = par.query("SELECT * FROM t ORDER BY 99, v * -1", []);
+    assert!(err.is_err(), "out-of-range ordinal must error");
+    let err2 = ser.query("SELECT * FROM t ORDER BY 99, v * -1", []);
+    assert!(err2.is_err());
+}

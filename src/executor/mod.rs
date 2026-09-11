@@ -3470,6 +3470,25 @@ fn exec_project(
                             return Ok(res);
                         }
                     }
+                } else if let Some((proj, names)) = bare_column_projection(columns, table) {
+                    // Expression terms under a 1:1 bare projection: the
+                    // same worker split with positional projection at
+                    // emit (star = identity over the table's columns).
+                    if let Some(expr_terms) =
+                        expr_sort_terms(terms, table, alias.as_deref(), row_width, ctx.params.len())
+                    {
+                        let project: Vec<usize> = proj.unwrap_or_else(|| (0..n_cols).collect());
+                        if let Some(res) = crate::executor::parallel::try_parallel_sort_expr(
+                            ctx,
+                            table,
+                            &expr_terms,
+                            Some(&project),
+                            false,
+                            names,
+                        )? {
+                            return Ok(res);
+                        }
+                    }
                 }
             }
         }
@@ -3826,12 +3845,30 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
             let n_cols = table.n_columns();
             let append_rowid = crate::planner::wants_rowid_slot(table);
             let row_width = n_cols + append_rowid as usize;
+            let out_cols = scan_output_columns(table, alias, append_rowid);
             if let Some(keys) = bare_sort_keys(terms, table, alias.as_deref(), row_width) {
-                let out_cols = scan_output_columns(table, alias, append_rowid);
                 if let Some(res) = crate::executor::parallel::try_parallel_sort(
                     ctx,
                     table,
                     &keys,
+                    None,
+                    append_rowid,
+                    out_cols,
+                )? {
+                    return Ok(res);
+                }
+            } else if let Some(expr_terms) =
+                expr_sort_terms(terms, table, alias.as_deref(), row_width, ctx.params.len())
+            {
+                // EXPRESSION-TERM split: every term compiles to a
+                // positional expression; workers materialize key values
+                // once per row (the serial path re-evaluates per
+                // comparison) and the k-way merge reproduces the serial
+                // stable order (see parallel.rs for the proof).
+                if let Some(res) = crate::executor::parallel::try_parallel_sort_expr(
+                    ctx,
+                    table,
+                    &expr_terms,
                     None,
                     append_rowid,
                     out_cols,
@@ -3958,6 +3995,73 @@ fn bare_sort_keys(
         return None;
     }
     Some(keys)
+}
+
+/// Compile every ORDER BY term for the worker-split EXPRESSION sort:
+/// (compiled positional expression, DESC, collation name — the driver
+/// resolves names to comparators on the MAIN thread). Ordinals (positive
+/// integer literals) become the k-1 column read (range-validated against
+/// `row_width`; out-of-range declines so the serial path raises the
+/// semantic error); bare rowid spellings resolve to the alias column or
+/// the trailing rowid slot; every other term compiles through
+/// `compile_expr_scoped` (literals, table columns, positional params,
+/// unary/binary arithmetic — user functions and other shapes decline).
+/// Collate wrappers unwrap: the inner expression is the key, the
+/// collation compares it.
+fn expr_sort_terms(
+    terms: &[OrderTerm],
+    table: &Table,
+    alias: Option<&str>,
+    row_width: usize,
+    params_len: usize,
+) -> Option<
+    Vec<(
+        crate::executor::predicate::CompiledExpr,
+        bool,
+        Option<String>,
+    )>,
+> {
+    let prefix = alias.unwrap_or(&table.name);
+    let n_cols = table.n_columns();
+    let mut out = Vec::with_capacity(terms.len());
+    for term in terms {
+        let (expr, collation): (&Expr, Option<String>) = match &term.expr {
+            Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.clone())),
+            e => (e, None),
+        };
+        let compiled = match expr {
+            Expr::Literal(Value::Integer(k)) if *k >= 1 => {
+                // Ordinal: the k-th OUTPUT column. Out of range -> let
+                // the serial path raise the semantic error.
+                if (*k as usize) > row_width {
+                    return None;
+                }
+                crate::executor::predicate::CompiledExpr::Col(*k as usize - 1)
+            }
+            Expr::Column { table: None, name }
+                if table.find_column(name).is_none()
+                    && !table.without_rowid
+                    && (name.eq_ignore_ascii_case("rowid")
+                        || name.eq_ignore_ascii_case("_rowid_")
+                        || name.eq_ignore_ascii_case("oid")
+                        || name == crate::planner::HIDDEN_ROWID) =>
+            {
+                match table.rowid_alias {
+                    // The INTEGER PRIMARY KEY column IS the rowid.
+                    Some(idx) => crate::executor::predicate::CompiledExpr::Col(idx),
+                    // No alias: the trailing rowid slot the worker
+                    // appends (the hidden-rowid scan slot).
+                    None => crate::executor::predicate::CompiledExpr::Col(n_cols),
+                }
+            }
+            e => crate::executor::predicate::compile_expr_scoped(e, table, prefix, params_len)?,
+        };
+        out.push((compiled, term.order == Order::Desc, collation));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 /// The scan operators' output column names, shared by `exec_scan` and

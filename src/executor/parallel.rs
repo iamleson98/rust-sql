@@ -1429,6 +1429,284 @@ fn sort_total_cmp(
     a_rowid.cmp(&b_rowid)
 }
 
+// ============================================================================
+// Parallel unbounded ORDER BY with EXPRESSION terms — compiled keys
+// ============================================================================
+
+/// One EXPRESSION-TERM sort key: (compiled positional expression, DESC,
+/// collation resolved ONCE on the main thread — see `sort_total_cmp`).
+type ExprSortTerm = (
+    crate::executor::predicate::CompiledExpr,
+    bool,
+    StdOption<StdArc<dyn crate::plugin::Collation>>,
+);
+
+/// (keys, rowid) strict total order over MATERIALIZED key values — the
+/// worker local sorts and the main-thread merge share it verbatim. The
+/// rowid tiebreak makes the order strict, reproducing the serial stable
+/// sort's tie behavior (equal keys keep scan order).
+fn expr_sort_cmp(
+    a_keys: &[Value],
+    a_rowid: i64,
+    b_keys: &[Value],
+    b_rowid: i64,
+    terms: &[ExprSortTerm],
+) -> std::cmp::Ordering {
+    for (i, (_, desc, ref coll)) in terms.iter().enumerate() {
+        let ord = match coll.as_deref() {
+            Some(c) => crate::plugin::compare_collated(&a_keys[i], &b_keys[i], c),
+            None => super::value_cmp_conn(&a_keys[i], &b_keys[i]),
+        };
+        let ord = if *desc { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a_rowid.cmp(&b_rowid)
+}
+
+/// One range worker's chunk of the expression-term sort:
+/// (rowid, materialized key values, output row) in `expr_sort_cmp` order.
+struct ExprSortChunk {
+    rows: Vec<(i64, Vec<Value>, Row)>,
+}
+
+/// Parallel unbounded ORDER BY whose terms are EXPRESSIONS over the
+/// scanned table (`ORDER BY v * -1, id + 1 DESC, name COLLATE NOCASE`):
+/// every term compiles to a positional `CompiledExpr` (literals, table
+/// columns, parameters, unary/binary arithmetic — anything outside that
+/// set declines, including user function calls), the collations resolve
+/// ONCE on the main thread (see `sort_total_cmp` for the worker-scope
+/// divergence this prevents), and each worker:
+///
+/// 1. wide-decodes its range's rows (all table columns, the rowid
+///    appended as a trailing slot — the compiled Col(n_cols) reads it),
+/// 2. evaluates each term's key value ONCE per row (O(n) evals; the
+///    serial path re-evaluates per comparison, O(n log n)),
+/// 3. sorts its chunk under the strict (keys, rowid) total order.
+///
+/// The main thread k-way merges under the SAME order — the materialized
+/// key of row r equals the serial comparator's `sort_key` for every term
+/// (same shared unary/binary evaluators), and the rowid tiebreak is the
+/// serial stable sort's tie order, so the merged output is identical to
+/// the serial answer.
+///
+/// `project == Some(indices)` fuses a 1:1 bare-column projection above
+/// the sort (indices are table columns; `ROWID_PROJ` emits the rowid);
+/// `project == None` emits the scan's own shape (hidden-rowid slot
+/// appended when the scan emits one).
+///
+/// `Ok(None)` = declined (below threshold / config off / txn open / a
+/// worker error) — the caller runs the serial path unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_parallel_sort_expr(
+    ctx: &ExecContext<'_>,
+    table: &StdArc<Table>,
+    terms: &[(
+        crate::executor::predicate::CompiledExpr,
+        bool,
+        StdOption<String>,
+    )],
+    project: Option<&[usize]>,
+    append_rowid: bool,
+    out_cols: StdArc<[String]>,
+) -> Result<Option<ExecResult>> {
+    let root = ctx.table_root(table);
+    let split = match plan_range_split(ctx, root)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    // Resolve every term's collation ONCE on the MAIN thread (the
+    // statement's plugin scope lives here; workers must not look names
+    // up — see sort_total_cmp's doc).
+    let resolved: Vec<ExprSortTerm> = terms
+        .iter()
+        .map(|(compiled, desc, name)| {
+            (
+                compiled.clone(),
+                *desc,
+                name.as_deref().and_then(crate::plugin::lookup_collation),
+            )
+        })
+        .collect();
+
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let rowid_slot = n_cols; // trailing slot the worker appends
+    let identity: Vec<usize> = (0..n_cols).collect();
+    let rowid_proj = crate::storage::row_codec::ROWID_PROJ;
+
+    let ranges = split.ranges;
+    let pager = ctx.pager;
+    let params: &[Value] = &ctx.params;
+
+    // Workers: wide decode + per-row key materialization + local sort.
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<Result<ExprSortChunk>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges.iter() {
+            let resolved = &resolved;
+            let identity = &identity;
+            handles.push(scope.spawn(move || -> Result<ExprSortChunk> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let mut bt = Btree::new(pager, root, false);
+                let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
+                let mut rows: Vec<(i64, Vec<Value>, Row)> = Vec::new();
+                bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+                    if crate::storage::row_codec::decode_row_selective_wide(
+                        payload,
+                        n_cols,
+                        identity,
+                        rowid,
+                        rowid_alias,
+                        &mut wide,
+                    )
+                    .is_err()
+                    {
+                        return true; // skip corrupt rows (serial contract)
+                    }
+                    // Trailing rowid slot (Col(n_cols) reads it; ordinal
+                    // terms over the hidden slot address it too).
+                    wide.push(Value::Integer(rowid));
+                    let keys: Vec<Value> = resolved
+                        .iter()
+                        .map(|(c, _, _)| c.eval(&wide, params))
+                        .collect();
+                    // Output row: the scan's own shape — with the hidden
+                    // rowid slot when the scan emits one, else the table
+                    // columns only.
+                    let row: Row = if append_rowid {
+                        wide.clone()
+                    } else {
+                        wide[..n_cols].to_vec()
+                    };
+                    rows.push((rowid, keys, row));
+                    wide.truncate(rowid_slot);
+                    true
+                })?;
+                rows.sort_unstable_by(|a, b| expr_sort_cmp(&a.1, a.0, &b.1, b.0, resolved));
+                Ok(ExprSortChunk { rows })
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel expression-sort worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    // Any worker error -> serial fallback (never a divergent answer).
+    let mut chunks: Vec<ExprSortChunk> = Vec::with_capacity(partials.len());
+    let mut total: usize = 0;
+    for p in partials {
+        match p {
+            Ok(c) => {
+                total += c.rows.len();
+                chunks.push(c);
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    // ---- k-way merge under the same strict total order ----------------
+    let mut cursors: Vec<usize> = vec![0; chunks.len()];
+    let mut heap: Vec<usize> = (0..chunks.len())
+        .filter(|&c| !chunks[c].rows.is_empty())
+        .collect();
+
+    // Sift-down over the chunk-index heap (heads read through the
+    // immutable chunks/cursors between sifts).
+    fn sift_down(
+        heap: &mut [usize],
+        mut i: usize,
+        chunks: &[ExprSortChunk],
+        cursors: &[usize],
+        terms: &[ExprSortTerm],
+    ) {
+        let n = heap.len();
+        loop {
+            let l = 2 * i + 1;
+            let r = l + 1;
+            let mut best = i;
+            if l < n {
+                let (bl, bi) = (&chunks[heap[l]], cursors[heap[l]]);
+                let (bb, bidx) = (&chunks[heap[best]], cursors[heap[best]]);
+                if expr_sort_cmp(
+                    &bl.rows[bi].1,
+                    bl.rows[bi].0,
+                    &bb.rows[bidx].1,
+                    bb.rows[bidx].0,
+                    terms,
+                ) == std::cmp::Ordering::Less
+                {
+                    best = l;
+                }
+            }
+            if r < n {
+                let (br, ri) = (&chunks[heap[r]], cursors[heap[r]]);
+                let (bb, bidx) = (&chunks[heap[best]], cursors[heap[best]]);
+                if expr_sort_cmp(
+                    &br.rows[ri].1,
+                    br.rows[ri].0,
+                    &bb.rows[bidx].1,
+                    bb.rows[bidx].0,
+                    terms,
+                ) == std::cmp::Ordering::Less
+                {
+                    best = r;
+                }
+            }
+            if best == i {
+                return;
+            }
+            heap.swap(i, best);
+            i = best;
+        }
+    }
+
+    for i in (0..heap.len() / 2).rev() {
+        sift_down(&mut heap, i, &chunks, &cursors, &resolved);
+    }
+
+    let mut rows: Vec<Row> = Vec::with_capacity(total.min(1 << 20));
+    while let Some(&top) = heap.first() {
+        let (rowid, _keys, row) = std::mem::take(&mut chunks[top].rows[cursors[top]]);
+        // Emit: projection indices (table columns; ROWID_PROJ = rowid),
+        // or the already-shaped scan row.
+        let out: Row = match project {
+            Some(ps) => ps
+                .iter()
+                .map(|&p| {
+                    if p == rowid_proj {
+                        Value::Integer(rowid)
+                    } else {
+                        row.get(p).cloned().unwrap_or(Value::Null)
+                    }
+                })
+                .collect(),
+            None => row,
+        };
+        rows.push(out);
+        cursors[top] += 1;
+        if cursors[top] >= chunks[top].rows.len() {
+            let last = heap.len() - 1;
+            heap.swap(0, last);
+            heap.pop();
+        }
+        if !heap.is_empty() {
+            sift_down(&mut heap, 0, &chunks, &cursors, &resolved);
+        }
+    }
+
+    Ok(Some(ExecResult {
+        columns: out_cols,
+        rows,
+    }))
+}
+
 /// One range worker's sorted chunk: (rowid, row) pairs in
 /// `sort_total_cmp` order. Rows are in the caller's wanted-column
 /// layout (full scan columns with the hidden-rowid trailing slot when
