@@ -1870,6 +1870,186 @@ struct SortChunk {
 }
 
 // ============================================================================
+// Parallel no-GROUP-BY aggregate over MATERIALIZED rows
+// ============================================================================
+
+/// Parallel no-GROUP-BY aggregate over MATERIALIZED input rows: the
+/// COUNT/SUM/AVG/MIN/MAX of a compound body (`SELECT COUNT(*) FROM
+/// (... UNION ...)`), a subquery/CTE output, or a join output — the
+/// aggregate paths that need a bare Scan never see these shapes.
+///
+/// Rows split into contiguous index chunks; each worker accumulates its
+/// own `AggState` list through the serial `update_agg_state` (DISTINCT
+/// included — the set-union merge arm), with the aggregate ARGUMENTS
+/// evaluated by compiled positional expressions (the same
+/// `compile_materialized_expr` resolution the materialized sort uses).
+/// Partials merge in chunk order via `merge_agg_state` (deterministic;
+/// identical to the serial scan for integer accumulators — the REAL SUM
+/// merge keeps the documented worker-split ULP latitude), finished by
+/// the serial `finish_no_group_by`.
+///
+/// Gates: row count >= the PRAGMA threshold; config on; no open
+/// transaction; >= 2 worthwhile workers; every aggregate in
+/// {COUNT, SUM, TOTAL, AVG, MIN, MAX}; every arg (or COUNT(*)) compiles.
+/// `Ok(None)` = declined — the caller runs the serial path unchanged.
+pub(crate) fn try_parallel_aggregate_rows(
+    ctx: &ExecContext<'_>,
+    rows: &mut Vec<Row>,
+    columns: &[String],
+    aggregates: &[AggExpr],
+) -> Result<Option<ExecResult>> {
+    // Aggregate-function gates (merge support + order-independence).
+    for agg in aggregates {
+        match AggFunc::from_name(&agg.func) {
+            AggFunc::Count
+            | AggFunc::Sum
+            | AggFunc::Total
+            | AggFunc::Avg
+            | AggFunc::Min
+            | AggFunc::Max => {}
+            _ => return Ok(None), // GROUP_CONCAT / JSON / percentile: order-dependent
+        }
+    }
+    // Args: COUNT(*) (None) or a compiled positional expression.
+    let mut compiled_args: Vec<Option<crate::executor::predicate::CompiledExpr>> =
+        Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        match &agg.arg {
+            None => compiled_args.push(None),
+            Some(e) => {
+                let c = match compile_materialized_expr(e, columns, ctx.params.len()) {
+                    Some(c) => c,
+                    None => return Ok(None), // non-compilable arg: serial path
+                };
+                compiled_args.push(Some(c));
+            }
+        }
+    }
+    // Gates: config + threshold + txn (the row count IS the estimate).
+    let min_rows = ctx.pager.parallel_scan_min_rows();
+    if min_rows <= 0 || (rows.len() as i64) < min_rows {
+        return Ok(None);
+    }
+    if ctx.in_transaction {
+        return Ok(None);
+    }
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let by_rows = (rows.len() / MIN_ROWS_PER_WORKER as usize).max(1);
+    let n_workers = hw.min(by_rows).clamp(1, MAX_WORKERS);
+    if n_workers < 2 {
+        return Ok(None);
+    }
+
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
+    let n_aggs = aggregates.len();
+    let distincts: Vec<bool> = aggregates.iter().map(|a| a.distinct).collect();
+    let seps: Vec<Option<String>> = (0..aggregates.len())
+        .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
+        .collect();
+    let compiled_args: StdArc<Vec<Option<crate::executor::predicate::CompiledExpr>>> =
+        StdArc::new(compiled_args);
+    let params: &[Value] = &ctx.params;
+
+    // Contiguous chunk split (rows move into the workers; the caller's
+    // Vec is restored on the (unreachable) error-free decline paths —
+    // all gates have passed by the time we take them).
+    let n = rows.len();
+    let chunk = n.div_ceil(n_workers);
+    let mut rest = std::mem::take(rows);
+    let mut chunks: Vec<(usize, Vec<Row>)> = Vec::with_capacity(n_workers);
+    let mut lo = 0usize;
+    while !rest.is_empty() {
+        let take = chunk.min(rest.len());
+        let part: Vec<Row> = rest.drain(..take).collect();
+        chunks.push((lo, part));
+        lo += take;
+    }
+
+    // Workers: the serial general-path loop over each chunk —
+    // update_agg_state with the compiled argument values.
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<(Vec<AggState>, bool)> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for (_base, part) in chunks {
+            let compiled_args = StdArc::clone(&compiled_args);
+            let agg_funcs = agg_funcs.clone();
+            let distincts = distincts.clone();
+            let seps = seps.clone();
+            handles.push(scope.spawn(move || -> (Vec<AggState>, bool) {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let mut states: Vec<AggState> = (0..n_aggs).map(|_| AggState::default()).collect();
+                let mut saw_any_row = false;
+                for row in part.iter() {
+                    saw_any_row = true;
+                    for i in 0..n_aggs {
+                        let arg_val: Value = match &compiled_args[i] {
+                            None => super::COUNT_STAR_ARG.clone(),
+                            Some(c) => c.eval(row, params),
+                        };
+                        super::update_agg_state(
+                            &mut states[i],
+                            agg_funcs[i],
+                            &arg_val,
+                            distincts[i],
+                            seps[i].as_deref(),
+                        );
+                    }
+                }
+                (states, saw_any_row)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel row-aggregate worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    // Merge in chunk order, then the serial finish.
+    let mut states: Option<Vec<AggState>> = None;
+    let mut saw_any_row = false;
+    for (ws, saw) in partials {
+        saw_any_row |= saw;
+        match &mut states {
+            None => states = Some(ws),
+            Some(dst) => {
+                for i in 0..n_aggs {
+                    merge_agg_state(
+                        &mut dst[i],
+                        &ws[i],
+                        agg_funcs[i],
+                        aggregates[i].distinct,
+                        agg_sep_at(aggregates, i),
+                    );
+                }
+            }
+        }
+    }
+    let states = match states {
+        Some(s) => s,
+        None => {
+            return Ok(Some(ExecResult {
+                columns: StdArc::from(vec![]),
+                rows: Vec::new(),
+            }))
+        }
+    };
+    // Restore the row count for the caller's potential decline reuse —
+    // not needed (we answer), but keep the contract: rows were consumed.
+    let _ = n;
+    Ok(Some(super::finish_no_group_by(
+        aggregates,
+        states,
+        saw_any_row,
+    )?))
+}
+
+// ============================================================================
 // Parallel sort of MATERIALIZED rows — compound bodies, subqueries, joins
 // ============================================================================
 

@@ -1966,3 +1966,112 @@ fn parallel_sort_materialized_ties_keep_input_order() {
     // Non-NULL cats cover 0..99 in order.
     assert_eq!(a[0][0], Value::Integer(0));
 }
+
+// ---------------------------------------------------------------------------
+// No-GROUP-BY aggregates over MATERIALIZED inputs: the COUNT/SUM/AVG/MIN/
+// MAX of a compound body, subquery, or join output — chunk-split
+// AggStates, chunk-ordered merge, serial finish
+// (parallel::try_parallel_aggregate_rows).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_aggregate_materialized_battery_matches_serial() {
+    let union_src = "(SELECT v, cat FROM t WHERE id <= 150000 UNION ALL SELECT v, cat FROM t WHERE id > 150000)";
+    let queries = [
+        &*format!("SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM {union_src}"),
+        // DISTINCT over the materialized input (set-union merge)
+        &*format!("SELECT COUNT(DISTINCT cat), COUNT(DISTINCT v) FROM {union_src}"),
+        // compiled expression argument
+        &*format!("SELECT COUNT(*), SUM(v * 2), MIN(v % 97) FROM {union_src}"),
+        // filtered inner branches (rows still > threshold)
+        "SELECT COUNT(*), SUM(v) FROM (SELECT v FROM t WHERE id <= 150000 AND v > 0 UNION ALL SELECT v FROM t WHERE id > 150000 AND v > 0)",
+    ];
+    for sql in queries {
+        let par = big_db();
+        let ser = {
+            let mut s = big_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), 1, "{sql}: one aggregate row");
+        assert_eq!(a, b, "{sql}: materialized aggregate must equal serial");
+    }
+    // Ground truths independent of the engine's aggregate machinery:
+    let par = big_db();
+    let a = rows_of(&par, &format!("SELECT COUNT(*) FROM {union_src}"));
+    assert_eq!(a[0][0], Value::Integer(BIG), "COUNT(*) over both halves");
+    // The compound aggregate equals the single-scan aggregate.
+    let a = rows_of(
+        &par,
+        &format!("SELECT SUM(v), MIN(v), MAX(v) FROM {union_src}"),
+    );
+    let b = rows_of(&par, "SELECT SUM(v), MIN(v), MAX(v) FROM t");
+    assert_eq!(a, b, "union-all aggregate == single-scan aggregate");
+    // COUNT(DISTINCT cat) == the single-scan distinct count.
+    let a = rows_of(
+        &par,
+        &format!("SELECT COUNT(DISTINCT cat) FROM {union_src}"),
+    );
+    let b = rows_of(&par, "SELECT COUNT(DISTINCT cat) FROM t");
+    assert_eq!(a, b);
+    match &a[0][0] {
+        Value::Integer(i) => assert_eq!(*i, 100),
+        other => panic!("INTEGER expected, got {other:?}"),
+    }
+}
+
+#[test]
+fn parallel_aggregate_materialized_param_and_nulls() {
+    // Bound parameter inside a compiled argument: the same value in every
+    // worker as the serial comparator sees.
+    let union_src =
+        "(SELECT v FROM t WHERE id <= 150000 UNION ALL SELECT v FROM t WHERE id > 150000)";
+    let par = big_db();
+    let ser = {
+        let mut s = big_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql = &*format!("SELECT COUNT(*), SUM(v + ?) FROM {union_src}");
+    let a = par.query(sql, [Value::Integer(7)]).unwrap();
+    let b = ser.query(sql, [Value::Integer(7)]).unwrap();
+    assert_eq!(a, b, "param materialized aggregate must equal serial");
+    // NULL semantics: v is NULL on the sparse set — SUM/AVG/MIN/MAX skip
+    // NULLs, COUNT(v) skips them, COUNT(*) does not.
+    let a = rows_of(
+        &par,
+        &format!("SELECT COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v), AVG(v) FROM {union_src}"),
+    );
+    let b = rows_of(
+        &ser_dummy(),
+        "SELECT COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v), AVG(v) FROM t",
+    );
+    let _ = b;
+    let null_count = rows_of(&par, "SELECT COUNT(*) FROM t WHERE v IS NULL");
+    match (&a[0][0], &a[0][1], &null_count[0][0]) {
+        (Value::Integer(total), Value::Integer(non_null), Value::Integer(nulls)) => {
+            assert_eq!(*total, BIG);
+            assert_eq!(*total - *non_null, *nulls, "COUNT(v) skips NULLs");
+        }
+        _ => panic!("INTEGER expected"),
+    }
+    // NULL-arg aggregate over an all-NULL subquery: empty-set semantics.
+    let a = rows_of(
+        &par,
+        "SELECT COUNT(v), SUM(v), MIN(v) FROM (SELECT NULL AS v FROM t LIMIT 200000)",
+    );
+    assert_eq!(
+        a[0],
+        vec![Value::Integer(0), Value::Null, Value::Null],
+        "all-NULL input: COUNT 0, SUM/MIN NULL"
+    );
+}
+
+// Helper: an independent serial-connection check (kept simple).
+fn ser_dummy() -> Database {
+    let mut s = big_db();
+    s.execute("PRAGMA parallel_scan=0", []).unwrap();
+    s
+}

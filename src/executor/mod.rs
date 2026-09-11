@@ -8970,7 +8970,23 @@ fn exec_aggregate(
             });
         }
     }
-    let inner = execute(input, ctx)?;
+    let mut inner = execute(input, ctx)?;
+    // ---- MATERIALIZED-ROW parallel split (no GROUP BY) ------------------
+    // The input is not a bare scan (a compound body, subquery/CTE, join,
+    // ...) but it IS materialized: chunk the rows, accumulate per-worker
+    // AggStates through the serial update_agg_state (DISTINCT included),
+    // merge in chunk order, finish serially. Declines leave the rows in
+    // place for the general loop below.
+    if group_by.is_empty() && !inner.rows.is_empty() {
+        if let Some(res) = crate::executor::parallel::try_parallel_aggregate_rows(
+            ctx,
+            &mut inner.rows,
+            &inner.columns,
+            aggregates,
+        )? {
+            return Ok(res);
+        }
+    }
     // Borrow params directly (inner is an owned local — no conflict).
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;

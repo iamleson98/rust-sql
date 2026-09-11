@@ -930,3 +930,32 @@ fn fused_full_join_multikey_and_aggregate() {
         ser.iter().filter(|r| !matches!(r[1], Value::Null)).count()
     );
 }
+
+#[test]
+fn parallel_aggregate_over_join_output_matches_serial() {
+    // The aggregate over a JOIN output: the fused join streams (no side
+    // materialization), then the materialized-row aggregate split chunks
+    // the join's output rows. Parallel (join probe split + aggregate
+    // split) == serial end-to-end.
+    let mut db = Database::open_in_memory().unwrap();
+    build(&mut db, 60_000);
+    let sql = "SELECT COUNT(*), SUM(a.x), AVG(b.y), MIN(a.x), MAX(b.y) FROM a JOIN b ON a.k = b.k";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert_eq!(ser, par, "aggregate over join output must equal serial");
+    let n = match &ser[0][0] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    // 3 matches per row: 180k output rows.
+    assert!(n > 175_000 && n < 185_000, "join output count: {n}");
+    // DISTINCT over the join output rides the same path.
+    let sql2 = "SELECT COUNT(DISTINCT a.k), COUNT(DISTINCT b.y) FROM a JOIN b ON a.k = b.k";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser2 = rows_of(&db, sql2);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par2 = rows_of(&db, sql2);
+    assert_eq!(ser2, par2, "DISTINCT over join output must equal serial");
+}
