@@ -9017,6 +9017,8 @@ fn exec_aggregate(
 
     let n_aggs = aggregates.len();
     let mut grouper = HashGrouper::with_aggs(n_aggs);
+    let mut emit_only = false;
+    let grouper_key_collations: Vec<Option<String>>;
     // Collated GROUP BY over non-scan inputs (filtered scans / joins /
     // subqueries / CTEs): explicit COLLATE terms always fold; a column
     // reference folds through its TABLE's declared collation, resolved by
@@ -9062,45 +9064,71 @@ fn exec_aggregate(
                 _ => None,
             })
             .collect();
-        grouper.set_key_collations(collations);
+        grouper_key_collations = collations;
+        grouper.set_key_collations(grouper_key_collations.clone());
     }
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
 
-    for row in &inner.rows {
-        // Group key: direct index when resolvable, eval_row otherwise.
-        key_buf.clear();
-        let mut key_ok = true;
-        for (ge, kidx) in group_by.iter().zip(key_col_indices.iter()) {
-            match kidx {
-                Some(idx) => key_buf.push(row[*idx].clone()),
-                None => match eval_row(ge, row, &inner.columns, params, named_params) {
-                    Ok(v) => key_buf.push(v),
-                    Err(_) => {
-                        key_ok = false;
-                        break;
-                    }
-                },
-            }
-        }
-        if !key_ok {
-            continue;
-        }
-        let gi = grouper.intern_key(&key_buf);
-        for (i, agg) in aggregates.iter().enumerate() {
-            let arg_val = match (&agg.arg, agg_col_indices[i]) {
-                (Some(_), Some(idx)) => row[idx].clone(),
-                (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
-                (None, _) => Value::Integer(1),
-            };
-            update_agg_state(
-                grouper.state(gi, i),
-                agg_funcs[i],
-                &arg_val,
-                agg.distinct,
-                agg_sep_at(aggregates, i),
-            );
+    // ---- MATERIALIZED-ROW parallel split (GROUP BY) ---------------------
+    // The input is materialized and the keys/args compile: chunk the rows,
+    // per-worker HashGroupers with the SAME collation folding, chunk-
+    // ordered merge reproducing the serial first-seen group order. The
+    // merged grouper drops into the emission path below unchanged. A
+    // decline (or empty input) leaves the serial general loop in charge.
+    if !group_by.is_empty() && !inner.rows.is_empty() {
+        if let Some(merged) = crate::executor::parallel::try_parallel_groupby_rows(
+            ctx,
+            &inner.rows,
+            &inner.columns,
+            group_by,
+            aggregates,
+            &grouper_key_collations,
+        )? {
+            grouper = merged;
+            key_buf.clear();
+            // Skip the serial accumulation loop — the emission path below
+            // (display keys, finalize, HAVING/projection) is shared.
+            emit_only = true;
         }
     }
+
+    if !emit_only {
+        for row in &inner.rows {
+            // Group key: direct index when resolvable, eval_row otherwise.
+            key_buf.clear();
+            let mut key_ok = true;
+            for (ge, kidx) in group_by.iter().zip(key_col_indices.iter()) {
+                match kidx {
+                    Some(idx) => key_buf.push(row[*idx].clone()),
+                    None => match eval_row(ge, row, &inner.columns, params, named_params) {
+                        Ok(v) => key_buf.push(v),
+                        Err(_) => {
+                            key_ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if !key_ok {
+                continue;
+            }
+            let gi = grouper.intern_key(&key_buf);
+            for (i, agg) in aggregates.iter().enumerate() {
+                let arg_val = match (&agg.arg, agg_col_indices[i]) {
+                    (Some(_), Some(idx)) => row[idx].clone(),
+                    (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
+                    (None, _) => Value::Integer(1),
+                };
+                update_agg_state(
+                    grouper.state(gi, i),
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                    agg_sep_at(aggregates, i),
+                );
+            }
+        }
+    } // end serial accumulation loop (skipped when the parallel split answered)
 
     // SQLite semantics: if there is no GROUP BY clause AND no rows were
     // produced by the input, the aggregate still emits ONE row (with

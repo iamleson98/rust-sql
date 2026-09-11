@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **786+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **788+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -760,8 +760,12 @@ compat surface. Every entry says what it costs and why it exists.
   build cache stays correct across join types). **No-GROUP-BY aggregates
   over MATERIALIZED inputs** (a compound body, subquery, or join output)
   split too: chunked AggStates through the serial update_agg_state
-  (DISTINCT included), chunk-ordered merge, serial finish. Still
-  serial: GROUP BY over non-scan inputs and non-equi conditions.
+  (DISTINCT included), chunk-ordered merge, serial finish — and **GROUP
+  BY over materialized inputs** too: per-chunk HashGroupers with the
+  same collation folding, chunk-ordered merge reproducing the serial
+  first-seen group order and display keys, the merged grouper dropping
+  into the unchanged emission path. Still serial: non-equi join
+  conditions.
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled

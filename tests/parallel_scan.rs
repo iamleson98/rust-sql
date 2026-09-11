@@ -2075,3 +2075,122 @@ fn ser_dummy() -> Database {
     s.execute("PRAGMA parallel_scan=0", []).unwrap();
     s
 }
+
+// ---------------------------------------------------------------------------
+// GROUP BY over MATERIALIZED inputs: compound bodies, subqueries, join
+// outputs — per-chunk HashGroupers, chunk-ordered merge reproducing the
+// serial first-seen group order (parallel::try_parallel_groupby_rows).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_groupby_materialized_matches_serial() {
+    let union_src = "(SELECT cat, v FROM t WHERE id <= 150000 UNION ALL SELECT cat, v FROM t WHERE id > 150000)";
+    let queries = [
+        // single key, full aggregate list
+        &*format!(
+            "SELECT cat, COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM {union_src} GROUP BY cat"
+        ),
+        // multi-key (cat, v%10-class)
+        &*format!("SELECT cat, v % 10, COUNT(*), SUM(v) FROM {union_src} GROUP BY cat, v % 10"),
+        // DISTINCT aggregate over a materialized input
+        &*format!("SELECT cat, COUNT(DISTINCT v) FROM {union_src} GROUP BY cat"),
+        // subquery (DISTINCT) input — 100 cats x distinct-vs pairs
+        "SELECT cat, COUNT(*) FROM (SELECT DISTINCT cat, v FROM t) GROUP BY cat",
+    ];
+    for sql in queries {
+        let par = big_db();
+        let ser = {
+            let mut s = big_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), b.len(), "{sql}: group count");
+        assert_eq!(
+            a, b,
+            "{sql}: materialized GROUP BY must equal serial (order included)"
+        );
+    }
+    // First-seen group order: cats 0..99 (the halves both emit cat j first
+    // at rowid j).
+    let par = big_db();
+    let a = rows_of(&par, &format!("SELECT cat FROM {union_src} GROUP BY cat"));
+    for (i, r) in a.iter().enumerate() {
+        assert_eq!(
+            r[0],
+            Value::Integer(i as i64),
+            "group order = first-seen order"
+        );
+    }
+}
+
+#[test]
+fn parallel_groupby_materialized_join_and_collated() {
+    // GROUP BY over a JOIN output (both splits engage: fused join probe +
+    // materialized group-by), plus a collated group key.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=60_000i64 {
+        db.execute(
+            "INSERT INTO a (id, k, x) VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(i * 3),
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO b (id, k, y) VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(i * 7),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    let sql = "SELECT a.k, COUNT(*), SUM(b.y), MIN(a.x), MAX(b.y) FROM a JOIN b ON a.k = b.k GROUP BY a.k";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert_eq!(ser, par, "GROUP BY over join output must equal serial");
+    assert!(ser.len() > 1000, "groups: {}", ser.len());
+
+    // Collated GROUP BY over a materialized TEXT input: first-seen
+    // representative spelling, NOCASE grouping.
+    let par = text_db();
+    let ser = {
+        let mut s = text_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql2 = "SELECT name COLLATE NOCASE, COUNT(*) FROM (SELECT id, name FROM t WHERE id <= 150000 UNION ALL SELECT id, name FROM t WHERE id > 150000) GROUP BY name COLLATE NOCASE";
+    let a = rows_of(&par, sql2);
+    let b = rows_of(&ser, sql2);
+    assert_eq!(
+        a, b,
+        "collated GROUP BY over materialized input must equal serial"
+    );
+    // 1000 no-case keys, each grouping its 300 rows.
+    assert_eq!(a.len(), 1000);
+    for r in a.iter() {
+        match &r[1] {
+            Value::Integer(i) => assert_eq!(*i, 300, "each no-case key groups 300 rows"),
+            other => panic!("INTEGER expected, got {other:?}"),
+        }
+    }
+}

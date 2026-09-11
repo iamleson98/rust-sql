@@ -2050,6 +2050,201 @@ pub(crate) fn try_parallel_aggregate_rows(
 }
 
 // ============================================================================
+// Parallel GROUP BY over MATERIALIZED rows
+// ============================================================================
+
+/// Parallel GROUP BY over MATERIALIZED input rows (a compound body,
+/// subquery/CTE, or join output — every GROUP BY the scan-based paths
+/// never see). Rows split into contiguous index chunks; each worker
+/// accumulates its own `HashGrouper` with the group keys and aggregate
+/// arguments evaluated by compiled positional expressions
+/// (`compile_materialized_expr` — the serial general path's resolution
+/// semantics), the collations folded through the SAME
+/// `set_key_collations` discipline. The main thread merges the partial
+/// groupers in CHUNK ORDER through `intern_key` + `merge_agg_state`,
+/// which reproduces the serial scan's first-seen group order exactly (a
+/// group's global first occurrence is in the earliest chunk containing
+/// it, and earlier chunks interned their keys first) — including the
+/// first-seen ORIGINAL display keys for collated groups.
+///
+/// Returns the MERGED grouper for the caller's own emission path
+/// (projection/HAVING/finalize unchanged), or `Ok(None)` when declined
+/// (below threshold / config off / txn open / non-compilable shape) —
+/// the caller runs the serial general loop, rows untouched.
+pub(crate) fn try_parallel_groupby_rows(
+    ctx: &ExecContext<'_>,
+    rows: &[Row],
+    columns: &[String],
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+    key_collations: &[StdOption<String>],
+) -> Result<Option<HashGrouper>> {
+    // Aggregate-function gates (the compiled GROUP BY split's own set).
+    for agg in aggregates {
+        match AggFunc::from_name(&agg.func) {
+            AggFunc::Count
+            | AggFunc::Sum
+            | AggFunc::Total
+            | AggFunc::Avg
+            | AggFunc::Min
+            | AggFunc::Max => {}
+            _ => return Ok(None),
+        }
+    }
+    // Group keys + aggregate args: all compile (COUNT(*) carries no arg).
+    let mut compiled_keys: Vec<crate::executor::predicate::CompiledExpr> =
+        Vec::with_capacity(group_by.len());
+    for g in group_by {
+        match compile_materialized_expr(g, columns, ctx.params.len()) {
+            Some(c) => compiled_keys.push(c),
+            None => return Ok(None),
+        }
+    }
+    let mut compiled_args: Vec<Option<crate::executor::predicate::CompiledExpr>> =
+        Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        match &agg.arg {
+            None => compiled_args.push(None),
+            Some(e) => match compile_materialized_expr(e, columns, ctx.params.len()) {
+                Some(c) => compiled_args.push(Some(c)),
+                None => return Ok(None),
+            },
+        }
+    }
+    // Gates: config + threshold + txn (the row count IS the estimate).
+    let min_rows = ctx.pager.parallel_scan_min_rows();
+    if min_rows <= 0 || (rows.len() as i64) < min_rows {
+        return Ok(None);
+    }
+    if ctx.in_transaction {
+        return Ok(None);
+    }
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let by_rows = (rows.len() / MIN_ROWS_PER_WORKER as usize).max(1);
+    let n_workers = hw.min(by_rows).clamp(1, MAX_WORKERS);
+    if n_workers < 2 {
+        return Ok(None);
+    }
+
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
+    let n_aggs = aggregates.len();
+    let group_by_len = group_by.len();
+    let distincts: Vec<bool> = aggregates.iter().map(|a| a.distinct).collect();
+    let seps: Vec<Option<String>> = (0..aggregates.len())
+        .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
+        .collect();
+    let compiled_keys: StdArc<Vec<crate::executor::predicate::CompiledExpr>> =
+        StdArc::new(compiled_keys);
+    let compiled_args: StdArc<Vec<Option<crate::executor::predicate::CompiledExpr>>> =
+        StdArc::new(compiled_args);
+    let key_collations: StdArc<Vec<StdOption<String>>> = StdArc::new(key_collations.to_vec());
+    let params: &[Value] = &ctx.params;
+    // Same temp-store discipline as the serial / selective paths.
+    let spill_ok = !ctx.pager.temp_store_memory();
+
+    // Contiguous index chunks (workers READ their slice — the rows stay
+    // in place; a decline leaves them untouched for the serial loop).
+    let n = rows.len();
+    let chunk = n.div_ceil(n_workers);
+    let bounds: Vec<(usize, usize)> = (0..n)
+        .step_by(chunk)
+        .map(|lo| (lo, (lo + chunk).min(n)))
+        .collect();
+
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<HashGrouper> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(bounds.len());
+        for (lo, hi) in bounds {
+            let compiled_keys = StdArc::clone(&compiled_keys);
+            let compiled_args = StdArc::clone(&compiled_args);
+            let key_collations = StdArc::clone(&key_collations);
+            let agg_funcs = agg_funcs.clone();
+            let distincts = distincts.clone();
+            let seps = seps.clone();
+            let aggregates_for_grouper = aggregates;
+            handles.push(scope.spawn(move || -> HashGrouper {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let mut grouper = if spill_ok {
+                    HashGrouper::with_spill_for(
+                        aggregates_for_grouper,
+                        super::group_spill_threshold(),
+                    )
+                } else {
+                    HashGrouper::with_aggs(n_aggs)
+                };
+                grouper.set_key_collations(key_collations.to_vec());
+                let mut key_buf: Vec<Value> = Vec::with_capacity(group_by_len.max(1));
+                for row in &rows[lo..hi] {
+                    key_buf.clear();
+                    for c in compiled_keys.iter() {
+                        key_buf.push(c.eval(row, params));
+                    }
+                    let gi = grouper.intern_key(&key_buf);
+                    for i in 0..n_aggs {
+                        let arg_val: Value = match &compiled_args[i] {
+                            None => super::COUNT_STAR_ARG.clone(),
+                            Some(c) => c.eval(row, params),
+                        };
+                        super::update_agg_state(
+                            grouper.state(gi, i),
+                            agg_funcs[i],
+                            &arg_val,
+                            distincts[i],
+                            seps[i].as_deref(),
+                        );
+                    }
+                }
+                grouper
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel row-group-by worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    // Merge in chunk order: the merged grouper reproduces the serial
+    // scan's first-seen group order and display keys exactly (the same
+    // fold the compiled GROUP BY split performs).
+    let mut merged = if spill_ok {
+        HashGrouper::with_spill_for(aggregates, super::group_spill_threshold())
+    } else {
+        HashGrouper::with_aggs(n_aggs)
+    };
+    merged.set_key_collations(key_collations.to_vec());
+    for g in partials {
+        let mut iter = g.into_group_iter();
+        while let Some((keys, states)) = iter.next_group() {
+            let dst_gi = merged.intern_key(&keys);
+            for i in 0..n_aggs {
+                // Safety of the split borrow: `merged.state` mutably
+                // borrows `merged`, `states` borrows the iterator's
+                // record (disjoint).
+                merge_agg_state(
+                    merged.state(dst_gi, i),
+                    &states[i],
+                    agg_funcs[i],
+                    aggregates[i].distinct,
+                    agg_sep_at(aggregates, i),
+                );
+            }
+        }
+    }
+    // Post-merge drain (the compiled path's rationale).
+    reclaim_worker_heaps();
+    if merged.is_empty() {
+        return Ok(None); // empty input: the serial path's implicit-group logic owns it
+    }
+    Ok(Some(merged))
+}
+
+// ============================================================================
 // Parallel sort of MATERIALIZED rows — compound bodies, subqueries, joins
 // ============================================================================
 
