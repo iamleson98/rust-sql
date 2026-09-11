@@ -10761,13 +10761,24 @@ fn try_fused_scan_hash_join(
     };
     let l_side = side(l_table, l_alias, &l_keys)?;
     let r_side = side(r_table, r_alias, &r_keys)?;
-    let left_outer = matches!(join_type, crate::sql::ast::JoinType::Left);
-    // INNER/CROSS: build the smaller side. LEFT: the RIGHT (inner) side
-    // must build — the LEFT (outer) side drives the output (every probe
-    // row emits: matches, or one NULL-extended row on no match).
-    // build_is_left travels with the CHOICE (a self-join shares one Arc,
-    // so table identity cannot identify the side).
-    let (build, probe, build_is_left) = if left_outer {
+    let left_outer = matches!(
+        join_type,
+        crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+    );
+    // RIGHT/FULL: the probe drives from the LEFT but the join semantics
+    // also need the unmatched BUILD (right) rows appended — the build
+    // side must be the right.
+    let build_unmatched_tail = matches!(
+        join_type,
+        crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+    );
+    // INNER/CROSS: build the smaller side. OUTER: the RIGHT (inner) side
+    // must build — the LEFT side drives the output (LEFT/FULL emit every
+    // probe row; RIGHT skips unmatched probe rows and appends the
+    // unmatched build rows instead). build_is_left travels with the
+    // CHOICE (a self-join shares one Arc, so table identity cannot
+    // identify the side).
+    let (build, probe, build_is_left) = if left_outer || build_unmatched_tail {
         (r_side, l_side, false)
     } else if l_side.count <= r_side.count {
         (l_side, r_side, true)
@@ -10937,6 +10948,7 @@ fn try_fused_scan_hash_join(
                 {
                     return true; // corrupt row: skip (matches exec_scan)
                 }
+                let mut null_key = false;
                 for (j, &kp) in build_key_pos.iter().enumerate() {
                     let k = match buf.get(kp) {
                         Some(Value::Integer(i)) => {
@@ -10950,9 +10962,16 @@ fn try_fused_scan_hash_join(
                             crate::types::value::double_order_key(*i as f64)
                         }
                         Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                        // NULL build keys never match anything (INNER join:
-                        // skip); TEXT/BLOB build keys need the byte-key path.
-                        Some(Value::Null) => return true,
+                        // NULL build keys never match anything — but they
+                        // are still STORED (slotless): RIGHT/FULL must emit
+                        // them in the unmatched tail, and a flavor-blind
+                        // build keeps the cross-statement cache correct
+                        // (an INNER/LEFT probe never sees them: no slot).
+                        // TEXT/BLOB build keys need the byte-key path.
+                        Some(Value::Null) => {
+                            null_key = true;
+                            break;
+                        }
                         _ => {
                             aborted = true;
                             return false;
@@ -10960,11 +10979,6 @@ fn try_fused_scan_hash_join(
                     };
                     ks[j] = k;
                 }
-                let k = if n_keys == 1 {
-                    ks[0]
-                } else {
-                    fold_join_hash(&ks)
-                };
                 // count_rows under-counted (corrupt page metadata) or the
                 // tree grew mid-scan: fall back to the materialized path
                 // rather than indexing past the pre-sized buffers.
@@ -10977,6 +10991,17 @@ fn try_fused_scan_hash_join(
                 for v in buf.iter() {
                     build_vals.push(v.clone());
                 }
+                if null_key {
+                    // Slotless: never probed, but present in the SoA store
+                    // for the RIGHT/FULL unmatched tail (and the
+                    // flavor-blind cross-statement cache).
+                    return true;
+                }
+                let k = if n_keys == 1 {
+                    ks[0]
+                } else {
+                    fold_join_hash(&ks)
+                };
                 // Open-addressing insert: find the key's slot (match = bucket
                 // chain prepend; empty slot = new head). Load factor <= 0.5
                 // (table_cap >= 2 * n_build >= 2 * stored) guarantees an empty
@@ -11065,6 +11090,7 @@ fn try_fused_scan_hash_join(
             &out_slots_plain,
             out_combined.len(),
             left_outer,
+            build_unmatched_tail,
         )? {
             let columns_out: std::sync::Arc<[String]> = out_names.into();
             return Ok(Some(ExecResult {
@@ -11085,6 +11111,16 @@ fn try_fused_scan_hash_join(
     // materialized paths emit each left row's matches in right-scan
     // order, and the chain is prepend-ordered (newest first).
     let mut match_ords: Vec<u32> = Vec::new();
+    // RIGHT/FULL: a matched bitmap over build ords — the unmatched tail
+    // emits [NULL left..., build values] in build (right-scan) order,
+    // exactly the materialized path's trailing emission.
+    let build_words = built.n_build.div_ceil(64);
+    let mut build_matched: Vec<u64> = if build_unmatched_tail {
+        vec![0u64; build_words]
+    } else {
+        Vec::new()
+    };
+    let serial_bitmap = build_unmatched_tail;
     {
         let mut bt = Btree::new(pager, probe.root, false);
         bt.scan_table_borrowed(|rowid, payload| {
@@ -11156,7 +11192,7 @@ fn try_fused_scan_hash_join(
                     }
                 };
             }
-            if !left_outer {
+            if !left_outer && !build_unmatched_tail {
                 // INNER: emit the matches in chain order (the established
                 // fused-path discipline — INNER row order is unspecified).
                 while next != u32::MAX {
@@ -11176,24 +11212,33 @@ fn try_fused_scan_hash_join(
                     next = chain[ord];
                 }
             } else {
-                // LEFT: collect the chain, REVERSE to build-scan order,
-                // emit — or one NULL-extended row when nothing matched.
+                // OUTER: collect the chain, REVERSE to build-scan order,
+                // emit. No match: LEFT/FULL emit one NULL-extended probe
+                // row; RIGHT skips (its unmatched rows come from the
+                // build tail below).
                 match_ords.clear();
                 while next != u32::MAX {
                     match_ords.push(next);
                     next = chain[next as usize];
                 }
                 if match_ords.is_empty() {
-                    let mut out: Row = Vec::with_capacity(n_out);
-                    for s in &out_slots {
-                        out.push(if s.from_build {
-                            Value::Null
-                        } else {
-                            pbuf[s.pos].clone()
-                        });
+                    if left_outer {
+                        let mut out: Row = Vec::with_capacity(n_out);
+                        for s in &out_slots {
+                            out.push(if s.from_build {
+                                Value::Null
+                            } else {
+                                pbuf[s.pos].clone()
+                            });
+                        }
+                        out_rows.push(out);
                     }
-                    out_rows.push(out);
                 } else {
+                    if serial_bitmap {
+                        for &ord in match_ords.iter() {
+                            build_matched[(ord as usize) / 64] |= 1u64 << ((ord as usize) % 64);
+                        }
+                    }
                     match_ords.reverse();
                     for &ord in match_ords.iter() {
                         let ord = ord as usize;
@@ -11212,6 +11257,26 @@ fn try_fused_scan_hash_join(
             }
             true
         })?;
+    }
+
+    // RIGHT/FULL: the unmatched-build tail — [NULL left..., build
+    // values] in build (right-scan) order, the materialized path's
+    // trailing emission.
+    if build_unmatched_tail {
+        for ord in 0..built.n_build {
+            if build_matched[ord / 64] & (1u64 << (ord % 64)) == 0 {
+                let mut out: Row = Vec::with_capacity(n_out);
+                for s in &out_slots {
+                    let v = if s.from_build {
+                        &build_vals[ord * stride + s.pos]
+                    } else {
+                        &Value::Null
+                    };
+                    out.push(v.clone());
+                }
+                out_rows.push(out);
+            }
+        }
     }
 
     let columns_out: std::sync::Arc<[String]> = out_names.into();
@@ -11287,14 +11352,19 @@ fn exec_hash_join(
         crate::sql::ast::JoinType::Inner
             | crate::sql::ast::JoinType::Cross
             | crate::sql::ast::JoinType::Left
+            | crate::sql::ast::JoinType::Right
+            | crate::sql::ast::JoinType::Full
     ) {
         // None (no Project above the join — e.g. an Aggregate directly
         // over the join) takes the fused path too: it emits FULL combined
         // rows, still streaming — the materialized path below executes
-        // BOTH sides into Vec<Row> first. LEFT joins fuse with the RIGHT
-        // (inner) side as the build and the LEFT (outer) side as the
-        // probe — non-matching probe rows emit NULL-extended (the
-        // materialized path's semantics, minus the materialization).
+        // BOTH sides into Vec<Row> first. OUTER joins fuse with the RIGHT
+        // (inner) side as the build and the LEFT side as the probe —
+        // non-matching probe rows emit NULL-extended for LEFT/FULL (the
+        // materialized path's semantics, minus the materialization), and
+        // RIGHT/FULL append the unmatched BUILD rows (a matched bitmap)
+        // with NULL left values — exactly the materialized path's
+        // left-driven order.
         if let Some(res) =
             try_fused_scan_hash_join(ctx, left, right, join_type, condition, projection)?
         {

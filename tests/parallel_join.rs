@@ -662,3 +662,271 @@ fn fused_left_join_projection_and_multikey() {
         "COUNT(r.y) counts matches"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fused RIGHT / FULL equi-joins: the RIGHT (inner) side builds, the LEFT
+// side probes; LEFT-driven match order with a matched-bitmap tail that
+// emits the unmatched BUILD rows ([NULL left..., right values]) in
+// build-scan order — the materialized path's exact emission discipline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fused_right_and_full_join_match_materialized() {
+    // Small hand-pinned fixture: every emission slot is ground-truthed.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO l (id, k, x) VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300), (4, NULL, 400)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO r (id, k, y) VALUES (1, 10, 7), (2, 10, 8), (3, 30, 9), (4, NULL, 10)",
+        [],
+    )
+    .unwrap();
+    // RIGHT JOIN: left rows without matches emit NOTHING; unmatched right
+    // rows emit [NULL, NULL, right...] at the end.
+    let got = rows_of(
+        &db,
+        "SELECT l.id, l.x, r.id, r.y FROM l RIGHT JOIN r ON l.k = r.k",
+    );
+    assert_eq!(
+        got,
+        vec![
+            // l1 (k=10) matches r1, r2 in right-scan order.
+            vec![
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(1),
+                Value::Integer(7)
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(2),
+                Value::Integer(8)
+            ],
+            // l3 (k=10) matches r1, r2.
+            vec![
+                Value::Integer(3),
+                Value::Integer(300),
+                Value::Integer(1),
+                Value::Integer(7)
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Integer(300),
+                Value::Integer(2),
+                Value::Integer(8)
+            ],
+            // l2 (k=20), l4 (k=NULL): no match, emit nothing.
+            // Unmatched RIGHT tail in right-scan order: r3 (k=30), r4 (k=NULL).
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(3),
+                Value::Integer(9)
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(4),
+                Value::Integer(10)
+            ],
+        ],
+        "RIGHT join emission discipline"
+    );
+    // FULL JOIN: left rows without matches emit [left..., NULL, NULL]
+    // inline; the unmatched right tail follows.
+    let got = rows_of(
+        &db,
+        "SELECT l.id, l.x, r.id, r.y FROM l FULL JOIN r ON l.k = r.k",
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(1),
+                Value::Integer(7)
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(2),
+                Value::Integer(8)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Integer(200),
+                Value::Null,
+                Value::Null
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Integer(300),
+                Value::Integer(1),
+                Value::Integer(7)
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Integer(300),
+                Value::Integer(2),
+                Value::Integer(8)
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Integer(400),
+                Value::Null,
+                Value::Null
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(3),
+                Value::Integer(9)
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(4),
+                Value::Integer(10)
+            ],
+        ],
+        "FULL join emission discipline"
+    );
+}
+
+#[test]
+fn fused_right_and_full_join_parallel_matches_serial() {
+    // Big tables: parallel probe split (with per-range bitmaps OR-merged
+    // for the tail) == serial, order included.
+    let mut db = Database::open_in_memory().unwrap();
+    build(&mut db, 150_000);
+    // b.k = i - i%3 covers [0, 150k); a.k = i - i%3 too — but b rows only
+    // exist for i in [1, 150000]: the k=0 bucket (i=1,2) partially
+    // unmatched... make a NON-overlapping band by deleting b's tail: keys
+    // [100000, 150000) then have no b rows (a-side unmatched) and a few
+    // low a keys missing (b-side unmatched) via a WHERE-shaped fixture.
+    db.execute("DELETE FROM b WHERE id > 100000", []).unwrap();
+    let sql_right = "SELECT a.id, a.x, b.id, b.y FROM a RIGHT JOIN b ON a.k = b.k";
+    let sql_full = "SELECT a.id, a.x, b.id, b.y FROM a FULL JOIN b ON a.k = b.k";
+    for sql in [sql_right, sql_full] {
+        db.execute("PRAGMA parallel_scan=0", []).unwrap();
+        let ser = rows_of(&db, sql);
+        db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+        let par = rows_of(&db, sql);
+        assert_eq!(ser, par, "{sql}: parallel RIGHT/FULL must equal serial");
+        assert!(
+            ser.len() > 131_072,
+            "{sql}: output above threshold: {}",
+            ser.len()
+        );
+    }
+    // Shape checks on the FULL result: unmatched-left rows inline +
+    // unmatched-right tail; counts are ground-truthed structurally.
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let full = rows_of(
+        &db,
+        "SELECT a.id, a.x, b.id, b.y FROM a FULL JOIN b ON a.k = b.k",
+    );
+    let null_left: usize = full.iter().filter(|r| matches!(r[0], Value::Null)).count();
+    let null_right: usize = full.iter().filter(|r| matches!(r[2], Value::Null)).count();
+    // b rows number 100000 (ids 1..=100000); a rows 150000. The k buckets
+    // are 3-wide: a keys [0..149999], b keys [0..99999]. a rows with
+    // k >= 99999+... unmatched-a = rows with k not in b's key set
+    // (k > 99999-2 region): a.ids 100002..150000 have k = i-i%3 > 99999 →
+    // 50k-ish. b unmatched: the k=0 bucket has a rows (a.id 1, 2, 3 with
+    // k=0) so b's k=0 rows match; every b row matches some a.
+    assert!(
+        null_left == 0,
+        "every b row matches some a row: {null_left}"
+    );
+    assert!(null_right > 49_000, "unmatched a rows: {null_right}");
+}
+
+#[test]
+fn fused_full_join_multikey_and_aggregate() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, x REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=150_000i64 {
+        db.execute(
+            "INSERT INTO l (id, k1, k2, x) VALUES (?, ?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(-(i % 5)),
+                Value::Real(i as f64 / 2.0),
+            ],
+        )
+        .unwrap();
+        if (40_000..110_000).contains(&i) {
+            db.execute(
+                "INSERT INTO r (id, k1, k2, y) VALUES (?, ?, ?, ?)",
+                [
+                    Value::Integer(i),
+                    Value::Integer(i - (i % 3)),
+                    Value::Integer(-((i + 2) % 5)),
+                    Value::Integer(i * 7),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    db.execute("COMMIT", []).unwrap();
+    let sql = "SELECT l.x, r.y FROM l FULL JOIN r ON l.k1 = r.k1 AND l.k2 = r.k2";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert_eq!(ser, par, "multi-key FULL join must equal serial");
+    // Aggregate over the FULL output rides the same path.
+    let a2 = rows_of(
+        &db,
+        "SELECT COUNT(*), COUNT(l.x), COUNT(r.y) FROM l FULL JOIN r ON l.k1 = r.k1 AND l.k2 = r.k2",
+    );
+    let total = match &a2[0][0] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    let count_l = match &a2[0][1] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    let count_r = match &a2[0][2] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    // l rows above the r band + r rows with no l match: total = 150k l
+    // driven rows (some with r matches) + unmatched r tail.
+    assert!(total > 150_000, "total rows: {total}");
+    assert_eq!(
+        count_l as usize,
+        ser.iter().filter(|r| !matches!(r[0], Value::Null)).count()
+    );
+    assert_eq!(
+        count_r as usize,
+        ser.iter().filter(|r| !matches!(r[1], Value::Null)).count()
+    );
+}

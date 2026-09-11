@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **780+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **783+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -751,8 +751,14 @@ compat surface. Every entry says what it costs and why it exists.
   the nested-loop/materialized paths' order), single- and multi-key, and
   the parallel probe split covers it (a self-join regression the
   differential suite caught: `build_is_left` now travels with the
-  side CHOICE, not Arc identity). Still serial: aggregates over
-  non-scan inputs, RIGHT/FULL joins, and non-equi conditions.
+  side CHOICE, not Arc identity). **RIGHT and FULL fuse too** — a
+  matched bitmap over the build ords collects the unmatched BUILD rows
+  into the trailing emission ([NULL left..., right values] in
+  build-scan order); the parallel probe OR-merges per-range worker
+  bitmaps; NULL build keys are stored SLOTLESS (never probed, but
+  present for the tail — and flavor-blind, so the cross-statement
+  build cache stays correct across join types). Still serial:
+  aggregates over non-scan inputs and non-equi conditions.
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled

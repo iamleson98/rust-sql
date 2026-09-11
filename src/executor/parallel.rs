@@ -2408,6 +2408,7 @@ pub(crate) fn try_parallel_join_probe(
     out_slots: &[(bool, usize)],
     n_out: usize,
     left_outer: bool,
+    build_unmatched_tail: bool,
 ) -> Result<Option<Vec<crate::Row>>> {
     let pager = ctx.pager;
     // Committed-view scope: workers are foreign to the TLS arming.
@@ -2435,9 +2436,11 @@ pub(crate) fn try_parallel_join_probe(
     let probe_key_pos: StdArc<Vec<usize>> = StdArc::new(probe_key_pos.to_vec());
     let n_keys = built.n_keys;
     let built_key_slots: StdArc<Vec<usize>> = StdArc::new(built.key_slots.clone());
+    let build_words = built.n_build.div_ceil(64);
     let n_workers = ranges.len();
     let conn_enc_tag = super::conn_enc::current();
-    let partials: Vec<Result<Vec<crate::Row>>> = std::thread::scope(|scope| {
+    type WorkerOut = (Vec<crate::Row>, Vec<u64>);
+    let partials: Vec<Result<WorkerOut>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(n_workers);
         for &(lo, hi) in ranges.iter() {
             let built = StdArc::clone(&built);
@@ -2445,12 +2448,17 @@ pub(crate) fn try_parallel_join_probe(
             let out_slots = StdArc::clone(&out_slots);
             let probe_key_pos = StdArc::clone(&probe_key_pos);
             let built_key_slots = StdArc::clone(&built_key_slots);
-            handles.push(scope.spawn(move || -> Result<Vec<crate::Row>> {
+            handles.push(scope.spawn(move || -> Result<WorkerOut> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut out_rows: Vec<crate::Row> = Vec::new();
                 let mut pbuf: Vec<crate::types::Value> = Vec::new();
                 let mut pks: Vec<u64> = vec![0u64; n_keys];
                 let mut match_ords: Vec<u32> = Vec::new();
+                let mut bitmap: Vec<u64> = if build_unmatched_tail {
+                    vec![0u64; build_words]
+                } else {
+                    Vec::new()
+                };
                 let mut bt = Btree::new(pager, probe_root, false);
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
                     if crate::storage::row_codec::decode_row_selective_sorted(
@@ -2515,7 +2523,7 @@ pub(crate) fn try_parallel_join_probe(
                         };
                     }
                     let stride = built.stride;
-                    if !left_outer {
+                    if !left_outer && !build_unmatched_tail {
                         // INNER: matches in chain order (the serial fused
                         // path's discipline — range-ordered partials stay
                         // bit-identical to it).
@@ -2534,24 +2542,33 @@ pub(crate) fn try_parallel_join_probe(
                             next = built.chain[ord];
                         }
                     } else {
-                        // LEFT: collect the chain, REVERSE to build-scan
-                        // order, emit — or one NULL-extended row.
+                        // OUTER: collect the chain, REVERSE to build-scan
+                        // order, emit. No match: LEFT/FULL emit one
+                        // NULL-extended probe row; RIGHT skips (its
+                        // unmatched rows come from the build tail).
                         match_ords.clear();
                         while next != u32::MAX {
                             match_ords.push(next);
                             next = built.chain[next as usize];
                         }
                         if match_ords.is_empty() {
-                            let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
-                            for s in out_slots.iter() {
-                                out.push(if s.from_build {
-                                    crate::types::Value::Null
-                                } else {
-                                    pbuf[s.pos].clone()
-                                });
+                            if left_outer {
+                                let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
+                                for s in out_slots.iter() {
+                                    out.push(if s.from_build {
+                                        crate::types::Value::Null
+                                    } else {
+                                        pbuf[s.pos].clone()
+                                    });
+                                }
+                                out_rows.push(out);
                             }
-                            out_rows.push(out);
                         } else {
+                            if build_unmatched_tail {
+                                for &ord in match_ords.iter() {
+                                    bitmap[(ord as usize) / 64] |= 1u64 << ((ord as usize) % 64);
+                                }
+                            }
                             match_ords.reverse();
                             for &ord in match_ords.iter() {
                                 let ord = ord as usize;
@@ -2570,7 +2587,7 @@ pub(crate) fn try_parallel_join_probe(
                     }
                     true
                 })?;
-                Ok(out_rows)
+                Ok((out_rows, bitmap))
             }));
         }
         handles
@@ -2580,10 +2597,42 @@ pub(crate) fn try_parallel_join_probe(
     });
     reclaim_worker_heaps();
     let mut rows: Vec<crate::Row> = Vec::new();
+    let mut matched: Vec<u64> = if build_unmatched_tail {
+        vec![0u64; build_words]
+    } else {
+        Vec::new()
+    };
     for p in partials {
         match p {
-            Ok(mut part) => rows.append(&mut part),
+            Ok((mut part, bitmap)) => {
+                rows.append(&mut part);
+                if build_unmatched_tail {
+                    for (dst, src) in matched.iter_mut().zip(bitmap.iter()) {
+                        *dst |= src;
+                    }
+                }
+            }
             Err(_) => return Ok(None), // worker error: serial fallback
+        }
+    }
+    // RIGHT/FULL: the unmatched-build tail — [NULL probe-side...,
+    // build values] in build (right-scan) order, the serial fused path's
+    // trailing emission.
+    if build_unmatched_tail {
+        let stride = built.stride;
+        for ord in 0..built.n_build {
+            if matched[ord / 64] & (1u64 << (ord % 64)) == 0 {
+                let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
+                for s in out_slots.iter() {
+                    let v = if s.from_build {
+                        built.build_vals[ord * stride + s.pos].clone()
+                    } else {
+                        crate::types::Value::Null
+                    };
+                    out.push(v);
+                }
+                rows.push(out);
+            }
         }
     }
     Ok(Some(rows))
