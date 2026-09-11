@@ -1742,13 +1742,9 @@ pub(crate) fn try_parallel_sort_expr(
 
     // Any worker error -> serial fallback (never a divergent answer).
     let mut chunks: Vec<ExprSortChunk> = Vec::with_capacity(partials.len());
-    let mut total: usize = 0;
     for p in partials {
         match p {
-            Ok(c) => {
-                total += c.rows.len();
-                chunks.push(c);
-            }
+            Ok(c) => chunks.push(c),
             Err(_) => return Ok(None),
         }
     }
@@ -1756,7 +1752,39 @@ pub(crate) fn try_parallel_sort_expr(
         return Ok(None);
     }
 
-    // ---- k-way merge under the same strict total order ----------------
+    // k-way merge under the same strict total order; the emit maps the
+    // projection indices over the scan-shaped row (ROWID_PROJ -> the
+    // rowid) or passes the row through.
+    let rows = expr_chunks_merge(chunks, &resolved, &|rowid, row| match project {
+        Some(ps) => ps
+            .iter()
+            .map(|&p| {
+                if p == rowid_proj {
+                    Value::Integer(rowid)
+                } else {
+                    row.get(p).cloned().unwrap_or(Value::Null)
+                }
+            })
+            .collect(),
+        None => row,
+    });
+
+    Ok(Some(ExecResult {
+        columns: out_cols,
+        rows,
+    }))
+}
+
+/// k-way merge of expression-sorted chunks under the shared strict
+/// (keys, tiebreak-index) total order, emitting through `emit` (the
+/// tiebreak index and the scan-shaped row in; the output row out). A
+/// binary heap of chunk indices; rows MOVE out of their chunk via
+/// mem::take (the output reuses each row's allocation).
+fn expr_chunks_merge(
+    mut chunks: Vec<ExprSortChunk>,
+    terms: &[ExprSortTerm],
+    emit: &dyn Fn(i64, Row) -> Row,
+) -> Vec<Row> {
     let mut cursors: Vec<usize> = vec![0; chunks.len()];
     let mut heap: Vec<usize> = (0..chunks.len())
         .filter(|&c| !chunks[c].rows.is_empty())
@@ -1813,28 +1841,13 @@ pub(crate) fn try_parallel_sort_expr(
     }
 
     for i in (0..heap.len() / 2).rev() {
-        sift_down(&mut heap, i, &chunks, &cursors, &resolved);
+        sift_down(&mut heap, i, &chunks, &cursors, terms);
     }
 
-    let mut rows: Vec<Row> = Vec::with_capacity(total.min(1 << 20));
+    let mut rows: Vec<Row> = Vec::new();
     while let Some(&top) = heap.first() {
-        let (rowid, _keys, row) = std::mem::take(&mut chunks[top].rows[cursors[top]]);
-        // Emit: projection indices (table columns; ROWID_PROJ = rowid),
-        // or the already-shaped scan row.
-        let out: Row = match project {
-            Some(ps) => ps
-                .iter()
-                .map(|&p| {
-                    if p == rowid_proj {
-                        Value::Integer(rowid)
-                    } else {
-                        row.get(p).cloned().unwrap_or(Value::Null)
-                    }
-                })
-                .collect(),
-            None => row,
-        };
-        rows.push(out);
+        let (idx, _keys, row) = std::mem::take(&mut chunks[top].rows[cursors[top]]);
+        rows.push(emit(idx, row));
         cursors[top] += 1;
         if cursors[top] >= chunks[top].rows.len() {
             let last = heap.len() - 1;
@@ -1842,14 +1855,10 @@ pub(crate) fn try_parallel_sort_expr(
             heap.pop();
         }
         if !heap.is_empty() {
-            sift_down(&mut heap, 0, &chunks, &cursors, &resolved);
+            sift_down(&mut heap, 0, &chunks, &cursors, terms);
         }
     }
-
-    Ok(Some(ExecResult {
-        columns: out_cols,
-        rows,
-    }))
+    rows
 }
 
 /// One range worker's sorted chunk: (rowid, row) pairs in
@@ -1858,6 +1867,236 @@ pub(crate) fn try_parallel_sort_expr(
 /// the scan shape emits one, or the fused projection's columns).
 struct SortChunk {
     rows: Vec<(i64, Row)>,
+}
+
+// ============================================================================
+// Parallel sort of MATERIALIZED rows — compound bodies, subqueries, joins
+// ============================================================================
+
+/// Compile one ORDER BY term against a MATERIALIZED input's output
+/// columns (a UNION's combined list, a subquery's/CTE's output, a join's
+/// combined row — anything `execute(input)` produced). Column references
+/// resolve through the SAME `resolve_column_index` chain the serial
+/// comparator's `eval_row` uses (qualified-exact -> exact -> suffix ->
+/// case-insensitive), so the compiled key evaluates identically; ordinals
+/// (positive integer literals) read the k-1 output column; the root
+/// `COLLATE` wrapper is handled by the caller (the term list carries the
+/// collation NAME — resolved on the main thread).
+fn compile_materialized_expr(
+    e: &Expr,
+    columns: &[String],
+    params_len: usize,
+) -> Option<crate::executor::predicate::CompiledExpr> {
+    use crate::executor::predicate::CompiledExpr;
+    match e {
+        Expr::Literal(v) => Some(CompiledExpr::Literal(v.clone())),
+        // Ordinal: the k-th OUTPUT column (validated by exec_sort's
+        // runtime range check before this compiler runs).
+        Expr::Column { table, name } => {
+            let idx = super::resolve_column_index(columns, table.as_deref(), name)?;
+            Some(CompiledExpr::Col(idx))
+        }
+        // Inner Collate wrappers evaluate their inner expression (the
+        // serial `evaluate` arm); collation only matters at comparison.
+        Expr::Collate { expr, .. } => compile_materialized_expr(expr, columns, params_len),
+        Expr::Parameter(name) => {
+            if name == "?" || name.is_empty() {
+                return Some(CompiledExpr::Param(0));
+            }
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx < params_len || params_len == 0 {
+                    return Some(CompiledExpr::Param(idx));
+                }
+            }
+            None
+        }
+        Expr::Unary { op, expr } => Some(CompiledExpr::Unary(
+            *op,
+            Box::new(compile_materialized_expr(expr, columns, params_len)?),
+        )),
+        Expr::Binary { op, left, right } => {
+            if matches!(
+                op,
+                crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or
+            ) {
+                return None;
+            }
+            Some(CompiledExpr::Binary(
+                *op,
+                Box::new(compile_materialized_expr(left, columns, params_len)?),
+                Box::new(compile_materialized_expr(right, columns, params_len)?),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Compile EVERY term of a materialized-input sort: (compiled key, DESC,
+/// collation name). Returns None when any term is outside the compiled
+/// set (user functions, CASE, ...) — the serial comparator's own
+/// semantics stay in charge.
+pub(crate) fn materialized_sort_terms(
+    terms: &[crate::sql::ast::OrderTerm],
+    columns: &[String],
+    params_len: usize,
+) -> Option<
+    Vec<(
+        crate::executor::predicate::CompiledExpr,
+        bool,
+        StdOption<String>,
+    )>,
+> {
+    let mut out = Vec::with_capacity(terms.len());
+    for term in terms {
+        let (expr, collation): (&Expr, Option<String>) = match &term.expr {
+            Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.clone())),
+            e => (e, None),
+        };
+        // Ordinals first (the serial sort_key's special case).
+        let compiled = match expr {
+            Expr::Literal(Value::Integer(k)) if *k >= 1 => {
+                let idx = (*k as usize).checked_sub(1)?;
+                if idx >= columns.len() {
+                    return None;
+                }
+                crate::executor::predicate::CompiledExpr::Col(idx)
+            }
+            e => compile_materialized_expr(e, columns, params_len)?,
+        };
+        out.push((
+            compiled,
+            term.order == crate::sql::ast::Order::Desc,
+            collation,
+        ));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parallel sort of ALREADY-MATERIALIZED rows: the ORDER BY of a
+/// compound SELECT (`... UNION ... ORDER BY x`), a subquery/CTE output,
+/// or anything else whose sort input is not a bare table scan. The rows
+/// split into contiguous index chunks; each worker materializes the
+/// COMPILED key values once per row and sorts its chunk under the strict
+/// (keys, global-index) total order; the main thread k-way merges under
+/// the same order.
+///
+/// ## Why the merge is exactly the serial answer
+///
+/// The serial path runs a STABLE sort with a per-term comparator that
+/// returns Equal on full ties, so tied rows keep input order: the serial
+/// output is the (keys, input-index ASC) sequence. Chunks arrive in
+/// input-index order; a local sort under the strict (keys, index) order
+/// yields (keys, index ASC) within the chunk; the chunks tile the index
+/// space in ascending order, so a k-way merge under the same strict
+/// order emits the global (keys, index ASC) sequence — identical rows,
+/// identical order.
+///
+/// Gates: row count >= the PRAGMA threshold; config on; no open
+/// transaction; >= 2 worthwhile workers. `Ok(None)` = declined — the
+/// caller runs the serial sort unchanged.
+pub(crate) fn try_parallel_sort_rows(
+    ctx: &ExecContext<'_>,
+    rows: &mut Vec<Row>,
+    terms: &[(
+        crate::executor::predicate::CompiledExpr,
+        bool,
+        StdOption<String>,
+    )],
+) -> Result<Option<Vec<Row>>> {
+    // Gate: config + threshold (the row count IS the estimate here — the
+    // rows are materialized).
+    let min_rows = ctx.pager.parallel_scan_min_rows();
+    if min_rows <= 0 || (rows.len() as i64) < min_rows {
+        return Ok(None);
+    }
+    // Gate: no open transaction (workers are foreign to the committed-
+    // view TLS).
+    if ctx.in_transaction {
+        return Ok(None);
+    }
+    // Worker count: hardware threads, scaled to the work size.
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let by_rows = (rows.len() / MIN_ROWS_PER_WORKER as usize).max(1);
+    let n_workers = hw.min(by_rows).clamp(1, MAX_WORKERS);
+    if n_workers < 2 {
+        return Ok(None); // one worker = the serial path + spawn cost
+    }
+
+    // Resolve every term's collation ONCE on the MAIN thread (the
+    // statement's plugin scope lives here).
+    let resolved: Vec<ExprSortTerm> = terms
+        .iter()
+        .map(|(compiled, desc, name)| {
+            (
+                compiled.clone(),
+                *desc,
+                name.as_deref().and_then(crate::plugin::lookup_collation),
+            )
+        })
+        .collect();
+
+    // Split the rows into contiguous index chunks, MOVED out of the
+    // input Vec (the merge reuses each row's allocation; no clones). A
+    // decline below never touches the rows — the gates have all passed.
+    let n = rows.len();
+    let chunk = n.div_ceil(n_workers);
+    let params: &[Value] = &ctx.params;
+    let mut rest = std::mem::take(rows);
+    let mut chunks: Vec<(usize, Vec<Row>)> = Vec::with_capacity(n_workers);
+    let mut lo = 0usize;
+    while !rest.is_empty() {
+        let take = chunk.min(rest.len());
+        let part: Vec<Row> = rest.drain(..take).collect();
+        chunks.push((lo, part));
+        lo += take;
+    }
+    let total = lo;
+
+    // Workers: materialize the key values once per row (parallel key
+    // evaluation — the serial comparator re-evaluates per comparison)
+    // and sort the chunk under the strict (keys, global-index) order.
+    // Pure compute — no I/O, no fallible step.
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<ExprSortChunk> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for (base, part) in chunks {
+            let resolved = &resolved;
+            handles.push(scope.spawn(move || -> ExprSortChunk {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let mut rows: Vec<(i64, Vec<Value>, Row)> = Vec::with_capacity(part.len());
+                for (i, row) in part.into_iter().enumerate() {
+                    let mut keys = Vec::with_capacity(resolved.len());
+                    for (c, _, _) in resolved {
+                        keys.push(c.eval(&row, params));
+                    }
+                    rows.push(((base + i) as i64, keys, row));
+                }
+                rows.sort_unstable_by(|a, b| expr_sort_cmp(&a.1, a.0, &b.1, b.0, resolved));
+                ExprSortChunk { rows }
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel row-sort worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    let chunks = partials;
+    if chunks.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    // k-way merge under the same strict total order; rows emit as-is
+    // (they ARE the output — the caller applies no projection).
+    let rows = expr_chunks_merge(chunks, &resolved, &|_idx, row| row);
+    debug_assert_eq!(rows.len(), total);
+    Ok(Some(rows))
 }
 
 /// Parallel unbounded `ORDER BY a, b DESC, ...` over a bare full table

@@ -1839,3 +1839,130 @@ fn parallel_topn_expression_fused_matches_materializing() {
         assert!(next > prev, "NULL tie block must be rowid ASC");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Parallel sort of MATERIALIZED rows: the ORDER BY of a compound body
+// (UNION ALL), a DISTINCT subquery — any sort input that is not a bare
+// scan. Contiguous index chunks + compiled key evaluation once per row +
+// k-way merge under the strict (keys, input-index) total order
+// (parallel::try_parallel_sort_rows).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_sort_materialized_battery_matches_serial() {
+    let queries = [
+        // compound body (UNION ALL of two halves) + expression term
+        "SELECT id, v FROM (SELECT id, v FROM t WHERE id <= 150000 UNION ALL SELECT id, v FROM t WHERE id > 150000) ORDER BY v * -1",
+        // compound body + runtime ordinals over the combined output
+        "SELECT id, v FROM (SELECT id, v FROM t WHERE id <= 150000 UNION ALL SELECT id, v FROM t WHERE id > 150000) ORDER BY 2, 1",
+        // DISTINCT subquery + NULL-key expression term (v is NULL on a
+        // sparse row set: NULLs first, ties in input order)
+        "SELECT cat, v FROM (SELECT DISTINCT cat, v FROM t) ORDER BY v * 2",
+    ];
+    for sql in queries {
+        let par = big_db();
+        let ser = {
+            let mut s = big_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), b.len(), "{sql}: row count");
+        assert!(
+            a.len() > 131_072,
+            "{sql}: output must be above the split threshold"
+        );
+        assert_eq!(a, b, "{sql}: materialized-row sort must equal serial");
+    }
+    // Spot checks pin the ORDER:
+    let db = big_db();
+    // v * -1 is NULL on the sparse NULL-v rows — NULLs sort FIRST, so
+    // the first three rows are the first NULL-v rowids (98, 399, 497 —
+    // the j%100>=97 && j%7==0 CRT solutions in ascending order).
+    let a = rows_of(
+        &db,
+        "SELECT id FROM (SELECT id, v FROM t WHERE id <= 150000 UNION ALL SELECT id, v FROM t WHERE id > 150000) ORDER BY v * -1 LIMIT 3",
+    );
+    assert_eq!(
+        a,
+        vec![
+            vec![Value::Integer(98)],
+            vec![Value::Integer(399)],
+            vec![Value::Integer(497)]
+        ]
+    );
+    // The non-NULL prefix: v * -1 = 150000 - id, ASCENDING = id
+    // DESCENDING; id 299999 is itself a NULL row, so the first non-NULL
+    // key belongs to id 299998.
+    let a = rows_of(
+        &db,
+        "SELECT id FROM (SELECT id, v FROM t WHERE id <= 150000 UNION ALL SELECT id, v FROM t WHERE id > 150000) ORDER BY v * -1 LIMIT 3 OFFSET 1286",
+    );
+    assert_eq!(
+        a,
+        vec![
+            vec![Value::Integer(299_998)],
+            vec![Value::Integer(299_997)],
+            vec![Value::Integer(299_996)]
+        ]
+    );
+    // Ordinals: ORDER BY 2 (v), 1 (id): NULL v rows first in id order —
+    // the first NULL row is id 98.
+    let a = rows_of(
+        &db,
+        "SELECT id, v FROM (SELECT id, v FROM t WHERE id <= 150000 UNION ALL SELECT id, v FROM t WHERE id > 150000) ORDER BY 2, 1 LIMIT 2",
+    );
+    assert_eq!(a[0][0], Value::Integer(98));
+    assert!(matches!(a[0][1], Value::Null));
+    // TEXT compound body + COLLATE over an expression:
+    let queries_text =
+        ["SELECT id, name FROM (SELECT id, name FROM t WHERE id <= 150000 UNION ALL SELECT id, name FROM t WHERE id > 150000) ORDER BY (name || '') COLLATE NOCASE, id"];
+    for sql in queries_text {
+        let par = text_db();
+        let ser = {
+            let mut s = text_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), BIG as usize, "{sql}: row count");
+        assert_eq!(a, b, "{sql}: materialized TEXT sort must equal serial");
+        // NOCASE min: user-00000's rows in rowid order (id 0, 1000, ...).
+        assert_eq!(a[0][0], Value::Integer(0));
+        assert_eq!(a[1][0], Value::Integer(1000));
+    }
+}
+
+#[test]
+fn parallel_sort_materialized_ties_keep_input_order() {
+    // A key with a MASSIVE tie block: ORDER BY cat (100 buckets over
+    // ~299k distinct-pair rows) — ties must keep the materialized input
+    // order (stable-sort semantics) in both paths.
+    let sql = "SELECT cat, v FROM (SELECT DISTINCT cat, v FROM t) ORDER BY cat";
+    let par = big_db();
+    let ser = {
+        let mut s = big_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "tie blocks must keep the stable input order");
+    // cat=0's block: the DISTINCT dedup emitted each (0, v) pair once in
+    // first-seen (rowid) order — the sorted block preserves that order.
+    let block: Vec<i64> = a
+        .iter()
+        .filter(|r| r[0] == Value::Integer(0))
+        .map(|r| r[1].as_integer())
+        .collect();
+    let mut sorted = block.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        block, sorted,
+        "within the cat=0 tie block, v is ascending (input order)"
+    );
+    // Non-NULL cats cover 0..99 in order.
+    assert_eq!(a[0][0], Value::Integer(0));
+}

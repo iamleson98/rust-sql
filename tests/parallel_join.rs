@@ -419,3 +419,43 @@ fn multikey_join_projection_and_aggregate() {
         other => panic!("INTEGER expected, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// ORDER BY over JOIN output: the sort input is the join's materialized
+// rows (not a bare scan) — the materialized-row parallel sort
+// (parallel::try_parallel_sort_rows) splits it; parallel (join probe
+// split + sort split) must equal serial end-to-end.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_sort_over_join_output_matches_serial() {
+    let mut db = Database::open_in_memory().unwrap();
+    build(&mut db, 60_000);
+    // The join emits ~3 matches per row (k = i - i%3 buckets): 180k
+    // output rows — above the split threshold.
+    let sql = "SELECT a.x, b.y FROM a JOIN b ON a.k = b.k ORDER BY a.x * -1, b.y";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert!(
+        ser.len() > 131_072,
+        "join output must be above threshold: {}",
+        ser.len()
+    );
+    assert_eq!(ser, par, "ORDER BY over join output must match serial");
+    // Spot check: a.x * -1 ascending — a.x = i*3, so x DESC; the first
+    // join row of the highest x, then b.y ascending within ties.
+    let first = &par[0];
+    let max_x = 60_000i64 * 3;
+    assert_eq!(first[0].as_integer(), max_x);
+    // Ties (same a.x): b.y ascending — the tie block is sorted.
+    let tie: Vec<i64> = par
+        .iter()
+        .filter(|r| r[0].as_integer() == max_x)
+        .map(|r| r[1].as_integer())
+        .collect();
+    let mut sorted = tie.clone();
+    sorted.sort_unstable();
+    assert_eq!(tie, sorted, "tie block must be b.y-ascending");
+}

@@ -3910,6 +3910,26 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         }
     }
 
+    // ---- MATERIALIZED-ROW parallel split ---------------------------------
+    // The sort's input is not a bare scan (a compound body, a subquery,
+    // a join, ...) but it IS materialized now: when every term compiles
+    // against the output columns, chunk-sort + k-way merge under the
+    // strict (keys, input-index) order reproduces the serial stable
+    // sort bit-for-bit (see parallel.rs for the proof) — with the key
+    // values evaluated ONCE per row instead of twice per comparison.
+    if inner.rows.len() >= 2 {
+        if let Some(mterms) =
+            crate::executor::parallel::materialized_sort_terms(terms, &columns, ctx.params.len())
+        {
+            if let Some(sorted) =
+                crate::executor::parallel::try_parallel_sort_rows(ctx, &mut inner.rows, &mterms)?
+            {
+                inner.rows = sorted;
+                return Ok(inner);
+            }
+        }
+    }
+
     inner.rows.sort_by(|a, b| {
         for term in terms {
             let va = sort_key(&term.expr, a, &columns, params, named_params);

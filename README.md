@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **774+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **777+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -740,8 +740,13 @@ compat surface. Every entry says what it costs and why it exists.
   an EXPRESSION key** (the bounded fusion evaluates compiled keys once
   per row, same heap discipline, serial + worker split). **Multi-key
   equi-joins fuse** (composite order-key hash + value verification,
-  serial + parallel probe). Still serial: subqueries, compound bodies,
-  and the non-fused join shapes (outer joins, non-equi conditions).
+  serial + parallel probe), and **the ORDER BY of any MATERIALIZED
+  input** — a compound body (`... UNION ... ORDER BY x`), a DISTINCT
+  subquery, a join output — splits too: contiguous index chunks, compiled
+  key evaluation once per row, k-way merge under the strict
+  (keys, input-index) total order (bit-identical to the serial stable
+  sort). Still serial: aggregates over non-scan inputs, and the
+  non-fused join shapes (outer joins, non-equi conditions).
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled
