@@ -59,6 +59,9 @@ const SQLITE_OPEN_SHAREDCACHE: c_int = 0x0002_0000;
 
 /// One delivered invocation: (args, narg, delivering thread).
 static DELIVERED: Mutex<Vec<(Vec<usize>, usize, usize)>> = Mutex::new(Vec::new());
+/// The notify-recording tests share the global DELIVERED sink — run them
+/// one at a time (they are millisecond-scale).
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 static DELIVERY_THREAD: AtomicUsize = AtomicUsize::new(0);
 static MAIN_THREAD: AtomicUsize = AtomicUsize::new(0);
 
@@ -108,6 +111,7 @@ fn temp_db(tag: &str) -> String {
 
 #[test]
 fn unlock_notify_immediate_when_not_blocked() {
+    let _test_guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     MAIN_THREAD.store(thread_id(), Ordering::Relaxed);
     let path = temp_db("immediate");
     let _ = std::fs::remove_file(&path);
@@ -137,6 +141,7 @@ fn unlock_notify_immediate_when_not_blocked() {
 
 #[test]
 fn shared_cache_locked_then_deferred_notify_on_commit() {
+    let _test_guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = temp_db("blocking");
     let _ = std::fs::remove_file(&path);
 
@@ -221,6 +226,7 @@ fn shared_cache_locked_then_deferred_notify_on_commit() {
 
 #[test]
 fn unlock_notify_batches_one_connection_args() {
+    let _test_guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = temp_db("batching");
     let _ = std::fs::remove_file(&path);
     let mut a: *mut compat::sqlite3 = ptr::null_mut();
@@ -308,6 +314,7 @@ fn unlock_notify_batches_one_connection_args() {
 
 #[test]
 fn private_cache_keeps_busy_semantics() {
+    let _test_guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The DEFAULT open discipline is untouched: no SHAREDCACHE flag ->
     // cross-connection contention is BUSY + busy_timeout, never
     // SQLITE_LOCKED, and unlock_notify fires immediately.
