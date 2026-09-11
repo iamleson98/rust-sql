@@ -4473,6 +4473,117 @@ fn exec_topn_scan(
     })
 }
 
+/// STREAMING top-N with an EXPRESSION key: `ORDER BY <expr> [COLLATE x]
+/// [DESC] LIMIT k OFFSET o` over a bare table scan — the same bounded
+/// keep-heap discipline as `exec_topn_scan`, but the key is a COMPILED
+/// positional expression evaluated once per row against the wide-decoded
+/// row (all table columns + the rowid in a trailing slot; the compiled
+/// `Col(n_cols)` and ordinal terms read it). The materializing
+/// `exec_topn` stays for non-compilable expressions and predicates.
+///
+/// The caller GUARANTEES the term compiles (checked in `exec_limit`
+/// before fusing). Rows emit through the projection indices (or the
+/// star shape: the table's columns, hidden-rowid slot excluded).
+fn exec_topn_scan_expr(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    compiled: &crate::executor::predicate::CompiledExpr,
+    coll: Option<&dyn crate::plugin::Collation>,
+    desc: bool,
+    keep: usize,
+    offset: usize,
+    project: Option<&[usize]>,
+    out_cols: Arc<[String]>,
+) -> Result<ExecResult> {
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let rowid_slot = n_cols;
+    let rowid_proj = crate::storage::row_codec::ROWID_PROJ;
+    let identity: Vec<usize> = (0..n_cols).collect();
+    let params: Vec<Value> = ctx.params.clone();
+
+    // LIMIT 0: nothing can survive — skip the walk entirely.
+    if keep == 0 {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
+    }
+
+    let root = ctx.table_root(table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+
+    // Bounded selection: identical max-heap discipline to the bare-column
+    // streaming path, with the key EVALUATED per row (O(n) evals — the
+    // materializing path also materializes keys once, so semantics and
+    // cost match; the serial materializing comparator would re-evaluate
+    // per comparison).
+    let mut sel: Vec<TopnSel> = Vec::with_capacity(keep.min(4096));
+    let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
+    bt.scan_table_borrowed(|rowid, payload| {
+        if crate::storage::row_codec::decode_row_selective_wide(
+            payload,
+            n_cols,
+            &identity,
+            rowid,
+            rowid_alias,
+            &mut wide,
+        )
+        .is_err()
+        {
+            return true; // skip corrupt rows (materializing path's contract)
+        }
+        wide.push(Value::Integer(rowid));
+        let key = compiled.eval(&wide, &params);
+        // Output row: projection indices (ROWID_PROJ -> the rowid) or the
+        // star shape (table columns, hidden slot excluded).
+        let row: Row = match project {
+            Some(ps) => ps
+                .iter()
+                .map(|&p| {
+                    if p == rowid_proj {
+                        Value::Integer(rowid)
+                    } else {
+                        wide.get(p).cloned().unwrap_or(Value::Null)
+                    }
+                })
+                .collect(),
+            None => wide[..n_cols].to_vec(),
+        };
+        if sel.len() < keep {
+            let idx = sel.len();
+            sel.push(TopnSel {
+                key,
+                serial: rowid,
+                row,
+            });
+            topn_sift_up(&mut sel, idx, desc, coll);
+        } else if topn_total_cmp(&key, rowid, &sel[0].key, sel[0].serial, desc, coll)
+            == std::cmp::Ordering::Less
+        {
+            sel[0] = TopnSel {
+                key,
+                serial: rowid,
+                row,
+            };
+            topn_sift_down(&mut sel, 0, desc, coll);
+        }
+        if wide.len() > rowid_slot {
+            wide.truncate(rowid_slot);
+        }
+        true
+    })?;
+
+    // Sort the survivors by the total order, then window [offset..keep).
+    sel.sort_by(|a, b| cmp_sel(a, b, desc, coll));
+    let start = offset.min(sel.len());
+    let rows: Vec<Row> = sel.drain(start..).map(|s| s.row).collect();
+    Ok(ExecResult {
+        columns: out_cols,
+        rows,
+    })
+}
+
 // ============================================================================
 // Limit
 // =========================================================================
@@ -4534,8 +4645,10 @@ fn exec_limit(
                 // scan feeds a `keep`-sized heap directly, never
                 // materializing the input. COLLATE terms unwrap (the
                 // wrapped column is the key; the collation resolves once
-                // and threads through the heap discipline). Expression
-                // terms keep the materializing path above.
+                // and threads through the heap discipline). EXPRESSION
+                // keys that COMPILE fuse through the same heap discipline
+                // (evaluated once per row); non-compilable shapes keep the
+                // materializing path.
                 if total <= 4096 {
                     if let Plan::Scan {
                         table,
@@ -4607,6 +4720,73 @@ fn exec_limit(
                                         project.as_deref(),
                                         out_cols,
                                         coll.as_deref(),
+                                    );
+                                }
+                            } else if let Some(compiled_terms) = expr_sort_terms(
+                                &terms[..1],
+                                table,
+                                alias.as_deref(),
+                                table.n_columns()
+                                    + crate::planner::wants_rowid_slot(table) as usize,
+                                ctx.params.len(),
+                            ) {
+                                // EXPRESSION-KEY streaming top-N: the term
+                                // is not a bare column but COMPILES (an
+                                // arithmetic expression over table columns,
+                                // a param, an ordinal, or a rowid spelling).
+                                // Workers/serial evaluate the key once per
+                                // row and run the identical heap discipline.
+                                let (compiled, _term_desc, coll_name) = compiled_terms
+                                    .into_iter()
+                                    .next()
+                                    .expect("single term compiled");
+                                let coll: Option<Arc<dyn crate::plugin::Collation>> = coll_name
+                                    .as_deref()
+                                    .and_then(crate::plugin::lookup_collation);
+                                let (project, out_cols) = match projection {
+                                    Some(columns) => {
+                                        match bare_column_projection(columns, table) {
+                                            Some((p, out)) => (p, out),
+                                            // Non-bare projection: the guard
+                                            // below falls back to exec_topn.
+                                            None => (None, scan_columns_static(table, alias)),
+                                        }
+                                    }
+                                    None => (None, scan_columns_static(table, alias)),
+                                };
+                                if projection.is_none() || project.is_some() {
+                                    let desc = terms[0].order == Order::Desc;
+                                    // Intra-statement parallel split FIRST
+                                    // (big tables): per-worker keep-heaps
+                                    // merged under the same strict total
+                                    // order — bit-identical to the serial
+                                    // streaming path. Declines below
+                                    // threshold / config off / txn open.
+                                    if let Some(res) =
+                                        crate::executor::parallel::try_parallel_topn_expr(
+                                            ctx,
+                                            table,
+                                            &compiled,
+                                            coll.clone(),
+                                            desc,
+                                            total,
+                                            offset_i as usize,
+                                            project.as_deref(),
+                                            out_cols.clone(),
+                                        )?
+                                    {
+                                        return Ok(res);
+                                    }
+                                    return exec_topn_scan_expr(
+                                        ctx,
+                                        table,
+                                        &compiled,
+                                        coll.as_deref(),
+                                        desc,
+                                        total,
+                                        offset_i as usize,
+                                        project.as_deref(),
+                                        out_cols,
                                     );
                                 }
                             }

@@ -1701,3 +1701,141 @@ fn parallel_sort_expression_params_and_nulls() {
     let err2 = ser.query("SELECT * FROM t ORDER BY 99, v * -1", []);
     assert!(err2.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Top-N with EXPRESSION keys: the bounded fusion extends past bare
+// columns — compiled keys evaluated once per row, the same keep-heap
+// discipline serial + worker split (exec_topn_scan_expr /
+// try_parallel_topn_expr).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_topn_expression_keys_match_serial() {
+    let queries = [
+        // unique keys: v * -1 = id ascending
+        "SELECT id, v FROM t ORDER BY v * -1 LIMIT 300",
+        // DESC expression key with mass ties (v % 97: the 0-key block first)
+        "SELECT id, v FROM t ORDER BY v % 97 DESC LIMIT 300",
+        // OFFSET window (total 1250, still fused)
+        "SELECT id, v FROM t ORDER BY v * -1 LIMIT 250 OFFSET 1000",
+        // key outside the projection (wide decode, projected emit)
+        "SELECT id, name FROM t ORDER BY v * -1 LIMIT 300",
+        // star shape (runtime ordinal — the projection is the identity)
+        "SELECT * FROM t ORDER BY 1 DESC LIMIT 300",
+        // COLLATE over an expression
+        "SELECT id, name FROM t ORDER BY (name || '') COLLATE NOCASE LIMIT 300",
+        // tiny keep
+        "SELECT id FROM t ORDER BY v * -1 LIMIT 3",
+        // bound parameter inside the key
+        "SELECT id, v FROM t ORDER BY v + ? LIMIT 300",
+        // unknown collation over an expression: both paths fall back
+        "SELECT id, name FROM t ORDER BY (name || '') COLLATE NOSUCHCOLL LIMIT 300",
+    ];
+    for sql in queries.iter().filter(|s| !s.contains('?')) {
+        let par = text_db();
+        let ser = {
+            let mut s = text_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a, b, "{sql}: expression-key top-N must equal serial");
+    }
+    // The parameter query needs bound values.
+    {
+        let sql = "SELECT id, v FROM t ORDER BY v + ? LIMIT 300";
+        let par = text_db();
+        let ser = {
+            let mut s = text_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = par.query(sql, [Value::Integer(7)]).unwrap();
+        let b = ser.query(sql, [Value::Integer(7)]).unwrap();
+        assert_eq!(a, b, "param expression-key top-N must equal serial");
+    }
+    // Spot checks pin the ORDER:
+    let par = text_db();
+    // v * -1 ascending: ids 0..2.
+    let a = rows_of(&par, "SELECT id FROM t ORDER BY v * -1 LIMIT 3");
+    assert_eq!(
+        a,
+        vec![
+            vec![Value::Integer(0)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)]
+        ]
+    );
+    // v % 97 DESC: max key 0 = the j % 97 == 0 rows, rowid ASC ties.
+    let a = rows_of(&par, "SELECT id FROM t ORDER BY v % 97 DESC LIMIT 2");
+    assert_eq!(a, vec![vec![Value::Integer(0)], vec![Value::Integer(97)]]);
+    // OFFSET window: rows 1000..1002 of the ascending order.
+    let a = rows_of(&par, "SELECT id FROM t ORDER BY v * -1 LIMIT 3 OFFSET 1000");
+    assert_eq!(
+        a,
+        vec![
+            vec![Value::Integer(1000)],
+            vec![Value::Integer(1001)],
+            vec![Value::Integer(1002)]
+        ]
+    );
+    // Star + ordinal DESC: ids 299999..299997.
+    let a = rows_of(&par, "SELECT * FROM t ORDER BY 1 DESC LIMIT 2");
+    assert_eq!(a[0][0], Value::Integer(299_999));
+    assert_eq!(a[1][0], Value::Integer(299_998));
+    // COLLATE over an expression: NOCASE min key family, rowid ASC ties.
+    let a = rows_of(
+        &par,
+        "SELECT id, name FROM t ORDER BY (name || '') COLLATE NOCASE LIMIT 2",
+    );
+    assert_eq!(a[0][0], Value::Integer(0));
+    assert_eq!(a[1][0], Value::Integer(1000));
+    match &a[0][1] {
+        Value::Text(t) => assert_eq!(t.as_str(), "user-00000"),
+        other => panic!("TEXT expected, got {other:?}"),
+    }
+}
+
+#[test]
+fn parallel_topn_expression_fused_matches_materializing() {
+    // The fused streaming path caps at keep <= 4096; a bigger bound runs
+    // the materializing exec_topn with the same expression comparator —
+    // the fused prefix must equal the materializing prefix.
+    let db = text_db();
+    let fused = rows_of(&db, "SELECT id, v FROM t ORDER BY v * -1 LIMIT 250");
+    let materializing = rows_of(&db, "SELECT id, v FROM t ORDER BY v * -1 LIMIT 5000");
+    assert_eq!(fused.len(), 250);
+    assert_eq!(materializing.len(), 5000);
+    assert_eq!(
+        fused,
+        materializing[..250].to_vec(),
+        "fused expression top-N prefix must equal the materializing path"
+    );
+    // NULL keys: big_db's sparse NULL v-column sorts FIRST (NULL < numbers
+    // in the value order), ties among NULLs keep rowid ASC.
+    let par = big_db();
+    let ser = {
+        let mut s = big_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql = "SELECT id, v FROM t ORDER BY v * 2 LIMIT 1200";
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "NULL-key expression top-N must equal serial");
+    // The first NULL row is j = 98 (j%100 >= 97 && j%7 == 0).
+    assert_eq!(a[0][0], Value::Integer(98));
+    let nulls: Vec<usize> = a
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r[1], Value::Null))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(nulls.len() > 1000, "the sparse NULL cluster must lead");
+    for w in nulls.windows(2) {
+        let prev = a[w[0]][0].as_integer();
+        let next = a[w[1]][0].as_integer();
+        assert!(next > prev, "NULL tie block must be rowid ASC");
+    }
+}

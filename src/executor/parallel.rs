@@ -1388,6 +1388,151 @@ pub(crate) fn try_parallel_topn(
     }))
 }
 
+/// Parallel streaming top-N with an EXPRESSION key (`ORDER BY <expr>
+/// [COLLATE x] [DESC] LIMIT k [OFFSET o]` over a big bare scan): the
+/// fused hash of the bare-column `try_parallel_topn` — workers
+/// wide-decode their ranges (all table columns + the rowid trailing
+/// slot), EVALUATE the compiled key once per row, and run the identical
+/// keep-heap discipline; the main thread merges the survivor sets under
+/// the same strict total order and windows [offset..keep).
+///
+/// `coll` is the main-thread-resolved collation (see `sort_total_cmp`);
+/// `project` is the projection's table-column indices (ROWID_PROJ emits
+/// the rowid) or None for the star shape. `Ok(None)` = declined — the
+/// caller runs the serial path unchanged.
+pub(crate) fn try_parallel_topn_expr(
+    ctx: &ExecContext<'_>,
+    table: &StdArc<Table>,
+    compiled: &crate::executor::predicate::CompiledExpr,
+    coll: Option<StdArc<dyn crate::plugin::Collation>>,
+    desc: bool,
+    keep: usize,
+    offset: usize,
+    project: Option<&[usize]>,
+    out_cols: StdArc<[String]>,
+) -> Result<Option<ExecResult>> {
+    if keep == 0 {
+        return Ok(None); // the serial path's LIMIT-0 shortcut already answers
+    }
+    let root = ctx.table_root(table);
+    let split = match plan_range_split(ctx, root)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let rowid_slot = n_cols;
+    let rowid_proj = crate::storage::row_codec::ROWID_PROJ;
+    let identity: Vec<usize> = (0..n_cols).collect();
+    let params: &[Value] = &ctx.params;
+
+    let ranges = split.ranges;
+    let pager = ctx.pager;
+    // Workers: the serial expression-key loop over each range (identical
+    // heap discipline — sift-up on insert, root-replace + sift-down when
+    // the candidate beats the worst survivor).
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges.iter() {
+            let compiled = compiled.clone();
+            let coll = coll.clone();
+            let identity = &identity;
+            handles.push(scope.spawn(move || -> Result<Vec<super::TopnSel>> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let coll_ref = coll.as_deref();
+                let mut bt = Btree::new(pager, root, false);
+                let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
+                let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
+                bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+                    if crate::storage::row_codec::decode_row_selective_wide(
+                        payload,
+                        n_cols,
+                        identity,
+                        rowid,
+                        rowid_alias,
+                        &mut wide,
+                    )
+                    .is_err()
+                    {
+                        return true; // skip corrupt rows (serial contract)
+                    }
+                    wide.push(Value::Integer(rowid));
+                    let key = compiled.eval(&wide, params);
+                    let row: Row = match project {
+                        Some(ps) => ps
+                            .iter()
+                            .map(|&p| {
+                                if p == rowid_proj {
+                                    Value::Integer(rowid)
+                                } else {
+                                    wide.get(p).cloned().unwrap_or(Value::Null)
+                                }
+                            })
+                            .collect(),
+                        None => wide[..n_cols].to_vec(),
+                    };
+                    if sel.len() < keep {
+                        let idx = sel.len();
+                        sel.push(super::TopnSel {
+                            key,
+                            serial: rowid,
+                            row,
+                        });
+                        super::topn_sift_up(&mut sel, idx, desc, coll_ref);
+                    } else if super::topn_total_cmp(
+                        &key,
+                        rowid,
+                        &sel[0].key,
+                        sel[0].serial,
+                        desc,
+                        coll_ref,
+                    ) == std::cmp::Ordering::Less
+                    {
+                        sel[0] = super::TopnSel {
+                            key,
+                            serial: rowid,
+                            row,
+                        };
+                        super::topn_sift_down(&mut sel, 0, desc, coll_ref);
+                    }
+                    if wide.len() > rowid_slot {
+                        wide.truncate(rowid_slot);
+                    }
+                    true
+                })?;
+                Ok(sel)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel expression top-N worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    // Any worker error -> serial fallback (never a divergent answer).
+    let mut merged: Vec<super::TopnSel> = Vec::with_capacity(keep * ranges.len());
+    for p in partials {
+        match p {
+            Ok(sel) => merged.extend(sel),
+            Err(_) => return Ok(None),
+        }
+    }
+
+    // Sort the survivors under the SAME total order, keep the first
+    // `keep`, window [offset..keep) — the serial path's exact tail.
+    merged.sort_by(|a, b| super::cmp_sel(a, b, desc, coll.as_deref()));
+    merged.truncate(keep);
+    let start = offset.min(merged.len());
+    let rows: Vec<Vec<Value>> = merged.drain(start..).map(|s| s.row).collect();
+    Ok(Some(ExecResult {
+        columns: out_cols,
+        rows,
+    }))
+}
+
 // ============================================================================
 // Parallel unbounded ORDER BY — chunk sort + k-way range-ordered merge
 // ============================================================================
