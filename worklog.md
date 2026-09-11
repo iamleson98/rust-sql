@@ -95,3 +95,33 @@ Stage Summary:
 - 3 latent engine perf bugs fixed on the way: implicit joins as cross+filter, multi-equi ON as nested loops, lookup-side join keys never extracting.
 - Remaining planner ledger: predicate pushdown into all scan shapes, subquery decorrelation, bushy/cost-searched plans (greedy can't see everything SQLite's cost model sees).
 - Ready to commit + push.
+
+---
+Task ID: 9
+Agent: main (Super Z)
+Task: Deep-research the remaining SQLite gaps, close them, push (user: "clone, deep research, find remaining gaps vs sqlite, fix them all, then push")
+
+Work Log:
+- Sandbox reset again: re-cloned iamleson98/rust-sql (PAT auth), reinstalled rust 1.98.1 + rustfmt + clippy. Remote state: master 6b71ae3, CI GREEN on HEAD, local == remote.
+- Deep research: wrote examples/probe_master_ddl.rs (38 DDL shapes + 37 pragmas, engine vs bundled-SQLite differential) — found 38 live sqlite_master divergences and 15 PRAGMA divergences in a single run. Also pinned SQLite's exact AUTOINCREMENT/journal_mode/reserved-name contracts with direct probes.
+- CLOSED (commit d497a86, tests/schema_parity.rs 24 suites):
+  - rootpage convention: schema rows carry SQLite's 1-based file numbers (page 1 = schema b-tree, first user object 2); internal 0-based ids translate at the master-row boundary; every decode->re-encode site converts back (load_schema, ALTER RENAME rewrites, VACUUM compact image, rewrite_schema_row_root).
+  - WR-PK autoindex: table-level PK no longer pushes an implicit autoindex on WITHOUT ROWID tables (both execute_create and rebuild_implicit_indexes — composite WR PKs materialized a phantom row SQLite never creates).
+  - WR-PK naming: index_list entry is sqlite_autoindex_<t>_<N> with N after every other autoindex (SQLite's observed allocation); rebuild numbers consistently.
+  - table_info: WR-PK columns report notnull=1.
+  - AUTOINCREMENT: REAL sqlite_sequence(name,seq) — created with the first autoincrement table (rootpage in allocation order), high-water rowid floor (deleted top rowids never reused), explicit-rowid bumps, user re-arm via UPDATE, drop removes the row (table survives), reopen persistence, SQLite's two validation errors pre-mutation, fast/chain INSERT paths gated off.
+  - Reserved sqlite_% names: user DDL rejects with SQLite's message; ANALYZE's internal stat1 DDL + foreign replay bypass (guard at the user-facing entry).
+  - [bracket] + `backtick` identifier lexing (SQLite's other quoting families), DDL text verbatim.
+  - 12 pragma read forms: schema_version (real cookie, +1 per DDL), busy_timeout (+write form), cache_size (raw setting, default -2000), max_page_count, data_version (open-time change counter + 1), journal_mode=memory on :memory: (write AND read), collation_list, database_list (main alone — temp is lazy in SQLite), pragma_list (SQLite's 66 names), compile_options (now 1-based like get()), function_list (136-entry 6-column inventory), module_list (registry).
+  - sqlite_compileoption_get: 1-based index fix (was 0-based).
+  - DROP TABLE invalidates stale max-rowid/root caches (recreated autoincrement tables start at 1).
+  - Fixed 4 pre-existing/stale tests to SQLite's contracts (cache_size read = raw setting; journal_mode write on :memory: = memory).
+- CLOSED (commit 78b7b06, compat 61/61): sqlite3_unlock_notify is SQLite-exact — SQLITE_OPEN_SHAREDCACHE arms the table-lock discipline (SQLITE_LOCKED immediate at all three write gates), deferred registration, delivery on the releaser's COMMIT/ROLLBACK thread, per-connection batching (apArg/nArg), close-time cancellation; found + fixed 2 pre-existing compat bugs: await_tx_slot polled forever on busy_timeout=0, and sqlite3_step's DML arm had NO cross-connection tx gate (step-writes silently joined the foreign BEGIN's transaction / deadlocked the writer gate).
+- README: fixed the stale planner lines (join reordering + subquery decorrelation were already real; remaining = predicate pushdown + cost-searched plans), rewrote the unlock_notify and sqlite_master/PRAGMA ledger entries as closed, added AUTOINCREMENT + quoting feature bullets.
+- Verification: dev matrix 835/835 (lib+integration incl. the 24 new schema_parity suites), compat 61/61, fmt clean, clippy -D warnings clean (default + workspace).
+
+Stage Summary:
+- The last queryable sqlite_master/PRAGMA divergences are closed with differential proof; unlock_notify is SQLite-exact.
+- 3 more pre-existing bugs found by the new probes: step-path cross-connection tx gate, busy_timeout=0 infinite poll, compileoption_get 0-based indexing.
+- Remaining ledger after this pass: cost-searched (bushy) planner, predicate pushdown into all scan shapes, memory peaks (S17/S14), binary size, page_count physical-layout difference (true, not mirrored).
+- Ready to push.

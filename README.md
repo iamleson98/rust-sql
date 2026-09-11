@@ -58,6 +58,8 @@ for row in &rows {
 - **DDL**: `CREATE TABLE`, `CREATE INDEX` (unique + partial), `CREATE VIEW`, `CREATE TRIGGER`, `DROP TABLE/INDEX/VIEW/TRIGGER`, `ALTER TABLE RENAME TO` (catalog + schema move with index/trigger attachment and FK reference rewriting), `ALTER TABLE ADD COLUMN` (with DEFAULT back-fill), `ALTER TABLE RENAME COLUMN` (rewrites the table's CREATE statement, other tables' REFERENCES clauses, indexes, triggers and views), `ALTER TABLE DROP COLUMN` (validates SQLite's restrictions and physically rewrites every row)
 - **DML**: `INSERT` (with `OR REPLACE/IGNORE/FAIL/ABORT/ROLLBACK`, `VALUES` / `SELECT` / `DEFAULT VALUES` sources, `RETURNING`), `UPDATE` (with `SET`, `FROM`, `WHERE`, `RETURNING`), `DELETE` (with `WHERE`, `RETURNING`, `ORDER BY`, `LIMIT`)
 - **UPSERT**: `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE SET ... [WHERE ...]` with `excluded.*` references (SQLite semantics)
+- **AUTOINCREMENT**: a real `sqlite_sequence(name,seq)` table (master-visible, queryable, user-editable), high-water rowid allocation — a deleted top rowid is never reused — explicit-rowid bumps, drop/remake resets, reopen persistence, and SQLite's exact validation errors
+- **Identifier quoting**: all three of SQLite's families — `"double"` (doubled-quote escape), `[bracket]` (no escape), `` `backtick` `` (doubled) — with the stored DDL text preserved verbatim
 - **CHECK + NOT NULL constraints**: enforced on INSERT, UPDATE, and UPSERT merges (column-level and table-level)
 - **FOREIGN KEY constraints**: enforced when `PRAGMA foreign_keys = ON` (default off, like SQLite) — child-side checks on INSERT/UPDATE, parent-side checks on DELETE with `ON DELETE RESTRICT / CASCADE (recursive) / SET NULL / SET DEFAULT`, composite keys, implicit-PK references, and index maintenance on cascaded deletes
 - **Implicit UNIQUE indexes**: column/table-level UNIQUE and non-rowid PKs create `sqlite_autoindex_*` (actually enforced)
@@ -221,7 +223,7 @@ The catalog is an in-memory map of name → `Arc<Table>` / `Arc<Index>` / `Arc<V
 
 ### Planner
 
-Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot (side-qualified inside joins so `a.rowid`/`b.rowid` bind their own sides), and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Not yet: predicate pushdown into all scan shapes, join reordering, subquery decorrelation.
+Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot (side-qualified inside joins so `a.rowid`/`b.rowid` bind their own sides), and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Correlated subqueries rewrite to bound parameters over cached plans (SQLite's co-routine model). Not yet: predicate pushdown into all scan shapes, cost-searched (bushy) join plans.
 
 ### Executor
 
@@ -718,10 +720,13 @@ compat surface. Every entry says what it costs and why it exists.
   pinning, self-joins, CTE atoms, subquery atoms declining safely,
   multiplicity, ANALYZE-driven estimates — the adversarial 3-join
   shape went 482 ms → 5.3 ms, ~90x, now matching the benign order).
-  Still rule-based rather than cost-searched: subquery decorrelation
-  remains unimplemented, and SQLite's full cost model still wins a few
-  orders the greedy can't see (bushy plans, multi-alternative
-  costing).
+  Correlated subqueries are REAL now too — the
+  correlated-parameter rewrite (SQLite's co-routine model) turns each
+  per-outer-row re-execution into a bound-parameter step over a cached
+  plan (the unindexed 2000x20000 correlated COUNT went 14.77 s → 0.58 s,
+  25x, vs SQLite's 1.96 s). Still rule-based rather than cost-searched:
+  SQLite's full cost model still wins a few orders the greedy can't see
+  (bushy plans, multi-alternative costing).
 - **Parallel executor coverage**: single-table shapes split (aggregates with
   literal **or parameter** filters, GROUP BY bare/compiled, top-N, unbounded
   ORDER BY with a fused 1:1 projection), and the **equi-JOIN probe side now
@@ -851,11 +856,20 @@ compat surface. Every entry says what it costs and why it exists.
   semantics), self-referential FK `ON DELETE CASCADE` never fired (the
   parent table excluded itself from the referencing scan), and the
   compat layer's script splitter mis-split `CREATE TRIGGER` bodies at
-  their internal `;`. Remaining: `sqlite3_unlock_notify` is a
-  functional immediate-notify (the engine never blocks a reader, so it
-  never needs SQLite's blocking path — but it is not SQLite's exact
-  blocking semantic); `sqlite3_serialize` / `sqlite3_deserialize` are
-  fully real.
+  their internal `;`. `sqlite3_unlock_notify` is SQLite-exact now:
+  `SQLITE_OPEN_SHAREDCACHE` arms the shared-cache discipline (a write
+  behind another connection's BEGIN returns SQLITE_LOCKED immediately —
+  no busy-handler run), a blocked connection's registration DEFERS, and
+  the holder's COMMIT/ROLLBACK delivers the callbacks on ITS thread
+  (SQLite's documented delivery model), batched per connection
+  (`apArg = [arg1, arg2, …]`, `nArg = count`); unblocked connections
+  fire immediately from within the call
+  (`compat/…/tests/unlock_notify.rs`, 5 suites). Two pre-existing
+  compat bugs the suite surfaced: `await_tx_slot` polled forever on
+  `busy_timeout = 0` (SQLite: BUSY immediately), and `sqlite3_step`'s
+  DML arm had no cross-connection transaction gate (a step-write
+  silently joined the foreign BEGIN's transaction). `sqlite3_serialize`
+  / `sqlite3_deserialize` are fully real.
 - **WITHOUT ROWID PRIMARY KEY uniqueness is fully enforced**: the
   engine stores WITHOUT ROWID tables as rowid tables internally, so the
   PK's uniqueness is backed by an engine-internal index
@@ -870,9 +884,30 @@ compat surface. Every entry says what it costs and why it exists.
   origin 'pk', and a dumped SQLite-format file round-trips with real
   SQLite re-opening it and enforcing the PK itself. Found by the
   preupdate differential battery (the gap it surfaced).
-- **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
-  approximations — tightened one at a time via differential tests against
-  real SQLite.
+- **`sqlite_master` + `PRAGMA` introspection surface — CLOSED (the
+  queryable shapes)**: every master row is byte-identical to SQLite's
+  across 38 DDL shapes — the rootpage column carries SQLite's 1-based
+  file convention (page 1 is the schema b-tree), WITHOUT ROWID PKs
+  create no autoindex row (the table b-tree IS the PK), AUTOINCREMENT
+  materializes a REAL `sqlite_sequence(name,seq)` table (queryable,
+  user-editable — SQLite's documented re-arm — its row deleted on DROP
+  TABLE), `sqlite_%` object names reject with SQLite's reserved-name
+  error, and `[bracket]` / `` `backtick` `` identifier quoting
+  round-trips (`tests/schema_parity.rs`, 24 differential suites).
+  `PRAGMA table_info` reports WR-PK columns notnull=1;
+  `index_list` numbers the WR-PK entry SQLite's way
+  (`sqlite_autoindex_<t>_<N>`, N after every other autoindex);
+  `schema_version` is the real cookie (+1 per DDL, DML-stable);
+  `busy_timeout` / `cache_size` / `max_page_count` / `data_version` /
+  `journal_mode=memory` on `:memory:` / `collation_list` /
+  `database_list` / `pragma_list` / `compile_options` /
+  `function_list` / `module_list` all answer SQLite's shapes
+  (content notes: `function_list`/`module_list`/`compile_options`
+  report the ENGINE's own inventories — SQLite's lists carry its
+  fts5/rtree/gcc build, which this engine does not ship; flags in
+  `function_list` are class-level). Remaining approximation:
+  `PRAGMA page_count` reflects the engine's own physical layout (its
+  b-tree fill differs from SQLite's — the value is TRUE, not mirrored).
 - **Custom collations in written SQLite files — CLOSED**: every
   collation the CONNECTION knows orders the written file — `NOCASE`
   through the writer's fast path, `RTRIM` and plugin-registered CUSTOM
