@@ -1020,3 +1020,244 @@ fn parallel_sort_unknown_collation_falls_back_like_serial() {
     let b = rows_of(&ser, sql);
     assert_eq!(a, b, "unknown collation fallback must match serial");
 }
+
+// ---------------------------------------------------------------------------
+// Collated top-N fusion: `ORDER BY <col> [COLLATE x] [DESC] LIMIT k` — the
+// fusion gate unwraps the Collate wrapper (explicit AND declared), the
+// resolved collation threads through the keep-heap discipline, serial
+// streaming and worker split alike.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_topn_collate_battery_matches_serial() {
+    let queries = [
+        // explicit COLLATE, ASC
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 300",
+        // explicit COLLATE, DESC
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE DESC LIMIT 300",
+        // OFFSET window (total 1000 — still fused)
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 250 OFFSET 750",
+        // RTRIM collation
+        "SELECT id, name FROM t ORDER BY name COLLATE RTRIM LIMIT 300",
+        // key outside the projection (fused Project shape)
+        "SELECT id, v FROM t ORDER BY name COLLATE NOCASE LIMIT 300",
+        // multi-column projection
+        "SELECT id, name, v FROM t ORDER BY name COLLATE NOCASE LIMIT 300",
+        // tiny keep
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 3",
+        // unregistered collation: both paths fall back to the connection
+        // comparator (None arm == serial comparator's unwrap_or_else)
+        "SELECT id, name FROM t ORDER BY name COLLATE NOSUCHCOLL LIMIT 300",
+    ];
+    for sql in queries {
+        let par = text_db();
+        let ser = {
+            let mut s = text_db();
+            s.execute("PRAGMA parallel_scan=0", []).unwrap();
+            s
+        };
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a, b, "{sql}: parallel collated top-N must equal serial");
+        // NOCASE monotonicity spot check: successive keys never decrease
+        // (never increase for DESC) under the collation's order. Only for
+        // projections that carry the key column (the key-outside-
+        // projection shape has no key to observe — its equivalence to
+        // serial is the assertion above).
+        let proj = sql.split(" FROM ").next().unwrap_or("");
+        let key_in_output = proj.contains("name");
+        if key_in_output {
+            let desc = sql.contains("DESC");
+            let mut prev: Option<String> = None;
+            for r in &a {
+                let key = match &r[1] {
+                    Value::Text(t) => {
+                        if sql.contains("NOSUCHCOLL") {
+                            t.as_str().to_string()
+                        } else {
+                            t.as_str().to_lowercase()
+                        }
+                    }
+                    other => panic!("{sql}: TEXT key expected, got {other:?}"),
+                };
+                if let Some(p) = &prev {
+                    let ok = if desc { key <= *p } else { key >= *p };
+                    assert!(
+                        ok,
+                        "{sql}: ordering not monotonic at key {key:?} after {p:?}"
+                    );
+                }
+                prev = Some(key);
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_topn_collate_actually_collates() {
+    let db = text_db();
+    // First/last key identity under NOCASE: the minimum no-case key is
+    // 'user-00000' (any spelling), the maximum is 'user-00999'.
+    let first = rows_of(
+        &db,
+        "SELECT name FROM t ORDER BY name COLLATE NOCASE LIMIT 1",
+    );
+    assert_eq!(first.len(), 1);
+    match &first[0][0] {
+        Value::Text(t) => assert_eq!(
+            t.as_str().to_ascii_lowercase(),
+            "user-00000",
+            "NOCASE minimum key expected"
+        ),
+        other => panic!("TEXT expected, got {other:?}"),
+    }
+    let last = rows_of(
+        &db,
+        "SELECT name FROM t ORDER BY name COLLATE NOCASE DESC LIMIT 1",
+    );
+    match &last[0][0] {
+        Value::Text(t) => assert_eq!(
+            t.as_str().to_ascii_lowercase(),
+            "user-00999",
+            "NOCASE maximum key expected"
+        ),
+        other => panic!("TEXT expected, got {other:?}"),
+    }
+    // Tie block: the minimum no-case key has 300 rows (rowids
+    // 0, 1000, ..., 299000). Ties break by rowid ASC on BOTH ASC and
+    // DESC terms — pin both.
+    let rows = rows_of(
+        &db,
+        "SELECT id FROM t ORDER BY name COLLATE NOCASE LIMIT 300",
+    );
+    let expected: Vec<Vec<Value>> = (0..300u32)
+        .map(|k| vec![Value::Integer(k as i64 * 1000)])
+        .collect();
+    assert_eq!(
+        rows, expected,
+        "300-row NOCASE tie block must keep rowid ASC order (ASC term)"
+    );
+    let rows_desc = rows_of(
+        &db,
+        "SELECT id FROM t ORDER BY name COLLATE NOCASE DESC LIMIT 300",
+    );
+    let expected_desc: Vec<Vec<Value>> = (0..300u32)
+        .map(|k| vec![Value::Integer(999 + k as i64 * 1000)])
+        .collect();
+    assert_eq!(
+        rows_desc, expected_desc,
+        "300-row NOCASE tie block must keep rowid ASC order (DESC term)"
+    );
+}
+
+#[test]
+fn parallel_topn_collate_fused_matches_materializing() {
+    // The fused streaming path caps at keep <= 4096; a bigger bound runs
+    // the materializing exec_topn with the same collated comparator. The
+    // fused prefix must equal the materializing prefix bit-for-bit.
+    let db = text_db();
+    let fused = rows_of(
+        &db,
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 250",
+    );
+    let materializing = rows_of(
+        &db,
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 5000",
+    );
+    assert_eq!(fused.len(), 250);
+    assert_eq!(materializing.len(), 5000);
+    assert_eq!(
+        fused,
+        materializing[..250].to_vec(),
+        "fused top-N prefix must equal the materializing path"
+    );
+    // OFFSET windows: same comparison through a windowed slice.
+    let fused_off = rows_of(
+        &db,
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 250 OFFSET 1000",
+    );
+    let materializing_off = rows_of(
+        &db,
+        "SELECT id, name FROM t ORDER BY name COLLATE NOCASE LIMIT 5000 OFFSET 1000",
+    );
+    assert_eq!(
+        fused_off,
+        materializing_off[..250].to_vec(),
+        "fused OFFSET window must equal the materializing window"
+    );
+}
+
+#[test]
+fn parallel_topn_declared_collation_fuses() {
+    // A DECLARED column collation arrives at the fusion as the same
+    // Collate wrapper (resolve_order_by_terms attaches it), so bare
+    // `ORDER BY k LIMIT n` must fuse AND collate — parallel == serial,
+    // NULLs first (the value order routes non-TEXT pairs around the
+    // collation), then NOCASE key order.
+    let build = || {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE, v INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        {
+            let mut i = 0i64;
+            while i < 150_000 {
+                let hi = (i + 1000).min(150_000);
+                let mut sql = String::from("INSERT INTO t (id, k, v) VALUES ");
+                for j in i..hi {
+                    if j > i {
+                        sql.push(',');
+                    }
+                    // 5-case spellings over 30k distinct keys -> 5 rows
+                    // per no-case key; a NULL cluster at 40000..41000.
+                    let k = if (40_000..41_000).contains(&j) {
+                        "NULL".to_string()
+                    } else {
+                        match j % 5 {
+                            0 => format!("'key-{:05}'", j % 30_000),
+                            1 => format!("'KEY-{:05}'", j % 30_000),
+                            2 => format!("'Key-{:05}'", j % 30_000),
+                            3 => format!("'kEy-{:05}'", j % 30_000),
+                            _ => format!("'KeY-{:05}'", j % 30_000),
+                        }
+                    };
+                    sql.push_str(&format!("({}, {}, {})", j, k, -j));
+                }
+                db.execute(&sql, []).unwrap();
+                i = hi;
+            }
+        }
+        db.execute("COMMIT", []).unwrap();
+        db
+    };
+    let par = build();
+    let ser = {
+        let mut s = build();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql = "SELECT id, k FROM t ORDER BY k LIMIT 500";
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "declared-collation top-N must match serial");
+    // NULL cluster first: the 1000 NULL keys precede every TEXT key.
+    assert!(
+        a.iter().all(|r| matches!(&r[1], Value::Null)),
+        "the first 500 rows must be the NULL-key cluster (NULL sorts first)"
+    );
+    // After the NULLs, NOCASE order: probe past the cluster.
+    let after = rows_of(&par, "SELECT id, k FROM t ORDER BY k LIMIT 5 OFFSET 1000");
+    for r in &after {
+        match &r[1] {
+            Value::Text(t) => assert_eq!(
+                t.as_str().to_ascii_lowercase(),
+                "key-00000",
+                "first non-NULL no-case key expected"
+            ),
+            other => panic!("TEXT expected after the NULL cluster, got {other:?}"),
+        }
+    }
+}

@@ -4163,6 +4163,11 @@ fn exec_topn(
 /// with ties broken by INPUT serial ASC — matching SQLite's stable
 /// sorter semantics for scan-sourced rows (equal keys keep rowid order
 /// on both ASC and DESC terms).
+///
+/// A resolved collation only redefines which TEXT keys are EQUAL — the
+/// rowid tiebreak still makes the order STRICT, so the parallel
+/// per-worker keep-heap + survivor merge decomposition stays bit-exact
+/// (the proof needs no change).
 #[inline]
 pub(super) fn topn_total_cmp(
     a: &Value,
@@ -4170,8 +4175,12 @@ pub(super) fn topn_total_cmp(
     b: &Value,
     bi: i64,
     desc: bool,
+    coll: Option<&dyn crate::plugin::Collation>,
 ) -> std::cmp::Ordering {
-    let ord = value_cmp_conn(a, b);
+    let ord = match coll {
+        Some(c) => crate::plugin::compare_collated(a, b, c),
+        None => value_cmp_conn(a, b),
+    };
     let ord = if desc { ord.reverse() } else { ord };
     ord.then(ai.cmp(&bi))
 }
@@ -4212,21 +4221,31 @@ pub(super) struct TopnSel {
 }
 
 #[inline]
-pub(super) fn cmp_sel(a: &TopnSel, b: &TopnSel, desc: bool) -> std::cmp::Ordering {
-    topn_total_cmp(&a.key, a.serial, &b.key, b.serial, desc)
+pub(super) fn cmp_sel(
+    a: &TopnSel,
+    b: &TopnSel,
+    desc: bool,
+    coll: Option<&dyn crate::plugin::Collation>,
+) -> std::cmp::Ordering {
+    topn_total_cmp(&a.key, a.serial, &b.key, b.serial, desc, coll)
 }
 
 /// Max-heap sift (parent worst-or-equal vs children) over `sel[..n]`.
-pub(super) fn topn_sift_down(sel: &mut [TopnSel], mut i: usize, desc: bool) {
+pub(super) fn topn_sift_down(
+    sel: &mut [TopnSel],
+    mut i: usize,
+    desc: bool,
+    coll: Option<&dyn crate::plugin::Collation>,
+) {
     let n = sel.len();
     loop {
         let l = 2 * i + 1;
         let r = l + 1;
         let mut w = i;
-        if l < n && cmp_sel(&sel[l], &sel[w], desc) != std::cmp::Ordering::Less {
+        if l < n && cmp_sel(&sel[l], &sel[w], desc, coll) != std::cmp::Ordering::Less {
             w = l;
         }
-        if r < n && cmp_sel(&sel[r], &sel[w], desc) != std::cmp::Ordering::Less {
+        if r < n && cmp_sel(&sel[r], &sel[w], desc, coll) != std::cmp::Ordering::Less {
             w = r;
         }
         if w == i {
@@ -4237,10 +4256,15 @@ pub(super) fn topn_sift_down(sel: &mut [TopnSel], mut i: usize, desc: bool) {
     }
 }
 
-pub(super) fn topn_sift_up(sel: &mut [TopnSel], mut i: usize, desc: bool) {
+pub(super) fn topn_sift_up(
+    sel: &mut [TopnSel],
+    mut i: usize,
+    desc: bool,
+    coll: Option<&dyn crate::plugin::Collation>,
+) {
     while i > 0 {
         let p = (i - 1) / 2;
-        if cmp_sel(&sel[i], &sel[p], desc) == std::cmp::Ordering::Greater {
+        if cmp_sel(&sel[i], &sel[p], desc, coll) == std::cmp::Ordering::Greater {
             sel.swap(i, p);
             i = p;
         } else {
@@ -4249,11 +4273,11 @@ pub(super) fn topn_sift_up(sel: &mut [TopnSel], mut i: usize, desc: bool) {
     }
 }
 
-/// STREAMING top-N: `ORDER BY <bare col> [DESC] LIMIT k OFFSET o` over a
-/// bare table scan, evaluated with BOUNDED memory — the scan feeds a
-/// `keep`-sized max-heap of survivors directly (O(n) key extraction,
-/// O(log keep) per replacement), never materializing the input rows.
-/// The materializing `exec_topn` path stays for expressions, collations,
+/// STREAMING top-N: `ORDER BY <bare col> [COLLATE x] [DESC] LIMIT k
+/// OFFSET o` over a bare table scan, evaluated with BOUNDED memory — the
+/// scan feeds a `keep`-sized max-heap of survivors directly (O(n) key
+/// extraction, O(log keep) per replacement), never materializing the
+/// input rows. The materializing `exec_topn` path stays for expressions,
 /// predicates, and large keeps.
 ///
 /// The caller GUARANTEES the term resolves to a table column (checked in
@@ -4267,6 +4291,7 @@ fn exec_topn_scan(
     offset: usize,
     project: Option<&[usize]>,
     out_cols: Arc<[String]>,
+    coll: Option<&dyn crate::plugin::Collation>,
 ) -> Result<ExecResult> {
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
@@ -4316,8 +4341,8 @@ fn exec_topn_scan(
                 serial: rowid,
                 row,
             });
-            topn_sift_up(&mut sel, idx, desc);
-        } else if topn_total_cmp(&key, rowid, &sel[0].key, sel[0].serial, desc)
+            topn_sift_up(&mut sel, idx, desc, coll);
+        } else if topn_total_cmp(&key, rowid, &sel[0].key, sel[0].serial, desc, coll)
             == std::cmp::Ordering::Less
         {
             // Beats the worst survivor: replace the root and re-sift.
@@ -4326,13 +4351,13 @@ fn exec_topn_scan(
                 serial: rowid,
                 row,
             };
-            topn_sift_down(&mut sel, 0, desc);
+            topn_sift_down(&mut sel, 0, desc, coll);
         }
         true
     })?;
 
     // Sort the survivors by the total order, then window [offset..keep).
-    sel.sort_by(|a, b| cmp_sel(a, b, desc));
+    sel.sort_by(|a, b| cmp_sel(a, b, desc, coll));
     let start = offset.min(sel.len());
     let rows: Vec<Row> = sel[start..]
         .iter()
@@ -4403,7 +4428,9 @@ fn exec_limit(
                 // term is a bare column of the (unindexed, unpredicated,
                 // non-vtab) scan's table and the keep is modest — the
                 // scan feeds a `keep`-sized heap directly, never
-                // materializing the input. Collations and expression
+                // materializing the input. COLLATE terms unwrap (the
+                // wrapped column is the key; the collation resolves once
+                // and threads through the heap discipline). Expression
                 // terms keep the materializing path above.
                 if total <= 4096 {
                     if let Plan::Scan {
@@ -4413,10 +4440,26 @@ fn exec_limit(
                         predicate: None,
                     } = sort_input
                     {
-                        if table.vtab.is_none() && !matches!(&terms[0].expr, Expr::Collate { .. }) {
-                            if let Some(key_col) =
-                                resolve_topn_key_col(&terms[0].expr, table, alias.as_deref())
+                        if table.vtab.is_none() {
+                            // COLLATE terms unwrap: the key is the wrapped
+                            // expression, the collation resolves ONCE here
+                            // (missing name = connection comparator — the
+                            // materializing exec_topn's exact fallback). A
+                            // DECLARED column collation arrives as the same
+                            // wrapper (resolve_order_by_terms attaches it),
+                            // so explicit and declared forms fuse alike.
+                            let (key_expr, collation): (&Expr, Option<&str>) = match &terms[0].expr
                             {
+                                Expr::Collate { expr, collation } => {
+                                    (expr.as_ref(), Some(collation.as_str()))
+                                }
+                                e => (e, None),
+                            };
+                            if let Some(key_col) =
+                                resolve_topn_key_col(key_expr, table, alias.as_deref())
+                            {
+                                let coll: Option<Arc<dyn crate::plugin::Collation>> =
+                                    collation.and_then(crate::plugin::lookup_collation);
                                 let (project, out_cols) = match projection {
                                     Some(columns) => {
                                         match bare_column_projection(columns, table) {
@@ -4446,6 +4489,7 @@ fn exec_limit(
                                         offset_i as usize,
                                         project.as_deref(),
                                         out_cols.clone(),
+                                        coll.clone(),
                                     )? {
                                         return Ok(res);
                                     }
@@ -4458,6 +4502,7 @@ fn exec_limit(
                                         offset_i as usize,
                                         project.as_deref(),
                                         out_cols,
+                                        coll.as_deref(),
                                     );
                                 }
                             }

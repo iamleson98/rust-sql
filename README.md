@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **758+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **762+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -231,7 +231,7 @@ Walks a `Plan` tree and produces rows. OLTP plan shapes (Scan with rowid-resume,
 
 - The rowid range tiles into inclusive ranges — worker 0's range extends to `i64::MIN` so explicit rowid-0/negative rows are never dropped. Each worker builds its own `Btree` handle over the shared `&Pager` and runs the serial path's own `FusedWalk` / `HashGrouper` / keep-heap / chunk-sort machinery over its `[lo, hi]` range, so per-row semantics are identical by construction.
 - Aggregates merge partial accumulators in **range order** with **op-aware layouts** (SUM `(i_sum, sum, sum_is_int, comp)`, AVG the same plus `count`, COUNT `count`, MIN/MAX min/max — the merge is not a byte-blit); GROUP BY first-seen group order is reproduced exactly; DISTINCT replays via set-union.
-- Top-N workers keep per-range bounded heaps under the same strict total order (equal keys break on rowid, ASC and DESC) and merge under that order — bit-identical to the serial streaming top-N, including OFFSET windows.
+- Top-N workers keep per-range bounded heaps under the same strict total order (equal keys break on rowid, ASC and DESC) and merge under that order — bit-identical to the serial streaming top-N, including OFFSET windows. **`COLLATE` terms fuse** — explicit and column-DECLARED collations alike: the wrapper unwraps, the collation resolves once from the process-global registry, and the same comparator threads through every worker heap and the survivor merge (a collation only redefines which keys are EQUAL, so the rowid tiebreak keeps the order strict and the split proof unchanged).
 - Unbounded sorts chunk-sort per range under the (keys, rowid) total order and k-way merge under the same order — bit-identical to the serial stable sort; a 1:1 bare-column projection above the sort fuses into the worker decode (only projected + key columns materialize).
 - Safety comes from the engine's aliasing model — a statement executes under `&Database` while writers need `&mut Database`, so no writer can interleave within one call — plus per-page locks. Workers decline while any transaction is open (they are foreign to the committed-view TLS) and any worker bail aborts the attempt and falls back to the serial path — answers can never diverge.
 - `PRAGMA parallel_scan` gates it (default ON, min-rows 131072; 0/OFF is bit-identical serial). The threshold sits above every existing test/bench table, so sub-threshold paths are unchanged.
@@ -730,11 +730,14 @@ compat surface. Every entry says what it costs and why it exists.
   key tuple and the worker-local comparator resolves it exactly like the
   serial path's per-comparison lookup (missing collations fall back to
   the connection comparator in both paths; `tests/parallel_scan.rs`,
-  5-query differential battery). Still serial: subqueries, compound
-  bodies, DISTINCT aggregates, sorts whose terms are expressions (only
-  bare-column, ordinal, and collated-bare-column terms split — the
-  top-N fusion declines COLLATE), and the non-fused join shapes (outer
-  joins, multi-key and non-equi conditions).
+  5-query differential battery). The **top-N fusion honors COLLATE as
+  well** — explicit and declared — through the whole heap discipline
+  (serial streaming + worker split, 4 differential suites). Still serial:
+  subqueries, compound bodies, DISTINCT aggregates, sorts whose terms are
+  expressions (only bare-column, ordinal, and collated-bare-column terms
+  split — top-N with an EXPRESSION key keeps the materializing path), and
+  the non-fused join shapes (outer joins, multi-key and non-equi
+  conditions).
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled

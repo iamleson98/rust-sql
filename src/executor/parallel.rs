@@ -1035,6 +1035,7 @@ pub(crate) fn try_parallel_topn(
     offset: usize,
     project: Option<&[usize]>,
     out_cols: StdArc<[String]>,
+    coll: Option<StdArc<dyn crate::plugin::Collation>>,
 ) -> Result<Option<ExecResult>> {
     if keep == 0 {
         return Ok(None); // the serial path's LIMIT-0 shortcut already answers
@@ -1073,14 +1074,20 @@ pub(crate) fn try_parallel_topn(
 
     // Workers: the serial top-N loop over each range (identical heap
     // discipline — sift-up on insert, root-replace + sift-down when the
-    // candidate beats the worst survivor).
+    // candidate beats the worst survivor). The collation is resolved
+    // ONCE on the main thread and CLONED into each worker — an Arc from
+    // the process-global registry, so every comparison (worker heap,
+    // main-thread merge) uses the same comparator the serial path
+    // resolved.
     let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
             let wanted = wanted.clone();
+            let coll = coll.clone();
             handles.push(scope.spawn(move || -> Result<Vec<super::TopnSel>> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let coll_ref = coll.as_deref();
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
                 bt.scan_table_range_selective(
@@ -1098,13 +1105,14 @@ pub(crate) fn try_parallel_topn(
                                 serial: rowid,
                                 row,
                             });
-                            super::topn_sift_up(&mut sel, idx, desc);
+                            super::topn_sift_up(&mut sel, idx, desc, coll_ref);
                         } else if super::topn_total_cmp(
                             &key,
                             rowid,
                             &sel[0].key,
                             sel[0].serial,
                             desc,
+                            coll_ref,
                         ) == std::cmp::Ordering::Less
                         {
                             sel[0] = super::TopnSel {
@@ -1112,7 +1120,7 @@ pub(crate) fn try_parallel_topn(
                                 serial: rowid,
                                 row,
                             };
-                            super::topn_sift_down(&mut sel, 0, desc);
+                            super::topn_sift_down(&mut sel, 0, desc, coll_ref);
                         }
                         true
                     },
@@ -1139,7 +1147,7 @@ pub(crate) fn try_parallel_topn(
     // Sort the survivors under the SAME total order, keep the first
     // `keep` (= the global top-keep — see the proof above), window
     // [offset..keep) — the serial path's exact tail.
-    merged.sort_by(|a, b| super::cmp_sel(a, b, desc));
+    merged.sort_by(|a, b| super::cmp_sel(a, b, desc, coll.as_deref()));
     merged.truncate(keep);
     let start = offset.min(merged.len());
     let rows: Vec<Vec<Value>> = merged[start..]
