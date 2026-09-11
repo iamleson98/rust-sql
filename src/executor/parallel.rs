@@ -69,6 +69,11 @@ use super::{
     FUSED_MAX_COLS,
 };
 
+/// One resolved ORDER BY term of the parallel sort: (column position,
+/// DESC, collation resolved ONCE on the main thread — see
+/// `sort_total_cmp` for why resolution must not happen in workers).
+type SortKey = (usize, bool, StdOption<StdArc<dyn crate::plugin::Collation>>);
+
 /// Minimum estimated rows per worker (below this, fewer threads pay off
 /// more than they return).
 const MIN_ROWS_PER_WORKER: i64 = 32_768;
@@ -1393,22 +1398,27 @@ pub(crate) fn try_parallel_topn(
 /// columns) with DESC reversal; the rowid tiebreak makes the order
 /// STRICT, which is what makes the chunk/merge decomposition reproduce
 /// the serial answer bit-for-bit.
+///
+/// The collation is a RESOLVED `Arc<dyn Collation>`, captured ONCE on
+/// the MAIN thread before workers spawn. Custom (user-registered)
+/// collations live in a THREAD-LOCAL statement scope — a worker-side
+/// name lookup would see no scope and silently fall back to BINARY
+/// while the main-thread merge used the real collation, k-way-merging
+/// chunks sorted under a DIFFERENT order (a divergent answer). The
+/// main-thread resolution hands every comparison — worker heap, worker
+/// local sort, main-thread merge — the same comparator object; a
+/// missing name resolves to None, which is the serial comparator's
+/// exact connection-comparator fallback.
 fn sort_total_cmp(
     a_row: &[Value],
     a_rowid: i64,
     b_row: &[Value],
     b_rowid: i64,
-    keys: &[(usize, bool, StdOption<String>)],
+    keys: &[SortKey],
 ) -> std::cmp::Ordering {
     for &(col, desc, ref coll) in keys {
-        // COLLATE terms compare TEXT through the named collation —
-        // the SAME per-comparison lookup + fallback the serial
-        // exec_sort comparator uses, so the orders cannot diverge (a
-        // missing collation falls back to the connection comparator in
-        // both paths). The registry is process-global, so workers
-        // resolve the same collations the main thread would.
-        let ord = match coll.as_deref().and_then(crate::plugin::lookup_collation) {
-            Some(c) => crate::plugin::compare_collated(&a_row[col], &b_row[col], c.as_ref()),
+        let ord = match coll.as_deref() {
+            Some(c) => crate::plugin::compare_collated(&a_row[col], &b_row[col], c),
             None => super::value_cmp_conn(&a_row[col], &b_row[col]),
         };
         let ord = if desc { ord.reverse() } else { ord };
@@ -1474,6 +1484,21 @@ pub(crate) fn try_parallel_sort(
         None => return Ok(None),
     };
 
+    // Resolve every term's collation ONCE, HERE — the main thread, where
+    // the statement's plugin scope is live (custom collations are
+    // thread-local; a worker-side lookup silently misses them — see
+    // sort_total_cmp's doc). None = the serial comparator's fallback.
+    let resolved: Vec<SortKey> = keys
+        .iter()
+        .map(|&(col, desc, ref name)| {
+            (
+                col,
+                desc,
+                name.as_deref().and_then(crate::plugin::lookup_collation),
+            )
+        })
+        .collect();
+
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
     let rowid_proj = crate::storage::row_codec::ROWID_PROJ;
@@ -1504,8 +1529,8 @@ pub(crate) fn try_parallel_sort(
         None => (0..n_cols).collect(),
     };
     // Key position in the WORKER row (post-append in full-row mode).
-    let row_keys: Vec<(usize, bool, StdOption<String>)> = match project {
-        Some(_) => keys
+    let row_keys: Vec<SortKey> = match project {
+        Some(_) => resolved
             .iter()
             .map(|&(k, d, ref c)| {
                 let k_eff = if k >= n_cols { rowid_proj } else { k };
@@ -1519,7 +1544,7 @@ pub(crate) fn try_parallel_sort(
                 )
             })
             .collect(),
-        None => keys.to_vec(),
+        None => resolved,
     };
     // Output position mapping (projection mode only).
     let project_map: Vec<usize> = match project {
@@ -1610,7 +1635,7 @@ pub(crate) fn try_parallel_sort(
         mut i: usize,
         chunks: &[SortChunk],
         cursors: &[usize],
-        row_keys: &[(usize, bool, StdOption<String>)],
+        row_keys: &[SortKey],
     ) {
         loop {
             let n = heap.len();

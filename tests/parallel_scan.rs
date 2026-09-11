@@ -1503,3 +1503,67 @@ fn parallel_distinct_null_and_sparse_semantics() {
         "no-row DISTINCT ground truth"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Custom-collation main-thread resolution: user-registered collations live
+// in a THREAD-LOCAL statement scope — a worker-side name lookup sees no
+// scope and silently falls back to BINARY, while the main-thread merge
+// uses the real collation and k-way-merges wrongly-sorted chunks (a
+// divergent answer). The driver resolves every collation ONCE on the main
+// thread; workers and the merge share the comparator object.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_sort_custom_collation_matches_serial() {
+    use rustqlite::plugin::Collation;
+    use std::cmp::Ordering as Ord2;
+
+    /// Reversed byte order — maximally different from BINARY, so a
+    /// BINARY-sorted chunk merged under REVORD is obviously wrong.
+    struct RevOrd;
+    impl Collation for RevOrd {
+        fn name(&self) -> &str {
+            "REVORD"
+        }
+        fn compare(&self, a: &str, b: &str) -> Ord2 {
+            b.as_bytes().cmp(a.as_bytes())
+        }
+    }
+
+    let mut par = text_db();
+    par.create_collation(RevOrd).unwrap();
+    let mut ser = {
+        let mut s = text_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    ser.create_collation(RevOrd).unwrap();
+
+    let sql = "SELECT id, name FROM t ORDER BY name COLLATE REVORD";
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a.len(), BIG as usize);
+    assert_eq!(
+        a, b,
+        "custom collation must order identically parallel vs serial"
+    );
+    // The REVORD-minimum name is the BINARY MAXIMUM. Spellings cycle by
+    // key % 5 (1000 % 5 == 0): key 995 is the largest key carrying the
+    // all-lowercase 'user-' spelling (byte-greatest first letters), so
+    // 'user-00995' is the byte-maximum string — a BINARY-sorted chunk
+    // anywhere in the merge would put a low no-case key first and break
+    // this.
+    match &a[0][1] {
+        Value::Text(t) => assert_eq!(
+            t.as_str(),
+            "user-00995",
+            "REVORD minimum is the BINARY maximum key"
+        ),
+        other => panic!("TEXT expected, got {other:?}"),
+    }
+    // Multi-term: custom collation + rowid tiebreak.
+    let sql2 = "SELECT id FROM t ORDER BY name COLLATE REVORD DESC, id LIMIT 300";
+    let a2 = rows_of(&par, sql2);
+    let b2 = rows_of(&ser, sql2);
+    assert_eq!(a2, b2, "REVORD DESC + rowid term must match serial");
+}
