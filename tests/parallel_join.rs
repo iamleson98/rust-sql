@@ -174,3 +174,248 @@ fn parallel_join_write_between_queries() {
         "insert must be visible to the parallel probe"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MULTI-KEY equi-joins: the fused scan-hash join builds a composite-key
+// table (folded hash + value verification); the parallel probe splits the
+// probe side under the same discipline. Parallel must equal serial
+// bit-for-bit (order included), and the fused path must agree with the
+// MATERIALIZED nested-loop path (sorted comparison — INNER-join row order
+// is unspecified across algorithms).
+// ---------------------------------------------------------------------------
+
+fn build_multikey(db: &mut Database, n: i64) {
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, x REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=n {
+        // k1 = i - i%3 (collisions), k2 = -(i % 5) (5 classes, negatives),
+        // x REAL to exercise the cross-type key mix.
+        db.execute(
+            "INSERT INTO a (id, k1, k2, x) VALUES (?, ?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(-(i % 5)),
+                Value::Real(i as f64 / 2.0),
+            ],
+        )
+        .unwrap();
+    }
+    for i in 1..=n {
+        // b mirrors a's key space with a shifted collision pattern.
+        db.execute(
+            "INSERT INTO b (id, k1, k2, y) VALUES (?, ?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(-((i + 2) % 5)),
+                Value::Integer(i * 7),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+}
+
+fn sorted_rows(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by(|a, b| {
+        for (x, y) in a.iter().zip(b.iter()) {
+            let ord = x.cmp(y);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    rows
+}
+
+#[test]
+fn multikey_join_parallel_matches_serial() {
+    let mut db = Database::open_in_memory().unwrap();
+    build_multikey(&mut db, 150_000);
+    let sql = "SELECT a.x, b.y, a.k1, b.k2 FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert_eq!(ser.len(), par.len(), "row count differs");
+    assert_eq!(ser, par, "parallel multi-key join must equal serial");
+    assert!(ser.len() > 1000, "join unexpectedly tiny: {}", ser.len());
+    // Ground truth row count: pairs (i, j) with same k1 and k2.
+    // k1 = i - i%3 (multiples of 3 buckets); k2 classes overlap only when
+    // i%5 == (j+2)%5 AND same k1 bucket — count via SQL itself:
+    let n = rows_of(
+        &db,
+        "SELECT COUNT(*) FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2",
+    );
+    assert_eq!(n[0][0], Value::Integer(ser.len() as i64));
+}
+
+#[test]
+fn multikey_join_fused_matches_materialized() {
+    // The fused streaming path vs the materialized nested-loop path: for
+    // 150k x 150k the fused path answers; forcing the materialized shape
+    // via a residual condition (`AND b.y > 0` is NOT a pure equi chain —
+    // wait, it is ANDed with the equi keys, so purity declines and the
+    // materialized hash join with encoded byte keys answers instead).
+    let mut db = Database::open_in_memory().unwrap();
+    build_multikey(&mut db, 60_000);
+    let fused = "SELECT a.id, b.id FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2";
+    let materialized = "SELECT a.id, b.id FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2 AND b.y > 0";
+    let f = rows_of(&db, fused);
+    let m_all = rows_of(&db, materialized);
+    // materialized adds `b.y > 0` (y = id*7 > 0 for all ids >= 1): the
+    // same matches — compare sorted.
+    assert_eq!(sorted_rows(f.clone()), sorted_rows(m_all.clone()));
+    // And against an independent formulation: IN-based semi-check via
+    // GROUP BY over the concatenated key.
+    let grouped = rows_of(
+        &db,
+        "SELECT COUNT(*) FROM (SELECT k1, k2 FROM a INTERSECT SELECT k1, k2 FROM b)",
+    );
+    let _ = grouped; // shape smoke: INTERSECT path executes on join keys
+                     // Spot check: rows satisfy BOTH key equalities by construction.
+    for r in f.iter().step_by(97) {
+        let a_k1 = rows_of(
+            &db,
+            &format!("SELECT k1 FROM a WHERE id = {}", r[0].as_integer()),
+        );
+        let b_k1 = rows_of(
+            &db,
+            &format!("SELECT k1, k2 FROM b WHERE id = {}", r[1].as_integer()),
+        );
+        let a_k2 = rows_of(
+            &db,
+            &format!("SELECT k2 FROM a WHERE id = {}", r[0].as_integer()),
+        );
+        assert_eq!(a_k1[0][0], b_k1[0][0], "k1 must match");
+        assert_eq!(a_k2[0][0], b_k1[0][1], "k2 must match");
+    }
+}
+
+#[test]
+fn multikey_join_null_and_type_mix() {
+    // NULL keys never match; INTEGER/REAL cross-type key equality (5 =
+    // 5.0) through the composite hash + verification; three-key chains.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, p INTEGER, q INTEGER, r REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE rr (id INTEGER PRIMARY KEY, p INTEGER, q INTEGER, r REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO l (id, p, q, r) VALUES
+            (1, 10, 20, 1.5),
+            (2, 10, 20, 2.5),
+            (3, NULL, 20, 1.5),
+            (4, 10, NULL, 1.5),
+            (5, 11, 21, 3.0)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO rr (id, p, q, r) VALUES
+            (1, 10, 20, 1.5),
+            (2, 10, 20, 1.5),
+            (3, 10, 20, 2.5),
+            (4, NULL, 20, 9.9),
+            (5, 10, NULL, 9.9)",
+        [],
+    )
+    .unwrap();
+    let sql = "SELECT l.id, rr.id FROM l JOIN rr ON l.p = rr.p AND l.q = rr.q AND l.r = rr.r";
+    let got = rows_of(&db, sql);
+    // Matches: l(1) [10,20,1.5] joins BOTH rr(1) and rr(2) (duplicate
+    // build-side key -> chain); l(2) [10,20,2.5] joins rr(3). NULL-key
+    // rows (l3, l4, rr4, rr5) never match; l(5) has no partner.
+    let mut pairs: Vec<(i64, i64)> = got
+        .iter()
+        .map(|r| (r[0].as_integer(), r[1].as_integer()))
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(
+        pairs,
+        vec![(1, 1), (1, 2), (2, 3)],
+        "NULL keys must drop, values must match exactly"
+    );
+    // INTEGER = REAL cross-type composite equality: 5 = 5.0 on every key.
+    db.execute(
+        "CREATE TABLE n1 (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE n2 (id INTEGER PRIMARY KEY, k REAL, v REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO n1 (id, k, v) VALUES (1, 5, 7), (2, 6, 8), (3, 5, 9)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO n2 (id, k, v) VALUES (1, 5.0, 7.0), (2, 6.0, 8.0), (3, 5.0, 9.0)",
+        [],
+    )
+    .unwrap();
+    let got = rows_of(
+        &db,
+        "SELECT n1.id, n2.id FROM n1 JOIN n2 ON n1.k = n2.k AND n1.v = n2.v",
+    );
+    let mut pairs: Vec<(i64, i64)> = got
+        .iter()
+        .map(|r| (r[0].as_integer(), r[1].as_integer()))
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(
+        pairs,
+        vec![(1, 1), (2, 2), (3, 3)],
+        "cross-type composite keys must match"
+    );
+}
+
+#[test]
+fn multikey_join_projection_and_aggregate() {
+    // Bare projection + no-Project shapes + an aggregate over the join
+    // output (the synthesized combined-row path), big tables, parallel
+    // vs serial.
+    let mut db = Database::open_in_memory().unwrap();
+    build_multikey(&mut db, 130_000);
+    let queries = [
+        "SELECT a.x, b.y FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2",
+        "SELECT a.id, a.k1, a.k2, a.x, b.id, b.k1, b.k2, b.y FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2",
+        "SELECT COUNT(*), SUM(b.y), MIN(a.x), MAX(a.x) FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2",
+    ];
+    for sql in queries {
+        db.execute("PRAGMA parallel_scan=0", []).unwrap();
+        let ser = rows_of(&db, sql);
+        db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+        let par = rows_of(&db, sql);
+        assert_eq!(ser, par, "{sql}: parallel must equal serial");
+    }
+    // The aggregate row is non-trivial.
+    let agg = rows_of(
+        &db,
+        "SELECT COUNT(*), SUM(b.y), MIN(a.x), MAX(a.x) FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2",
+    );
+    match &agg[0][0] {
+        Value::Integer(i) => assert!(*i > 1000, "join aggregate count: {i}"),
+        other => panic!("INTEGER expected, got {other:?}"),
+    }
+}

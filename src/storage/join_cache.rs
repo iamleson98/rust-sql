@@ -44,6 +44,19 @@ pub(crate) struct JoinBuildState {
     pub slots: Vec<JoinSlot>,
     /// Duplicate chain: ordinal -> next ordinal with the same key.
     pub chain: Vec<u32>,
+    /// Number of equi-key columns. 1 = the ORIGINAL exact-key mode (each
+    /// slot's `key` IS the single column's order key — a slot hit IS a
+    /// key match, no verification). >1 = folded-hash mode: each slot's
+    /// `key` is a composite hash of all key columns' order keys, and a
+    /// slot hit must be VERIFIED against the stored values (the probe
+    /// side carries the matching key list — see the executor's
+    /// `join_keys_match`).
+    pub n_keys: usize,
+    /// Build-side key positions within the stride layout (len ==
+    /// n_keys) — the verification columns. Also part of the cache key:
+    /// the same wanted-column set with DIFFERENT key columns builds a
+    /// different table.
+    pub key_slots: Vec<usize>,
 }
 
 impl JoinBuildState {
@@ -53,10 +66,11 @@ impl JoinBuildState {
     }
 }
 
-/// Cache map: (build root page, wanted-column list) -> built state.
-/// Bounded: a fresh insert beyond [`MAX_ENTRIES`] clears the map (join
-/// shapes per database are few; a clear-all is a cheap, safe policy).
-pub(crate) type JoinBuildCache = HashMap<(u32, Vec<usize>), Arc<JoinBuildState>>;
+/// Cache map: (build root page, wanted-column list, key-column slots
+/// within the stride) -> built state. Bounded: a fresh insert beyond
+/// [`MAX_ENTRIES`] clears the map (join shapes per database are few; a
+/// clear-all is a cheap, safe policy).
+pub(crate) type JoinBuildCache = HashMap<(u32, Vec<usize>, Vec<usize>), Arc<JoinBuildState>>;
 
 /// Maximum cached join builds before a wholesale clear.
 pub(crate) const MAX_JOIN_CACHE_ENTRIES: usize = 8;
@@ -64,7 +78,7 @@ pub(crate) const MAX_JOIN_CACHE_ENTRIES: usize = 8;
 /// Insert with the bounded-clear policy.
 pub(crate) fn join_cache_insert(
     cache: &mut JoinBuildCache,
-    key: (u32, Vec<usize>),
+    key: (u32, Vec<usize>, Vec<usize>),
     state: Arc<JoinBuildState>,
 ) {
     if cache.len() >= MAX_JOIN_CACHE_ENTRIES && !cache.contains_key(&key) {

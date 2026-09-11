@@ -10555,6 +10555,54 @@ fn scan_columns_static(table: &Arc<Table>, alias: &Option<String>) -> std::sync:
 /// Returns `Ok(None)` whenever the shape or the data doesn't qualify (the
 /// caller falls back to the materialized hash join — never an error, just
 /// a different cost profile for the SAME semantics).
+/// Fold per-column order keys into one composite join hash (multi-key
+/// equi-joins). FNV-style mixing: each level multiplies by the FNV prime
+/// after XOR — order keys of small integers carry their mantissa in the
+/// HIGH bits and zeros below, so plain XOR-accumulate would collide
+/// monotone tuples; the multiply spreads every level across the word.
+/// `u64::MAX` is reserved for the empty-slot sentinel.
+#[inline]
+fn fold_join_hash(ks: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &k in ks {
+        h ^= k;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    if h == u64::MAX {
+        h -= 1; // reserve the empty-slot sentinel
+    }
+    h
+}
+
+/// Verify a multi-key slot hit: the stored build row's key columns (at
+/// `ord`'s stride offset, positions `b_key_pos`) against the probing
+/// row's key values (positions `p_key_pos` in the probe buffer). SQL
+/// equality semantics (`values_sql_equal`: 5 = 5.0 across INTEGER/REAL).
+/// Build-side insert verification passes the build's own buffer for the
+/// "probe" side (same wanted layout, same positions).
+#[inline]
+fn join_keys_match(
+    build_vals: &[Value],
+    ord: usize,
+    stride: usize,
+    b_key_pos: &[usize],
+    probe_buf: &[Value],
+    p_key_pos: &[usize],
+) -> bool {
+    for (bi, pi) in b_key_pos.iter().zip(p_key_pos.iter()) {
+        let bv = &build_vals[ord * stride + bi];
+        let pv = probe_buf.get(*pi);
+        let pv = match pv {
+            Some(v) => v,
+            None => return false,
+        };
+        if !crate::types::values_sql_equal(bv, pv) {
+            return false;
+        }
+    }
+    true
+}
+
 fn try_fused_scan_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -10616,19 +10664,25 @@ fn try_fused_scan_hash_join(
     if columns.is_empty() {
         return Ok(None);
     }
-    // Single pure equi-join key.
+    // One or more pure equi-join keys (an AND chain of `l.c = r.c`
+    // conjuncts, nothing else). Multi-key builds a composite-key table:
+    // each slot carries a FOLDED hash of all key columns' order keys, and
+    // a slot hit is verified against the stored values (see the build
+    // comment) — single-key keeps the original exact-key slots.
     let eq_pairs = extract_equi_join_keys(condition, &l_cols, &r_cols);
-    if eq_pairs.len() != 1 {
+    if eq_pairs.is_empty() {
         return Ok(None);
     }
     let pure_equi = matches!(
         count_eq_leaves_and_purity(condition, &l_cols, &r_cols),
-        Some(n) if n == 1
+        Some(n) if n == eq_pairs.len()
     );
     if !pure_equi {
         return Ok(None);
     }
-    let (l_key, r_key) = eq_pairs[0];
+    let l_keys: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
+    let r_keys: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
+    let n_keys = eq_pairs.len();
 
     // ---- Projection resolution (bare columns only) --------------------
     // Combined column list as BORROWED strings (left then right — exactly
@@ -10662,30 +10716,30 @@ fn try_fused_scan_hash_join(
     }
 
     // ---- Side selection (smaller side builds) --------------------------
-    // Per side: table, wanted-column count, local join-key index, live
+    // Per side: table, wanted-column count, local join-key indices, live
     // root, row count (a pure n_cells walk — no payload decode).
     struct JoinSide {
         table: Arc<Table>,
         n_cols: usize,
-        key_local: usize,
+        keys_local: Vec<usize>,
         root: u32,
         count: usize,
     }
     let pager = ctx.pager;
-    let side = |t: &Arc<Table>, a: &Option<String>, key: usize| -> Result<JoinSide> {
+    let side = |t: &Arc<Table>, a: &Option<String>, keys: &[usize]| -> Result<JoinSide> {
         let root = ctx.table_root(t);
         let count = Btree::new(pager, root, false).count_rows()? as usize;
         let n_cols = scan_columns_static(t, a).len();
         Ok(JoinSide {
             table: Arc::clone(t),
             n_cols,
-            key_local: key,
+            keys_local: keys.to_vec(),
             root,
             count,
         })
     };
-    let l_side = side(l_table, l_alias, l_key)?;
-    let r_side = side(r_table, r_alias, r_key)?;
+    let l_side = side(l_table, l_alias, &l_keys)?;
+    let r_side = side(r_table, r_alias, &r_keys)?;
     let (build, probe) = if l_side.count <= r_side.count {
         (l_side, r_side)
     } else {
@@ -10708,11 +10762,11 @@ fn try_fused_scan_hash_join(
         out_side_build.push(from_left == build_is_left);
         out_local.push(if from_left { p } else { p - n_left });
     }
-    // Build side wanted columns: key + every build-side projected local.
-    // Sorted + deduplicated so `decode_row_selective` takes its
+    // Build side wanted columns: every key + every build-side projected
+    // local. Sorted + deduplicated so `decode_row_selective` takes its
     // allocation-free ascending path (an unsorted list costs a
     // permutation Vec allocation PER ROW).
-    let mut build_wanted: Vec<usize> = vec![build.key_local];
+    let mut build_wanted: Vec<usize> = build.keys_local.clone();
     for (i, &is_build) in out_side_build.iter().enumerate() {
         if is_build {
             build_wanted.push(out_local[i]);
@@ -10720,12 +10774,16 @@ fn try_fused_scan_hash_join(
     }
     build_wanted.sort_unstable();
     build_wanted.dedup();
-    let build_key_pos = build_wanted
+    // Key positions within the build stride layout (ascending — the
+    // wanted list is sorted, so each lookup is a linear scan of a tiny
+    // vec).
+    let build_key_pos: Vec<usize> = build
+        .keys_local
         .iter()
-        .position(|&c| c == build.key_local)
-        .unwrap_or(0);
+        .map(|&k| build_wanted.iter().position(|&c| c == k).unwrap_or(0))
+        .collect();
     // Probe side: same construction.
-    let mut probe_wanted: Vec<usize> = vec![probe.key_local];
+    let mut probe_wanted: Vec<usize> = probe.keys_local.clone();
     for (i, &is_build) in out_side_build.iter().enumerate() {
         if !is_build {
             probe_wanted.push(out_local[i]);
@@ -10733,10 +10791,11 @@ fn try_fused_scan_hash_join(
     }
     probe_wanted.sort_unstable();
     probe_wanted.dedup();
-    let probe_key_pos = probe_wanted
+    let probe_key_pos: Vec<usize> = probe
+        .keys_local
         .iter()
-        .position(|&c| c == probe.key_local)
-        .unwrap_or(0);
+        .map(|&k| probe_wanted.iter().position(|&c| c == k).unwrap_or(0))
+        .collect();
     // Position of each output column's value inside its side's decode
     // buffer, packed with the side flag for the emit loop.
     let out_slots: Vec<OutSlot> = out_side_build
@@ -10790,14 +10849,17 @@ fn try_fused_scan_hash_join(
     // own writes. The reader's scope-drop poison bump only applies AFTER
     // the reader finishes; concurrent owner queries must stay safe.
     let committed_read = pager.committed_reads_armed();
-    let cache_key = (build.root, build_wanted.clone());
+    // The cache key includes the KEY COLUMNS: the same wanted set with
+    // different key columns builds a different table (folded-hash slots
+    // + verification columns).
+    let cache_key = (build.root, build_wanted.clone(), build_key_pos.clone());
     let cached: Option<std::sync::Arc<JoinBuildState>> = if committed_read {
         None
     } else {
         {
             let jc = pager.join_build_cache().lock();
             jc.get(&cache_key)
-                .filter(|st| st.epoch == join_epoch)
+                .filter(|st| st.epoch == join_epoch && st.n_keys == n_keys)
                 .cloned()
         }
     };
@@ -10829,6 +10891,9 @@ fn try_fused_scan_hash_join(
         let mut stored: usize = 0;
         let mut buf: Vec<Value> = Vec::new();
         let build_alias = build.table.rowid_alias;
+        // Per-key order keys + the folded composite hash (n_keys > 1) or
+        // the exact single order key (n_keys == 1).
+        let mut ks: Vec<u64> = vec![0u64; n_keys];
         {
             let mut bt = Btree::new(pager, build.root, false);
             bt.scan_table_borrowed(|rowid, payload| {
@@ -10844,24 +10909,33 @@ fn try_fused_scan_hash_join(
                 {
                     return true; // corrupt row: skip (matches exec_scan)
                 }
-                let k = match buf.get(build_key_pos) {
-                    Some(Value::Integer(i)) => {
-                        // Same 2^53 gate as the materialized path's u64_mode:
-                        // beyond it, i as f64 rounds and keys could collide.
-                        if i.unsigned_abs() > (1u64 << 53) {
+                for (j, &kp) in build_key_pos.iter().enumerate() {
+                    let k = match buf.get(kp) {
+                        Some(Value::Integer(i)) => {
+                            // Same 2^53 gate as the materialized path's
+                            // u64_mode: beyond it, i as f64 rounds and keys
+                            // could collide.
+                            if i.unsigned_abs() > (1u64 << 53) {
+                                aborted = true;
+                                return false;
+                            }
+                            crate::types::value::double_order_key(*i as f64)
+                        }
+                        Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
+                        // NULL build keys never match anything (INNER join:
+                        // skip); TEXT/BLOB build keys need the byte-key path.
+                        Some(Value::Null) => return true,
+                        _ => {
                             aborted = true;
                             return false;
                         }
-                        crate::types::value::double_order_key(*i as f64)
-                    }
-                    Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                    // NULL build keys never match anything (INNER join: skip);
-                    // TEXT/BLOB build keys need the byte-key path.
-                    Some(Value::Null) => return true,
-                    _ => {
-                        aborted = true;
-                        return false;
-                    }
+                    };
+                    ks[j] = k;
+                }
+                let k = if n_keys == 1 {
+                    ks[0]
+                } else {
+                    fold_join_hash(&ks)
                 };
                 // count_rows under-counted (corrupt page metadata) or the
                 // tree grew mid-scan: fall back to the materialized path
@@ -10878,7 +10952,10 @@ fn try_fused_scan_hash_join(
                 // Open-addressing insert: find the key's slot (match = bucket
                 // chain prepend; empty slot = new head). Load factor <= 0.5
                 // (table_cap >= 2 * n_build >= 2 * stored) guarantees an empty
-                // slot exists, so the probe always terminates.
+                // slot exists, so the probe always terminates. Multi-key
+                // slots hold a FOLDED hash: a hash hit is verified against
+                // the stored values (a collision with different keys keeps
+                // probing instead of chaining).
                 let mut slot = key_slot(k, hash_shift, table_mask);
                 loop {
                     let existing = slots[slot].key;
@@ -10886,7 +10963,17 @@ fn try_fused_scan_hash_join(
                         slots[slot] = JoinSlot { key: k, head: ord };
                         break;
                     }
-                    if existing == k {
+                    if existing == k
+                        && (n_keys == 1
+                            || join_keys_match(
+                                &build_vals,
+                                slots[slot].head as usize,
+                                stride,
+                                &build_key_pos,
+                                &buf,
+                                &build_key_pos,
+                            ))
+                    {
                         chain[ord as usize] = slots[slot].head;
                         slots[slot].head = ord;
                         break;
@@ -10908,6 +10995,8 @@ fn try_fused_scan_hash_join(
             build_vals,
             slots,
             chain,
+            n_keys,
+            key_slots: build_key_pos.clone(),
         });
         if !committed_read {
             crate::storage::join_cache::join_cache_insert(
@@ -10943,7 +11032,7 @@ fn try_fused_scan_hash_join(
             probe.n_cols,
             &probe_wanted,
             probe_alias,
-            probe_key_pos,
+            &probe_key_pos,
             &built,
             &out_slots_plain,
             out_combined.len(),
@@ -10957,8 +11046,11 @@ fn try_fused_scan_hash_join(
     }
     // ---- PROBE: stream scan + selective decode + emit -------------------
     let n_out = out_combined.len();
+    let built_n_keys = built.n_keys;
+    let built_key_slots: &[usize] = &built.key_slots;
     let mut out_rows: Vec<Row> = Vec::with_capacity(probe.count.max(1));
     let mut pbuf: Vec<Value> = Vec::new();
+    let mut pks: Vec<u64> = vec![0u64; n_keys];
     {
         let mut bt = Btree::new(pager, probe.root, false);
         bt.scan_table_borrowed(|rowid, payload| {
@@ -10974,27 +11066,48 @@ fn try_fused_scan_hash_join(
             {
                 return true; // corrupt row: skip
             }
-            let k = match pbuf.get(probe_key_pos) {
-                Some(Value::Integer(i)) => {
-                    // Mirrors the materialized path exactly (no 2^53 gate
-                    // on probe keys): identical match semantics either way.
-                    crate::types::value::double_order_key(*i as f64)
-                }
-                Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                // NULL / TEXT / BLOB probe keys cannot equal the
-                // all-numeric build keys: no match, next row.
-                _ => return true,
+            for (j, &kp) in probe_key_pos.iter().enumerate() {
+                let k = match pbuf.get(kp) {
+                    Some(Value::Integer(i)) => {
+                        // Mirrors the materialized path exactly (no 2^53
+                        // gate on probe keys): identical match semantics.
+                        crate::types::value::double_order_key(*i as f64)
+                    }
+                    Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
+                    // NULL / TEXT / BLOB probe keys cannot equal the
+                    // all-numeric build keys: no match, next row.
+                    _ => return true,
+                };
+                pks[j] = k;
+            }
+            let k = if n_keys == 1 {
+                pks[0]
+            } else {
+                fold_join_hash(&pks)
             };
             let mut next = {
                 // Open-addressing lookup: probe until an empty slot (no
-                // match) or the exact key.
+                // match) or a key hit. Single-key slots hold EXACT order
+                // keys (a hit IS a match); multi-key slots hold folded
+                // hashes (a hit is verified against the stored values —
+                // a hash collision keeps probing).
                 let mut slot = key_slot(k, hash_shift, table_mask);
                 loop {
                     let existing = slots[slot].key;
                     if existing == u64::MAX {
                         break u32::MAX;
                     }
-                    if existing == k {
+                    if existing == k
+                        && (built_n_keys == 1
+                            || join_keys_match(
+                                build_vals,
+                                slots[slot].head as usize,
+                                stride,
+                                built_key_slots,
+                                &pbuf,
+                                &probe_key_pos,
+                            ))
+                    {
                         break slots[slot].head;
                     }
                     slot = (slot + 1) & table_mask;

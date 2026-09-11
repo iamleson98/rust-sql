@@ -2164,7 +2164,7 @@ pub(crate) fn try_parallel_join_probe(
     probe_n_cols: usize,
     probe_wanted: &[usize],
     probe_alias: Option<usize>,
-    probe_key_pos: usize,
+    probe_key_pos: &[usize],
     built: &StdArc<crate::storage::join_cache::JoinBuildState>,
     out_slots: &[(bool, usize)],
     n_out: usize,
@@ -2192,6 +2192,9 @@ pub(crate) fn try_parallel_join_probe(
             .map(|&(from_build, pos)| ProbeOutSlot { from_build, pos })
             .collect(),
     );
+    let probe_key_pos: StdArc<Vec<usize>> = StdArc::new(probe_key_pos.to_vec());
+    let n_keys = built.n_keys;
+    let built_key_slots: StdArc<Vec<usize>> = StdArc::new(built.key_slots.clone());
     let n_workers = ranges.len();
     let conn_enc_tag = super::conn_enc::current();
     let partials: Vec<Result<Vec<crate::Row>>> = std::thread::scope(|scope| {
@@ -2200,10 +2203,13 @@ pub(crate) fn try_parallel_join_probe(
             let built = StdArc::clone(&built);
             let wanted = StdArc::clone(&wanted);
             let out_slots = StdArc::clone(&out_slots);
+            let probe_key_pos = StdArc::clone(&probe_key_pos);
+            let built_key_slots = StdArc::clone(&built_key_slots);
             handles.push(scope.spawn(move || -> Result<Vec<crate::Row>> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
                 let mut out_rows: Vec<crate::Row> = Vec::new();
                 let mut pbuf: Vec<crate::types::Value> = Vec::new();
+                let mut pks: Vec<u64> = vec![0u64; n_keys];
                 let mut bt = Btree::new(pager, probe_root, false);
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
                     if crate::storage::row_codec::decode_row_selective_sorted(
@@ -2218,14 +2224,22 @@ pub(crate) fn try_parallel_join_probe(
                     {
                         return true; // corrupt row: skip (serial parity)
                     }
-                    let k = match pbuf.get(probe_key_pos) {
-                        Some(crate::types::Value::Integer(i)) => {
-                            crate::types::value::double_order_key(*i as f64)
-                        }
-                        Some(crate::types::Value::Real(f)) => {
-                            crate::types::value::double_order_key(*f)
-                        }
-                        _ => return true, // NULL/TEXT/BLOB: no match
+                    for (j, &kp) in probe_key_pos.iter().enumerate() {
+                        let k = match pbuf.get(kp) {
+                            Some(crate::types::Value::Integer(i)) => {
+                                crate::types::value::double_order_key(*i as f64)
+                            }
+                            Some(crate::types::Value::Real(f)) => {
+                                crate::types::value::double_order_key(*f)
+                            }
+                            _ => return true, // NULL/TEXT/BLOB: no match
+                        };
+                        pks[j] = k;
+                    }
+                    let k = if n_keys == 1 {
+                        pks[0]
+                    } else {
+                        super::fold_join_hash(&pks)
                     };
                     let mut next = {
                         let mut slot = join_key_slot(k, hash_shift, table_mask);
@@ -2234,7 +2248,17 @@ pub(crate) fn try_parallel_join_probe(
                             if existing == u64::MAX {
                                 break u32::MAX;
                             }
-                            if existing == k {
+                            if existing == k
+                                && (n_keys == 1
+                                    || super::join_keys_match(
+                                        &built.build_vals,
+                                        slots[slot].head as usize,
+                                        built.stride,
+                                        &built_key_slots,
+                                        &pbuf,
+                                        &probe_key_pos,
+                                    ))
+                            {
                                 break slots[slot].head;
                             }
                             slot = (slot + 1) & table_mask;

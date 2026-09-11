@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **770+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **774+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -390,7 +390,7 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 - **UPDATE range / index scans**: the `IndexRange` plan node seeks the index and touches only matching rows; UPDATE rewrites payloads in place where possible (payload-patch fast path). UPDATEs whose WHERE is an exact unique-index probe (`WHERE k = ?`, `WHERE k IN (...)`) take an index-point path — seek, rowid fetch, payload patch — and `IN` probes keep every key's matches in per-key scratch buffers.
 - **Top-N**: per-worker bounded keep-heaps under the statement's exact total order, merged range-ordered — the serial streaming top-N's own algorithm, split across workers.
 - **Unbounded sorts**: `ORDER BY` without a LIMIT splits the rowid space; each worker chunk-sorts its range under the statement's (keys, rowid) total order and the main thread k-way merges under the same order — bit-identical to the serial stable sort. A 1:1 bare-column projection above the sort (`SELECT id, val ... ORDER BY val`) is fused into the worker decode: only the projected + key columns are ever materialized, so wide TEXT columns the projection would discard are never decoded.
-- **Joins (parallel probe)**: the fused streaming hash join builds the smaller side's hash table once, then splits the PROBE side's rowid space across workers — each worker selective-decodes its range and probes the read-only build state into its own buffer; partials concatenate in range order, reproducing the serial probe's row order bit for bit (`tests/parallel_join.rs` pins the equality). Aggregates directly over a join (`SELECT COUNT(*), SUM(a.x) FROM a JOIN b ON b.k = a.k`) ride the same fused path — no full-row materialization of either side. 1M×1M → 3M output rows: 1.38x vs SQLite on 2 cores.
+- **Joins (parallel probe)**: the fused streaming hash join builds the smaller side's hash table once, then splits the PROBE side's rowid space across workers — each worker selective-decodes its range and probes the read-only build state into its own buffer; partials concatenate in range order, reproducing the serial probe's row order bit for bit (`tests/parallel_join.rs` pins the equality). Aggregates directly over a join (`SELECT COUNT(*), SUM(a.x) FROM a JOIN b ON b.k = a.k`) ride the same fused path — no full-row materialization of either side. 1M×1M → 3M output rows: 1.38x vs SQLite on 2 cores. **Multi-key equi-joins fuse too** (`ON a.k1 = b.k1 AND a.k2 = b.k2`): composite order-key hashes (FNV-folded per key column) with VALUE verification on every slot hit — a hash collision keeps probing instead of chaining — and the same parallel probe split; the build cache keys on (root, wanted, key columns) so different key sets never share a table (`tests/parallel_join.rs`, 4 multi-key suites: 150k-row parallel==serial, fused==materialized, NULL-key and cross-type semantics, projection/aggregate shapes).
 - **Join reordering**: multi-table INNER-join spines flatten and rebuild smallest-filtered-first (`reorder_inner_joins` — greedy, connectivity-preferring, stat1 + access-path cardinalities); the WHERE's cross-relation conjuncts FUSE into join conditions, so implicit-join syntax hash-joins instead of crossing + filtering. The adversarial order (`big1 JOIN big2 … JOIN small WHERE small.id = ?`) drove the point-filtered table first and turned a 482 ms big×big intermediate into a 5.3 ms point-lookup chain — matching the benign order's plan. Multi-key AND-chain ON conditions take the hash path (they used to plan as nested loops), and pushed-lookup join sides keep their key extraction (`col_index`'s plain-name fallback).
 - **Bulk inserts**: BTREE_APPEND rightmost descent + append-mode splits + codec v2 keep sequential loads dense.
 - **Join point filters**: IndexNestedLoopJoin + a warm statement cache beat SQLite's prepared-statement path on point-filtered joins; the unfiltered 2-table PK join sits at parity.
@@ -738,9 +738,10 @@ compat surface. Every entry says what it costs and why it exists.
   set-union merge) — as do **EXPRESSION-TERM sorts** (compiled keys,
   worker-side materialization, `ORDER BY v * -1` shapes) and **top-N with
   an EXPRESSION key** (the bounded fusion evaluates compiled keys once
-  per row, same heap discipline, serial + worker split). Still serial:
-  subqueries, compound bodies, and the non-fused join shapes (outer
-  joins, multi-key and non-equi conditions).
+  per row, same heap discipline, serial + worker split). **Multi-key
+  equi-joins fuse** (composite order-key hash + value verification,
+  serial + parallel probe). Still serial: subqueries, compound bodies,
+  and the non-fused join shapes (outer joins, non-equi conditions).
 - **Numeric precision**: serial SUM/TOTAL/AVG and window-frame arithmetic are
   **bit-exact** with SQLite (integer-exact i64 accumulation + Kahan–Babuška
   compensated REAL sums, pinned by `tests/numeric_parity.rs` against bundled
