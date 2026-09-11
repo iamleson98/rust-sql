@@ -2407,6 +2407,7 @@ pub(crate) fn try_parallel_join_probe(
     built: &StdArc<crate::storage::join_cache::JoinBuildState>,
     out_slots: &[(bool, usize)],
     n_out: usize,
+    left_outer: bool,
 ) -> Result<Option<Vec<crate::Row>>> {
     let pager = ctx.pager;
     // Committed-view scope: workers are foreign to the TLS arming.
@@ -2449,6 +2450,7 @@ pub(crate) fn try_parallel_join_probe(
                 let mut out_rows: Vec<crate::Row> = Vec::new();
                 let mut pbuf: Vec<crate::types::Value> = Vec::new();
                 let mut pks: Vec<u64> = vec![0u64; n_keys];
+                let mut match_ords: Vec<u32> = Vec::new();
                 let mut bt = Btree::new(pager, probe_root, false);
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
                     if crate::storage::row_codec::decode_row_selective_sorted(
@@ -2463,6 +2465,7 @@ pub(crate) fn try_parallel_join_probe(
                     {
                         return true; // corrupt row: skip (serial parity)
                     }
+                    let mut key_ok = true;
                     for (j, &kp) in probe_key_pos.iter().enumerate() {
                         let k = match pbuf.get(kp) {
                             Some(crate::types::Value::Integer(i)) => {
@@ -2471,52 +2474,99 @@ pub(crate) fn try_parallel_join_probe(
                             Some(crate::types::Value::Real(f)) => {
                                 crate::types::value::double_order_key(*f)
                             }
-                            _ => return true, // NULL/TEXT/BLOB: no match
+                            // NULL/TEXT/BLOB: no match (LEFT still emits
+                            // the NULL-extended probe row).
+                            _ => {
+                                key_ok = false;
+                                break;
+                            }
                         };
                         pks[j] = k;
                     }
-                    let k = if n_keys == 1 {
-                        pks[0]
-                    } else {
-                        super::fold_join_hash(&pks)
-                    };
-                    let mut next = {
-                        let mut slot = join_key_slot(k, hash_shift, table_mask);
-                        loop {
-                            let existing = slots[slot].key;
-                            if existing == u64::MAX {
-                                break u32::MAX;
+                    let mut next = u32::MAX;
+                    if key_ok {
+                        let k = if n_keys == 1 {
+                            pks[0]
+                        } else {
+                            super::fold_join_hash(&pks)
+                        };
+                        next = {
+                            let mut slot = join_key_slot(k, hash_shift, table_mask);
+                            loop {
+                                let existing = slots[slot].key;
+                                if existing == u64::MAX {
+                                    break u32::MAX;
+                                }
+                                if existing == k
+                                    && (n_keys == 1
+                                        || super::join_keys_match(
+                                            &built.build_vals,
+                                            slots[slot].head as usize,
+                                            built.stride,
+                                            &built_key_slots,
+                                            &pbuf,
+                                            &probe_key_pos,
+                                        ))
+                                {
+                                    break slots[slot].head;
+                                }
+                                slot = (slot + 1) & table_mask;
                             }
-                            if existing == k
-                                && (n_keys == 1
-                                    || super::join_keys_match(
-                                        &built.build_vals,
-                                        slots[slot].head as usize,
-                                        built.stride,
-                                        &built_key_slots,
-                                        &pbuf,
-                                        &probe_key_pos,
-                                    ))
-                            {
-                                break slots[slot].head;
-                            }
-                            slot = (slot + 1) & table_mask;
-                        }
-                    };
+                        };
+                    }
                     let stride = built.stride;
-                    while next != u32::MAX {
-                        let ord = next as usize;
-                        let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
-                        for s in out_slots.iter() {
-                            let v = if s.from_build {
-                                &built.build_vals[ord * stride + s.pos]
-                            } else {
-                                &pbuf[s.pos]
-                            };
-                            out.push(v.clone());
+                    if !left_outer {
+                        // INNER: matches in chain order (the serial fused
+                        // path's discipline — range-ordered partials stay
+                        // bit-identical to it).
+                        while next != u32::MAX {
+                            let ord = next as usize;
+                            let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
+                            for s in out_slots.iter() {
+                                let v = if s.from_build {
+                                    &built.build_vals[ord * stride + s.pos]
+                                } else {
+                                    &pbuf[s.pos]
+                                };
+                                out.push(v.clone());
+                            }
+                            out_rows.push(out);
+                            next = built.chain[ord];
                         }
-                        out_rows.push(out);
-                        next = built.chain[ord];
+                    } else {
+                        // LEFT: collect the chain, REVERSE to build-scan
+                        // order, emit — or one NULL-extended row.
+                        match_ords.clear();
+                        while next != u32::MAX {
+                            match_ords.push(next);
+                            next = built.chain[next as usize];
+                        }
+                        if match_ords.is_empty() {
+                            let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
+                            for s in out_slots.iter() {
+                                out.push(if s.from_build {
+                                    crate::types::Value::Null
+                                } else {
+                                    pbuf[s.pos].clone()
+                                });
+                            }
+                            out_rows.push(out);
+                        } else {
+                            match_ords.reverse();
+                            for &ord in match_ords.iter() {
+                                let ord = ord as usize;
+                                let mut out: Vec<crate::types::Value> = Vec::with_capacity(n_out);
+                                for s in out_slots.iter() {
+                                    let v = if s.from_build {
+                                        &built.build_vals[ord * stride + s.pos]
+                                    } else {
+                                        &pbuf[s.pos]
+                                    };
+                                    out.push(v.clone());
+                                }
+                                out_rows.push(out);
+                            }
+                        }
                     }
                     true
                 })?;

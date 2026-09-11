@@ -10627,6 +10627,7 @@ fn try_fused_scan_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
     right: &Plan,
+    join_type: crate::sql::ast::JoinType,
     condition: &Option<Expr>,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
 ) -> Result<Option<ExecResult>> {
@@ -10760,10 +10761,18 @@ fn try_fused_scan_hash_join(
     };
     let l_side = side(l_table, l_alias, &l_keys)?;
     let r_side = side(r_table, r_alias, &r_keys)?;
-    let (build, probe) = if l_side.count <= r_side.count {
-        (l_side, r_side)
+    let left_outer = matches!(join_type, crate::sql::ast::JoinType::Left);
+    // INNER/CROSS: build the smaller side. LEFT: the RIGHT (inner) side
+    // must build — the LEFT (outer) side drives the output (every probe
+    // row emits: matches, or one NULL-extended row on no match).
+    // build_is_left travels with the CHOICE (a self-join shares one Arc,
+    // so table identity cannot identify the side).
+    let (build, probe, build_is_left) = if left_outer {
+        (r_side, l_side, false)
+    } else if l_side.count <= r_side.count {
+        (l_side, r_side, true)
     } else {
-        (r_side, l_side)
+        (r_side, l_side, false)
     };
 
     // ---- Decode plans ---------------------------------------------------
@@ -10774,7 +10783,6 @@ fn try_fused_scan_hash_join(
         from_build: bool,
         pos: usize,
     }
-    let build_is_left = Arc::ptr_eq(&build.table, l_table);
     let mut out_side_build: Vec<bool> = Vec::with_capacity(out_combined.len());
     let mut out_local: Vec<usize> = Vec::with_capacity(out_combined.len());
     for &p in &out_combined {
@@ -11056,6 +11064,7 @@ fn try_fused_scan_hash_join(
             &built,
             &out_slots_plain,
             out_combined.len(),
+            left_outer,
         )? {
             let columns_out: std::sync::Arc<[String]> = out_names.into();
             return Ok(Some(ExecResult {
@@ -11071,6 +11080,11 @@ fn try_fused_scan_hash_join(
     let mut out_rows: Vec<Row> = Vec::with_capacity(probe.count.max(1));
     let mut pbuf: Vec<Value> = Vec::new();
     let mut pks: Vec<u64> = vec![0u64; n_keys];
+    // LEFT-outer scratch: the matched-build-ord chain, REVERSED to build
+    // (right-side) scan order before emission — the nested-loop and
+    // materialized paths emit each left row's matches in right-scan
+    // order, and the chain is prepend-ordered (newest first).
+    let mut match_ords: Vec<u32> = Vec::new();
     {
         let mut bt = Btree::new(pager, probe.root, false);
         bt.scan_table_borrowed(|rowid, payload| {
@@ -11086,6 +11100,10 @@ fn try_fused_scan_hash_join(
             {
                 return true; // corrupt row: skip
             }
+            // Extract the probe keys; NULL / TEXT / BLOB keys cannot equal
+            // the all-numeric build keys — no match. For LEFT that still
+            // emits the NULL-extended probe row.
+            let mut key_ok = true;
             for (j, &kp) in probe_key_pos.iter().enumerate() {
                 let k = match pbuf.get(kp) {
                     Some(Value::Integer(i)) => {
@@ -11094,60 +11112,103 @@ fn try_fused_scan_hash_join(
                         crate::types::value::double_order_key(*i as f64)
                     }
                     Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                    // NULL / TEXT / BLOB probe keys cannot equal the
-                    // all-numeric build keys: no match, next row.
-                    _ => return true,
+                    // NULL / TEXT / BLOB: no match possible.
+                    _ => {
+                        key_ok = false;
+                        break;
+                    }
                 };
                 pks[j] = k;
             }
-            let k = if n_keys == 1 {
-                pks[0]
+            let mut next = u32::MAX;
+            if key_ok {
+                let k = if n_keys == 1 {
+                    pks[0]
+                } else {
+                    fold_join_hash(&pks)
+                };
+                next = {
+                    // Open-addressing lookup: probe until an empty slot
+                    // (no match) or a key hit. Single-key slots hold EXACT
+                    // order keys (a hit IS a match); multi-key slots hold
+                    // folded hashes (a hit is verified against the stored
+                    // values — a hash collision keeps probing).
+                    let mut slot = key_slot(k, hash_shift, table_mask);
+                    loop {
+                        let existing = slots[slot].key;
+                        if existing == u64::MAX {
+                            break u32::MAX;
+                        }
+                        if existing == k
+                            && (built_n_keys == 1
+                                || join_keys_match(
+                                    build_vals,
+                                    slots[slot].head as usize,
+                                    stride,
+                                    built_key_slots,
+                                    &pbuf,
+                                    &probe_key_pos,
+                                ))
+                        {
+                            break slots[slot].head;
+                        }
+                        slot = (slot + 1) & table_mask;
+                    }
+                };
+            }
+            if !left_outer {
+                // INNER: emit the matches in chain order (the established
+                // fused-path discipline — INNER row order is unspecified).
+                while next != u32::MAX {
+                    let ord = next as usize;
+                    let mut out: Row = Vec::with_capacity(n_out);
+                    for s in &out_slots {
+                        let v = if s.from_build {
+                            // (ord + 1) rows of `stride` values each are
+                            // resident — bounds are structural.
+                            &build_vals[ord * stride + s.pos]
+                        } else {
+                            &pbuf[s.pos]
+                        };
+                        out.push(v.clone());
+                    }
+                    out_rows.push(out);
+                    next = chain[ord];
+                }
             } else {
-                fold_join_hash(&pks)
-            };
-            let mut next = {
-                // Open-addressing lookup: probe until an empty slot (no
-                // match) or a key hit. Single-key slots hold EXACT order
-                // keys (a hit IS a match); multi-key slots hold folded
-                // hashes (a hit is verified against the stored values —
-                // a hash collision keeps probing).
-                let mut slot = key_slot(k, hash_shift, table_mask);
-                loop {
-                    let existing = slots[slot].key;
-                    if existing == u64::MAX {
-                        break u32::MAX;
-                    }
-                    if existing == k
-                        && (built_n_keys == 1
-                            || join_keys_match(
-                                build_vals,
-                                slots[slot].head as usize,
-                                stride,
-                                built_key_slots,
-                                &pbuf,
-                                &probe_key_pos,
-                            ))
-                    {
-                        break slots[slot].head;
-                    }
-                    slot = (slot + 1) & table_mask;
+                // LEFT: collect the chain, REVERSE to build-scan order,
+                // emit — or one NULL-extended row when nothing matched.
+                match_ords.clear();
+                while next != u32::MAX {
+                    match_ords.push(next);
+                    next = chain[next as usize];
                 }
-            };
-            while next != u32::MAX {
-                let ord = next as usize;
-                let mut out: Row = Vec::with_capacity(n_out);
-                for s in &out_slots {
-                    let v = if s.from_build {
-                        // (ord + 1) rows of `stride` values each are
-                        // resident — bounds are structural.
-                        &build_vals[ord * stride + s.pos]
-                    } else {
-                        &pbuf[s.pos]
-                    };
-                    out.push(v.clone());
+                if match_ords.is_empty() {
+                    let mut out: Row = Vec::with_capacity(n_out);
+                    for s in &out_slots {
+                        out.push(if s.from_build {
+                            Value::Null
+                        } else {
+                            pbuf[s.pos].clone()
+                        });
+                    }
+                    out_rows.push(out);
+                } else {
+                    match_ords.reverse();
+                    for &ord in match_ords.iter() {
+                        let ord = ord as usize;
+                        let mut out: Row = Vec::with_capacity(n_out);
+                        for s in &out_slots {
+                            let v = if s.from_build {
+                                &build_vals[ord * stride + s.pos]
+                            } else {
+                                &pbuf[s.pos]
+                            };
+                            out.push(v.clone());
+                        }
+                        out_rows.push(out);
+                    }
                 }
-                out_rows.push(out);
-                next = chain[ord];
             }
             true
         })?;
@@ -11223,13 +11284,20 @@ fn exec_hash_join(
     }
     if matches!(
         join_type,
-        crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+        crate::sql::ast::JoinType::Inner
+            | crate::sql::ast::JoinType::Cross
+            | crate::sql::ast::JoinType::Left
     ) {
         // None (no Project above the join — e.g. an Aggregate directly
         // over the join) takes the fused path too: it emits FULL combined
         // rows, still streaming — the materialized path below executes
-        // BOTH sides into Vec<Row> first.
-        if let Some(res) = try_fused_scan_hash_join(ctx, left, right, condition, projection)? {
+        // BOTH sides into Vec<Row> first. LEFT joins fuse with the RIGHT
+        // (inner) side as the build and the LEFT (outer) side as the
+        // probe — non-matching probe rows emit NULL-extended (the
+        // materialized path's semantics, minus the materialization).
+        if let Some(res) =
+            try_fused_scan_hash_join(ctx, left, right, join_type, condition, projection)?
+        {
             return Ok(res);
         }
     }

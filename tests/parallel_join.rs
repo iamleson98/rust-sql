@@ -459,3 +459,206 @@ fn parallel_sort_over_join_output_matches_serial() {
     sorted.sort_unstable();
     assert_eq!(tie, sorted, "tie block must be b.y-ascending");
 }
+
+// ---------------------------------------------------------------------------
+// Fused LEFT JOIN: the RIGHT (inner) side builds, the LEFT (outer) side
+// probes and emits matches in BUILD-SCAN order (chain reversed) or one
+// NULL-extended row on no match — the materialized path's semantics minus
+// the materialization. Parallel probe split + serial must be bit-identical.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fused_left_join_matches_serial() {
+    // Keys with deliberate non-matches: b only covers k in a middle band,
+    // so left rows outside it emit NULL-extended rows.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=150_000i64 {
+        // l covers all keys; r covers only [50000, 120000) — outside rows
+        // must NULL-extend.
+        db.execute(
+            "INSERT INTO l (id, k, x) VALUES (?, ?, ?)",
+            [Value::Integer(i), Value::Integer(i), Value::Integer(i * 3)],
+        )
+        .unwrap();
+        if (50_000..120_000).contains(&i) {
+            // r.k collides 3-wide (k, k+1, k+2 share one bucket): dup
+            // chains with reversed emission order.
+            let k = i - (i % 3);
+            db.execute(
+                "INSERT INTO r (id, k, y) VALUES (?, ?, ?)",
+                [Value::Integer(i), Value::Integer(k), Value::Integer(i * 7)],
+            )
+            .unwrap();
+        }
+    }
+    db.execute("COMMIT", []).unwrap();
+    let sql = "SELECT l.id, l.x, r.id, r.y FROM l LEFT JOIN r ON l.k = r.k";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert_eq!(
+        ser, par,
+        "fused LEFT join must equal serial, order included"
+    );
+    // Shape ground truth: left rows 1..149999 with k in [50000, 120000)
+    // matched; NULL-extended rows for the rest.
+    let null_rows: Vec<&Vec<Value>> = ser.iter().filter(|r| matches!(r[3], Value::Null)).collect();
+    let matched: usize = ser.iter().filter(|r| !matches!(r[3], Value::Null)).count();
+    // r's keys are the 3-multiples spanned by its band (~23.3k keys);
+    // each matching l row joins r's 3-wide bucket -> ~70k matched OUTPUT
+    // rows; every other l row emits exactly one NULL-extended row.
+    assert!(
+        (69_000..=71_000).contains(&matched),
+        "matched rows: {matched}"
+    );
+    assert_eq!(
+        ser.len(),
+        matched + null_rows.len(),
+        "output = matched + NULL-extended rows"
+    );
+    // Every left row emits at least once: the distinct l.id values in
+    // the output cover 1..=150000 (band-edge buckets make the per-row
+    // match count 3 or fewer).
+    let distinct_l: std::collections::HashSet<i64> =
+        ser.iter().map(|r| r[0].as_integer()).collect();
+    assert_eq!(
+        distinct_l.len(),
+        150_000,
+        "every left row emits at least once"
+    );
+    // NULL-extended rows keep the left row's values.
+    for r in null_rows.iter().step_by(997) {
+        assert!(!matches!(r[1], Value::Null), "left columns stay real");
+        assert!(matches!(r[2], Value::Null) && matches!(r[3], Value::Null));
+    }
+    // Spot check ORDER: the first row is l.id=1 (k=1 outside the band ->
+    // NULL-extended).
+    assert_eq!(ser[0][0], Value::Integer(1));
+    assert!(matches!(ser[0][3], Value::Null));
+}
+
+#[test]
+fn fused_left_join_null_keys_and_dup_order() {
+    // NULL keys never match (NULL-extended emission); duplicate build
+    // keys emit in build-scan (right) order.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO l (id, k, x) VALUES (1, 10, 100), (2, NULL, 200), (3, 10, 300), (4, 30, 400)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO r (id, k, y) VALUES (1, 10, 7), (2, 10, 8), (3, 10, 9), (4, 20, 10)",
+        [],
+    )
+    .unwrap();
+    let sql = "SELECT l.id, r.id, r.y FROM l LEFT JOIN r ON l.k = r.k";
+    let got = rows_of(&db, sql);
+    // l1 (k=10): matches r1, r2, r3 in RIGHT-SCAN order (ids 1, 2, 3).
+    // l2 (k=NULL): no match -> NULL-extended. l3 (k=10): same matches.
+    // l4 (k=30): no match.
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1), Value::Integer(7)],
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(8)],
+            vec![Value::Integer(1), Value::Integer(3), Value::Integer(9)],
+            vec![Value::Integer(2), Value::Null, Value::Null],
+            vec![Value::Integer(3), Value::Integer(1), Value::Integer(7)],
+            vec![Value::Integer(3), Value::Integer(2), Value::Integer(8)],
+            vec![Value::Integer(3), Value::Integer(3), Value::Integer(9)],
+            vec![Value::Integer(4), Value::Null, Value::Null],
+        ],
+        "LEFT join: right-scan match order + NULL-extended non-matches"
+    );
+}
+
+#[test]
+fn fused_left_join_projection_and_multikey() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, x REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=150_000i64 {
+        db.execute(
+            "INSERT INTO l (id, k1, k2, x) VALUES (?, ?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(-(i % 5)),
+                Value::Real(i as f64 / 2.0),
+            ],
+        )
+        .unwrap();
+        if (40_000..110_000).contains(&i) {
+            db.execute(
+                "INSERT INTO r (id, k1, k2, y) VALUES (?, ?, ?, ?)",
+                [
+                    Value::Integer(i),
+                    Value::Integer(i - (i % 3)),
+                    Value::Integer(-((i + 2) % 5)),
+                    Value::Integer(i * 7),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    db.execute("COMMIT", []).unwrap();
+    // Multi-key LEFT join with a narrow projection.
+    let sql = "SELECT l.x, r.y FROM l LEFT JOIN r ON l.k1 = r.k1 AND l.k2 = r.k2";
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = rows_of(&db, sql);
+    db.execute("PRAGMA parallel_scan=131072", []).unwrap();
+    let par = rows_of(&db, sql);
+    assert_eq!(ser, par, "multi-key fused LEFT join must equal serial");
+    let nulls: usize = ser.iter().filter(|r| matches!(r[1], Value::Null)).count();
+    assert!(nulls > 30_000, "NULL-extended multi-key rows: {nulls}");
+    // An aggregate over the LEFT join output rides the same path.
+    let sql2 =
+        "SELECT COUNT(*), COUNT(r.y), SUM(r.y) FROM l LEFT JOIN r ON l.k1 = r.k1 AND l.k2 = r.k2";
+    let a2 = rows_of(&db, sql2);
+    let count = match &a2[0][0] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    let counted = match &a2[0][1] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    assert_eq!(count, 150_000, "every left row emits exactly once");
+    assert_eq!(
+        counted as usize,
+        ser.len() - nulls,
+        "COUNT(r.y) counts matches"
+    );
+}
