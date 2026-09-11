@@ -471,10 +471,65 @@ fn pragma_read_forms_match() {
             "PRAGMA journal_mode",
             "PRAGMA collation_list",
             "PRAGMA database_list",
-            "PRAGMA pragma_list",
         ],
         "read-forms",
     );
+}
+
+#[test]
+fn pragma_list_is_the_portable_core() {
+    // SQLite's own list is BUILD-SPECIFIC (macOS's system build carries
+    // `lock_proxy_file`, for example); the engine answers the portable
+    // core. The differential contract: every name the engine reports is
+    // a pragma real SQLite knows (subset), the shape is one text column
+    // per row, and the stable core members are present.
+    let mut db = Database::open_in_memory().unwrap();
+    let ours: Vec<String> = db
+        .query("PRAGMA pragma_list", [])
+        .unwrap()
+        .iter()
+        .map(|r| render(&r[0]))
+        .collect();
+    let theirs_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut stmt = theirs_conn.prepare("PRAGMA pragma_list").unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    let mut theirs: Vec<String> = Vec::new();
+    while let Some(r) = rows.next().unwrap() {
+        theirs.push(format!(
+            "T:{}",
+            match r.get_ref(0).unwrap() {
+                rusqlite::types::ValueRef::Text(t) => {
+                    String::from_utf8_lossy(t).into_owned()
+                }
+                other => panic!("pragma_list row should be text, got {other:?}"),
+            }
+        ));
+    }
+    let unknown: Vec<&String> = ours.iter().filter(|o| !theirs.contains(o)).collect();
+    assert!(
+        unknown.is_empty(),
+        "engine reports pragmas SQLite does not know: {unknown:?}"
+    );
+    for core in [
+        "busy_timeout",
+        "cache_size",
+        "encoding",
+        "foreign_keys",
+        "index_list",
+        "integrity_check",
+        "journal_mode",
+        "page_size",
+        "schema_version",
+        "table_info",
+        "user_version",
+        "wal_checkpoint",
+    ] {
+        assert!(
+            ours.contains(&format!("T:{core}")),
+            "missing core pragma {core}"
+        );
+    }
+    assert!(!ours.is_empty());
 }
 
 #[test]
