@@ -271,14 +271,17 @@ fn journal_mode_write_returns_row() {
         .unwrap();
     assert_eq!(res.0, vec!["journal_mode".to_string()]);
     assert_eq!(res.1.len(), 1);
+    // SQLite: in-memory databases support only memory/off — a WAL write
+    // returns "memory" (pinned against real SQLite: write WAL on
+    // :memory: yields 'memory', reads too).
     match &res.1[0][0] {
-        rustqlite::Value::Text(t) => assert_eq!(t.as_str(), "wal"),
+        rustqlite::Value::Text(t) => assert_eq!(t.as_str(), "memory"),
         other => panic!("journal_mode row should be Text, got {other:?}"),
     }
     // And a read returns the current mode.
     let res = db.query("PRAGMA journal_mode", []).unwrap();
     match &res[0][0] {
-        rustqlite::Value::Text(t) => assert_eq!(t.as_str(), "wal"),
+        rustqlite::Value::Text(t) => assert_eq!(t.as_str(), "memory"),
         other => panic!("journal_mode read should be Text, got {other:?}"),
     }
 }
@@ -288,8 +291,10 @@ fn journal_mode_call_form_writes() {
     let db = Database::open_in_memory().unwrap();
     let res = db.query("PRAGMA journal_mode(WAL)", []).unwrap();
     assert_eq!(res.len(), 1);
+    // In-memory databases report "memory" (SQLite's contract — see
+    // journal_mode_write_returns_row).
     match &res[0][0] {
-        rustqlite::Value::Text(t) => assert_eq!(t.as_str(), "wal"),
+        rustqlite::Value::Text(t) => assert_eq!(t.as_str(), "memory"),
         other => panic!("journal_mode() write should return Text, got {other:?}"),
     }
 }

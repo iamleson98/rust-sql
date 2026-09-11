@@ -314,6 +314,16 @@ impl PluginRegistry {
     pub fn collation(&self, name: &str) -> Option<Arc<dyn Collation>> {
         self.collations.get(&name.to_ascii_lowercase()).cloned()
     }
+    /// All registered collation names (PRAGMA collation_list).
+    pub fn collation_names(&self) -> Vec<String> {
+        self.collations.keys().cloned().collect()
+    }
+
+    /// All registered virtual-table module names (PRAGMA module_list).
+    pub fn module_names(&self) -> Vec<String> {
+        self.modules.keys().cloned().collect()
+    }
+
     pub fn module(&self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
         self.modules.get(&name.to_ascii_lowercase()).cloned()
     }

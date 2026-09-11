@@ -195,9 +195,15 @@ impl<'a> Lexer<'a> {
         if c == b'\'' {
             return self.lex_string();
         }
-        // Quoted identifier
-        if c == b'"' {
-            return self.lex_quoted_ident();
+        // Quoted identifier — SQLite's three quoting families:
+        //   "ident"  (escape: double the quote)
+        //   [ident]  (no escape — the first `]` closes)
+        //   `ident`  (escape: double the backtick)
+        if c == b'"' || c == b'`' {
+            return self.lex_quoted_ident(c, true);
+        }
+        if c == b'[' {
+            return self.lex_quoted_ident(b']', false);
         }
         // Parameter placeholder
         if c == b'?' || c == b':' || c == b'@' || c == b'$' {
@@ -422,8 +428,8 @@ impl<'a> Lexer<'a> {
         Ok(Token::Blob(bytes))
     }
 
-    fn lex_quoted_ident(&mut self) -> Result<Token> {
-        self.advance(); // skip opening quote
+    fn lex_quoted_ident(&mut self, delim: u8, doubling_escape: bool) -> Result<Token> {
+        self.advance(); // skip opening quote/delimiter
                         // Raw bytes + UTF-8 decode (see lex_string — same Latin-1 bug fix).
         let mut bytes: Vec<u8> = Vec::new();
         loop {
@@ -435,9 +441,9 @@ impl<'a> Lexer<'a> {
                 ));
             }
             let c = self.src[self.pos];
-            if c == b'"' {
-                if self.peek(1) == Some(b'"') {
-                    bytes.push(b'"');
+            if c == delim {
+                if doubling_escape && self.peek(1) == Some(delim) {
+                    bytes.push(delim);
                     self.advance();
                     self.advance();
                 } else {

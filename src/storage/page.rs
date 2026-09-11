@@ -433,6 +433,12 @@ impl FileHeader {
                                                           // fresh pages default both to 0 (the buffer is zeroed).
     }
 
+    /// The file change counter (header offset 24) — `PRAGMA
+    /// data_version`'s base.
+    pub fn change_counter(buf: &[u8]) -> u32 {
+        u32::from_be_bytes(buf[24..28].try_into().unwrap_or([0; 4]))
+    }
+
     pub fn user_version(buf: &[u8]) -> u32 {
         u32::from_le_bytes(buf[60..64].try_into().unwrap())
     }

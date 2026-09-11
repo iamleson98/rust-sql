@@ -991,6 +991,12 @@ pub fn build_index_columns(cols: &[IndexedColumn], table: &Table) -> Result<Vec<
 
 /// Encode a catalog entry as a row in the schema table (`sqlite_master`).
 /// Columns: (type, name, tbl_name, rootpage, sql).
+///
+/// `rootpage` takes the ENGINE-INTERNAL page id (0-based: page 0 is the
+/// schema b-tree itself) and is translated to SQLite's file convention
+/// (1-based: page 1 is the schema b-tree, so every real b-tree root is
+/// +1). Views and triggers carry no b-tree: internal 0 stays 0, exactly
+/// SQLite's `rootpage = 0` for them.
 pub fn encode_schema_row(
     kind: &str,
     name: &str,
@@ -1013,16 +1019,31 @@ pub fn encode_schema_row_opt(
     rootpage: PageId,
     sql: Option<&str>,
 ) -> Vec<Value> {
+    // Internal 0-based -> SQLite 1-based. Internal 0 is only ever the
+    // schema b-tree itself (never a user object), so a 0 here means
+    // "no b-tree" (view/trigger) and passes through untouched.
+    let sqlite_rootpage: i64 = if rootpage >= 1 {
+        rootpage as i64 + 1
+    } else {
+        0
+    };
     vec![
         Value::Text(kind.to_string().into()),
         Value::Text(name.to_string().into()),
         Value::Text(tbl_name.to_string().into()),
-        Value::Integer(rootpage as i64),
+        Value::Integer(sqlite_rootpage),
         match sql {
             Some(s) => Value::Text(s.to_string().into()),
             None => Value::Null,
         },
     ]
+}
+
+/// Inverse of [`encode_schema_row_opt`]'s translation: a rootpage read
+/// back from a schema row (SQLite 1-based convention) to the engine's
+/// internal 0-based page id. 0 (view/trigger) stays 0.
+pub fn rootpage_to_internal(rootpage: u32) -> PageId {
+    rootpage.saturating_sub(1)
 }
 
 /// The `sqlite_master` (aka `sqlite_schema`) table: a real, queryable view

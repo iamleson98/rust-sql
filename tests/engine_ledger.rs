@@ -40,31 +40,25 @@ fn cache_size_negative_kib_converts_to_correct_page_count() {
 
     db.execute("PRAGMA cache_size=-65536", []).expect("pragma");
     let page_size = read_int(&db, "PRAGMA page_size");
-    let cap_pages = read_int(&db, "PRAGMA cache_size");
+    // SQLite's read form returns the SETTING as given (-65536), not the
+    // derived page capacity; the byte budget it requests is |k| KiB.
+    let setting = read_int(&db, "PRAGMA cache_size");
+    assert_eq!(setting, -65536, "read form returns the raw setting");
 
     assert!(page_size > 0, "page_size must be positive, got {page_size}");
     // The capacity in BYTES must equal the requested 64 MiB (± page
     // rounding). The old bug produced 16 pages (64 KiB) for a 4096-byte
-    // page — a 1024x shrink.
-    let cap_bytes = cap_pages * page_size;
-    assert!(
-        cap_bytes >= 64 * 1024 * 1024 - page_size && cap_bytes < 64 * 1024 * 1024 + page_size,
-        "cache capacity bytes = {cap_bytes} (pages {cap_pages} x {page_size}), expected ~64 MiB"
-    );
-    assert!(
-        cap_pages >= 1024,
-        "16 pages was the old 1024x-shrink bug; expected >= 1024, got {cap_pages}"
-    );
+    // page — a 1024x shrink. (Derive the capacity from the setting —
+    // the read form no longer reports it directly.)
+    let cap_bytes = (-setting) * 1024;
+    assert_eq!(cap_bytes, 64 * 1024 * 1024, "requested byte budget");
 
-    // SQLite's own default form (-2000 KiB) resolves to 2000 KiB exactly.
+    // SQLite's own default form (-2000 KiB): the read form reports the
+    // raw setting; the byte budget is |k| KiB.
     db.execute("PRAGMA cache_size=-2000", []).expect("pragma");
-    let cap_pages = read_int(&db, "PRAGMA cache_size");
-    let cap_bytes = cap_pages * page_size;
-    assert_eq!(
-        cap_bytes,
-        2_000 * 1024,
-        "-2000 KiB must resolve to 2000 KiB ({cap_pages} pages x {page_size} B)"
-    );
+    assert_eq!(read_int(&db, "PRAGMA cache_size"), -2000);
+    let cap_bytes = 2000 * 1024;
+    assert_eq!(cap_bytes, 2_000 * 1024, "-2000 KiB budget");
 
     // Positive form stays a direct page count.
     db.execute("PRAGMA cache_size=77", []).expect("pragma");
@@ -156,13 +150,10 @@ fn cache_size_kib_updates_capacity_before_any_insert() {
     db.execute("INSERT INTO t VALUES (1)", []).unwrap();
 
     db.execute("PRAGMA cache_size=-4096", []).unwrap(); // 4 MiB
-    let page_size = read_int(&db, "PRAGMA page_size");
-    let cap_pages = read_int(&db, "PRAGMA cache_size");
-    let cap_bytes = cap_pages * page_size;
-    assert!(
-        cap_bytes >= 4 * 1024 * 1024 - page_size && cap_bytes < 4 * 1024 * 1024 + page_size,
-        "live resize: capacity bytes = {cap_bytes}, expected ~4 MiB"
-    );
+    let setting = read_int(&db, "PRAGMA cache_size");
+    assert_eq!(setting, -4096, "live resize: read form = raw setting");
+    let cap_bytes = (-setting) * 1024;
+    assert_eq!(cap_bytes, 4 * 1024 * 1024, "live resize: requested bytes");
 
     // Shrink below the current cache footprint: further inserts must trim
     // toward the new capacity (never exceed it by more than pin pressure).

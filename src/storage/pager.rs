@@ -772,6 +772,12 @@ pub struct Pager {
     /// PRAGMA user_version / application_id — persisted at the SQLite
     /// header offsets (60..64 / 68..72) inside page 0.
     user_version: std::sync::atomic::AtomicU32,
+    /// PRAGMA busy_timeout (ms) — the read form's value (default 0,
+    /// SQLite's fresh-connection default).
+    busy_timeout_ms: std::sync::atomic::AtomicI64,
+    /// PRAGMA cache_size as SET (positive = pages, negative = KiB;
+    /// SQLite's default is -2000).
+    cache_size_setting: std::sync::atomic::AtomicI64,
     application_id: std::sync::atomic::AtomicU32,
     /// Retired flag (VACUUM's rewrite path): the database file is being
     /// replaced out from under this pager — `Drop` must skip ALL close-time
@@ -1528,6 +1534,8 @@ impl Pager {
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
             committed_view_epoch: std::sync::atomic::AtomicU64::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
+            busy_timeout_ms: std::sync::atomic::AtomicI64::new(0),
+            cache_size_setting: std::sync::atomic::AtomicI64::new(-2000),
             application_id: std::sync::atomic::AtomicU32::new(0),
             retired: AtomicBool::new(false),
             parallel_scan_min_rows: std::sync::atomic::AtomicI64::new(
@@ -2130,6 +2138,13 @@ impl Pager {
     /// Upper-bound count of dirty pages since the last `flush()`. O(1).
     pub fn dirty_page_count(&self) -> usize {
         self.dirty_count_approx.load(Ordering::Acquire)
+    }
+
+    /// Advance the schema cookie in memory only (DDL bookkeeping). The
+    /// next `flush` writes it into page 0's header — the WAL-aware path
+    /// (unlike the direct-file-write `bump_schema_cookie`).
+    pub fn note_schema_change(&self) {
+        self.schema_cookie.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn bump_schema_cookie(&self) -> Result<()> {
@@ -4511,6 +4526,52 @@ impl Pager {
 
     pub fn cache_size(&self) -> usize {
         self.cache.read().len()
+    }
+
+    /// PRAGMA busy_timeout's stored value (ms).
+    pub fn busy_timeout_ms(&self) -> i64 {
+        self.busy_timeout_ms.load(Ordering::Acquire)
+    }
+
+    /// Store PRAGMA busy_timeout's value (ms).
+    pub fn set_busy_timeout_ms(&self, ms: i64) {
+        self.busy_timeout_ms
+            .store(ms.clamp(0, i64::MAX), Ordering::Release);
+    }
+
+    /// PRAGMA cache_size as SET (SQLite's convention: negative = KiB).
+    pub fn cache_size_setting(&self) -> i64 {
+        self.cache_size_setting.load(Ordering::Acquire)
+    }
+
+    /// Store the raw PRAGMA cache_size setting.
+    pub fn set_cache_size_setting(&self, k: i64) {
+        self.cache_size_setting.store(k, Ordering::Release);
+    }
+
+    /// The database file's path (None for in-memory / `:memory:`).
+    pub fn db_path(&self) -> Option<String> {
+        if self.is_memory() {
+            return None;
+        }
+        self.path.to_str().map(|p| p.to_string())
+    }
+
+    /// `PRAGMA data_version`'s base: the file change counter as observed
+    /// at open (+1, so a fresh connection reports 1 like SQLite). The
+    /// connection's own commits never advance what it reports (SQLite's
+    /// observed single-connection behavior — the value tracks the
+    /// header as LAST read from disk, and the writer serves its own
+    /// header from cache).
+    pub fn data_version_base(&self) -> i64 {
+        if self.is_memory() {
+            return 1;
+        }
+        let mut header = [0u8; 100];
+        if self.read_file_at(0, &mut header).is_err() {
+            return 1;
+        }
+        (FileHeader::change_counter(&header) as i64).max(0) + 1
     }
 
     pub fn cache_capacity(&self) -> usize {

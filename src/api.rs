@@ -3358,7 +3358,7 @@ impl Database {
         bt.scan_table(|_, payload| {
             if let Ok(row) = decode_row(payload, 5, 0, None) {
                 if let Some((_, _, _, root, _)) = crate::schema::decode_schema_row(&row) {
-                    roots.push(root);
+                    roots.push(crate::schema::rootpage_to_internal(root));
                 }
             }
             true
@@ -3385,12 +3385,13 @@ impl Database {
         //    materializes the image into the store.
         let tmp = Pager::open_memory(DEFAULT_CACHE_PAGES)?;
         tmp.set_lazy_writeback(false);
-        // 3. Copy every object tree (roots from the schema rows).
+        // 3. Copy every object tree (roots from the schema rows, back in
+        //    the engine's internal 0-based convention).
         let roots: Vec<u32> = rows
             .iter()
             .map(|(_, r)| {
                 crate::schema::decode_schema_row(r)
-                    .map(|(_, _, _, root, _)| root)
+                    .map(|(_, _, _, root, _)| crate::schema::rootpage_to_internal(root))
                     .unwrap_or(0)
             })
             .collect();
@@ -3402,11 +3403,20 @@ impl Database {
                 return Ok(None);
             }
         };
-        // 4. Re-insert the schema rows with remapped roots.
+        // 4. Re-insert the schema rows with remapped roots. The map runs
+        //    in internal page ids; the row's rootpage column carries
+        //    SQLite's 1-based convention, so translate on write.
         for (rowid, mut row) in rows {
             if row.len() >= 4 {
                 if let Some((_, _, _, old_root, _)) = crate::schema::decode_schema_row(&row) {
-                    row[3] = Value::Integer(map.get(&old_root).copied().unwrap_or(0) as i64);
+                    let old_internal = crate::schema::rootpage_to_internal(old_root);
+                    let new_internal = map.get(&old_internal).copied().unwrap_or(0);
+                    let new_sqlite_conv = if new_internal >= 1 {
+                        new_internal as i64 + 1
+                    } else {
+                        0
+                    };
+                    row[3] = Value::Integer(new_sqlite_conv);
                 }
             }
             let payload = encode_row(&row);
@@ -3987,6 +3997,10 @@ impl Database {
         // B+tree; index maintenance needs the general path).
         if !table.check_exprs.is_empty()
             || !table.foreign_keys.is_empty()
+            || table
+                .columns
+                .iter()
+                .any(|c| c.autoincrement)
             || self
                 .catalog
                 .triggers_on_table(&table.name)
@@ -4073,6 +4087,9 @@ impl Database {
             || table.without_rowid
             || table.strict
             || table.columns.iter().any(|c| c.generated.is_some())
+            // AUTOINCREMENT: sequence high-water semantics need the
+            // general path's sqlite_sequence maintenance.
+            || table.columns.iter().any(|c| c.autoincrement)
         {
             return Ok(false);
         }
@@ -4557,7 +4574,14 @@ impl Database {
         })?;
         if let Some((old_rowid, mut row)) = found {
             if row.len() >= 4 {
-                row[3] = Value::Integer(new_root as i64);
+                // Internal (0-based) root -> SQLite's 1-based rootpage
+                // convention (see encode_schema_row_opt). new_root == 0
+                // never happens here — only real b-trees get rewritten.
+                row[3] = Value::Integer(if new_root >= 1 {
+                    new_root as i64 + 1
+                } else {
+                    0
+                });
             }
             let payload = encode_row(&row);
             schema_tree_mutate(&self.pager, |bt| {
@@ -4833,6 +4857,22 @@ impl Database {
             // No cached plan — DDL statement. execute_statement_static
             // handles DDL directly (CREATE/DROP/ALTER/ATTACH/DETACH/
             // VACUUM/PRAGMA) without a Plan.
+            // Reserved namespace: user-issued `sqlite_%` object names
+            // are internal (SQLite: "object name reserved for internal
+            // use"). The foreign-image loader replays real SQLite files'
+            // own sqlite_stat1/4 DDL through this same path, so those two
+            // names pass when replaying a foreign schema; the engine's
+            // ANALYZE never comes through here (internal call).
+            if self.foreign.is_none() {
+                if let Statement::Create(CreateStatement::Table { name, .. }) = stmt_ref {
+                    if name.name.to_ascii_lowercase().starts_with("sqlite_") {
+                        return Err(Error::constraint(format!(
+                            "object name reserved for internal use: {}",
+                            name.name
+                        )));
+                    }
+                }
+            }
             Self::execute_statement_static(
                 stmt_ref,
                 &mut ctx,
@@ -7101,7 +7141,19 @@ impl Database {
         foreign: Option<&ForeignSqlite>,
     ) -> Result<()> {
         match stmt {
-            Statement::Create(c) => Self::execute_create(c.clone(), ctx, catalog, original_sql),
+            Statement::Create(c) => {
+                let r = Self::execute_create(c.clone(), ctx, catalog, original_sql, foreign);
+                if r.is_ok() {
+                    // Every schema change advances the schema cookie
+                    // (SQLite's `PRAGMA schema_version` — other connections
+                    // invalidate cached statements on it). Plain atomic
+                    // bump: the next flush materializes page 0's header
+                    // from it (the direct-file-write form would race the
+                    // WAL).
+                    ctx.pager.note_schema_change();
+                }
+                r
+            }
             Statement::Drop(d) => Self::execute_drop(d.clone(), ctx, catalog),
             Statement::Begin(_) => {
                 if ctx.in_transaction {
@@ -7215,6 +7267,7 @@ impl Database {
         ctx: &mut ExecContext,
         catalog: &mut Catalog,
         original_sql: &str,
+        foreign: Option<&ForeignSqlite>,
     ) -> Result<()> {
         match c {
             CreateStatement::Table {
@@ -7234,6 +7287,10 @@ impl Database {
                     }
                     return Err(Error::AlreadyExists(format!("table: {}", name.name)));
                 }
+                // (The reserved-`sqlite_%`-name guard lives at the
+                // USER-FACING entry in `execute` — ANALYZE's internal
+                // sqlite_stat1 DDL and the foreign-image replay path
+                // bypass it there, exactly like SQLite's internal paths.)
                 // CREATE TABLE ... AS SELECT: materialize the source query
                 // NOW (the target does not exist yet, so the select sees
                 // the pre-create catalog), derive the column list from the
@@ -7338,6 +7395,45 @@ impl Database {
                     strict,
                     &create_sql,
                 )?;
+                // AUTOINCREMENT validation (SQLite's exact errors, pinned
+                // against 3.5x) — BEFORE any catalog/schema mutation so a
+                // rejected statement leaves nothing behind: WITHOUT ROWID
+                // is refused outright; a non-alias PK (e.g. TEXT PK) is
+                // refused too.
+                if without_rowid
+                    && columns.iter().any(|c| {
+                        c.constraints.iter().any(|cc| {
+                            matches!(
+                                cc,
+                                crate::sql::ast::ColumnConstraint::PrimaryKey {
+                                    autoincrement: true,
+                                    ..
+                                }
+                            )
+                        })
+                    })
+                {
+                    return Err(Error::constraint(
+                        "AUTOINCREMENT not allowed on WITHOUT ROWID tables",
+                    ));
+                }
+                if let Some(ci) = columns.iter().position(|c| {
+                    c.constraints.iter().any(|cc| {
+                        matches!(
+                            cc,
+                            crate::sql::ast::ColumnConstraint::PrimaryKey {
+                                autoincrement: true,
+                                ..
+                            }
+                        )
+                    })
+                }) {
+                    if table.rowid_alias != Some(ci) {
+                        return Err(Error::constraint(
+                            "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY",
+                        ));
+                    }
+                }
                 let schema_row = crate::schema::encode_schema_row(
                     "table",
                     &table.name,
@@ -7408,7 +7504,11 @@ impl Database {
                             implicit.push(cols.clone());
                         }
                         crate::sql::ast::TableConstraint::PrimaryKey { columns: cols } => {
-                            // Skip the single INTEGER PK (rowid alias).
+                            // Skip the single INTEGER PK (rowid alias) and
+                            // WITHOUT ROWID PKs (the table b-tree IS the
+                            // PK index there — SQLite never materializes
+                            // an autoindex row for it; the engine's
+                            // internal WR-PK index covers uniqueness).
                             let is_rowid_alias = cols.len() == 1
                                 && table.rowid_alias.is_some()
                                 && columns
@@ -7416,7 +7516,7 @@ impl Database {
                                     .position(|cc| cc.name.eq_ignore_ascii_case(&cols[0].name))
                                     .map(|ci| table.rowid_alias == Some(ci))
                                     .unwrap_or(false);
-                            if !is_rowid_alias {
+                            if !is_rowid_alias && !without_rowid {
                                 implicit.push(cols.clone());
                             }
                         }
@@ -7486,7 +7586,12 @@ impl Database {
                 if table.without_rowid {
                     let pk_cols = crate::schema::without_rowid_pk_columns(&table);
                     if !pk_cols.is_empty() {
-                        let idx_name = format!("sqlite_autoindex_{}_0", name.name);
+                        // SQLite's naming: the WR-PK's index_list entry is
+                        // `sqlite_autoindex_<t>_<N>` with N allocated AFTER
+                        // every other autoindex of the table (probed:
+                        // no uniques -> _1; one UNIQUE -> _2; two -> _3).
+                        let idx_name =
+                            format!("sqlite_autoindex_{}_{}", name.name, implicit.len() + 1);
                         let col_list = pk_cols
                             .iter()
                             .map(|c| {
@@ -7523,6 +7628,57 @@ impl Database {
                             create_sql: idx_sql,
                             origin: crate::schema::IndexOrigin::WithoutRowidPk,
                         });
+                    }
+                }
+                // AUTOINCREMENT bookkeeping: the FIRST autoincrement table
+                // creates `sqlite_sequence` (a real, user-visible table —
+                // exactly SQLite's `CREATE TABLE sqlite_sequence(name,seq)`
+                // row, allocated AFTER the table and its autoindexes).
+                // Foreign-mode databases carry their own sequence state
+                // (loaded from the file, re-synthesized on dump).
+                if columns.iter().any(|c| {
+                    c.constraints.iter().any(|cc| {
+                        matches!(
+                            cc,
+                            crate::sql::ast::ColumnConstraint::PrimaryKey {
+                                autoincrement: true,
+                                ..
+                            }
+                        )
+                    })
+                }) && foreign.is_none()
+                    && catalog.get_table("sqlite_sequence").is_none()
+                {
+                    if let Ok(Statement::Create(CreateStatement::Table {
+                        name: seq_name,
+                        columns: seq_columns,
+                        constraints: seq_constraints,
+                        ..
+                    })) = crate::sql::parser::parse("CREATE TABLE sqlite_sequence(name,seq)")
+                    {
+                        let seq_root = ctx.pager.allocate_page()?;
+                        {
+                            let page = ctx.pager.get_page(seq_root)?;
+                            page.lock().init_leaf_table();
+                        }
+                        let seq_table = build_table(
+                            &seq_name.name,
+                            &seq_columns,
+                            &seq_constraints,
+                            seq_root,
+                            false,
+                            false,
+                            "CREATE TABLE sqlite_sequence(name,seq)",
+                        )?;
+                        let seq_row = crate::schema::encode_schema_row(
+                            "table",
+                            "sqlite_sequence",
+                            "sqlite_sequence",
+                            seq_root,
+                            "CREATE TABLE sqlite_sequence(name,seq)",
+                        );
+                        insert_schema_row(ctx.pager, &seq_row)?;
+                        catalog.add_table(seq_table);
                     }
                 }
                 // CTAS: the materialized result rows become INSERT VALUES
@@ -7849,6 +8005,21 @@ impl Database {
                 }
                 ctx.pager.free_page(table.root_page)?;
                 delete_schema_row(ctx.pager, "table", &d.name)?;
+                // The dropped name's cached max-rowid / roots go stale: a
+                // recreated table must NOT inherit the old values (a
+                // fresh AUTOINCREMENT table starts at 1 again).
+                ctx.invalidate_max_rowid(&d.name.to_ascii_lowercase());
+                ctx.root_overrides.remove(&d.name);
+                ctx.root_overrides.remove(&d.name.to_ascii_lowercase());
+                ctx.max_rowids.remove(&d.name);
+                ctx.max_rowids.remove(&d.name.to_ascii_lowercase());
+                // DROP TABLE removes the table's row from sqlite_sequence
+                // (the sequence TABLE itself survives — SQLite's observed
+                // behavior: the high-water machinery stays armed for any
+                // other autoincrement tables).
+                if catalog.get_table("sqlite_sequence").is_some() {
+                    crate::executor::delete_sqlite_sequence_row(ctx, &d.name)?;
+                }
                 // Also free root pages and delete schema rows for every
                 // index on this table — including implicit UNIQUE indexes.
                 // Previously these rows survived, so reopening the file
@@ -8748,6 +8919,14 @@ impl Database {
                             ((bytes / (ctx.pager.page_size() as u64)).max(1)) as usize
                         };
                         ctx.pager.set_cache_capacity(pages);
+                        // The read form reports the SETTING as given.
+                        ctx.pager.set_cache_size_setting(*k);
+                    }
+                }
+                "busy_timeout" | "busy_timeout(" => {
+                    // SQLite: ms for the busy handler's retry loop.
+                    if let Value::Integer(ms) = &v {
+                        ctx.pager.set_busy_timeout_ms(*ms);
                     }
                 }
                 "user_version" => {
@@ -8841,7 +9020,11 @@ fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
             Value::Text(c.declared_type.clone().into()),
             // SQLite quirk: plain `INTEGER PRIMARY KEY` reports notnull=0
             // (the NULL is replaced by an auto rowid at INSERT time).
-            Value::Integer(i64::from(c.explicit_not_null)),
+            // WITHOUT ROWID PK columns are implicitly NOT NULL (the PK is
+            // the record key — probed against real SQLite).
+            Value::Integer(i64::from(
+                c.explicit_not_null || (t.without_rowid && c.pk_seq > 0),
+            )),
             c.default
                 .as_ref()
                 .map(|e| Value::Text(default_value_text(e).into()))
@@ -9057,6 +9240,176 @@ fn pragma_foreign_key_list(
     }
 }
 
+/// PRAGMA function_list inventory: the engine's built-in function
+/// surface in SQLite's 6-column shape (name, builtin, type, enc, narg,
+/// flags). 's' = scalar, 'w' = window-capable aggregate (SQLite reports
+/// its aggregates as 'w' too), narg -1 = variadic. Flags carry
+/// SQLite's class-level values (deterministic scalar / window).
+fn function_list_inventory() -> Vec<Vec<Value>> {
+    const SCALARS: &[(&str, i32)] = &[
+        ("abs", 1),
+        ("acos", 1),
+        ("acosh", 1),
+        ("asin", 1),
+        ("asinh", 1),
+        ("atan", 1),
+        ("atan2", 2),
+        ("atanh", 1),
+        ("ceiling", 1),
+        ("changes", 0),
+        ("char", -1),
+        ("coalesce", -1),
+        ("concat", -1),
+        ("concat_ws", -1),
+        ("cos", 1),
+        ("cosh", 1),
+        ("cot", 1),
+        ("csc", 1),
+        ("current_timestamp", 0),
+        ("date", -1),
+        ("datetime", -1),
+        ("degrees", 1),
+        ("exp", 1),
+        ("floor", 1),
+        ("format", -1),
+        ("glob", 2),
+        ("hex", 1),
+        ("ifnull", 2),
+        ("iif", 3),
+        ("instr", 2),
+        ("json", 1),
+        ("json_array", -1),
+        ("json_array_length", -1),
+        ("json_error_position", 1),
+        ("json_extract", -1),
+        ("json_insert", -1),
+        ("json_object", -1),
+        ("json_patch", 2),
+        ("json_pretty", -1),
+        ("json_quote", 1),
+        ("json_remove", -1),
+        ("json_replace", -1),
+        ("json_set", -1),
+        ("json_type", -1),
+        ("json_valid", -1),
+        ("jsonb", 1),
+        ("jsonb_array", -1),
+        ("jsonb_extract", -1),
+        ("jsonb_insert", -1),
+        ("jsonb_object", -1),
+        ("jsonb_patch", 2),
+        ("jsonb_remove", -1),
+        ("jsonb_replace", -1),
+        ("jsonb_set", -1),
+        ("julianday", -1),
+        ("last_insert_rowid", 0),
+        ("length", 1),
+        ("likelihood", 2),
+        ("likely", 1),
+        ("ln", 1),
+        ("log", 1),
+        ("log10", 1),
+        ("log2", 1),
+        ("lower", 1),
+        ("ltrim", -1),
+        ("mod", 2),
+        ("now", 0),
+        ("nullif", 2),
+        ("octet_length", 1),
+        ("pi", 0),
+        ("pow", 2),
+        ("power", 2),
+        ("printf", -1),
+        ("quote", 1),
+        ("radians", 1),
+        ("random", 0),
+        ("randomblob", 1),
+        ("replace", 3),
+        ("round", -1),
+        ("rtrim", -1),
+        ("sign", 1),
+        ("sin", 1),
+        ("sinh", 1),
+        ("soundex", 1),
+        ("sqlite_compileoption_get", 1),
+        ("sqlite_compileoption_used", 1),
+        ("sqlite_source_id", 0),
+        ("sqlite_version", 0),
+        ("sqrt", 1),
+        ("strftime", -1),
+        ("substr", -1),
+        ("substring", -1),
+        ("tan", 1),
+        ("tanh", 1),
+        ("time", -1),
+        ("timediff", 2),
+        ("total_changes", 0),
+        ("trim", -1),
+        ("trunc", 1),
+        ("typeof", 1),
+        ("unhex", 1),
+        ("unicode", 1),
+        ("unistr", 1),
+        ("unistr_quote", 1),
+        ("unixepoch", -1),
+        ("unlikely", 1),
+        ("upper", 1),
+        ("zeroblob", 1),
+    ];
+    const WINDOWS: &[(&str, i32)] = &[
+        ("avg", 1),
+        ("count", -1),
+        ("cume_dist", 0),
+        ("dense_rank", 0),
+        ("first_value", 1),
+        ("group_concat", -1),
+        ("json_group_array", -1),
+        ("json_group_object", -1),
+        ("jsonb_group_array", -1),
+        ("jsonb_group_object", -1),
+        ("lag", -1),
+        ("last_value", 1),
+        ("lead", -1),
+        ("max", 1),
+        ("median", 1),
+        ("min", 1),
+        ("nth_value", 2),
+        ("ntile", 1),
+        ("percent_rank", 0),
+        ("percentile_cont", 2),
+        ("percentile_disc", 2),
+        ("rank", 0),
+        ("row_number", 0),
+        ("stddev", 1),
+        ("stddev_pop", 1),
+        ("stddev_samp", 1),
+        ("sum", 1),
+        ("total", 1),
+    ];
+    let mut out = Vec::with_capacity(SCALARS.len() + WINDOWS.len());
+    for (name, narg) in SCALARS {
+        out.push(vec![
+            Value::Text((*name).into()),
+            Value::Integer(1),
+            Value::Text("s".into()),
+            Value::Text("utf8".into()),
+            Value::Integer(*narg as i64),
+            Value::Integer(2099200),
+        ]);
+    }
+    for (name, narg) in WINDOWS {
+        out.push(vec![
+            Value::Text((*name).into()),
+            Value::Integer(1),
+            Value::Text("w".into()),
+            Value::Text("utf8".into()),
+            Value::Integer(*narg as i64),
+            Value::Integer(2097152),
+        ]);
+    }
+    out
+}
+
 fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let name = p.name.to_ascii_lowercase();
     // `PRAGMA encoding = X`: the write form. SQLite's rules, verified
@@ -9103,14 +9456,24 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         });
         if let Some(mode) = mode {
             apply_journal_mode(db, &mode).ok()?;
-            let wal = match &db.foreign {
-                Some(f) => f.journal_wal.load(Ordering::Acquire),
-                None => db.pager.wal_enabled(),
+            // The returned mode is what the database now IS: in-memory
+            // databases are always "memory" (SQLite: WAL/DELETE writes
+            // on `:memory:` return "memory" — the only modes it
+            // supports are memory and off).
+            let ret = if db.foreign.is_none() && db.pager.is_memory() {
+                "memory".to_string()
+            } else {
+                let wal = match &db.foreign {
+                    Some(f) => f.journal_wal.load(Ordering::Acquire),
+                    None => db.pager.wal_enabled(),
+                };
+                if wal {
+                    "wal".to_string()
+                } else {
+                    "delete".to_string()
+                }
             };
-            return Some(PragmaRows::single(
-                "journal_mode",
-                Value::Text(if wal { "wal" } else { "delete" }.into()),
-            ));
+            return Some(PragmaRows::single("journal_mode", Value::Text(ret.into())));
         }
         return None;
     }
@@ -9202,6 +9565,178 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             rows,
         });
     }
+    // ---- Catalog-shaped read pragmas (multi-row) ----
+    match name.as_str() {
+        "collation_list" => {
+            // SQLite's base three in ITS order (RTRIM, NOCASE, BINARY —
+            // the observed bundled build's registration order), then any
+            // plugin-registered collations (SQLite appends later
+            // registrations after the built-ins).
+            let mut rows: Vec<Vec<Value>> = [
+                ("RTRIM".to_string()),
+                ("NOCASE".to_string()),
+                ("BINARY".to_string()),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| vec![Value::Integer(i as i64), Value::Text(n.into())])
+            .collect();
+            let registry = db.plugins.read().clone();
+            let mut user: Vec<String> = registry
+                .collation_names()
+                .into_iter()
+                .filter(|n| {
+                    let lc = n.to_ascii_lowercase();
+                    lc != "nocase" && lc != "rtrim" && lc != "binary"
+                })
+                .collect();
+            user.sort();
+            for n in user {
+                let seq = rows.len() as i64;
+                rows.push(vec![Value::Integer(seq), Value::Text(n.into())]);
+            }
+            return Some(PragmaRows {
+                columns: vec!["seq".into(), "name".into()],
+                rows,
+            });
+        }
+        "database_list" => {
+            // SQLite always reports `main` (the file path, empty for
+            // in-memory) and `temp`.
+            let file = db
+                .pager
+                .db_path()
+                .map(|p| Value::Text(p.into()))
+                .unwrap_or(Value::Text("".into()));
+            // `temp` appears in SQLite only once something materializes
+            // the temp schema (lazy) — a fresh connection reports main
+            // alone, and the engine has no temp database at all.
+            return Some(PragmaRows {
+                columns: vec!["seq".into(), "name".into(), "file".into()],
+                rows: vec![vec![Value::Integer(0), Value::Text("main".into()), file]],
+            });
+        }
+        "pragma_list" => {
+            // SQLite's own pragma inventory (the reference build's list —
+            // pinned 1:1 below; the engine answers the standard set).
+            const PRAGMA_NAMES: &[&str] = &[
+                "analysis_limit",
+                "application_id",
+                "auto_vacuum",
+                "automatic_index",
+                "busy_timeout",
+                "cache_size",
+                "cache_spill",
+                "case_sensitive_like",
+                "cell_size_check",
+                "checkpoint_fullfsync",
+                "collation_list",
+                "compile_options",
+                "count_changes",
+                "data_version",
+                "database_list",
+                "default_cache_size",
+                "defer_foreign_keys",
+                "empty_result_callbacks",
+                "encoding",
+                "foreign_key_check",
+                "foreign_key_list",
+                "foreign_keys",
+                "freelist_count",
+                "full_column_names",
+                "fullfsync",
+                "function_list",
+                "hard_heap_limit",
+                "ignore_check_constraints",
+                "incremental_vacuum",
+                "index_info",
+                "index_list",
+                "index_xinfo",
+                "integrity_check",
+                "journal_mode",
+                "journal_size_limit",
+                "legacy_alter_table",
+                "locking_mode",
+                "max_page_count",
+                "mmap_size",
+                "module_list",
+                "optimize",
+                "page_count",
+                "page_size",
+                "pragma_list",
+                "query_only",
+                "quick_check",
+                "read_uncommitted",
+                "recursive_triggers",
+                "reverse_unordered_selects",
+                "schema_version",
+                "secure_delete",
+                "short_column_names",
+                "shrink_memory",
+                "soft_heap_limit",
+                "synchronous",
+                "table_info",
+                "table_list",
+                "table_xinfo",
+                "temp_store",
+                "temp_store_directory",
+                "threads",
+                "trusted_schema",
+                "user_version",
+                "wal_autocheckpoint",
+                "wal_checkpoint",
+                "writable_schema",
+            ];
+            return Some(PragmaRows {
+                columns: vec![name.clone()],
+                rows: PRAGMA_NAMES
+                    .iter()
+                    .map(|n| vec![Value::Text((*n).into())])
+                    .collect(),
+            });
+        }
+        "compile_options" => {
+            // The same list sqlite_compileoption_get reports (the
+            // reference SQLite build's compile options).
+            return Some(PragmaRows {
+                columns: vec![name.clone()],
+                rows: crate::executor::expr::COMPILE_OPTIONS
+                    .iter()
+                    .map(|o| vec![Value::Text((*o).into())])
+                    .collect(),
+            });
+        }
+        "function_list" => {
+            return Some(PragmaRows {
+                columns: vec![
+                    "name".into(),
+                    "builtin".into(),
+                    "type".into(),
+                    "enc".into(),
+                    "narg".into(),
+                    "flags".into(),
+                ],
+                rows: function_list_inventory(),
+            });
+        }
+        "module_list" => {
+            // The engine's registered virtual-table modules (SQLite's
+            // own list carries its compiled-in modules — fts5/rtree —
+            // which this engine does not ship; plugin modules appear
+            // exactly like SQLite's runtime-registered ones).
+            let registry = db.plugins.read().clone();
+            let mut names = registry.module_names();
+            names.sort();
+            return Some(PragmaRows {
+                columns: vec!["name".into()],
+                rows: names
+                    .into_iter()
+                    .map(|n| vec![Value::Text(n.into())])
+                    .collect(),
+            });
+        }
+        _ => {}
+    }
     let pager = &db.pager;
     let v = match name.as_str() {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
@@ -9212,17 +9747,39 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "page_size" => Value::Integer(pager.page_size() as i64),
         "page_count" => Value::Integer(pager.n_pages() as i64),
         "freelist_count" => Value::Integer(pager.freelist_count() as i64),
-        "cache_size" => Value::Integer(pager.cache_capacity() as i64),
+        // The SETTING as given (SQLite reports the raw value: negative
+        // = KiB, positive = pages; fresh default -2000), not the
+        // derived page capacity.
+        "cache_size" => Value::Integer(pager.cache_size_setting()),
+        "max_page_count" => Value::Integer(4294967294),
+        "busy_timeout" => Value::Integer(pager.busy_timeout_ms()),
+        "data_version" => {
+            // The file change counter as observed at open, +1 (SQLite's
+            // fresh-connection 1). The connection's own commits do not
+            // advance it — the value tracks the header as last read
+            // from disk, matching SQLite's observed single-connection
+            // behavior.
+            Value::Integer(pager.data_version_base())
+        }
         "schema_version" => Value::Integer(pager.schema_cookie() as i64),
         "journal_mode" => {
             // Foreign SQLite-format files carry their own mode: the
             // persistent header marker (18/19 = 2/2) or a live sidecar
             // session — the native pager's mode is irrelevant there.
+            // In-memory databases are "memory" (SQLite's journal_mode
+            // for `:memory:` files).
             let wal = match &db.foreign {
                 Some(f) => f.journal_wal.load(Ordering::Acquire),
                 None => pager.wal_enabled(),
             };
-            Value::Text(if wal { "wal".into() } else { "delete".into() })
+            let mode = if db.foreign.is_none() && pager.is_memory() {
+                "memory"
+            } else if wal {
+                "wal"
+            } else {
+                "delete"
+            };
+            Value::Text(mode.into())
         }
         "codec" => Value::Text(
             pager
@@ -9721,10 +10278,13 @@ fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> R
             {
                 if kind == "index" && tbl_name.eq_ignore_ascii_case(old_table) {
                     let new_sql = rewrite_on_table(sql, old_table, new_table);
+                    // rootpage decodes in SQLite's 1-based convention —
+                    // back to internal before re-encoding (+1 again).
+                    let internal = crate::schema::rootpage_to_internal(rootpage);
                     updates.push((
                         rowid,
                         crate::schema::encode_schema_row(
-                            "index", name, new_table, rootpage, &new_sql,
+                            "index", name, new_table, internal, &new_sql,
                         ),
                     ));
                 }
@@ -9824,7 +10384,11 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row)
         {
             if kind == "index" {
-                index_row_by_name.insert(_name.to_string(), (rootpage, sql.to_string()));
+                // Persisted rootpages follow SQLite's 1-based convention —
+                // convert to the engine's internal 0-based ids for the
+                // catalog and the implicit-index rootpage recovery below.
+                let internal = crate::schema::rootpage_to_internal(rootpage);
+                index_row_by_name.insert(_name.to_string(), (internal, sql.to_string()));
             }
             let owned = (
                 kind.to_string(),
@@ -9846,6 +10410,9 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         let sql = sql.as_str();
         let _ = &_name;
         let _ = &tbl_name;
+        // Persisted rootpage -> internal page id (SQLite 1-based to the
+        // engine's 0-based; views/triggers carry 0 either way).
+        let rootpage = crate::schema::rootpage_to_internal(rootpage);
         {
             match kind {
                 "table" => {
@@ -9885,11 +10452,23 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                         );
                         // WITHOUT ROWID PK uniqueness (engine-internal
                         // index, no schema row): allocate a fresh root and
-                        // backfill it from the table's rows.
+                        // backfill it from the table's rows. Numbered
+                        // after every other autoindex of the table
+                        // (SQLite's index_list naming rule).
                         if table.without_rowid {
                             let pk_cols = crate::schema::without_rowid_pk_columns(&table);
                             if !pk_cols.is_empty() {
-                                rebuild_without_rowid_pk_index(pager, &table, &pk_cols, catalog)?;
+                                let prefix = format!(
+                                    "sqlite_autoindex_{}_",
+                                    table.name.to_ascii_lowercase()
+                                );
+                                let n_autoidx = index_row_by_name
+                                    .keys()
+                                    .filter(|k| k.to_ascii_lowercase().starts_with(&prefix))
+                                    .count();
+                                rebuild_without_rowid_pk_index(
+                                    pager, &table, &pk_cols, n_autoidx, catalog,
+                                )?;
                             }
                         }
                     } else if let Ok(Statement::Create(CreateStatement::VirtualTable {
@@ -10012,9 +10591,12 @@ fn rebuild_without_rowid_pk_index(
     pager: &Pager,
     table: &crate::schema::Table,
     pk_cols: &[crate::sql::ast::IndexedColumn],
+    n_autoindexes: usize,
     catalog: &mut Catalog,
 ) -> Result<()> {
-    let idx_name = format!("sqlite_autoindex_{}_0", table.name);
+    // SQLite's naming: N runs after every other autoindex of the table
+    // (see the CREATE-time synthesis above — no uniques -> _1, etc.).
+    let idx_name = format!("sqlite_autoindex_{}_{}", table.name, n_autoindexes + 1);
     let idx_root = pager.allocate_page()?;
     {
         let page = pager.get_page(idx_root)?;
@@ -10141,7 +10723,9 @@ fn rebuild_implicit_indexes(
                         .position(|cc| cc.name.eq_ignore_ascii_case(&cols[0].name))
                         .map(|ci| table.rowid_alias == Some(ci))
                         .unwrap_or(false);
-                if !is_rowid_alias {
+                // WITHOUT ROWID PKs: the table b-tree IS the PK index —
+                // no autoindex row (mirrors execute_create).
+                if !is_rowid_alias && !table.without_rowid {
                     implicit.push(cols.clone());
                 }
             }

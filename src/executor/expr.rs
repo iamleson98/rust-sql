@@ -1447,10 +1447,12 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(v) => Value::Text(soundex(&v.as_text()).into()),
         },
         "sqlite_compileoption_get" => {
-            let n = args.first().map(|v| v.as_integer()).unwrap_or(-1);
+            // 1-BASED index (SQLite: N=1 returns the first option), so
+            // PRAGMA compile_options' row order and get() agree.
+            let n = args.first().map(|v| v.as_integer()).unwrap_or(0);
             Value::Text(
                 compile_options()
-                    .get(n.max(0) as usize)
+                    .get((n - 1).max(0) as usize)
                     .map(|s| (*s).into())
                     .unwrap_or_default(),
             )
@@ -2320,7 +2322,7 @@ fn soundex(s: &str) -> String {
 /// Compile options reported by `sqlite_compileoption_get/used`. Mirrors
 /// the reference SQLite build the engine is differentially tested
 /// against (feature-detection probes like `ENABLE_FTS5` succeed).
-const COMPILE_OPTIONS: &[&str] = &[
+pub(crate) const COMPILE_OPTIONS: &[&str] = &[
     "ATOMIC_INTRINSICS=1",
     "COMPILER=rustc",
     "DEFAULT_AUTOVACUUM",

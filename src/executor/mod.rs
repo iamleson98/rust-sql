@@ -15056,6 +15056,17 @@ fn exec_insert_inner(
     let mut max_rowid = ctx.get_or_scan_max_rowid(&table)?;
     let mut inserted = 0i64;
 
+    // AUTOINCREMENT: the high-water floor comes from sqlite_sequence
+    // (SQLite's contract: a deleted top rowid is NEVER reused). Read
+    // once per statement; `bump` keeps the table row current as rows
+    // land. Plain tables skip all of this (no sequence table lookup).
+    let is_autoinc = table.columns.iter().any(|c| c.autoincrement);
+    let mut seq_floor: i64 = if is_autoinc {
+        read_sqlite_sequence(ctx, &table.name)?.unwrap_or(i64::MIN)
+    } else {
+        i64::MIN
+    };
+
     // Look up indexes on this table once, up front.
     let indexes = ctx.catalog().indexes_on_table(&table.name);
 
@@ -15183,7 +15194,7 @@ fn exec_insert_inner(
             let mut rowid_autogen = false;
             if let Some(idx) = table.rowid_alias {
                 if full_row[idx].is_null() {
-                    let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
+                    let r = next_auto_rowid(ctx.pager, current_root, max_rowid.max(seq_floor))?;
                     if r > max_rowid {
                         max_rowid = r;
                     }
@@ -15252,6 +15263,19 @@ fn exec_insert_inner(
             match outcome {
                 InsertOutcome::Inserted => {
                     inserted += 1;
+                    // AUTOINCREMENT: raise the sequence high-water to the
+                    // landed rowid (SQLite bumps on every insert that
+                    // exceeds it — auto-allocated or explicit).
+                    if is_autoinc {
+                        if let Some(alias) = table.rowid_alias {
+                            if let Some(crate::types::Value::Integer(r)) = full_row.get(alias) {
+                                if *r > seq_floor {
+                                    seq_floor = *r;
+                                    bump_sqlite_sequence(ctx, &table.name, *r)?;
+                                }
+                            }
+                        }
+                    }
                     if let Some(ret) = returning {
                         returning_rows.push(project_returning_row(
                             ret,
@@ -16910,6 +16934,160 @@ impl RowidRng {
             r
         }
     }
+}
+
+/// AUTOINCREMENT high-water: read `table_name`'s row from the
+/// `sqlite_sequence` table (its (name, seq) pair). Returns None when the
+/// table has no row yet (never inserted, or the sequence row was deleted
+/// — SQLite's contract: DELETE FROM sqlite_sequence resets the floor to
+/// the live max rowid). The sequence table is tiny (one row per
+/// AUTOINCREMENT table), so a full scan is the same cost as a lookup.
+pub(crate) fn read_sqlite_sequence(ctx: &ExecContext, table_name: &str) -> Result<Option<i64>> {
+    let Some(seq_table) = ctx.catalog().get_table("sqlite_sequence") else {
+        return Ok(None);
+    };
+    if seq_table.vtab.is_some() {
+        return Ok(None);
+    }
+    let root = ctx.table_root(&seq_table);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let mut out = None;
+    let name_lc = table_name.to_ascii_lowercase();
+    bt.scan_table_borrowed(|_rowid, payload| {
+        if out.is_some() {
+            return false; // found — stop early
+        }
+        // 2 columns: (name TEXT, seq INTEGER)
+        if let Ok(vals) = crate::storage::row_codec::decode_row(payload, 2, 0, None) {
+            if vals.len() == 2 {
+                let matches = match &vals[0] {
+                    crate::types::Value::Text(t) => t.as_str().to_ascii_lowercase() == name_lc,
+                    _ => false,
+                };
+                if matches {
+                    out = match &vals[1] {
+                        crate::types::Value::Integer(i) => Some(*i),
+                        _ => None,
+                    };
+                    return false;
+                }
+            }
+        }
+        true
+    })?;
+    Ok(out)
+}
+
+/// AUTOINCREMENT high-water write: upsert `table_name` -> `seq` in
+/// `sqlite_sequence` (SQLite bumps the row whenever an insert's rowid
+/// exceeds the stored value; a missing row is created). The write goes
+/// through the b-tree directly — the sequence table is engine-maintained
+/// (created by CREATE TABLE with AUTOINCREMENT, kept across reopen like
+/// any real table) and user-visible (SQLite lets users UPDATE / DELETE
+/// its rows to re-arm sequences).
+pub(crate) fn bump_sqlite_sequence(
+    ctx: &mut ExecContext,
+    table_name: &str,
+    new_seq: i64,
+) -> Result<()> {
+    let Some(seq_table) = ctx.catalog().get_table("sqlite_sequence") else {
+        return Ok(());
+    };
+    if seq_table.vtab.is_some() {
+        return Ok(());
+    }
+    let root = ctx.table_root(&seq_table);
+    let name_lc = table_name.to_ascii_lowercase();
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let mut existing: Option<(i64, i64)> = None; // (rowid, seq)
+    bt.scan_table_borrowed(|rowid, payload| {
+        if existing.is_some() {
+            return false;
+        }
+        if let Ok(vals) = crate::storage::row_codec::decode_row(payload, 2, 0, None) {
+            if vals.len() == 2 {
+                let matches = match &vals[0] {
+                    crate::types::Value::Text(t) => t.as_str().to_ascii_lowercase() == name_lc,
+                    _ => false,
+                };
+                if matches {
+                    if let crate::types::Value::Integer(i) = &vals[1] {
+                        existing = Some((rowid, *i));
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    })?;
+    // Only raise: SQLite never lowers the sequence on re-insert of a
+    // smaller explicit rowid (the high-water is monotone until the user
+    // edits the table).
+    if let Some((rowid, seq)) = existing {
+        if new_seq <= seq {
+            return Ok(());
+        }
+        let row = vec![
+            crate::types::Value::Text(crate::types::text::Text::from(table_name)),
+            crate::types::Value::Integer(new_seq),
+        ];
+        let payload = crate::storage::row_codec::encode_row(&row);
+        bt.delete_table(rowid)?;
+        bt.insert_table(rowid, &payload)?;
+    } else {
+        let rowid = bt.max_rowid_hint().unwrap_or(0) + 1;
+        let row = vec![
+            crate::types::Value::Text(crate::types::text::Text::from(table_name)),
+            crate::types::Value::Integer(new_seq),
+        ];
+        let payload = crate::storage::row_codec::encode_row(&row);
+        bt.insert_table(rowid, &payload)?;
+    }
+    // Root tracking: the sequence table's root can split while growing;
+    // record the live root so later statements in this transaction see it.
+    if bt.root != root {
+        ctx.set_table_root("sqlite_sequence", bt.root);
+    }
+    Ok(())
+}
+
+/// DELETE FROM sqlite_sequence's row for `table_name` (DROP TABLE of an
+/// AUTOINCREMENT table removes its sequence row — SQLite's observed
+/// behavior; the sequence TABLE itself survives).
+pub(crate) fn delete_sqlite_sequence_row(ctx: &mut ExecContext, table_name: &str) -> Result<()> {
+    let Some(seq_table) = ctx.catalog().get_table("sqlite_sequence") else {
+        return Ok(());
+    };
+    if seq_table.vtab.is_some() {
+        return Ok(());
+    }
+    let root = ctx.table_root(&seq_table);
+    let name_lc = table_name.to_ascii_lowercase();
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let mut victim: Option<i64> = None;
+    bt.scan_table_borrowed(|rowid, payload| {
+        if victim.is_some() {
+            return false;
+        }
+        if let Ok(vals) = crate::storage::row_codec::decode_row(payload, 2, 0, None) {
+            if vals.len() == 2 {
+                if let crate::types::Value::Text(t) = &vals[0] {
+                    if t.as_str().to_ascii_lowercase() == name_lc {
+                        victim = Some(rowid);
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    })?;
+    if let Some(rowid) = victim {
+        bt.delete_table(rowid)?;
+    }
+    if bt.root != root {
+        ctx.set_table_root("sqlite_sequence", bt.root);
+    }
+    Ok(())
 }
 
 /// Rowid to assign for an auto-allocated insert (NULL INTEGER PRIMARY KEY,
