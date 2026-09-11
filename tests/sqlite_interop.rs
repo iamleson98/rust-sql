@@ -1318,3 +1318,133 @@ fn foreign_journal_mode_reports_the_file_mode() {
     let _ = std::fs::remove_file(&del_path);
     let _ = std::fs::remove_file(&fresh);
 }
+
+// ---------------------------------------------------------------------------
+// Collated index write order: RTRIM and plugin CUSTOM collations.
+// ---------------------------------------------------------------------------
+
+/// RTRIM indexes write in RTRIM order. The discriminating data matters:
+/// keys differing only in trailing spaces are RTRIM-EQUAL and tie-break
+/// on rowid ASCENDING — writing them in BINARY byte order ('a' before
+/// 'a  ' even when 'a  ' has the smaller rowid) corrupts the index
+/// (SQLite's integrity_check reports "row N missing from index").
+#[test]
+fn rtrim_index_writes_in_collation_order() {
+    let path = temp_path("rtrim_order");
+    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+    {
+        // Seed with real SQLite (so the file starts SQLite-format).
+        let con = rusqlite::Connection::open(&path).unwrap();
+        con.execute_batch(
+            "CREATE TABLE t (s TEXT);
+             INSERT INTO t VALUES ('a  '), ('a'), ('b'), ('B'), ('c  ');",
+        )
+        .unwrap();
+    }
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("CREATE INDEX ix ON t(s COLLATE RTRIM)", ())
+            .unwrap();
+    }
+    let con = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(integrity_check(&con), "ok");
+    // Physical index order = RTRIM(s), rowid.
+    let scan: Vec<(i64, String)> = con
+        .prepare("SELECT rowid, s FROM t INDEXED BY ix")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    // RTRIM: B < a(== 'a  ') < b < 'c  '; the trailing-space pair ties
+    // and breaks on rowid: rowid 1 ('a  ') BEFORE rowid 2 ('a').
+    assert_eq!(
+        scan,
+        vec![
+            (4, "B".to_string()),
+            (1, "a  ".to_string()),
+            (2, "a".to_string()),
+            (3, "b".to_string()),
+            (5, "c  ".to_string()),
+        ]
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+}
+
+/// A plugin-registered CUSTOM collation orders the written index with
+/// the collation object registered on the connection — exactly what
+/// real SQLite does (the collation registered at CREATE INDEX time
+/// defines the b-tree order; reading it back requires re-registration,
+/// which is SQLite's own contract).
+#[derive(Debug)]
+struct ReverseColl;
+impl rustqlite::plugin::Collation for ReverseColl {
+    fn name(&self) -> &str {
+        "REVERSE"
+    }
+    fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        let ra: String = a.chars().rev().collect();
+        let rb: String = b.chars().rev().collect();
+        ra.cmp(&rb)
+    }
+}
+
+#[test]
+fn custom_collation_orders_written_index() {
+    let path = temp_path("custom_coll");
+    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+    {
+        let con = rusqlite::Connection::open(&path).unwrap();
+        con.execute_batch("CREATE TABLE t (s TEXT);").unwrap();
+    }
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.create_collation(ReverseColl).unwrap();
+        db.execute("CREATE INDEX ix ON t(s COLLATE REVERSE)", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES ('apple'), ('Banana'), ('cherry'), ('date'), ('Elderberry')",
+            (),
+        )
+        .unwrap();
+    }
+    let con = rusqlite::Connection::open(&path).unwrap();
+    // SQLite needs the collation registered to verify/scan the index
+    // (SQLite's own rule: an unknown collation sequence is an error at
+    // USE time).
+    con.create_collation("REVERSE", |a: &str, b: &str| {
+        let ra: String = a.chars().rev().collect();
+        let rb: String = b.chars().rev().collect();
+        ra.cmp(&rb)
+    })
+    .unwrap();
+    assert_eq!(integrity_check(&con), "ok");
+    let scan: Vec<String> = con
+        .prepare("SELECT s FROM t INDEXED BY ix")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    // REVERSE sorts by the reversed string.
+    let mut expect = vec![
+        "apple".to_string(),
+        "Banana".to_string(),
+        "cherry".to_string(),
+        "date".to_string(),
+        "Elderberry".to_string(),
+    ];
+    expect.sort_by(|a, b| {
+        let ra: String = a.chars().rev().collect();
+        let rb: String = b.chars().rev().collect();
+        ra.cmp(&rb)
+    });
+    assert_eq!(scan, expect);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+}

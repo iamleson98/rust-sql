@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **807+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **809+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -873,11 +873,18 @@ compat surface. Every entry says what it costs and why it exists.
 - **`sqlite_master` DDL text and a few `PRAGMA` result shapes** are
   approximations — tightened one at a time via differential tests against
   real SQLite.
-- **Custom collations in written SQLite files**: `NOCASE` / `RTRIM`
-  index columns (explicit, column-declared, autoindex, `WITHOUT ROWID`
-  PK, DESC) now write in their collation's order with SQLite verifying
-  the file; plugin-registered CUSTOM collations still fall back to binary
-  ordering in the written file (no portable file-format encoding).
+- **Custom collations in written SQLite files — CLOSED**: every
+  collation the CONNECTION knows orders the written file — `NOCASE`
+  through the writer's fast path, `RTRIM` and plugin-registered CUSTOM
+  collations through the registry's own collation object (resolved at
+  dump time from the Database itself — no statement scope needed),
+  exactly SQLite's rule that the collation registered at CREATE INDEX
+  time defines the b-tree order (reading it back requires
+  re-registration, SQLite's own contract). RTRIM's tie-break
+  (trailing-space-equal keys break on rowid ASC) is
+  integrity_check-pinned with discriminating data, and a
+  plugin-registered REVERSE collation's physical index order is
+  verified by real SQLite (`tests/sqlite_interop.rs`).
   Engine-side collation semantics are now differential-tested end-to-end:
   `ORDER BY` under declared collations (alias/ordinal/explicit forms),
   index selection gated on collation match (a BINARY equality never seeks

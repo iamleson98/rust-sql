@@ -542,12 +542,15 @@ fn without_rowid_record_map(table: &Table) -> Vec<usize> {
 /// Collations of a WITHOUT ROWID table's PK columns, in RECORD order
 /// (PK first, pk_seq order) — what the writer needs to order the records
 /// on disk when the file's text encoding is not UTF-8.
-fn without_rowid_pk_collations(table: &Table) -> Vec<crate::storage::sqlitefmt::Collation> {
+fn without_rowid_pk_collations(
+    table: &Table,
+    registry: &crate::plugin::PluginRegistry,
+) -> Vec<crate::storage::sqlitefmt::Collation> {
     let n_pk = table.columns.iter().filter(|c| c.pk_seq > 0).count();
     without_rowid_record_map(table)
         .into_iter()
         .take(n_pk)
-        .map(|decl_i| collation_of(&table.columns[decl_i].collation, &table.name))
+        .map(|decl_i| collation_of(&table.columns[decl_i].collation, &table.name, registry))
         .collect()
 }
 
@@ -591,20 +594,33 @@ fn sorted_indexes_on(
     out
 }
 
-/// Map a collation name to the writer's supported set.
-fn collation_of(name: &str, index: &str) -> crate::storage::sqlitefmt::Collation {
+/// Map a collation name to the writer's supported set. Custom
+/// collations resolve through the CONNECTION's registry (the exact
+/// collation object the user registered — real SQLite orders
+/// custom-collation indexes with the collation registered at CREATE
+/// time); `RTRIM` rides the same path through the builtin. A name that
+/// resolves to nothing falls back to binary ordering (a
+/// round-trip-visible degradation, unchanged).
+fn collation_of(
+    name: &str,
+    index: &str,
+    registry: &crate::plugin::PluginRegistry,
+) -> crate::storage::sqlitefmt::Collation {
     match name.to_ascii_lowercase().as_str() {
         "" | "binary" | "bom" => crate::storage::sqlitefmt::Collation::Binary,
         "nocase" => crate::storage::sqlitefmt::Collation::NoCase,
-        other => {
-            // Unsupported collations in the SQLite-format output: the
-            // engine may know them (plugin collations), but the writer
-            // can only order BINARY/NOCASE. Fall back to binary with a
-            // dev-visible name — the round-trip test suite covers the
-            // supported set.
-            let _ = (other, index);
-            crate::storage::sqlitefmt::Collation::Binary
-        }
+        "rtrim" => crate::storage::sqlitefmt::Collation::Custom(std::sync::Arc::new(
+            crate::plugin::RTrimCollation,
+        )),
+        other => match registry.collation(other) {
+            Some(c) => crate::storage::sqlitefmt::Collation::Custom(c),
+            None => {
+                // Unresolvable in this connection: the writer can only
+                // order BINARY — a round-trip-visible degradation.
+                let _ = index;
+                crate::storage::sqlitefmt::Collation::Binary
+            }
+        },
     }
 }
 
@@ -2729,6 +2745,9 @@ impl Database {
 
         let foreign = self.foreign.as_ref().unwrap();
         let mut objects: Vec<OutObject> = Vec::new();
+        // Connection plugin registry: custom collations order the written
+        // index/PK records (see collation_of).
+        let registry = self.plugins.read().clone();
 
         // Live catalog snapshots (lowercased names). The engine's
         // sqlite_master / sqlite_schema query shims are NOT schema rows
@@ -2796,7 +2815,7 @@ impl Database {
                         objects.push(OutObject::WithoutRowid {
                             name: table_name.clone(),
                             sql: table.create_sql.clone(),
-                            pk_collations: without_rowid_pk_collations(table),
+                            pk_collations: without_rowid_pk_collations(table, &registry),
                             rows,
                         });
                     } else {
@@ -2815,7 +2834,7 @@ impl Database {
                     // the table.
                     for (idx_name, idx) in sorted_indexes_on(&indexes, name) {
                         if idx_name.starts_with("sqlite_autoindex_") {
-                            let obj = self.dump_index_object(idx.as_ref(), &tables)?;
+                            let obj = self.dump_index_object(idx.as_ref(), &tables, &registry)?;
                             objects.push(obj);
                             emitted_autoindexes.insert(idx_name);
                         }
@@ -2833,7 +2852,7 @@ impl Database {
                     let Some(idx) = indexes.get(name) else {
                         continue;
                     };
-                    let obj = self.dump_index_object(idx.as_ref(), &tables)?;
+                    let obj = self.dump_index_object(idx.as_ref(), &tables, &registry)?;
                     objects.push(obj);
                 }
                 SchemaOrderKey::View(name) => {
@@ -2994,6 +3013,7 @@ impl Database {
         &self,
         idx: &Index,
         tables: &HashMap<String, std::sync::Arc<Table>>,
+        registry: &crate::plugin::PluginRegistry,
     ) -> Result<crate::storage::sqlitefmt::OutObject> {
         use crate::storage::sqlitefmt::Collation;
         let Some(table) = tables.get(&idx.table.to_ascii_lowercase()) else {
@@ -3060,7 +3080,7 @@ impl Database {
         let collations: Vec<Collation> = idx
             .columns
             .iter()
-            .map(|c| collation_of(&c.collation, &idx.name))
+            .map(|c| collation_of(&c.collation, &idx.name, registry))
             .collect();
         Ok(crate::storage::sqlitefmt::OutObject::Index {
             name: idx.name.clone(),

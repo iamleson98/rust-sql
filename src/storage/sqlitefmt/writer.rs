@@ -70,11 +70,27 @@ pub enum OutObject {
     },
 }
 
-/// Collations the writer can order by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Collations the writer can order by. `Custom` carries a plugin
+/// collation resolved from the CONNECTION's registry at dump time —
+/// real SQLite orders custom-collation indexes with the collation that
+/// was registered when the index was created, and we can do exactly
+/// that (the registry is on the Database, no statement scope needed).
+/// `RTRIM` rides the same variant through the builtin RTrimCollation.
+#[derive(Clone)]
 pub enum Collation {
     Binary,
     NoCase,
+    Custom(std::sync::Arc<dyn crate::plugin::Collation>),
+}
+
+impl std::fmt::Debug for Collation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Collation::Binary => write!(f, "Binary"),
+            Collation::NoCase => write!(f, "NoCase"),
+            Collation::Custom(_) => write!(f, "Custom(<plugin>)"),
+        }
+    }
 }
 
 /// Whole-file build parameters.
@@ -679,10 +695,25 @@ pub fn compare_index_keys(
     let n = a.len().min(b.len());
     for i in 0..n {
         let mut cmp = compare_values(&a[i], &b[i], enc);
-        if let Some(Collation::NoCase) = collations.get(i) {
-            if let (Value::Text(x), Value::Text(y)) = (&a[i], &b[i]) {
-                cmp = compare_nocase(x.as_str(), y.as_str());
+        match collations.get(i) {
+            // NOCASE folds ASCII in UTF-8 space regardless of the file's
+            // encoding (SQLite converts for its UTF-8-only nocase).
+            Some(Collation::NoCase) => {
+                if let (Value::Text(x), Value::Text(y)) = (&a[i], &b[i]) {
+                    cmp = compare_nocase(x.as_str(), y.as_str());
+                }
             }
+            // A plugin collation (RTRIM or user-registered): text pairs
+            // compare through the collation itself — exactly
+            // `plugin::compare_collated`'s dispatch; other type pairs
+            // keep the engine's class/byte order (a collation only
+            // redefines TEXT comparison).
+            Some(Collation::Custom(c)) => {
+                if let (Value::Text(x), Value::Text(y)) = (&a[i], &b[i]) {
+                    cmp = c.compare(x.as_str(), y.as_str());
+                }
+            }
+            _ => {}
         }
         if i < desc.len() && desc[i] {
             cmp = cmp.reverse();
