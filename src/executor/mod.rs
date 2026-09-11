@@ -236,10 +236,13 @@ mod corr {
                 "scalar subqueries via evaluator (use executor)",
             ));
         }
+        // The frame goes on the runtime outer-scope stack (nested
+        // subqueries resolve through it) AND travels as the binding
+        // tuple for the correlated-parameter rewrite.
         let _frame = push_outer(outer_row, outer_names);
-        // SAFETY: the pointer is valid for the lifetime of the installing
-        // Guard, which our caller keeps alive above this frame.
-        let res: ExecResult = unsafe { exec_select(sel, ctx_ptr)? };
+        // SAFETY: as in exec_scalar.
+        let res: ExecResult =
+            unsafe { exec_select(sel, ctx_ptr, Some((outer_row, outer_names)), false)? };
         Ok(res
             .rows
             .first()
@@ -260,8 +263,13 @@ mod corr {
             ));
         }
         let _frame = push_outer(outer_row, outer_names);
-        // SAFETY: as in exec_scalar.
-        let res: ExecResult = unsafe { exec_select(sel, ctx_ptr)? };
+        // SAFETY: as in exec_scalar. limit-one: EXISTS only needs to
+        // know whether ANY row exists — SQLite's co-routine model stops
+        // at the first match, and the injected LIMIT 1 makes the plan's
+        // scan stop there too instead of sweeping the rest of the
+        // table per outer row.
+        let res: ExecResult =
+            unsafe { exec_select(sel, ctx_ptr, Some((outer_row, outer_names)), true)? };
         Ok(Value::Integer(if res.rows.is_empty() { 0 } else { 1 }))
     }
 
@@ -278,8 +286,9 @@ mod corr {
             ));
         }
         let _frame = push_outer(outer_row, outer_names);
-        // SAFETY: as in exec_scalar.
-        let res: ExecResult = unsafe { exec_select(sel, ctx_ptr)? };
+        // SAFETY: as in exec_scalar. Full list — IN needs every row.
+        let res: ExecResult =
+            unsafe { exec_select(sel, ctx_ptr, Some((outer_row, outer_names)), false)? };
         Ok(res
             .rows
             .iter()
@@ -292,9 +301,11 @@ mod corr {
     unsafe fn exec_select(
         sel: &SelectStatement,
         ctx: *mut ExecContext<'static>,
+        outer: Option<(*const [Value], *const [String])>,
+        limit_one: bool,
     ) -> Result<ExecResult> {
         let ctx = unsafe { &mut *ctx };
-        super::exec_select_statement(sel, ctx)
+        super::exec_select_statement(sel, ctx, outer, limit_one)
     }
 }
 
@@ -497,6 +508,285 @@ impl StmtMaps {
     }
 }
 
+/// Cached plan for a (correlated) subquery: the cloned AST with outer
+/// refs rewritten to parameters, the bindings (param slot -> outer
+/// column), the plan built from the clone, and the schema cookie it
+/// was planned under.
+pub(crate) struct SubqPlanEntry {
+    /// (outer qualifier, outer column) per binding, in slot order. The
+    /// parameter NAMES are baked into the cloned AST as NUMERIC strings
+    /// `base + i` — positional slots, so the compiled predicate
+    /// machinery (`PredExpr::Param`) and the interpretive evaluator both
+    /// resolve them straight from `ctx.params` (no named-param
+    /// fallback: a named param makes the conjunct UNCOMPILABLE and the
+    /// whole filter falls to the per-row AST walk — 2.8M rows/s vs
+    /// 70M/s, measured in examples/bench_corr.rs). Arc-shared so the
+    /// per-outer-row cache hit is a refcount bump, not a HashMap
+    /// remove/insert of a Box (the churn measured ~2 of the 3 us/row
+    /// bridge cost).
+    pub(crate) bindings: std::sync::Arc<Vec<(Option<String>, String)>>,
+    /// The first slot the bindings occupy: `ctx.params.len()` at
+    /// rewrite time (= statement arity + the ancestor subqueries'
+    /// currently-active appended tails — each level swaps in its own
+    /// extended vector, so nesting cannot alias). Re-checked at bind
+    /// time (debug_assert) — the ancestor chain of an AST node is
+    /// static, so the base is identical on every evaluation.
+    pub(crate) base: usize,
+    pub(crate) plan: std::sync::Arc<crate::planner::plan::Plan>,
+    pub(crate) cookie: u64,
+}
+
+/// Rewrite column references to the IMMEDIATE outer scope into
+/// positional parameters over a cloned subquery AST.
+///
+/// A qualified ref (`u.id`) whose qualifier names no source of the
+/// subquery's own FROM tree is an outer reference; binding it as a
+/// parameter makes every index/rowid access path treat it as a runtime
+/// value (SQLite's co-routine model binds the outer row exactly this
+/// way). Only refs that RESOLVE against the immediate outer frame's
+/// column names are rewritten — anything else (deeper levels, typos)
+/// keeps the runtime correlated-lookup path, so semantics are
+/// unchanged by fallback.
+///
+/// Nested subquery bodies are NOT descended into: their refs resolve
+/// through the runtime outer-scope stack, which sees every level.
+fn rewrite_outer_refs(
+    sel: &SelectStatement,
+    catalog: &crate::schema::Catalog,
+    outer_names: &[String],
+    base: usize,
+) -> (SelectStatement, Vec<(Option<String>, String)>) {
+    // The subquery's own source names (lowercased), including nested
+    // subqueries' sources — a ref to a nested alias is local for
+    // resolution purposes.
+    let mut sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut source_tables: Vec<Arc<Table>> = Vec::new();
+    collect_select_sources(sel, catalog, &mut sources, &mut source_tables);
+    // Resolve-in-frame check: does (qual, name) bind against the
+    // immediate outer frame's names (qualified exact, then bare exact,
+    // then suffix — the runtime outer-scope resolver's passes)?
+    let resolves_in_frame = |qual: &Option<String>, name: &str| -> bool {
+        match qual {
+            Some(q) => outer_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&format!("{}.{}", q, name))),
+            None => outer_names.iter().any(|n| {
+                n.eq_ignore_ascii_case(name)
+                    || n.rsplit('.')
+                        .next()
+                        .is_some_and(|sfx| sfx.eq_ignore_ascii_case(name))
+            }),
+        }
+    };
+    let mut bindings: Vec<(Option<String>, String)> = Vec::new();
+    let mut cloned = sel.clone();
+    rewrite_outer_refs_in_select(
+        &mut cloned,
+        &sources,
+        base,
+        &mut bindings,
+        &resolves_in_frame,
+    );
+    (cloned, bindings)
+}
+
+/// One SELECT's expression sites (WHERE, HAVING, columns, GROUP BY,
+/// ORDER BY, LIMIT/OFFSET, join constraints). The FROM tree itself is
+/// left alone (its aliases are the subquery's own sources).
+fn rewrite_outer_refs_in_select(
+    sel: &mut SelectStatement,
+    sources: &std::collections::HashSet<String>,
+    base: usize,
+    bindings: &mut Vec<(Option<String>, String)>,
+    resolves_in_frame: &dyn Fn(&Option<String>, &str) -> bool,
+) {
+    rewrite_outer_refs_in_body(&mut sel.body, sources, base, bindings, resolves_in_frame);
+    for t in sel.order_by.iter_mut() {
+        rewrite_outer_refs_in_expr(&mut t.expr, sources, base, bindings, resolves_in_frame);
+    }
+    if let Some(l) = sel.limit.as_mut() {
+        rewrite_outer_refs_in_expr(l, sources, base, bindings, resolves_in_frame);
+    }
+    if let Some(o) = sel.offset.as_mut() {
+        rewrite_outer_refs_in_expr(o, sources, base, bindings, resolves_in_frame);
+    }
+    if let Some(w) = sel.with.as_mut() {
+        for cte in w.ctes.iter_mut() {
+            rewrite_outer_refs_in_select(
+                &mut cte.select,
+                sources,
+                base,
+                bindings,
+                resolves_in_frame,
+            );
+        }
+    }
+}
+
+fn rewrite_outer_refs_in_body(
+    body: &mut crate::sql::ast::SelectBody,
+    sources: &std::collections::HashSet<String>,
+    base: usize,
+    bindings: &mut Vec<(Option<String>, String)>,
+    resolves_in_frame: &dyn Fn(&Option<String>, &str) -> bool,
+) {
+    match body {
+        crate::sql::ast::SelectBody::Simple(s) => {
+            for c in s.columns.iter_mut() {
+                if let crate::sql::ast::ResultColumn::Expr { expr, .. } = c {
+                    rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+                }
+            }
+            if let Some(from) = s.from.as_mut() {
+                rewrite_outer_refs_in_from(from, sources, base, bindings, resolves_in_frame);
+            }
+            if let Some(pred) = s.where_clause.as_mut() {
+                rewrite_outer_refs_in_expr(pred, sources, base, bindings, resolves_in_frame);
+            }
+            for g in s.group_by.iter_mut() {
+                rewrite_outer_refs_in_expr(g, sources, base, bindings, resolves_in_frame);
+            }
+            if let Some(h) = s.having.as_mut() {
+                rewrite_outer_refs_in_expr(h, sources, base, bindings, resolves_in_frame);
+            }
+        }
+        crate::sql::ast::SelectBody::Binary { left, right, .. } => {
+            rewrite_outer_refs_in_body(left, sources, base, bindings, resolves_in_frame);
+            rewrite_outer_refs_in_body(right, sources, base, bindings, resolves_in_frame);
+        }
+    }
+}
+
+/// JOIN constraints carry expressions over both sides — rewrite them
+/// too (they live in the FROM tree, but their refs follow the same
+/// scoping).
+fn rewrite_outer_refs_in_from(
+    from: &mut crate::sql::ast::TableExpression,
+    sources: &std::collections::HashSet<String>,
+    base: usize,
+    bindings: &mut Vec<(Option<String>, String)>,
+    resolves_in_frame: &dyn Fn(&Option<String>, &str) -> bool,
+) {
+    if let crate::sql::ast::TableExpression::Join {
+        left,
+        right,
+        constraint,
+        ..
+    } = from
+    {
+        rewrite_outer_refs_in_from(left, sources, base, bindings, resolves_in_frame);
+        rewrite_outer_refs_in_from(right, sources, base, bindings, resolves_in_frame);
+        if let crate::sql::ast::JoinConstraint::On(e) = constraint {
+            rewrite_outer_refs_in_expr(e, sources, base, bindings, resolves_in_frame);
+        }
+    }
+}
+
+/// The expression walker. A qualified column ref whose qualifier is not
+/// a local source AND which resolves against the immediate outer frame
+/// becomes a parameter. Subquery nodes are scope boundaries — NOT
+/// descended (their runtime resolution sees every outer level).
+fn rewrite_outer_refs_in_expr(
+    e: &mut Expr,
+    sources: &std::collections::HashSet<String>,
+    base: usize,
+    bindings: &mut Vec<(Option<String>, String)>,
+    resolves_in_frame: &dyn Fn(&Option<String>, &str) -> bool,
+) {
+    match e {
+        Expr::Column { table, name } => {
+            let is_outer = match table {
+                Some(q) => !sources.contains(&q.to_ascii_lowercase()),
+                None => false, // bare refs: runtime inner-first resolution
+            };
+            if is_outer && resolves_in_frame(table, name) {
+                // A POSITIONAL parameter (numeric name): both the
+                // compiled predicate machinery (PredExpr::Param — named
+                // params don't compile) and the interpretive evaluator
+                // resolve it from ctx.params. Slot = base + binding
+                // index; the corr bridge swaps in an extended params
+                // vector per outer row (see exec_select_statement), and
+                // each nesting level's swap only appends past its
+                // ancestors' tails — no aliasing.
+                let pname = format!("{}", base + bindings.len());
+                bindings.push((table.clone(), name.clone()));
+                *e = Expr::Parameter(pname);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            rewrite_outer_refs_in_expr(left, sources, base, bindings, resolves_in_frame);
+            rewrite_outer_refs_in_expr(right, sources, base, bindings, resolves_in_frame);
+        }
+        Expr::Unary { expr, .. } => {
+            rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+            rewrite_outer_refs_in_expr(low, sources, base, bindings, resolves_in_frame);
+            rewrite_outer_refs_in_expr(high, sources, base, bindings, resolves_in_frame);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+            rewrite_outer_refs_in_expr(pattern, sources, base, bindings, resolves_in_frame);
+            if let Some(es) = escape.as_mut() {
+                rewrite_outer_refs_in_expr(es, sources, base, bindings, resolves_in_frame);
+            }
+        }
+        Expr::IsNull { expr, .. } => {
+            rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+        }
+        Expr::Is { left, right, .. } => {
+            rewrite_outer_refs_in_expr(left, sources, base, bindings, resolves_in_frame);
+            rewrite_outer_refs_in_expr(right, sources, base, bindings, resolves_in_frame);
+        }
+        Expr::Function { args, filter, .. } => {
+            for a in args.iter_mut() {
+                rewrite_outer_refs_in_expr(a, sources, base, bindings, resolves_in_frame);
+            }
+            if let Some(f) = filter.as_mut() {
+                rewrite_outer_refs_in_expr(f, sources, base, bindings, resolves_in_frame);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand.as_mut() {
+                rewrite_outer_refs_in_expr(o, sources, base, bindings, resolves_in_frame);
+            }
+            for (w, t) in whens.iter_mut() {
+                rewrite_outer_refs_in_expr(w, sources, base, bindings, resolves_in_frame);
+                rewrite_outer_refs_in_expr(t, sources, base, bindings, resolves_in_frame);
+            }
+            if let Some(el) = else_.as_mut() {
+                rewrite_outer_refs_in_expr(el, sources, base, bindings, resolves_in_frame);
+            }
+        }
+        Expr::Row(exprs) => {
+            for x in exprs.iter_mut() {
+                rewrite_outer_refs_in_expr(x, sources, base, bindings, resolves_in_frame);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+        }
+        Expr::Collate { expr, .. } => {
+            rewrite_outer_refs_in_expr(expr, sources, base, bindings, resolves_in_frame);
+        }
+        // Scope boundaries (subqueries resolve through the runtime
+        // stack) and leaves (literals, params, IN-table sources).
+        _ => {}
+    }
+}
+
 pub struct ExecContext<'a> {
     pub pager: &'a Pager,
     /// Positional bound parameters (`?` placeholders), indexed 0..N.
@@ -577,6 +867,22 @@ pub struct ExecContext<'a> {
     /// subquery planning (exec_select_statement) so `IN (SELECT .. FROM cte)`
     /// inside a WITH statement resolves the CTE.
     pub ctes: Option<HashMap<String, crate::types::CteMaterialization>>,
+    /// Correlated-subquery cache for the CURRENT statement: a
+    /// correlated scalar/EXISTS/IN subquery re-executes per outer row,
+    /// and re-PLANNING it per row (a fresh Planner + full
+    /// name-resolution walk) was pure waste — SQLite's co-routine model
+    /// compiles the subquery once. Keyed by the AST node's address
+    /// (stable for the statement's lifetime — the AST is immutable);
+    /// validated against the pager's schema cookie (DDL between
+    /// evaluations re-plans). The cache dies with the statement.
+    ///
+    /// The entry also carries the CORRELATED-PARAMETER REWRITE: refs to
+    /// the immediate outer scope become bound parameters over a CLONED
+    /// AST (see `rewrite_outer_refs`), so the planner treats them as
+    /// runtime values — `WHERE o.user_id = u.id` becomes an INDEX
+    /// LOOKUP keyed on the outer row's value instead of a full inner
+    /// scan + per-row correlated filter evaluation.
+    pub(crate) subquery_plans: HashMap<usize, SubqPlanEntry>,
     /// Current trigger-firing depth (guards runaway recursion).
     pub trigger_depth: u32,
     /// Trigger names currently executing (a stack). SQLite's
@@ -614,6 +920,7 @@ impl<'a> ExecContext<'a> {
             shared_detached: false,
             table_append_hint: None,
             ctes: None,
+            subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
             _marker: std::marker::PhantomData,
@@ -653,6 +960,7 @@ impl<'a> ExecContext<'a> {
             shared_detached: false,
             table_append_hint: None,
             ctes: None,
+            subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
             _marker: std::marker::PhantomData,
@@ -2397,7 +2705,7 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                 Ok(Expr::Subquery(Box::new(sel)))
             } else {
-                let res = exec_select_statement(&sel, ctx)?;
+                let res = exec_select_statement(&sel, ctx, None, false)?;
                 let v = res
                     .rows
                     .first()
@@ -2413,7 +2721,7 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                 Ok(Expr::Exists(Box::new(sel)))
             } else {
-                let res = exec_select_statement(&sel, ctx)?;
+                let res = exec_select_statement(&sel, ctx, None, true)?;
                 Ok(Expr::Literal(Value::Integer(if res.rows.is_empty() {
                     0
                 } else {
@@ -2434,7 +2742,7 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                     if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                         InSource::Subquery(Box::new(sel))
                     } else {
-                        let res = exec_select_statement(&sel, ctx)?;
+                        let res = exec_select_statement(&sel, ctx, None, false)?;
                         let list: Vec<Expr> = res
                             .rows
                             .iter()
@@ -2531,15 +2839,201 @@ fn rewrite_table_expression_subqueries(
     Ok(())
 }
 
-/// Plan + execute a SELECT statement (used by subquery substitution).
-fn exec_select_statement(sel: &SelectStatement, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
-    let catalog = ctx.catalog();
-    let mut planner = crate::planner::Planner::new(catalog);
-    if let Some(ctes) = ctx.ctes.clone() {
-        planner.set_ctes(ctes);
+/// Plan + execute a SELECT statement (used by subquery substitution and
+/// the correlated-subquery bridge). Two layers of per-row waste removal:
+///
+/// 1. The PLAN is cached per AST node for the statement's lifetime (a
+///    correlated subquery evaluates per outer row; the old path
+///    re-planned it every time — a fresh Planner + name resolution +
+///    all the index/rowid decisions, per ROW). The schema cookie guards
+///    against DDL between evaluations.
+///
+/// 2. When an outer frame is supplied (the correlated bridge), the
+///    cached entry holds a CLONED AST whose immediate-outer refs became
+///    positional parameters (`rewrite_outer_refs`) — the planner then
+///    treats them as runtime values, so `WHERE o.user_id = u.id` plans
+///    as an INDEX LOOKUP keyed on the outer row's value (bound per
+///    evaluation) instead of a full inner scan + per-row correlated
+///    filter evaluation. Refs that do NOT resolve against the immediate
+///    frame (deeper levels, unqualified) keep the runtime outer-scope
+///    stack — semantics are unchanged by fallback.
+fn exec_select_statement(
+    sel: &SelectStatement,
+    ctx: &mut ExecContext<'_>,
+    outer: Option<(*const [Value], *const [String])>,
+    limit_one: bool,
+) -> Result<ExecResult> {
+    // The one-shot (uncorrelated) path: the pre-execution rewrite
+    // executes these over STACK-local copies (`let mut sel = *sel`) —
+    // sibling subqueries at the same recursion depth reuse the same
+    // stack slot, so the address-keyed cache must not serve (or
+    // populate) entries on this path. The correlated bridge passes
+    // heap-stable addresses (Box'd AST nodes that survive per-row
+    // re-execution) — those are the cacheable ones.
+    let Some((outer_row_ptr, outer_names_ptr)) = outer else {
+        let catalog = ctx.catalog();
+        let mut planner = crate::planner::Planner::new(catalog);
+        if let Some(ctes) = ctx.ctes.clone() {
+            planner.set_ctes(ctes);
+        }
+        let plan = if limit_one {
+            let mut cloned = sel.clone();
+            clamp_select_limit_to_one(&mut cloned);
+            planner.plan_select(&cloned)?
+        } else {
+            planner.plan_select(sel)?
+        };
+        return execute(&plan, ctx);
+    };
+    // SAFETY: the frame pointers are valid for the caller's stack
+    // frame, which outlives this call (the corr bridge keeps them
+    // alive).
+    let outer_names: &[String] = unsafe { &*outer_names_ptr };
+    let key = sel as *const SelectStatement as usize;
+    let cookie = ctx.pager.schema_cookie() as u64;
+    // Cache hit: Arc-clone (refcount bumps — no map churn, no Box moves).
+    // A cookie mismatch (DDL between evaluations) falls through to the
+    // rebuild, which overwrites the entry.
+    let entry: Option<SubqPlanEntry> = match ctx.subquery_plans.get(&key) {
+        Some(e) if e.cookie == cookie => Some(SubqPlanEntry {
+            bindings: std::sync::Arc::clone(&e.bindings),
+            base: e.base,
+            plan: std::sync::Arc::clone(&e.plan),
+            cookie: e.cookie,
+        }),
+        _ => None,
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            let catalog = ctx.catalog();
+            let mut planner = crate::planner::Planner::new(catalog);
+            if let Some(ctes) = ctx.ctes.clone() {
+                planner.set_ctes(ctes);
+            }
+            // The binding slots start past the CURRENT parameter tail —
+            // the statement's own positional arity PLUS any ancestor
+            // subquery's swapped-in bindings. The ancestor chain of an
+            // AST node is static, so this base recurs identically on
+            // every re-evaluation of the cached plan.
+            let base = ctx.params.len();
+            let (mut cloned, bindings) = rewrite_outer_refs(sel, catalog, outer_names, base);
+            if limit_one {
+                clamp_select_limit_to_one(&mut cloned);
+            }
+            let plan = planner.plan_select(&cloned)?;
+            let entry = SubqPlanEntry {
+                bindings: std::sync::Arc::new(bindings),
+                base,
+                plan: std::sync::Arc::new(plan),
+                cookie,
+            };
+            ctx.subquery_plans.insert(
+                key,
+                SubqPlanEntry {
+                    bindings: std::sync::Arc::clone(&entry.bindings),
+                    base: entry.base,
+                    plan: std::sync::Arc::clone(&entry.plan),
+                    cookie: entry.cookie,
+                },
+            );
+            entry
+        }
+    };
+    // Bind the outer values as POSITIONAL parameters for THIS
+    // evaluation, then restore the parameter vector: the bindings are
+    // appended past the current tail (statement arity + ancestor
+    // tails — exactly the base the rewrite baked in), the statement's
+    // own slots are the unchanged PREFIX, and each level's swap-restore
+    // discipline keeps nesting alias-free. Only one subquery of any
+    // level executes at a time (filter evaluation is sequential).
+    let bound_params = if entry.bindings.is_empty() {
+        None
+    } else {
+        let row: &[Value] = unsafe { &*outer_row_ptr };
+        let mut p = Vec::with_capacity(entry.base + entry.bindings.len());
+        p.extend_from_slice(&ctx.params);
+        debug_assert_eq!(p.len(), entry.base, "correlated binding base drifted");
+        if p.len() > entry.base {
+            // Never happens (the ancestor chain is static); truncate to
+            // keep the baked-in slot numbers valid regardless.
+            p.truncate(entry.base);
+        }
+        while p.len() < entry.base {
+            p.push(Value::Null);
+        }
+        for (qual, name) in entry.bindings.iter() {
+            p.push(lookup_outer_frame_value(
+                row,
+                outer_names,
+                qual.as_deref(),
+                name,
+            ));
+        }
+        Some(p)
+    };
+    if let Some(p) = bound_params {
+        let saved = std::mem::replace(&mut ctx.params, p);
+        let r = execute(&entry.plan, ctx);
+        ctx.params = saved;
+        r
+    } else {
+        execute(&entry.plan, ctx)
     }
-    let plan = planner.plan_select(sel)?;
-    execute(&plan, ctx)
+}
+
+/// EXISTS short-circuit: clamp a SELECT's LIMIT so the plan stops after
+/// the first row (SQLite's co-routine model does exactly this for
+/// EXISTS). Conservative: a literal limit of 0 stays 0 (an empty
+/// result by construction), and NON-literal limits (parameters,
+/// expressions — including NULL, which SQLite treats as unlimited) are
+/// left untouched since their runtime value decides. OFFSET survives:
+/// `LIMIT 1 OFFSET k` still yields "row k+1 exists".
+fn clamp_select_limit_to_one(sel: &mut SelectStatement) {
+    let one = || Expr::Literal(Value::Integer(1));
+    sel.limit = Some(match sel.limit.take() {
+        None => one(),
+        Some(Expr::Literal(Value::Integer(0))) => Expr::Literal(Value::Integer(0)),
+        Some(Expr::Literal(Value::Integer(_))) => one(),
+        Some(other) => other,
+    });
+}
+
+/// Resolve (qualifier, name) against ONE outer frame — the runtime
+/// outer-scope resolver's passes for a single frame: qualified exact
+/// "q.name" (case-insensitive), then bare exact, then suffix
+/// ("u.id" matches "id"). Unresolved -> NULL (mirrors the evaluator's
+/// missing-column semantics; a genuinely missing column binds NULL and
+/// the subquery filters on it exactly as the runtime path would).
+fn lookup_outer_frame_value(
+    row: &[Value],
+    names: &[String],
+    qual: Option<&str>,
+    name: &str,
+) -> Value {
+    if let Some(q) = qual {
+        let qual_name = format!("{}.{}", q, name);
+        for (i, n) in names.iter().enumerate() {
+            if n.eq_ignore_ascii_case(&qual_name) {
+                return row.get(i).cloned().unwrap_or(Value::Null);
+            }
+        }
+        // Fall through to the unqualified passes (the runtime resolver
+        // does the same for qualified refs that miss).
+    }
+    for (i, n) in names.iter().enumerate() {
+        if n.eq_ignore_ascii_case(name) {
+            return row.get(i).cloned().unwrap_or(Value::Null);
+        }
+    }
+    for (i, n) in names.iter().enumerate() {
+        if let Some(pos) = n.rfind('.') {
+            if n[pos + 1..].eq_ignore_ascii_case(name) {
+                return row.get(i).cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+    Value::Null
 }
 
 /// Conservative correlated-subquery detector: collect every column ref in
@@ -6797,67 +7291,137 @@ pub(crate) fn scan_groupby_grouper(
 
             let mut wide: Vec<Value> = vec![Value::Null; n_cols];
             let mut owned_key: Value = Value::Null;
-            bt.scan_table_borrowed(|rowid, payload| {
-                if decode_row_selective_wide(
-                    payload,
-                    n_cols,
-                    &wanted,
-                    rowid,
-                    rowid_alias,
-                    &mut wide,
-                )
-                .is_err()
-                {
+            let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+            bt.scan_table_borrowed_opts(
+                |rowid, payload| {
+                    if decode_row_selective_wide(
+                        payload,
+                        n_cols,
+                        &wanted,
+                        rowid,
+                        rowid_alias,
+                        &mut wide,
+                    )
+                    .is_err()
+                    {
+                        return true; // skip corrupt rows
+                    }
+                    if let Some(pred) = filter_predicate {
+                        let keep = if let Some(cp) = &compiled_filter {
+                            cp.eval(&wide, &identity, params)
+                        } else {
+                            match eval_row(pred, &wide, &columns, params, named_params) {
+                                Ok(v) => v.is_truthy(),
+                                Err(_) => false,
+                            }
+                        };
+                        if !keep {
+                            return true;
+                        }
+                    }
+                    // Group key: single-value fast path or full key Vec.
+                    let gi = if single_key {
+                        let kv = match &compiled_keys[0] {
+                            Some(c) => c.eval(&wide, params),
+                            None => wide[key_col_indices[0].unwrap()].clone(),
+                        };
+                        owned_key = kv;
+                        grouper.intern_one(&owned_key)
+                    } else {
+                        key_buf.clear();
+                        for (i, _g) in group_by.iter().enumerate() {
+                            let kv = match &compiled_keys[i] {
+                                Some(c) => c.eval(&wide, params),
+                                None => wide[key_col_indices[i].unwrap()].clone(),
+                            };
+                            key_buf.push(kv);
+                        }
+                        grouper.intern(&key_buf)
+                    };
+                    for (i, agg) in aggregates.iter().enumerate() {
+                        if agg.arg.is_none() {
+                            // COUNT(*): constant placeholder, no evaluation.
+                            update_agg_state(
+                                grouper.state(gi, i),
+                                agg_funcs[i],
+                                &COUNT_STAR_ARG,
+                                false,
+                                agg_sep_at(aggregates, i),
+                            );
+                            continue;
+                        }
+                        let arg_val = match (agg_col_indices[i], &compiled_args[i]) {
+                            (Some(idx), _) => wide[idx].clone(),
+                            (None, Some(c)) => c.eval(&wide, params),
+                            (None, None) => Value::Null,
+                        };
+                        update_agg_state(
+                            grouper.state(gi, i),
+                            agg_funcs[i],
+                            &arg_val,
+                            agg.distinct,
+                            agg_sep_at(aggregates, i),
+                        );
+                    }
+                    true
+                },
+                pred_may_reenter,
+            )?;
+            return Ok(grouper);
+        }
+
+        let identity_ref: &[usize] = &identity;
+        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        bt.scan_table_borrowed_opts(
+            |rowid, payload| {
+                row_buf.clear();
+                if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
                     return true; // skip corrupt rows
                 }
+                // Apply the filter predicate inline (if any).
                 if let Some(pred) = filter_predicate {
                     let keep = if let Some(cp) = &compiled_filter {
-                        cp.eval(&wide, &identity, params)
+                        cp.eval(&row_buf, identity_ref, params)
                     } else {
-                        match eval_row(pred, &wide, &columns, params, named_params) {
+                        match eval_row(pred, &row_buf, &columns, params, named_params) {
                             Ok(v) => v.is_truthy(),
                             Err(_) => false,
                         }
                     };
                     if !keep {
-                        return true;
+                        return true; // skip — predicate false
                     }
                 }
-                // Group key: single-value fast path or full key Vec.
-                let gi = if single_key {
-                    let kv = match &compiled_keys[0] {
-                        Some(c) => c.eval(&wide, params),
-                        None => wide[key_col_indices[0].unwrap()].clone(),
-                    };
-                    owned_key = kv;
-                    grouper.intern_one(&owned_key)
-                } else {
-                    key_buf.clear();
-                    for (i, _g) in group_by.iter().enumerate() {
-                        let kv = match &compiled_keys[i] {
-                            Some(c) => c.eval(&wide, params),
-                            None => wide[key_col_indices[i].unwrap()].clone(),
-                        };
-                        key_buf.push(kv);
+                // Compute the group-by key: direct index when resolved, eval_row
+                // otherwise (e.g. GROUP BY x+y, GROUP BY upper(name)).
+                key_buf.clear();
+                let mut key_ok = true;
+                for (gi_expr, kidx) in group_by.iter().zip(key_col_indices.iter()) {
+                    match kidx {
+                        Some(idx) => key_buf.push(row_buf[*idx].clone()),
+                        None => match eval_row(gi_expr, &row_buf, &columns, params, named_params) {
+                            Ok(v) => key_buf.push(v),
+                            Err(_) => {
+                                key_ok = false;
+                                break;
+                            }
+                        },
                     }
-                    grouper.intern(&key_buf)
-                };
+                }
+                if !key_ok {
+                    return true;
+                }
+                let gi = grouper.intern_key(&key_buf);
                 for (i, agg) in aggregates.iter().enumerate() {
-                    if agg.arg.is_none() {
-                        // COUNT(*): constant placeholder, no evaluation.
-                        update_agg_state(
-                            grouper.state(gi, i),
-                            agg_funcs[i],
-                            &COUNT_STAR_ARG,
-                            false,
-                            agg_sep_at(aggregates, i),
-                        );
-                        continue;
-                    }
-                    let arg_val = match (agg_col_indices[i], &compiled_args[i]) {
-                        (Some(idx), _) => wide[idx].clone(),
-                        (None, Some(c)) => c.eval(&wide, params),
-                        (None, None) => Value::Null,
+                    let arg_val = match (&agg.arg, agg_col_indices[i]) {
+                        (Some(_), Some(idx)) => row_buf[idx].clone(),
+                        (Some(arg), None) => {
+                            match eval_row(arg, &row_buf, &columns, params, named_params) {
+                                Ok(v) => v,
+                                Err(_) => Value::Null,
+                            }
+                        }
+                        (None, _) => Value::Integer(1), // COUNT(*)
                     };
                     update_agg_state(
                         grouper.state(gi, i),
@@ -6868,71 +7432,9 @@ pub(crate) fn scan_groupby_grouper(
                     );
                 }
                 true
-            })?;
-            return Ok(grouper);
-        }
-
-        let identity_ref: &[usize] = &identity;
-        bt.scan_table_borrowed(|rowid, payload| {
-            row_buf.clear();
-            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
-                return true; // skip corrupt rows
-            }
-            // Apply the filter predicate inline (if any).
-            if let Some(pred) = filter_predicate {
-                let keep = if let Some(cp) = &compiled_filter {
-                    cp.eval(&row_buf, identity_ref, params)
-                } else {
-                    match eval_row(pred, &row_buf, &columns, params, named_params) {
-                        Ok(v) => v.is_truthy(),
-                        Err(_) => false,
-                    }
-                };
-                if !keep {
-                    return true; // skip — predicate false
-                }
-            }
-            // Compute the group-by key: direct index when resolved, eval_row
-            // otherwise (e.g. GROUP BY x+y, GROUP BY upper(name)).
-            key_buf.clear();
-            let mut key_ok = true;
-            for (gi_expr, kidx) in group_by.iter().zip(key_col_indices.iter()) {
-                match kidx {
-                    Some(idx) => key_buf.push(row_buf[*idx].clone()),
-                    None => match eval_row(gi_expr, &row_buf, &columns, params, named_params) {
-                        Ok(v) => key_buf.push(v),
-                        Err(_) => {
-                            key_ok = false;
-                            break;
-                        }
-                    },
-                }
-            }
-            if !key_ok {
-                return true;
-            }
-            let gi = grouper.intern_key(&key_buf);
-            for (i, agg) in aggregates.iter().enumerate() {
-                let arg_val = match (&agg.arg, agg_col_indices[i]) {
-                    (Some(_), Some(idx)) => row_buf[idx].clone(),
-                    (Some(arg), None) => {
-                        match eval_row(arg, &row_buf, &columns, params, named_params) {
-                            Ok(v) => v,
-                            Err(_) => Value::Null,
-                        }
-                    }
-                    (None, _) => Value::Integer(1), // COUNT(*)
-                };
-                update_agg_state(
-                    grouper.state(gi, i),
-                    agg_funcs[i],
-                    &arg_val,
-                    agg.distinct,
-                    agg_sep_at(aggregates, i),
-                );
-            }
-            true
-        })?;
+            },
+            pred_may_reenter,
+        )?;
     }
 
     Ok(grouper)
@@ -8444,131 +8946,140 @@ fn exec_aggregate_no_group_by(
         // allocation by passing &[u8] borrows directly into the page buffer.
         // For 10k rows, this saves 10k malloc+free pairs.
         let rowid_alias = table.rowid_alias;
-        bt.scan_table_borrowed(|rowid, payload| {
-            // Decode only the wanted columns.
-            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
-                .is_err()
-            {
-                return true;
-            }
-            // Apply the filter predicate, if any. We need a full row buffer
-            // because eval_row indexes by column position. The cheap path
-            // is to expand sel_buf back into a full row (NULLs for un-wanted
-            // columns). For aggregates only on a few cols, this is still
-            // cheaper than decode_row_into because we skip the heavy Text/Blob
-            // allocations on un-wanted cols (only Integer/Real decoded).
-            if let Some(pred) = filter_predicate {
-                let cols = wanted_names
-                    .as_ref()
-                    .expect("col_names built when filter is present");
-                // Expand into full_row_buf at the correct positions.
-                full_row_buf.clear();
-                full_row_buf.resize(n_cols, Value::Null);
-                for (i, &col_idx) in wanted.iter().enumerate() {
-                    if i < sel_buf.len() {
-                        full_row_buf[col_idx] = sel_buf[i].clone();
-                    }
+        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        bt.scan_table_borrowed_opts(
+            |rowid, payload| {
+                // Decode only the wanted columns.
+                if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
+                    .is_err()
+                {
+                    return true;
                 }
-                match eval_row(pred, &full_row_buf, cols, &params, &named_params) {
-                    Ok(v) => {
-                        if !v.is_truthy() {
-                            return true;
-                        }
-                    }
-                    Err(_) => return true,
-                }
-            }
-            saw_any_row = true;
-            for i in 0..aggregates.len() {
-                // `agg_pos` / `agg_is_count_star` are precomputed ONCE above
-                // (was: a `wanted.iter().position()` linear scan per agg per
-                // row — for the 5-aggregate bench shape that was ~20 ns of
-                // pure per-row waste, and `sel_buf[pos].clone()` another
-                // Value copy per update; update_agg_state only borrows).
-                let arg_val: &Value = if agg_is_count_star[i] {
-                    &COUNT_STAR_ARG
-                } else if let Some(pos) = agg_pos[i] {
-                    &sel_buf[pos]
-                } else if let Some(arg) = &aggregates[i].arg {
+                // Apply the filter predicate, if any. We need a full row buffer
+                // because eval_row indexes by column position. The cheap path
+                // is to expand sel_buf back into a full row (NULLs for un-wanted
+                // columns). For aggregates only on a few cols, this is still
+                // cheaper than decode_row_into because we skip the heavy Text/Blob
+                // allocations on un-wanted cols (only Integer/Real decoded).
+                if let Some(pred) = filter_predicate {
                     let cols = wanted_names
                         .as_ref()
-                        .expect("col_names built when not all are Column");
-                    // Fall back to eval_row for non-Column args.
-                    let mut full_row = vec![Value::Null; n_cols];
-                    for (j, &col_idx) in wanted.iter().enumerate() {
-                        if j < sel_buf.len() {
-                            full_row[col_idx] = sel_buf[j].clone();
+                        .expect("col_names built when filter is present");
+                    // Expand into full_row_buf at the correct positions.
+                    full_row_buf.clear();
+                    full_row_buf.resize(n_cols, Value::Null);
+                    for (i, &col_idx) in wanted.iter().enumerate() {
+                        if i < sel_buf.len() {
+                            full_row_buf[col_idx] = sel_buf[i].clone();
                         }
                     }
-                    match eval_row(arg, &full_row, cols, &params, &named_params) {
-                        Ok(v) => scratch_arg[i] = v,
-                        Err(_) => scratch_arg[i] = Value::Null,
+                    match eval_row(pred, &full_row_buf, cols, &params, &named_params) {
+                        Ok(v) => {
+                            if !v.is_truthy() {
+                                return true;
+                            }
+                        }
+                        Err(_) => return true,
                     }
-                    &scratch_arg[i]
-                } else {
-                    &COUNT_STAR_ARG
-                };
-                update_agg_state(
-                    &mut states[i],
-                    agg_funcs[i],
-                    arg_val,
-                    aggregates[i].distinct,
-                    agg_sep_at(aggregates, i),
-                );
-            }
-            true
-        })?;
+                }
+                saw_any_row = true;
+                for i in 0..aggregates.len() {
+                    // `agg_pos` / `agg_is_count_star` are precomputed ONCE above
+                    // (was: a `wanted.iter().position()` linear scan per agg per
+                    // row — for the 5-aggregate bench shape that was ~20 ns of
+                    // pure per-row waste, and `sel_buf[pos].clone()` another
+                    // Value copy per update; update_agg_state only borrows).
+                    let arg_val: &Value = if agg_is_count_star[i] {
+                        &COUNT_STAR_ARG
+                    } else if let Some(pos) = agg_pos[i] {
+                        &sel_buf[pos]
+                    } else if let Some(arg) = &aggregates[i].arg {
+                        let cols = wanted_names
+                            .as_ref()
+                            .expect("col_names built when not all are Column");
+                        // Fall back to eval_row for non-Column args.
+                        let mut full_row = vec![Value::Null; n_cols];
+                        for (j, &col_idx) in wanted.iter().enumerate() {
+                            if j < sel_buf.len() {
+                                full_row[col_idx] = sel_buf[j].clone();
+                            }
+                        }
+                        match eval_row(arg, &full_row, cols, &params, &named_params) {
+                            Ok(v) => scratch_arg[i] = v,
+                            Err(_) => scratch_arg[i] = Value::Null,
+                        }
+                        &scratch_arg[i]
+                    } else {
+                        &COUNT_STAR_ARG
+                    };
+                    update_agg_state(
+                        &mut states[i],
+                        agg_funcs[i],
+                        arg_val,
+                        aggregates[i].distinct,
+                        agg_sep_at(aggregates, i),
+                    );
+                }
+                true
+            },
+            pred_may_reenter,
+        )?;
     } else {
         // Fallback: decode the entire row.
         let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
         let root = ctx.table_root(&table);
         let mut bt = Btree::new(ctx.pager, root, false);
         let rowid_alias = table.rowid_alias;
-        bt.scan_table_borrowed(|rowid, payload| {
-            row_buf.clear();
-            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
-                return true; // skip corrupt rows
-            }
-            if append_rowid {
-                row_buf.push(Value::Integer(rowid));
-            }
-            // Apply the filter predicate inline (if any).
-            if let Some(pred) = filter_predicate {
-                let cols = columns_ref.expect("columns were built because predicate is Some");
-                match eval_row(pred, &row_buf, cols, &params, &named_params) {
-                    Ok(v) => {
-                        if !v.is_truthy() {
-                            return true;
-                        }
-                    }
-                    Err(_) => return true,
+        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        bt.scan_table_borrowed_opts(
+            |rowid, payload| {
+                row_buf.clear();
+                if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
+                    return true; // skip corrupt rows
                 }
-            }
-            saw_any_row = true;
-            for (i, agg) in aggregates.iter().enumerate() {
-                let arg_val = if let Some(idx) = agg_col_indices[i] {
-                    // Fast path: pre-resolved column index.
-                    row_buf[idx].clone()
-                } else if let Some(arg) = &agg.arg {
-                    // Slow path: eval_row (e.g. SUM(x + 1), AVG(x * 2)).
-                    let cols = columns_ref.expect("columns were built because not all are Column");
-                    match eval_row(arg, &row_buf, cols, &params, &named_params) {
-                        Ok(v) => v,
-                        Err(_) => Value::Null,
+                if append_rowid {
+                    row_buf.push(Value::Integer(rowid));
+                }
+                // Apply the filter predicate inline (if any).
+                if let Some(pred) = filter_predicate {
+                    let cols = columns_ref.expect("columns were built because predicate is Some");
+                    match eval_row(pred, &row_buf, cols, &params, &named_params) {
+                        Ok(v) => {
+                            if !v.is_truthy() {
+                                return true;
+                            }
+                        }
+                        Err(_) => return true,
                     }
-                } else {
-                    Value::Integer(1)
-                };
-                update_agg_state(
-                    &mut states[i],
-                    agg_funcs[i],
-                    &arg_val,
-                    agg.distinct,
-                    agg_sep_at(aggregates, i),
-                );
-            }
-            true
-        })?;
+                }
+                saw_any_row = true;
+                for (i, agg) in aggregates.iter().enumerate() {
+                    let arg_val = if let Some(idx) = agg_col_indices[i] {
+                        // Fast path: pre-resolved column index.
+                        row_buf[idx].clone()
+                    } else if let Some(arg) = &agg.arg {
+                        // Slow path: eval_row (e.g. SUM(x + 1), AVG(x * 2)).
+                        let cols =
+                            columns_ref.expect("columns were built because not all are Column");
+                        match eval_row(arg, &row_buf, cols, &params, &named_params) {
+                            Ok(v) => v,
+                            Err(_) => Value::Null,
+                        }
+                    } else {
+                        Value::Integer(1)
+                    };
+                    update_agg_state(
+                        &mut states[i],
+                        agg_funcs[i],
+                        &arg_val,
+                        agg.distinct,
+                        agg_sep_at(aggregates, i),
+                    );
+                }
+                true
+            },
+            pred_may_reenter,
+        )?;
     }
 
     finish_no_group_by(aggregates, states, saw_any_row)
@@ -8880,6 +9391,18 @@ fn exec_aggregate(
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx =
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            // NULL bound: comparison is NULL (SQL 3VL) — zero rows.
+            let null_bound = match (start, end) {
+                (Some(e), _) | (_, Some(e)) => evaluate(e, &eval_ctx)?.is_null(),
+                (None, None) => false,
+            };
+            if null_bound {
+                let row: Vec<Value> = vec![Value::Integer(0)];
+                return Ok(ExecResult {
+                    columns: Arc::from(vec!["__agg_0".to_string()]),
+                    rows: vec![row],
+                });
+            }
             let start_v = match start {
                 Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
                 None => i64::MIN,
@@ -8923,6 +9446,61 @@ fn exec_aggregate(
                     aggregates,
                     projection,
                 );
+            }
+        }
+    }
+    // Fast path #3b: COUNT(*) over an IndexLookup — count the index
+    // ENTRIES matching the (runtime-bound) equality keys directly: no
+    // row fetching, no payload decoding, no per-call AggState. This is
+    // exactly the shape the correlated-parameter rewrite produces per
+    // outer row (`WHERE o.user_id = ?binding` over an index), where the
+    // api.rs IndexCount OLTP fastpath is unreachable — the bridge's
+    // `execute(&plan, ctx)` landed on the general materialize+aggregate
+    // pipeline (~2.6 us/outer-row vs ~0.4 us app-driven, measured in
+    // examples/prof_corr.rs / prof_corr2.rs).
+    if group_by.is_empty()
+        && aggregates.len() == 1
+        && aggregates[0].func == "count"
+        && aggregates[0].arg.is_none()
+        && !aggregates[0].distinct
+    {
+        if let Plan::IndexLookup {
+            table,
+            index,
+            key_exprs,
+            ..
+        } = input
+        {
+            if table.vtab.is_none() {
+                let empty_row: Vec<Value> = Vec::new();
+                let empty_cols: Vec<String> = Vec::new();
+                let eval_ctx =
+                    EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                let key_values: Vec<Value> = key_exprs
+                    .iter()
+                    .map(|e| evaluate(e, &eval_ctx))
+                    .collect::<Result<_>>()?;
+                // NULL equality probes match nothing (SQL 3VL).
+                let n: i64 = if key_values.iter().any(|v| v.is_null()) {
+                    0
+                } else {
+                    let mut key_bytes = Vec::with_capacity(16);
+                    crate::plugin::encode_collated_index_key_into(
+                        &index.columns,
+                        &key_values,
+                        &mut key_bytes,
+                    );
+                    let index_root = ctx.index_root(index);
+                    let mut index_bt = Btree::new(ctx.pager, index_root, true);
+                    let mut rowids: Vec<i64> = Vec::new();
+                    index_bt.lookup_index_into(&key_bytes, &mut rowids)?;
+                    rowids.len() as i64
+                };
+                let row: Vec<Value> = vec![Value::Integer(n)];
+                return Ok(ExecResult {
+                    columns: Arc::from(vec!["__agg_0".to_string()]),
+                    rows: vec![row],
+                });
             }
         }
     }
@@ -8988,6 +9566,20 @@ fn exec_aggregate(
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx =
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            // NULL bound: comparison is NULL (SQL 3VL) — zero rows (the
+            // encoded NULL key would otherwise match the stored NULL
+            // entries exactly).
+            let null_bound = match (start, end) {
+                (Some((e, _)), _) | (_, Some((e, _))) => evaluate(e, &eval_ctx)?.is_null(),
+                (None, None) => false,
+            };
+            if null_bound {
+                let row: Vec<Value> = vec![Value::Integer(0)];
+                return Ok(ExecResult {
+                    columns: Arc::from(vec!["__agg_0".to_string()]),
+                    rows: vec![row],
+                });
+            }
             let fold_bound = |e: &Expr| -> Result<Value> {
                 let v = evaluate(e, &eval_ctx)?;
                 Ok(match index.columns.first() {
@@ -13081,7 +13673,33 @@ fn exec_rowid_range(
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
 
-    // Evaluate the bounds. None means unbounded (-∞ or +∞).
+    // Evaluate the bounds. None means unbounded (-∞ or +∞). A NULL
+    // bound makes the comparison NULL (SQL 3VL) — the range is EMPTY,
+    // never "NULL coerces to 0" (which turned `id >= NULL` into
+    // "everything from rowid 0" — found by examples/probe_null_key3.rs,
+    // differential vs SQLite).
+    let start_null = match start_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.is_null(),
+        None => false,
+    };
+    let end_null = match end_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.is_null(),
+        None => false,
+    };
+    if start_null || end_null {
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let columns: Arc<[String]> = if append_rowid {
+            let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+            v.push(crate::planner::hidden_rowid_slot(&table.name));
+            v.into()
+        } else {
+            table.col_names.clone()
+        };
+        return Ok(ExecResult {
+            columns,
+            rows: Vec::new(),
+        });
+    }
     let start: i64 = match start_expr {
         Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
         None => i64::MIN,
@@ -13141,26 +13759,32 @@ fn exec_rowid_range(
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
     let residual_expr = residual;
-    bt.scan_table_range_borrowed(start, end, |rowid, payload| {
-        if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-            if let Some(res) = residual_expr {
-                row.push(Value::Integer(rowid));
-                let keep = eval_row(res, &row, &eval_cols, params, named_params)
-                    .map(|v| v.is_truthy())
-                    .unwrap_or(false);
-                if !keep {
-                    return true;
+    let pred_may_reenter = residual_expr.is_some_and(expr_has_subquery);
+    bt.scan_table_range_borrowed_opts(
+        start,
+        end,
+        |rowid, payload| {
+            if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                if let Some(res) = residual_expr {
+                    row.push(Value::Integer(rowid));
+                    let keep = eval_row(res, &row, &eval_cols, params, named_params)
+                        .map(|v| v.is_truthy())
+                        .unwrap_or(false);
+                    if !keep {
+                        return true;
+                    }
+                    if !append_rowid {
+                        row.pop();
+                    }
+                } else if append_rowid {
+                    row.push(Value::Integer(rowid));
                 }
-                if !append_rowid {
-                    row.pop();
-                }
-            } else if append_rowid {
-                row.push(Value::Integer(rowid));
+                rows.push(row);
             }
-            rows.push(row);
-        }
-        true
-    })?;
+            true
+        },
+        pred_may_reenter,
+    )?;
 
     let columns: Arc<[String]> = if append_rowid {
         // Side-qualified hidden slot (this driver is alias-less — the
@@ -13259,6 +13883,22 @@ fn exec_rowid_range_projected_impl(
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    // NULL bound: the comparison is NULL (SQL 3VL) — empty range (see
+    // exec_rowid_range's guard).
+    let start_null = match start_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.is_null(),
+        None => false,
+    };
+    let end_null = match end_expr {
+        Some(e) => evaluate(e, &eval_ctx)?.is_null(),
+        None => false,
+    };
+    if start_null || end_null {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
+    }
     let start: i64 = match start_expr {
         Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
         None => i64::MIN,
@@ -13289,55 +13929,62 @@ fn exec_rowid_range_projected_impl(
     };
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
-    bt.scan_table_range_borrowed(start, end, |rowid, payload| {
-        match (project, residual) {
-            (Some(idxs), None) => {
-                let mut row = Vec::with_capacity(idxs.len());
-                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok()
-                {
-                    rows.push(row);
+    let pred_may_reenter = residual.is_some_and(expr_has_subquery);
+    bt.scan_table_range_borrowed_opts(
+        start,
+        end,
+        |rowid, payload| {
+            match (project, residual) {
+                (Some(idxs), None) => {
+                    let mut row = Vec::with_capacity(idxs.len());
+                    if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
+                        .is_ok()
+                    {
+                        rows.push(row);
+                    }
                 }
-            }
-            (Some(idxs), Some(res)) => {
-                // Full decode (the residual may need non-projected
-                // columns), evaluate, then project positionally.
-                if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    full.push(Value::Integer(rowid));
-                    let keep = eval_row(res, &full, &eval_cols, params, named_params)
-                        .map(|v| v.is_truthy())
-                        .unwrap_or(false);
-                    if keep {
-                        full.pop();
-                        let mut row = Vec::with_capacity(idxs.len());
-                        for &p in idxs {
-                            if p == crate::storage::row_codec::ROWID_PROJ {
-                                row.push(Value::Integer(rowid));
-                            } else {
-                                row.push(full.get(p).cloned().unwrap_or(Value::Null));
+                (Some(idxs), Some(res)) => {
+                    // Full decode (the residual may need non-projected
+                    // columns), evaluate, then project positionally.
+                    if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                        full.push(Value::Integer(rowid));
+                        let keep = eval_row(res, &full, &eval_cols, params, named_params)
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
+                        if keep {
+                            full.pop();
+                            let mut row = Vec::with_capacity(idxs.len());
+                            for &p in idxs {
+                                if p == crate::storage::row_codec::ROWID_PROJ {
+                                    row.push(Value::Integer(rowid));
+                                } else {
+                                    row.push(full.get(p).cloned().unwrap_or(Value::Null));
+                                }
                             }
+                            rows.push(row);
+                        }
+                    }
+                }
+                (None, _) => {
+                    if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
+                        if let Some(res) = residual {
+                            row.push(Value::Integer(rowid));
+                            let keep = eval_row(res, &row, &eval_cols, params, named_params)
+                                .map(|v| v.is_truthy())
+                                .unwrap_or(false);
+                            if !keep {
+                                return true;
+                            }
+                            row.pop();
                         }
                         rows.push(row);
                     }
                 }
             }
-            (None, _) => {
-                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    if let Some(res) = residual {
-                        row.push(Value::Integer(rowid));
-                        let keep = eval_row(res, &row, &eval_cols, params, named_params)
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
-                        if !keep {
-                            return true;
-                        }
-                        row.pop();
-                    }
-                    rows.push(row);
-                }
-            }
-        }
-        true
-    })?;
+            true
+        },
+        pred_may_reenter,
+    )?;
     Ok(ExecResult {
         columns: out_cols,
         rows,
@@ -13447,6 +14094,18 @@ fn exec_index_lookup_impl(
         .iter()
         .map(|e| evaluate(e, &eval_ctx))
         .collect::<Result<_>>()?;
+
+    // NULL equality probes match NOTHING (SQL 3VL: `v = NULL` is never
+    // true — not even for rows where v IS NULL). A NULL probe value
+    // encodes to exactly the stored NULL entry's key, so without this
+    // guard `WHERE v = ?` bound to NULL would return the v-IS-NULL rows
+    // (found by examples/probe_null_key.rs, differential vs SQLite).
+    if key_values.iter().any(|v| v.is_null()) {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
+    }
 
     // Encode the key: concatenate the order-preserving encoded form of each
     // indexed column value (must match encode_index_key's encoding —
@@ -13580,6 +14239,49 @@ fn exec_index_range(
             None => v,
         })
     };
+    // NULL bound: the comparison is NULL (SQL 3VL) — the range is
+    // EMPTY. The NULL order-key would otherwise EXACTLY match the
+    // stored NULL entries (`v >= NULL AND v <= NULL` / `v = NULL`
+    // planned as a degenerate range returned the v-IS-NULL rows —
+    // examples/probe_null_key2.rs, differential vs SQLite).
+    if let Some((e, _)) = start {
+        if evaluate(e, &eval_ctx)?.is_null() {
+            let columns: Arc<[String]> = if alias.as_deref().unwrap_or(&table.name) == table.name {
+                table.qualified_col_names.clone()
+            } else {
+                let prefix = alias.as_deref().unwrap_or(&table.name);
+                table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", prefix, c.name))
+                    .collect::<Vec<_>>()
+                    .into()
+            };
+            return Ok(ExecResult {
+                columns,
+                rows: Vec::new(),
+            });
+        }
+    }
+    if let Some((e, _)) = end {
+        if evaluate(e, &eval_ctx)?.is_null() {
+            let columns: Arc<[String]> = if alias.as_deref().unwrap_or(&table.name) == table.name {
+                table.qualified_col_names.clone()
+            } else {
+                let prefix = alias.as_deref().unwrap_or(&table.name);
+                table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", prefix, c.name))
+                    .collect::<Vec<_>>()
+                    .into()
+            };
+            return Ok(ExecResult {
+                columns,
+                rows: Vec::new(),
+            });
+        }
+    }
     let start_key: Option<(Vec<u8>, bool)> = match start {
         Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
         None => None,
@@ -13698,37 +14400,42 @@ fn exec_index_range(
             &eval_names
         };
         let mut bt = Btree::new(ctx.pager, table_root, false);
-        bt.scan_table_borrowed(|rowid, payload| {
-            // Advance the merge cursor.
-            while ri < rowids.len() && rowids[ri] < rowid {
-                ri += 1;
-            }
-            if ri >= rowids.len() {
-                return false; // all matches emitted — stop the scan early
-            }
-            if rowids[ri] != rowid {
-                return true; // not a match — keep scanning
-            }
-            ri += 1;
-            if let Ok(mut row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
-                if append_rowid {
-                    row.push(Value::Integer(rowid));
+        let pred_may_reenter = residual_pred.is_some_and(expr_has_subquery);
+        bt.scan_table_borrowed_opts(
+            |rowid, payload| {
+                // Advance the merge cursor.
+                while ri < rowids.len() && rowids[ri] < rowid {
+                    ri += 1;
                 }
-                let keep = match residual_pred {
-                    Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params) {
-                        Ok(v) => v.is_truthy(),
-                        Err(_) => false,
-                    },
-                    None => true,
-                };
-                if keep {
-                    if let Some(&pos) = position.get(&rowid) {
-                        placed[pos] = Some(row);
+                if ri >= rowids.len() {
+                    return false; // all matches emitted — stop the scan early
+                }
+                if rowids[ri] != rowid {
+                    return true; // not a match — keep scanning
+                }
+                ri += 1;
+                if let Ok(mut row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
+                    let keep = match residual_pred {
+                        Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params)
+                        {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => false,
+                        },
+                        None => true,
+                    };
+                    if keep {
+                        if let Some(&pos) = position.get(&rowid) {
+                            placed[pos] = Some(row);
+                        }
                     }
                 }
-            }
-            true
-        })?;
+                true
+            },
+            pred_may_reenter,
+        )?;
         for row in placed.into_iter().flatten() {
             rows.push(row);
         }
@@ -13832,6 +14539,24 @@ fn exec_index_range_projected(
             None => v,
         })
     };
+    // NULL bound: the comparison is NULL (SQL 3VL) — empty range (see
+    // exec_index_range's guard).
+    if let Some((e, _)) = start {
+        if evaluate(e, &eval_ctx)?.is_null() {
+            return Ok(ExecResult {
+                columns: out_cols,
+                rows: Vec::new(),
+            });
+        }
+    }
+    if let Some((e, _)) = end {
+        if evaluate(e, &eval_ctx)?.is_null() {
+            return Ok(ExecResult {
+                columns: out_cols,
+                rows: Vec::new(),
+            });
+        }
+    }
     let start_key: Option<(Vec<u8>, bool)> = match start {
         Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
         None => None,
@@ -16883,13 +17608,28 @@ fn try_streaming_update(
                 .iter()
                 .map(|e| evaluate(e, &eval_ctx))
                 .collect::<Result<_>>()?;
-            let mut buf = Vec::with_capacity(16);
-            crate::plugin::encode_collated_index_key_into(&index.columns, &key_values, &mut buf);
-            StreamingSource::IndexPoint {
-                table: t,
-                index,
-                residual: None,
-                keys: vec![buf],
+            // NULL equality probe: matches nothing (SQL 3VL — see
+            // exec_index_lookup_impl's guard).
+            if key_values.iter().any(|v| v.is_null()) {
+                StreamingSource::IndexPoint {
+                    table: t,
+                    index,
+                    residual: None,
+                    keys: Vec::new(),
+                }
+            } else {
+                let mut buf = Vec::with_capacity(16);
+                crate::plugin::encode_collated_index_key_into(
+                    &index.columns,
+                    &key_values,
+                    &mut buf,
+                );
+                StreamingSource::IndexPoint {
+                    table: t,
+                    index,
+                    residual: None,
+                    keys: vec![buf],
+                }
             }
         }
         // `UPDATE t SET ... WHERE indexed_col IN (...)`: probe each
@@ -18704,9 +19444,20 @@ fn try_streaming_delete(
                 .iter()
                 .map(|e| evaluate(e, &eval_ctx))
                 .collect::<Result<_>>()?;
-            let mut buf = Vec::with_capacity(16);
-            crate::plugin::encode_collated_index_key_into(&index.columns, &key_values, &mut buf);
-            (t, None, None, None, Some((index.clone(), vec![buf])))
+            // NULL equality probe: matches nothing (SQL 3VL — see
+            // exec_index_lookup_impl's guard).
+            let probe_keys = if key_values.iter().any(|v| v.is_null()) {
+                Vec::new()
+            } else {
+                let mut buf = Vec::with_capacity(16);
+                crate::plugin::encode_collated_index_key_into(
+                    &index.columns,
+                    &key_values,
+                    &mut buf,
+                );
+                vec![buf]
+            };
+            (t, None, None, None, Some((index.clone(), probe_keys)))
         }
         _ => return Ok(None),
     };
@@ -18964,25 +19715,30 @@ fn try_streaming_delete(
         }
     } else {
         // Full scan (optionally filtered): walk every cell.
-        bt.scan_table_borrowed(|rowid, payload| {
-            if let Some(pred) = residual_pred {
-                row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
-                {
-                    return true;
-                }
-                match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
-                    Ok(v) if v.is_truthy() => {}
-                    Ok(_) => return true,
-                    Err(e) => {
-                        first_error = Some(e);
-                        return false;
+        let pred_may_reenter = residual_pred.is_some_and(expr_has_subquery);
+        bt.scan_table_borrowed_opts(
+            |rowid, payload| {
+                if let Some(pred) = residual_pred {
+                    row_buf.clear();
+                    if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
+                        .is_err()
+                    {
+                        return true;
+                    }
+                    match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                        Ok(v) if v.is_truthy() => {}
+                        Ok(_) => return true,
+                        Err(e) => {
+                            first_error = Some(e);
+                            return false;
+                        }
                     }
                 }
-            }
-            rowids.push(rowid);
-            true
-        })?;
+                rowids.push(rowid);
+                true
+            },
+            pred_may_reenter,
+        )?;
     }
     if let Some(e) = first_error {
         return Err(e);

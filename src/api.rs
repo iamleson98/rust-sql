@@ -859,6 +859,15 @@ fn pre_encode_literal_keys(keys: &[FastBound], index: &Index) -> Option<Arc<[u8]
     if !keys.iter().all(|k| matches!(k, FastBound::Literal(_))) {
         return None;
     }
+    // A literal NULL probe key matches NOTHING (SQL 3VL: v = NULL is
+    // never true); declining pre-encoding keeps the runtime guards in
+    // charge of that decision.
+    if keys
+        .iter()
+        .any(|k| matches!(k, FastBound::Literal(v) if v.is_null()))
+    {
+        return None;
+    }
     let mut buf = Vec::with_capacity(keys.len() * 8);
     for (i, k) in keys.iter().enumerate() {
         if let FastBound::Literal(v) = k {
@@ -6502,6 +6511,11 @@ impl Database {
                 pre_encoded,
                 ..
             } => {
+                // NULL probe key (runtime-bound): matches nothing (SQL
+                // 3VL — see exec_index_lookup_impl's guard).
+                if keys.iter().any(|k| k.resolve(params).is_null()) {
+                    return Ok(vec![vec![Value::Integer(0)]]);
+                }
                 let mut key_scratch: Vec<u8>;
                 let key_bytes: &[u8] = match pre_encoded {
                     Some(pre) => &pre[..],
@@ -6561,6 +6575,11 @@ impl Database {
                 project,
                 columns: _,
             } => {
+                // NULL probe key (runtime-bound or literal): matches
+                // nothing (SQL 3VL — see exec_index_lookup_impl's guard).
+                if keys.iter().any(|k| k.resolve(params).is_null()) {
+                    return Ok(Vec::new());
+                }
                 // Encode the key (same order-preserving encoding as the
                 // general path's exec_index_lookup). All-literal keys were
                 // pre-encoded at cache time — borrow, don't re-encode.

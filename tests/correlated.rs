@@ -299,3 +299,318 @@ fn explain_query_plan_rows() {
     let after = db.query("SELECT COUNT(*) FROM users", []).unwrap();
     assert_eq!(before, after);
 }
+
+/// The correlated-parameter rewrite (outer refs become bound parameters
+/// over a cached plan — index seeks per outer row instead of full
+/// inner scans + per-row correlated filter evaluation). Correctness at
+/// scale against real SQLite, including bound parameters MIXED with
+/// correlated bindings (the rewrite uses uniquely-named parameters, so
+/// positional slots can never alias).
+#[test]
+fn correlated_param_rewrite_matches_sqlite_at_scale() {
+    let (mut db, conn) = setup_scale();
+
+    let cases = [
+        "SELECT count(*) FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) >= 3",
+        "SELECT count(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.total > 90)",
+        "SELECT count(*) FROM users u WHERE (SELECT SUM(o.total) FROM orders o WHERE o.user_id = u.id) > 200",
+        "SELECT count(*) FROM users u WHERE u.dept = 'eng' AND (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) >= 2",
+        // correlated ref from BOTH sides of a range
+        "SELECT count(*) FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.total BETWEEN u.id AND u.id + 500) > 0",
+        // correlated subquery over a JOIN-shaped outer query
+        "SELECT count(*) FROM users u JOIN orders o ON o.user_id = u.id WHERE (SELECT COUNT(*) FROM items i WHERE i.order_id = o.id) >= 1",
+        // ORDER BY a correlated subquery
+        "SELECT u.id FROM users u ORDER BY (SELECT SUM(o.total) FROM orders o WHERE o.user_id = u.id), u.id LIMIT 7",
+    ];
+    assert_eq!(check(&mut db, &conn, &cases), 0, "scale mismatches");
+
+    // Bound parameters + correlation in the same statement: the
+    // correlated bindings are NAMED parameters, so the positional slots
+    // are untouched.
+    for (sql, params) in [
+        (
+            "SELECT count(*) FROM users u WHERE u.id > ? AND (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) >= ?",
+            vec![rustqlite::Value::Integer(300), rustqlite::Value::Integer(2)],
+        ),
+        (
+            "SELECT count(*) FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.total > ?)",
+            vec![rustqlite::Value::Integer(50)],
+        ),
+    ] {
+        let ours = db.query(sql, params.clone()).unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let r: Vec<Vec<rustqlite::Value>> = stmt
+            .query_map(
+                rusqlite::params_from_iter(params.iter().map(|v| match v {
+                    rustqlite::Value::Integer(i) => *i,
+                    _ => 0,
+                })),
+                |r| Ok(vec![rustqlite::Value::Integer(r.get::<_, i64>(0)?)]),
+            )
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        assert_eq!(
+            format!("{:?}", ours),
+            format!("{:?}", r),
+            "param+correlation mismatch: {sql}"
+        );
+    }
+}
+
+/// Scale fixture: 800 users, 4000 orders, 12000 items.
+fn setup_scale() -> (Database, rusqlite::Connection) {
+    let mut db = Database::open_in_memory().unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary REAL)",
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, qty INTEGER)",
+    ] {
+        db.execute(s, []).unwrap();
+        conn.execute(s, []).unwrap();
+    }
+    let mut sql = String::from("INSERT INTO users VALUES ");
+    for i in 1..=800 {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!(
+            "({}, 'u{}', '{}', {})",
+            i,
+            i,
+            if i % 3 == 0 { "eng" } else { "ops" },
+            i
+        ));
+    }
+    db.execute(&sql, []).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    let mut sql = String::from("INSERT INTO orders VALUES ");
+    for i in 1..=4000 {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, {}, {})", i, i % 800 + 1, (i * 7) % 100));
+    }
+    db.execute(&sql, []).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    let mut sql = String::from("INSERT INTO items VALUES ");
+    for i in 1..=12000 {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, {}, {})", i, i % 4000 + 1, i % 5));
+    }
+    db.execute(&sql, []).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    (db, conn)
+}
+
+/// Adversarial differential battery for the correlated-parameter rewrite:
+/// nesting (the positional binding stack), SIBLING subqueries (the
+/// stack-address cache-collision hazard), DDL between evaluations (the
+/// schema cookie), the EXISTS LIMIT clamp shapes, correlated subqueries
+/// in every clause position, and DML shapes (compared by table STATE —
+/// query() surfaces the change count while rusqlite returns none).
+#[test]
+fn correlated_rewrite_adversarial_matches_sqlite() {
+    let (mut db, conn) = setup();
+
+    let cases = [
+        // ---- nesting: two levels, each level binds past its ancestor's tail
+        "SELECT u.name FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id AND o.total > (SELECT AVG(o2.total) FROM orders o2 WHERE o2.user_id = u.id)) >= 1",
+        // ---- sibling correlated subqueries at the SAME expression depth
+        "SELECT u.id FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) >= 1 AND (SELECT SUM(o.total) FROM orders o WHERE o.user_id = u.id) > 100 ORDER BY u.id",
+        // ---- three siblings, mixed kinds (scalar/EXISTS/IN)
+        "SELECT u.id FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) >= 2 AND EXISTS (SELECT 1 FROM items i WHERE i.order_id IN (SELECT o.id FROM orders o WHERE o.user_id = u.id)) ORDER BY u.id",
+        // ---- correlated ref on both sides of the correlation itself
+        "SELECT u.id FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id AND u.id < o.total) >= 1 ORDER BY u.id",
+        // ---- bare (unqualified) correlated refs — runtime outer-scope stack
+        "SELECT u.id FROM users u WHERE (SELECT COUNT(*) FROM orders WHERE user_id = id) >= 1 ORDER BY u.id",
+        // ---- correlation through a JOIN-shaped outer query
+        "SELECT u.name, o.id FROM users u JOIN orders o ON o.user_id = u.id WHERE (SELECT COUNT(*) FROM items i WHERE i.order_id = o.id) >= 2 ORDER BY o.id",
+        // ---- correlated subquery in SELECT list, ORDER BY
+        "SELECT u.name, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS n FROM users u ORDER BY n DESC, u.name",
+        // ---- ORDER BY a correlated subquery
+        "SELECT u.id FROM users u ORDER BY (SELECT MAX(o.total) FROM orders o WHERE o.user_id = u.id) DESC, u.id LIMIT 3",
+        // ---- HAVING: correlate by the GROUP KEY (a subquery referencing a
+        // NON-grouped column is SQLite's "some row of the group" extension —
+        // a documented pre-existing divergence, not tested here)
+        "SELECT u.dept, COUNT(*) FROM users u GROUP BY u.dept HAVING (SELECT COUNT(*) FROM orders o WHERE o.user_id IN (SELECT id FROM users u2 WHERE u2.dept = u.dept)) >= 3 ORDER BY u.dept",
+        // ---- EXISTS clamp shapes: existing LIMIT, LIMIT 0, OFFSET, ORDER BY
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id LIMIT 5) ORDER BY u.id",
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id LIMIT 0) ORDER BY u.id",
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id LIMIT 1 OFFSET 1) ORDER BY u.id",
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT o.total FROM orders o WHERE o.user_id = u.id ORDER BY o.total LIMIT 1) ORDER BY u.id",
+        // ---- NOT EXISTS
+        "SELECT u.id FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.total > 500) ORDER BY u.id",
+        // ---- correlated subquery referencing an outer computed expression
+        "SELECT u.id FROM users u WHERE u.salary > (SELECT AVG(o.total) FROM orders o WHERE o.user_id = u.id + 1) ORDER BY u.id",
+    ];
+    assert_eq!(check(&mut db, &conn, &cases), 0, "adversarial mismatches");
+
+    // ---- DML with correlated subqueries: fresh copies, compare TABLE STATE
+    for (dml, table) in [
+        (
+            "UPDATE users SET name = name || '!' WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = users.id) >= 2",
+            "users",
+        ),
+        (
+            "DELETE FROM orders WHERE (SELECT COUNT(*) FROM items i WHERE i.order_id = orders.id) = 0",
+            "orders",
+        ),
+        (
+            "DELETE FROM users WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = users.id AND o.total > 400)",
+            "users",
+        ),
+    ] {
+        let (mut ours, theirs) = setup();
+        ours.execute(dml, []).unwrap();
+        theirs.execute(dml, []).unwrap();
+        let render = format!("SELECT rowid, * FROM {} ORDER BY rowid", table);
+        let our_txt: Vec<String> = ours
+            .query(&render, [])
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| match v {
+                        rustqlite::Value::Null => "NULL".into(),
+                        rustqlite::Value::Integer(i) => format!("{}", i),
+                        rustqlite::Value::Real(f) => format!("{:.6}", f),
+                        rustqlite::Value::Text(t) => format!("{:?}", t),
+                        rustqlite::Value::Blob(b) => format!("x'{}'", b.len()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        let sqlite_txt: Vec<String> = {
+            let mut stmt = theirs.prepare(&render).unwrap();
+            let n = stmt.column_count();
+            stmt.query_map([], |r| {
+                let mut parts = Vec::with_capacity(n);
+                for i in 0..n {
+                    let v: rusqlite::types::Value = r.get(i)?;
+                    parts.push(match v {
+                        rusqlite::types::Value::Null => "NULL".into(),
+                        rusqlite::types::Value::Integer(i) => format!("{}", i),
+                        rusqlite::types::Value::Real(f) => format!("{:.6}", f),
+                        rusqlite::types::Value::Text(t) => format!("{:?}", t),
+                        rusqlite::types::Value::Blob(b) => format!("x'{}'", b.len()),
+                    });
+                }
+                Ok(parts.join("|"))
+            })
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+        };
+        assert_eq!(our_txt, sqlite_txt, "DML state mismatch: {dml}");
+    }
+
+    // ---- DDL between evaluations: the schema cookie must re-plan
+    {
+        let (mut db2, conn2) = setup();
+        let q = "SELECT COUNT(*) FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) >= 1";
+        let count_of = |rows: &Vec<Vec<rustqlite::Value>>| -> i64 {
+            rows.first()
+                .and_then(|r| r.first())
+                .and_then(|v| match v {
+                    rustqlite::Value::Integer(i) => Some(*i),
+                    _ => None,
+                })
+                .unwrap_or(-1)
+        };
+        let before = count_of(&db2.query(q, []).unwrap());
+        let sqlite_before: i64 = conn2
+            .prepare(q)
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .unwrap();
+        db2.execute("CREATE INDEX ix_o_user ON orders(user_id)", [])
+            .unwrap();
+        conn2
+            .execute("CREATE INDEX ix_o_user ON orders(user_id)", [])
+            .unwrap();
+        // A FRESH user + order: the qualifying-user count must change.
+        db2.execute("INSERT INTO users VALUES (999, 'eve', 'eng', 1.0)", [])
+            .unwrap();
+        conn2
+            .execute("INSERT INTO users VALUES (999, 'eve', 'eng', 1.0)", [])
+            .unwrap();
+        db2.execute("INSERT INTO orders VALUES (999, 999, 50)", [])
+            .unwrap();
+        conn2
+            .execute("INSERT INTO orders VALUES (999, 999, 50)", [])
+            .unwrap();
+        let after = count_of(&db2.query(q, []).unwrap());
+        let sqlite_after: i64 = conn2
+            .prepare(q)
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, sqlite_before, "before-DDL");
+        assert_eq!(after, sqlite_after, "after-DDL");
+        assert_ne!(before, after, "the insert must be visible");
+    }
+
+    // ---- NULL-bound equality probes over nullable columns (the SQL 3VL
+    //      guards found by examples/probe_null_key*.rs)
+    {
+        let (mut db2, conn2) = setup();
+        db2.execute("UPDATE orders SET total = NULL WHERE id = 1", [])
+            .unwrap();
+        conn2
+            .execute("UPDATE orders SET total = NULL WHERE id = 1", [])
+            .unwrap();
+        for sql in [
+            "SELECT COUNT(*) FROM orders WHERE total = ?",
+            "SELECT COUNT(*) FROM orders WHERE total >= ? AND total <= ?",
+            "SELECT COUNT(*) FROM orders WHERE total BETWEEN ? AND ?",
+            "SELECT id FROM orders WHERE total = ? ORDER BY id",
+            "SELECT COUNT(*) FROM orders WHERE total > ?",
+        ] {
+            let ours = db2
+                .query(sql, vec![rustqlite::Value::Null, rustqlite::Value::Null])
+                .unwrap();
+            let mut stmt = conn2.prepare(sql).unwrap();
+            let n = stmt.parameter_count();
+            let theirs: Vec<Vec<rusqlite::types::Value>> = if n > 1 {
+                stmt.query_map([rusqlite::types::Null; 2], |r| {
+                    (0..r.as_ref().column_count())
+                        .map(|i| r.get(i))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+            } else {
+                stmt.query_map([rusqlite::types::Null], |r| {
+                    (0..r.as_ref().column_count())
+                        .map(|i| r.get(i))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+            };
+            assert_eq!(
+                format!("{:?}", ours),
+                format!("{:?}", theirs),
+                "NULL-param mismatch: {sql}"
+            );
+        }
+        // non-NULL probes still agree with NULL rows present
+        let cases3 = [
+            "SELECT COUNT(*) FROM orders WHERE total = 200",
+            "SELECT COUNT(*) FROM orders WHERE total > 100 AND total < 300",
+            "SELECT id FROM orders WHERE total = 100 ORDER BY id",
+        ];
+        assert_eq!(
+            check(&mut db2, &conn2, &cases3),
+            0,
+            "post-NULL-update mismatches"
+        );
+    }
+}

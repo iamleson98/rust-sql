@@ -1438,7 +1438,119 @@ pub struct BtreeHandleState {
     index_leaf: Option<StructIndexHint>,
 }
 
-/// A B+tree over a pager. Trees are identified by their root page ID.
+/// One deferred visitor cell: either an in-page payload (offset/len
+/// into `ScanBatch::payload`) or an overflow cell (local prefix in
+/// `payload`, full length + chain head for assembly at visit time).
+#[derive(Clone, Copy)]
+enum ScanCell {
+    InPage {
+        rowid: i64,
+        off: u32,
+        len: u32,
+    },
+    Overflow {
+        rowid: i64,
+        off: u32,
+        len: u32,
+        plen: u64,
+        chain: u32,
+    },
+}
+
+/// Deferred leaf-visitor batch: cells are copied out of the leaf
+/// UNDER its lock, and the visitor callbacks run AFTER the lock is
+/// released. This is what makes RE-ENTRANT scans of the same table
+/// work: a correlated subquery evaluated inside a visitor callback
+/// (filter evaluation) re-enters `get_page` on this very leaf, and
+/// the held page Mutex deadlocks on the same thread — found by the
+/// nested-correlation differential probe (`WHERE x > (SELECT ..
+/// FROM <same table> ..)` hung forever; pre-existing). The batch is
+/// reused across all leaves of one scan (cleared per leaf); overflow
+/// assembly uses the batch's own scratch, not a thread-local (a
+/// nested scan reusing a thread-local buffer would corrupt the outer
+/// visitor's payload). Contract unchanged: the callback must not
+/// RETAIN the payload slice past its return.
+#[derive(Default)]
+struct ScanBatch {
+    payload: Vec<u8>,
+    cells: Vec<ScanCell>,
+    overflow_scratch: Vec<u8>,
+}
+
+impl ScanBatch {
+    fn clear(&mut self) {
+        self.payload.clear();
+        self.cells.clear();
+    }
+
+    fn push_in_page(&mut self, rowid: i64, bytes: &[u8]) {
+        let off = self.payload.len() as u32;
+        self.payload.extend_from_slice(bytes);
+        self.cells.push(ScanCell::InPage {
+            rowid,
+            off,
+            len: bytes.len() as u32,
+        });
+    }
+
+    fn push_overflow(&mut self, rowid: i64, local: &[u8], plen: u64, chain: u32) {
+        let off = self.payload.len() as u32;
+        self.payload.extend_from_slice(local);
+        self.cells.push(ScanCell::Overflow {
+            rowid,
+            off,
+            len: local.len() as u32,
+            plen,
+            chain,
+        });
+    }
+
+    /// Phase 2 — visit the batched cells with NO page lock held.
+    /// Returns the visitor's continue flag.
+    fn visit<F: FnMut(i64, &[u8]) -> bool>(&mut self, bt: &mut Btree, f: &mut F) -> Result<bool> {
+        let mut idx = 0usize;
+        while idx < self.cells.len() {
+            let (rowid, off, len, over) = match self.cells[idx] {
+                ScanCell::InPage { rowid, off, len } => (rowid, off, len, None),
+                ScanCell::Overflow {
+                    rowid,
+                    off,
+                    len,
+                    plen,
+                    chain,
+                } => (rowid, off, len, Some((plen, chain))),
+            };
+            let cont = match over {
+                None => {
+                    let start = off as usize;
+                    let end = start + len as usize;
+                    f(rowid, &self.payload[start..end])
+                }
+                Some((plen, chain)) => {
+                    // Disjoint field borrows: local prefix from
+                    // `payload`, assembly into `overflow_scratch`.
+                    let ScanBatch {
+                        payload,
+                        overflow_scratch,
+                        ..
+                    } = self;
+                    overflow_scratch.clear();
+                    let start = off as usize;
+                    let end = start + len as usize;
+                    let local: &[u8] = &payload[start..end];
+                    bt.assemble_overflow_payload_into(local, plen, chain, overflow_scratch)?;
+                    f(rowid, overflow_scratch)
+                }
+            };
+            if !cont {
+                return Ok(false);
+            }
+            idx += 1;
+        }
+        Ok(true)
+    }
+}
+
 pub struct Btree<'a> {
     pub pager: &'a Pager,
     pub root: PageId,
@@ -5979,7 +6091,6 @@ impl<'a> Btree<'a> {
     pub fn scan_table<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
         self.scan_subtree(self.root, &mut f).map(|_| ())
     }
-
     /// Zero-allocation table scan: callback receives `(rowid, payload_bytes)`
     /// where `payload_bytes` is a BORROW into the cached page's data buffer.
     ///
@@ -5991,14 +6102,58 @@ impl<'a> Btree<'a> {
     /// guard for the whole leaf iteration, so the callback must NOT call
     /// back into the pager (no `get_page`, no `allocate_page`). For pure
     /// decode/transform callbacks this is fine.
-    pub fn scan_table_borrowed<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
-        self.scan_subtree_borrowed(self.root, &mut f).map(|_| ())
+    /// `may_reenter`: does the visitor callback possibly call back into
+    /// the pager (a correlated subquery inside a filter predicate, a
+    /// table-valued function, ...)? Two leaf disciplines:
+    /// - `false` (the default for every pure decode/transform visitor):
+    ///   ZERO-COPY — the callback borrows payload bytes straight from
+    ///   the page buffer under the leaf lock, exactly as before.
+    /// - `true`: DEFERRED — cell payloads are batch-copied under the
+    ///   lock and the callback runs lock-free (a re-entrant get_page on
+    ///   this leaf would otherwise deadlock on the held Mutex; found by
+    ///   the nested-correlation probe).
+    pub fn scan_table_borrowed_opts<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        mut f: F,
+        may_reenter: bool,
+    ) -> Result<()> {
+        if may_reenter {
+            // ONE batch for the whole scan: the buffers grow on the
+            // first leaf and are reused by every subsequent leaf.
+            let mut batch = ScanBatch::default();
+            self.scan_subtree_borrowed(self.root, &mut f, &mut batch)?;
+            Ok(())
+        } else {
+            self.scan_subtree_borrowed_fast(self.root, &mut f)
+                .map(|_| ())
+        }
+    }
+
+    /// Zero-allocation table scan: callback receives `(rowid, payload_bytes)`
+    /// where `payload_bytes` is a BORROW into the cached page's data buffer.
+    ///
+    /// This bypasses `Cell::decode` which would allocate a fresh `Vec<u8>`
+    /// per row to copy the payload out. For a 10k-row scan, that's 10k
+    /// malloc+free pairs saved (~500μs on a hot CPU).
+    ///
+    /// The catch: the borrow is tied to the page lock. We hold the Mutex
+    /// guard for the whole leaf iteration, so the callback must NOT call
+    /// back into the pager (no `get_page`, no `allocate_page`) — callers
+    /// whose visitor evaluates a CORRELATED SUBQUERY (which re-enters the
+    /// pager on this very leaf when the subquery scans the same table)
+    /// must use `scan_table_borrowed_opts(_, true)` instead.
+    pub fn scan_table_borrowed<F: FnMut(i64, &[u8]) -> bool>(&mut self, f: F) -> Result<()> {
+        self.scan_table_borrowed_opts(f, false)
     }
 
     /// Returns `Ok(false)` when the visitor stopped the scan early —
     /// interior nodes propagate the stop so `false` unwinds the whole
     /// tree walk instead of visiting every remaining leaf.
-    fn scan_subtree_borrowed<F: FnMut(i64, &[u8]) -> bool>(
+    /// The ZERO-COPY leaf discipline (see `scan_table_borrowed_opts`):
+    /// the visitor runs under the leaf lock, borrowing payload bytes
+    /// straight from the page buffer. Only for visitors that CANNOT
+    /// re-enter the pager.
+    fn scan_subtree_borrowed_fast<F: FnMut(i64, &[u8]) -> bool>(
         &mut self,
         page_id: PageId,
         f: &mut F,
@@ -6070,13 +6225,11 @@ impl<'a> Btree<'a> {
                                 .unwrap(),
                         );
                         // Reuse one assembly buffer across all overflow
-                        // rows in this scan: a 64KB blob scan otherwise
-                        // pays a 64KB malloc+free per row (~100 rows =
-                        // 6.4MB of allocator traffic + zeroing). The
-                        // callback receives the buffer's contents and
-                        // must NOT retain the slice (it is reused for
-                        // the next row) — the scan callbacks copy or
-                        // decode synchronously, so this is safe.
+                        // rows in this scan. The callback receives the
+                        // buffer's contents and must NOT retain the slice
+                        // (it is reused for the next row) — the scan
+                        // callbacks copy or decode synchronously, so this
+                        // is safe.
                         thread_local! {
                             static ASSEMBLE_BUF: std::cell::RefCell<Vec<u8>> =
                                 std::cell::RefCell::new(Vec::with_capacity(1 << 16));
@@ -6110,6 +6263,133 @@ impl<'a> Btree<'a> {
                             v.push(left_child);
                         }
                     }
+                    if right != 0 {
+                        v.push(right);
+                    }
+                    v
+                };
+                drop(page);
+                for child in cells {
+                    if !self.scan_subtree_borrowed_fast(child, f)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in scan_borrowed: {:?}",
+                pt
+            ))),
+        }
+    }
+
+    fn scan_subtree_borrowed<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        page_id: PageId,
+        f: &mut F,
+        batch: &mut ScanBatch,
+    ) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let pt = page.lock().page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                // DEFERRED-visitor leaf: phase 1 copies every cell's
+                // payload bytes into the batch under ONE lock (no
+                // allocation, no visitor code running); phase 2 runs the
+                // visitor with the lock RELEASED. The old design called
+                // the visitor under the lock (zero-copy borrows into the
+                // page buffer) — which DEADLOCKED any re-entrant scan of
+                // the same table: a correlated subquery evaluated inside
+                // the visitor re-enters get_page on this very leaf and
+                // blocks on the held Mutex forever (nested-correlation
+                // probe). The per-leaf batch copy (~1 memcpy of the
+                // leaf's payload bytes, reused buffer) is the price of
+                // re-entrancy safety; the visitor contract is unchanged
+                // (payload slices must not be retained past the call —
+                // the same contract the overflow path always had).
+                {
+                    batch.clear();
+                    let borrowed = page.lock();
+                    prefetch_search_lines(&borrowed.data);
+                    let n = borrowed.n_cells();
+                    let psz = borrowed.data.len();
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        if cell_ptr >= psz {
+                            return Err(Error::corruption(format!(
+                                "cell pointer {} out of range",
+                                cell_ptr
+                            )));
+                        }
+                        // Decode rowid varint + payload length varint, then
+                        // copy the payload bytes into the batch.
+                        let buf = borrowed.cell_slice_checked(cell_ptr)?;
+                        let (rowid, n1) = varint::decode_signed(buf).ok_or_else(|| {
+                            Error::corruption("truncated leaf rowid in scan_borrowed")
+                        })?;
+                        let rest = &buf[n1..];
+                        let (plen, n2) = varint::decode(rest).ok_or_else(|| {
+                            Error::corruption("truncated leaf payload len in scan_borrowed")
+                        })?;
+                        let payload_start = n1 + n2;
+                        let plen = plen as usize;
+                        let page_size = psz;
+                        let local_len = overflow_local_len_for(plen, page_size);
+                        if local_len == plen {
+                            // In-page payload. Corrupt files can carry huge
+                            // payload-length varints: checked add, not
+                            // `payload_start + plen` (which overflows usize
+                            // and panics in debug builds).
+                            if plen
+                                .checked_add(payload_start)
+                                .map_or(true, |end| end > buf.len())
+                            {
+                                return Err(Error::corruption(
+                                    "truncated leaf payload in scan_borrowed",
+                                ));
+                            }
+                            batch.push_in_page(rowid, &buf[payload_start..payload_start + plen]);
+                        } else {
+                            // Overflow cell: local prefix + 4-byte chain
+                            // head, copied now; the chain is assembled in
+                            // phase 2 (no leaf lock held — a nested scan
+                            // assembling the same chain would deadlock on
+                            // the overflow pages otherwise).
+                            if local_len + 4 > buf.len() - payload_start {
+                                return Err(Error::corruption(
+                                    "truncated overflow cell in scan_borrowed",
+                                ));
+                            }
+                            let local = &buf[payload_start..payload_start + local_len];
+                            let chain = u32::from_be_bytes(
+                                buf[payload_start + local_len..payload_start + local_len + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            batch.push_overflow(rowid, local, plen as u64, chain);
+                        }
+                    }
+                }
+                drop(page);
+                batch.visit(self, f)
+            }
+            PageType::InteriorTable => {
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
+                let cells: Vec<PageId> = {
+                    let borrowed = page.lock();
+                    let mut v = Vec::with_capacity(n as usize + 1);
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let c = Cell::decode(
+                            borrowed.cell_slice_checked(cell_ptr)?,
+                            pt,
+                            borrowed.page_size(),
+                        )?;
+                        if let Cell::TableInterior { left_child, .. } = c {
+                            v.push(left_child);
+                        }
+                    }
                     // 0 = "no rightmost child" (an interior page keeps
                     // this after a split); descending into 0 would scan the
                     // header/schema-root page and yield its row as a table
@@ -6122,7 +6402,7 @@ impl<'a> Btree<'a> {
                 };
                 drop(page);
                 for child in cells {
-                    if !self.scan_subtree_borrowed(child, f)? {
+                    if !self.scan_subtree_borrowed(child, f, batch)? {
                         return Ok(false);
                     }
                 }
@@ -7137,10 +7417,164 @@ impl<'a> Btree<'a> {
         &mut self,
         start: i64,
         end: i64,
-        mut f: F,
+        f: F,
     ) -> Result<()> {
-        self.scan_range_subtree_borrowed(self.root, start, end, &mut f)?;
-        Ok(())
+        self.scan_table_range_borrowed_opts(start, end, f, false)
+    }
+
+    /// The range twin of `scan_table_borrowed_opts`: `may_reenter`
+    /// visitors (correlated subqueries in range predicates) get the
+    /// DEFERRED leaf discipline (batch copy under the lock, visitor
+    /// lock-free); pure decode visitors keep the zero-copy fast path.
+    pub fn scan_table_range_borrowed_opts<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        start: i64,
+        end: i64,
+        mut f: F,
+        may_reenter: bool,
+    ) -> Result<()> {
+        if may_reenter {
+            let mut batch = ScanBatch::default();
+            self.scan_range_subtree_borrowed_deferred(self.root, start, end, &mut f, &mut batch)?;
+            Ok(())
+        } else {
+            self.scan_range_subtree_borrowed(self.root, start, end, &mut f)?;
+            Ok(())
+        }
+    }
+
+    /// DEFERRED-visitor range recursion (see `scan_table_borrowed_opts`
+    /// for why the visitor must not run under the leaf lock).
+    fn scan_range_subtree_borrowed_deferred<F: FnMut(i64, &[u8]) -> bool>(
+        &mut self,
+        page_id: PageId,
+        start: i64,
+        end: i64,
+        f: &mut F,
+        batch: &mut ScanBatch,
+    ) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let pt = page.lock().page_type()?;
+        match pt {
+            PageType::LeafTable => {
+                batch.clear();
+                // Phase 1: binary-search the range start + copy the
+                // in-range cells under ONE lock (visitor never runs here).
+                {
+                    let borrowed = page.lock();
+                    prefetch_search_lines(&borrowed.data);
+                    let n = borrowed.n_cells();
+                    let psz = borrowed.data.len();
+                    let mut lo: u16 = 0;
+                    let mut hi: u16 = n;
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid) as usize;
+                        if cell_ptr >= psz {
+                            return Err(Error::corruption(format!(
+                                "cell pointer {} out of range",
+                                cell_ptr
+                            )));
+                        }
+                        match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
+                            Some((rowid, _)) if rowid < start => lo = mid + 1,
+                            _ => hi = mid,
+                        }
+                    }
+                    let mut stop = false;
+                    for i in lo..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        if cell_ptr >= psz {
+                            return Err(Error::corruption(format!(
+                                "cell pointer {} out of range",
+                                cell_ptr
+                            )));
+                        }
+                        let buf = borrowed.cell_slice_checked(cell_ptr)?;
+                        let (rowid, n1) = varint::decode_signed(buf).ok_or_else(|| {
+                            Error::corruption("truncated leaf rowid in range_borrowed")
+                        })?;
+                        if rowid > end {
+                            stop = true;
+                            break;
+                        }
+                        if rowid >= start {
+                            let rest = &buf[n1..];
+                            let (plen, n2) = varint::decode(rest).ok_or_else(|| {
+                                Error::corruption("truncated payload len in range_borrowed")
+                            })?;
+                            let payload_start = n1 + n2;
+                            let plen_usize = plen as usize;
+                            let local_len = overflow_local_len_for(plen_usize, psz);
+                            if local_len == plen_usize {
+                                if payload_start + plen_usize > buf.len() {
+                                    return Err(Error::corruption(
+                                        "truncated payload in range_borrowed",
+                                    ));
+                                }
+                                batch.push_in_page(
+                                    rowid,
+                                    &buf[payload_start..payload_start + plen_usize],
+                                );
+                            } else {
+                                if local_len + 4 > buf.len() - payload_start {
+                                    return Err(Error::corruption(
+                                        "truncated overflow cell in range_borrowed",
+                                    ));
+                                }
+                                let local = &buf[payload_start..payload_start + local_len];
+                                let chain = u32::from_be_bytes(
+                                    buf[payload_start + local_len..payload_start + local_len + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                batch.push_overflow(rowid, local, plen, chain);
+                            }
+                        }
+                    }
+                    if stop {
+                        return Ok(false);
+                    }
+                }
+                drop(page);
+                // Phase 2: visitor with NO leaf lock held.
+                batch.visit(self, f)
+            }
+            PageType::InteriorTable => {
+                let n = page.lock().n_cells();
+                let right = page.lock().right_most_pointer();
+                let cells: Vec<PageId> = {
+                    let borrowed = page.lock();
+                    let mut v = Vec::with_capacity(n as usize + 1);
+                    for i in 0..n {
+                        let cell_ptr = borrowed.cell_pointer(i) as usize;
+                        let c = Cell::decode(
+                            borrowed.cell_slice_checked(cell_ptr)?,
+                            pt,
+                            borrowed.page_size(),
+                        )?;
+                        if let Cell::TableInterior { left_child, .. } = c {
+                            v.push(left_child);
+                        }
+                    }
+                    if right != 0 {
+                        v.push(right);
+                    }
+                    v
+                };
+                drop(page);
+                for child in cells {
+                    if !self.scan_range_subtree_borrowed_deferred(child, start, end, f, batch)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(Error::corruption(format!(
+                "unexpected page type in range_borrowed: {:?}",
+                pt
+            ))),
+        }
     }
 
     /// FUSED scan+patch: walk the rowid range handing each cell's payload
