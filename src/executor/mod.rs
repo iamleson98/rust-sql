@@ -4668,6 +4668,55 @@ impl AggState {
     }
 }
 
+/// Hash key for a full ROW under `Value::eq` semantics (the Vec<Value>
+/// PartialEq the DISTINCT / set operations dedup with): numbers hash by
+/// their NORMALIZED f64 bits, so Integer(5) and Real(5.0) — which COMPARE
+/// equal — hash equal; distinct integers beyond f64 precision merely
+/// COLLIDE (the equality check disambiguates); NaN normalizes to one
+/// canonical pattern (all NaNs compare Equal under the engine's value
+/// order); -0.0 folds to +0.0 (they compare Equal too). TEXT and BLOB
+/// hash their bytes with their own type tags.
+struct SqlRowKey(Vec<Value>);
+
+impl PartialEq for SqlRowKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for SqlRowKey {}
+impl std::hash::Hash for SqlRowKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.0.len());
+        for v in &self.0 {
+            match v {
+                Value::Null => state.write_u8(0),
+                Value::Integer(i) => {
+                    state.write_u8(1);
+                    state.write_u64((*i as f64).to_bits());
+                }
+                Value::Real(f) => {
+                    state.write_u8(1);
+                    if f.is_nan() {
+                        state.write_u64(f64::NAN.to_bits());
+                    } else if *f == 0.0 {
+                        state.write_u64(0u64); // -0.0 == 0.0 under the value order
+                    } else {
+                        state.write_u64(f.to_bits());
+                    }
+                }
+                Value::Text(s) => {
+                    state.write_u8(3);
+                    s.hash(state);
+                }
+                Value::Blob(b) => {
+                    state.write_u8(4);
+                    b.hash(state);
+                }
+            }
+        }
+    }
+}
+
 /// A single SQL value wrapped for use as a HashSet key with SQL equality
 /// semantics (numeric cross-type equality). Replaces the old `format!("{:?}")`
 /// String keys in DISTINCT aggregates — one Value clone (free for Int/Real)
@@ -7793,6 +7842,23 @@ fn exec_aggregate_no_group_by(
         aggregates,
     )? {
         return Ok(res);
+    }
+
+    // DISTINCT split: the fused machine declines every distinct
+    // aggregate; per-range AggState sets + range-ordered set-union
+    // merge (see parallel::try_parallel_distinct_aggregate). A decline
+    // (config / threshold / shape / worker bail) falls through to the
+    // serial paths below.
+    if aggregates.iter().any(|a| a.distinct) {
+        if let Some(res) = crate::executor::parallel::try_parallel_distinct_aggregate(
+            ctx,
+            &table,
+            alias.as_deref(),
+            filter_predicate,
+            aggregates,
+        )? {
+            return Ok(res);
+        }
     }
 
     // Fused typed-aggregate machine: bare-column numeric aggregates
@@ -11664,15 +11730,20 @@ fn exec_index_nested_loop_join(
 
 fn exec_distinct(ctx: &mut ExecContext<'_>, input: &Plan) -> Result<ExecResult> {
     let mut inner = execute(input, ctx)?;
-    let mut seen: Vec<Row> = Vec::new();
-    inner.rows.retain(|r| {
-        if seen.contains(r) {
-            false
-        } else {
-            seen.push(r.clone());
-            true
+    // O(n) first-occurrence dedup under `Value::eq` semantics (the old
+    // Vec::contains linear scan was O(n^2) — 300k rows took 132 s;
+    // SQLite dedups DISTINCT through a hashed ephemeral index). The key
+    // hashes rows consistently with row equality (see SqlRowKey), so
+    // equal rows still collapse and first-seen order is preserved.
+    let mut seen: std::collections::HashSet<SqlRowKey> =
+        std::collections::HashSet::with_capacity(inner.rows.len());
+    let mut out: Vec<Row> = Vec::with_capacity(inner.rows.len());
+    for row in inner.rows.drain(..) {
+        if seen.insert(SqlRowKey(row.clone())) {
+            out.push(row);
         }
-    });
+    }
+    inner.rows = out;
     Ok(inner)
 }
 
@@ -11693,13 +11764,17 @@ fn exec_union(
     if all {
         rows.extend(r.rows);
     } else {
-        let mut seen: Vec<Row> = Vec::new();
-        for row in rows.iter().chain(r.rows.iter()) {
-            if !seen.contains(row) {
-                seen.push(row.clone());
+        // O(n) dedup of the concatenation, first-seen order (the old
+        // Vec::contains scan was O(n^2)).
+        let mut seen: std::collections::HashSet<SqlRowKey> =
+            std::collections::HashSet::with_capacity(rows.len() + r.rows.len());
+        let mut out: Vec<Row> = Vec::with_capacity(rows.len() + r.rows.len());
+        for row in rows.into_iter().chain(r.rows) {
+            if seen.insert(SqlRowKey(row.clone())) {
+                out.push(row);
             }
         }
-        rows = seen;
+        rows = out;
     }
     Ok(ExecResult { columns, rows })
 }
@@ -11708,32 +11783,38 @@ fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Resul
     let l = execute(left, ctx)?;
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
-    let mut seen: Vec<Row> = Vec::new();
-    for row in &l.rows {
-        if r.rows.contains(row) && !seen.contains(row) {
-            seen.push(row.clone());
+    // O(n) membership + dedup (the old Vec::contains scans were O(n^2)).
+    let rseen: std::collections::HashSet<SqlRowKey> =
+        r.rows.iter().map(|row| SqlRowKey(row.clone())).collect();
+    let mut seen: std::collections::HashSet<SqlRowKey> =
+        std::collections::HashSet::with_capacity(l.rows.len());
+    let mut out: Vec<Row> = Vec::with_capacity(l.rows.len());
+    for row in l.rows {
+        let key = SqlRowKey(row.clone());
+        if rseen.contains(&key) && seen.insert(key) {
+            out.push(row);
         }
     }
-    Ok(ExecResult {
-        columns,
-        rows: seen,
-    })
+    Ok(ExecResult { columns, rows: out })
 }
 
 fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<ExecResult> {
     let l = execute(left, ctx)?;
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
-    let mut seen: Vec<Row> = Vec::new();
-    for row in &l.rows {
-        if !r.rows.contains(row) && !seen.contains(row) {
-            seen.push(row.clone());
+    // O(n) membership + dedup (the old Vec::contains scans were O(n^2)).
+    let rseen: std::collections::HashSet<SqlRowKey> =
+        r.rows.iter().map(|row| SqlRowKey(row.clone())).collect();
+    let mut seen: std::collections::HashSet<SqlRowKey> =
+        std::collections::HashSet::with_capacity(l.rows.len());
+    let mut out: Vec<Row> = Vec::with_capacity(l.rows.len());
+    for row in l.rows {
+        let key = SqlRowKey(row.clone());
+        if !rseen.contains(&key) && seen.insert(key) {
+            out.push(row);
         }
     }
-    Ok(ExecResult {
-        columns,
-        rows: seen,
-    })
+    Ok(ExecResult { columns, rows: out })
 }
 
 // ============================================================================

@@ -1261,3 +1261,245 @@ fn parallel_topn_declared_collation_fuses() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// No-GROUP-BY DISTINCT aggregates: per-range AggState sets + range-ordered
+// set-union merge (parallel::try_parallel_distinct_aggregate). The battery
+// covers mixed distinct/non-distinct lists, every allowed function, and
+// compiled-filter shapes; TEXT distinct and NULL-degenerate tables pin the
+// semantics against the serial paths.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_distinct_aggregate_battery_matches_serial() {
+    // One big_db pair for the whole battery (building 300k rows per query
+    // would dominate the runtime).
+    let par = big_db();
+    let ser = {
+        let mut s = big_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let queries = [
+        "SELECT COUNT(DISTINCT cat), COUNT(DISTINCT v) FROM t",
+        "SELECT SUM(DISTINCT v) FROM t",
+        "SELECT COUNT(DISTINCT cat), SUM(DISTINCT v), MIN(DISTINCT v), MAX(DISTINCT v) FROM t",
+        "SELECT AVG(DISTINCT v) FROM t",
+        "SELECT TOTAL(DISTINCT v) FROM t",
+        // mixed: DISTINCT and non-DISTINCT in one list
+        "SELECT COUNT(DISTINCT cat), SUM(v), COUNT(*) FROM t",
+        // compiled filters
+        "SELECT COUNT(DISTINCT cat) FROM t WHERE v > 100000",
+        "SELECT SUM(DISTINCT v), COUNT(DISTINCT cat) FROM t WHERE cat < 50",
+        "SELECT MIN(DISTINCT v), MAX(DISTINCT v) FROM t WHERE cat >= 90",
+    ];
+    for sql in queries {
+        let a = rows_of(&par, sql);
+        let b = rows_of(&ser, sql);
+        assert_eq!(a.len(), 1, "{sql}: one aggregate row");
+        assert_eq!(a, b, "{sql}: parallel DISTINCT must equal serial");
+    }
+    // Ground truths (independent of the engine's DISTINCT machinery):
+    // cat = j % 100 over dense rowids -> exactly 100 distinct values.
+    match &rows_of(&par, "SELECT COUNT(DISTINCT cat) FROM t")[0][0] {
+        Value::Integer(i) => assert_eq!(*i, 100, "COUNT(DISTINCT cat) ground truth"),
+        other => panic!("INTEGER expected, got {other:?}"),
+    }
+    // COUNT(DISTINCT v): every row's v = id - 150000 is unique except the
+    // NULL rows (v IS NULL); distinct-count == non-NULL row count.
+    let row = &rows_of(&par, "SELECT COUNT(DISTINCT v), COUNT(v) FROM t")[0];
+    let distinct_v = match &row[0] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    let count_v = match &row[1] {
+        Value::Integer(i) => *i,
+        other => panic!("INTEGER expected, got {other:?}"),
+    };
+    assert_eq!(distinct_v, count_v, "DISTINCT v count == non-NULL v count");
+    // MIN/MAX(DISTINCT v) == MIN/MAX(v) (distinct never changes extremes).
+    let row = &rows_of(
+        &par,
+        "SELECT MIN(DISTINCT v), MAX(DISTINCT v), MIN(v), MAX(v) FROM t",
+    )[0];
+    assert_eq!(row[0], row[2], "MIN(DISTINCT v) == MIN(v)");
+    assert_eq!(row[1], row[3], "MAX(DISTINCT v) == MAX(v)");
+    // SUM(DISTINCT v) == SUM over the deduplicated subquery (a completely
+    // different execution path: materialize + dedup + aggregate).
+    let a = rows_of(&par, "SELECT SUM(DISTINCT v) FROM t");
+    let b = rows_of(&par, "SELECT SUM(v) FROM (SELECT DISTINCT v FROM t)");
+    assert_eq!(a, b, "SUM(DISTINCT v) == subquery-dedup SUM(v)");
+}
+
+#[test]
+fn parallel_distinct_text_matches_serial() {
+    // text_db: name = user-{j%1000} with the spelling chosen by j%5 —
+    // 1000 % 5 == 0, so each key arrives with exactly ONE spelling and
+    // the BINARY distinct count is exactly the key count.
+    let par = text_db();
+    let ser = {
+        let mut s = text_db();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql = "SELECT COUNT(DISTINCT name) FROM t";
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "TEXT COUNT(DISTINCT) must match serial");
+    match &a[0][0] {
+        Value::Integer(i) => assert_eq!(
+            *i, 1000,
+            "distinct BINARY names (one spelling per key by construction)"
+        ),
+        other => panic!("INTEGER expected, got {other:?}"),
+    }
+    // MIN/MAX(DISTINCT text) are the BINARY string extremes (a 'USER-'
+    // spelling precedes every 'user-' one byte-wise).
+    let sql2 = "SELECT MIN(DISTINCT name), MAX(DISTINCT name) FROM t";
+    let a2 = rows_of(&par, sql2);
+    let b2 = rows_of(&ser, sql2);
+    assert_eq!(a2, b2, "TEXT MIN/MAX(DISTINCT) must match serial");
+    // A dedicated table where every key DOES carry all 5 spellings
+    // (spelling by row-block, keys by rowid mod): 2000 keys x 5
+    // spellings = 10000 distinct BINARY strings.
+    let build = || {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        {
+            let mut i = 0i64;
+            while i < 200_000 {
+                let hi = (i + 1000).min(200_000);
+                let mut sql = String::from("INSERT INTO t (id, name, v) VALUES ");
+                for j in i..hi {
+                    if j > i {
+                        sql.push(',');
+                    }
+                    let name = match (j / 2000) % 5 {
+                        0 => format!("'user-{:05}'", j % 2000),
+                        1 => format!("'USER-{:05}'", j % 2000),
+                        2 => format!("'User-{:05}'", j % 2000),
+                        3 => format!("'uSeR-{:05}'", j % 2000),
+                        _ => format!("'UsEr-{:05}'", j % 2000),
+                    };
+                    sql.push_str(&format!("({}, {}, {})", j, name, -j));
+                }
+                db.execute(&sql, []).unwrap();
+                i = hi;
+            }
+        }
+        db.execute("COMMIT", []).unwrap();
+        db
+    };
+    let par5 = build();
+    let ser5 = {
+        let mut s = build();
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let sql3 = "SELECT COUNT(DISTINCT name) FROM t";
+    let a3 = rows_of(&par5, sql3);
+    let b3 = rows_of(&ser5, sql3);
+    assert_eq!(a3, b3, "5-spelling TEXT COUNT(DISTINCT) must match serial");
+    match &a3[0][0] {
+        Value::Integer(i) => assert_eq!(*i, 10_000, "2000 keys x 5 spellings"),
+        other => panic!("INTEGER expected, got {other:?}"),
+    }
+}
+
+#[test]
+fn parallel_distinct_null_and_sparse_semantics() {
+    // Degenerate distinct sets over big tables (above threshold):
+    // all-NULL column and one-non-NULL column.
+    let build = |non_null: Option<i64>| {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, cat INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        {
+            let mut i = 0i64;
+            while i < 200_000 {
+                let hi = (i + 1000).min(200_000);
+                let mut sql = String::from("INSERT INTO t (id, v, cat) VALUES ");
+                for j in i..hi {
+                    if j > i {
+                        sql.push(',');
+                    }
+                    let v = if Some(j) == non_null {
+                        "42".to_string()
+                    } else {
+                        "NULL".to_string()
+                    };
+                    sql.push_str(&format!("({}, {}, {})", j, v, j % 10));
+                }
+                db.execute(&sql, []).unwrap();
+                i = hi;
+            }
+        }
+        db.execute("COMMIT", []).unwrap();
+        db
+    };
+    // One non-NULL value: every DISTINCT aggregate sees exactly {42}.
+    let sql = "SELECT COUNT(DISTINCT v), SUM(DISTINCT v), MIN(DISTINCT v), MAX(DISTINCT v), AVG(DISTINCT v) FROM t";
+    let par = build(Some(150_000));
+    let ser = {
+        let mut s = build(Some(150_000));
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "sparse DISTINCT set must match serial");
+    assert_eq!(
+        a[0],
+        vec![
+            Value::Integer(1),
+            Value::Integer(42),
+            Value::Integer(42),
+            Value::Integer(42),
+            Value::Real(42.0)
+        ],
+        "one-value DISTINCT ground truth"
+    );
+    // All-NULL column: the distinct set is empty — COUNT 0, SUM/MIN/MAX
+    // NULL, AVG NULL (SQLite's empty-aggregate semantics).
+    let par = build(None);
+    let ser = {
+        let mut s = build(None);
+        s.execute("PRAGMA parallel_scan=0", []).unwrap();
+        s
+    };
+    let a = rows_of(&par, sql);
+    let b = rows_of(&ser, sql);
+    assert_eq!(a, b, "all-NULL DISTINCT must match serial");
+    assert_eq!(
+        a[0],
+        vec![
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ],
+        "empty DISTINCT set ground truth"
+    );
+    // A filter that passes NO rows: same empty-set semantics through the
+    // compiled-filter arm.
+    let sql_filtered =
+        "SELECT COUNT(DISTINCT v), SUM(DISTINCT v), MIN(DISTINCT v) FROM t WHERE v > 1000000000";
+    let a = rows_of(&par, sql_filtered);
+    let b = rows_of(&ser, sql_filtered);
+    assert_eq!(a, b, "filtered-empty DISTINCT must match serial");
+    assert_eq!(
+        a[0],
+        vec![Value::Integer(0), Value::Null, Value::Null],
+        "no-row DISTINCT ground truth"
+    );
+}

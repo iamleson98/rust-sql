@@ -357,6 +357,229 @@ pub(crate) fn try_parallel_fused_aggregate(
     Ok(Some(fused_finalize(aggregates, &accs)))
 }
 
+/// Parallel no-GROUP-BY DISTINCT aggregates (`SELECT COUNT(DISTINCT x),
+/// SUM(DISTINCT y) ... FROM big` — with an optional compiled filter):
+/// per-range `AggState` sets accumulate through the serial
+/// `update_agg_state` (the DISTINCT arm interns `SqlValueKey`s in a
+/// set), partials fold in RANGE ORDER via `merge_agg_state` (the
+/// DISTINCT arm replays the worker's set into the destination — the
+/// set-union is exactly the global distinct value set, each replayed
+/// value updating the numeric state once, which is precisely what the
+/// serial scan computed), and the merged states finish through the
+/// serial `finish_no_group_by` — column naming and finalization
+/// identical to the serial paths.
+///
+/// Gates: at least one DISTINCT aggregate (pure non-DISTINCT lists stay
+/// with the fused machine); every aggregate in {COUNT, SUM, TOTAL, AVG,
+/// MIN, MAX} — GROUP_CONCAT and the JSON group aggregates are
+/// order-dependent across ranges and decline; every arg a bare column
+/// of the scan or COUNT(*); a present filter must COMPILE positionally
+/// (`compile_predicate`), matching the serial compiled path the decline
+/// falls back to. `Ok(None)` = declined (shape below threshold / config
+/// off / txn open / a worker error) — the caller runs the serial path
+/// unchanged, so answers can never diverge.
+pub(crate) fn try_parallel_distinct_aggregate(
+    ctx: &ExecContext<'_>,
+    table: &StdArc<Table>,
+    alias: Option<&str>,
+    filter_predicate: Option<&Expr>,
+    aggregates: &[AggExpr],
+) -> Result<Option<ExecResult>> {
+    if !aggregates.iter().any(|a| a.distinct) {
+        return Ok(None); // the fused machine owns non-DISTINCT shapes
+    }
+    for agg in aggregates {
+        match AggFunc::from_name(&agg.func) {
+            AggFunc::Count
+            | AggFunc::Sum
+            | AggFunc::Total
+            | AggFunc::Avg
+            | AggFunc::Min
+            | AggFunc::Max => {}
+            _ => return Ok(None), // GROUP_CONCAT / JSON / percentile: order-dependent
+        }
+    }
+    let prefix = alias.unwrap_or(&table.name);
+    let n_cols = table.n_columns();
+
+    // Bare-column args only (COUNT(*) carries no arg). The resolution
+    // mirrors exec_aggregate_no_group_by's agg_col_indices discipline —
+    // an alias REPLACES the table name, so a `t.col` reference under
+    // `FROM t t2` must not bind.
+    let mut agg_col_indices: Vec<Option<usize>> = Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        match &agg.arg {
+            None => agg_col_indices.push(None),
+            Some(Expr::Column { table: ref_t, name }) => {
+                let matches = ref_t
+                    .as_ref()
+                    .map(|t| {
+                        if prefix == table.name {
+                            t == &table.name || t == prefix
+                        } else {
+                            t == prefix
+                        }
+                    })
+                    .unwrap_or(true);
+                if matches {
+                    match table.find_column(name) {
+                        Some(idx) => agg_col_indices.push(Some(idx)),
+                        None => return Ok(None), // unresolvable: serial path evaluates
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None), // expression args keep the serial paths
+        }
+    }
+
+    // Filter: must compile positionally (the serial compiled path's own
+    // gate); an uncompilable predicate declines.
+    let compiled = filter_predicate
+        .and_then(|p| crate::executor::predicate::compile_predicate(p, table, prefix));
+
+    let root = ctx.table_root(table);
+    let split = match plan_range_split(ctx, root)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // Wanted columns: aggregate args + the filter's columns (the serial
+    // compiled path's exact set), sorted + deduped; positions maps table
+    // column -> decoded-slice position.
+    let mut wanted: Vec<usize> = agg_col_indices.iter().filter_map(|x| *x).collect();
+    if let Some(pred) = &compiled {
+        crate::executor::predicate::compiled_columns(pred, &mut wanted);
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut positions = vec![usize::MAX; n_cols];
+    for (pos, &c) in wanted.iter().enumerate() {
+        positions[c] = pos;
+    }
+    // Decoded-slice position per aggregate arg (usize::MAX = COUNT(*)).
+    let agg_pos: Vec<usize> = agg_col_indices
+        .iter()
+        .map(|a| a.map(|c| positions[c]).unwrap_or(usize::MAX))
+        .collect();
+
+    let agg_funcs: Vec<AggFunc> = aggregates
+        .iter()
+        .map(|a| AggFunc::from_name(&a.func))
+        .collect();
+    let n_aggs = aggregates.len();
+    let rowid_alias = table.rowid_alias;
+    let ranges = split.ranges;
+    let pager = ctx.pager;
+    let params: &[Value] = &ctx.params;
+
+    // Workers: an exact replica of the serial compiled-path loop over
+    // each range — decode_row_selective into a reused buffer, compiled
+    // filter, then update_agg_state with the DISTINCT flags.
+    let conn_enc_tag = super::conn_enc::current();
+    let partials: Vec<Result<(Vec<AggState>, bool)>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges.iter() {
+            let wanted = wanted.clone();
+            let agg_pos = agg_pos.clone();
+            let agg_funcs = agg_funcs.clone();
+            let distincts: Vec<bool> = aggregates.iter().map(|a| a.distinct).collect();
+            let seps: Vec<Option<String>> = (0..aggregates.len())
+                .map(|i| agg_sep_at(aggregates, i).map(|s| s.to_string()))
+                .collect();
+            let compiled = compiled.clone();
+            let positions = positions.clone();
+            handles.push(scope.spawn(move || -> Result<(Vec<AggState>, bool)> {
+                let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                let mut bt = Btree::new(pager, root, false);
+                let mut states: Vec<AggState> = (0..n_aggs).map(|_| AggState::default()).collect();
+                let mut saw_any_row = false;
+                let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
+                bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
+                    if crate::storage::row_codec::decode_row_selective(
+                        payload,
+                        n_cols,
+                        &wanted,
+                        rowid,
+                        rowid_alias,
+                        &mut sel_buf,
+                    )
+                    .is_err()
+                    {
+                        return true; // skip corrupt rows (serial contract)
+                    }
+                    if let Some(pred) = &compiled {
+                        if !pred.eval(&sel_buf, &positions, params) {
+                            return true; // filtered out
+                        }
+                    }
+                    saw_any_row = true;
+                    for i in 0..n_aggs {
+                        let arg_val: &Value = if agg_pos[i] == usize::MAX {
+                            &super::COUNT_STAR_ARG
+                        } else if agg_pos[i] < sel_buf.len() {
+                            &sel_buf[agg_pos[i]]
+                        } else {
+                            &Value::Null
+                        };
+                        super::update_agg_state(
+                            &mut states[i],
+                            agg_funcs[i],
+                            arg_val,
+                            distincts[i],
+                            seps[i].as_deref(),
+                        );
+                    }
+                    true
+                })?;
+                Ok((states, saw_any_row))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel DISTINCT worker panicked"))
+            .collect()
+    });
+    reclaim_worker_heaps();
+
+    // Any worker error -> serial fallback (never a divergent answer).
+    let mut states: Option<Vec<AggState>> = None;
+    let mut saw_any_row = false;
+    for p in partials {
+        match p {
+            Ok((ws, saw)) => match &mut states {
+                None => {
+                    states = Some(ws);
+                    saw_any_row = saw;
+                }
+                Some(dst) => {
+                    saw_any_row |= saw;
+                    for i in 0..n_aggs {
+                        merge_agg_state(
+                            &mut dst[i],
+                            &ws[i],
+                            agg_funcs[i],
+                            aggregates[i].distinct,
+                            agg_sep_at(aggregates, i),
+                        );
+                    }
+                }
+            },
+            Err(_) => return Ok(None),
+        }
+    }
+    let states = match states {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    Ok(Some(super::finish_no_group_by(
+        aggregates,
+        states,
+        saw_any_row,
+    )?))
+}
+
 /// Parallel GROUP BY over the selective branch's shape: bare-column keys,
 /// bare-column aggregate args (or COUNT(*)), no filter. Each worker runs
 /// an exact replica of the serial selective loop over its rowid range
