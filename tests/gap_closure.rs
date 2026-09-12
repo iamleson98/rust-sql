@@ -393,3 +393,94 @@ fn with_dml_matches_sqlite() {
         lite_rows(&con, "SELECT x FROM g ORDER BY x")
     );
 }
+
+// ---------------------------------------------------------------------------
+// HAVING over projection aliases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn having_alias_differential() {
+    let mut db = mem();
+    let con = lite();
+    db.execute("CREATE TABLE c(k, v)", []).unwrap();
+    db.execute("INSERT INTO c VALUES ('a',1),('a',5),('b',10)", [])
+        .unwrap();
+    con.execute_batch("CREATE TABLE c(k, v); INSERT INTO c VALUES ('a',1),('a',5),('b',10);")
+        .unwrap();
+    for sql in [
+        "SELECT k, SUM(v) AS s FROM c GROUP BY k HAVING s > 4 ORDER BY k",
+        "SELECT k, SUM(v) FROM c GROUP BY k HAVING SUM(v) > 4 ORDER BY k",
+        "SELECT v % 2 AS p, COUNT(*) AS n FROM c GROUP BY p HAVING n > 1 ORDER BY p",
+    ] {
+        let ours = engine_strs(&engine_rows(&db, sql));
+        let theirs = lite_rows(&con, sql);
+        assert_eq!(ours, theirs, "mismatch on {}", sql);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Partial UNIQUE indexes + UPSERT target WHERE
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partial_unique_differential() {
+    let mut db = mem();
+    let con = lite();
+    db.execute("CREATE TABLE u(a, b)", []).unwrap();
+    db.execute("CREATE UNIQUE INDEX ui ON u(a) WHERE b > 0", [])
+        .unwrap();
+    con.execute_batch("CREATE TABLE u(a, b); CREATE UNIQUE INDEX ui ON u(a) WHERE b > 0;")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, -5)", []).unwrap();
+    db.execute("INSERT INTO u VALUES (1, -6)", []).unwrap();
+    con.execute("INSERT INTO u VALUES (1, -5)", []).unwrap();
+    con.execute("INSERT INTO u VALUES (1, -6)", []).unwrap();
+    db.execute("INSERT INTO u VALUES (1, 7)", []).unwrap();
+    con.execute("INSERT INTO u VALUES (1, 7)", []).unwrap();
+    assert!(db.execute("INSERT INTO u VALUES (1, 8)", []).is_err());
+    assert!(con.execute("INSERT INTO u VALUES (1, 8)", []).is_err());
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT a, b FROM u ORDER BY b")),
+        lite_rows(&con, "SELECT a, b FROM u ORDER BY b")
+    );
+}
+
+#[test]
+fn upsert_partial_where_differential() {
+    let mut db = mem();
+    let con = lite();
+    db.execute("CREATE TABLE u(a, b)", []).unwrap();
+    db.execute("CREATE UNIQUE INDEX ui ON u(a) WHERE b > 0", [])
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", []).unwrap();
+    con.execute_batch("CREATE TABLE u(a, b); CREATE UNIQUE INDEX ui ON u(a) WHERE b > 0; INSERT INTO u VALUES (1, 1);")
+        .unwrap();
+    db.execute(
+        "INSERT INTO u VALUES (1, -5) ON CONFLICT(a) WHERE b>0 DO UPDATE SET b=2",
+        [],
+    )
+    .unwrap();
+    con.execute(
+        "INSERT INTO u VALUES (1, -5) ON CONFLICT(a) WHERE b>0 DO UPDATE SET b=2",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT a, b FROM u ORDER BY b")),
+        lite_rows(&con, "SELECT a, b FROM u ORDER BY b")
+    );
+    db.execute(
+        "INSERT INTO u VALUES (1, 5) ON CONFLICT(a) WHERE b>0 DO UPDATE SET b=excluded.b",
+        [],
+    )
+    .unwrap();
+    con.execute(
+        "INSERT INTO u VALUES (1, 5) ON CONFLICT(a) WHERE b>0 DO UPDATE SET b=excluded.b",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT a, b FROM u")),
+        lite_rows(&con, "SELECT a, b FROM u")
+    );
+}

@@ -16323,6 +16323,11 @@ fn exec_insert_one_row(
         if !st.idx.unique {
             continue;
         }
+        // Partial index: rows failing the WHERE predicate are not
+        // indexed at all (SQLite) — exempt from uniqueness.
+        if !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params) {
+            continue;
+        }
         // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
         // with ANY NULL among the indexed columns is exempt from the
         // uniqueness check, so multiple NULL rows coexist. Expression
@@ -16607,12 +16612,24 @@ fn exec_insert_one_row(
         ctx.set_table_root_lc(table_name_lc, *current_root);
     }
     // On conflict: delete the old row's index entries first.
+    // Partial indexes only ever held the old row when it matched their
+    // predicate — delete only then (deleting a never-inserted key is a
+    // no-op on the B+tree, but the gate keeps the invariant explicit).
     if let Some(old_payload) = old_payload_opt {
         if !index_states.is_empty() {
             if let Ok(old_row) =
                 decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)
             {
                 for st in index_states.iter_mut() {
+                    if !index_row_matches_partial(
+                        &st.idx,
+                        table,
+                        &old_row,
+                        &ctx.params,
+                        &ctx.named_params,
+                    ) {
+                        continue;
+                    }
                     let old_key = encode_index_key(&st.idx, table, &old_row);
                     let mut ibt = Btree::new(ctx.pager, st.root, true);
                     ibt.delete_index(&old_key, rowid)?;
@@ -16622,10 +16639,15 @@ fn exec_insert_one_row(
         }
     }
     // Maintain indexes: insert an entry for each index on this table.
+    // Partial indexes only contain rows matching their WHERE predicate
+    // (SQLite) — non-matching rows get no entry.
     // The per-index APPEND HINT skips the root-to-leaf descent + binary
     // search on ascending bulk loads (validated per use; falls back to
     // the full insert path automatically).
     for st in index_states.iter_mut() {
+        if !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params) {
+            continue;
+        }
         // Copy the root/hint out first: `encode_key` holds a mutable
         // borrow of `st` for as long as `key_bytes` is live.
         let root = st.root;
@@ -16850,6 +16872,25 @@ pub(crate) struct UpdateConflictPlan {
     /// Rowids to DELETE before applying the write set (OR REPLACE
     /// conflicting holders — baseline rows or write-set rows).
     pub delete_rowids: Vec<i64>,
+}
+
+/// True when `row` belongs in a partial index (its WHERE predicate
+/// holds). Rows failing the predicate are never indexed (SQLite:
+/// partial indexes only contain matching rows), so they are exempt
+/// from that index's uniqueness enforcement.
+fn index_row_matches_partial(
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> bool {
+    match &index.partial_expr {
+        None => true,
+        Some(pred) => eval_row(pred, row, &table.col_names, params, named_params)
+            .map(|v| v.is_truthy())
+            .unwrap_or(false),
+    }
 }
 
 /// True when any indexed column of `row` is NULL (UNIQUE-exempt).

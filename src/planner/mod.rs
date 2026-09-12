@@ -435,8 +435,18 @@ impl<'a> Planner<'a> {
                 aggregates: aggregates.clone(),
             };
             if let Some(having) = &having_rewritten {
-                let rewritten_having =
-                    rewrite_aggregates_and_groups(having, &aggregates, &resolved_group_by, n_group);
+                // HAVING may reference a projection ALIAS (`HAVING s`
+                // where the SELECT list has `SUM(v) AS s` — SQLite
+                // resolves aliases in HAVING). Substitute the alias's
+                // expression first so the aggregate rewrite below sees
+                // the real aggregate call.
+                let having_unaliased = resolve_having_aliases(having, &s.columns);
+                let rewritten_having = rewrite_aggregates_and_groups(
+                    &having_unaliased,
+                    &aggregates,
+                    &resolved_group_by,
+                    n_group,
+                );
                 plan = Plan::Filter {
                     input: Box::new(plan),
                     predicate: rewritten_having,
@@ -901,6 +911,137 @@ impl<'a> Planner<'a> {
         }
         Ok(out)
     }
+}
+
+/// Substitute projection aliases inside a HAVING clause with their
+/// SELECT-list expressions (SQLite resolves output aliases in HAVING:
+/// `SELECT SUM(v) AS s ... HAVING s > 4` means `HAVING SUM(v) > 4`).
+/// Only bare-column references matching an alias are substituted;
+/// anything else passes through (it may be a real input column).
+fn resolve_having_aliases(having: &Expr, columns: &[ResultColumn]) -> Expr {
+    // Alias map: lowercase alias -> SELECT-list expression.
+    let mut aliases: Vec<(String, &Expr)> = Vec::new();
+    for c in columns {
+        if let ResultColumn::Expr {
+            expr,
+            alias: Some(a),
+        } = c
+        {
+            aliases.push((a.to_ascii_lowercase(), expr));
+        }
+    }
+    if aliases.is_empty() {
+        return having.clone();
+    }
+    fn subst(e: &Expr, aliases: &[(String, &Expr)]) -> Expr {
+        match e {
+            Expr::Column { table: None, name } => {
+                let lc = name.to_ascii_lowercase();
+                for (a, expr) in aliases {
+                    if *a == lc {
+                        return (*expr).clone();
+                    }
+                }
+                e.clone()
+            }
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(subst(left, aliases)),
+                right: Box::new(subst(right, aliases)),
+            },
+            Expr::Unary { op, expr } => Expr::Unary {
+                op: *op,
+                expr: Box::new(subst(expr, aliases)),
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(subst(expr, aliases)),
+                low: Box::new(subst(low, aliases)),
+                high: Box::new(subst(high, aliases)),
+                negated: *negated,
+            },
+            Expr::In {
+                expr,
+                source,
+                negated,
+            } => Expr::In {
+                expr: Box::new(subst(expr, aliases)),
+                source: match source {
+                    InSource::List(l) => {
+                        let v: Vec<Expr> = l.iter().map(|x| subst(x, aliases)).collect();
+                        InSource::List(v.into())
+                    }
+                    other => other.clone(),
+                },
+                negated: *negated,
+            },
+            Expr::Like {
+                op,
+                expr,
+                pattern,
+                escape,
+                negated,
+            } => Expr::Like {
+                op: *op,
+                expr: Box::new(subst(expr, aliases)),
+                pattern: Box::new(subst(pattern, aliases)),
+                escape: escape.as_ref().map(|x| Box::new(subst(x, aliases))),
+                negated: *negated,
+            },
+            Expr::IsNull { expr, negated } => Expr::IsNull {
+                expr: Box::new(subst(expr, aliases)),
+                negated: *negated,
+            },
+            Expr::Is {
+                left,
+                right,
+                negated,
+            } => Expr::Is {
+                left: Box::new(subst(left, aliases)),
+                right: Box::new(subst(right, aliases)),
+                negated: *negated,
+            },
+            Expr::Function {
+                name,
+                distinct,
+                args,
+                filter,
+                over,
+            } => Expr::Function {
+                name: name.clone(),
+                distinct: *distinct,
+                args: args.iter().map(|a| subst(a, aliases)).collect(),
+                filter: filter.as_ref().map(|f| Box::new(subst(f, aliases))),
+                over: over.clone(),
+            },
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => Expr::Case {
+                operand: operand.as_ref().map(|o| Box::new(subst(o, aliases))),
+                whens: whens
+                    .iter()
+                    .map(|(c, v)| (subst(c, aliases), subst(v, aliases)))
+                    .collect(),
+                else_: else_.as_ref().map(|x| Box::new(subst(x, aliases))),
+            },
+            Expr::Cast { expr, type_name } => Expr::Cast {
+                expr: Box::new(subst(expr, aliases)),
+                type_name: type_name.clone(),
+            },
+            Expr::Collate { expr, collation } => Expr::Collate {
+                expr: Box::new(subst(expr, aliases)),
+                collation: collation.clone(),
+            },
+            _ => e.clone(),
+        }
+    }
+    subst(having, &aliases)
 }
 
 /// Rewrite an expression, replacing:
