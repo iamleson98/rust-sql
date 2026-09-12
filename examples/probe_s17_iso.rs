@@ -1,7 +1,7 @@
 //! Isolated parallel-SUM memory cost: build the file OUT of process, then
 //! this process only opens + queries. Vary worker count via PRAGMA.
 
-use rustqlite::{Database, Value};
+use rustqlite::Database;
 
 fn mem() -> (f64, f64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
