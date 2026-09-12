@@ -153,3 +153,27 @@ Stage Summary:
 - Planner ledger entry CLOSED: cost-searched plans (multi-alternative costing + bushy trees — the engine now searches a plan space STRICTLY LARGER than SQLite's own left-deep-only search).
 - Marquee number: 1.91x vs SQLite on the bushy pair-join shape (5M-row output), differentially answer-checked.
 - Remaining ledger after this pass: S17/S14 memory peaks (allocator-level), binary size (deliberate), page_count physical layout (true, not mirrored), predicate pushdown into all scan shapes.
+
+---
+Task ID: 11
+Agent: main (Super Z)
+Task: WHERE-pushdown into FROM-clause subqueries (SQLite's pushDownWhereTerms analog) + the EXPLAIN-of-WITH regression the probe surfaced
+
+Work Log:
+- CI on the cost-searched planner push (7fa39f0): ALL GREEN (22/22 jobs) — master healthy.
+- probe_pushdown (new example): engine-vs-SQLite EXPLAIN over 10 filter-placement shapes — found 2 live gaps: (1) `SELECT * FROM (SELECT ...) s WHERE s.k > 3` scanned the body fully while SQLite pushed the term and searched the index; (2) `EXPLAIN QUERY PLAN WITH c AS (...) SELECT * FROM c` PANICKED with "no such table: c" — the EXPLAIN path used the static plan_for_statement (no CTE scope).
+- EXPLAIN-of-WITH fixed: explain_plan_for_statement materializes WITH clauses through the same read-only reader-ctx machinery the execution path uses (both EXPLAIN arms in api.rs rewired). Regression-pinned in tests/pushdown_subquery.rs.
+- Pushdown implemented as an AST-level pre-pass in plan_simple_select (the push must precede the body's planning):
+  - push_where_into_from_subqueries: clones the FROM, re-homes conjuncts into eligible subquery bodies' WHERE (refs rewritten onto the body's own table through the output->bare-column map), removes them from the outer WHERE.
+  - Eligibility (conservative): plain single-table SELECT body (no WITH/compound/DISTINCT/LIMIT/OFFSET/GROUP BY/HAVING/WINDOW/aggregates); every conjunct ref binds to ONE subquery atom — qualified via the atom's FROM alias (which must be unique across the FROM), unqualified only when the name is exposed by exactly one atom of the whole FROM; only ref-through shapes (Column/Collate/Binary/Unary/Between/In-list/Like/Literal/Parameter); no subquery-carrying conjuncts; atoms under any outer-join boundary decline.
+  - Star/TableStar projections expand through the body table's columns; FROM column aliases rename positionally; non-bare outputs (expressions) decline.
+  - the pre-pass operates on the COLLATED where; the body re-collates its own WHERE against its own scope when planned.
+- Probe results after: `SEARCH t USING INDEX idx_t_k (k>?)` — EXACTLY SQLite's plan for both the projection and SELECT * bodies.
+- tests/pushdown_subquery.rs (16 differential suites vs bundled SQLite): pushes (qualified/unqualified/star/multi-conjunct/IN-list/parameter/join-alongside), declines (expression outputs, aggregate bodies, LIMIT bodies — filter-then-limit is NOT limit-then-filter, DISTINCT, compound bodies, LEFT-join boundaries both sides, ambiguous unqualified — pinned via EXPLAIN no-index + a disjoint-value shape), nested subquery bodies, and the EXPLAIN-of-WITH regression.
+- Found + documented while testing: the engine's parser does not accept FROM-subquery column aliases `s(a, b)` (SQLite does) — noted as a parser gap; the engine resolves ambiguous unqualified refs first-match instead of erroring like SQLite (pre-existing, plain tables identical — out of scope).
+- Verification: dev matrix 865/865 (849 + 16), fmt clean, clippy -D warnings clean in all 4 configs, all four CI bench gates PASS locally (18/18, 20/20, 8/8, 12/12 WIN).
+
+Stage Summary:
+- The classic subquery pushdown optimization is REAL and SQLite-plan-matching for the eligible shapes; EXPLAIN-of-WITH no longer errors.
+- Remaining pushdown surface (documented): compound bodies, CTE atoms (eagerly materialized before planning), view bodies (expanded during planning), join-condition pushdown/ flattening (SQLite's covering-index trick over subquery join sides).
+- Ready to push.

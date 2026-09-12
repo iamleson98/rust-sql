@@ -5200,7 +5200,7 @@ impl Database {
         // EXPLAIN [QUERY PLAN]: plan the inner statement and render rows;
         // never execute it.
         if let Statement::Explain(inner) = cached.stmt.as_ref() {
-            let plan = Self::plan_for_statement(&self.catalog, inner)?;
+            let plan = self.explain_plan_for_statement(inner)?;
             return Ok(match plan {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),
                 None => Vec::new(),
@@ -5415,7 +5415,7 @@ impl Database {
             }
         }
         if let Statement::Explain(inner) = cached.stmt.as_ref() {
-            let plan = Self::plan_for_statement(&self.catalog, inner)?;
+            let plan = self.explain_plan_for_statement(inner)?;
             let rows = match plan {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),
                 None => Vec::new(),
@@ -6166,6 +6166,36 @@ impl Database {
             frontier = next_frontier;
         }
         Ok((rows, out_cols))
+    }
+
+    /// EXPLAIN [QUERY PLAN] of a statement: the static plan, EXCEPT that a
+    /// WITH-carrying SELECT needs its CTEs materialized first — the same
+    /// read-only machinery the execution path uses. Without this,
+    /// `EXPLAIN QUERY PLAN WITH c AS (…) SELECT * FROM c` failed with
+    /// "no such table: c" (the static planner has no CTE scope).
+    fn explain_plan_for_statement(&self, inner: &Statement) -> Result<Option<Plan>> {
+        if let Statement::Select(sel) = inner {
+            if let Some(with) = &sel.with {
+                let in_txn = self.in_transaction.load(Ordering::Acquire);
+                let txn_snap = if in_txn {
+                    self.txn_snapshot.lock().clone()
+                } else {
+                    None
+                };
+                let shared = self.read_maps();
+                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+                ctx.in_transaction = in_txn;
+                ctx.txn_snapshot = txn_snap;
+                let _plugin_guard = self.plugin_scope();
+                let cte_map = self.materialize_ctes(with, &HashMap::new(), &mut ctx)?;
+                let mut planner = Planner::new(&self.catalog);
+                planner.set_ctes(cte_map);
+                let plan = planner.plan_select(sel)?;
+                return Ok(Some(plan));
+            }
+        }
+        Self::plan_for_statement(&self.catalog, inner)
     }
 
     pub(crate) fn plan_for_statement(

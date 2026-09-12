@@ -366,14 +366,37 @@ impl<'a> Planner<'a> {
             .as_ref()
             .map(|p| rewrite_column_collations(self.catalog, p, &coll_scope));
 
-        let mut plan = if let Some(from) = &s.from {
+        // WHERE pushdown into FROM-clause subqueries (SQLite's
+        // pushDownWhereTerms analog): a conjunct whose every column
+        // reference binds to ONE subquery atom's output column — and that
+        // output column is a BARE column of the subquery body's single
+        // table — re-homes into the body's own WHERE (refs renamed onto
+        // the body's table), so the body's planning sees it: index
+        // selection, index ranges, fused scans. The conjunct leaves the
+        // outer WHERE. Runs on the COLLATED where (the body re-collates
+        // its own where against its own scope when planned).
+        let mut from_owned: Option<TableExpression> = None;
+        let where_effective: Option<Expr> = match where_rewritten.as_ref() {
+            Some(w) if s.from.is_some() => {
+                match self.push_where_into_from_subqueries(s.from.as_ref().expect("is_some"), w) {
+                    Some((f2, w2)) => {
+                        from_owned = Some(f2);
+                        w2
+                    }
+                    None => where_rewritten,
+                }
+            }
+            _ => where_rewritten,
+        };
+
+        let mut plan = if let Some(from) = from_owned.as_ref().or(s.from.as_ref()) {
             self.plan_table_expression(from)?
         } else {
             Plan::Values { rows: vec![vec![]] }
         };
 
         // Apply WHERE — with predicate pushdown and index/rowid lookup optimization.
-        if let Some(pred) = &where_rewritten {
+        if let Some(pred) = &where_effective {
             plan = self.apply_where(plan, pred);
         }
 
@@ -2626,6 +2649,622 @@ pub fn top_level_output_names(sel: &SelectStatement) -> Option<Vec<String>> {
             Some(names)
         }
         _ => None, // compound selects: defer to execution-time names
+    }
+}
+
+// ============================================================================
+// WHERE-conjunct pushdown into FROM-clause subqueries
+// ============================================================================
+//
+// `SELECT * FROM (SELECT k, v FROM t) s WHERE s.k > 3` — the syntactic plan
+// materializes the FULL subquery output and filters after. SQLite pushes
+// the conjunct INTO the subquery body (its pushDownWhereTerms): the body's
+// own planning then sees `k > 3` — an index range, a rowid lookup, a fused
+// selective scan. This is the engine's analog, as an AST-level pre-pass in
+// `plan_simple_select` (the push must precede the body's planning, so it
+// rewrites the FROM tree + WHERE before any Plan node exists).
+//
+// Safety rules (conservative; any miss keeps the conjunct outside):
+// - Eligible bodies only: a plain SELECT (no WITH / compound / DISTINCT /
+//   LIMIT / OFFSET / GROUP BY / HAVING / WINDOW / aggregates) over a
+//   SINGLE bare table — the pushed term is a plain row filter there.
+// - The conjunct's every column reference must bind to ONE subquery atom:
+//   qualified (`s.k` — the atom's FROM alias) or unqualified (`k` — the
+//   name is exposed by exactly one atom of the whole FROM and no other).
+//   A reference through a non-bare projection (expression, alias over an
+//   expression) or to another atom declines the whole conjunct.
+// - No subquery-carrying conjuncts (correlations inside the term would
+//   break under the body's scope).
+// - Atoms under any outer-join boundary decline: the term's placement
+//   interacts with NULL-extension (SQLite's own pushdown has the same
+//   caution); INNER/CROSS paths only.
+//
+// Semantics: filtering a subquery's rows before or after its boundary is
+// the same multiset when the term references only the subquery's own
+// output columns — and the body's output column NAMES are unchanged, so
+// every outer consumer (projection, ORDER BY, HAVING) resolves as before.
+
+/// One atom of the outer FROM, as name-resolution sees it.
+struct FromAtomInventory {
+    /// The qualifier a `qual.col` reference may use for this atom
+    /// (subquery alias / table alias / table name).
+    qualifier: Option<String>,
+    /// Unqualified names this atom exposes (subquery output names /
+    /// table column names). Empty when uncomputable.
+    unqualified_names: Vec<String>,
+    /// True when the names could not be fully computed (complex
+    /// subquery): unqualified pushdown must then be disabled globally.
+    unknown_names: bool,
+}
+
+/// The push mapping for one eligible subquery atom: output name → the
+/// body-table column a pushed reference becomes (None: not pushable
+/// through — expression output).
+struct SubqueryPushMap {
+    /// The body table's qualifier (alias or table name).
+    table_qualifier: String,
+    /// (output name, Some(target column name)) pairs.
+    outputs: Vec<(String, Option<String>)>,
+}
+
+impl<'a> Planner<'a> {
+    /// Attempt the pushdown. Returns Some((transformed FROM, reduced
+    /// WHERE)) when at least one conjunct re-homed; None when nothing
+    /// changed (the caller keeps the originals).
+    fn push_where_into_from_subqueries(
+        &self,
+        from: &TableExpression,
+        pred: &Expr,
+    ) -> Option<(TableExpression, Option<Expr>)> {
+        // Subquery atoms must exist at all.
+        if !from_has_subquery_atom(from) {
+            return None;
+        }
+        let conjuncts = split_and_chain(pred);
+        // Subquery-carrying conjuncts never push.
+        if conjuncts.iter().all(crate::executor::expr_has_subquery) {
+            return None;
+        }
+
+        // ---- Inventory: every atom's exposed names ------------------------
+        let mut inventory: Vec<FromAtomInventory> = Vec::new();
+        collect_from_inventory(self.catalog, from, &mut inventory);
+        let any_unknown = inventory.iter().any(|a| a.unknown_names);
+
+        // ---- Transform: clone the FROM, push into eligible bodies --------
+        let mut f2 = from.clone();
+        let mut consumed = vec![false; conjuncts.len()];
+        let mut pushed_any = false;
+        push_into_subquery_atoms(
+            self,
+            &mut f2,
+            &inventory,
+            &conjuncts,
+            &mut consumed,
+            any_unknown,
+            false, // not under an outer-join boundary at the root
+            &mut pushed_any,
+        );
+        if !pushed_any {
+            return None;
+        }
+
+        let remaining: Vec<Expr> = conjuncts
+            .iter()
+            .zip(consumed.iter())
+            .filter(|(_, &used)| !used)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let where_left = if remaining.is_empty() {
+            None
+        } else {
+            Some(combine_and(&remaining))
+        };
+        Some((f2, where_left))
+    }
+
+    /// The push map for one subquery atom, when its body is an eligible
+    /// plain single-table SELECT. `None` = not eligible (or not
+    /// computable) — no pushdown into this atom.
+    fn subquery_push_map(
+        &self,
+        select: &SelectStatement,
+        column_aliases: &Option<Vec<String>>,
+    ) -> Option<SubqueryPushMap> {
+        // Plain SELECT only: no WITH / compound / LIMIT / OFFSET.
+        if select.with.is_some() || select.limit.is_some() || select.offset.is_some() {
+            return None;
+        }
+        let body = match &select.body {
+            SelectBody::Simple(s) => s,
+            SelectBody::Binary { .. } => return None,
+        };
+        // No DISTINCT / grouping / windows / aggregates: the pushed term
+        // must be a plain row filter.
+        if body.distinct
+            || !body.group_by.is_empty()
+            || body.having.is_some()
+            || !body.window.is_empty()
+            || self.expr_list_has_aggregates(&body.columns)
+        {
+            return None;
+        }
+        // A single bare table in the body's FROM.
+        let table_expr = match body.from.as_ref() {
+            Some(TableExpression::Table { name, alias, .. }) => (name, alias),
+            _ => return None,
+        };
+        let (tname, talias) = table_expr;
+        let table = self.catalog.get_table(tname)?;
+        let table_qualifier = talias.clone().unwrap_or_else(|| tname.clone());
+
+        // Output-name → body-column mapping (positionally).
+        let mut outputs: Vec<(String, Option<String>)> = Vec::new();
+        for c in &body.columns {
+            match c {
+                crate::sql::ast::ResultColumn::Expr { expr, alias } => {
+                    let out_name = match alias {
+                        Some(a) => a.clone(),
+                        None => match expr {
+                            Expr::Column { name, .. } => name.clone(),
+                            _ => return None, // expression without alias:
+                                              // unnameable, and a non-bare
+                                              // output is not pushable anyway
+                        },
+                    };
+                    let target = match expr {
+                        Expr::Column { name, .. } => Some(name.clone()),
+                        _ => None, // expression output: filterable only
+                                   // as a reference, never through
+                    };
+                    outputs.push((out_name, target));
+                }
+                crate::sql::ast::ResultColumn::Star => {
+                    for col in &table.columns {
+                        outputs.push((col.name.clone(), Some(col.name.clone())));
+                    }
+                }
+                crate::sql::ast::ResultColumn::TableStar(q) => {
+                    if !q.eq_ignore_ascii_case(tname)
+                        && !talias.as_ref().is_some_and(|a| q.eq_ignore_ascii_case(a))
+                    {
+                        return None;
+                    }
+                    for col in &table.columns {
+                        outputs.push((col.name.clone(), Some(col.name.clone())));
+                    }
+                }
+            }
+        }
+        // FROM (…) s(a, b): the declared column list renames the outputs
+        // positionally (the underlying mapping still holds).
+        if let Some(list) = column_aliases {
+            if list.len() != outputs.len() {
+                return None; // SQLite errors at planning; let the normal
+                             // path produce the error — no pushdown
+            }
+            for (out, new) in outputs.iter_mut().zip(list.iter()) {
+                out.0 = new.clone();
+            }
+        }
+        Some(SubqueryPushMap {
+            table_qualifier,
+            outputs,
+        })
+    }
+}
+
+/// Does the FROM tree contain any subquery atom?
+fn from_has_subquery_atom(te: &TableExpression) -> bool {
+    match te {
+        TableExpression::Subquery { .. } => true,
+        TableExpression::Join { left, right, .. } => {
+            from_has_subquery_atom(left) || from_has_subquery_atom(right)
+        }
+        _ => false,
+    }
+}
+
+/// Collect every atom's name-resolution inventory (immutable walk of the
+/// ORIGINAL from — the transform walks a clone).
+fn collect_from_inventory(
+    catalog: &Catalog,
+    te: &TableExpression,
+    out: &mut Vec<FromAtomInventory>,
+) {
+    match te {
+        TableExpression::Table { name, alias, .. } => {
+            let names = catalog
+                .get_table(name)
+                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default();
+            out.push(FromAtomInventory {
+                qualifier: alias.clone().or_else(|| Some(name.clone())),
+                unqualified_names: names,
+                unknown_names: false,
+            });
+        }
+        TableExpression::Subquery {
+            select,
+            alias,
+            column_aliases,
+        } => {
+            // Output names: explicit FROM column list, else the body's
+            // top-level names; stars need the body's table (plain bodies
+            // only). Uncomputable → unknown_names (disables unqualified
+            // pushdown globally).
+            let mut unknown = false;
+            let names: Vec<String> = if let Some(list) = column_aliases {
+                list.clone()
+            } else {
+                match top_level_output_names(select) {
+                    Some(n) => n,
+                    None => {
+                        // Star projection over a single plain table: the
+                        // table's columns.
+                        let expanded = match select.body {
+                            SelectBody::Simple(ref s) => match s.from.as_ref() {
+                                Some(TableExpression::Table { name, .. }) => {
+                                    catalog.get_table(name).map(|t| {
+                                        t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+                                    })
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match expanded {
+                            Some(n) => n,
+                            None => {
+                                unknown = true;
+                                Vec::new()
+                            }
+                        }
+                    }
+                }
+            };
+            out.push(FromAtomInventory {
+                qualifier: alias.clone(),
+                unqualified_names: names,
+                unknown_names: unknown,
+            });
+        }
+        TableExpression::Function { alias, name, .. } => {
+            let _ = name;
+            out.push(FromAtomInventory {
+                qualifier: alias.clone(),
+                unqualified_names: Vec::new(),
+                unknown_names: true, // table-function outputs vary per family
+            });
+        }
+        TableExpression::Join { left, right, .. } => {
+            collect_from_inventory(catalog, left, out);
+            collect_from_inventory(catalog, right, out);
+        }
+    }
+}
+
+/// Walk the CLONED FROM tree; at every subquery atom not under an
+/// outer-join boundary, try to push unconsumed conjuncts whose refs all
+/// bind to that atom through its push map.
+#[allow(clippy::too_many_arguments)]
+fn push_into_subquery_atoms(
+    planner: &Planner,
+    te: &mut TableExpression,
+    inventory: &[FromAtomInventory],
+    conjuncts: &[Expr],
+    consumed: &mut [bool],
+    any_unknown: bool,
+    under_outer: bool,
+    pushed_any: &mut bool,
+) {
+    match te {
+        TableExpression::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            // Outer-join boundaries: the non-preserved side(s) get the
+            // flag — a WHERE term interacting with NULL-extension must
+            // stay outside.
+            let (l_outer, r_outer) = match join_type {
+                JoinType::Inner | JoinType::Cross => (under_outer, under_outer),
+                JoinType::Left => (under_outer, true),
+                JoinType::Right => (true, under_outer),
+                JoinType::Full => (true, true),
+            };
+            push_into_subquery_atoms(
+                planner,
+                left,
+                inventory,
+                conjuncts,
+                consumed,
+                any_unknown,
+                l_outer,
+                pushed_any,
+            );
+            push_into_subquery_atoms(
+                planner,
+                right,
+                inventory,
+                conjuncts,
+                consumed,
+                any_unknown,
+                r_outer,
+                pushed_any,
+            );
+        }
+        TableExpression::Subquery {
+            select,
+            alias,
+            column_aliases,
+        } => {
+            if under_outer {
+                return;
+            }
+            // The push map for THIS atom (borrow of the body, dropped
+            // before the mutation).
+            let map = planner.subquery_push_map(select, column_aliases);
+            let Some(map) = map else { return };
+            let qualifier = alias.clone();
+            // This atom's inventory entry — matched by qualifier, which
+            // must be UNIQUE across the FROM (a duplicated qualifier
+            // makes every reference ambiguous: decline the atom).
+            let idx = match qualifier.as_deref().and_then(|q| {
+                inventory.iter().position(|a| {
+                    a.qualifier
+                        .as_deref()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(q))
+                })
+            }) {
+                Some(i)
+                    if inventory
+                        .iter()
+                        .filter(|a| {
+                            a.qualifier.as_deref().is_some_and(|x| {
+                                qualifier
+                                    .as_deref()
+                                    .is_some_and(|q| x.eq_ignore_ascii_case(q))
+                            })
+                        })
+                        .count()
+                        == 1 =>
+                {
+                    i
+                }
+                _ => return,
+            };
+            let atom_outputs: Option<&Vec<String>> = (!any_unknown
+                && !inventory[idx].unknown_names)
+                .then(|| &inventory[idx].unqualified_names);
+            // Try each unconsumed conjunct.
+            for (ci, conj) in conjuncts.iter().enumerate() {
+                if consumed[ci] {
+                    continue;
+                }
+                if crate::executor::expr_has_subquery(conj) {
+                    continue;
+                }
+                match rewrite_conjunct_into_body(
+                    conj,
+                    &map,
+                    qualifier.as_deref(),
+                    atom_outputs,
+                    inventory,
+                ) {
+                    Some(rewritten) => {
+                        // AND it into the body's WHERE.
+                        if let SelectBody::Simple(body) = &mut select.body {
+                            match body.where_clause.take() {
+                                Some(existing) => {
+                                    body.where_clause = Some(Expr::Binary {
+                                        op: BinaryOp::And,
+                                        left: Box::new(existing),
+                                        right: Box::new(rewritten),
+                                    });
+                                }
+                                None => body.where_clause = Some(rewritten),
+                            }
+                        }
+                        consumed[ci] = true;
+                        *pushed_any = true;
+                    }
+                    None => continue,
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite one conjunct's references into the subquery body's own table
+/// refs. Returns None when the conjunct is not fully bindable to this
+/// atom through bare outputs.
+fn rewrite_conjunct_into_body(
+    conj: &Expr,
+    map: &SubqueryPushMap,
+    atom_qualifier: Option<&str>,
+    atom_unqualified: Option<&Vec<String>>,
+    inventory: &[FromAtomInventory],
+) -> Option<Expr> {
+    let mut refs: Vec<(Option<&String>, &str)> = Vec::new();
+    if !collect_pushable_refs(conj, &mut refs) {
+        return None; // unsupported expression shape: keep outside
+    }
+    if refs.is_empty() {
+        return None; // no column refs: nothing to bind (keep outside)
+    }
+    // Every ref must map through THIS atom to a bare output column.
+    for (q, name) in &refs {
+        match q {
+            Some(qs) => {
+                // Qualified: must be this atom's alias.
+                let this_atom = atom_qualifier
+                    .map(|a| a.eq_ignore_ascii_case(qs))
+                    .unwrap_or(false);
+                if !this_atom {
+                    return None;
+                }
+                let target = map
+                    .outputs
+                    .iter()
+                    .find(|(o, _)| o.eq_ignore_ascii_case(name))
+                    .and_then(|(_, t)| t.clone());
+                target?; // non-bare output: not pushable through
+            }
+            None => {
+                // Unqualified: the name must be exposed by exactly ONE
+                // atom of the whole FROM, and that atom is this one.
+                let exposed = atom_unqualified?;
+                if !exposed.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    return None;
+                }
+                let count = inventory
+                    .iter()
+                    .map(|a| {
+                        a.unqualified_names
+                            .iter()
+                            .filter(|n| n.eq_ignore_ascii_case(name))
+                            .count()
+                    })
+                    .sum::<usize>();
+                if count != 1 {
+                    return None;
+                }
+                let target = map
+                    .outputs
+                    .iter()
+                    .find(|(o, _)| o.eq_ignore_ascii_case(name))
+                    .and_then(|(_, t)| t.clone());
+                target?; // non-bare output: not pushable through
+            }
+        }
+    }
+    // Rewrite: clone + substitute.
+    let mut rewritten = conj.clone();
+    rewrite_refs_to_body(&mut rewritten, map, atom_qualifier)?;
+    Some(rewritten)
+}
+
+/// Collect the column references of a pushable expression shape.
+/// Returns false on any shape the rewriter does not understand (the
+/// conjunct then stays outside).
+fn collect_pushable_refs<'e>(e: &'e Expr, out: &mut Vec<(Option<&'e String>, &'e str)>) -> bool {
+    match e {
+        Expr::Column { table, name } => {
+            out.push((table.as_ref(), name));
+            true
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Collate { expr, .. } => collect_pushable_refs(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_pushable_refs(left, out) && collect_pushable_refs(right, out)
+        }
+        Expr::Unary { expr, .. } => collect_pushable_refs(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_pushable_refs(expr, out)
+                && collect_pushable_refs(low, out)
+                && collect_pushable_refs(high, out)
+        }
+        Expr::In { expr, source, .. } => {
+            let mut ok = collect_pushable_refs(expr, out);
+            if let crate::sql::ast::InSource::List(es) = source {
+                for m in es.iter() {
+                    ok &= collect_pushable_refs(m, out);
+                }
+            } else {
+                ok = false; // subquery source: expr_has_subquery gated
+            }
+            ok
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            let mut ok = collect_pushable_refs(expr, out) && collect_pushable_refs(pattern, out);
+            if let Some(esc) = escape {
+                ok &= collect_pushable_refs(esc, out);
+            }
+            ok
+        }
+        _ => false,
+    }
+}
+
+/// Substitute every column reference in `e` with its body-table target.
+/// Mirrors `collect_pushable_refs`'s coverage (same shapes only).
+fn rewrite_refs_to_body(
+    e: &mut Expr,
+    map: &SubqueryPushMap,
+    atom_qualifier: Option<&str>,
+) -> Option<()> {
+    match e {
+        Expr::Column { table, name } => {
+            // Qualified refs must name this atom; unqualified handled the
+            // same way (uniqueness was established by the caller).
+            if let Some(q) = table {
+                let this_atom = atom_qualifier
+                    .map(|a| a.eq_ignore_ascii_case(q))
+                    .unwrap_or(false);
+                if !this_atom {
+                    return None;
+                }
+            }
+            let target = map
+                .outputs
+                .iter()
+                .find(|(o, _)| o.eq_ignore_ascii_case(name))
+                .and_then(|(_, t)| t.clone())?;
+            *table = Some(map.table_qualifier.clone());
+            *name = target;
+            Some(())
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => Some(()),
+        Expr::Collate { expr, .. } => rewrite_refs_to_body(expr, map, atom_qualifier),
+        Expr::Binary { left, right, .. } => {
+            rewrite_refs_to_body(left, map, atom_qualifier)?;
+            rewrite_refs_to_body(right, map, atom_qualifier)
+        }
+        Expr::Unary { expr, .. } => rewrite_refs_to_body(expr, map, atom_qualifier),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_refs_to_body(expr, map, atom_qualifier)?;
+            rewrite_refs_to_body(low, map, atom_qualifier)?;
+            rewrite_refs_to_body(high, map, atom_qualifier)
+        }
+        Expr::In { expr, source, .. } => {
+            rewrite_refs_to_body(expr, map, atom_qualifier)?;
+            if let crate::sql::ast::InSource::List(es) = source {
+                let mut list = Vec::with_capacity(es.len());
+                for m in es.iter() {
+                    let mut mc = m.clone();
+                    rewrite_refs_to_body(&mut mc, map, atom_qualifier)?;
+                    list.push(mc);
+                }
+                *source = crate::sql::ast::InSource::List(std::sync::Arc::new(list));
+            }
+            Some(())
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_refs_to_body(expr, map, atom_qualifier)?;
+            rewrite_refs_to_body(pattern, map, atom_qualifier)?;
+            if let Some(esc) = escape {
+                rewrite_refs_to_body(esc, map, atom_qualifier)?;
+            }
+            Some(())
+        }
+        _ => None,
     }
 }
 
