@@ -213,3 +213,21 @@ Work Log:
 Stage Summary:
 - The "each remaining MB needs profiling at the allocator level" ledger line is now closed WITH the profiling: the remaining S17/S14 gap is the allocator floor, documented with direct measurements. No code change shipped (the honest outcome); README + worklog updated.
 - Ready to push (docs-only commit).
+
+---
+Task ID: 14
+Agent: main (Super Z)
+Task: CTE pushdown — WHERE conjuncts into single-use CTE bodies before materialization
+
+Work Log:
+- Planner: push_where_into_cte_bodies (pub(crate)) — clone + mutate the statement: candidates are CTEs referenced EXACTLY ONCE anywhere in the statement (count_cte_refs_* walker: main FROM, nested FROMs, CTE bodies, expression subqueries — scalar/EXISTS/IN); the single reference must be a main-FROM Table atom (no INDEXED hint) not under an outer-join boundary; the body passes the same eligibility as the subquery pre-pass (plain single-table SELECT, no WITH/LIMIT/OFFSET/DISTINCT/grouping/windows/aggregates); the conjunct binds through the CTE's exposed names (declared column list or the body's own) with the same qualifier-uniqueness and unqualified-uniqueness rules; rewrite_refs_to_body rewrites onto the body's table; and_into_select_body ANDs it into the body's WHERE. The main WHERE loses the pushed conjuncts.
+- api.rs exec_select_with_ctes: runs the pre-pass on the incoming statement (non-recursive WITH only) and materializes/plan the modified clone — the materialized set is pre-filtered and the body's own planning sees the term (index ranges, rowid lookups).
+- CTE-aware inventory (collect_cte_aware_inventory/cte_output_names): a Table atom naming a CTE exposes the CTE's output names (stars expanded through the body's table).
+- The EXPLAIN path materializes + plans without the pre-pass — the displayed plan node is CteRows either way ("SCAN CTE" — the honest shape: the rows are pre-filtered; SQLite's co-routine display shape differs by architecture).
+- tests/pushdown_subquery.rs: 10 CTE suites (28 total): pushes (qualified/unqualified/declared-column-list/under INNER join/prefiltered-materialization SUM), declines (referenced twice via a WHERE subquery — the shared-materialization corruption case, used twice in FROM, RECURSIVE, aggregate body, LIMIT body, LEFT-join boundary).
+- Timing (1M-row CTE SUM, k > 500000): engine 101ms vs SQLite 55ms — the CteRows materialization model dominates (the push removes the post-filter and halves the materialized set, but the engine materializes rows where SQLite's co-routine streams); answers equal.
+- Verification: dev matrix 877/877, fmt clean, clippy -D warnings clean in all 4 configs.
+
+Stage Summary:
+- The pushdown surface now covers plain subqueries, compound bodies, and single-use CTEs; remaining: multiply-referenced CTEs (architectural), view bodies (expanded mid-planning), join-condition pushdown/flattening.
+- Ready to push.

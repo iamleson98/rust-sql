@@ -5997,9 +5997,22 @@ impl Database {
         select: &SelectStatement,
         outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
     ) -> Result<crate::executor::ExecResult> {
+        // WHERE pushdown into single-use CTE bodies (the pushDownWhereTerms
+        // analog for CTEs): a conjunct over a CTE referenced exactly once
+        // re-homes into the CTE body's WHERE before materialization, so the
+        // body's planning sees it (index ranges, rowid lookups). The
+        // modified statement clone carries both the reduced outer WHERE and
+        // the augmented bodies.
+        let pushed_stmt: Option<SelectStatement> =
+            if select.with.as_ref().is_some_and(|w| !w.recursive) {
+                crate::planner::Planner::new(&self.catalog).push_where_into_cte_bodies(select)
+            } else {
+                None
+            };
+        let select_ref: &SelectStatement = pushed_stmt.as_ref().unwrap_or(select);
         // Materialize THIS select's own WITH clause (nested WITH), layered
         // on top of the outer map (inner names shadow outer names).
-        let cte_map = if let Some(with) = &select.with {
+        let cte_map = if let Some(with) = &select_ref.with {
             let mut m = outer_ctes.clone();
             let own = self.materialize_ctes(with, &m, ctx)?;
             m.extend(own);
@@ -6009,7 +6022,7 @@ impl Database {
         };
         let mut planner = Planner::new(&self.catalog);
         planner.set_ctes(cte_map.clone());
-        let plan = planner.plan_select(select)?;
+        let plan = planner.plan_select(select_ref)?;
         let mut plan = plan;
         // Make the CTEs visible to subquery planning inside this statement.
         ctx.ctes = Some(cte_map);

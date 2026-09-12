@@ -457,3 +457,141 @@ fn explain_query_plan_over_with() {
         .expect("EXPLAIN over WITH must plan, not error");
     assert!(!rows.is_empty(), "expected a non-empty plan");
 }
+
+// ------------------------------------------------------------------------
+// CTE pushdown: single-use CTE bodies get the term before materialization
+// ------------------------------------------------------------------------
+
+#[test]
+fn push_into_single_use_cte() {
+    diff_with(
+        SETUP,
+        INSERTS,
+        "WITH c AS (SELECT k, v FROM t) SELECT * FROM c WHERE k > 7 ORDER BY k",
+    );
+    diff_with(
+        SETUP,
+        INSERTS,
+        "WITH c AS (SELECT k, v FROM t) SELECT c.k, c.v FROM c WHERE c.k > 7 ORDER BY c.k",
+    );
+}
+
+#[test]
+fn push_into_cte_with_column_list() {
+    diff_with(
+        SETUP,
+        INSERTS,
+        "WITH c(a, b) AS (SELECT k, v FROM t) SELECT * FROM c WHERE a > 7 ORDER BY a",
+    );
+}
+
+#[test]
+fn push_into_cte_under_inner_join() {
+    let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
+                 CREATE INDEX idx_t_k ON t(k);
+                 CREATE TABLE u (id INTEGER PRIMARY KEY, j INT, w INT);";
+    let inserts = &[
+        "INSERT INTO t (k, v) VALUES (1,10),(2,20),(3,30),(4,40)",
+        "INSERT INTO u (j, w) VALUES (1,100),(2,200),(3,300)",
+    ];
+    diff_with(
+        setup,
+        inserts,
+        "WITH c AS (SELECT k, v FROM t) \
+         SELECT c.k, u.w FROM c JOIN u ON c.k = u.j WHERE c.k > 1 ORDER BY c.k",
+    );
+}
+
+#[test]
+fn decline_cte_referenced_twice() {
+    // Two consumers share ONE materialization: pushing the outer term
+    // into the body would corrupt the subquery's view of it.
+    diff_with(
+        SETUP,
+        INSERTS,
+        "WITH c AS (SELECT k, v FROM t) \
+         SELECT * FROM c WHERE k > 7 AND k <= (SELECT MAX(k) FROM c) ORDER BY k",
+    );
+}
+
+#[test]
+fn decline_cte_used_twice_in_from() {
+    let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
+                 CREATE INDEX idx_t_k ON t(k);";
+    diff_with(
+        setup,
+        INSERTS,
+        "WITH c AS (SELECT k, v FROM t) \
+         SELECT a.k, b.v FROM c a, c b WHERE a.k = b.k AND a.k > 7 ORDER BY a.k",
+    );
+}
+
+#[test]
+fn decline_recursive_cte() {
+    let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);";
+    let inserts = &["INSERT INTO t (k, v) VALUES (1,10),(2,20),(3,30)"];
+    diff_with(
+        setup,
+        inserts,
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 5) \
+         SELECT SUM(x) FROM cnt WHERE x > 2",
+    );
+}
+
+#[test]
+fn decline_cte_aggregate_body() {
+    diff_with(
+        SETUP,
+        INSERTS,
+        "WITH g AS (SELECT k, COUNT(*) AS c FROM t GROUP BY k) \
+         SELECT * FROM g WHERE g.k > 7 ORDER BY g.k",
+    );
+}
+
+#[test]
+fn decline_cte_limit_body() {
+    // filter-then-limit is NOT limit-then-filter: the push must NOT fire.
+    diff_with(
+        SETUP,
+        INSERTS,
+        "WITH c AS (SELECT k, v FROM t ORDER BY k LIMIT 5) \
+         SELECT * FROM c WHERE k > 3 ORDER BY k",
+    );
+}
+
+#[test]
+fn decline_cte_under_left_join() {
+    let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
+                 CREATE INDEX idx_t_k ON t(k);
+                 CREATE TABLE u (id INTEGER PRIMARY KEY, j INT, w INT);";
+    let inserts = &[
+        "INSERT INTO t (k, v) VALUES (1,10),(2,20),(3,30)",
+        "INSERT INTO u (j, w) VALUES (1,100),(2,200)",
+    ];
+    diff_with(
+        setup,
+        inserts,
+        "WITH c AS (SELECT k, v FROM t) \
+         SELECT u.j, c.k FROM u LEFT JOIN c ON c.k = u.j WHERE c.k > 1 ORDER BY u.j, c.k",
+    );
+}
+
+#[test]
+fn cte_push_prefilters_materialization() {
+    // The materialized set itself shrinks: a SUM over the CTE with a
+    // selective term reads only the matching rows at materialization.
+    let mut eng = Database::open_in_memory().unwrap();
+    for s in SETUP.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+        eng.execute(s, []).unwrap();
+    }
+    for s in INSERTS {
+        eng.execute(s, []).unwrap();
+    }
+    let rows = eng
+        .query(
+            "WITH c AS (SELECT k, v FROM t) SELECT SUM(v) FROM c WHERE k > 7",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows[0][0].as_integer(), 80 + 90 + 100);
+}

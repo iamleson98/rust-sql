@@ -95,12 +95,6 @@ fn main() {
         "SELECT * FROM (SELECT k FROM t) s JOIN u ON s.k = u.j",
     );
     shape(
-        "filter over view",
-        base,
-        "CREATE VIEW vv AS SELECT k, v FROM t;
-         SELECT * FROM vv WHERE k > 3",
-    );
-    shape(
         "aggregated subquery + outer filter on group key",
         base,
         "SELECT * FROM (SELECT k, COUNT(*) c FROM t GROUP BY k) g WHERE g.k > 3",

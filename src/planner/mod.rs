@@ -2947,6 +2947,421 @@ impl<'a> Planner<'a> {
     }
 }
 
+// ============================================================================
+// WHERE-conjunct pushdown into single-use CTE bodies
+// ============================================================================
+//
+// CTEs materialize BEFORE planning (api.rs), so a WHERE over `FROM c`
+// filters the materialized rows after the fact. When the CTE is
+// referenced EXACTLY ONCE in the whole statement (one materialization,
+// one consumer — counted across the main FROM, nested FROMs, and
+// expression subqueries) and its body is an eligible plain single-table
+// SELECT, the same pushdown re-homes the conjunct into the BODY's WHERE
+// before materialization: the body's planning sees index ranges and
+// rowid lookups, and the materialized set is pre-filtered.
+//
+// The machinery is the FROM-subquery pre-pass's (shared validation and
+// rewrite helpers); the CTE's exposed names come from its column list or
+// its body's own outputs.
+
+impl<'a> Planner<'a> {
+    /// Attempt the CTE pushdown. Returns the modified statement when at
+    /// least one conjunct re-homed; None keeps the original.
+    pub(crate) fn push_where_into_cte_bodies(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        let with = stmt.with.as_ref()?;
+        if with.recursive {
+            return None; // recursive CTEs have their own materialization loop
+        }
+        let main = match &stmt.body {
+            SelectBody::Simple(s) => s,
+            SelectBody::Binary { .. } => return None,
+        };
+        let pred = main.where_clause.as_ref()?;
+        let from = main.from.as_ref()?;
+        let conjuncts = split_and_chain(pred);
+
+        // Candidate CTEs: referenced EXACTLY ONCE anywhere in the
+        // statement (one materialization, one consumer).
+        let candidates: Vec<String> = with
+            .ctes
+            .iter()
+            .filter(|c| {
+                let n = count_cte_refs_stmt(stmt, &c.name);
+                n == 1
+            })
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // The main FROM's inventory, CTE-aware (a Table atom naming a CTE
+        // exposes the CTE's output names).
+        let mut inventory: Vec<FromAtomInventory> = Vec::new();
+        collect_cte_aware_inventory(self.catalog, from, with, &mut inventory);
+        let any_unknown = inventory.iter().any(|a| a.unknown_names);
+
+        let mut stmt2 = stmt.clone();
+        let mut consumed = vec![false; conjuncts.len()];
+        let mut pushed_any = false;
+        {
+            // Disjoint field borrows: the WITH (CTE bodies) and the body.
+            let with2 = stmt2.with.as_mut().expect("checked is_some");
+            let SelectBody::Simple(body2) = &mut stmt2.body else {
+                return None;
+            };
+            if let Some(from2) = body2.from.as_mut() {
+                push_into_cte_reference(
+                    self,
+                    from2,
+                    with2,
+                    &candidates,
+                    &conjuncts,
+                    &mut consumed,
+                    &inventory,
+                    any_unknown,
+                    false,
+                    &mut pushed_any,
+                );
+            }
+        }
+        if !pushed_any {
+            return None;
+        }
+        // Rebuild the main WHERE from the unconsumed conjuncts.
+        if let SelectBody::Simple(body2) = &mut stmt2.body {
+            let remaining: Vec<Expr> = conjuncts
+                .iter()
+                .zip(consumed.iter())
+                .filter(|(_, &used)| !used)
+                .map(|(c, _)| c.clone())
+                .collect();
+            body2.where_clause = if remaining.is_empty() {
+                None
+            } else {
+                Some(combine_and(&remaining))
+            };
+        }
+        Some(stmt2)
+    }
+}
+
+/// Walk the (cloned) main FROM; at every candidate CTE-referencing Table
+/// atom (not under an outer-join boundary, no INDEXED hint), push the
+/// applicable conjuncts into that CTE's body (in the statement's WITH).
+#[allow(clippy::too_many_arguments)]
+fn push_into_cte_reference(
+    planner: &Planner,
+    te: &mut TableExpression,
+    with: &mut WithClause,
+    candidates: &[String],
+    conjuncts: &[Expr],
+    consumed: &mut [bool],
+    inventory: &[FromAtomInventory],
+    any_unknown: bool,
+    under_outer: bool,
+    pushed_any: &mut bool,
+) {
+    match te {
+        TableExpression::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            let (l_outer, r_outer) = match join_type {
+                JoinType::Inner | JoinType::Cross => (under_outer, under_outer),
+                JoinType::Left => (under_outer, true),
+                JoinType::Right => (true, under_outer),
+                JoinType::Full => (true, true),
+            };
+            push_into_cte_reference(
+                planner,
+                left,
+                with,
+                candidates,
+                conjuncts,
+                consumed,
+                inventory,
+                any_unknown,
+                l_outer,
+                pushed_any,
+            );
+            push_into_cte_reference(
+                planner,
+                right,
+                with,
+                candidates,
+                conjuncts,
+                consumed,
+                inventory,
+                any_unknown,
+                r_outer,
+                pushed_any,
+            );
+        }
+        TableExpression::Table {
+            name,
+            alias,
+            indexed,
+            ..
+        } => {
+            if under_outer || indexed.is_some() {
+                return;
+            }
+            if !candidates.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                return;
+            }
+            let cte_idx = with
+                .ctes
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .expect("candidate came from the WITH");
+            // The CTE body's push map (statement gates + plain body).
+            let cte = &with.ctes[cte_idx];
+            if cte.select.with.is_some()
+                || cte.select.limit.is_some()
+                || cte.select.offset.is_some()
+            {
+                return;
+            }
+            let body = match &cte.select.body {
+                SelectBody::Simple(s) => s,
+                _ => return,
+            };
+            let map = match planner.simple_body_push_map(body) {
+                Some(m) => m,
+                None => return,
+            };
+            // Rename the map's outputs to the CTE's exposed names (the
+            // declared column list, else the body's own — which they
+            // already are).
+            let map = match cte_output_names(planner.catalog, cte) {
+                Some(names) if names.len() == map.outputs.len() => {
+                    let mut m = map;
+                    for (out, new) in m.outputs.iter_mut().zip(names.iter()) {
+                        out.0 = new.clone();
+                    }
+                    m
+                }
+                _ => map, // no declared list: the body's names ARE the exposed names
+            };
+            // This atom's inventory entry — qualifier unique across the FROM.
+            let qualifier = alias.clone().or_else(|| Some(name.clone()));
+            let idx = match qualifier.as_deref().and_then(|q| {
+                inventory.iter().position(|a| {
+                    a.qualifier
+                        .as_deref()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(q))
+                })
+            }) {
+                Some(i)
+                    if inventory
+                        .iter()
+                        .filter(|a| {
+                            a.qualifier.as_deref().is_some_and(|x| {
+                                qualifier
+                                    .as_deref()
+                                    .is_some_and(|q| x.eq_ignore_ascii_case(q))
+                            })
+                        })
+                        .count()
+                        == 1 =>
+                {
+                    i
+                }
+                _ => return,
+            };
+            let atom_outputs: Option<&Vec<String>> = (!any_unknown
+                && !inventory[idx].unknown_names)
+                .then(|| &inventory[idx].unqualified_names);
+            // Try each unconsumed conjunct.
+            for (ci, conj) in conjuncts.iter().enumerate() {
+                if consumed[ci] {
+                    continue;
+                }
+                if crate::executor::expr_has_subquery(conj) {
+                    continue;
+                }
+                if !conjunct_binds_to_atom(
+                    conj,
+                    &map.outputs,
+                    qualifier.as_deref(),
+                    atom_outputs,
+                    inventory,
+                ) {
+                    continue;
+                }
+                let mut rewritten = conj.clone();
+                if rewrite_refs_to_body(&mut rewritten, &map, qualifier.as_deref()).is_some() {
+                    // AND it into the CTE body's WHERE.
+                    let cte = &mut with.ctes[cte_idx];
+                    and_into_select_body(&mut cte.select.body, rewritten);
+                    consumed[ci] = true;
+                    *pushed_any = true;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The main FROM inventory, resolving Table atoms that name a CTE to the
+/// CTE's output names.
+fn collect_cte_aware_inventory(
+    catalog: &Catalog,
+    te: &TableExpression,
+    with: &WithClause,
+    out: &mut Vec<FromAtomInventory>,
+) {
+    match te {
+        TableExpression::Table { name, alias, .. } => {
+            // CTE reference? (shadowing: the WITH clause's own names first)
+            let cte = with.ctes.iter().find(|c| c.name.eq_ignore_ascii_case(name));
+            let names: Option<Vec<String>> = match cte {
+                Some(c) => cte_output_names(catalog, c),
+                None => catalog
+                    .get_table(name)
+                    .map(|t| t.columns.iter().map(|c| c.name.clone()).collect()),
+            };
+            match names {
+                Some(n) => out.push(FromAtomInventory {
+                    qualifier: alias.clone().or_else(|| Some(name.clone())),
+                    unqualified_names: n,
+                    unknown_names: false,
+                }),
+                None => out.push(FromAtomInventory {
+                    qualifier: alias.clone().or_else(|| Some(name.clone())),
+                    unqualified_names: Vec::new(),
+                    unknown_names: true,
+                }),
+            }
+        }
+        TableExpression::Subquery {
+            select,
+            alias,
+            column_aliases,
+        } => {
+            let (names, unknown) = match column_aliases
+                .clone()
+                .or_else(|| subquery_atom_output_names(catalog, select))
+            {
+                Some(n) => (n, false),
+                None => (Vec::new(), true),
+            };
+            out.push(FromAtomInventory {
+                qualifier: alias.clone(),
+                unqualified_names: names,
+                unknown_names: unknown,
+            });
+        }
+        TableExpression::Function { alias, .. } => {
+            out.push(FromAtomInventory {
+                qualifier: alias.clone(),
+                unqualified_names: Vec::new(),
+                unknown_names: true,
+            });
+        }
+        TableExpression::Join { left, right, .. } => {
+            collect_cte_aware_inventory(catalog, left, with, out);
+            collect_cte_aware_inventory(catalog, right, with, out);
+        }
+    }
+}
+
+/// A CTE's exposed output names: the declared column list, else the
+/// body's own output names.
+fn cte_output_names(catalog: &Catalog, cte: &Cte) -> Option<Vec<String>> {
+    if let Some(list) = &cte.columns {
+        return Some(list.clone());
+    }
+    match cte.select.body {
+        SelectBody::Simple(ref s) => simple_select_names(catalog, s),
+        _ => None,
+    }
+}
+
+/// Count references to `cte` (Table atoms naming it) anywhere in the
+/// statement: the main FROM, nested FROMs (subquery atoms, CTE bodies),
+/// and expression subqueries. One materialization serves them all.
+fn count_cte_refs_stmt(stmt: &SelectStatement, cte: &str) -> usize {
+    let mut n = 0usize;
+    count_cte_refs_stmt_inner(stmt, cte, &mut n);
+    n
+}
+
+fn count_cte_refs_stmt_inner(stmt: &SelectStatement, cte: &str, n: &mut usize) {
+    count_cte_refs_body(&stmt.body, cte, n);
+    if let Some(w) = &stmt.with {
+        for c in &w.ctes {
+            count_cte_refs_stmt_inner(&c.select, cte, n);
+        }
+    }
+}
+
+fn count_cte_refs_body(body: &SelectBody, cte: &str, n: &mut usize) {
+    match body {
+        SelectBody::Simple(s) => {
+            if let Some(f) = &s.from {
+                count_cte_refs_from(f, cte, n);
+            }
+            for e in s.columns.iter().filter_map(result_column_expr) {
+                count_cte_refs_expr(e, cte, n);
+            }
+            if let Some(w) = &s.where_clause {
+                count_cte_refs_expr(w, cte, n);
+            }
+            for g in &s.group_by {
+                count_cte_refs_expr(g, cte, n);
+            }
+            if let Some(h) = &s.having {
+                count_cte_refs_expr(h, cte, n);
+            }
+        }
+        SelectBody::Binary { left, right, .. } => {
+            count_cte_refs_body(left, cte, n);
+            count_cte_refs_body(right, cte, n);
+        }
+    }
+}
+
+fn result_column_expr(c: &crate::sql::ast::ResultColumn) -> Option<&Expr> {
+    match c {
+        crate::sql::ast::ResultColumn::Expr { expr, .. } => Some(expr),
+        _ => None,
+    }
+}
+
+fn count_cte_refs_from(te: &TableExpression, cte: &str, n: &mut usize) {
+    match te {
+        TableExpression::Table { name, .. } => {
+            if name.eq_ignore_ascii_case(cte) {
+                *n += 1;
+            }
+        }
+        TableExpression::Subquery { select, .. } => count_cte_refs_stmt_inner(select, cte, n),
+        TableExpression::Join { left, right, .. } => {
+            count_cte_refs_from(left, cte, n);
+            count_cte_refs_from(right, cte, n);
+        }
+        TableExpression::Function { .. } => {}
+    }
+}
+
+fn count_cte_refs_expr(e: &Expr, cte: &str, n: &mut usize) {
+    match e {
+        Expr::Subquery(s) | Expr::Exists(s) => count_cte_refs_stmt_inner(s, cte, n),
+        Expr::In {
+            source: crate::sql::ast::InSource::Subquery(s),
+            ..
+        } => count_cte_refs_stmt_inner(s, cte, n),
+        _ => {}
+    }
+}
+
 /// The push-target structure for one subquery atom.
 enum SubqueryPushTarget {
     /// A plain single-table SELECT body.
