@@ -1506,6 +1506,11 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
                 && aggregates
                     .iter()
                     .all(|a| crate::plugin::lookup_aggregate(&a.func).is_none())
+                // Bare-column pseudo-aggregates need the representative-row
+                // tracking of the general aggregate path (first-seen + the
+                // single-min/max rule) — scan_groupby_grouper's fused
+                // machines have none of it.
+                && aggregates.iter().all(|a| a.func != "bare")
                 && GroupByDriver::scan_input(agg_input).is_some()
             {
                 if let Some(proj) = trivial_group_projection(columns, group_by, aggregates) {

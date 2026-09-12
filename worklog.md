@@ -231,3 +231,31 @@ Work Log:
 Stage Summary:
 - The pushdown surface now covers plain subqueries, compound bodies, and single-use CTEs; remaining: multiply-referenced CTEs (architectural), view bodies (expanded mid-planning), join-condition pushdown/flattening.
 - Ready to push.
+
+---
+Task ID: 15
+Agent: main (Super Z)
+Task: Review PR #2 ("Muse spark", muse-spark -> master, 4 commits), verify against SQLite, keep what is right, fix what is not; then update README on new improvements + remaining gaps
+
+Work Log:
+- Restored sandbox state: rust toolchain 1.98.1 verified, repo re-attached at pr2-review (master@a278f17 merged with origin/muse-spark), prior uncommitted review fixes found in the tree.
+- Deep review of PR #2's 4 commits via tests/adv_review.rs (24 adversarial differential suites, written by prior agent, 16/24 passing at start) + 6 rounds of SQLite ground-truth probes (fk truth 1-6): pinned SQLite's exact contracts for FK action clauses, trailing-VALUES grammar, view UPDATE OF matching, SET DEFAULT validation, cascade collision semantics, statement atomicity, and the bare-column register-writer rules.
+- VERDICT: keep the PR's features (HAVING aliases, BEFORE triggers + UPDATE OF, partial-index maintenance, WITH RECURSIVE + DML, view DML, unknown-function errors, EXCLUDE TIES/GROUP) after fixing 8 divergences the adversarial battery surfaced:
+  1. FK parser duplicate ON DELETE/ON UPDATE: SQLite ACCEPTS duplicates, LAST clause wins (the in-tree fix that rejected them was wrong — reverted to unbounded last-wins).
+  2. Trailing-VALUES compound + ORDER BY/LIMIT: SQLite syntax-errors; parser now returns ends_on_values and rejects (bare VALUES ORDER BY/LIMIT included).
+  3. View UPDATE OF mismatch: SQLite errors "cannot modify v because it is a view"; engine silently succeeded — authorization = firing now.
+  4. FK CASCADE onto rowid-alias child: wrote payload in place (old key stayed visible; grandchildren never cascaded — pre_row only existed with the preupdate hook). New fk_write_child_row: real rowid move + REPLACE-on-collision + old-entry index maintenance + grandchildren keyed off old_crow/post-move rowid.
+  5. FK SET NULL onto rowid-alias child: "datatype mismatch" (SQLite-pinned).
+  6. FK SET DEFAULT: post-state parent validation + rowid-alias move + statement atomicity via validate_parent_update_actions (pre-write pass at both exec_update Pass-2 boundaries) — a failing UPDATE now leaves the database untouched (was half-applied).
+  7. Partial unique index UPDATE move-in: simulate_update_unique now partial-aware (old_in/new_in membership; "same encoded key" is not "same entry"); both apply paths add/remove entries on membership changes.
+  8. HAVING plain-column aliases returned empty: the deeper cause was bare-column semantics missing entirely.
+- CLOSED the bare-column family (tests/bare_columns.rs, 18 suites): SELECT k, v FROM c GROUP BY k previously emitted NULL for v — SQLite projects the group's representative row. Implemented as `bare` pseudo-aggregates appended by build_full_agg_set (planner): bare refs collected from projection/HAVING(unaliased)/ORDER terms/star expansion, deduped, rewritten via a new match arm in rewrite_aggregates_and_groups; ORDER BY terms now resolve in a pre-pass (plan_select passes phase-1 terms into plan_select_body) so ORDER-ONLY aggregates and bare slots exist on the Aggregate node; star-over-GROUP-BY expands at plan time. Executor: AggFunc::Bare + AggCold.bare + first-seen / register-writer update in the serial loop; merge_agg_state Bare arm; fast paths (streaming/fused/selective/parallel/GroupByDriver) decline on bare, general path honors trivial_group_projection (latent fusion bug fixed: the general path previously ignored the parent Project's slot selection — raw __agg_* columns leaked for any input the fast paths decline).
+- Register-writer rule (pinned by probes W/X): the LAST-declared plain min()/max() writes the bare registers on strict improvement; count/sum ride along without disabling it; no min/max -> first-seen.
+- Tests: adv_review.rs 24/24 (4 rewritten per pinned SQLite truth), bare_columns.rs 18/18, gap_closure values test updated to the now-SQLite-exact grammar.
+- Verification: dev matrix 936/936 (--lib + all 55 integration suites), fmt clean, clippy -D warnings clean in all 4 configs, all 4 CI bench gates PASS locally (bench_full_vs_sqlite 18/18, bench_compare 20/20, bench_sqlx_native 12/12, criterion sqlite_comparison 8/8 — every row beats SQLite).
+- README: PR-2 review outcome block in the gaps intro; FOREIGN KEY bullet rewritten (ON UPDATE complete, pinned); new bare-columns feature bullet; planner paragraph notes the full downstream aggregate set.
+
+Stage Summary:
+- PR #2 merged-and-hardened: every feature kept, 8 divergences fixed, 1 missing semantic family (bare columns) closed with differential proof, plus a latent fusion bug and 2 pre-existing FK bugs (grandchild cascades, statement atomicity) fixed on the way.
+- Diskspace: cleaned target/, CARGO_INCREMENTAL=0 for the session.
+- Ready to push: pr2-review -> master.

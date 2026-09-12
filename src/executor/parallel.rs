@@ -904,6 +904,15 @@ pub(crate) fn merge_agg_state(
                 }
             }
         }
+        AggFunc::Bare => {
+            // Bare-column representative: merges run in scan/chunk order
+            // with dst = the EARLIER side — first-seen semantics keep
+            // dst's value when it exists, else adopt src's.
+            if !dst.seen_value {
+                dst.cold_mut().bare = src.cold().and_then(|c| c.bare.clone());
+                dst.seen_value = src.seen_value;
+            }
+        }
         AggFunc::Stddev
         | AggFunc::StddevPop
         | AggFunc::Median

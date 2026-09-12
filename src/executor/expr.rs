@@ -1493,13 +1493,30 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             }
             _ => Value::Null,
         },
-        // likelihood(X, P) / likely(X) / unlikely(X) — query-planner
-        // hints, identity on X (SQLite: likelihood returns its first
-        // argument; NULL stays NULL).
-        "likelihood" => match args.first() {
-            Some(v) => v.clone(),
-            None => Value::Null,
-        },
+        // likelihood(X, P) — a query-planner hint that evaluates to X.
+        // P must be a constant in [0.0, 1.0]; out-of-range P is an error
+        // (SQLite: "second argument to likelihood() must be a constant
+        // between 0.0 and 1.0"). Eval-time validation catches literal
+        // out-of-range values.
+        "likelihood" => {
+            if let Some(p) = args.get(1) {
+                let ok = match p {
+                    Value::Integer(i) => *i == 0 || *i == 1,
+                    Value::Real(f) => (0.0..=1.0).contains(f),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(Error::semantic(
+                        "second argument to likelihood() must be a constant between 0.0 and 1.0"
+                            .to_string(),
+                    ));
+                }
+            }
+            match args.first() {
+                Some(v) => v.clone(),
+                None => Value::Null,
+            }
+        }
         // JSON1 — see json.rs. USER FUNCTIONS take priority over JSON1
         // so extensions can shadow built-in JSON names (SQLite: user
         // functions override core ones registered in the same "override"

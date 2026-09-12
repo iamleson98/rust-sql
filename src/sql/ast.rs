@@ -324,9 +324,17 @@ impl SimpleSelect {
     /// becomes a projected expression column (SQLite's single-row
     /// SELECT model for one VALUES arm).
     pub fn values_row(row: Vec<Expr>) -> Self {
+        // SQLite names VALUES output columns positionally: column1,
+        // column2, ... (visible in `SELECT * FROM (VALUES (1,'a'))` and
+        // `SELECT column2 FROM (VALUES (1,'a'))`). Attach those names as
+        // result aliases so projection + subquery lookup resolve them.
         let columns = row
             .into_iter()
-            .map(|expr| ResultColumn::Expr { expr, alias: None })
+            .enumerate()
+            .map(|(i, expr)| ResultColumn::Expr {
+                expr,
+                alias: Some(format!("column{}", i + 1)),
+            })
             .collect();
         Self {
             distinct: false,

@@ -61,10 +61,11 @@ for row in &rows {
 - **AUTOINCREMENT**: a real `sqlite_sequence(name,seq)` table (master-visible, queryable, user-editable), high-water rowid allocation — a deleted top rowid is never reused — explicit-rowid bumps, drop/remake resets, reopen persistence, and SQLite's exact validation errors
 - **Identifier quoting**: all three of SQLite's families — `"double"` (doubled-quote escape), `[bracket]` (no escape), `` `backtick` `` (doubled) — with the stored DDL text preserved verbatim
 - **CHECK + NOT NULL constraints**: enforced on INSERT, UPDATE, and UPSERT merges (column-level and table-level)
-- **FOREIGN KEY constraints**: enforced when `PRAGMA foreign_keys = ON` (default off, like SQLite) — child-side checks on INSERT/UPDATE, parent-side checks on DELETE with `ON DELETE RESTRICT / CASCADE (recursive) / SET NULL / SET DEFAULT`, composite keys, implicit-PK references, and index maintenance on cascaded deletes
+- **FOREIGN KEY constraints**: enforced when `PRAGMA foreign_keys = ON` (default off, like SQLite) — child-side checks on INSERT/UPDATE, parent-side checks on DELETE with `ON DELETE RESTRICT / CASCADE (recursive) / SET NULL / SET DEFAULT`, and parent-side `ON UPDATE RESTRICT / CASCADE / SET NULL / SET DEFAULT`, composite keys, implicit-PK references, and index maintenance on cascaded writes. The ON UPDATE actions are SQLite-exact (differential-pinned in `tests/adv_review.rs`): a CASCADE whose child column is the child's `INTEGER PRIMARY KEY` alias MOVES the child row (rowid = key — an in-place payload write would silently keep the old key visible) and cascades onward to grandchildren; a cascade landing on an existing rowid or unique-index key follows SQLite's UPDATE-OR-REPLACE semantics (the conflicting row is deleted, its own delete-time FK enforcement runs); `SET NULL` onto a rowid-alias column is SQLite's `datatype mismatch`; `SET DEFAULT` moves a rowid-alias child to its (INTEGER) default key and validates that the default key references a parent row in the statement's POST state; every FK-action failure mode is pre-validated BEFORE any row of the statement lands (statement atomicity — a failing `UPDATE p SET id=...` leaves `p` restored, SQLite's statement-journal behavior); duplicate `ON DELETE`/`ON UPDATE` clauses parse with last-one-wins semantics (SQLite's `refargs` grammar has no uniqueness check); and index maintenance on every FK-action write deletes the PRE-mutation entries (deleting the new values leaks the old ones)
 - **Implicit UNIQUE indexes**: column/table-level UNIQUE and non-rowid PKs create `sqlite_autoindex_*` (actually enforced)
 - **Subqueries**: uncorrelated scalar / `IN (SELECT ...)` / `EXISTS (SELECT ...)` — executed once per statement, arbitrarily nested; correlated subqueries execute per outer row with SQLite's scoping
-- **Queries**: `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (multi-key, `COLLATE`, NULLs-last), `LIMIT`/`OFFSET`
+- **Queries**: `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING` (aggregate functions AND projection aliases — `HAVING s > 4` where the SELECT list has `SUM(v) AS s`, and `HAVING v2 > 2` where it has `v AS v2`), `ORDER BY` (multi-key, `COLLATE`, NULLs-last), `LIMIT`/`OFFSET`
+- **Bare columns in aggregate queries (SQLite-exact)**: `SELECT k, v FROM c GROUP BY k` projects the group's REPRESENTATIVE row value for `v` — first-seen, or the row achieving the extreme when the query's last-declared plain `min()`/`max()` strictly improves (differential-pinned in `tests/bare_columns.rs`, 18 suites: projection/HAVING/ORDER BY, aliased refs, expressions over bare columns, star-over-GROUP-BY expansion — `SELECT * FROM c GROUP BY k` projects every FROM column — ORDER-ONLY aggregates riding the Aggregate node's output (`ORDER BY sum(v)` with sum nowhere in the SELECT list), joins, composite keys, collated groups, NULL first-rows, FILTERed co-aggregates, and the register-writer declaration-order rules). `likelihood(X, P)` validates P like SQLite (`datatype` range error); multi-row `VALUES` chains follow SQLite's grammar exactly — a trailing-VALUES core cannot carry `ORDER BY`/`LIMIT` (`VALUES (1) UNION VALUES (2) ORDER BY 1` is SQLite's own syntax error, and so is bare `VALUES (1),(2) ORDER BY 1`), with VALUES output columns named `column1, column2, …`
 - **Joins**: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`, with `ON` / `USING`
 - **Set operations**: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
 - **CTEs**: `WITH` (non-recursive) and `WITH RECURSIVE` — full execution
@@ -223,7 +224,7 @@ The catalog is an in-memory map of name → `Arc<Table>` / `Arc<Index>` / `Arc<V
 
 ### Planner
 
-Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot (side-qualified inside joins so `a.rowid`/`b.rowid` bind their own sides), and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Correlated subqueries rewrite to bound parameters over cached plans (SQLite's co-routine model). Join ordering is cost-searched: a Selinger-style subset DP (bushy partitions ≤ 10 relations, left-deep enumeration ≤ 16, greedy beyond) minimizes a selectivity-aware cost model — see [Remaining gaps](#remaining-gaps-vs-sqlite). WHERE conjuncts over FROM-clause subquery atoms push into the subquery body's own WHERE when the body is a plain single-table SELECT and every reference binds through a bare output column (SQLite's pushDownWhereTerms analog — the body's planning then sees index ranges and rowid lookups); COMPOUND bodies (UNION [ALL] / INTERSECT / EXCEPT) push the same term into EVERY arm — a row filter distributes over set operations — all-or-nothing when any arm is ineligible (differential-pinned in `tests/pushdown_subquery.rs`, 18 suites incl. the decline shapes: aggregates, LIMIT, DISTINCT, ineligible compound arms, outer-join boundaries, ambiguous names). SINGLE-USE CTE bodies get the term before materialization (a CTE referenced exactly once in the whole statement — counted across the main FROM, nested FROMs, and expression subqueries — with a plain single-table body; the materialized set itself becomes pre-filtered). `EXPLAIN QUERY PLAN` materializes WITH clauses like the execution path. Not yet: pushdown into multiply-referenced CTEs (one materialization serves every consumer), view bodies (expanded during planning, after the pre-pass), and join-condition pushdown/flattening.
+Converts an `ast::SelectStatement` into a `Plan` tree: name resolution through a scope stack, plan shape `Scan → Filter (WHERE) → Aggregate (GROUP BY + aggs) → Filter (HAVING) → Window → Distinct → Project → Sort → Limit`, and aggregate rewriting (each `SUM(x)` in the projection becomes a column reference to the `Aggregate` operator's pre-computed output). Aggregate planning carries the FULL downstream set: ORDER-ONLY aggregates (`ORDER BY sum(v)` with sum not in the SELECT list) and one `bare` pseudo-aggregate per bare-column reference (the group's representative-row value — SQLite's bare-column semantics) join the node's output, with ORDER BY terms resolved in a dedicated pre-pass so the Sort above the Aggregate references the same slots the plan built. Beyond the basics it plans: `RowidLookup` for `WHERE id = ?`, `RowidRange` for `BETWEEN`/comparison rowid predicates, `IndexRange` + `IndexNestedLoopJoin` for indexed predicates, fused scan shapes (Filter-over-Scan over selective decode), rowid-inside-expressions rewriting with a hidden rowid slot (side-qualified inside joins so `a.rowid`/`b.rowid` bind their own sides), and rowid-via-index-range plans. Statistics-driven: after `ANALYZE`, `sqlite_stat1` rows feed SQLite's row-estimate model into index-candidate ranking, and an index estimated to match > 75% of the table is declined in favor of the sequential scan. Correlated subqueries rewrite to bound parameters over cached plans (SQLite's co-routine model). Join ordering is cost-searched: a Selinger-style subset DP (bushy partitions ≤ 10 relations, left-deep enumeration ≤ 16, greedy beyond) minimizes a selectivity-aware cost model — see [Remaining gaps](#remaining-gaps-vs-sqlite). WHERE conjuncts over FROM-clause subquery atoms push into the subquery body's own WHERE when the body is a plain single-table SELECT and every reference binds through a bare output column (SQLite's pushDownWhereTerms analog — the body's planning then sees index ranges and rowid lookups); COMPOUND bodies (UNION [ALL] / INTERSECT / EXCEPT) push the same term into EVERY arm — a row filter distributes over set operations — all-or-nothing when any arm is ineligible (differential-pinned in `tests/pushdown_subquery.rs`, 18 suites incl. the decline shapes: aggregates, LIMIT, DISTINCT, ineligible compound arms, outer-join boundaries, ambiguous names). SINGLE-USE CTE bodies get the term before materialization (a CTE referenced exactly once in the whole statement — counted across the main FROM, nested FROMs, and expression subqueries — with a plain single-table body; the materialized set itself becomes pre-filtered). `EXPLAIN QUERY PLAN` materializes WITH clauses like the execution path. Not yet: pushdown into multiply-referenced CTEs (one materialization serves every consumer), view bodies (expanded during planning, after the pre-pass), and join-condition pushdown/flattening.
 
 ### Executor
 
@@ -679,6 +680,53 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
 The honest ledger of everything still missing, organized the way the comparisons
 above are: performance, resource consumption, concurrency, and the feature /
 compat surface. Every entry says what it costs and why it exists.
+
+> **PR #2 ("Muse spark") review outcome — merged after adversarial audit.**
+> The PR's four commits (SQL correctness gaps, HAVING aliases + partial
+> unique indexes + FK clause order, BEFORE triggers + `UPDATE OF` +
+> partial-index maintenance, and a final bundle) were merged into review and
+> then differentially audited against bundled SQLite with a 24-suite
+> adversarial battery (`tests/adv_review.rs`) probing edge cases the PR's own
+> tests did not cover. The audit kept the PR's features, fixed 8 divergences
+> it surfaced, and closed a deeper family the PR missed entirely:
+>
+> - **FK `ON UPDATE` actions rewritten**: cascades onto `INTEGER PRIMARY KEY`
+>   child columns now MOVE the child row (they previously wrote the payload
+>   in place, silently keeping the old key visible — and grandchildren never
+>   cascaded); collisions follow SQLite's UPDATE-OR-REPLACE semantics;
+>   `SET NULL` onto a rowid-alias column errors `datatype mismatch`;
+>   `SET DEFAULT` validates the default key against the post-statement
+>   parent state; every failure mode pre-validates for statement atomicity
+>   (previously a failing `UPDATE p SET id=…` left `p` half-moved);
+>   duplicate `ON DELETE`/`ON UPDATE` clauses follow last-one-wins (the PR
+>   review initially assumed SQLite rejects them — it accepts them, pinned).
+> - **Bare columns in aggregate queries** (the big one the PR's HAVING-alias
+>   work exposed): `SELECT k, v FROM c GROUP BY k` previously emitted NULL
+>   for `v`; SQLite projects the group's representative row value. Now
+>   SQLite-exact — including the single-min/max register-writer rule,
+>   star-over-GROUP-BY expansion, ORDER-ONLY aggregates, and HAVING/ORDER BY
+>   on bare columns and their aliases (`tests/bare_columns.rs`, 18 suites).
+>   Fixing it also fixed a latent `trivial_group_projection` fusion bug: the
+>   general (non-streaming) aggregate path ignored the parent Project's
+>   slot-selection fusion, returning raw `__agg_*` columns for any input
+>   shape the fast paths decline.
+> - **Partial unique indexes**: UPDATEs moving a row INTO the predicate now
+>   enforce uniqueness (the write-set simulation previously treated the
+>   unchanged encoded key as "entry unchanged" — but the row was never IN
+>   the index); membership changes with the same key add/remove entries on
+>   every apply path; FK-action writes follow REPLACE-on-collision.
+> - **Trailing-VALUES grammar**: `VALUES (…) UNION VALUES (…) ORDER BY …`
+>   (and bare `VALUES (…) ORDER BY/LIMIT`) previously parsed as a superset;
+>   now SQLite's own syntax error, exactly.
+> - **View DML matching**: an `INSTEAD OF UPDATE OF (cols)` trigger that does
+>   not match the statement's SET list errors `cannot modify <view> because
+>   it is a view` (previously a silent no-op success).
+> - The PR's own features that the audit verified and kept as-is: HAVING
+>   aggregate aliases (extended to plain-column aliases), `BEFORE`/`AFTER`
+>   trigger ordering with `UPDATE OF` column matching, `WITH RECURSIVE` +
+>   DML shapes, view DML through `INSTEAD OF` triggers (insert/update/delete
+>   + column lists), unknown-function errors, window `EXCLUDE TIES/GROUP`,
+>   and the partial-index maintenance rewrite.
 
 ### Performance gaps
 

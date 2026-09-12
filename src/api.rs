@@ -12,11 +12,11 @@
 //! ```
 
 use crate::error::{Error, Result};
+use crate::executor::StmtMaps;
 use crate::executor::{execute, ExecContext};
 use crate::planner::plan::Plan;
 use crate::planner::Planner;
 use crate::schema::{build_table, Catalog, Index, Table, View};
-use crate::executor::StmtMaps;
 use crate::sql::ast::*;
 use crate::sql::parse;
 use crate::storage::btree::Btree;
@@ -2102,7 +2102,8 @@ fn probe_insert_view_target(sql: &str, catalog: &Catalog) -> Option<String> {
     catalog.get_view(name).map(|v| v.name.clone())
 }
 
-fn dml_view_target(stmt: &Statement, catalog: &Catalog) -> Option<String> {    let name = match stmt {
+fn dml_view_target(stmt: &Statement, catalog: &Catalog) -> Option<String> {
+    let name = match stmt {
         Statement::Insert(i) => &i.table,
         Statement::Update(u) => &u.table,
         Statement::Delete(d) => &d.from,
@@ -2111,14 +2112,9 @@ fn dml_view_target(stmt: &Statement, catalog: &Catalog) -> Option<String> {    l
     if catalog.get_table(name).is_some() {
         return None;
     }
-    catalog
-        .get_view(name)
-        .map(|v| v.name.clone())
-        .or_else(|| {
-            // Unknown name: let the normal path produce its error, unless
-            // a view of that name exists under different case.
-            None
-        })
+    // Unknown name: the normal path produces its error (a view under
+    // different case is not resolved here either).
+    catalog.get_view(name).map(|v| v.name.clone())
 }
 
 /// Scope guard: drain allocator wakes when a query completes on ANY
@@ -6318,10 +6314,7 @@ impl Database {
                         .iter()
                         .position(|c| c.eq_ignore_ascii_case(name))
                         .ok_or_else(|| {
-                            Error::semantic(format!(
-                                "column {} not in view {}",
-                                name, view.name
-                            ))
+                            Error::semantic(format!("column {} not in view {}", name, view.name))
                         })?;
                     row[pos] = v;
                 }
@@ -6329,7 +6322,8 @@ impl Database {
                 if src.len() != n {
                     return Err(Error::semantic(format!(
                         "table {} has {} columns but {} values were supplied",
-                        view.name, n,
+                        view.name,
+                        n,
                         src.len()
                     )));
                 }
@@ -6365,9 +6359,11 @@ impl Database {
         }
         let res = crate::executor::execute(&plan, &mut ctx)?;
         // Column names of the view result (suffix form for matching).
-        let result_cols: Vec<String> = res.columns.iter().map(|c| {
-            c.rsplit('.').next().unwrap_or(c).to_string()
-        }).collect();
+        let result_cols: Vec<String> = res
+            .columns
+            .iter()
+            .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+            .collect();
         // Resolve SET targets to view-column positions.
         let mut set_idx: Vec<(usize, crate::sql::ast::Expr)> = Vec::new();
         for (col, expr) in &upd.set {
@@ -6396,7 +6392,11 @@ impl Database {
             // WHERE against the view row (view-column names + params).
             if let Some(w) = &upd.where_clause {
                 let v = crate::executor::eval_row_public(
-                    w, &old_view, view_cols, &ctx.params, &ctx.named_params,
+                    w,
+                    &old_view,
+                    view_cols,
+                    &ctx.params,
+                    &ctx.named_params,
                 )?;
                 if !v.is_truthy() {
                     continue;
@@ -6406,7 +6406,11 @@ impl Database {
             let mut new_view = old_view.clone();
             for (pos, expr) in &set_idx {
                 let v = crate::executor::eval_row_public(
-                    expr, &old_view, view_cols, &ctx.params, &ctx.named_params,
+                    expr,
+                    &old_view,
+                    view_cols,
+                    &ctx.params,
+                    &ctx.named_params,
                 )?;
                 new_view[*pos] = v;
             }
@@ -6436,9 +6440,11 @@ impl Database {
             plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
         }
         let res = crate::executor::execute(&plan, &mut ctx)?;
-        let result_cols: Vec<String> = res.columns.iter().map(|c| {
-            c.rsplit('.').next().unwrap_or(c).to_string()
-        }).collect();
+        let result_cols: Vec<String> = res
+            .columns
+            .iter()
+            .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+            .collect();
         let mut out = Vec::new();
         for row in res.rows {
             let mut old_view = vec![Value::Null; view_cols.len()];
@@ -6452,7 +6458,11 @@ impl Database {
             }
             if let Some(w) = &del.where_clause {
                 let v = crate::executor::eval_row_public(
-                    w, &old_view, view_cols, &ctx.params, &ctx.named_params,
+                    w,
+                    &old_view,
+                    view_cols,
+                    &ctx.params,
+                    &ctx.named_params,
                 )?;
                 if !v.is_truthy() {
                     continue;
@@ -6475,9 +6485,8 @@ impl Database {
         rows: Vec<(Option<Row>, Option<Row>)>,
         params: Vec<Value>,
     ) -> Result<()> {
-        let _thread_db = crate::plugin::abi::ThreadDbGuard::install(
-            self as *const Database as *mut Database,
-        );
+        let _thread_db =
+            crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -6505,8 +6514,8 @@ impl Database {
             create_sql: String::new(),
             check_exprs: Vec::new(),
             foreign_keys: Vec::new(),
-            col_names: view_cols.iter().cloned().collect::<Vec<_>>().into(),
-            qualified_col_names: view_cols.iter().cloned().collect::<Vec<_>>().into(),
+            col_names: view_cols.to_vec().into(),
+            qualified_col_names: view_cols.to_vec().into(),
             vtab: None,
         };
         for (new_row, old_row) in &rows {
@@ -6526,7 +6535,10 @@ impl Database {
                         continue;
                     }
                 }
-                if ctx.trigger_stack.iter().any(|n| n.eq_ignore_ascii_case(&trig.name))
+                if ctx
+                    .trigger_stack
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&trig.name))
                     && !ctx.pager.recursive_triggers_enabled()
                 {
                     continue;
@@ -6546,15 +6558,9 @@ impl Database {
                         // Plan against the live catalog (bodies touch
                         // real tables, never the view itself).
                         let plan = match &s {
-                            Statement::Insert(_) => {
-                                Self::plan_insert(&self.catalog, &s)?
-                            }
-                            Statement::Update(_) => {
-                                Self::plan_update(&self.catalog, &s)?
-                            }
-                            Statement::Delete(_) => {
-                                Self::plan_delete(&self.catalog, &s)?
-                            }
+                            Statement::Insert(_) => Self::plan_insert(&self.catalog, &s)?,
+                            Statement::Update(_) => Self::plan_update(&self.catalog, &s)?,
+                            Statement::Delete(_) => Self::plan_delete(&self.catalog, &s)?,
                             Statement::Select(sel) => {
                                 let mut planner = Planner::new(&self.catalog);
                                 planner.plan_select(sel)?
@@ -6707,9 +6713,10 @@ impl Database {
             let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Plan-only column probe: execute with LIMIT 0 via the plan.
             let res = crate::executor::execute(&plan, &mut ctx)?;
-            res.columns.iter().map(|c| {
-                c.rsplit('.').next().unwrap_or(c).to_string()
-            }).collect()
+            res.columns
+                .iter()
+                .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+                .collect()
         };
         // INSTEAD OF triggers on this view for the statement's event.
         let (event_kind, phase) = match stmt {
@@ -6719,30 +6726,45 @@ impl Database {
             _ => return Err(Error::semantic("cannot modify view")),
         };
         let _ = event_kind;
+        // Authorization AND firing are the SAME rule (pinned against
+        // bundled SQLite): a DML statement on a view is authorized only
+        // by an INSTEAD OF trigger that MATCHES the statement — for an
+        // `UPDATE OF (cols)` trigger, a listed column must actually be
+        // SET. `UPDATE v SET b` when the only INSTEAD OF trigger is
+        // `UPDATE OF a` errors "cannot modify v because it is a view"
+        // (a successful no-op is NOT SQLite's behavior), while
+        // `UPDATE v SET a, b` fires the same trigger exactly once.
         let triggers: Vec<Arc<crate::schema::Trigger>> = self
             .catalog
             .triggers_on_table(view_name)
             .into_iter()
+            .filter(|t| t.when == crate::sql::ast::TriggerWhen::InsteadOf)
             .filter(|t| {
-                t.when == crate::sql::ast::TriggerWhen::InsteadOf
-                    && match stmt {
-                        Statement::Insert(_) => t.events.iter().any(|e| {
-                            matches!(e, crate::sql::ast::TriggerEvent::Insert)
-                        }),
-                        Statement::Update(u) => t.events.iter().any(|e| match e {
-                            crate::sql::ast::TriggerEvent::Update(list) => {
-                                list.is_empty()
-                                    || list.iter().any(|c| {
-                                        u.set.iter().any(|(col, _)| col.eq_ignore_ascii_case(c))
-                                    })
-                            }
-                            _ => false,
-                        }),
-                        Statement::Delete(_) => t.events.iter().any(|e| {
-                            matches!(e, crate::sql::ast::TriggerEvent::Delete)
-                        }),
+                match stmt {
+                    Statement::Insert(_) => t
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, crate::sql::ast::TriggerEvent::Insert)),
+                    Statement::Update(u) => t.events.iter().any(|e| match e {
+                        crate::sql::ast::TriggerEvent::Update(list) => {
+                            // No column list: fires for every UPDATE.
+                            // With a list: at least one listed column
+                            // must be assigned by this statement.
+                            list.is_empty()
+                                || list.iter().any(|c| {
+                                    u.set.iter().any(|(col, _)| col.eq_ignore_ascii_case(c))
+                                })
+                        }
+                        // Other events on a multi-event trigger don't
+                        // authorize an UPDATE statement.
                         _ => false,
-                    }
+                    }),
+                    Statement::Delete(_) => t
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, crate::sql::ast::TriggerEvent::Delete)),
+                    _ => false,
+                }
             })
             .collect();
         if triggers.is_empty() {
@@ -6758,32 +6780,24 @@ impl Database {
                 // Evaluate the source rows (VALUES / SELECT) in a reader
                 // ctx, map them positionally onto the view columns, and
                 // fire per row.
-                let rows =
-                    self.eval_view_insert_rows(&view, ins, &view_cols, params.clone())?;
+                let rows = self.eval_view_insert_rows(&view, ins, &view_cols, params.clone())?;
                 self.fire_view_triggers(
                     view_name,
                     &view_cols,
                     &triggers,
                     phase,
-                    rows.iter()
-                        .map(|r| (Some(r.clone()), None))
-                        .collect(),
+                    rows.iter().map(|r| (Some(r.clone()), None)).collect(),
                     params,
                 )
             }
             Statement::Update(upd) => {
-                let rows = self.eval_view_update_rows(view_name, &view, upd, &view_cols, params.clone())?;
-                self.fire_view_triggers(
-                    view_name,
-                    &view_cols,
-                    &triggers,
-                    phase,
-                    rows,
-                    params,
-                )
+                let rows =
+                    self.eval_view_update_rows(view_name, &view, upd, &view_cols, params.clone())?;
+                self.fire_view_triggers(view_name, &view_cols, &triggers, phase, rows, params)
             }
             Statement::Delete(del) => {
-                let rows = self.eval_view_delete_rows(view_name, &view, del, &view_cols, params.clone())?;
+                let rows =
+                    self.eval_view_delete_rows(view_name, &view, del, &view_cols, params.clone())?;
                 self.fire_view_triggers(
                     view_name,
                     &view_cols,

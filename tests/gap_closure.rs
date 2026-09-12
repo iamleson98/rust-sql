@@ -89,11 +89,21 @@ fn values_multi_row_differential() {
     ] {
         assert_same(sql);
     }
-    // ORDER BY over a VALUES chain: SQLite requires a compound SELECT
-    // wrapper; the engine accepts the bare form (superset, same rows).
+    // ORDER BY / LIMIT after a bare VALUES chain is SQLite's OWN syntax
+    // error ("near "ORDER"" — pinned): a trailing-VALUES core cannot
+    // carry them, in a single statement or a compound. The engine now
+    // matches that exactly (it previously accepted the bare form as a
+    // superset). The legal spelling routes the VALUES through a
+    // FROM subquery whose OUTER select carries the ORDER BY / LIMIT.
     let db = mem();
-    let rows = db
+    assert!(db
         .query("VALUES (2),(1),(3) ORDER BY 1 LIMIT 2", [])
+        .is_err());
+    assert!(db
+        .query("VALUES (1) UNION VALUES (2) ORDER BY 1", [])
+        .is_err());
+    let rows = db
+        .query("SELECT * FROM (VALUES (2),(1),(3)) ORDER BY 1 LIMIT 2", [])
         .unwrap();
     assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
 }

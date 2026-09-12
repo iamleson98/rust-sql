@@ -1862,6 +1862,340 @@ fn fk_find_child_rows(
     Ok(hits)
 }
 
+/// Write one FK-action-updated child row. Handles everything the plain
+/// in-place payload write misses (all pinned against bundled SQLite):
+///
+/// - **Rowid-alias moves**: when the child's INTEGER PRIMARY KEY alias
+///   column is among the changed columns, the new key value IS the
+///   b-tree key — the row MOVES (delete at the old rowid + insert at
+///   the new one). An in-place payload write would silently keep the
+///   old key visible (the alias column is stored as NULL; the value is
+///   the cell key). NULL / non-integer onto the alias is SQLite's
+///   "datatype mismatch".
+/// - **REPLACE semantics for collisions**: SQLite's FK-action UPDATE
+///   behaves as UPDATE OR REPLACE — a cascade landing on an existing
+///   rowid DELETES that row (with its own delete-time FK enforcement)
+///   instead of failing UNIQUE.
+/// - **Old-entry index maintenance**: index entries are deleted with
+///   the PRE-mutation row values (deleting with the new values leaks
+///   the old entries) and inserted with the new values at the final
+///   rowid. Unique-index key collisions on plain (non-alias) columns
+///   follow the same REPLACE rule.
+///
+/// Returns the row's rowid AFTER the write (the grandchildren
+/// enforcement keys off it).
+fn fk_write_child_row(
+    ctx: &mut ExecContext<'_>,
+    child: &Table,
+    rowid: i64,
+    old_crow: &Row,
+    new_crow: &Row,
+) -> Result<i64> {
+    // Does the rowid-alias column change? (SET NULL / SET DEFAULT onto
+    // the alias, or a CASCADE whose new key lives on the alias.)
+    let move_target: Option<i64> = if let Some(a) = child.rowid_alias {
+        let old_v = old_crow.get(a);
+        let new_v = new_crow.get(a);
+        if old_v == new_v {
+            None
+        } else {
+            match new_v {
+                Some(Value::Integer(i)) => Some(*i),
+                // SQLite: `ON UPDATE SET NULL` onto an INTEGER PRIMARY
+                // KEY child column errors "datatype mismatch" (the
+                // FK action writes NULL directly — no auto-assign).
+                _ => return Err(Error::constraint("datatype mismatch")),
+            }
+        }
+    } else {
+        None
+    };
+    let payload = encode_row_aliased(new_crow, child.rowid_alias);
+    let indexes = ctx.catalog().indexes_on_table(&child.name);
+    if let Some(target) = move_target {
+        if target == rowid {
+            // Key value unchanged numerically — plain in-place write.
+            let root = ctx.table_root(child);
+            let new_root = {
+                let mut bt = Btree::new(ctx.pager, root, false);
+                let updated = bt.update_table(rowid, &payload).unwrap_or(false);
+                if !updated {
+                    bt.delete_table(rowid)?;
+                    bt.insert_table(rowid, &payload)?;
+                }
+                bt.root
+            };
+            ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
+            for idx in &indexes {
+                delete_index_entry(ctx, idx, child, old_crow, rowid)?;
+                insert_index_entry_replace(ctx, idx, child, new_crow, rowid)?;
+            }
+            return Ok(rowid);
+        }
+        // Collision at the target: REPLACE — delete the conflicting row
+        // (delete_rows_by_rowid runs its full DELETE FK enforcement,
+        // exactly SQLite's OR REPLACE semantics).
+        {
+            let root = ctx.table_root(child);
+            let mut bt = Btree::new(ctx.pager, root, false);
+            if let LookupResult::Found(_) = bt.lookup_table(target)? {
+                drop(bt);
+                delete_rows_by_rowid(ctx, child, &[target])?;
+            }
+        }
+        // Delete the old cell + its index entries (OLD row values).
+        {
+            let root = ctx.table_root(child);
+            let (new_root, old_payload) = {
+                let mut bt = Btree::new(ctx.pager, root, false);
+                let p = bt.delete_table_get_payload(rowid)?;
+                (bt.root, p)
+            };
+            ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
+            if let Some(op) = old_payload {
+                if !indexes.is_empty() {
+                    if let Ok(orow) = decode_row(&op, child.n_columns(), rowid, child.rowid_alias) {
+                        for idx in &indexes {
+                            delete_index_entry(ctx, idx, child, &orow, rowid)?;
+                        }
+                    }
+                }
+                ctx.invalidate_max_rowid_if_deleted(&child.name.to_ascii_lowercase(), rowid);
+            }
+        }
+        // Insert at the new key + new index entries.
+        {
+            let root = ctx.table_root(child);
+            let mut bt = Btree::new(ctx.pager, root, false);
+            bt.insert_table(target, &payload)?;
+            if bt.root != root {
+                ctx.set_table_root(&child.name, bt.root);
+            }
+        }
+        for idx in &indexes {
+            insert_index_entry(ctx, idx, child, new_crow, target)?;
+        }
+        Ok(target)
+    } else {
+        // Plain in-place payload write (no alias move).
+        let root = ctx.table_root(child);
+        let new_root = {
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
+            if !updated {
+                bt.delete_table(rowid)?;
+                bt.insert_table(rowid, &payload)?;
+            }
+            bt.root
+        };
+        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
+        for idx in &indexes {
+            delete_index_entry(ctx, idx, child, old_crow, rowid)?;
+            insert_index_entry_replace(ctx, idx, child, new_crow, rowid)?;
+        }
+        Ok(rowid)
+    }
+}
+
+/// Insert an index entry for an FK-action row write, applying SQLite's
+/// REPLACE semantics on unique-index key collisions: a UNIQUE index key
+/// already held by a DIFFERENT rowid deletes that row (the whole row,
+/// with its delete-time FK enforcement) before the entry lands. Only
+/// UNIQUE indexes conflict; plain indexes tolerate duplicate keys, and
+/// partial indexes only consider rows matching their WHERE predicate
+/// (the lookup runs through the same encoded key space).
+fn insert_index_entry_replace(
+    ctx: &mut ExecContext<'_>,
+    index: &Arc<crate::schema::Index>,
+    table: &Table,
+    row: &Row,
+    rowid: i64,
+) -> Result<()> {
+    if index.unique {
+        let key_bytes = encode_index_key(index, table, row);
+        let root = ctx.index_root(index);
+        let conflicts: Vec<i64> = {
+            let mut bt = Btree::new(ctx.pager, root, true);
+            bt.lookup_index(&key_bytes)?
+                .into_iter()
+                .filter(|&r| r != rowid)
+                .collect()
+        };
+        if !conflicts.is_empty() {
+            delete_rows_by_rowid(ctx, table, &conflicts)?;
+        }
+    }
+    insert_index_entry(ctx, index, table, row, rowid)
+}
+
+/// Pre-application validation for parent-key UPDATEs (statement
+/// atomicity — the apply-time enforcement cannot undo rows already
+/// written). SQLite reports every FK-action failure BEFORE any row of
+/// the statement lands: a failing `UPDATE p SET id=...` leaves `p`
+/// untouched (pinned: SET DEFAULT onto a missing parent row errors
+/// with the parent key RESTORED). Failure modes validated here:
+///
+/// - NoAction / Restrict with referencing children → constraint error.
+/// - SET NULL whose FK column is the child's rowid alias → datatype
+///   mismatch (see `fk_write_child_row`).
+/// - SET DEFAULT: the would-be default key must reference a parent row
+///   in the statement's POST state (removed old keys don't count, new
+///   keys do; a partially-NULL key passes), and a rowid-alias FK column
+///   requires an INTEGER default.
+/// - CASCADE onto a rowid-alias FK column requires an INTEGER new key.
+///
+/// Rowid collisions on cascade targets follow REPLACE semantics (the
+/// conflicting row is deleted, not an error) and are NOT checked here.
+fn validate_parent_update_actions(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    write_set: &[(i64, Vec<Value>, Vec<Value>)],
+) -> Result<()> {
+    if !ctx.pager.foreign_keys_enabled() || write_set.is_empty() {
+        return Ok(());
+    }
+    let referencing: Vec<(Arc<Table>, Vec<crate::schema::ForeignKeyClause>)> = ctx
+        .catalog()
+        .all_tables()
+        .into_iter()
+        .filter(|(_, t)| {
+            t.foreign_keys
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(&table.name))
+        })
+        .map(|(_, t)| {
+            let fks: Vec<crate::schema::ForeignKeyClause> = t
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.ref_table.eq_ignore_ascii_case(&table.name))
+                .cloned()
+                .collect();
+            (t, fks)
+        })
+        .collect();
+    if referencing.is_empty() {
+        return Ok(());
+    }
+    for (child, fks) in &referencing {
+        for fk in fks {
+            let parent_cols: Vec<usize> = if !fk.ref_columns.is_empty() {
+                let mut v = Vec::with_capacity(fk.ref_columns.len());
+                for rc in &fk.ref_columns {
+                    if let Some(i) = table.find_column(rc) {
+                        v.push(i);
+                    }
+                }
+                v
+            } else {
+                table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.primary_key)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            // Per-row parent keys over the write set (for the post-state
+            // key sets).
+            let key_of = |row: &[Value]| -> Vec<Value> {
+                if parent_cols.is_empty() {
+                    // No PK on parent: the FK references the rowid.
+                    // Old rows carry the rowid only via the tuple; the
+                    // rowid-alias column holds it, else fall back to
+                    // Integer equality below (the apply path passes the
+                    // real rowids; here the alias column is the best
+                    // proxy).
+                    vec![row
+                        .get(table.rowid_alias.unwrap_or(usize::MAX))
+                        .cloned()
+                        .unwrap_or(Value::Null)]
+                } else {
+                    parent_cols
+                        .iter()
+                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                        .collect()
+                }
+            };
+            let removed: std::collections::HashSet<String> = write_set
+                .iter()
+                .map(|(_, old, _)| format!("{:?}", key_of(old)))
+                .collect();
+            let added: std::collections::HashSet<String> = write_set
+                .iter()
+                .map(|(_, _, new)| format!("{:?}", key_of(new)))
+                .collect();
+            for (rowid, old_row, new_row) in write_set {
+                let old_key = key_of(old_row);
+                let new_key = key_of(new_row);
+                if old_key == new_key {
+                    continue;
+                }
+                let children = fk_find_child_rows(ctx, child, fk, &parent_cols, old_row, *rowid)?;
+                if children.is_empty() {
+                    continue;
+                }
+                match fk.on_update {
+                    ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                        return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                    }
+                    ForeignKeyAction::SetNull => {
+                        if let Some(a) = child.rowid_alias {
+                            if fk.columns.contains(&a) {
+                                return Err(Error::constraint("datatype mismatch"));
+                            }
+                        }
+                    }
+                    ForeignKeyAction::SetDefault => {
+                        let alias = child.rowid_alias.filter(|a| fk.columns.contains(a));
+                        for (_, crow) in &children {
+                            let mut wkey = Vec::with_capacity(fk.columns.len());
+                            for &ci in &fk.columns {
+                                let dv = child.columns[ci].default.as_ref().map(|e| {
+                                    let names: Vec<String> =
+                                        child.columns.iter().map(|c| c.name.clone()).collect();
+                                    eval_row(e, crow, &names, &ctx.params, &ctx.named_params)
+                                        .unwrap_or(Value::Null)
+                                });
+                                wkey.push(dv.unwrap_or(Value::Null));
+                            }
+                            if wkey.iter().any(|v| v.is_null()) {
+                                continue; // partially-NULL child key passes
+                            }
+                            if let Some(a) = alias {
+                                if !matches!(wkey.get(a), Some(Value::Integer(_))) {
+                                    return Err(Error::constraint("datatype mismatch"));
+                                }
+                            }
+                            // Default key must reference a parent row in
+                            // the POST-update state.
+                            let serialized = format!("{:?}", wkey);
+                            if added.contains(&serialized) {
+                                continue;
+                            }
+                            if removed.contains(&serialized) {
+                                return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                            }
+                            if !fk_parent_exists(ctx, fk, &wkey)? {
+                                return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                            }
+                        }
+                    }
+                    ForeignKeyAction::Cascade => {
+                        if let Some(a) = child.rowid_alias {
+                            if fk.columns.contains(&a)
+                                && !matches!(new_key.get(a), Some(Value::Integer(_)))
+                            {
+                                return Err(Error::constraint("datatype mismatch"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parent-side enforcement for a DELETE (or a parent-key UPDATE that moves
 /// the key away): apply the ON DELETE action of every referencing FK.
 ///
@@ -2164,6 +2498,9 @@ fn enforce_parent_update_fks(
                         } else {
                             None
                         };
+                        // Pre-mutation snapshot (index deletes key off the
+                        // OLD row values; mutating first leaks entries).
+                        let old_crow = crow.clone();
                         for (&ci, nv) in fk.columns.iter().zip(new_key.iter()) {
                             if ci < crow.len() {
                                 crow[ci] = nv.clone();
@@ -2171,40 +2508,29 @@ fn enforce_parent_update_fks(
                         }
                         // Child-side re-validation is unnecessary: the new
                         // key is the parent's own post-update key.
-                        let payload = encode_row_aliased(&crow, child.rowid_alias);
-                        let root = ctx.table_root(&child);
-                        let new_root;
-                        {
-                            crate::preupdate::fire(
-                                crate::preupdate::PreupdateOp::Update,
-                                child.as_ref(),
-                                rowid,
-                                pre_row.as_deref(),
-                                Some(&crow),
-                            );
-                            let mut bt = Btree::new(ctx.pager, root, false);
-                            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
-                            if !updated {
-                                bt.delete_table(rowid)?;
-                                bt.insert_table(rowid, &payload)?;
-                            }
-                            new_root = bt.root;
-                        }
-                        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
-                        let indexes = ctx.catalog().indexes_on_table(&child.name);
-                        for idx in indexes {
-                            delete_index_entry(ctx, &idx, &child, &crow, rowid)?;
-                            insert_index_entry(ctx, &idx, &child, &crow, rowid)?;
-                        }
+                        crate::preupdate::fire(
+                            crate::preupdate::PreupdateOp::Update,
+                            child.as_ref(),
+                            rowid,
+                            pre_row.as_deref(),
+                            Some(&crow),
+                        );
+                        // Rowid-alias FK columns MOVE the child row (the
+                        // key value IS the b-tree cell key); collisions
+                        // follow SQLite's REPLACE semantics.
+                        let new_rowid = fk_write_child_row(ctx, &child, rowid, &old_crow, &crow)?;
                         ctx.changes += 1;
-                        // Grandchildren (this child may itself be a parent).
+                        // Grandchildren (this child may itself be a parent)
+                        // — keyed off the PRE-mutation row values (the
+                        // child lookup needs the OLD key) and the rowid
+                        // AFTER any move.
                         enforce_parent_update_fks(
                             ctx,
                             &child,
-                            pre_row.as_deref().unwrap_or(&crow),
+                            &old_crow,
                             &crow,
                             rowid,
-                            rowid,
+                            new_rowid,
                             depth + 1,
                         )?;
                     }
@@ -2216,6 +2542,7 @@ fn enforce_parent_update_fks(
                         } else {
                             None
                         };
+                        let old_crow = crow.clone();
                         for &ci in &fk.columns {
                             crow[ci] = if fk.on_update == ForeignKeyAction::SetNull {
                                 Value::Null
@@ -2229,31 +2556,18 @@ fn enforce_parent_update_fks(
                                 default_val.unwrap_or(Value::Null)
                             };
                         }
-                        let payload = encode_row_aliased(&crow, child.rowid_alias);
-                        let root = ctx.table_root(&child);
-                        let new_root;
-                        {
-                            crate::preupdate::fire(
-                                crate::preupdate::PreupdateOp::Update,
-                                child.as_ref(),
-                                rowid,
-                                pre_row.as_deref(),
-                                Some(&crow),
-                            );
-                            let mut bt = Btree::new(ctx.pager, root, false);
-                            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
-                            if !updated {
-                                bt.delete_table(rowid)?;
-                                bt.insert_table(rowid, &payload)?;
-                            }
-                            new_root = bt.root;
-                        }
-                        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
-                        let indexes = ctx.catalog().indexes_on_table(&child.name);
-                        for idx in indexes {
-                            delete_index_entry(ctx, &idx, &child, &crow, rowid)?;
-                            insert_index_entry(ctx, &idx, &child, &crow, rowid)?;
-                        }
+                        crate::preupdate::fire(
+                            crate::preupdate::PreupdateOp::Update,
+                            child.as_ref(),
+                            rowid,
+                            pre_row.as_deref(),
+                            Some(&crow),
+                        );
+                        // SET NULL onto a rowid-alias FK column errors
+                        // "datatype mismatch"; SET DEFAULT moves the row
+                        // to the (INTEGER) default key (validated in the
+                        // pre-write pass).
+                        fk_write_child_row(ctx, &child, rowid, &old_crow, &crow)?;
                         ctx.changes += 1;
                     }
                 }
@@ -5726,6 +6040,10 @@ struct AggCold {
     /// The constant percentile P (0..=100), parsed once from the
     /// literal the planner threaded through the separator channel.
     pct: Option<f64>,
+    /// Bare-column representative value (AggFunc::Bare): the first-seen
+    /// row's value — or the min/max row's value under the single-min/max
+    /// rule (updated by the serial loop's extreme tracking).
+    bare: Option<Value>,
 }
 
 impl AggState {
@@ -5867,6 +6185,12 @@ pub(crate) enum AggFunc {
     PercentileCont,
     /// percentile_disc(Y, P) — first value at/above the percentile.
     PercentileDisc,
+    /// INTERNAL pseudo-aggregate: a bare column's representative value in
+    /// an aggregate query (SQLite's "bare columns take values from an
+    /// arbitrary row of the group" — the first row in practice, or the
+    /// min/max-achieving row when the query's single aggregate is min()
+    /// or max()). Never user-callable ("no such function: bare").
+    Bare,
     Other,
 }
 
@@ -5889,6 +6213,7 @@ impl AggFunc {
             "median" => AggFunc::Median,
             "percentile_cont" => AggFunc::PercentileCont,
             "percentile_disc" => AggFunc::PercentileDisc,
+            "bare" => AggFunc::Bare,
             _ => AggFunc::Other,
         }
     }
@@ -9617,23 +9942,29 @@ fn exec_aggregate(
     // Fast path #1: input is a bare Scan.
     // Handles: `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t`
     //          `SELECT col, COUNT(*) FROM t GROUP BY col`
-    if let Plan::Scan {
-        table,
-        alias,
-        index: None,
-        predicate: None,
-    } = input
-    {
-        if table.vtab.is_none() {
-            return exec_aggregate_streaming_scan(
-                ctx,
-                table.clone(),
-                alias.clone(),
-                None,
-                group_by,
-                aggregates,
-                projection,
-            );
+    // BARE-COLUMN pseudo-aggregates route to the general path below: the
+    // streaming/selective/compiled machines have no representative-row
+    // handling (first-seen + the single-min/max rule); the general serial
+    // loop does (SQLite's bare-column semantics).
+    if !aggregates.iter().any(|a| a.func == "bare") {
+        if let Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } = input
+        {
+            if table.vtab.is_none() {
+                return exec_aggregate_streaming_scan(
+                    ctx,
+                    table.clone(),
+                    alias.clone(),
+                    None,
+                    group_by,
+                    aggregates,
+                    projection,
+                );
+            }
         }
     }
     // Fast path #1b: COUNT(*) over a RowidRange — count leaf CELLS in the
@@ -9696,28 +10027,30 @@ fn exec_aggregate(
     // Fast path #2: input is Filter(Scan, predicate).
     // Handles: `SELECT COUNT(*) FROM t WHERE val > 5000`
     //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
-    if let Plan::Filter {
-        input: inner,
-        predicate,
-    } = input
-    {
-        if let Plan::Scan {
-            table,
-            alias,
-            index: None,
-            predicate: None,
-        } = inner.as_ref()
+    if !aggregates.iter().any(|a| a.func == "bare") {
+        if let Plan::Filter {
+            input: inner,
+            predicate,
+        } = input
         {
-            if table.vtab.is_none() {
-                return exec_aggregate_streaming_scan(
-                    ctx,
-                    table.clone(),
-                    alias.clone(),
-                    Some(predicate),
-                    group_by,
-                    aggregates,
-                    projection,
-                );
+            if let Plan::Scan {
+                table,
+                alias,
+                index: None,
+                predicate: None,
+            } = inner.as_ref()
+            {
+                if table.vtab.is_none() {
+                    return exec_aggregate_streaming_scan(
+                        ctx,
+                        table.clone(),
+                        alias.clone(),
+                        Some(predicate),
+                        group_by,
+                        aggregates,
+                        projection,
+                    );
+                }
             }
         }
     }
@@ -10000,6 +10333,38 @@ fn exec_aggregate(
     }
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_by.len());
 
+    // Bare-column bookkeeping (SQLite's bare-column semantics): which
+    // aggregate slots are bare-column representatives, and the REGISTER
+    // WRITER — the LAST-declared plain min()/max() in the aggregate list
+    // (no DISTINCT, no FILTER, with an argument). Whenever the writer's
+    // accumulator strictly improves on a row, the representatives are
+    // overwritten with that row's values; the first row of a group
+    // always writes. With NO min/max in the list the representatives
+    // stay first-seen. All pinned against bundled SQLite:
+    //   `count(*), min(v), v` rows (5,1) → v=1 (min row — other
+    //   aggregates don't disable the rule);
+    //   `max(v), min(v), v` rows (5,1) → v=1 (the LAST-declared min/max
+    //   writes — the min);
+    //   `min(v), max(v), v` rows (1,5) → v=5 (the max writes);
+    //   `count(*), v` rows (1,5) → v=1 (no writer: first-seen).
+    let has_bare_aggs = agg_funcs.contains(&AggFunc::Bare);
+    let bare_extreme: Option<(usize, bool)> = if has_bare_aggs {
+        aggregates
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                let f = AggFunc::from_name(&a.func);
+                (f == AggFunc::Min || f == AggFunc::Max)
+                    && !a.distinct
+                    && a.filter.is_none()
+                    && a.arg.is_some()
+            })
+            .map(|(i, a)| (i, AggFunc::from_name(&a.func) == AggFunc::Min))
+            .next_back()
+    } else {
+        None
+    };
+
     // ---- MATERIALIZED-ROW parallel split (GROUP BY) ---------------------
     // The input is materialized and the keys/args compile: chunk the rows,
     // per-worker HashGroupers with the SAME collation folding, chunk-
@@ -10044,6 +10409,40 @@ fn exec_aggregate(
                 continue;
             }
             let gi = grouper.intern_key(&key_buf);
+            // Single-min/max rule (SQLite bare-column semantics): when
+            // the query's ONLY real aggregate is min() or max() (no
+            // DISTINCT, no FILTER), the bare-column representatives take
+            // their values from the row ACHIEVING the extreme — computed
+            // BEFORE this row's aggregate update (comparison vs the
+            // running extreme). Otherwise representatives are first-seen.
+            let extreme_improved = if let (Some((xi, is_min)), true) = (bare_extreme, has_bare_aggs)
+            {
+                let xval = match (&aggregates[xi].arg, agg_col_indices[xi]) {
+                    (Some(_), Some(idx)) => row[idx].clone(),
+                    (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
+                    (None, _) => Value::Integer(1),
+                };
+                let st = grouper.state(gi, xi);
+                let cur = if is_min {
+                    st.cold().and_then(|c| c.min.clone())
+                } else {
+                    st.cold().and_then(|c| c.max.clone())
+                };
+                !xval.is_null()
+                    && match cur {
+                        None => true,
+                        Some(c) => {
+                            let o = value_cmp_conn(&xval, &c);
+                            if is_min {
+                                o == std::cmp::Ordering::Less
+                            } else {
+                                o == std::cmp::Ordering::Greater
+                            }
+                        }
+                    }
+            } else {
+                false
+            };
             for (i, agg) in aggregates.iter().enumerate() {
                 // Per-aggregate FILTER over materialized inputs.
                 if let Some(f) = &agg.filter {
@@ -10060,6 +10459,16 @@ fn exec_aggregate(
                     (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
                     (None, _) => Value::Integer(1),
                 };
+                if agg_funcs[i] == AggFunc::Bare {
+                    // First-seen representative — or the extreme row's
+                    // value under the single-min/max rule.
+                    let st = grouper.state(gi, i);
+                    if !st.seen_value || extreme_improved {
+                        st.cold_mut().bare = Some(arg_val);
+                        st.seen_value = true;
+                    }
+                    continue;
+                }
                 update_agg_state(
                     grouper.state(gi, i),
                     agg_funcs[i],
@@ -10128,6 +10537,25 @@ fn exec_aggregate(
         let _ = agg.alias;
         let _ = i;
         out_cols.push(format!("__agg_{}", i));
+    }
+
+    // The parent Project's trivial-projection fusion (see
+    // trivial_group_projection's call site in exec_project): when the
+    // projection is a bare slot selection, emit the FINAL projected rows
+    // directly — the general path previously honored it only through the
+    // streaming fast paths, so any input shape they decline (joins,
+    // subqueries, and now bare-column queries, which the fast paths
+    // decline for representative-row tracking) returned the RAW
+    // aggregate output instead.
+    if let Some(proj) = projection {
+        let rows = out_rows
+            .iter()
+            .map(|r| proj.src.iter().map(|&si| r[si].clone()).collect())
+            .collect();
+        return Ok(ExecResult {
+            columns: proj.names.clone().into(),
+            rows,
+        });
     }
 
     Ok(ExecResult {
@@ -10704,6 +11132,15 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
             let pct = state.cold().and_then(|c| c.pct).unwrap_or(f64::NAN);
             percentile_of(&mut nums, pct, false).map_or(Value::Null, Value::Real)
         }
+        // Bare-column representative (AggFunc::Bare): the tracked value,
+        // NULL when the group never saw one (impossible for a non-empty
+        // group; the implicit empty group of an aggregate-without-GROUP-BY
+        // emits NULL, matching SQLite's single-row aggregate over an
+        // empty input).
+        "bare" => state
+            .cold()
+            .and_then(|c| c.bare.clone())
+            .unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }
@@ -16934,6 +17371,27 @@ fn index_key_has_null(index: &crate::schema::Index, table: &Table, row: &[Value]
 ///
 /// `write_set` entries are `(rowid, old_row, new_row)` in scan order.
 /// Returns `Ok(plan)` with no conflicts when `unique_indexes` is empty.
+/// Partial-index membership for an UPDATE's old/new rows: (old_in, new_in).
+/// Non-partial indexes report (true, true) — every row is a member.
+#[inline]
+fn partial_membership_pair(
+    index: &crate::schema::Index,
+    table: &Table,
+    old_row: &[Value],
+    new_row: &[Value],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> (bool, bool) {
+    if index.partial_expr.is_none() {
+        (true, true)
+    } else {
+        (
+            index_row_matches_partial(index, table, old_row, params, named_params),
+            index_row_matches_partial(index, table, new_row, params, named_params),
+        )
+    }
+}
+
 pub(crate) fn simulate_update_unique(
     ctx: &ExecContext<'_>,
     table: &Table,
@@ -16955,13 +17413,28 @@ pub(crate) fn simulate_update_unique(
     // entries are (virtually) gone for every index.
     let mut deleted: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for idx in unique_indexes {
-        // Per-row (old_key, new_key) pairs, encoded once. NULL rows carry
-        // keys too (they have index entries) but are exempt from CHECKING.
-        let mut keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(write_set.len());
+        // Per-row (old_key, new_key, old_in, new_in) tuples, encoded once.
+        // NULL rows carry keys too (they have index entries) but are exempt
+        // from CHECKING. The *_in flags are PARTIAL-INDEX membership: an
+        // entry exists only while the row matches the WHERE predicate, so
+        // "same encoded key" does NOT imply "same entry" (a row moving
+        // into the predicate gains an entry that must be uniqueness-
+        // checked; a row leaving it loses the entry).
+        let mut keys: Vec<(Vec<u8>, Vec<u8>, bool, bool)> = Vec::with_capacity(write_set.len());
         for (_, old_row, new_row) in write_set {
+            let (old_in, new_in) = partial_membership_pair(
+                idx,
+                table,
+                old_row,
+                new_row,
+                &ctx.params,
+                &ctx.named_params,
+            );
             keys.push((
                 encode_index_key(idx, table, old_row),
                 encode_index_key(idx, table, new_row),
+                old_in,
+                new_in,
             ));
         }
         let root = ctx.index_root(idx);
@@ -16973,13 +17446,23 @@ pub(crate) fn simulate_update_unique(
         let mut probe: Vec<i64> = Vec::new();
         for pos in 0..write_set.len() {
             let rowid = write_set[pos].0;
-            let (ref old_key, ref new_key) = keys[pos];
-            if old_key == new_key {
+            let (ref old_key, ref new_key, old_in, new_in) = keys[pos];
+            if old_key == new_key && old_in == new_in {
                 // Index entry unchanged — the entry stays; claim it so
-                // LATER rows probing this key see it as taken.
-                pending_new.insert(new_key.clone(), rowid);
+                // LATER rows probing this key see it as taken. (Both OUT
+                // of a partial index: no entry either way — nothing.)
+                if new_in {
+                    pending_new.insert(new_key.clone(), rowid);
+                }
                 continue;
             }
+            if !new_in {
+                // The row LEFT the partial index (or never had an entry):
+                // its old entry — if any — is removed at application
+                // time; nothing to claim, nothing to check.
+                continue;
+            }
+            let _ = old_key;
             let null_new = index_key_has_null(idx, table, write_set[pos].2);
             let mut conflict: Option<i64> = None;
             if !null_new {
@@ -16995,7 +17478,13 @@ pub(crate) fn simulate_update_unique(
                             // key never changed or the row was skipped
                             // (OR IGNORE), in which case the entry persists.
                             let skipped = plan.skip.contains(&lpos);
-                            let unchanged = keys[lpos].0 == keys[lpos].1;
+                            // Partial-aware: the earlier row's entry
+                            // survives its application iff its NEW row
+                            // holds the same key AND is a member; a
+                            // skipped row keeps its OLD entry (which the
+                            // probe hit already proves exists).
+                            let unchanged = keys[lpos].0 == keys[lpos].1
+                                && (if skipped { keys[lpos].2 } else { keys[lpos].3 });
                             if skipped || unchanged {
                                 conflict = Some(m);
                                 break;
@@ -17682,6 +18171,12 @@ fn exec_update(
         delete_rows_by_rowid(ctx, &table, &plan.delete_rowids)?;
     }
 
+    // FK-action pre-validation (statement atomicity): every failure mode
+    // of the ON UPDATE actions is checked BEFORE any row lands, so a
+    // failing statement leaves the database untouched (SQLite's
+    // statement-journal behavior — pinned against bundled SQLite).
+    validate_parent_update_actions(ctx, &table, &write_set)?;
+
     // ---- Pass 2: apply.
     for (pos, (rowid, row, new_row)) in write_set.into_iter().enumerate() {
         if plan.skip.contains(&pos) {
@@ -18013,6 +18508,10 @@ fn exec_update_from(
         delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
     }
 
+    // FK-action pre-validation (statement atomicity) — see the main
+    // exec_update site for the rationale.
+    validate_parent_update_actions(ctx, table, &write_set)?;
+
     // ---- Pass 2: apply.
     for (pos, (rowid, row, new_row)) in write_set.into_iter().enumerate() {
         if plan.skip.contains(&pos) {
@@ -18098,11 +18597,21 @@ fn exec_update_from(
         for idx in &indexes {
             let old_key = encode_index_key(idx, table, &row);
             let new_key = encode_index_key(idx, table, &new_row);
-            if old_key == new_key {
+            let (old_in, new_in) =
+                partial_membership_pair(idx, table, &row, &new_row, &ctx.params, &ctx.named_params);
+            if old_key == new_key && old_in == new_in {
                 continue;
             }
-            delete_index_entry(ctx, idx, table, &row, rowid)?;
-            insert_index_entry(ctx, idx, table, &new_row, rowid)?;
+            // Partial indexes: entries exist only for member rows — a
+            // membership change with the SAME key still adds/removes the
+            // entry (delete_index_entry on a non-member is a no-op-safe
+            // miss; insert only when the new row is a member).
+            if old_in {
+                delete_index_entry(ctx, idx, table, &row, rowid)?;
+            }
+            if new_in {
+                insert_index_entry(ctx, idx, table, &new_row, rowid)?;
+            }
         }
         // AFTER UPDATE triggers (NEW = post-change, OLD = pre-change).
         if has_update_triggers {
@@ -19594,15 +20103,32 @@ fn try_streaming_update(
                 for (ti, idx) in touched_indexes.iter().enumerate() {
                     let old_key = encode_index_key(idx, table, &old_row_buf);
                     let new_key = encode_index_key(idx, table, &new_row);
-                    if old_key == new_key {
+                    let (old_in, new_in) = partial_membership_pair(
+                        idx,
+                        table,
+                        &old_row_buf,
+                        &new_row,
+                        &params,
+                        &named_params,
+                    );
+                    if old_key == new_key && old_in == new_in {
                         continue;
                     }
                     let ibt = &mut index_bts[ti];
-                    if ibt.delete_index(&old_key, *rowid).is_ok()
-                        && ibt.insert_index(&new_key, *rowid).is_err()
+                    // Partial indexes: membership changes with the same
+                    // key still add/remove entries (a row entering the
+                    // WHERE predicate gains one; a row leaving it loses
+                    // one). The delete of a non-existent entry is a
+                    // tolerated miss (old_in false skips it entirely).
+                    let mut maintenance_failed = false;
+                    if old_in && ibt.delete_index(&old_key, *rowid).is_err() {
+                        maintenance_failed = true;
+                    }
+                    if !maintenance_failed && new_in && ibt.insert_index(&new_key, *rowid).is_err()
                     {
-                        // Insert failed after a successful delete — the
-                        // entry is gone; propagate a hard error.
+                        maintenance_failed = true;
+                    }
+                    if maintenance_failed {
                         return Err(Error::corruption(format!(
                             "index maintenance failed for {} (rowid {})",
                             idx.name, rowid

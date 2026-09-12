@@ -647,12 +647,17 @@ impl Parser {
     }
 
     /// Parse the optional `ON DELETE ...` / `ON UPDATE ...` clause pair
-    /// (either order, each at most once — SQLite's grammar). Returns
-    /// (on_delete, on_update), each defaulting to NoAction.
+    /// (either order, any number of repetitions — SQLite's `refargs`
+    /// grammar rule has no uniqueness check). Each occurrence OVERWRITES
+    /// the previous action, so the LAST clause of each kind wins
+    /// (pinned against bundled SQLite: `ON DELETE CASCADE ON DELETE SET
+    /// NULL` behaves as SET NULL; the reversed order behaves as
+    /// CASCADE). Returns (on_delete, on_update), each defaulting to
+    /// NoAction.
     fn parse_fk_actions(&mut self) -> Result<(ForeignKeyAction, ForeignKeyAction)> {
         let mut on_delete = ForeignKeyAction::NoAction;
         let mut on_update = ForeignKeyAction::NoAction;
-        for _ in 0..2 {
+        loop {
             if self.peek().is_keyword("ON") && self.peek_n(1).is_keyword("DELETE") {
                 self.advance();
                 self.advance();
@@ -1685,8 +1690,23 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_select_body()?;
+        let (body, ends_on_values) = self.parse_select_body()?;
+        // SQLite grammar quirk (pinned against bundled SQLite): ORDER BY
+        // / LIMIT may follow a select statement ONLY when its FINAL
+        // compound term is a SELECT core — a trailing VALUES core cannot
+        // carry them. `VALUES (1) UNION VALUES (2) ORDER BY 1`, `SELECT 1
+        // UNION VALUES (2) ORDER BY 1`, and bare `VALUES (1) ORDER BY 1`
+        // are all `near "ORDER": syntax error` (likewise LIMIT);
+        // `VALUES (1) UNION SELECT 2 ORDER BY 1` is fine.
         let order_by = if self.peek().is_keyword("ORDER") {
+            if ends_on_values {
+                let t = self.peek();
+                return Err(Error::parse(
+                    t.line,
+                    t.col,
+                    "near \"ORDER\": syntax error".to_string(),
+                ));
+            }
             self.advance();
             self.expect_keyword("BY")?;
             self.parse_order_terms()?
@@ -1694,6 +1714,14 @@ impl Parser {
             Vec::new()
         };
         let (limit, offset) = if self.peek().is_keyword("LIMIT") {
+            if ends_on_values {
+                let t = self.peek();
+                return Err(Error::parse(
+                    t.line,
+                    t.col,
+                    "near \"LIMIT\": syntax error".to_string(),
+                ));
+            }
             self.advance();
             let l = self.parse_expr()?;
             if self.peek().is_keyword("OFFSET") {
@@ -1720,7 +1748,10 @@ impl Parser {
         })
     }
 
-    fn parse_select_body(&mut self) -> Result<SelectBody> {
+    /// Parse a select body. Returns (body, ends_on_values) — the flag
+    /// reports whether the FINAL compound term is a VALUES core (the
+    /// trailing-VALUES grammar restriction above keys off it).
+    fn parse_select_body(&mut self) -> Result<(SelectBody, bool)> {
         // Top-level VALUES (..), (..), ... — a multi-row table
         // constructor (SQLite: a compound of single-row SELECTs). Parse
         // every row here (before set-op chaining) so all rows survive:
@@ -1790,14 +1821,18 @@ impl Parser {
                     self.advance();
                     SetOp::Except
                 };
-                let right = self.parse_select_body()?;
-                return Ok(SelectBody::Binary {
-                    op,
-                    left: Box::new(body),
-                    right: Box::new(right),
-                });
+                let (right, right_ends_on_values) = self.parse_select_body()?;
+                return Ok((
+                    SelectBody::Binary {
+                        op,
+                        left: Box::new(body),
+                        right: Box::new(right),
+                    },
+                    right_ends_on_values,
+                ));
             }
-            return Ok(body);
+            // The VALUES chain itself is the trailing core.
+            return Ok((body, true));
         }
         let left = self.parse_simple_select()?;
         // Look for set operators
@@ -1819,14 +1854,17 @@ impl Parser {
                 self.advance();
                 SetOp::Except
             };
-            let right = self.parse_select_body()?;
-            return Ok(SelectBody::Binary {
-                op,
-                left: Box::new(SelectBody::Simple(left)),
-                right: Box::new(right),
-            });
+            let (right, right_ends_on_values) = self.parse_select_body()?;
+            return Ok((
+                SelectBody::Binary {
+                    op,
+                    left: Box::new(SelectBody::Simple(left)),
+                    right: Box::new(right),
+                },
+                right_ends_on_values,
+            ));
         }
-        Ok(SelectBody::Simple(left))
+        Ok((SelectBody::Simple(left), false))
     }
 
     fn parse_simple_select(&mut self) -> Result<SimpleSelect> {

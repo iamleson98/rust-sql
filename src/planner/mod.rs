@@ -62,7 +62,19 @@ impl<'a> Planner<'a> {
     /// old vestigial pass re-planned CTE bodies without CTE scope, which
     /// broke nested WITH clauses.
     pub fn plan_select(&mut self, stmt: &SelectStatement) -> Result<Plan> {
-        let plan = self.plan_select_body(&stmt.body)?;
+        // ORDER BY terms resolve BEFORE body planning: the aggregate
+        // branch needs them (ORDER-ONLY aggregates + bare-column
+        // representatives must be part of the Aggregate node's output so
+        // the Sort above it can reference them). Phase 1 here is purely
+        // AST-level (ordinal + alias + collation); phase 2 (the aggregate
+        // rewrite) runs after the body plan, keyed off the same resolved
+        // terms.
+        let resolved_order: Vec<OrderTerm> = if !stmt.order_by.is_empty() {
+            self.resolve_order_by_terms(&stmt.body, &stmt.order_by)?
+        } else {
+            Vec::new()
+        };
+        let plan = self.plan_select_body(&stmt.body, &resolved_order)?;
 
         // Insert Sort BELOW Project / Distinct so it can see all input
         // columns (not just the projected ones). This is required for
@@ -70,7 +82,8 @@ impl<'a> Planner<'a> {
         // in the projection. SQLite semantics: ORDER BY may reference any
         // column in the FROM clause, or any projection alias.
         let plan = if !stmt.order_by.is_empty() {
-            let terms = self.resolve_order_by_terms(&stmt.body, &stmt.order_by)?;
+            let terms =
+                self.rewrite_order_terms_aggregate(&stmt.body, &resolved_order, &stmt.order_by)?;
             let sorted = insert_sort_below_top(plan, terms);
             // ROWID-ORDER ELISION: a table b-tree scan emits rows in
             // rowid order by construction — an ORDER BY that resolves to
@@ -239,52 +252,23 @@ impl<'a> Planner<'a> {
                         }
                     }
                 }
-                // 2. Aggregate rewrite (mirrors plan_simple_select).
-                let has_aggregates = self.expr_list_has_aggregates(&s.columns)
-                    || s.having.is_some()
-                    || !s.group_by.is_empty();
-                if has_aggregates {
-                    let aggregates = self
-                        .collect_aggregates(&s.columns, s.having.as_ref())
-                        .unwrap_or_default();
-                    let resolved_group_by: Vec<Expr> = s
-                        .group_by
-                        .iter()
-                        .map(|g| {
-                            if let Expr::Column { table: None, name } = g {
-                                for c in &s.columns {
-                                    if let ResultColumn::Expr {
-                                        expr,
-                                        alias: Some(a),
-                                    } = c
-                                    {
-                                        if a.eq_ignore_ascii_case(name) {
-                                            return expr.clone();
-                                        }
-                                    }
-                                }
-                            }
-                            g.clone()
-                        })
-                        .collect();
-                    expr = rewrite_aggregates_and_groups(
-                        &expr,
-                        &aggregates,
-                        &resolved_group_by,
-                        resolved_group_by.len(),
-                    );
-                }
+                // (Aggregate rewrite moved to phase 2 — see
+                // rewrite_order_terms_aggregate — because the Aggregate
+                // node built by plan_simple_select must carry the SAME
+                // aggregate set the rewrite resolves against, including
+                // ORDER-ONLY aggregates and bare-column representatives.)
                 // 3. Collation attachment (SQLite): the ORDER BY term's
                 //    own collation — an explicit COLLATE on the term
-                //    (checked on the ORIGINAL term: the aggregate
-                //    rewrite above replaces the term with a group-key
-                //    column reference and would otherwise lose it), else
-                //    a bare-column term's DECLARED collation. Attached
-                //    AFTER alias / aggregate resolution so terms that
-                //    resolved to an expression keep the expression's own
-                //    semantics; every sort comparator (serial exec_sort,
-                //    top-N, and the parallel path's Collate declination)
-                //    honors the wrapper.
+                //    (checked on the ORIGINAL term: phase 2's aggregate
+                //    rewrite replaces the term with a group-key column
+                //    reference and would otherwise lose it), else a
+                //    bare-column term's DECLARED collation. Attached
+                //    AFTER alias resolution (before the aggregate
+                //    rewrite — phase 2 recurses through the wrapper) so
+                //    terms that resolved to an expression keep the
+                //    expression's own semantics; every sort comparator
+                //    (serial exec_sort, top-N, and the parallel path's
+                //    Collate declination) honors the wrapper.
                 if !matches!(&expr, Expr::Collate { .. }) {
                     let term_coll = if let Expr::Collate { collation, .. } = &t.expr {
                         Some(collation.clone())
@@ -315,12 +299,18 @@ impl<'a> Planner<'a> {
         Ok(resolved)
     }
 
-    fn plan_select_body(&mut self, body: &SelectBody) -> Result<Plan> {
+    /// `order_terms` are the statement's PHASE-1-RESOLVED ORDER BY terms
+    /// (ordinal + alias + collation, NO aggregate rewrite): the aggregate
+    /// branch of a simple select needs them so ORDER-ONLY aggregates and
+    /// bare-column representatives join the Aggregate node's output.
+    /// Compound bodies plan their arms WITHOUT them (a compound's ORDER
+    /// BY sorts the combined output above the set-op tree).
+    fn plan_select_body(&mut self, body: &SelectBody, order_terms: &[OrderTerm]) -> Result<Plan> {
         match body {
-            SelectBody::Simple(s) => self.plan_simple_select(s),
+            SelectBody::Simple(s) => self.plan_simple_select(s, order_terms),
             SelectBody::Binary { op, left, right } => {
-                let l = self.plan_select_body(left)?;
-                let r = self.plan_select_body(right)?;
+                let l = self.plan_select_body(left, &[])?;
+                let r = self.plan_select_body(right, &[])?;
                 match op {
                     SetOp::Union => Ok(Plan::Union {
                         left: Box::new(l),
@@ -345,7 +335,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn plan_simple_select(&mut self, s: &SimpleSelect) -> Result<Plan> {
+    fn plan_simple_select(&mut self, s: &SimpleSelect, order_terms: &[OrderTerm]) -> Result<Plan> {
         // SQLite's collation resolution: a comparison whose operand is a
         // column with a DECLARED collation (e.g. `email TEXT COLLATE
         // NOCASE`) uses that collation even without an explicit COLLATE in
@@ -417,8 +407,13 @@ impl<'a> Planner<'a> {
         let has_aggregates = self.expr_list_has_aggregates(&s.columns)
             || s.having.is_some()
             || !s.group_by.is_empty();
+        // The FULL aggregate set: real aggregates (SELECT + HAVING +
+        // ORDER BY — ORDER-ONLY aggregates ride along so the Sort above
+        // the Aggregate can reference them) plus one `bare` pseudo-
+        // aggregate per bare-column reference (SQLite's bare-column
+        // semantics: representatives over the group's rows).
         let aggregates = if has_aggregates {
-            self.collect_aggregates(&s.columns, s.having.as_ref())?
+            self.build_full_agg_set(s, order_terms)?
         } else {
             Vec::new()
         };
@@ -476,24 +471,39 @@ impl<'a> Planner<'a> {
                 };
             }
 
-            let rewritten_columns: Vec<ProjectExpr> = s
+            // Star/expr arms; stars expand to N columns, exprs stay one.
+            enum StarArm {
+                Expanded(Vec<ProjectExpr>),
+                Plain(Vec<ProjectExpr>),
+            }
+            let star_arms: Vec<StarArm> = s
                 .columns
                 .iter()
                 .map(|c| match c {
-                    ResultColumn::Star => ProjectExpr {
-                        expr: Expr::Column {
-                            table: None,
-                            name: "*".into(),
-                        },
-                        alias: None,
-                    },
-                    ResultColumn::TableStar(t) => ProjectExpr {
-                        expr: Expr::Column {
-                            table: Some(t.clone()),
-                            name: "*".into(),
-                        },
-                        alias: None,
-                    },
+                    // STAR over an aggregate query: expand at PLAN time to
+                    // the FROM's table columns (SQLite: `SELECT * FROM c
+                    // GROUP BY k` projects k, v — v is the group's
+                    // representative value, not a dropped column). Each
+                    // expanded column rewrites to its group-key column or
+                    // bare representative. Non-expandable FROM shapes
+                    // (subquery atoms) keep the legacy star-over-Aggregate
+                    // behavior.
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        let expanded = self.expand_star_for_aggregate(s, c);
+                        match expanded {
+                            Some(cols) => StarArm::Expanded(cols),
+                            None => StarArm::Plain(vec![ProjectExpr {
+                                expr: Expr::Column {
+                                    table: match c {
+                                        ResultColumn::TableStar(t) => Some(t.clone()),
+                                        _ => None,
+                                    },
+                                    name: "*".into(),
+                                },
+                                alias: None,
+                            }]),
+                        }
+                    }
                     ResultColumn::Expr { expr, alias } => {
                         let rewritten = rewrite_aggregates_and_groups(
                             expr,
@@ -514,11 +524,19 @@ impl<'a> Planner<'a> {
                                 None
                             }
                         });
-                        ProjectExpr {
+                        StarArm::Plain(vec![ProjectExpr {
                             expr: rewritten,
                             alias,
-                        }
+                        }])
                     }
+                })
+                .collect::<Vec<_>>();
+            // Flatten the star/expr mix.
+            let rewritten_columns: Vec<ProjectExpr> = star_arms
+                .into_iter()
+                .flat_map(|e| match e {
+                    StarArm::Expanded(cols) => cols,
+                    StarArm::Plain(v) => v,
                 })
                 .collect();
             plan = Plan::Project {
@@ -962,6 +980,346 @@ impl<'a> Planner<'a> {
         Ok(out)
     }
 
+    /// The FULL aggregate set for an aggregate query's Aggregate node:
+    ///
+    /// 1. Real aggregates from the SELECT list and HAVING (the classic
+    ///    `collect_aggregates` output).
+    /// 2. ORDER-ONLY real aggregates — `SELECT k FROM c GROUP BY k ORDER
+    ///    BY sum(v)`: sum(v) appears nowhere in the projection but the
+    ///    Sort (which sits ABOVE the Aggregate) needs it as an output
+    ///    column. Deduped against the SELECT/HAVING set by the rewrite's
+    ///    matching key.
+    /// 3. One `func: "bare"` pseudo-aggregate per BARE column reference
+    ///    (projection, HAVING, ORDER BY, star expansion) that is neither
+    ///    a GROUP BY key nor inside an aggregate call — SQLite's
+    ///    bare-column semantics: `SELECT k, v FROM c GROUP BY k` projects
+    ///    the group's representative row value for v (first-seen; the
+    ///    min/max-achieving row when the query's single aggregate is
+    ///    min() or max() — the executor tracks that).
+    ///
+    /// Called from plan_simple_select (the Aggregate node) AND the ORDER
+    /// BY term rewrite — the SAME inputs produce the SAME list, so the
+    /// `__agg_i` indices the rewrite emits resolve against the node the
+    /// plan built.
+    fn build_full_agg_set(
+        &self,
+        s: &SimpleSelect,
+        order_terms: &[OrderTerm],
+    ) -> Result<Vec<AggExpr>> {
+        let mut aggregates = self.collect_aggregates(&s.columns, s.having.as_ref())?;
+        // ORDER-ONLY real aggregates.
+        let mut order_aggs: Vec<AggExpr> = Vec::new();
+        for t in order_terms {
+            collect_aggregates_rec(&t.expr, &None, &mut order_aggs);
+        }
+        for oa in order_aggs {
+            let dup = aggregates.iter().any(|x| {
+                x.func == oa.func
+                    && x.distinct == oa.distinct
+                    && format!("{:?}", x.arg) == format!("{:?}", oa.arg)
+                    && format!("{:?}", x.filter) == format!("{:?}", oa.filter)
+            });
+            if !dup {
+                aggregates.push(oa);
+            }
+        }
+        // Bare-column pseudo-aggregates.
+        let resolved_group_by: Vec<Expr> = s
+            .group_by
+            .iter()
+            .map(|g| {
+                if let Expr::Column { table: None, name } = g {
+                    for c in &s.columns {
+                        if let ResultColumn::Expr {
+                            expr,
+                            alias: Some(a),
+                        } = c
+                        {
+                            if a.eq_ignore_ascii_case(name) {
+                                return expr.clone();
+                            }
+                        }
+                    }
+                }
+                g.clone()
+            })
+            .collect();
+        let mut bare: Vec<Expr> = Vec::new();
+        for c in &s.columns {
+            if let ResultColumn::Expr { expr, .. } = c {
+                collect_bare_refs(expr, &resolved_group_by, &mut bare);
+            }
+        }
+        // Star expansions contribute their columns as bare refs (or group
+        // keys, which the collector skips).
+        if let Some(expanded) = self.expand_star_exprs(s) {
+            for e in &expanded {
+                collect_bare_refs(e, &resolved_group_by, &mut bare);
+            }
+        }
+        if let Some(h) = &s.having {
+            // The UNALIASED HAVING — alias substitution happens before the
+            // rewrite in plan_simple_select, so the collector sees the
+            // same post-substitution shape.
+            let unaliased = resolve_having_aliases(h, &s.columns);
+            collect_bare_refs(&unaliased, &resolved_group_by, &mut bare);
+        }
+        for t in order_terms {
+            collect_bare_refs(&t.expr, &resolved_group_by, &mut bare);
+        }
+        for e in bare {
+            let display = match &e {
+                Expr::Column { name, .. } => name.clone(),
+                _ => "bare".to_string(),
+            };
+            aggregates.push(AggExpr {
+                func: "bare".into(),
+                arg: Some(e),
+                sep: None,
+                distinct: false,
+                alias: None,
+                display_name: display,
+                filter: None,
+            });
+        }
+        Ok(aggregates)
+    }
+
+    /// Star / table-star expansion for the AGGREGATE branch (plan time):
+    /// every column of every plain-table FROM side (or the named side for
+    /// `t.*`), in FROM order — each as a bare Column reference that the
+    /// projection rewrite maps to its group-key column or bare
+    /// representative. Returns None when the FROM shape is not
+    /// plan-time expandable (subquery / table-function atoms).
+    fn expand_star_exprs(&self, s: &SimpleSelect) -> Option<Vec<Expr>> {
+        let from = s.from.as_ref()?;
+        let mut sides: Vec<(String, Option<String>)> = Vec::new();
+        if !collect_plain_table_sides(from, &mut sides) {
+            return None;
+        }
+        if sides.is_empty() {
+            return None;
+        }
+        let mut out: Vec<Expr> = Vec::new();
+        for c in &s.columns {
+            match c {
+                ResultColumn::Star => {
+                    for (name, _) in &sides {
+                        let t = self.catalog.get_table(name)?;
+                        for col in &t.columns {
+                            out.push(Expr::Column {
+                                table: None,
+                                name: col.name.clone(),
+                            });
+                        }
+                    }
+                }
+                ResultColumn::TableStar(tn) => {
+                    let side = sides.iter().find(|(n, a)| {
+                        n.eq_ignore_ascii_case(tn)
+                            || a.as_deref()
+                                .map(|x| x.eq_ignore_ascii_case(tn))
+                                .unwrap_or(false)
+                    })?;
+                    let t = self.catalog.get_table(&side.0)?;
+                    for col in &t.columns {
+                        out.push(Expr::Column {
+                            table: None,
+                            name: col.name.clone(),
+                        });
+                    }
+                }
+                ResultColumn::Expr { .. } => {}
+            }
+        }
+        Some(out)
+    }
+
+    /// Star expansion for ONE projection arm (see expand_star_exprs);
+    /// returns the rewritten ProjectExpr list for that arm, or None when
+    /// the arm's star is not plan-time expandable.
+    fn expand_star_for_aggregate(
+        &self,
+        s: &SimpleSelect,
+        c: &ResultColumn,
+    ) -> Option<Vec<ProjectExpr>> {
+        // Only star arms expand.
+        if !matches!(c, ResultColumn::Star | ResultColumn::TableStar(_)) {
+            return None;
+        }
+        let expanded = self.expand_star_exprs(s)?;
+        // Rebuild the group-by resolution + aggregate set for the rewrite.
+        let resolved_group_by: Vec<Expr> = s
+            .group_by
+            .iter()
+            .map(|g| {
+                if let Expr::Column { table: None, name } = g {
+                    for c in &s.columns {
+                        if let ResultColumn::Expr {
+                            expr,
+                            alias: Some(a),
+                        } = c
+                        {
+                            if a.eq_ignore_ascii_case(name) {
+                                return expr.clone();
+                            }
+                        }
+                    }
+                }
+                g.clone()
+            })
+            .collect();
+        let aggregates = self
+            .build_full_agg_set(s, &[])
+            .ok()
+            .or_else(|| Some(Vec::new()))?;
+        let n_group = resolved_group_by.len();
+        let mut cols: Vec<ProjectExpr> = Vec::new();
+        // Filter the expansion to THIS arm's side (for t.*).
+        let wanted: Option<String> = match c {
+            ResultColumn::TableStar(t) => Some(t.to_ascii_lowercase()),
+            _ => None,
+        };
+        let mut sides: Vec<(String, Option<String>)> = Vec::new();
+        let from = s.from.as_ref()?;
+        if !collect_plain_table_sides(from, &mut sides) {
+            return None;
+        }
+        let mut emitted_for_side: Vec<String> = Vec::new();
+        for (i, e) in expanded.iter().enumerate() {
+            // Position mapping: the expansion walks sides in order; find
+            // which side each expr came from by re-walking.
+            let _ = i;
+            if let Expr::Column { name, .. } = e {
+                // For t.*: only columns of the named side.
+                if let Some(want) = &wanted {
+                    let side_match = sides.iter().any(|(n, a)| {
+                        n.eq_ignore_ascii_case(want)
+                            || a.as_deref()
+                                .map(|x| x.eq_ignore_ascii_case(want))
+                                .unwrap_or(false)
+                    });
+                    if !side_match && emitted_for_side.is_empty() {
+                        // The named side's columns: matched below.
+                    }
+                }
+                let rewritten =
+                    rewrite_aggregates_and_groups(e, &aggregates, &resolved_group_by, n_group);
+                cols.push(ProjectExpr {
+                    expr: rewritten,
+                    alias: Some(name.clone()),
+                });
+            }
+        }
+        // For t.*: filter to the named side's columns by re-expanding.
+        if let Some(want) = wanted {
+            let side = sides.iter().find(|(n, a)| {
+                n.eq_ignore_ascii_case(&want)
+                    || a.as_deref()
+                        .map(|x| x.eq_ignore_ascii_case(&want))
+                        .unwrap_or(false)
+            })?;
+            let t = self.catalog.get_table(&side.0)?;
+            let names: Vec<String> = t
+                .columns
+                .iter()
+                .map(|c| c.name.to_ascii_lowercase())
+                .collect();
+            cols.retain(|pe| {
+                pe.alias
+                    .as_deref()
+                    .map(|a| names.iter().any(|n| n == &a.to_ascii_lowercase()))
+                    .unwrap_or(false)
+            });
+            if cols.is_empty() {
+                return None;
+            }
+        }
+        let _ = &mut emitted_for_side;
+        Some(cols)
+    }
+
+    /// Phase 2 of ORDER BY term resolution: the aggregate rewrite. Runs
+    /// AFTER the body plan (the Aggregate node exists) and uses the SAME
+    /// full aggregate set plan_simple_select built (build_full_agg_set on
+    /// the same (s, resolved terms) inputs → identical `__agg_i`
+    /// indices). Compound bodies pass through unchanged (their ORDER BY
+    /// sorts the combined output above the set-op tree).
+    fn rewrite_order_terms_aggregate(
+        &mut self,
+        body: &SelectBody,
+        resolved_terms: &[OrderTerm],
+        raw_terms: &[OrderTerm],
+    ) -> Result<Vec<OrderTerm>> {
+        let s = match body {
+            SelectBody::Simple(s) => s,
+            SelectBody::Binary { .. } => return Ok(resolved_terms.to_vec()),
+        };
+        let has_aggregates = self.expr_list_has_aggregates(&s.columns)
+            || s.having.is_some()
+            || !s.group_by.is_empty();
+        if !has_aggregates {
+            return Ok(resolved_terms.to_vec());
+        }
+        let aggregates = self.build_full_agg_set(s, resolved_terms)?;
+        let resolved_group_by: Vec<Expr> = s
+            .group_by
+            .iter()
+            .map(|g| {
+                if let Expr::Column { table: None, name } = g {
+                    for c in &s.columns {
+                        if let ResultColumn::Expr {
+                            expr,
+                            alias: Some(a),
+                        } = c
+                        {
+                            if a.eq_ignore_ascii_case(name) {
+                                return expr.clone();
+                            }
+                        }
+                    }
+                }
+                g.clone()
+            })
+            .collect();
+        let n = resolved_group_by.len();
+        Ok(resolved_terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let rewritten =
+                    rewrite_aggregates_and_groups(&t.expr, &aggregates, &resolved_group_by, n);
+                // Explicit-COLLATE re-attach (the ORIGINAL term's): the
+                // group-key match consumes a whole `v COLLATE X` term and
+                // returns the bare group output column — the wrapper
+                // would be lost. Phase 1 attached DECLARED collations
+                // (which survive through the rewrite's Collate
+                // recursion); this restores the EXPLICIT ones.
+                let expr = if !matches!(&rewritten, Expr::Collate { .. }) {
+                    match raw_terms.get(i).map(|rt| &rt.expr) {
+                        Some(Expr::Collate { collation, .. })
+                            if !collation.is_empty()
+                                && !collation.eq_ignore_ascii_case("BINARY") =>
+                        {
+                            Expr::Collate {
+                                expr: Box::new(rewritten),
+                                collation: collation.clone(),
+                            }
+                        }
+                        _ => rewritten,
+                    }
+                } else {
+                    rewritten
+                };
+                OrderTerm {
+                    expr,
+                    order: t.order,
+                    nulls: t.nulls,
+                }
+            })
+            .collect())
+    }
+
     fn collect_windows(
         &self,
         cols: &[ResultColumn],
@@ -1150,6 +1508,25 @@ pub fn rewrite_aggregates_and_groups(
                 _ => format!("col{}", i + 1),
             };
             return Expr::Column { table: None, name };
+        }
+    }
+    // Bare-column pseudo-aggregates (SQLite's bare-column semantics): a
+    // Column reference that is NOT a group key and NOT inside an
+    // aggregate call resolves to the group's representative row value —
+    // the planner appends `func: "bare"` pseudo-aggregates to the list;
+    // match them here by structural (Display) equality of the arg.
+    if let Expr::Column { .. } = e {
+        for (i, agg) in aggregates.iter().enumerate() {
+            if agg.func == "bare" {
+                if let Some(arg) = &agg.arg {
+                    if format!("{:?}", arg) == e_display {
+                        return Expr::Column {
+                            table: None,
+                            name: format!("__agg_{}", i),
+                        };
+                    }
+                }
+            }
         }
     }
     // Otherwise, rewrite aggregates and recurse.
@@ -6839,6 +7216,132 @@ fn rewrite_rowid_refs_in_plan_multi(
 /// tree — walking Join nodes, skipping subqueries and table functions
 /// (their output columns carry no rowid slots; a same-named qualifier
 /// simply matches nothing in the rewrite).
+/// Plain-table FROM sides for plan-time star expansion: (table name,
+/// alias) in FROM order. Returns FALSE when any side is a subquery /
+/// table-function atom (the star is then not plan-time expandable).
+fn collect_plain_table_sides(
+    from: &TableExpression,
+    out: &mut Vec<(String, Option<String>)>,
+) -> bool {
+    match from {
+        TableExpression::Table { name, alias, .. } => {
+            out.push((name.clone(), alias.clone()));
+            true
+        }
+        TableExpression::Join { left, right, .. } => {
+            collect_plain_table_sides(left, out) && collect_plain_table_sides(right, out)
+        }
+        TableExpression::Subquery { .. } | TableExpression::Function { .. } => false,
+    }
+}
+
+/// Collect BARE column references for the aggregate machinery (SQLite's
+/// bare-column semantics). A ref qualifies when it is a Column (qualified
+/// or not), does NOT display-match a GROUP BY term (the rewrite maps
+/// those to the group-key output columns), and is NOT inside an
+/// aggregate call (the aggregate owns its arguments), a window call, or
+/// a subquery (scope boundary — outer refs inside subqueries resolve
+/// through their own machinery). Deduped by structural (Display)
+/// equality.
+fn collect_bare_refs(e: &Expr, group_by: &[Expr], out: &mut Vec<Expr>) {
+    match e {
+        Expr::Column { .. } => {
+            let d = format!("{:?}", e);
+            for g in group_by {
+                let gd = format!("{:?}", g);
+                let inner = match g {
+                    Expr::Collate { expr, .. } => format!("{:?}", expr),
+                    _ => gd.clone(),
+                };
+                if gd == d || inner == d {
+                    return;
+                }
+            }
+            if !out.iter().any(|x| format!("{:?}", x) == d) {
+                out.push(e.clone());
+            }
+        }
+        // Aggregate calls own their arguments; window calls are opaque;
+        // subqueries are scope boundaries.
+        Expr::Function {
+            name,
+            args,
+            over,
+            filter,
+            ..
+        } => {
+            let is_agg =
+                over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len());
+            if !is_agg {
+                for a in args {
+                    collect_bare_refs(a, group_by, out);
+                }
+                if let Some(f) = filter {
+                    collect_bare_refs(f, group_by, out);
+                }
+            }
+        }
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::Raise { .. } => {}
+        Expr::In { expr, source, .. } => {
+            collect_bare_refs(expr, group_by, out);
+            if let crate::sql::ast::InSource::List(l) = source {
+                for x in l.iter() {
+                    collect_bare_refs(x, group_by, out);
+                }
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_bare_refs(left, group_by, out);
+            collect_bare_refs(right, group_by, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            collect_bare_refs(expr, group_by, out)
+        }
+        Expr::Collate { expr, .. } => collect_bare_refs(expr, group_by, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_bare_refs(expr, group_by, out);
+            collect_bare_refs(low, group_by, out);
+            collect_bare_refs(high, group_by, out);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_bare_refs(expr, group_by, out);
+            collect_bare_refs(pattern, group_by, out);
+            if let Some(x) = escape {
+                collect_bare_refs(x, group_by, out);
+            }
+        }
+        Expr::Is { left, right, .. } => {
+            collect_bare_refs(left, group_by, out);
+            collect_bare_refs(right, group_by, out);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+            ..
+        } => {
+            if let Some(o) = operand {
+                collect_bare_refs(o, group_by, out);
+            }
+            for (w, v) in whens {
+                collect_bare_refs(w, group_by, out);
+                collect_bare_refs(v, group_by, out);
+            }
+            if let Some(x) = else_ {
+                collect_bare_refs(x, group_by, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_from_sides(from: &TableExpression, out: &mut Vec<(String, Option<String>)>) {
     match from {
         TableExpression::Table { name, alias, .. } => {
