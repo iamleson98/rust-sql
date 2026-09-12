@@ -724,9 +724,31 @@ compat surface. Every entry says what it costs and why it exists.
   correlated-parameter rewrite (SQLite's co-routine model) turns each
   per-outer-row re-execution into a bound-parameter step over a cached
   plan (the unindexed 2000x20000 correlated COUNT went 14.77 s → 0.58 s,
-  25x, vs SQLite's 1.96 s). Still rule-based rather than cost-searched:
-  SQLite's full cost model still wins a few orders the greedy can't see
-  (bushy plans, multi-alternative costing).
+  25x, vs SQLite's 1.96 s). **The planner is COST-SEARCHED now** —
+  Selinger-style subset DP replaces the greedy for spines of ≤ 16
+  relations: every left-deep order is enumerated (and, for ≤ 10
+  relations, every BUSHY partition too — an order SQLite's own planner
+  cannot generate), under a selectivity-aware cost model (stat1
+  distincts / rowid-alias counts / SQLite's blind 1/10 fallback per equi
+  conjunct, hash build+probe+emit vs. index-probe economics mirroring
+  the INLJ rewrite's own eligibility gates, cartesian steps punished at
+  r1×r2, output rows compounding through the chain). The syntactic
+  order's cost is evaluated under the same model and the rebuild fires
+  only on a real win (> 1%) or when the WHERE fusion contributed
+  conjuncts — identity-optimal spines keep their tree. Differential-
+  pinned against real SQLite (`tests/join_cost_search.rs`, 13 suites:
+  star schemas with the fact driven by index probes, bushy pairings
+  through a low-distinct link, the greedy's tiny-non-selective blind
+  spot, 5-table chains with SELECT * column order, non-equi ON,
+  cartesians, single-atom ON folds, CTE atoms, chained INLJ,
+  determinism). Measured: the analyzed 4-table pair-join shape —
+  `(A ⋈ B) ⋈ (C ⋈ D)` where the low-distinct product becomes the FINAL
+  output instead of an intermediate — runs **1.91x faster than SQLite
+  (560.6 ms vs 1071.5 ms, 5M output rows)**, a plan SQLite cannot
+  search; the 1M-row star schema's engine-side plan improved ~1.16x
+  over the greedy's (the INLJ chain replaces a full fact-table hash
+  build; `examples/probe_join_dp.rs`, RSQL_NO_DP=1 is the A/B knob).
+  Greedy ordering still serves 17–64-atom spines beyond the DP cap.
 - **Parallel executor coverage**: single-table shapes split (aggregates with
   literal **or parameter** filters, GROUP BY bare/compiled, top-N, unbounded
   ORDER BY with a fused 1:1 projection), and the **equi-JOIN probe side now

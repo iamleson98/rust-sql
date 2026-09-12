@@ -3837,6 +3837,27 @@ fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>)
         .map(|a| atom_est_rows(catalog, a))
         .collect();
 
+    // ---- Cost-searched DP rebuild (spines within the cap) ----------------
+    // The DP explores EVERY left-deep order (and, within the bushy cap,
+    // every partitioned tree) under a selectivity-aware cost model — a
+    // strict superset of the greedy's single smallest-atom-first guess
+    // below. The syntactic (identity) order is inside the search space,
+    // so "no win" means identity-optimal: decline and keep the syntactic
+    // tree. The greedy only serves spines beyond the DP cap.
+    // RSQL_NO_DP=1 disables the DP (A/B debugging knob — the greedy takes
+    // over at every spine size).
+    if n <= DP_LEFTDEEP_MAX_ATOMS && std::env::var_os("RSQL_NO_DP").is_none() {
+        return try_cost_search_spine(
+            catalog,
+            &atom_plans,
+            &atom_cols,
+            pool,
+            &ests,
+            pooled_from_filter,
+            top_conjuncts,
+        );
+    }
+
     // ---- Greedy connected left-deep rebuild ------------------------------
     let mut covered = vec![false; n];
     let seed = (0..n).min_by_key(|&i| (ests[i], i))?;
@@ -3911,11 +3932,31 @@ fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>)
         return None;
     }
 
-    // ---- Column-order restoration -----------------------------------------
-    // The rebuilt spine's combined columns are the same names in a
-    // different order; wrap in a projection of bare column references
-    // (unique by the gate, so exact-match resolution is order-independent)
-    // restoring the original FROM order.
+    // ---- Column-order restoration + top assembly --------------------------
+    // (shared with the cost-searched path)
+    let leftover: Vec<Expr> = pool.into_iter().map(|pc| pc.expr).collect();
+    Some(finish_reordered_spine(
+        acc,
+        &order,
+        &atom_cols,
+        leftover,
+        top_conjuncts,
+    ))
+}
+
+/// Assemble the final rebuilt-spine plan: restore the original FROM-clause
+/// column order with a bare-reference projection (names are unique by the
+/// spine gate, so exact-match resolution is order-independent), then lay
+/// any leftover pool conjuncts (relations outside the spine — unreachable
+/// in valid SQL, but kept verbatim rather than dropped) and the top-filter
+/// conjuncts on top as one Filter.
+fn finish_reordered_spine(
+    acc: Plan,
+    order: &[usize],
+    atom_cols: &[Vec<String>],
+    leftover: Vec<Expr>,
+    top_conjuncts: Vec<Expr>,
+) -> Plan {
     let original_names: Vec<String> = atom_cols.iter().flatten().cloned().collect();
     let new_order_names: Vec<String> = order
         .iter()
@@ -3940,18 +3981,667 @@ fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>)
         }
     };
 
-    // Leftover pool conjuncts (relations outside the spine — unreachable
-    // in valid SQL, but kept verbatim rather than dropped) + top filter.
-    top_conjuncts.extend(pool.into_iter().map(|pc| pc.expr));
-
-    if top_conjuncts.is_empty() {
-        Some(restored)
+    let mut tops = top_conjuncts;
+    tops.extend(leftover);
+    if tops.is_empty() {
+        restored
     } else {
-        Some(Plan::Filter {
+        Plan::Filter {
             input: Box::new(restored),
-            predicate: combine_and(&top_conjuncts),
+            predicate: combine_and(&tops),
+        }
+    }
+}
+
+// ============================================================================
+// Cost-searched join ordering (DP over relation subsets)
+// ============================================================================
+//
+// The greedy rebuild above orders joins by ATOM SIZE — smallest relation
+// first. That misses the orders a real cost model sees: an equi conjunct's
+// SELECTIVITY (how much the join shrinks its sides), the join STEP cost
+// (hash build+probe vs. index-driven probes), and BUSHY trees — pairing
+// two selective sub-joins instead of growing one left-deep accumulator.
+// SQLite's planner searches orders with a full cost model; this DP is the
+// engine's answer, and it goes one step further than SQLite (bushy trees).
+//
+// The search: classic Selinger-style subset DP. For every subset S of the
+// spine's relations, keep the best (cost, rows, shape-flag, split) found;
+// transitions join two disjoint covered subsets. n <= DP_BUSHY_MAX_ATOMS
+// enumerates ALL splits (bushy included, 3^n); n <= DP_LEFTDEEP_MAX_ATOMS
+// restricts transitions to (covered prefix ⋈ single atom) — left-deep only
+// (2^n × n); beyond that the greedy takes over.
+//
+// The cost model (per join step joining side 1 of r1 rows to side 2 of r2
+// rows, with the conjuncts whose relations span both sides attaching here):
+// - output rows = r1 × r2 × Π conjunct selectivity, floored at 1.
+//   An equi conjunct `a.x = b.y` contributes 1/max(D(ax), D(by)) where D is
+//   the column's stat1 distinct count (ANALYZE) or the rowid-alias row
+//   count; without stats it degrades to SQLite's blind 1/10. Non-equi
+//   conjuncts use `conjunct_selectivity` (range 1/3, LIKE 1/4, …).
+// - pure cartesian (no attaching conjunct): step cost = r1 × r2 (a nested
+//   loop over every pair — punished hard, exactly what makes the DP avoid
+//   disconnected picks unless the query really is a cross product).
+// - hash join (≥1 attaching equi pair): step cost = r1 + r2 + out (build
+//   the smaller side, probe the bigger, emit the output).
+// - index-driven nested loop (INLJ): when one side is a single BARE SCAN
+//   atom whose join column carries an index and the other side is
+//   "selective-shaped" (the post-pass INLJ rewrite's own gate — pushed
+//   point/range lookups, filters, and already-converted INLJ chains), the
+//   step cost is outer_rows × INLJ_PROBE_ROWS + out and the inner atom's
+//   scan base cost is NOT paid (it is probed, never read). This mirrors
+//   `optimize_index_nested_loop_join` exactly: the rewrite fires on the
+//   same eligibility, so the DP's cost and the executed plan agree.
+//
+// The output rows and the shape-flag propagate: a step's rows feed the
+// next step's cost (intermediate sizes compound), and the flag tells the
+// next step whether the outer side would be INLJ-convertible (the chain
+// rule of the post-pass).
+//
+// Semantics are the greedy's: inner joins are commutative/associative, the
+// multiset of combined rows is order-independent, every pooled conjunct
+// attaches at the LOWEST join node covering its relations, and column
+// order is restored by the shared `finish_reordered_spine` projection.
+//
+// No-op gate: the identity (syntactic FROM order) left-deep chain lives in
+// the search space, so the DP's best cost is ≤ the identity's under the
+// same model, with equal floats when identity is optimal. Rebuild only on
+// a real win (>1%) or when the WHERE fusion contributed conjuncts (the
+// rebuild fuses them into join nodes — its own optimization).
+
+/// Spine sizes where the full bushy subset DP runs: 3^n split evaluations
+/// (≈59k at the cap — microseconds-to-milliseconds at plan time).
+const DP_BUSHY_MAX_ATOMS: usize = 10;
+
+/// Spine sizes where the left-deep-only subset DP runs: 2^n × n
+/// transitions (≈1M at the cap). Beyond this the greedy heuristic serves.
+const DP_LEFTDEEP_MAX_ATOMS: usize = 16;
+
+/// Per-probe cost of an index nested-loop seek, in row-equivalents: a
+/// B-tree seek touches a root, an interior, and a leaf page (vs. one row
+/// of a sequential scan). Mirrors the post-pass INLJ rewrite's economics.
+const INLJ_PROBE_ROWS: f64 = 3.0;
+
+/// Relative win threshold before the DP rebuilds a spine: below this the
+/// restoration projection's own per-row cost eats the difference.
+const DP_WIN_FACTOR: f64 = 0.99;
+
+/// One pooled conjunct in the DP's cost-model view: the (already
+/// canonicalized) expression, its relation mask, and — when it is a bare
+/// column-to-column equality over exactly two relations — the equi pair
+/// with each side's owning atom and column.
+struct DpConjunct {
+    expr: Expr,
+    mask: u64,
+    eq: Option<((usize, String), (usize, String))>,
+}
+
+/// Everything the DP needs about the spine, precomputed once.
+struct DpCtx<'a> {
+    catalog: &'a Catalog,
+    /// Atom plans (single-atom conjuncts folded in as Filter wraps).
+    plans: Vec<Plan>,
+    conjuncts: Vec<DpConjunct>,
+    /// Estimated output rows per atom (folds applied).
+    rows: Vec<f64>,
+    /// Production cost per atom — rows read to produce its output.
+    base: Vec<f64>,
+    /// `outer_is_selective` per atom (INLJ chain gate).
+    selective: Vec<bool>,
+    /// The atom's table when its plan is EXACTLY a bare `Scan` (the INLJ
+    /// rewrite requires a bare scan as the inner side — a Filter-wrapped
+    /// or lookup-shaped atom is hashed, not probed).
+    bare_scan: Vec<Option<Arc<Table>>>,
+    /// Whether the atom's output exposes table columns positionally (the
+    /// INLJ rewrite resolves the outer key column through it).
+    key_resolvable: Vec<bool>,
+}
+
+impl<'a> DpCtx<'a> {
+    /// The stat1 distinct count of `atom`'s column `col`: the rowid-alias
+    /// row count, the first index (leading column = `col`) with ANALYZE
+    /// stats, else unknown (caller falls back to the blind factor).
+    fn distinct(&self, atom: usize, col: &str) -> Option<i64> {
+        let plan = &self.plans[atom];
+        let table = atom_table_of(plan)?;
+        if let Some(idx) = table.rowid_alias {
+            if table.columns[idx].name.eq_ignore_ascii_case(col) {
+                return Some(table_rows_hint(self.catalog, table));
+            }
+        }
+        for idx in self.catalog.indexes_on_table(&table.name) {
+            if idx
+                .columns
+                .first()
+                .is_some_and(|c| c.name.eq_ignore_ascii_case(col))
+            {
+                if let Some(s) = self.catalog.index_stats(&idx.name) {
+                    if let Some(&d) = s.distinct_prefix.first() {
+                        if d > 0 {
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Evaluate one join step: join side `s1` (cost `c1`, rows `r1`, flag
+    /// `fl1`) to disjoint side `s2` (`c2`, `r2`, `fl2`). Returns the new
+    /// cell (total cost, output rows, output shape flag). Conjuncts whose
+    /// masks span both sides attach HERE (masks fully inside one side
+    /// attach deeper, by construction).
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &self,
+        s1: u64,
+        s2: u64,
+        c1: f64,
+        r1: f64,
+        fl1: bool,
+        c2: f64,
+        r2: f64,
+        fl2: bool,
+    ) -> (f64, f64, bool) {
+        let t = s1 | s2;
+        let mut sel_prod = 1.0f64;
+        let mut has_eq = false;
+        let mut has_attaching = false;
+        for c in &self.conjuncts {
+            let m = c.mask;
+            if m & !t == 0 && m & s1 != 0 && m & s2 != 0 {
+                has_attaching = true;
+                match &c.eq {
+                    Some(((a1, col1), (a2, col2))) => {
+                        has_eq = true;
+                        let d1 = self.distinct(*a1, col1);
+                        let d2 = self.distinct(*a2, col2);
+                        let d = match (d1, d2) {
+                            (Some(x), Some(y)) => Some(x.max(y)),
+                            (Some(x), None) | (None, Some(x)) => Some(x),
+                            (None, None) => None,
+                        };
+                        sel_prod *= match d {
+                            Some(d) if d > 0 => 1.0 / d as f64,
+                            _ => 0.1, // SQLite's blind equality guess
+                        };
+                    }
+                    None => sel_prod *= conjunct_selectivity(&c.expr),
+                }
+            }
+        }
+        let out = (r1 * r2 * sel_prod).max(1.0);
+
+        if has_eq {
+            // INLJ: a single bare-scan side probed through an index by a
+            // selective-shaped outer — the post-pass rewrite's own rule.
+            // The inner atom's scan cost is skipped (probed, not read).
+            if s2.count_ones() == 1 {
+                let j = s2.trailing_zeros() as usize;
+                if let Some(tbl) = &self.bare_scan[j] {
+                    if fl1 && self.eq_key_indexed(j, tbl, s1, t) {
+                        return (
+                            c1 + c2 + r1 * INLJ_PROBE_ROWS + out - self.base[j],
+                            out,
+                            true,
+                        );
+                    }
+                }
+            }
+            if s1.count_ones() == 1 {
+                let j = s1.trailing_zeros() as usize;
+                if let Some(tbl) = &self.bare_scan[j] {
+                    if fl2 && self.eq_key_indexed(j, tbl, s2, t) {
+                        return (
+                            c1 + c2 + r2 * INLJ_PROBE_ROWS + out - self.base[j],
+                            out,
+                            true,
+                        );
+                    }
+                }
+            }
+            // Hash: build one side, probe the other, emit the output.
+            (c1 + c2 + r1 + r2 + out, out, false)
+        } else if has_attaching {
+            // Attaching non-equi conjuncts: nested loop over every pair.
+            (c1 + c2 + r1 * r2 + out, out, false)
+        } else {
+            // Pure cross product.
+            let out = r1 * r2;
+            (c1 + c2 + out, out, false)
+        }
+    }
+
+    /// Does an attaching equi conjunct bind inner atom `j`'s indexed
+    /// column against an outer-side atom that exposes its key? Mirrors the
+    /// post-pass's pair scan (first pair whose outer key resolves and whose
+    /// inner column has an index).
+    fn eq_key_indexed(&self, j: usize, tbl: &Table, outer: u64, t: u64) -> bool {
+        self.conjuncts.iter().any(|c| {
+            let m = c.mask;
+            if m & !t != 0 || m & (1u64 << j) == 0 {
+                return false; // not attaching here / doesn't touch j
+            }
+            if let Some(((a1, col1), (a2, col2))) = &c.eq {
+                let (other, inner_col) = if *a1 == j {
+                    (*a2, col1)
+                } else if *a2 == j {
+                    (*a1, col2)
+                } else {
+                    return false;
+                };
+                (1u64 << other) & outer != 0
+                    && self.key_resolvable[other]
+                    && find_index_for_column(self.catalog, tbl, inner_col).is_some()
+            } else {
+                false
+            }
         })
     }
+}
+
+/// The table an atom's plan reads, when it is table-shaped (Scan family or
+/// a Filter over one). CTE rows, table functions and VALUES report None.
+fn atom_table_of(plan: &Plan) -> Option<&Table> {
+    match plan {
+        Plan::Scan { table, .. }
+        | Plan::RowidLookup { table, .. }
+        | Plan::RowidIn { table, .. }
+        | Plan::IndexIn { table, .. }
+        | Plan::IndexLookup { table, .. }
+        | Plan::IndexRange { table, .. }
+        | Plan::RowidRange { table, .. } => Some(table),
+        Plan::Filter { input, .. } => atom_table_of(input),
+        _ => None,
+    }
+}
+
+/// Whether an atom's output resolves table columns positionally — the
+/// coverage of `resolve_outer_col_index` for single plans.
+fn atom_exposes_table_cols(plan: &Plan) -> bool {
+    match plan {
+        Plan::Scan { .. }
+        | Plan::RowidLookup { .. }
+        | Plan::RowidIn { .. }
+        | Plan::IndexIn { .. }
+        | Plan::IndexLookup { .. }
+        | Plan::IndexRange { .. }
+        | Plan::RowidRange { .. } => true,
+        Plan::Filter { input, .. } => atom_exposes_table_cols(input),
+        _ => false,
+    }
+}
+
+/// Production cost of an atom's access path — the rows READ to produce
+/// its output (`atom_est_rows` is the rows EMITTED). Filter pays the full
+/// inner read plus emits the filtered rows; lookups pay their seek fan-in.
+fn atom_base_cost(catalog: &Catalog, plan: &Plan) -> f64 {
+    match plan {
+        Plan::RowidLookup { .. } => 1.0,
+        Plan::RowidIn { values, .. } => (values.len() as f64).max(1.0),
+        Plan::RowidRange {
+            table, start, end, ..
+        } => {
+            let lit = |e: &Option<Expr>| match e.as_ref() {
+                Some(Expr::Literal(Value::Integer(i))) => Some(*i),
+                _ => None,
+            };
+            match (lit(start), lit(end)) {
+                (Some(s), Some(e)) if e >= s => {
+                    ((e - s + 1).min(table_rows_hint(catalog, table)) as f64).max(1.0)
+                }
+                _ => (table_rows_hint(catalog, table) as f64 / 4.0).max(1.0),
+            }
+        }
+        Plan::IndexLookup {
+            index, key_exprs, ..
+        } => {
+            let k = key_exprs.len();
+            catalog
+                .index_stats(&index.name)
+                .map(|s| s.estimate_eq(k))
+                .filter(|&e| e > 0)
+                .unwrap_or(10) as f64
+        }
+        Plan::IndexIn {
+            index, key_exprs, ..
+        } => {
+            let members = key_exprs.len() as f64;
+            let base = catalog
+                .index_stats(&index.name)
+                .map(|s| s.estimate_eq(1))
+                .filter(|&e| e > 0)
+                .unwrap_or(10) as f64;
+            (base * members).max(1.0)
+        }
+        Plan::IndexRange { index, .. } => catalog
+            .index_stats(&index.name)
+            .map(|s| s.rows / 4)
+            .filter(|&e| e > 0)
+            .unwrap_or(UNANALYZED_ROWS / 4) as f64,
+        Plan::Filter { input, .. } => {
+            atom_base_cost(catalog, input) + atom_est_rows(catalog, input) as f64
+        }
+        Plan::Scan { table, .. } => table_rows_hint(catalog, table) as f64,
+        Plan::CteRows { rows, .. } => (rows.len() as f64).max(1.0),
+        _ => UNANALYZED_ROWS as f64,
+    }
+}
+
+/// Wrap an atom plan in a Filter (merging when it already is one) — the
+/// fold applied to single-atom pooled conjuncts, the same shape pushdown
+/// would have produced.
+fn wrap_atom_filter(plan: Plan, conj: Expr) -> Plan {
+    if let Plan::Filter { input, predicate } = plan {
+        let mut conjuncts = split_and_chain(&predicate);
+        conjuncts.push(conj);
+        Plan::Filter {
+            input,
+            predicate: combine_and(&conjuncts),
+        }
+    } else {
+        Plan::Filter {
+            input: Box::new(plan),
+            predicate: conj,
+        }
+    }
+}
+
+/// The (table, name) of a column operand, seeing through COLLATE.
+fn operand_col(e: &Expr) -> Option<(&Option<String>, &str)> {
+    match e {
+        Expr::Column { table, name } => Some((table, name)),
+        Expr::Collate { expr, .. } => operand_col(expr),
+        _ => None,
+    }
+}
+
+/// The equi-pair shape of a pooled conjunct: `col = col` with both
+/// operands resolving to DISTINCT atoms (a join key pair).
+fn eq_pair_of(
+    expr: &Expr,
+    n: usize,
+    atom_cols: &[Vec<String>],
+) -> Option<((usize, String), (usize, String))> {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let (lq, ln) = operand_col(left)?;
+    let (rq, rn) = operand_col(right)?;
+    let (la, _) = resolve_ref_window(lq, ln, 0, n, atom_cols)?;
+    let (ra, _) = resolve_ref_window(rq, rn, 0, n, atom_cols)?;
+    if la == ra {
+        return None; // same-atom equality — not a join key
+    }
+    let plain = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
+    Some(((la, plain(ln)), (ra, plain(rn))))
+}
+
+/// Cost-searched rebuild of one flattened inner-join spine. Returns None
+/// (caller keeps the syntactic tree) when the DP finds no meaningful win
+/// and the filter fusion contributed nothing.
+#[allow(clippy::too_many_arguments)]
+fn try_cost_search_spine(
+    catalog: &Catalog,
+    atom_plans: &[Plan],
+    atom_cols: &[Vec<String>],
+    pool: Vec<PooledConjunct>,
+    ests: &[i64],
+    pooled_from_filter: usize,
+    mut top_conjuncts: Vec<Expr>,
+) -> Option<Plan> {
+    let n = atom_plans.len();
+    let dbg = std::env::var_os("RSQL_DBG_REORDER").is_some();
+
+    // ---- Fold single-atom conjuncts into their atoms ---------------------
+    // A conjunct referencing one relation evaluates identically as a Filter
+    // on the atom (pushdown's own shape) — cheaper than any join-node
+    // placement, and it keeps the DP's masks strictly 2+ relation.
+    let mut plans: Vec<Plan> = atom_plans.to_vec();
+    let mut rows: Vec<f64> = ests.iter().map(|&e| e as f64).collect();
+    let mut multi: Vec<PooledConjunct> = Vec::new();
+    for pc in pool {
+        if pc.rels.len() == 1 {
+            let j = pc.rels[0];
+            rows[j] = (rows[j] * conjunct_selectivity(&pc.expr)).max(1.0);
+            let plan = std::mem::replace(&mut plans[j], Plan::Values { rows: vec![] });
+            plans[j] = wrap_atom_filter(plan, pc.expr);
+        } else {
+            multi.push(pc);
+        }
+    }
+
+    // ---- Conjunct masks + equi-pair shapes --------------------------------
+    let mut conjuncts: Vec<DpConjunct> = Vec::with_capacity(multi.len());
+    for pc in multi {
+        let mut mask = 0u64;
+        for &r in &pc.rels {
+            mask |= 1u64 << r;
+        }
+        let eq = eq_pair_of(&pc.expr, n, atom_cols);
+        conjuncts.push(DpConjunct {
+            expr: pc.expr,
+            mask,
+            eq,
+        });
+    }
+
+    let base: Vec<f64> = plans.iter().map(|p| atom_base_cost(catalog, p)).collect();
+    let selective: Vec<bool> = plans.iter().map(outer_is_selective).collect();
+    let bare_scan: Vec<Option<Arc<Table>>> = plans
+        .iter()
+        .map(|p| match p {
+            Plan::Scan { table, .. } => Some(table.clone()),
+            _ => None,
+        })
+        .collect();
+    let key_resolvable: Vec<bool> = plans.iter().map(atom_exposes_table_cols).collect();
+
+    let ctx = DpCtx {
+        catalog,
+        plans,
+        conjuncts,
+        rows,
+        base,
+        selective,
+        bare_scan,
+        key_resolvable,
+    };
+
+    // ---- Subset DP --------------------------------------------------------
+    let full: u64 = (1u64 << n) - 1;
+    let sz = 1usize << n;
+    let mut cost = vec![f64::INFINITY; sz];
+    let mut rows_d = vec![0.0f64; sz];
+    let mut flag = vec![false; sz];
+    let mut split: Vec<(u64, u64)> = vec![(0, 0); sz];
+    for i in 0..n {
+        let m = 1u64 << i;
+        cost[m as usize] = ctx.base[i];
+        rows_d[m as usize] = ctx.rows[i];
+        flag[m as usize] = ctx.selective[i];
+    }
+
+    // Popcount buckets: every split's sources have smaller popcount, so
+    // processing masks in popcount order leaves every source final.
+    let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); n + 1];
+    for m in 1u64..=full {
+        buckets[m.count_ones() as usize].push(m);
+    }
+
+    let bushy = n <= DP_BUSHY_MAX_ATOMS;
+    // Popcount ≥ 2 buckets, in popcount order (skip the singleton buckets).
+    for bucket in buckets.iter().skip(2) {
+        for &t in bucket {
+            let ti = t as usize;
+            if bushy {
+                // Every unordered proper split {s1, s2} (bushy included).
+                let mut s1 = (t - 1) & t;
+                while s1 != 0 {
+                    let s2 = t ^ s1;
+                    if s1 < s2 {
+                        let a = s1 as usize;
+                        let b = s2 as usize;
+                        let (nc, nr, nf) = ctx.step(
+                            s1, s2, cost[a], rows_d[a], flag[a], cost[b], rows_d[b], flag[b],
+                        );
+                        if nc < cost[ti] {
+                            cost[ti] = nc;
+                            rows_d[ti] = nr;
+                            flag[ti] = nf;
+                            split[ti] = (s1, s2);
+                        }
+                    }
+                    s1 = (s1 - 1) & t;
+                }
+            } else {
+                // Left-deep only: covered prefix ⋈ one atom.
+                for j in 0..n {
+                    let bit = 1u64 << j;
+                    if t & bit != 0 {
+                        let s1 = t ^ bit;
+                        let a = s1 as usize;
+                        let (nc, nr, nf) = ctx.step(
+                            s1,
+                            bit,
+                            cost[a],
+                            rows_d[a],
+                            flag[a],
+                            ctx.base[j],
+                            ctx.rows[j],
+                            ctx.selective[j],
+                        );
+                        if nc < cost[ti] {
+                            cost[ti] = nc;
+                            rows_d[ti] = nr;
+                            flag[ti] = nf;
+                            split[ti] = (s1, bit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Identity (syntactic order) chain under the same model ----------
+    let mut acc_mask = 1u64;
+    let mut c = ctx.base[0];
+    let mut r = ctx.rows[0];
+    let mut fl = ctx.selective[0];
+    for j in 1..n {
+        let bit = 1u64 << j;
+        let (nc, nr, nfl) = ctx.step(
+            acc_mask,
+            bit,
+            c,
+            r,
+            fl,
+            ctx.base[j],
+            ctx.rows[j],
+            ctx.selective[j],
+        );
+        c = nc;
+        r = nr;
+        fl = nfl;
+        acc_mask |= bit;
+    }
+    let identity_cost = c;
+
+    let best = cost[full as usize];
+    let win = best < identity_cost * DP_WIN_FACTOR;
+    if dbg {
+        let order = dp_order(full, &split);
+        eprintln!(
+            "[dp] n={n} identity_cost={identity_cost:.0} best={best:.0} win={win} pooled={pooled_from_filter} order={order:?}"
+        );
+    }
+    if !win && pooled_from_filter == 0 {
+        return None; // identity-optimal (or within noise): keep the tree
+    }
+
+    // ---- Reconstruct the winning tree -------------------------------------
+    let mut used = vec![false; ctx.conjuncts.len()];
+    let tree = dp_build(full, &ctx, &mut used, &split);
+    let order = dp_order(full, &split);
+    let leftover: Vec<Expr> = ctx
+        .conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !used[*i])
+        .map(|(_, c)| c.expr.clone())
+        .collect();
+    top_conjuncts.extend(leftover);
+    Some(finish_reordered_spine(
+        tree,
+        &order,
+        atom_cols,
+        Vec::new(),
+        top_conjuncts,
+    ))
+}
+
+/// Build the winning plan for `mask` bottom-up from the DP's split table,
+/// attaching each conjunct at the lowest join node covering its relations
+/// (exactly the nodes the cost model charged).
+fn dp_build(mask: u64, ctx: &DpCtx, used: &mut [bool], split: &[(u64, u64)]) -> Plan {
+    if mask.count_ones() == 1 {
+        let j = mask.trailing_zeros() as usize;
+        return ctx.plans[j].clone();
+    }
+    let (s1, s2) = split[mask as usize];
+    let left = dp_build(s1, ctx, used, split);
+    let right = dp_build(s2, ctx, used, split);
+    let mut attach: Vec<Expr> = Vec::new();
+    for (i, c) in ctx.conjuncts.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        let m = c.mask;
+        if m & !mask == 0 && m & s1 != 0 && m & s2 != 0 {
+            attach.push(c.expr.clone());
+            used[i] = true;
+        }
+    }
+    let condition = if attach.is_empty() {
+        None
+    } else {
+        Some(combine_and(&attach))
+    };
+    let join_type = if condition.is_none() {
+        JoinType::Cross
+    } else {
+        JoinType::Inner
+    };
+    let algorithm = if condition.as_ref().is_some_and(condition_has_equi_leaf) {
+        JoinAlgorithm::Hash
+    } else {
+        JoinAlgorithm::NestedLoop
+    };
+    Plan::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type,
+        condition,
+        algorithm,
+    }
+}
+
+/// The atom order of the winning tree (left-to-right leaf order) — the
+/// restoration projection's input order.
+fn dp_order(mask: u64, split: &[(u64, u64)]) -> Vec<usize> {
+    if mask.count_ones() == 1 {
+        return vec![mask.trailing_zeros() as usize];
+    }
+    let (s1, s2) = split[mask as usize];
+    let mut o = dp_order(s1, split);
+    o.extend(dp_order(s2, split));
+    o
 }
 
 /// Post-pass optimization: rewrite eligible Hash joins to

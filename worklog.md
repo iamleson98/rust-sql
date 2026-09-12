@@ -125,3 +125,31 @@ Stage Summary:
 - 3 more pre-existing bugs found by the new probes: step-path cross-connection tx gate, busy_timeout=0 infinite poll, compileoption_get 0-based indexing.
 - Remaining ledger after this pass: cost-searched (bushy) planner, predicate pushdown into all scan shapes, memory peaks (S17/S14), binary size, page_count physical-layout difference (true, not mirrored).
 - Ready to push.
+
+---
+Task ID: 10
+Agent: main (Super Z)
+Task: Restore green CI on 44acaf8; close the cost-searched-planner ledger gap (subset DP, bushy plans) with differential proof
+
+Work Log:
+- Sandbox reset again: re-cloned iamleson98/rust-sql (PAT), reinstalled rust 1.98.1 + clippy + rustfmt. Remote HEAD 44acaf8 CI RED: all four clippy configs failed on one unused `Value` import in examples/probe_s17_iso.rs (the memory commit shipped without an examples clippy pass). Fixed (16d5e07), pushed — CI back to green.
+- Baseline before work: dev matrix 836/836 (--lib --tests, disk-conscious CI env), fmt clean, clippy x4 clean.
+- Implemented the cost-searched join order (src/planner/mod.rs, ~600 lines):
+  - `try_cost_search_spine`: Selinger-style subset DP replacing the greedy for spines <= DP_LEFTDEEP_MAX_ATOMS (16). Bushy splits (every unordered partition of every subset) for n <= 10 (3^n); left-deep transitions only for 11..=16 (2^n x n); greedy untouched for 17..=64.
+  - Cost model: per-step output rows = r1 x r2 x prod(selectivity) where an equi conjunct contributes 1/max(D_a, D_b) (stat1 distinct via the first leading-column index, rowid-alias row count, else SQLite's blind 1/10) and non-equi conjuncts use conjunct_selectivity; hash step = r1+r2+out; nested-loop step = r1*r2+out; pure cartesian = r1*r2. INLJ economics mirror optimize_index_nested_loop_join's own gates exactly (single BARE-Scan inner + eq key with find_index_for_column + outer_is_selective flag propagated through the DP cells — the chain rule): step cost = outer_rows x 3 + out, inner atom's scan base skipped.
+  - atom_base_cost (production cost of an access path) distinct from atom_est_rows (output rows); single-atom pooled conjuncts FOLD into their atom as a Filter (pushdown's shape), rows adjust by selectivity.
+  - No-op gate: the identity (syntactic) chain is evaluated under the same model — identity is inside the search space, so best <= identity with equal floats iff identity-optimal; rebuild only on >1% win or pooled_from_filter > 0 (WHERE fusion). Same safety gates as the greedy (unique names, no subqueries, outer-join pinning); finish_reordered_spine shared by both paths (restoration Project + top Filter).
+  - RSQL_NO_DP=1 env knob (A/B debugging); RSQL_DBG_REORDER prints the DP decision line.
+- Bug fixed during implementation: the left-deep DP branch passed the FULL mask as the single-atom side (infinite recursion in reconstruction) — caught by inspection before ever running.
+- tests/join_cost_search.rs (13 differential suites vs bundled SQLite): star schema point-filter (EXPLAIN asserts SEARCH fact USING INDEX — the INLJ chain), unfiltered star, ANALYZE'd star GROUP BY, bushy pairing, greedy blind spot, 5-table SELECT * column order + aggregates, non-equi ON, true cartesian, single-atom ON folds, identity no-op, CTE atom, chained INLJ (>= 3 SEARCH lines), plan determinism.
+- examples/probe_join_dp.rs (warm best-of-3 both engines, answer-equality asserts):
+  - bushy 5k-pairs (ANALYZE): 560.6 ms vs SQLite 1071.5 ms = 1.91x — a plan shape SQLite cannot generate (left-deep only).
+  - star 1M INLJ: engine 134 ms vs greedy's 156 ms (1.16x engine-side; SQLite 36 ms — the documented serial-row gap, now with the RIGHT plan under it).
+  - blind-spot 100k: 1.09-1.24x vs SQLite.
+- All four CI bench gates verified locally (release, gate parser): bench_full_vs_sqlite 18/18 WIN, bench_compare all rows WIN, criterion sqlite_comparison 8/8 WIN (inner_join 1.83x), bench_sqlx_native 12/12 WIN.
+- Verification: dev matrix 849/849 (836 + 13 new), fmt clean, clippy -D warnings clean in all 4 configs (default / no-default / sqlx / workspace).
+
+Stage Summary:
+- Planner ledger entry CLOSED: cost-searched plans (multi-alternative costing + bushy trees — the engine now searches a plan space STRICTLY LARGER than SQLite's own left-deep-only search).
+- Marquee number: 1.91x vs SQLite on the bushy pair-join shape (5M-row output), differentially answer-checked.
+- Remaining ledger after this pass: S17/S14 memory peaks (allocator-level), binary size (deliberate), page_count physical layout (true, not mirrored), predicate pushdown into all scan shapes.
