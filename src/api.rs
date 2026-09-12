@@ -4244,6 +4244,9 @@ impl Database {
     fn stmt_needs_cte_materialization(stmt: &Statement) -> bool {
         match stmt {
             Statement::Select(s) => s.with.is_some(),
+            Statement::Insert(i) => i.with.is_some(),
+            Statement::Update(u) => u.with.is_some(),
+            Statement::Delete(d) => d.with.is_some(),
             _ => false,
         }
     }
@@ -4764,6 +4767,79 @@ impl Database {
                 }
                 *self.maps.get_mut() = ctx.shared;
                 self.refresh_maps_flag();
+                res?;
+                return Ok(());
+            }
+        }
+        // WITH-clause DML (INSERT / UPDATE / DELETE) via the execute
+        // path: materialize the CTEs, plan the DML with them in scope,
+        // execute — never cached (rows are recomputed per call, same as
+        // WITH SELECT above). Replaces the old `unreachable!` panics in
+        // the parser.
+        {
+            let with_opt: Option<WithClause> = match cached.stmt.as_ref() {
+                Statement::Insert(i) => i.with.clone(),
+                Statement::Update(u) => u.with.clone(),
+                Statement::Delete(d) => d.with.clone(),
+                _ => None,
+            };
+            if let Some(with) = with_opt {
+                let _thread_db = crate::plugin::abi::ThreadDbGuard::install(
+                    self as *const Database as *mut Database,
+                );
+                let in_txn = self.in_transaction.load(Ordering::Acquire);
+                let txn_snap = self.txn_snapshot.get_mut().take();
+                let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+                ctx.in_transaction = in_txn;
+                ctx.deferred_flush = deferred_flush;
+                ctx.txn_snapshot = txn_snap;
+                ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+                ctx.shared_detached = true;
+                for v in params.into_iter() {
+                    ctx.bind_positional(v);
+                }
+                let _plugin_guard = self.plugin_scope();
+                let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+                let res = self.exec_dml_with_ctes(&mut ctx, cached.stmt.as_ref(), &with);
+                self.in_transaction
+                    .store(ctx.in_transaction, Ordering::Release);
+                self.set_last_insert_rowid(ctx.last_insert_rowid);
+                *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+                crate::executor::change_counters::record(ctx.changes);
+                self.pager.note_rows_modified(ctx.changes);
+                if ctx.roots_changed {
+                    Arc::make_mut(&mut ctx.shared)
+                        .roots
+                        .extend(ctx.root_overrides.drain());
+                }
+                if ctx.max_rowids_changed {
+                    let shared = Arc::make_mut(&mut ctx.shared);
+                    shared.max_rowids.extend(ctx.max_rowids.drain());
+                    for k in ctx.max_rowids_invalidated.drain(..) {
+                        shared.max_rowids.remove(&k);
+                    }
+                }
+                if ctx.index_roots_changed {
+                    Arc::make_mut(&mut ctx.shared)
+                        .index_roots
+                        .extend(ctx.index_roots.drain());
+                }
+                *self.maps.get_mut() = ctx.shared;
+                self.refresh_maps_flag();
+                if ctx.roots_changed {
+                    self.sync_schema_roots_inner()?;
+                }
+                if let Some(foreign) = self.foreign.as_ref() {
+                    foreign
+                        .dirty
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if !self.in_transaction.load(Ordering::Acquire) {
+                        self.dump_foreign()?;
+                    }
+                }
+                self.maybe_drain_after_burst();
                 res?;
                 return Ok(());
             }
@@ -6022,6 +6098,63 @@ impl Database {
         res
     }
 
+    /// Execute a WITH-clause DML statement (INSERT / UPDATE / DELETE):
+    /// materialize the CTEs, plan the DML with them in scope, substitute
+    /// uncorrelated subqueries, execute. Mirrors exec_select_with_ctes
+    /// for the DML planners (which take no CTE map — the planner is
+    /// seeded directly, and ctx.ctes covers subquery planning).
+    fn exec_dml_with_ctes(
+        &self,
+        ctx: &mut ExecContext<'_>,
+        stmt: &Statement,
+        with: &WithClause,
+    ) -> Result<()> {
+        let cte_map = self.materialize_ctes(with, &HashMap::new(), ctx)?;
+        let mut planner = Planner::new(&self.catalog);
+        planner.set_ctes(cte_map.clone());
+        let plan = match stmt {
+            Statement::Insert(ins) => {
+                // plan_insert plans the source SELECT without CTE scope;
+                // re-plan here with the seeded planner when the source is
+                // a SELECT, else delegate.
+                match &ins.source {
+                    InsertSource::Select(s) => {
+                        let source_plan = planner.plan_select(s)?;
+                        let table = self
+                            .catalog
+                            .get_table(&ins.table)
+                            .ok_or_else(|| Error::NotFound(format!("table: {}", ins.table)))?;
+                        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+                        crate::planner::plan::Plan::Insert {
+                            table,
+                            source: Box::new(source_plan),
+                            columns,
+                            on_conflict: ins.or.unwrap_or(ConflictResolution::Abort),
+                            upsert: ins.upsert.clone(),
+                            returning: ins.returning.clone(),
+                        }
+                    }
+                    _ => Self::plan_insert(&self.catalog, stmt)?,
+                }
+            }
+            Statement::Update(_) => Self::plan_update_cte(&self.catalog, stmt, &cte_map)?,
+            Statement::Delete(_) => Self::plan_delete_cte(&self.catalog, stmt, &cte_map)?,
+            _ => {
+                return Err(Error::semantic(
+                    "WITH is only supported on SELECT/INSERT/UPDATE/DELETE",
+                ))
+            }
+        };
+        ctx.ctes = Some(cte_map);
+        let mut plan = plan;
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, ctx)?;
+        }
+        let res = crate::executor::execute(&plan, ctx);
+        ctx.ctes = None;
+        res.map(|_| ())
+    }
+
     /// Materialize every CTE of a WITH clause into (rows, qualified column
     /// names). Later CTEs see earlier ones; WITH RECURSIVE iterates the
     /// recursive arm until no new rows appear.
@@ -6250,7 +6383,11 @@ impl Database {
                 return None;
             }
             let agg = &aggregates[0];
-            if !agg.func.eq_ignore_ascii_case("count") || agg.arg.is_some() || agg.distinct {
+            if !agg.func.eq_ignore_ascii_case("count")
+                || agg.arg.is_some()
+                || agg.distinct
+                || agg.filter.is_some()
+            {
                 return None;
             }
             match input {
@@ -6288,7 +6425,11 @@ impl Database {
                 return None;
             }
             let agg = &aggregates[0];
-            if !agg.func.eq_ignore_ascii_case("count") || agg.arg.is_some() || agg.distinct {
+            if !agg.func.eq_ignore_ascii_case("count")
+                || agg.arg.is_some()
+                || agg.distinct
+                || agg.filter.is_some()
+            {
                 return None;
             }
             // Only a plain table scan (no predicate; vtabs fall back —
@@ -6773,14 +6914,30 @@ impl Database {
                 crate::planner::plan::Plan::Values { rows: vec![vec![]] }
             }
         };
-        let columns: Option<Vec<usize>> = if let Some(cols) = &ins.columns {
+        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+        let on_conflict = ins.or.unwrap_or(ConflictResolution::Abort);
+        Ok(crate::planner::plan::Plan::Insert {
+            table,
+            source: Box::new(source_plan),
+            columns,
+            on_conflict,
+            upsert: ins.upsert.clone(),
+            returning: ins.returning.clone(),
+        })
+    }
+
+    /// Resolve an INSERT's column list to indices (shared by plan_insert
+    /// and the WITH-DML path, which plans the source with CTE scope).
+    fn insert_columns(
+        table: &Arc<crate::schema::Table>,
+        cols: Option<&Vec<String>>,
+    ) -> Result<Option<Vec<usize>>> {
+        if let Some(cols) = cols {
             let mut v = Vec::with_capacity(cols.len());
             for c in cols {
-                let idx = resolve_insert_column(&table, c).ok_or_else(|| {
+                let idx = resolve_insert_column(table, c).ok_or_else(|| {
                     Error::semantic(format!("column {} not in table {}", c, table.name))
                 })?;
-                // Generated columns cannot be assigned (SQLite: "cannot
-                // INSERT into generated column").
                 if idx != usize::MAX
                     && table
                         .columns
@@ -6794,37 +6951,32 @@ impl Database {
                 }
                 v.push(idx);
             }
-            Some(v)
-        } else {
-            // No column list: positional values map to the NON-generated
-            // columns in declared order — SQLite's rule (generated columns
-            // are excluded from the positional column count: `INSERT INTO
-            // s VALUES (1)` on (a, b AS (a*2) STORED) inserts a=1 and
-            // computes b; supplying the generated slot errors "table s has
-            // 1 columns but 2 values were supplied").
-            let v: Vec<usize> = table
+            return Ok(Some(v));
+        }
+        Ok(Some(
+            table
                 .columns
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| c.generated.is_none())
                 .map(|(i, _)| i)
-                .collect();
-            Some(v)
-        };
-        let on_conflict = ins.or.unwrap_or(ConflictResolution::Abort);
-        Ok(crate::planner::plan::Plan::Insert {
-            table,
-            source: Box::new(source_plan),
-            columns,
-            on_conflict,
-            upsert: ins.upsert.clone(),
-            returning: ins.returning.clone(),
-        })
+                .collect(),
+        ))
     }
 
     pub(crate) fn plan_update(
         catalog: &Catalog,
         stmt: &Statement,
+    ) -> Result<crate::planner::plan::Plan> {
+        Self::plan_update_cte(catalog, stmt, &HashMap::new())
+    }
+
+    /// UPDATE planner with a pre-materialized CTE map (the WITH-DML path
+    /// seeds the planner; the plain path passes an empty map).
+    fn plan_update_cte(
+        catalog: &Catalog,
+        stmt: &Statement,
+        ctes: &HashMap<String, crate::types::CteMaterialization>,
     ) -> Result<crate::planner::plan::Plan> {
         let upd = match stmt {
             Statement::Update(u) => u,
@@ -6848,6 +7000,7 @@ impl Database {
             .as_ref()
             .map(|te| {
                 let mut planner = crate::planner::Planner::new(catalog);
+                planner.set_ctes(ctes.clone());
                 let plan = planner.plan_table_expression_pub(te)?;
                 Ok::<_, Error>(Box::new(crate::planner::plan::UpdateFrom {
                     plan,
@@ -6934,6 +7087,15 @@ impl Database {
     pub(crate) fn plan_delete(
         catalog: &Catalog,
         stmt: &Statement,
+    ) -> Result<crate::planner::plan::Plan> {
+        Self::plan_delete_cte(catalog, stmt, &HashMap::new())
+    }
+
+    /// DELETE planner with a pre-materialized CTE map (WITH-DML path).
+    fn plan_delete_cte(
+        catalog: &Catalog,
+        stmt: &Statement,
+        _ctes: &HashMap<String, crate::types::CteMaterialization>,
     ) -> Result<crate::planner::plan::Plan> {
         let del = match stmt {
             Statement::Delete(d) => d,

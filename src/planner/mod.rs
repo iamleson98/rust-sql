@@ -997,6 +997,18 @@ pub fn rewrite_aggregates_and_groups(
                     if agg.func != name.to_ascii_lowercase() || agg.distinct != *distinct {
                         continue;
                     }
+                    // FILTER is part of the aggregate's identity: two
+                    // calls differing only in FILTER are different
+                    // aggregates (SQLite computes each over its own row
+                    // subset).
+                    let filter_match = match (&agg.filter, filter) {
+                        (None, None) => true,
+                        (Some(a), Some(c)) => format!("{:?}", a) == format!("{:?}", c),
+                        _ => false,
+                    };
+                    if !filter_match {
+                        continue;
+                    }
                     // Match on the argument expression as well: two calls
                     // of the same function with DIFFERENT arguments are
                     // different aggregates. Previously only the function
@@ -1447,6 +1459,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         distinct: *distinct,
                         alias: alias.clone(),
                         display_name: aggregate_display_name(name, *distinct, args),
+                        filter: filter.clone().map(|b| (*b).clone()),
                     });
                     return;
                 } else if (fname == "percentile_cont" || fname == "percentile_disc")
@@ -1491,6 +1504,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         distinct: *distinct,
                         alias: alias.clone(),
                         display_name: aggregate_display_name(name, *distinct, args),
+                        filter: filter.clone().map(|b| (*b).clone()),
                     });
                     return;
                 } else if (fname == "json_group_object" || fname == "jsonb_group_object")
@@ -1524,6 +1538,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     distinct: *distinct,
                     alias: alias.clone(),
                     display_name: aggregate_display_name(name, *distinct, args),
+                    filter: filter.clone().map(|b| (*b).clone()),
                 });
                 return;
             }
@@ -1605,7 +1620,7 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
             distinct,
             args,
             over,
-            ..
+            filter,
         } => {
             if let Some(spec) = over {
                 let (partition_by, order_by, frame) = match spec.as_ref() {
@@ -1639,6 +1654,7 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
                     frame,
                     alias: alias.clone(),
                     display_name: aggregate_display_name(name, *distinct, args),
+                    filter: filter.clone().map(|b| (*b).clone()),
                     expr_key: format!("{:?}", e),
                 });
                 return;

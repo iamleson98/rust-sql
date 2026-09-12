@@ -192,19 +192,34 @@ impl Parser {
                 }
                 "INSERT" | "REPLACE" => {
                     let ins = self.parse_insert_inner()?;
-                    // insert.with is not modeled separately; attach to select if any
-                    let _ = ins;
-                    unreachable!("WITH ... INSERT not yet supported")
+                    // Attach the WITH clause to the INSERT statement
+                    // (SQLite: CTEs visible to the INSERT's SELECT
+                    // source and to subqueries in the statement).
+                    if let Statement::Insert(mut i) = ins {
+                        i.with = Some(with);
+                        Ok(Statement::Insert(i))
+                    } else {
+                        // REPLACE parses to Insert too; unreachable otherwise.
+                        Ok(ins)
+                    }
                 }
                 "UPDATE" => {
                     let upd = self.parse_update()?;
-                    let _ = upd;
-                    unreachable!("WITH ... UPDATE not yet supported")
+                    if let Statement::Update(mut u) = upd {
+                        u.with = Some(with);
+                        Ok(Statement::Update(u))
+                    } else {
+                        Ok(upd)
+                    }
                 }
                 "DELETE" => {
                     let del = self.parse_delete()?;
-                    let _ = del;
-                    unreachable!("WITH ... DELETE not yet supported")
+                    if let Statement::Delete(mut d) = del {
+                        d.with = Some(with);
+                        Ok(Statement::Delete(d))
+                    } else {
+                        Ok(del)
+                    }
                 }
                 _ => Err(Error::parse(
                     t.line,
@@ -560,8 +575,7 @@ impl Parser {
                     let _ = self.parse_ident_or_keyword()?;
                 }
             }
-            let on_delete = self.parse_fk_action("ON DELETE")?;
-            let on_update = self.parse_fk_action("ON UPDATE")?;
+            let (on_delete, on_update) = self.parse_fk_actions()?;
             Ok(ColumnConstraint::References {
                 table,
                 columns,
@@ -632,52 +646,56 @@ impl Parser {
         }
     }
 
-    fn parse_fk_action(&mut self, prefix: &str) -> Result<ForeignKeyAction> {
-        let action = if self.peek().is_keyword("ON") {
+    /// Parse the optional `ON DELETE ...` / `ON UPDATE ...` clause pair
+    /// (either order, each at most once — SQLite's grammar). Returns
+    /// (on_delete, on_update), each defaulting to NoAction.
+    fn parse_fk_actions(&mut self) -> Result<(ForeignKeyAction, ForeignKeyAction)> {
+        let mut on_delete = ForeignKeyAction::NoAction;
+        let mut on_update = ForeignKeyAction::NoAction;
+        for _ in 0..2 {
+            if self.peek().is_keyword("ON") && self.peek_n(1).is_keyword("DELETE") {
+                self.advance();
+                self.advance();
+                on_delete = self.parse_fk_action_body()?;
+            } else if self.peek().is_keyword("ON") && self.peek_n(1).is_keyword("UPDATE") {
+                self.advance();
+                self.advance();
+                on_update = self.parse_fk_action_body()?;
+            } else {
+                break;
+            }
+        }
+        Ok((on_delete, on_update))
+    }
+
+    fn parse_fk_action_body(&mut self) -> Result<ForeignKeyAction> {
+        if self.peek().is_keyword("NO") {
             self.advance();
-            // Next should be DELETE or UPDATE
-            if self.peek().is_keyword("DELETE") || self.peek().is_keyword("UPDATE") {
+            self.expect_keyword("ACTION")?;
+            Ok(ForeignKeyAction::NoAction)
+        } else if self.peek().is_keyword("RESTRICT") {
+            self.advance();
+            Ok(ForeignKeyAction::Restrict)
+        } else if self.peek().is_keyword("SET") {
+            self.advance();
+            if self.peek().is_keyword("NULL") {
                 self.advance();
+                Ok(ForeignKeyAction::SetNull)
             } else {
-                let t = self.peek();
-                return Err(Error::parse(
-                    t.line,
-                    t.col,
-                    format!("expected DELETE or UPDATE after ON, got {:?}", t.token),
-                ));
+                self.expect_keyword("DEFAULT")?;
+                Ok(ForeignKeyAction::SetDefault)
             }
-            if self.peek().is_keyword("NO") {
-                self.advance();
-                self.expect_keyword("ACTION")?;
-                ForeignKeyAction::NoAction
-            } else if self.peek().is_keyword("RESTRICT") {
-                self.advance();
-                ForeignKeyAction::Restrict
-            } else if self.peek().is_keyword("SET") {
-                self.advance();
-                if self.peek().is_keyword("NULL") {
-                    self.advance();
-                    ForeignKeyAction::SetNull
-                } else {
-                    self.expect_keyword("DEFAULT")?;
-                    ForeignKeyAction::SetDefault
-                }
-            } else if self.peek().is_keyword("CASCADE") {
-                self.advance();
-                ForeignKeyAction::Cascade
-            } else {
-                let t = self.peek();
-                return Err(Error::parse(
-                    t.line,
-                    t.col,
-                    format!("expected FK action, got {:?}", t.token),
-                ));
-            }
+        } else if self.peek().is_keyword("CASCADE") {
+            self.advance();
+            Ok(ForeignKeyAction::Cascade)
         } else {
-            ForeignKeyAction::NoAction
-        };
-        let _ = prefix;
-        Ok(action)
+            let t = self.peek();
+            Err(Error::parse(
+                t.line,
+                t.col,
+                format!("expected FK action, got {:?}", t.token),
+            ))
+        }
     }
 
     fn parse_table_constraint(&mut self) -> Result<TableConstraint> {
@@ -732,8 +750,7 @@ impl Parser {
                     let _ = self.parse_ident_or_keyword()?;
                 }
             }
-            let on_delete = self.parse_fk_action("ON DELETE")?;
-            let on_update = self.parse_fk_action("ON UPDATE")?;
+            let (on_delete, on_update) = self.parse_fk_actions()?;
             Ok(TableConstraint::ForeignKey {
                 columns: cols,
                 ref_table,
@@ -1248,6 +1265,7 @@ impl Parser {
             source,
             upsert,
             returning,
+            with: None,
         }))
     }
 
@@ -1357,6 +1375,7 @@ impl Parser {
             set,
             from,
             where_clause,
+            with: None,
             returning,
             order_by,
             limit,
@@ -1414,6 +1433,7 @@ impl Parser {
             from,
             alias,
             where_clause,
+            with: None,
             returning,
             limit,
             order_by,
@@ -1701,6 +1721,84 @@ impl Parser {
     }
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
+        // Top-level VALUES (..), (..), ... — a multi-row table
+        // constructor (SQLite: a compound of single-row SELECTs). Parse
+        // every row here (before set-op chaining) so all rows survive:
+        // the old parse_simple_select arm kept only the first row.
+        if self.peek().is_keyword("VALUES") {
+            self.advance();
+            let mut rows: Vec<Vec<Expr>> = Vec::new();
+            loop {
+                self.expect_punct('(')?;
+                let mut row = Vec::new();
+                loop {
+                    row.push(self.parse_expr()?);
+                    if self.peek().is_punct(',') {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect_punct(')')?;
+                rows.push(row);
+                if self.peek().is_punct(',') {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            // Uniform width (SQLite: "all VALUES must have the same
+            // number of terms").
+            if let Some(first) = rows.first() {
+                let n = first.len();
+                if rows.iter().any(|r| r.len() != n) {
+                    let t = self.peek();
+                    return Err(Error::parse(
+                        t.line,
+                        t.col,
+                        "all VALUES must have the same number of terms".to_string(),
+                    ));
+                }
+            }
+            // Chain rows as UNION ALL of one-row Values bodies (SQLite's
+            // own model) — ORDER BY / LIMIT / set-ops above apply to the
+            // whole chain uniformly.
+            let mut body = SelectBody::Simple(SimpleSelect::values_row(rows.remove(0)));
+            for row in rows {
+                body = SelectBody::Binary {
+                    op: SetOp::UnionAll,
+                    left: Box::new(body),
+                    right: Box::new(SelectBody::Simple(SimpleSelect::values_row(row))),
+                };
+            }
+            // A set-op may follow the VALUES chain itself.
+            if self.peek().is_keyword("UNION")
+                || self.peek().is_keyword("INTERSECT")
+                || self.peek().is_keyword("EXCEPT")
+            {
+                let op = if self.peek().is_keyword("UNION") {
+                    self.advance();
+                    if self.consume_keyword("ALL") {
+                        SetOp::UnionAll
+                    } else {
+                        SetOp::Union
+                    }
+                } else if self.peek().is_keyword("INTERSECT") {
+                    self.advance();
+                    SetOp::Intersect
+                } else {
+                    self.advance();
+                    SetOp::Except
+                };
+                let right = self.parse_select_body()?;
+                return Ok(SelectBody::Binary {
+                    op,
+                    left: Box::new(body),
+                    right: Box::new(right),
+                });
+            }
+            return Ok(body);
+        }
         let left = self.parse_simple_select()?;
         // Look for set operators
         if self.peek().is_keyword("UNION")
@@ -1733,9 +1831,12 @@ impl Parser {
 
     fn parse_simple_select(&mut self) -> Result<SimpleSelect> {
         if self.peek().is_keyword("VALUES") {
-            // VALUES (..), (..) — convert to a SELECT 1, 2, ... FROM (VALUES ...) form
+            // Subquery-position VALUES (e.g. `IN (VALUES (1),(2))`):
+            // parse_select_body owns the top-level multi-row shape;
+            // this arm keeps single-row behavior for nested positions.
+            // Delegate by parsing one row through the shared helper.
             self.advance();
-            let mut rows = Vec::new();
+            let mut rows: Vec<Vec<Expr>> = Vec::new();
             loop {
                 self.expect_punct('(')?;
                 let mut row = Vec::new();
@@ -1755,27 +1856,22 @@ impl Parser {
                     break;
                 }
             }
-            // Simplify: just return VALUES as a single-row select for now.
-            // Each row becomes a literal expression column. We use the first row.
-            // Note: a real implementation would handle multi-row VALUES, but this
-            // suffices for the common single-row case.
+            if let Some(first) = rows.first() {
+                let n = first.len();
+                if rows.iter().any(|r| r.len() != n) {
+                    let t = self.peek();
+                    return Err(Error::parse(
+                        t.line,
+                        t.col,
+                        "all VALUES must have the same number of terms".to_string(),
+                    ));
+                }
+            }
+            // Nested positions keep first-row behavior (SQLite's nested
+            // VALUES is single-row in practice); top-level multi-row is
+            // handled by parse_select_body above.
             let first_row = rows.into_iter().next().unwrap();
-            let n_cols = first_row.len();
-            let columns: Vec<ResultColumn> = (0..n_cols)
-                .map(|i| ResultColumn::Expr {
-                    expr: first_row[i].clone(),
-                    alias: None,
-                })
-                .collect();
-            return Ok(SimpleSelect {
-                distinct: false,
-                columns,
-                from: None,
-                where_clause: None,
-                group_by: Vec::new(),
-                having: None,
-                window: Vec::new(),
-            });
+            return Ok(SimpleSelect::values_row(first_row));
         }
         self.expect_keyword("SELECT")?;
         let distinct = if self.peek().is_keyword("DISTINCT") {

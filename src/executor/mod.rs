@@ -2052,6 +2052,217 @@ fn enforce_parent_delete_fks(
     Ok(())
 }
 
+/// Parent-side enforcement for a parent-key UPDATE that moves the key:
+/// apply the ON UPDATE action of every referencing FK.
+///
+/// - NoAction / Restrict: reject if any child references the OLD key.
+/// - Cascade: rewrite the referencing children's key columns to the NEW key
+///   (recursively — children may themselves be parents).
+/// - SetNull / SetDefault: rewrite the referencing children's key columns
+///   to NULL / defaults.
+///
+/// Only fires when the UPDATE actually changed a referenced parent key
+/// column (comparing old vs new on the FK's parent columns); a no-op
+/// UPDATE of unrelated columns never touches children (SQLite semantics).
+/// `new_row` / `new_rowid` carry the parent's post-update key.
+fn enforce_parent_update_fks(
+    ctx: &mut ExecContext<'_>,
+    parent: &Table,
+    old_row: &[Value],
+    new_row: &[Value],
+    parent_rowid: i64,
+    new_parent_rowid: i64,
+    depth: usize,
+) -> Result<()> {
+    if !ctx.pager.foreign_keys_enabled() || depth > 16 {
+        return Ok(());
+    }
+    let _preupdate_depth = crate::preupdate::enter_nested_change();
+    let referencing: Vec<(Arc<Table>, Vec<crate::schema::ForeignKeyClause>)> = ctx
+        .catalog()
+        .all_tables()
+        .into_iter()
+        .filter(|(_, t)| !t.foreign_keys.is_empty())
+        .filter(|(_, t)| {
+            t.foreign_keys
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+        })
+        .map(|(_, t)| {
+            let fks: Vec<crate::schema::ForeignKeyClause> = t
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+                .cloned()
+                .collect();
+            (t, fks)
+        })
+        .collect();
+    let mut referencing = referencing;
+    referencing.sort_by_key(|(t, _)| {
+        std::cmp::Reverse(
+            ctx.catalog()
+                .table_creation_seq(&t.name.to_ascii_lowercase()),
+        )
+    });
+    for (child, fks) in referencing {
+        for fk in &fks {
+            let parent_cols: Vec<usize> = if !fk.ref_columns.is_empty() {
+                let mut v = Vec::with_capacity(fk.ref_columns.len());
+                for rc in &fk.ref_columns {
+                    if let Some(i) = parent.find_column(rc) {
+                        v.push(i);
+                    }
+                }
+                v
+            } else {
+                parent
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.primary_key)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            // New parent key for this FK (explicit columns, PK columns,
+            // or the rowid when the parent has no PK).
+            let new_key: Vec<Value> = if parent_cols.is_empty() {
+                vec![Value::Integer(new_parent_rowid)]
+            } else {
+                parent_cols
+                    .iter()
+                    .map(|&i| new_row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect()
+            };
+            let old_key: Vec<Value> = if parent_cols.is_empty() {
+                vec![Value::Integer(parent_rowid)]
+            } else {
+                parent_cols
+                    .iter()
+                    .map(|&i| old_row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect()
+            };
+            // Key unchanged by this UPDATE → nothing to enforce.
+            if old_key.len() == new_key.len()
+                && old_key.iter().zip(new_key.iter()).all(|(a, b)| a == b)
+            {
+                continue;
+            }
+            let children =
+                fk_find_child_rows(ctx, &child, fk, &parent_cols, old_row, parent_rowid)?;
+            if children.is_empty() {
+                continue;
+            }
+            match fk.on_update {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                    return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                }
+                ForeignKeyAction::Cascade => {
+                    for (rowid, mut crow) in children {
+                        let pre_row = if crate::preupdate::hook_installed() {
+                            Some(crow.clone())
+                        } else {
+                            None
+                        };
+                        for (&ci, nv) in fk.columns.iter().zip(new_key.iter()) {
+                            if ci < crow.len() {
+                                crow[ci] = nv.clone();
+                            }
+                        }
+                        // Child-side re-validation is unnecessary: the new
+                        // key is the parent's own post-update key.
+                        let payload = encode_row_aliased(&crow, child.rowid_alias);
+                        let root = ctx.table_root(&child);
+                        let new_root;
+                        {
+                            crate::preupdate::fire(
+                                crate::preupdate::PreupdateOp::Update,
+                                child.as_ref(),
+                                rowid,
+                                pre_row.as_deref(),
+                                Some(&crow),
+                            );
+                            let mut bt = Btree::new(ctx.pager, root, false);
+                            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
+                            if !updated {
+                                bt.delete_table(rowid)?;
+                                bt.insert_table(rowid, &payload)?;
+                            }
+                            new_root = bt.root;
+                        }
+                        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
+                        let indexes = ctx.catalog().indexes_on_table(&child.name);
+                        for idx in indexes {
+                            delete_index_entry(ctx, &idx, &child, &crow, rowid)?;
+                            insert_index_entry(ctx, &idx, &child, &crow, rowid)?;
+                        }
+                        ctx.changes += 1;
+                        // Grandchildren (this child may itself be a parent).
+                        enforce_parent_update_fks(
+                            ctx,
+                            &child,
+                            pre_row.as_deref().unwrap_or(&crow),
+                            &crow,
+                            rowid,
+                            rowid,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                    for (rowid, mut crow) in children {
+                        let pre_row = if crate::preupdate::hook_installed() {
+                            Some(crow.clone())
+                        } else {
+                            None
+                        };
+                        for &ci in &fk.columns {
+                            crow[ci] = if fk.on_update == ForeignKeyAction::SetNull {
+                                Value::Null
+                            } else {
+                                let default_val = child.columns[ci].default.as_ref().map(|e| {
+                                    let names: Vec<String> =
+                                        child.columns.iter().map(|c| c.name.clone()).collect();
+                                    eval_row(e, &crow, &names, &ctx.params, &ctx.named_params)
+                                        .unwrap_or(Value::Null)
+                                });
+                                default_val.unwrap_or(Value::Null)
+                            };
+                        }
+                        let payload = encode_row_aliased(&crow, child.rowid_alias);
+                        let root = ctx.table_root(&child);
+                        let new_root;
+                        {
+                            crate::preupdate::fire(
+                                crate::preupdate::PreupdateOp::Update,
+                                child.as_ref(),
+                                rowid,
+                                pre_row.as_deref(),
+                                Some(&crow),
+                            );
+                            let mut bt = Btree::new(ctx.pager, root, false);
+                            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
+                            if !updated {
+                                bt.delete_table(rowid)?;
+                                bt.insert_table(rowid, &payload)?;
+                            }
+                            new_root = bt.root;
+                        }
+                        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
+                        let indexes = ctx.catalog().indexes_on_table(&child.name);
+                        for idx in indexes {
+                            delete_index_entry(ctx, &idx, &child, &crow, rowid)?;
+                            insert_index_entry(ctx, &idx, &child, &crow, rowid)?;
+                        }
+                        ctx.changes += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Project the RETURNING clause for one affected row.
 /// `Star` expands to all columns; `Expr` is evaluated against the row.
 fn project_returning_row(
@@ -7103,7 +7314,10 @@ pub(crate) fn scan_groupby_grouper(
 
     let all_resolved =
         key_col_indices.iter().all(|x| x.is_some()) && agg_col_indices.iter().all(|x| x.is_some());
-    let selective_eligible = all_resolved && filter_predicate.is_none();
+    // Per-aggregate FILTER opts out of the selective fast paths (no
+    // per-aggregate gating there); the general loop below evaluates it.
+    let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
+    let selective_eligible = all_resolved && filter_predicate.is_none() && !has_agg_filter;
 
     // Sorted, deduped list of column indices to decode on the selective path.
     let wanted: Vec<usize> = if selective_eligible {
@@ -7247,7 +7461,9 @@ pub(crate) fn scan_groupby_grouper(
         let single_key = group_by.len() == 1;
         let rowid_alias = table.rowid_alias;
 
-        if keys_all_compile && args_all_compile {
+        // Per-aggregate FILTER opts out of the compiled fast path (no
+        // per-aggregate gating there); the general loop below owns it.
+        if !has_agg_filter && keys_all_compile && args_all_compile {
             // Referenced columns = union of compiled key/arg columns +
             // bare-column indices, ascending + deduped.
             let mut wanted: Vec<usize> = Vec::with_capacity(n_cols);
@@ -7413,6 +7629,17 @@ pub(crate) fn scan_groupby_grouper(
                 }
                 let gi = grouper.intern_key(&key_buf);
                 for (i, agg) in aggregates.iter().enumerate() {
+                    // Per-aggregate FILTER (WHERE ...): only rows passing
+                    // the predicate contribute to THIS aggregate.
+                    if let Some(f) = &agg.filter {
+                        let pass = match eval_row(f, &row_buf, &columns, params, named_params) {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => false,
+                        };
+                        if !pass {
+                            continue;
+                        }
+                    }
                     let arg_val = match (&agg.arg, agg_col_indices[i]) {
                         (Some(_), Some(idx)) => row_buf[idx].clone(),
                         (Some(arg), None) => {
@@ -8705,14 +8932,19 @@ fn exec_aggregate_no_group_by(
     // off / txn open / below threshold / unsupported shape) or a worker
     // bail falls through to the serial paths — the parallel attempt can
     // never produce a divergent answer.
-    if let Some(res) = crate::executor::parallel::try_parallel_fused_aggregate(
-        ctx,
-        &table,
-        alias.as_deref(),
-        filter_predicate,
-        aggregates,
-    )? {
-        return Ok(res);
+    // Per-aggregate FILTER opts out (same reason as the serial fused
+    // machine below — no per-aggregate gating there either).
+    let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
+    if !has_agg_filter {
+        if let Some(res) = crate::executor::parallel::try_parallel_fused_aggregate(
+            ctx,
+            &table,
+            alias.as_deref(),
+            filter_predicate,
+            aggregates,
+        )? {
+            return Ok(res);
+        }
     }
 
     // DISTINCT split: the fused machine declines every distinct
@@ -8720,7 +8952,9 @@ fn exec_aggregate_no_group_by(
     // merge (see parallel::try_parallel_distinct_aggregate). A decline
     // (config / threshold / shape / worker bail) falls through to the
     // serial paths below.
-    if aggregates.iter().any(|a| a.distinct) {
+    // Per-aggregate FILTER opts out here too (the DISTINCT worker has
+    // no per-aggregate gating).
+    if !has_agg_filter && aggregates.iter().any(|a| a.distinct) {
         if let Some(res) = crate::executor::parallel::try_parallel_distinct_aggregate(
             ctx,
             &table,
@@ -8736,18 +8970,30 @@ fn exec_aggregate_no_group_by(
     // with an optional `col <op> literal` filter. Returns None for any
     // shape it cannot reproduce exactly — then the generic paths below
     // take over (identical results, slower decode/dispatch).
-    if let Some(res) =
-        try_fused_aggregate(ctx, &table, alias.as_deref(), filter_predicate, aggregates)?
-    {
-        return Ok(res);
+    // Per-aggregate FILTER (WHERE ...) opts out: the fused machine has
+    // no per-aggregate row gating (its filter is statement-wide).
+    let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
+    if !has_agg_filter {
+        if let Some(res) =
+            try_fused_aggregate(ctx, &table, alias.as_deref(), filter_predicate, aggregates)?
+        {
+            return Ok(res);
+        }
     }
 
     // Try to resolve each aggregate's arg as a bare Column index.
     // If ALL of them are Columns (or COUNT(*), which has no arg),
     // we can use the index-based fast path. Otherwise, fall back to eval_row.
+    // Per-aggregate FILTER forces name materialization (its predicates
+    // evaluate per row in the fallback loop below). COUNT(*) alone does
+    // NOT need names — unless a FILTER is present.
     let mut agg_col_indices: Vec<Option<usize>> = Vec::with_capacity(aggregates.len());
-    let mut all_columns = filter_predicate.is_none();
+    let mut all_columns = filter_predicate.is_none() && !has_agg_filter;
     for agg in aggregates {
+        if agg.filter.is_some() {
+            // FILTER needs eval_row → names required regardless of arg shape.
+            all_columns = false;
+        }
         if let Some(arg) = &agg.arg {
             if let Expr::Column { table: ref_t, name } = arg {
                 // Verify the table matches (or is None).
@@ -8821,8 +9067,13 @@ fn exec_aggregate_no_group_by(
     // no per-row name lookups, no AST walk. For `SELECT COUNT(*) FROM t
     // WHERE val > 5000` this is the difference between ~114 ns/row and
     // ~35 ns/row.
-    let compiled = filter_predicate
-        .and_then(|p| crate::executor::predicate::compile_predicate(p, &table, prefix));
+    // Per-aggregate FILTER opts out (per-row gating below owns it).
+    let compiled = if has_agg_filter {
+        None
+    } else {
+        filter_predicate
+            .and_then(|p| crate::executor::predicate::compile_predicate(p, &table, prefix))
+    };
     if let Some(pred) = compiled {
         // Eligible when every aggregate is COUNT(*) (no arg) or has a
         // resolved bare-column arg. (COUNT(*) pushes None into
@@ -8898,7 +9149,10 @@ fn exec_aggregate_no_group_by(
     //
     // The filter predicate is allowed to be None (no WHERE clause) — in that
     // case the set of needed columns is just the aggregate args.
-    let selective_eligible = agg_col_indices.iter().all(|x| x.is_some())
+    // Per-aggregate FILTER opts out (its predicates need eval per row
+    // below; the selective buffer lacks their columns).
+    let selective_eligible = !has_agg_filter
+        && agg_col_indices.iter().all(|x| x.is_some())
         && filter_predicate
             .map(|p| expr_only_columns(p, &table, prefix))
             .unwrap_or(true);
@@ -9054,6 +9308,20 @@ fn exec_aggregate_no_group_by(
                 }
                 saw_any_row = true;
                 for (i, agg) in aggregates.iter().enumerate() {
+                    // Per-aggregate FILTER (WHERE ...): only rows passing
+                    // the predicate contribute to THIS aggregate (SQLite
+                    // 3.30+). Evaluated against the full decoded row.
+                    if let Some(f) = &agg.filter {
+                        let cols =
+                            columns_ref.expect("columns built when per-aggregate FILTER present");
+                        let pass = match eval_row(f, &row_buf, cols, &params, &named_params) {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => false,
+                        };
+                        if !pass {
+                            continue;
+                        }
+                    }
                     let arg_val = if let Some(idx) = agg_col_indices[i] {
                         // Fast path: pre-resolved column index.
                         row_buf[idx].clone()
@@ -9320,7 +9588,10 @@ fn exec_aggregate(
                 // COUNT(col) — arg is Some(Column). We can't use the fast path
                 // for COUNT(col) because we need to skip NULLs, which requires
                 // decoding.
-                if agg.func == "count" && agg.arg.is_none() && !agg.distinct {
+                // A per-aggregate FILTER also opts out (the cell count is
+                // unfiltered; the FILTER needs per-row evaluation).
+                if agg.func == "count" && agg.arg.is_none() && !agg.distinct && agg.filter.is_none()
+                {
                     // Parallel split first (big tables): each worker counts
                     // leaf cells in its rowid range (still zero decode),
                     // counts sum. Declines below threshold / config off.
@@ -9378,6 +9649,7 @@ fn exec_aggregate(
         && aggregates[0].func == "count"
         && aggregates[0].arg.is_none()
         && !aggregates[0].distinct
+        && aggregates[0].filter.is_none()
     {
         if let Plan::RowidRange {
             table,
@@ -9463,6 +9735,7 @@ fn exec_aggregate(
         && aggregates[0].func == "count"
         && aggregates[0].arg.is_none()
         && !aggregates[0].distinct
+        && aggregates[0].filter.is_none()
     {
         if let Plan::IndexLookup {
             table,
@@ -9513,6 +9786,7 @@ fn exec_aggregate(
         && aggregates[0].func == "count"
         && aggregates[0].arg.is_none()
         && !aggregates[0].distinct
+        && aggregates[0].filter.is_none()
     {
         let covering = match input {
             Plan::IndexRange {
@@ -9771,6 +10045,16 @@ fn exec_aggregate(
             }
             let gi = grouper.intern_key(&key_buf);
             for (i, agg) in aggregates.iter().enumerate() {
+                // Per-aggregate FILTER over materialized inputs.
+                if let Some(f) = &agg.filter {
+                    let pass = match eval_row(f, row, &inner.columns, params, named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(_) => false,
+                    };
+                    if !pass {
+                        continue;
+                    }
+                }
                 let arg_val = match (&agg.arg, agg_col_indices[i]) {
                     (Some(_), Some(idx)) => row[idx].clone(),
                     (Some(arg), None) => eval_row(arg, row, &inner.columns, params, named_params)?,
@@ -10615,6 +10899,19 @@ fn exec_one_window(
 
         // ---- 5. Frame bounds per sorted position (inclusive index range
         //         in sorted-partition space), with EXCLUDE applied. ----
+        // Per-aggregate FILTER: evaluated once per partition row against
+        // the INPUT row (sorted-position space), then consulted per frame
+        // row inside compute_window_at.
+        let filter_pass: Option<Vec<bool>> = w.filter.as_ref().map(|f| {
+            sorted
+                .iter()
+                .map(|&ri| {
+                    eval_row(f, &rows[ri], columns, params, named_params)
+                        .map(|v| v.is_truthy())
+                        .unwrap_or(false)
+                })
+                .collect()
+        });
         for p in 0..np {
             let val = compute_window_at(
                 w,
@@ -10624,6 +10921,7 @@ fn exec_one_window(
                 &arg_vals,
                 &keys,
                 (peer_start[p], peer_end[p]),
+                filter_pass.as_deref(),
             )?;
             let ri = sorted[p];
             if extra_cols[ri].len() < w_idx + 1 {
@@ -10929,6 +11227,7 @@ fn compute_window_at(
     arg_vals: &[Option<Value>],
     keys: &[Vec<Value>],
     peer: (usize, usize),
+    filter_pass: Option<&[bool]>,
 ) -> Result<Value> {
     let val_of = |pos: usize| -> Value {
         arg_vals
@@ -11047,7 +11346,11 @@ fn compute_window_at(
                 match w.frame.as_ref().map(|f| f.exclude) {
                     Some(FrameExclude::CurrentRow) => pos != p,
                     Some(FrameExclude::Group) => pos < peer.0 || pos >= peer.1,
-                    Some(FrameExclude::Ties) => pos == p,
+                    // EXCLUDE TIES: drop the current row's PEERS but KEEP
+                    // the current row itself (SQLite: "the peer rows of
+                    // the current row are excluded"). Differs from
+                    // EXCLUDE GROUP only by `pos == p` staying in.
+                    Some(FrameExclude::Ties) => pos == p || pos < peer.0 || pos >= peer.1,
                     _ => true,
                 }
             };
@@ -11067,6 +11370,13 @@ fn compute_window_at(
             for pos in fs..=fe.max(fs) {
                 if !in_frame(pos) {
                     continue;
+                }
+                // Per-aggregate FILTER on window aggregates: only frame
+                // rows passing the predicate contribute (SQLite).
+                if let Some(pass) = filter_pass {
+                    if !pass.get(pos).copied().unwrap_or(false) {
+                        continue;
+                    }
                 }
                 total_count += 1;
                 let v = val_of(pos);
@@ -16840,7 +17150,30 @@ fn apply_rowid_alias_move(
     // then insert at the new rowid (+ index entries). No preupdate
     // events here: the caller fired the whole move as ONE UPDATE event
     // (SQLite's observable semantics for a rowid-changing UPDATE).
-    delete_rows_by_rowid_inner(ctx, table, &[rowid], false)?;
+    // NOTE: the internal delete must NOT run parent-side DELETE FK
+    // enforcement (that would CASCADE-delete children of a mere key
+    // move); the caller runs ON UPDATE enforcement after the move.
+    // delete_rows_by_rowid_inner always enforces DELETE FKs, so inline
+    // the delete here without that call.
+    {
+        let root = ctx.table_root(table);
+        let (new_root, old_payload) = {
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let payload = bt.delete_table_get_payload(rowid)?;
+            (bt.root, payload)
+        };
+        ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), new_root);
+        if let Some(payload) = old_payload {
+            if !indexes.is_empty() {
+                if let Ok(row) = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias) {
+                    for idx in &indexes {
+                        delete_index_entry(ctx, idx, table, &row, rowid)?;
+                    }
+                }
+            }
+            ctx.invalidate_max_rowid_if_deleted(&table.name.to_ascii_lowercase(), rowid);
+        }
+    }
     {
         let root = ctx.table_root(table);
         let mut bt = Btree::new(ctx.pager, root, false);
@@ -17338,6 +17671,21 @@ fn exec_update(
                         &new_row,
                         or_conflict,
                     )? {
+                        // Parent-side FK (ON UPDATE) for the moved key.
+                        let new_parent_rowid = table
+                            .rowid_alias
+                            .and_then(|a| new_row.get(a))
+                            .map(|v| v.as_integer())
+                            .unwrap_or(rowid);
+                        enforce_parent_update_fks(
+                            ctx,
+                            &table,
+                            &row,
+                            &new_row,
+                            rowid,
+                            new_parent_rowid,
+                            0,
+                        )?;
                         ctx.changes += 1;
                         updated += 1;
                         if let Some(ret) = returning {
@@ -17398,6 +17746,18 @@ fn exec_update(
             }
             delete_index_entry(ctx, idx, &table, &row, rowid)?;
             insert_index_entry(ctx, idx, &table, &new_row, rowid)?;
+        }
+        // Parent-side FK (ON UPDATE): a moved parent key cascades /
+        // nulls / rejects referencing children (SQLite). The rowid-alias
+        // move path above `continue`s before reaching here — it calls
+        // the same enforcement (see apply_rowid_alias_move site).
+        {
+            let new_parent_rowid = table
+                .rowid_alias
+                .and_then(|a| new_row.get(a))
+                .map(|v| v.as_integer())
+                .unwrap_or(rowid);
+            enforce_parent_update_fks(ctx, &table, &row, &new_row, rowid, new_parent_rowid, 0)?;
         }
         ctx.changes += 1;
         updated += 1;
@@ -17878,6 +18238,53 @@ fn try_streaming_update(
     if let Some(alias_idx) = table.rowid_alias {
         if assignments.iter().any(|(a_idx, _)| *a_idx == alias_idx) {
             return Ok(None);
+        }
+    }
+    // Parent-side FK (ON UPDATE): when the UPDATE assigns any column of
+    // a referenced parent key, children must cascade / null / reject.
+    // The streaming path applies rows without parent-key enforcement;
+    // decline to the general path (which enforces per applied row).
+    if ctx.pager.foreign_keys_enabled() {
+        let catalog = ctx.catalog();
+        let is_parent = catalog.all_tables().into_iter().any(|(_, t)| {
+            t.foreign_keys
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(&table.name))
+        });
+        if is_parent {
+            // Which parent columns are referenced? Empty ref_columns =
+            // the PK; resolve the assigned column indices against them.
+            let mut referenced: Vec<usize> = Vec::new();
+            for (_, t) in catalog.all_tables() {
+                for fk in &t.foreign_keys {
+                    if !fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                        continue;
+                    }
+                    if fk.ref_columns.is_empty() {
+                        for (i, c) in table.columns.iter().enumerate() {
+                            if c.primary_key && !referenced.contains(&i) {
+                                referenced.push(i);
+                            }
+                        }
+                        // No PK: the rowid is the implicit key — any
+                        // rowid-alias assignment already declined above.
+                    } else {
+                        for rc in &fk.ref_columns {
+                            if let Some(i) = table.find_column(rc) {
+                                if !referenced.contains(&i) {
+                                    referenced.push(i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if assignments
+                .iter()
+                .any(|(a_idx, _)| referenced.contains(a_idx))
+            {
+                return Ok(None);
+            }
         }
     }
 
