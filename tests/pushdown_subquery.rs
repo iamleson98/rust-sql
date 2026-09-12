@@ -271,15 +271,85 @@ fn decline_distinct_body() {
 }
 
 #[test]
-fn decline_compound_body() {
+fn push_into_compound_arms() {
+    // A row filter DISTRIBUTES over set operations: the conjunct is
+    // rewritten into EVERY arm (each arm's own table refs) — all or
+    // nothing.
+    let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
+                 CREATE INDEX idx_t_k ON t(k);
+                 CREATE TABLE u (id INTEGER PRIMARY KEY, j INT, v INT);
+                 CREATE INDEX idx_u_j ON u(j);";
+    let inserts = &[
+        "INSERT INTO t (k, v) VALUES (1,10),(2,20),(8,80),(9,90)",
+        "INSERT INTO u (j, v) VALUES (1,100),(2,200),(8,800),(9,900)",
+    ];
+    // UNION ALL: both arms filtered.
+    diff_with(
+        setup,
+        inserts,
+        "SELECT k, v FROM (SELECT k, v FROM t UNION ALL SELECT j, v FROM u) c \
+         WHERE c.k > 2 ORDER BY c.k, c.v",
+    );
+    let plan = explain(
+        setup,
+        inserts,
+        "SELECT k, v FROM (SELECT k, v FROM t UNION ALL SELECT j, v FROM u) c \
+         WHERE c.k > 2",
+    );
+    assert!(
+        plan.iter()
+            .any(|p| p.contains("SEARCH t USING INDEX idx_t_k")),
+        "expected the pushed term to drive t's index, got {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|p| p.contains("SEARCH u USING INDEX idx_u_j")),
+        "expected the pushed term to drive u's index, got {plan:?}"
+    );
+    // UNION (dedup commutes with the filter).
+    diff_with(
+        setup,
+        inserts,
+        "SELECT k, v FROM (SELECT k, v FROM t UNION SELECT j, v FROM u) c \
+         WHERE c.k > 2 ORDER BY c.k, c.v",
+    );
+    // INTERSECT / EXCEPT.
+    diff_with(
+        setup,
+        inserts,
+        "SELECT k, v FROM (SELECT k, v FROM t INTERSECT SELECT j, v FROM u) c \
+         WHERE c.k > 2 ORDER BY c.k, c.v",
+    );
+    diff_with(
+        setup,
+        inserts,
+        "SELECT k, v FROM (SELECT k, v FROM t EXCEPT SELECT j, v FROM u) c \
+         WHERE c.k > 2 ORDER BY c.k, c.v",
+    );
+}
+
+#[test]
+fn decline_compound_with_ineligible_arm() {
+    // One arm aggregates: all-or-nothing — the term must NOT go into any
+    // arm (a partially-filtered compound changes the set-op result).
     let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
                  CREATE INDEX idx_t_k ON t(k);
                  CREATE TABLE u (id INTEGER PRIMARY KEY, k INT, v INT);";
     diff_with(
         setup,
         INSERTS,
-        "SELECT * FROM (SELECT k, v FROM t UNION ALL SELECT k, v FROM u) c \
+        "SELECT * FROM (SELECT k, v FROM t UNION ALL SELECT k, COUNT(*) FROM u GROUP BY k) c \
          WHERE c.k > 7 ORDER BY c.k, c.v",
+    );
+    let plan = explain(
+        setup,
+        INSERTS,
+        "SELECT * FROM (SELECT k, v FROM t UNION ALL SELECT k, COUNT(*) FROM u GROUP BY k) c \
+         WHERE c.k > 7",
+    );
+    assert!(
+        !plan.iter().any(|p| p.contains("SEARCH t USING INDEX")),
+        "the compound has an ineligible arm — no arm may be pushed, got {plan:?}"
     );
 }
 

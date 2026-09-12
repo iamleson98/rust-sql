@@ -177,3 +177,23 @@ Stage Summary:
 - The classic subquery pushdown optimization is REAL and SQLite-plan-matching for the eligible shapes; EXPLAIN-of-WITH no longer errors.
 - Remaining pushdown surface (documented): compound bodies, CTE atoms (eagerly materialized before planning), view bodies (expanded during planning), join-condition pushdown/ flattening (SQLite's covering-index trick over subquery join sides).
 - Ready to push.
+
+---
+Task ID: 12
+Agent: main (Super Z)
+Task: Compound-body pushdown (UNION/INTERSECT/EXCEPT arms) + the FROM-subquery column-list fix the tests surfaced
+
+Work Log:
+- Found while restoring the column-aliases test: the engine PARSES PostgreSQL-style FROM-subquery column lists s(a, b) (a superset — SQLite itself rejects the syntax) but planning ignored the list — outer refs to the declared names projected NULL. Fixed: positional Project over the subquery boundary, the same shape CREATE VIEW v(a, b) uses (83271c8, pushed, CI running).
+- Compound-body pushdown: a row filter DISTRIBUTES over set operations (filter(A UNION B) = filter(A) UNION filter(B), likewise INTERSECT/EXCEPT), so the same term is rewritten into EVERY arm — each arm's own table refs through its own output mapping, all-or-nothing (a partially-filtered compound changes the set-op result).
+  - subquery_push_map now returns SubqueryPushTarget: Simple(map) | Compound(per-arm maps) — compound arms normalize their output NAMES to the leftmost arm's (shared positions), keep their own targets; arity must match (SQLite's compound rule); FROM column lists rename positionally over the compound.
+  - push_into_subquery_atoms: validation against the shared outputs (a position is pushable only when EVERY arm maps it to a bare column), then per-arm rewrite + AND into each Simple leaf in left-to-right order (and_into_leaves).
+  - rewrite_conjunct_into_body split: conjunct_binds_to_atom (validation, shared by both paths) + rewrite_refs_to_body (per-arm substitution).
+  - Inventory: compound subquery atoms expose the leftmost arm's names (stars expanded through the arm's single table) — subquery_atom_output_names / simple_select_names.
+- Probe after: engine shows SEARCH t USING INDEX idx_t_k (k>?) + SCAN u + temp b-tree — SQLite's own compound pushdown shape (SQLite additionally materializes a co-routine wrapper; the engine's plan is flatter).
+- tests/pushdown_subquery.rs: compound suites (UNION ALL with per-arm different tables+indexes, EXPLAIN asserts both arms' index searches; UNION; INTERSECT; EXCEPT; decline with an ineligible aggregated arm — pinned by EXPLAIN no-index) — 18 suites total.
+- Verification: dev matrix 867/867, fmt clean, clippy -D warnings clean in all 4 configs.
+
+Stage Summary:
+- The pushdown surface now covers plain and compound subquery bodies; remaining: CTE atoms (architectural — eager materialization), view bodies (expanded mid-planning), join-condition pushdown/flattening.
+- Ready to push.

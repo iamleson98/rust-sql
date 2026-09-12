@@ -2812,15 +2812,77 @@ impl<'a> Planner<'a> {
         &self,
         select: &SelectStatement,
         column_aliases: &Option<Vec<String>>,
-    ) -> Option<SubqueryPushMap> {
-        // Plain SELECT only: no WITH / compound / LIMIT / OFFSET.
+    ) -> Option<SubqueryPushTarget> {
+        // Plain SELECT only: no WITH / LIMIT / OFFSET.
         if select.with.is_some() || select.limit.is_some() || select.offset.is_some() {
             return None;
         }
-        let body = match &select.body {
-            SelectBody::Simple(s) => s,
-            SelectBody::Binary { .. } => return None,
-        };
+        match &select.body {
+            SelectBody::Simple(body) => {
+                let mut map = self.simple_body_push_map(body)?;
+                // FROM (…) s(a, b): the declared column list renames the
+                // outputs positionally (the mapping still holds).
+                if let Some(list) = column_aliases {
+                    if list.len() != map.outputs.len() {
+                        return None; // SQLite errors at planning; let the
+                                     // normal path produce the error
+                    }
+                    for (out, new) in map.outputs.iter_mut().zip(list.iter()) {
+                        out.0 = new.clone();
+                    }
+                }
+                Some(SubqueryPushTarget::Simple(map))
+            }
+            SelectBody::Binary { .. } => {
+                // A row filter DISTRIBUTES over set operations
+                // (filter(A ∪ B) = filter(A) ∪ filter(B), likewise for
+                // ∩ and —), so the same term can be rewritten into EVERY
+                // arm — provided every arm maps the output through a
+                // bare column of its own single table. All-or-nothing:
+                // a partially-filtered compound changes the set-op result.
+                let mut leaves: Vec<&SimpleSelect> = Vec::new();
+                collect_simple_leaves(&select.body, &mut leaves);
+                if leaves.len() < 2 {
+                    return None;
+                }
+                let mut arm_maps = Vec::with_capacity(leaves.len());
+                for leaf in &leaves {
+                    arm_maps.push(self.simple_body_push_map(leaf)?);
+                }
+                // Equal arity across the arms (SQLite's compound rule);
+                // normalize every arm's output NAMES to the leftmost
+                // arm's (the compound's exposed names) — the per-arm
+                // TARGETS stay that arm's own.
+                let arity = arm_maps[0].outputs.len();
+                if arm_maps.iter().any(|m| m.outputs.len() != arity) {
+                    return None;
+                }
+                let left_names: Vec<String> =
+                    arm_maps[0].outputs.iter().map(|(o, _)| o.clone()).collect();
+                for m in arm_maps.iter_mut() {
+                    for (pos, out) in m.outputs.iter_mut().enumerate() {
+                        out.0 = left_names[pos].clone();
+                    }
+                }
+                // FROM (…) c(a, b) over the compound: rename positionally.
+                if let Some(list) = column_aliases {
+                    if list.len() != arity {
+                        return None;
+                    }
+                    for m in arm_maps.iter_mut() {
+                        for (out, new) in m.outputs.iter_mut().zip(list.iter()) {
+                            out.0 = new.clone();
+                        }
+                    }
+                }
+                Some(SubqueryPushTarget::Compound(arm_maps))
+            }
+        }
+    }
+
+    /// The push map for one plain SELECT body (no compound): eligible
+    /// single-table row-filter shape, output-name → bare-column mapping.
+    fn simple_body_push_map(&self, body: &SimpleSelect) -> Option<SubqueryPushMap> {
         // No DISTINCT / grouping / windows / aggregates: the pushed term
         // must be a plain row filter.
         if body.distinct
@@ -2878,21 +2940,31 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        // FROM (…) s(a, b): the declared column list renames the outputs
-        // positionally (the underlying mapping still holds).
-        if let Some(list) = column_aliases {
-            if list.len() != outputs.len() {
-                return None; // SQLite errors at planning; let the normal
-                             // path produce the error — no pushdown
-            }
-            for (out, new) in outputs.iter_mut().zip(list.iter()) {
-                out.0 = new.clone();
-            }
-        }
         Some(SubqueryPushMap {
             table_qualifier,
             outputs,
         })
+    }
+}
+
+/// The push-target structure for one subquery atom.
+enum SubqueryPushTarget {
+    /// A plain single-table SELECT body.
+    Simple(SubqueryPushMap),
+    /// A compound body (UNION [ALL] / INTERSECT / EXCEPT): one map per
+    /// Simple leaf arm, in left-to-right order, all sharing the
+    /// leftmost arm's output NAMES (each arm keeps its own targets).
+    Compound(Vec<SubqueryPushMap>),
+}
+
+/// Collect the Simple leaves of a SelectBody tree left-to-right.
+fn collect_simple_leaves<'a>(body: &'a SelectBody, out: &mut Vec<&'a SimpleSelect>) {
+    match body {
+        SelectBody::Simple(s) => out.push(s),
+        SelectBody::Binary { left, right, .. } => {
+            collect_simple_leaves(left, out);
+            collect_simple_leaves(right, out);
+        }
     }
 }
 
@@ -2905,6 +2977,56 @@ fn from_has_subquery_atom(te: &TableExpression) -> bool {
         }
         _ => false,
     }
+}
+
+/// The output names a subquery atom exposes: its own body's (a
+/// compound's come from the leftmost arm), stars expanded through the
+/// single table.
+fn subquery_atom_output_names(catalog: &Catalog, select: &SelectStatement) -> Option<Vec<String>> {
+    match &select.body {
+        SelectBody::Simple(s) => simple_select_names(catalog, s),
+        SelectBody::Binary { .. } => {
+            // Leftmost leaf defines the compound's names.
+            let mut leaf = &select.body;
+            loop {
+                match leaf {
+                    SelectBody::Simple(s) => return simple_select_names(catalog, s),
+                    SelectBody::Binary { left, .. } => leaf = left,
+                }
+            }
+        }
+    }
+}
+
+/// One plain SELECT's output names (aliases, bare column names, or the
+/// single table's columns for stars).
+fn simple_select_names(catalog: &Catalog, s: &SimpleSelect) -> Option<Vec<String>> {
+    let mut names = Vec::with_capacity(s.columns.len());
+    for c in &s.columns {
+        match c {
+            crate::sql::ast::ResultColumn::Expr { expr, alias } => {
+                if let Some(a) = alias {
+                    names.push(a.clone());
+                } else if let Expr::Column { name, .. } = expr {
+                    names.push(name.clone());
+                } else {
+                    return None;
+                }
+            }
+            crate::sql::ast::ResultColumn::Star | crate::sql::ast::ResultColumn::TableStar(_) => {
+                let te = s.from.as_ref()?;
+                if let TableExpression::Table { name, .. } = te {
+                    let t = catalog.get_table(name)?;
+                    for col in &t.columns {
+                        names.push(col.name.clone());
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(names)
 }
 
 /// Collect every atom's name-resolution inventory (immutable walk of the
@@ -2932,38 +3054,16 @@ fn collect_from_inventory(
             column_aliases,
         } => {
             // Output names: explicit FROM column list, else the body's
-            // top-level names; stars need the body's table (plain bodies
-            // only). Uncomputable → unknown_names (disables unqualified
+            // own names (a compound's come from its leftmost arm — all
+            // arms share positions). Stars expand through the single
+            // table. Uncomputable → unknown_names (disables unqualified
             // pushdown globally).
-            let mut unknown = false;
-            let names: Vec<String> = if let Some(list) = column_aliases {
-                list.clone()
-            } else {
-                match top_level_output_names(select) {
-                    Some(n) => n,
-                    None => {
-                        // Star projection over a single plain table: the
-                        // table's columns.
-                        let expanded = match select.body {
-                            SelectBody::Simple(ref s) => match s.from.as_ref() {
-                                Some(TableExpression::Table { name, .. }) => {
-                                    catalog.get_table(name).map(|t| {
-                                        t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
-                                    })
-                                }
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        match expanded {
-                            Some(n) => n,
-                            None => {
-                                unknown = true;
-                                Vec::new()
-                            }
-                        }
-                    }
-                }
+            let (names, unknown) = match column_aliases
+                .clone()
+                .or_else(|| subquery_atom_output_names(catalog, select))
+            {
+                Some(n) => (n, false),
+                None => (Vec::new(), true),
             };
             out.push(FromAtomInventory {
                 qualifier: alias.clone(),
@@ -3045,11 +3145,28 @@ fn push_into_subquery_atoms(
             if under_outer {
                 return;
             }
-            // The push map for THIS atom (borrow of the body, dropped
+            // The push target for THIS atom (borrow of the body, dropped
             // before the mutation).
-            let map = planner.subquery_push_map(select, column_aliases);
-            let Some(map) = map else { return };
+            let target = planner.subquery_push_map(select, column_aliases);
+            let Some(target) = target else { return };
             let qualifier = alias.clone();
+            // The shared validation outputs: a Simple body's own map, or
+            // (for a compound) the leftmost arm's names with a position
+            // pushable only when EVERY arm maps it to a bare column.
+            let shared_outputs: Vec<(String, Option<String>)> = match &target {
+                SubqueryPushTarget::Simple(m) => m.outputs.clone(),
+                SubqueryPushTarget::Compound(arms) => {
+                    let mut outs = Vec::with_capacity(arms[0].outputs.len());
+                    for pos in 0..arms[0].outputs.len() {
+                        let all_bare = arms.iter().all(|m| m.outputs[pos].1.is_some());
+                        outs.push((
+                            arms[0].outputs[pos].0.clone(),
+                            all_bare.then(|| arms[0].outputs[pos].1.clone().unwrap_or_default()),
+                        ));
+                    }
+                    outs
+                }
+            };
             // This atom's inventory entry — matched by qualifier, which
             // must be UNIQUE across the FROM (a duplicated qualifier
             // makes every reference ambiguous: decline the atom).
@@ -3088,31 +3205,46 @@ fn push_into_subquery_atoms(
                 if crate::executor::expr_has_subquery(conj) {
                     continue;
                 }
-                match rewrite_conjunct_into_body(
+                if !conjunct_binds_to_atom(
                     conj,
-                    &map,
+                    &shared_outputs,
                     qualifier.as_deref(),
                     atom_outputs,
                     inventory,
                 ) {
-                    Some(rewritten) => {
-                        // AND it into the body's WHERE.
-                        if let SelectBody::Simple(body) = &mut select.body {
-                            match body.where_clause.take() {
-                                Some(existing) => {
-                                    body.where_clause = Some(Expr::Binary {
-                                        op: BinaryOp::And,
-                                        left: Box::new(existing),
-                                        right: Box::new(rewritten),
-                                    });
-                                }
-                                None => body.where_clause = Some(rewritten),
-                            }
+                    continue;
+                }
+                match &target {
+                    SubqueryPushTarget::Simple(map) => {
+                        let mut rewritten = conj.clone();
+                        if rewrite_refs_to_body(&mut rewritten, map, qualifier.as_deref()).is_some()
+                        {
+                            and_into_select_body(&mut select.body, rewritten);
+                            consumed[ci] = true;
+                            *pushed_any = true;
                         }
-                        consumed[ci] = true;
-                        *pushed_any = true;
                     }
-                    None => continue,
+                    SubqueryPushTarget::Compound(arm_maps) => {
+                        // Rewrite the SAME term into every arm (each arm's
+                        // own targets), then AND each rewrite into its
+                        // matching Simple leaf. All-or-nothing.
+                        let mut per_arm: Vec<Expr> = Vec::with_capacity(arm_maps.len());
+                        let mut all_ok = true;
+                        for m in arm_maps {
+                            let mut r = conj.clone();
+                            if rewrite_refs_to_body(&mut r, m, qualifier.as_deref()).is_none() {
+                                all_ok = false;
+                                break;
+                            }
+                            per_arm.push(r);
+                        }
+                        if all_ok {
+                            let mut leaf = 0usize;
+                            and_into_leaves(&mut select.body, &per_arm, &mut leaf);
+                            consumed[ci] = true;
+                            *pushed_any = true;
+                        }
+                    }
                 }
             }
         }
@@ -3120,24 +3252,57 @@ fn push_into_subquery_atoms(
     }
 }
 
-/// Rewrite one conjunct's references into the subquery body's own table
-/// refs. Returns None when the conjunct is not fully bindable to this
-/// atom through bare outputs.
-fn rewrite_conjunct_into_body(
+/// AND `term` into a Simple select body's WHERE clause.
+fn and_into_select_body(body: &mut SelectBody, term: Expr) {
+    if let SelectBody::Simple(s) = body {
+        match s.where_clause.take() {
+            Some(existing) => {
+                s.where_clause = Some(Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(existing),
+                    right: Box::new(term),
+                });
+            }
+            None => s.where_clause = Some(term),
+        }
+    }
+}
+
+/// AND `terms[i]` into the i-th Simple leaf of a compound body,
+/// left-to-right (the leaf order the arm maps were built in).
+fn and_into_leaves(body: &mut SelectBody, terms: &[Expr], idx: &mut usize) {
+    match body {
+        SelectBody::Simple(_) => {
+            if let Some(term) = terms.get(*idx) {
+                and_into_select_body(body, term.clone());
+            }
+            *idx += 1;
+        }
+        SelectBody::Binary { left, right, .. } => {
+            and_into_leaves(left, terms, idx);
+            and_into_leaves(right, terms, idx);
+        }
+    }
+}
+
+/// The validation half of the push decision: every column reference of
+/// the conjunct binds to THIS atom — qualified via the atom's alias, or
+/// unqualified through a globally-unique exposure — and maps to a BARE
+/// output (`outputs`: name → Some(target) when pushable through).
+fn conjunct_binds_to_atom(
     conj: &Expr,
-    map: &SubqueryPushMap,
+    outputs: &[(String, Option<String>)],
     atom_qualifier: Option<&str>,
     atom_unqualified: Option<&Vec<String>>,
     inventory: &[FromAtomInventory],
-) -> Option<Expr> {
+) -> bool {
     let mut refs: Vec<(Option<&String>, &str)> = Vec::new();
     if !collect_pushable_refs(conj, &mut refs) {
-        return None; // unsupported expression shape: keep outside
+        return false; // unsupported expression shape: keep outside
     }
     if refs.is_empty() {
-        return None; // no column refs: nothing to bind (keep outside)
+        return false; // no column refs: nothing to bind (keep outside)
     }
-    // Every ref must map through THIS atom to a bare output column.
     for (q, name) in &refs {
         match q {
             Some(qs) => {
@@ -3146,21 +3311,24 @@ fn rewrite_conjunct_into_body(
                     .map(|a| a.eq_ignore_ascii_case(qs))
                     .unwrap_or(false);
                 if !this_atom {
-                    return None;
+                    return false;
                 }
-                let target = map
-                    .outputs
+                let target = outputs
                     .iter()
                     .find(|(o, _)| o.eq_ignore_ascii_case(name))
                     .and_then(|(_, t)| t.clone());
-                target?; // non-bare output: not pushable through
+                if target.is_none() {
+                    return false; // non-bare output: not pushable through
+                }
             }
             None => {
                 // Unqualified: the name must be exposed by exactly ONE
                 // atom of the whole FROM, and that atom is this one.
-                let exposed = atom_unqualified?;
+                let Some(exposed) = atom_unqualified else {
+                    return false;
+                };
                 if !exposed.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                    return None;
+                    return false;
                 }
                 let count = inventory
                     .iter()
@@ -3172,21 +3340,19 @@ fn rewrite_conjunct_into_body(
                     })
                     .sum::<usize>();
                 if count != 1 {
-                    return None;
+                    return false;
                 }
-                let target = map
-                    .outputs
+                let target = outputs
                     .iter()
                     .find(|(o, _)| o.eq_ignore_ascii_case(name))
                     .and_then(|(_, t)| t.clone());
-                target?; // non-bare output: not pushable through
+                if target.is_none() {
+                    return false;
+                }
             }
         }
     }
-    // Rewrite: clone + substitute.
-    let mut rewritten = conj.clone();
-    rewrite_refs_to_body(&mut rewritten, map, atom_qualifier)?;
-    Some(rewritten)
+    true
 }
 
 /// Collect the column references of a pushable expression shape.
