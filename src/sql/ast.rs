@@ -243,6 +243,8 @@ pub struct InsertStatement {
     pub source: InsertSource,
     pub upsert: Option<UpsertClause>,
     pub returning: Option<Vec<ResultColumn>>,
+    /// `WITH ... INSERT` (SQLite: CTEs visible to the statement).
+    pub with: Option<WithClause>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,6 +317,27 @@ pub struct SimpleSelect {
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
     pub window: Vec<WindowDef>,
+}
+
+impl SimpleSelect {
+    /// One row of a top-level `VALUES (..)` constructor: each term
+    /// becomes a projected expression column (SQLite's single-row
+    /// SELECT model for one VALUES arm).
+    pub fn values_row(row: Vec<Expr>) -> Self {
+        let columns = row
+            .into_iter()
+            .map(|expr| ResultColumn::Expr { expr, alias: None })
+            .collect();
+        Self {
+            distinct: false,
+            columns,
+            from: None,
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            window: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -455,6 +478,7 @@ pub struct UpdateStatement {
     pub set: Vec<(String, Expr)>,
     pub from: Option<TableExpression>,
     pub where_clause: Option<Expr>,
+    pub with: Option<WithClause>,
     pub returning: Option<Vec<ResultColumn>>,
     /// `UPDATE ... ORDER BY <terms>` (SQLITE_ENABLE_UPDATE_DELETE_LIMIT).
     pub order_by: Vec<OrderTerm>,
@@ -468,6 +492,7 @@ pub struct DeleteStatement {
     pub from: String,
     pub alias: Option<String>,
     pub where_clause: Option<Expr>,
+    pub with: Option<WithClause>,
     pub returning: Option<Vec<ResultColumn>>,
     pub limit: Option<Expr>,
     pub order_by: Vec<OrderTerm>,

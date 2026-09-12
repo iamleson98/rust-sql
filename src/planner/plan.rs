@@ -277,6 +277,10 @@ pub struct AggExpr {
     pub alias: Option<String>,
     /// Original expression text for output column naming.
     pub display_name: String,
+    /// `FILTER (WHERE ...)` clause (SQLite 3.30+): only rows satisfying
+    /// the predicate contribute to this aggregate. Evaluated per-row
+    /// against the aggregate's INPUT row (pre-grouping).
+    pub filter: Option<Expr>,
 }
 
 /// A window function expression.
@@ -293,6 +297,9 @@ pub struct WindowExpr {
     pub frame: Option<crate::sql::ast::WindowFrame>,
     pub alias: Option<String>,
     pub display_name: String,
+    /// `FILTER (WHERE ...)` on window aggregates (SQLite: only rows
+    /// passing the predicate contribute to the frame aggregation).
+    pub filter: Option<Expr>,
     /// Canonical structural key of the whole function expression (used by
     /// the projection rewrite to replace the window call with a reference
     /// to the window column `__win_N` that `exec_window` appends).

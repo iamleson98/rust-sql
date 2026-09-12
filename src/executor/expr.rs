@@ -1478,16 +1478,42 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         // TRUE() / FALSE() — SQLite 3.23+ boolean literals.
         "true" => Value::Integer(1),
         "false" => Value::Integer(0),
-        // JSON1 — see json.rs. Unknown names return NULL (legacy behavior:
-        // unknown functions evaluate to NULL rather than erroring).
-        // USER FUNCTIONS take priority over JSON1 so extensions can shadow
-        // built-in JSON names (SQLite: user functions override core ones
-        // registered in the same "override" slot).
+        // like(PATTERN, X [, ESCAPE]) — the LIKE operator as a function
+        // (argument order matches SQLite: pattern first, then the string).
+        // NULL in any operand yields NULL (three-valued logic, like the
+        // operator form above).
+        "like" => match (args.first(), args.get(1), args.get(2)) {
+            (Some(p), Some(v), esc) if !p.is_null() && !v.is_null() => {
+                let esc_val = match esc {
+                    Some(e) if !e.is_null() => Some(e.clone()),
+                    Some(_) => return Ok(Value::Null),
+                    None => None,
+                };
+                Value::Integer(i64::from(like_match(v, p, esc_val.as_ref(), false)))
+            }
+            _ => Value::Null,
+        },
+        // likelihood(X, P) / likely(X) / unlikely(X) — query-planner
+        // hints, identity on X (SQLite: likelihood returns its first
+        // argument; NULL stays NULL).
+        "likelihood" => match args.first() {
+            Some(v) => v.clone(),
+            None => Value::Null,
+        },
+        // JSON1 — see json.rs. USER FUNCTIONS take priority over JSON1
+        // so extensions can shadow built-in JSON names (SQLite: user
+        // functions override core ones registered in the same "override"
+        // slot). Unknown names error like SQLite ("no such function").
         _ => {
             if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
                 return r;
             }
-            crate::executor::json::call_json_function(&fname, args)?.unwrap_or(Value::Null)
+            match crate::executor::json::call_json_function(&fname, args)? {
+                Some(v) => v,
+                None => {
+                    return Err(Error::semantic(format!("no such function: {}", name)));
+                }
+            }
         }
     })
 }

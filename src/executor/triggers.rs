@@ -132,6 +132,16 @@ pub(crate) fn fire_triggers(
 /// Evaluate an expression with NEW/OLD row references bound: the evaluation
 /// row is `[new_row..., old_row...]` with column names `["new.c"...,
 /// "old.c"...]`, so `NEW.c` resolves by qualified lookup.
+pub(crate) fn eval_with_new_old_pub(
+    expr: &Expr,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    col_names: &[String],
+    ctx: &ExecContext<'_>,
+) -> crate::error::Result<Value> {
+    eval_with_new_old(expr, new_row, old_row, col_names, ctx)
+}
+
 fn eval_with_new_old(
     expr: &Expr,
     new_row: Option<&Row>,
@@ -175,6 +185,15 @@ pub(crate) fn has_triggers_for(
 
 /// Replace every `NEW.col` / `OLD.col` reference in a statement with the
 /// literal value from the bound row. Unknown columns error (typo safety).
+pub(crate) fn substitute_new_old_pub(
+    stmt: &mut Statement,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    col_names: &[String],
+) -> crate::error::Result<()> {
+    substitute_new_old(stmt, new_row, old_row, col_names)
+}
+
 fn substitute_new_old(
     stmt: &mut Statement,
     new_row: Option<&Row>,
