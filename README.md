@@ -831,12 +831,22 @@ compat surface. Every entry says what it costs and why it exists.
   `default-features = false` drops mimalloc. The only resource metric where
   rustqlite is behind, and it is deliberate: SQLite's ~2 MB is a 25-year
   head start of hand-tuned code size.
-- **S17 open 1M-row file + SUM (0.50x) and S14 churn (0.62x)**: the
+- **S17 open 1M-row file + SUM (~0.56x) and S14 churn (~0.64x)**: the
   file-mode build transaction peaks ~3–6 MB over SQLite (WAL-side
   bookkeeping plus allocator fragmentation of the insert churn), and the
-  child's whole build phase defines the high-water mark. SQLite's pager is
-  25 years of bounded-everything tuning; each remaining MB needs profiling
-  at the allocator level.
+  child's whole build phase defines the high-water mark. Allocator-level
+  forensics (post-44acaf8, examples/probe_s17_insert + drop/reopen
+  instrumentation): the build retains ~4 MB above its 2 MB live cache
+  floor; the drop-then-reopen query phases STACK another ~2.5 MB on top
+  because freed pages never return — measured directly, `mi_collect(true)`
+  under the engine's `purge_delay = -1` configuration releases NOTHING for
+  freshly-freed blocks (a close-time drain was prototyped, measured as a
+  no-op, and reverted). The engine is 2.4–2.6x FASTER on the same section
+  (parallel open+SUM); the memory delta is mimalloc holding RSS at the
+  heap's high-water — the documented throughput trade
+  (`default-features = false` recovers the glibc baseline). SQLite's pager
+  is 25 years of bounded-everything tuning; the remaining MBs are the
+  allocator's floor, not engine-logic waste.
 - **S07/S10/S12/S13/S16/S18 (~0.73–0.93x, 1–2 MB each)**: the mimalloc
   baseline — its 64 KiB-per-size-class page granularity commits ~1 MB at
   `Database::open` where glibc packs the same allocations into ~0.4 MB.

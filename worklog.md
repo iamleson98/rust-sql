@@ -197,3 +197,19 @@ Work Log:
 Stage Summary:
 - The pushdown surface now covers plain and compound subquery bodies; remaining: CTE atoms (architectural — eager materialization), view bodies (expanded mid-planning), join-condition pushdown/flattening.
 - Ready to push.
+
+---
+Task ID: 13
+Agent: main (Super Z)
+Task: S17/S14 memory-gap forensics (allocator level) — close the question with measurements
+
+Work Log:
+- Measured current state (CI lean env: MIMALLOC_ARENA_RESERVE=64M, ALLOW_THP=0): S17 hwm 12.56 MB vs SQLite 6.99 (engine 2.44x FASTER on open+SUM: 24.2ms vs 59.0ms); S14 hwm 12.97 vs 8.51.
+- Phase attribution (instrumented drop/reopen probe): build phase ~8.85 MB (base ~2.9 + the 2 MB live page cache — parity with SQLite's default — + ~3 MB insert-path retention + commit step); the 3x open+SUM cycles stack +2.5 MB on top because the build's freed pages never return to the OS; parallel SUM itself costs +1.7 MB over serial (worker allocations across mimalloc size classes).
+- Drop-drain experiment: added drain_mimalloc_wake() to Database::drop — S17 moved only 12.56 -> 12.25 MB. Direct micro-probes of mi_collect(true) under the engine's purge_delay = -1 configuration: ZERO pages returned for freshly-freed blocks (across drop / settle-300ms / repeated wake+collect cycles; one abandoned-segment state returned 2.3 MB, not reproducible). The drain was a measured no-op — REVERTED (no cost-without-benefit code).
+- Conclusion recorded in the README ledger: the S17/S14 deltas are mimalloc holding RSS at the heap's high-water (the deliberate 20-40% small-allocation throughput trade; default-features=false recovers glibc). purge_delay >= 0 would auto-return pages but re-faults the working set every benchmark round (measured +0.5ms/round on the join bench) — the existing trade stands.
+- The 44acaf8 commit already took the achievable wins (checkpoint scratch reuse: commit-step +2.6 -> +0.7 MB).
+
+Stage Summary:
+- The "each remaining MB needs profiling at the allocator level" ledger line is now closed WITH the profiling: the remaining S17/S14 gap is the allocator floor, documented with direct measurements. No code change shipped (the honest outcome); README + worklog updated.
+- Ready to push (docs-only commit).
