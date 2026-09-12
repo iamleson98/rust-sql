@@ -7244,19 +7244,30 @@ fn collect_plain_table_sides(
 /// through their own machinery). Deduped by structural (Display)
 /// equality.
 fn collect_bare_refs(e: &Expr, group_by: &[Expr], out: &mut Vec<Expr>) {
+    // WHOLE-SUBTREE group-term cutoff (mirrors the rewrite, which re-runs
+    // its group match at every recursion level): a sub-expression that
+    // display-matches a GROUP BY term is replaced BY the group output
+    // column — its inner columns are never referenced, so they are not
+    // live bare refs. Without this, `SELECT val / 100 AS bucket,
+    // COUNT(*) ... GROUP BY val/100` collected a dead `bare(val)` slot
+    // whose mere presence declined every fast path (0.71x on the CI
+    // GROUP BY bench).
+    {
+        let d = format!("{:?}", e);
+        for g in group_by {
+            let gd = format!("{:?}", g);
+            let inner = match g {
+                Expr::Collate { expr, .. } => format!("{:?}", expr),
+                _ => gd.clone(),
+            };
+            if gd == d || inner == d {
+                return;
+            }
+        }
+    }
     match e {
         Expr::Column { .. } => {
             let d = format!("{:?}", e);
-            for g in group_by {
-                let gd = format!("{:?}", g);
-                let inner = match g {
-                    Expr::Collate { expr, .. } => format!("{:?}", expr),
-                    _ => gd.clone(),
-                };
-                if gd == d || inner == d {
-                    return;
-                }
-            }
             if !out.iter().any(|x| format!("{:?}", x) == d) {
                 out.push(e.clone());
             }
