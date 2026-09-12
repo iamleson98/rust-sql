@@ -17687,6 +17687,27 @@ fn exec_update(
         if plan.skip.contains(&pos) {
             continue; // OR IGNORE: row keeps its old values
         }
+        // BEFORE UPDATE triggers (NEW = post-change, OLD = pre-change).
+        // Fired per applied row before the write (SQLite order).
+        if crate::executor::triggers::has_triggers_for(
+            ctx,
+            &table,
+            &crate::sql::ast::TriggerEvent::Update(vec![]),
+        ) {
+            let changed_cols: Vec<String> = assignments
+                .iter()
+                .map(|(idx, _)| table.columns[*idx].name.clone())
+                .collect();
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                &table,
+                &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                crate::sql::ast::TriggerWhen::Before,
+                Some(&new_row),
+                Some(&row),
+                &table.col_names,
+            )?;
+        }
         // Preupdate: one UPDATE event per applied row (the alias-move
         // below is an internal delete+insert — SQLite reports the whole
         // rowid-changing UPDATE as ONE event).
@@ -17727,6 +17748,27 @@ fn exec_update(
                             new_parent_rowid,
                             0,
                         )?;
+                        // AFTER UPDATE triggers for the moved row too
+                        // (the `continue` below skips the shared site).
+                        if crate::executor::triggers::has_triggers_for(
+                            ctx,
+                            &table,
+                            &crate::sql::ast::TriggerEvent::Update(vec![]),
+                        ) {
+                            let changed_cols: Vec<String> = assignments
+                                .iter()
+                                .map(|(idx, _)| table.columns[*idx].name.clone())
+                                .collect();
+                            crate::executor::triggers::fire_triggers(
+                                ctx,
+                                &table,
+                                &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                                crate::sql::ast::TriggerWhen::After,
+                                Some(&new_row),
+                                Some(&row),
+                                &table.col_names,
+                            )?;
+                        }
                         ctx.changes += 1;
                         updated += 1;
                         if let Some(ret) = returning {
@@ -17799,6 +17841,28 @@ fn exec_update(
                 .map(|v| v.as_integer())
                 .unwrap_or(rowid);
             enforce_parent_update_fks(ctx, &table, &row, &new_row, rowid, new_parent_rowid, 0)?;
+        }
+        // AFTER UPDATE triggers (NEW = post-change, OLD = pre-change).
+        // UPDATE OF (cols) matching uses the assigned columns (SQLite:
+        // fires only when a listed column is SET).
+        if crate::executor::triggers::has_triggers_for(
+            ctx,
+            &table,
+            &crate::sql::ast::TriggerEvent::Update(vec![]),
+        ) {
+            let changed_cols: Vec<String> = assignments
+                .iter()
+                .map(|(idx, _)| table.columns[*idx].name.clone())
+                .collect();
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                &table,
+                &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                crate::sql::ast::TriggerWhen::After,
+                Some(&new_row),
+                Some(&row),
+                &table.col_names,
+            )?;
         }
         ctx.changes += 1;
         updated += 1;
@@ -17953,6 +18017,27 @@ fn exec_update_from(
     for (pos, (rowid, row, new_row)) in write_set.into_iter().enumerate() {
         if plan.skip.contains(&pos) {
             continue; // OR IGNORE: row keeps its old values
+        }
+        // BEFORE UPDATE triggers (NEW = post-change, OLD = pre-change).
+        // Fired per applied row before the write (SQLite order).
+        if crate::executor::triggers::has_triggers_for(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Update(vec![]),
+        ) {
+            let changed_cols: Vec<String> = assignments
+                .iter()
+                .map(|(idx, _)| table.columns[*idx].name.clone())
+                .collect();
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                crate::sql::ast::TriggerWhen::Before,
+                Some(&new_row),
+                Some(&row),
+                &table.col_names,
+            )?;
         }
         // Preupdate: one UPDATE event per applied row (the alias-move
         // below is an internal delete+insert — SQLite reports the whole
@@ -19409,6 +19494,31 @@ fn try_streaming_update(
         let (rowid, new_payload_range, old_payload_stash) = &updates[i];
         let new_payload: &[u8] = &update_arena[new_payload_range.clone()];
         let old_payload_opt: Option<&[u8]> = old_payload_stash.as_deref();
+        // BEFORE UPDATE triggers on the streaming path (NEW/OLD decoded
+        // from the payloads; the bulk pass above is skipped whenever
+        // triggers exist, so every row here is per-row applied).
+        if has_update_triggers {
+            if let (Some(op), Ok(new_r)) = (
+                old_payload_opt,
+                decode_row(new_payload, n_cols, *rowid, table.rowid_alias),
+            ) {
+                if let Ok(old_r) = decode_row(op, n_cols, *rowid, table.rowid_alias) {
+                    let changed_cols: Vec<String> = assignments
+                        .iter()
+                        .map(|(idx, _)| table.columns[*idx].name.clone())
+                        .collect();
+                    crate::executor::triggers::fire_triggers(
+                        ctx,
+                        table,
+                        &crate::sql::ast::TriggerEvent::Update(changed_cols.clone()),
+                        crate::sql::ast::TriggerWhen::Before,
+                        Some(&new_r),
+                        Some(&old_r),
+                        &table.col_names,
+                    )?;
+                }
+            }
+        }
         let new_root;
         {
             let mut bt = Btree::new(ctx.pager, root, false);
@@ -20426,6 +20536,25 @@ fn try_streaming_delete(
         if let Some(p) = pre_payload.as_ref() {
             crate::preupdate::fire_delete_payload(table, rid, p);
         }
+        // BEFORE DELETE triggers (OLD = pre-change row). Fired
+        // before FK enforcement and the write (SQLite order). The fetch
+        // runs only when triggers exist (need_row covers it).
+        if has_delete_triggers {
+            let mut bt = Btree::new(ctx.pager, new_root, false);
+            if let LookupResult::Found(payload) = bt.lookup_table(rid)? {
+                if let Ok(old_row) = decode_row(&payload, n_cols, rid, table.rowid_alias) {
+                    crate::executor::triggers::fire_triggers(
+                        ctx,
+                        table,
+                        &crate::sql::ast::TriggerEvent::Delete,
+                        crate::sql::ast::TriggerWhen::Before,
+                        None,
+                        Some(&old_row),
+                        &table.col_names,
+                    )?;
+                }
+            }
+        }
         // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
         // row goes away. The old row is fetched first (needed for the key
         // comparison and for CASCADE/SET NULL rewrites of child rows).
@@ -20562,6 +20691,30 @@ fn exec_delete(
             if let Some(p) = pre_payload.as_ref() {
                 crate::preupdate::fire_delete_payload(&table, rowid_val, p);
             }
+            // BEFORE DELETE triggers (OLD = pre-change row). Fired
+            // before FK enforcement and the write (SQLite order).
+            if crate::executor::triggers::has_triggers_for(
+                ctx,
+                &table,
+                &crate::sql::ast::TriggerEvent::Delete,
+            ) {
+                let mut bt = Btree::new(ctx.pager, root, false);
+                if let LookupResult::Found(payload) = bt.lookup_table(rowid_val)? {
+                    if let Ok(old_row) =
+                        decode_row(&payload, table.n_columns(), rowid_val, table.rowid_alias)
+                    {
+                        crate::executor::triggers::fire_triggers(
+                            ctx,
+                            &table,
+                            &crate::sql::ast::TriggerEvent::Delete,
+                            crate::sql::ast::TriggerWhen::Before,
+                            None,
+                            Some(&old_row),
+                            &table.col_names,
+                        )?;
+                    }
+                }
+            }
             // FOREIGN KEY (parent side): check BEFORE deleting — the row's
             // key values are needed for the child-reference scan and for
             // CASCADE / SET NULL rewrites.
@@ -20672,6 +20825,23 @@ fn exec_delete(
                 &ctx.params,
                 &ctx.named_params,
             )?);
+        }
+        // BEFORE DELETE triggers (OLD = pre-change row). Fired
+        // before FK enforcement and the write (SQLite order).
+        if crate::executor::triggers::has_triggers_for(
+            ctx,
+            &table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        ) {
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                &table,
+                &crate::sql::ast::TriggerEvent::Delete,
+                crate::sql::ast::TriggerWhen::Before,
+                None,
+                Some(row),
+                &table.col_names,
+            )?;
         }
         // FOREIGN KEY (parent side): reject / cascade / set-null before the
         // row goes away (only when the pragma is on and some table

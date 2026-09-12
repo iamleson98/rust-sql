@@ -484,3 +484,78 @@ fn upsert_partial_where_differential() {
         lite_rows(&con, "SELECT a, b FROM u")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Triggers: UPDATE OF column filtering, WHEN guards, BEFORE phases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trigger_update_of_and_when_differential() {
+    let mut db = mem();
+    let con = lite();
+    for s in [
+        "CREATE TABLE t(a, b)",
+        "INSERT INTO t VALUES (1, 1)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tu AFTER UPDATE OF a ON t BEGIN INSERT INTO log VALUES ('upd'); END",
+    ] {
+        db.execute(s, []).unwrap();
+        con.execute(s, []).unwrap();
+    }
+    // UPDATE of an unlisted column: no fire on either engine.
+    db.execute("UPDATE t SET b = 2", []).unwrap();
+    con.execute("UPDATE t SET b = 2", []).unwrap();
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT * FROM log")),
+        lite_rows(&con, "SELECT * FROM log")
+    );
+    // UPDATE of the listed column: fires on both.
+    db.execute("UPDATE t SET a = 2", []).unwrap();
+    con.execute("UPDATE t SET a = 2", []).unwrap();
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT * FROM log")),
+        lite_rows(&con, "SELECT * FROM log")
+    );
+    // WHEN guard: only NEW.a > 100 fires.
+    let s = "CREATE TRIGGER tw AFTER INSERT ON t WHEN NEW.a > 100 BEGIN INSERT INTO log VALUES ('big'); END";
+    db.execute(s, []).unwrap();
+    con.execute(s, []).unwrap();
+    db.execute("INSERT INTO t(a) VALUES (5)", []).unwrap();
+    con.execute("INSERT INTO t(a) VALUES (5)", []).unwrap();
+    db.execute("INSERT INTO t(a) VALUES (200)", []).unwrap();
+    con.execute("INSERT INTO t(a) VALUES (200)", []).unwrap();
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT * FROM log")),
+        lite_rows(&con, "SELECT * FROM log")
+    );
+}
+
+#[test]
+fn trigger_before_phases_differential() {
+    let mut db = mem();
+    let con = lite();
+    for s in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a)",
+        "INSERT INTO t VALUES (1,1),(2,2),(3,3)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('bu'); END",
+        "CREATE TRIGGER bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES ('bd'); END",
+    ] {
+        db.execute(s, []).unwrap();
+        con.execute(s, []).unwrap();
+    }
+    db.execute("UPDATE t SET a = 9 WHERE id = 1", []).unwrap();
+    con.execute("UPDATE t SET a = 9 WHERE id = 1", []).unwrap();
+    db.execute("DELETE FROM t WHERE id > 1", []).unwrap();
+    con.execute("DELETE FROM t WHERE id > 1", []).unwrap();
+    db.execute("DELETE FROM t WHERE id = 1", []).unwrap();
+    con.execute("DELETE FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT * FROM log")),
+        lite_rows(&con, "SELECT * FROM log")
+    );
+    assert_eq!(
+        engine_strs(&engine_rows(&db, "SELECT * FROM t ORDER BY id")),
+        lite_rows(&con, "SELECT * FROM t ORDER BY id")
+    );
+}
