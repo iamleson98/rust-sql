@@ -746,14 +746,56 @@ impl<'a> Planner<'a> {
                     predicate: None,
                 })
             }
-            TableExpression::Subquery { select, alias, .. } => {
+            TableExpression::Subquery {
+                select,
+                alias,
+                column_aliases,
+            } => {
                 let inner = self.plan_select(select)?;
-                if let Some(a) = alias {
-                    let _ = a;
-                }
-                Ok(Plan::Subquery {
-                    plan: Box::new(inner),
-                })
+                // FROM-subquery column list (`FROM (…) s(a, b)`, an engine
+                // superset — SQLite itself does not parse this syntax):
+                // rename the body's output columns positionally, exactly
+                // the way view column lists do. Without the rename the
+                // outer references to the declared names would resolve to
+                // nothing (NULL columns).
+                let plan = match column_aliases {
+                    Some(list) => {
+                        let prefix = alias.clone().unwrap_or_else(|| String::from("subquery"));
+                        let inner_names = top_level_output_names(select).ok_or_else(|| {
+                            Error::semantic(
+                                "subquery column aliases require an explicit projection list",
+                            )
+                        })?;
+                        if list.len() != inner_names.len() {
+                            return Err(Error::semantic(format!(
+                                "subquery declares {} columns but its SELECT produces {}",
+                                list.len(),
+                                inner_names.len()
+                            )));
+                        }
+                        let cols: Vec<crate::planner::plan::ProjectExpr> = list
+                            .iter()
+                            .zip(inner_names.iter())
+                            .map(|(new, old)| crate::planner::plan::ProjectExpr {
+                                expr: Expr::Column {
+                                    table: None,
+                                    name: old.clone(),
+                                },
+                                alias: Some(format!("{prefix}.{new}")),
+                            })
+                            .collect();
+                        Plan::Project {
+                            input: Box::new(Plan::Subquery {
+                                plan: Box::new(inner),
+                            }),
+                            columns: cols,
+                        }
+                    }
+                    None => Plan::Subquery {
+                        plan: Box::new(inner),
+                    },
+                };
+                Ok(plan)
             }
             TableExpression::Function { name, args, alias } => Ok(Plan::TableFunction {
                 name: name.clone(),

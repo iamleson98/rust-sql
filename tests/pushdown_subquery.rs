@@ -184,6 +184,49 @@ fn push_alongside_a_join() {
     );
 }
 
+#[test]
+fn push_with_from_column_aliases() {
+    // `s(a, b)` FROM-subquery column aliases are an engine superset
+    // (SQLite itself does not parse this syntax) — engine-only pins.
+    let mut eng = Database::open_in_memory().unwrap();
+    for s in SETUP.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+        eng.execute(s, []).unwrap();
+    }
+    for s in INSERTS {
+        eng.execute(s, []).unwrap();
+    }
+    let rows = eng
+        .query(
+            "SELECT a, b FROM (SELECT k, v FROM t) s(a, b) WHERE a > 7 ORDER BY a",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        render(&rows),
+        vec![
+            vec!["I:8", "I:80"],
+            vec!["I:9", "I:90"],
+            vec!["I:10", "I:100"]
+        ]
+    );
+    let rows = eng
+        .query(
+            "SELECT s.b FROM (SELECT k, v FROM t) AS s(a, b) WHERE s.a > 9",
+            [],
+        )
+        .unwrap();
+    assert_eq!(render(&rows), vec![vec!["I:100"]]);
+    let plan = explain(
+        SETUP,
+        INSERTS,
+        "SELECT a, b FROM (SELECT k, v FROM t) s(a, b) WHERE a > 7",
+    );
+    assert!(
+        plan.iter().any(|p| p.contains("SEARCH t USING INDEX")),
+        "expected the renamed output to push through, got {plan:?}"
+    );
+}
+
 // ------------------------------------------------------------------------
 // Decline shapes: correctness only (the conjunct stays outside)
 // ------------------------------------------------------------------------
