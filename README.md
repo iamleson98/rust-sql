@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **809+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **936+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -727,9 +727,39 @@ compat surface. Every entry says what it costs and why it exists.
 >   DML shapes, view DML through `INSTEAD OF` triggers (insert/update/delete
 >   + column lists), unknown-function errors, window `EXCLUDE TIES/GROUP`,
 >   and the partial-index maintenance rewrite.
+>
+> **Post-merge hardening (performance + routing):** the merged view-DML
+> routing ran a raw-SQL catalog probe and a re-resolved view-target check
+> on EVERY `execute()` — two HashMap lookups plus a String allocation per
+> statement — which regressed the S12 torture section (100k parameterized
+> INSERTs over 5 secondary indexes) by ~19% on macOS CI, the merge commit's
+> only gate failure. Fixed by routing view DML through the statement
+> cache: `CachedStmt.view_target` resolves the DML target ONCE at
+> cache-fill time (DDL invalidates the cache, so the answer can never go
+> stale — drop-table-then-create-view re-routes, probed), the pre-parse
+> probe is deleted, and the byte-scanner fast INSERT path now falls
+> through to the general path for non-table targets instead of erroring
+> (INSERTs into views route to their `INSTEAD OF` triggers; unknown names
+> get the planner's error). Two collateral fixes: cache-disabled mode
+> (`set_stmt_cache_capacity(0)`) now runs view DML at all (it previously
+> died in the planner — the fill-time early-return only guarded the cached
+> path), and the insert path's partial-index membership checks are gated
+> behind `partial_expr.is_some()` so non-partial indexes pay one branch,
+> not a call (`examples/probe_view_routing.rs` pins all seven routing
+> shapes: positional/named/parameterized view inserts, view
+> update/delete, no-trigger rejection, cache-disabled DML, and DDL
+> re-routing).
 
 ### Performance gaps
 
+- **S12 multi-index INSERT load (the PR #2 regression — FIXED)**: the
+  view-DML routing overhead described above cost ~120–250 ns per
+  parameterized INSERT statement; on the macOS CI runner that was ~19%
+  of the whole 100k-row, 5-index load (61.3 ms vs SQLite's 51.4 ms,
+  0.84x — the merge commit's single gate failure; the same section was
+  1.01x parity before the merge). The routing is now one field read per
+  statement; S12's lookups were already 8–9x wins. Tracked by the CI
+  torture matrix as the regression guard.
 - **One narrow serial row**: the unfiltered 2-table PK join sits at parity in
   the cold best-of-5 table (1.43x under proper warmup — see
   [Performance](#performance-vs-sqlite)); at 1M-row scale the parallel probe
@@ -1055,6 +1085,17 @@ compat surface. Every entry says what it costs and why it exists.
   `PRAGMA journal_mode = delete` / `= WAL` switch a foreign file's mode
   both ways with real SQLite verifying the result
   (`tests/sqlite_interop.rs`).
+- **Error-message text parity (open, small)**: the engine errors on the
+  right CONDITIONS everywhere the differential suites probe, but a few
+  message TEXTS still differ from SQLite's canonical wording — e.g. an
+  INSERT naming a missing table reports `not found: table: nosuch`
+  where SQLite says `no such table: nosuch` (the byte-scanner fast
+  path now falls through to the general path, so at least both routes
+  produce the SAME engine text — before the PR #2 hardening they
+  diverged). No test or driver asserts these strings today; closing
+  them is a sweep over ~15 `Error::NotFound("table: …")` sites plus
+  the `Display` prefix, deferred until something actually compares
+  `sqlite3_errmsg` strings byte-for-byte.
 
 ## Usage
 

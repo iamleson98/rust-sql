@@ -16761,8 +16761,11 @@ fn exec_insert_one_row(
             continue;
         }
         // Partial index: rows failing the WHERE predicate are not
-        // indexed at all (SQLite) — exempt from uniqueness.
-        if !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params) {
+        // indexed at all (SQLite) — exempt from uniqueness. The
+        // `is_none` gate keeps the hot (non-partial) path branch-only.
+        if st.idx.partial_expr.is_some()
+            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)
+        {
             continue;
         }
         // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
@@ -17058,13 +17061,15 @@ fn exec_insert_one_row(
                 decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)
             {
                 for st in index_states.iter_mut() {
-                    if !index_row_matches_partial(
-                        &st.idx,
-                        table,
-                        &old_row,
-                        &ctx.params,
-                        &ctx.named_params,
-                    ) {
+                    if st.idx.partial_expr.is_some()
+                        && !index_row_matches_partial(
+                            &st.idx,
+                            table,
+                            &old_row,
+                            &ctx.params,
+                            &ctx.named_params,
+                        )
+                    {
                         continue;
                     }
                     let old_key = encode_index_key(&st.idx, table, &old_row);
@@ -17082,7 +17087,9 @@ fn exec_insert_one_row(
     // search on ascending bulk loads (validated per use; falls back to
     // the full insert path automatically).
     for st in index_states.iter_mut() {
-        if !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params) {
+        if st.idx.partial_expr.is_some()
+            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)
+        {
             continue;
         }
         // Copy the root/hint out first: `encode_key` holds a mutable

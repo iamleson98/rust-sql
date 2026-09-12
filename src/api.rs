@@ -816,6 +816,15 @@ pub(crate) struct CachedStmt {
     pub(crate) has_subqueries: bool,
     /// Pre-compiled point-lookup fast path (see `FastPath`).
     pub(crate) fast_path: Option<Arc<FastPath>>,
+    /// DML-on-VIEW target (INSERT/UPDATE/DELETE naming a VIEW), resolved
+    /// ONCE at cache-fill time. `Some(view)` routes the executor to the
+    /// view's INSTEAD OF trigger bodies; `None` is the common case (table
+    /// DML / non-DML). Carrying the answer in the entry (vs re-resolving
+    /// per execute — a catalog lookup plus a lowercasing allocation on
+    /// EVERY hot-path DML statement) keeps `execute`'s per-statement
+    /// overhead at one field read. DDL invalidates the statement cache,
+    /// so a cached target can never go stale across schema changes.
+    pub(crate) view_target: Option<String>,
 }
 
 impl FastPath {
@@ -2038,68 +2047,6 @@ fn stmt_ref_pre(stmt: &Statement) -> StmtPre {
         },
         _ => StmtPre::Other,
     }
-}
-
-/// DML target that names a VIEW rather than a table (INSERT INTO v,
-/// UPDATE v, DELETE FROM v). Returns the view name when the target is
-/// a view (whether or not INSTEAD OF triggers exist — the caller
-/// errors when none do, matching SQLite's "cannot modify <view>").
-fn probe_insert_view_target(sql: &str, catalog: &Catalog) -> Option<String> {
-    // Cheap byte-level probe for `INSERT [OR ...] INTO <name>`: skip the
-    // full parse when the target is clearly a table. Quoted names and
-    // schema qualifiers fall through to the parsed path (None here).
-    let b = sql.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' || b[i] == b'\n') {
-        i += 1;
-    }
-    // Match INSERT (case-insensitive).
-    if b.len() < i + 6 || !b[i..i + 6].eq_ignore_ascii_case(b"insert") {
-        return None;
-    }
-    i += 6;
-    // Optional OR <resolution>.
-    let save = i;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    if b.len() >= i + 2 && b[i..i + 2].eq_ignore_ascii_case(b"or") {
-        // Skip to INTO.
-        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
-            i += 1;
-        }
-        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-            i += 1;
-        }
-        // Skip the resolution word.
-        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
-            i += 1;
-        }
-    } else {
-        i = save;
-    }
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
-        i += 1;
-    }
-    if b.len() < i + 4 || !b[i..i + 4].eq_ignore_ascii_case(b"into") {
-        return None;
-    }
-    i += 4;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    let start = i;
-    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-        i += 1;
-    }
-    if start == i || (i < b.len() && b[i] == b'.') {
-        return None; // quoted / qualified: parsed path handles it
-    }
-    let name = std::str::from_utf8(&b[start..i]).ok()?;
-    if catalog.get_table(name).is_some() {
-        return None;
-    }
-    catalog.get_view(name).map(|v| v.name.clone())
 }
 
 fn dml_view_target(stmt: &Statement, catalog: &Catalog) -> Option<String> {
@@ -4153,10 +4100,12 @@ impl Database {
     fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
         let table = match self.catalog.get_table_fast(fi.table) {
             Some(t) => t,
-            None => {
-                // Unknown table — same error the planner produces.
-                return Err(Error::NotFound(format!("table: {}", fi.table)));
-            }
+            // Not a table — a VIEW (DML on views routes to INSTEAD OF
+            // triggers via the cached-statement `view_target` check) or
+            // an unknown name (the general path's planner produces the
+            // canonical "no such table" error). Fall through: this path
+            // is table-only by construction.
+            None => return Ok(false),
         };
         // Table-shape bails: fall through to the general path.
         // Virtual tables route through xUpdate — the byte scanner's
@@ -4358,6 +4307,20 @@ impl Database {
             let t0 = profile::now();
             let stmt = parse(sql)?;
             profile::span(t0, &profile::PARSE_NS);
+            // View-DML targets are never planned (the planner resolves
+            // tables only): resolve once and carry the target in the
+            // entry — same contract as the cached path below. Without
+            // this, cache-disabled DML on a view would die in the planner.
+            let view_target = dml_view_target(&stmt, &self.catalog);
+            if view_target.is_some() {
+                return Ok(Arc::new(CachedStmt {
+                    stmt: Arc::new(stmt),
+                    plan: None,
+                    has_subqueries: false,
+                    fast_path: None,
+                    view_target,
+                }));
+            }
             let t1 = profile::now();
             let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
             profile::span(t1, &profile::PLAN_NS);
@@ -4375,6 +4338,7 @@ impl Database {
                 plan: plan_arc,
                 has_subqueries: has_subq,
                 fast_path,
+                view_target: None,
             }));
         }
         // Fast path 1: last-statement memo — consecutive calls with the
@@ -4416,19 +4380,24 @@ impl Database {
                 plan: None,
                 has_subqueries: false,
                 fast_path: None,
+                // WITH-DML never routes to view triggers (the execute()
+                // WITH-DML intercept precedes the view check), matching
+                // the pre-existing ordering.
+                view_target: None,
             }));
         }
         // View-DML targets (INSERT/UPDATE/DELETE on a VIEW) are NEVER
         // cached and never planned here: planning resolves tables only
         // and would fail with "not found: table". The execute() path
-        // intercepts these via dml_view_target and runs the INSTEAD OF
-        // trigger bodies per affected view row.
-        if dml_view_target(&stmt, &self.catalog).is_some() {
+        // intercepts these via the entry's `view_target` and runs the
+        // INSTEAD OF trigger bodies per affected view row.
+        if let Some(view_target) = dml_view_target(&stmt, &self.catalog) {
             return Ok(Arc::new(CachedStmt {
                 stmt: Arc::new(stmt),
                 plan: None,
                 has_subqueries: false,
                 fast_path: None,
+                view_target: Some(view_target),
             }));
         }
         let t1 = profile::now();
@@ -4448,6 +4417,8 @@ impl Database {
             plan: plan_arc,
             has_subqueries: has_subq,
             fast_path,
+            // Resolved above: DML reaching the planner targets a TABLE.
+            view_target: None,
         });
         let t2 = profile::now();
         // "Cache on second sight": only populate the cache for SQL text we
@@ -4754,30 +4725,13 @@ impl Database {
         // and can never observe a torn epoch.
         self.write_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        // ---- VIEW-DML INTERCEPT (before the fast INSERT path) ----
-        // INSERT INTO a view never takes the table fast paths: it runs
-        // the view's INSTEAD OF triggers per row. A cheap catalog probe
-        // on INSERT-shaped text avoids a full parse for the common table
-        // case (views are rare; the probe is a name lookup).
-        if let Some(first) = sql
-            .as_bytes()
-            .iter()
-            .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-        {
-            if *first == b'I' || *first == b'i' {
-                if let Some(target) = probe_insert_view_target(sql, &self.catalog) {
-                    // Break any hot chain (a view write is still a write
-                    // for allocator accounting) and route via the cached
-                    // statement (which skips planning for view targets).
-                    self.break_insert_chain();
-                    let cached = self.get_or_cache_stmt(sql)?;
-                    let stmt_clone = cached.stmt.clone();
-                    let params_vec: Vec<Value> = params.into_iter().collect();
-                    drop(cached);
-                    return self.exec_view_dml(&target, &stmt_clone, params_vec);
-                }
-            }
-        }
+        // (View-DML intercept: the cached-statement `view_target` field
+        // carries the resolution — INSERT into a view is caught after
+        // `get_or_cache_stmt`, BEFORE any write path can act on it. The
+        // byte-scanner fast path below returns Ok(false) for non-table
+        // targets, so views never reach a table write. A pre-parse raw
+        // probe here cost a catalog lookup + String allocation on every
+        // hot INSERT and regressed S12 by ~20%.)
         // ---- FAST INSERT PATH ----
         // Single-row literal VALUES inserts are the hottest statement shape
         // in OLTP. Two tiers:
@@ -4982,7 +4936,7 @@ impl Database {
         // statement errors (SQLite: "cannot modify <view> because it is
         // a view"). Checked here — before planning, which only resolves
         // tables — so INSERT/UPDATE/DELETE on views route correctly.
-        if let Some(view_name) = dml_view_target(cached.stmt.as_ref(), &self.catalog) {
+        if let Some(view_name) = cached.view_target.clone() {
             let stmt_clone = cached.stmt.clone();
             let params_vec: Vec<Value> = params.into_iter().collect();
             drop(cached);
