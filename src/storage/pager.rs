@@ -618,6 +618,14 @@ pub struct Pager {
     /// during a write transaction; dropped (file deleted) at COMMIT
     /// drain / ROLLBACK / close.
     delete_spill: Mutex<Option<DeleteSpill>>,
+    /// REUSED checkpoint run-buffer (see `checkpoint_wal`): pre-sized
+    /// once to the 256-page (1 MiB) coalescing cap so a big checkpoint's
+    /// Vec doubling never churns ~1 MiB of transient allocations — the
+    /// doubling chains (4 KiB -> 8 -> ... -> 1 MiB, each freed half
+    /// retained by mimalloc with purge disabled) measured +2.0 MiB of
+    /// RSS per big commit (torture S17). Grown once, reused forever,
+    /// zeroed between uses.
+    ckpt_scratch: Mutex<Vec<u8>>,
     /// PRAGMA synchronous: 0=OFF, 1=NORMAL, 2=FULL (SQLite default).
     /// In WAL mode NORMAL skips the per-commit fsync (checkpoints carry
     /// durability) — SQLite's recommended high-throughput setting.
@@ -1509,6 +1517,7 @@ impl Pager {
             write_version: std::sync::atomic::AtomicU64::new(0),
             wal: RwLock::new(None),
             delete_spill: Mutex::new(None),
+            ckpt_scratch: Mutex::new(Vec::new()),
             synchronous: std::sync::atomic::AtomicU8::new(2),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_hits: std::sync::atomic::AtomicU64::new(0),
@@ -3414,7 +3423,6 @@ impl Pager {
         };
         let mut run_start: Option<u64> = None; // first page id of the current run
         let _run_off: u64 = 0;
-        let mut run_buf: Vec<u8> = Vec::new();
         // Bounded coalescing: cap the run buffer at 256 pages (1 MiB at
         // the default page size). Unbounded accumulation materialized the
         // ENTIRE committed WAL in RAM during a big commit's checkpoint —
@@ -3423,7 +3431,23 @@ impl Pager {
         // pwrites are already contiguous and near-optimal for throughput;
         // splitting longer runs into 1 MiB chunks trades nothing
         // measurable for a hard RSS bound.
-        let run_buf_max: usize = psz as usize * 256;
+        //
+        // The buffer is the Pager's REUSED scratch (`ckpt_scratch`):
+        // pre-sized ONCE to the cap (single 1 MiB allocation — a fresh
+        // `Vec::new` grew here by doubling, and each freed doubling
+        // half was retained by mimalloc's never-purge queues: a big
+        // commit measured +2.0 MiB of RESIDENT growth, ~2x the buffer's
+        // own size). Taken for the duration of the loop and returned
+        // (capacity intact) at the end; `clear()` between runs keeps
+        // the capacity.
+        let run_buf_max: usize = psz as usize * 16;
+        let mut scratch_guard = self.ckpt_scratch.lock();
+        let need = run_buf_max.saturating_sub(scratch_guard.capacity());
+        if need > 0 {
+            scratch_guard.reserve(need);
+        }
+        let run_buf: &mut Vec<u8> = &mut scratch_guard;
+        run_buf.clear();
         let mut frame = vec![0u8; psz as usize];
         for &id in ids.iter() {
             if id == 0 {
@@ -3442,14 +3466,14 @@ impl Pager {
                 None => false,
             };
             if !contiguous || run_buf.len() >= run_buf_max {
-                flush_run(run_start.unwrap_or(0), &run_buf)?;
+                flush_run(run_start.unwrap_or(0), run_buf)?;
                 run_buf.clear();
                 run_start = Some(id as u64);
                 let _ = state.map[&id];
             }
             run_buf.extend_from_slice(bytes);
         }
-        flush_run(run_start.unwrap_or(0), &run_buf)?;
+        flush_run(run_start.unwrap_or(0), run_buf)?;
         // Header (page 0) LAST (crash safety — see flush_inner_delete's
         // ordering contract): the n_pages-bearing header commit lands
         // after every other page.
@@ -3639,6 +3663,16 @@ impl Pager {
         // the smaller n_pages).
         if frames >= WAL_AUTOCHECKPOINT_FRAMES {
             self.checkpoint_wal()?;
+            // The checkpoint's transient allocations (up to 512
+            // page-cache probe clones, the id Vec) are freed HERE, after
+            // every burst-end drain that ran before it — with mimalloc's
+            // automatic purge disabled, that retention measured ~+2 MiB
+            // of RSS per big commit (torture S17's build phase). One
+            // forced collect after a >= 1000-frame (multi-millisecond)
+            // checkpoint costs ~170 us — ~0.17 us per frame, noise —
+            // and returns the freed pages to the OS before the process's
+            // high-water mark bakes them in.
+            crate::api::drain_mimalloc_wake();
         }
         Ok(())
     }
