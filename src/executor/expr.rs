@@ -1500,16 +1500,20 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(v) => v.clone(),
             None => Value::Null,
         },
-        // JSON1 — see json.rs. Unknown names return NULL (legacy behavior:
-        // unknown functions evaluate to NULL rather than erroring).
-        // USER FUNCTIONS take priority over JSON1 so extensions can shadow
-        // built-in JSON names (SQLite: user functions override core ones
-        // registered in the same "override" slot).
+        // JSON1 — see json.rs. USER FUNCTIONS take priority over JSON1
+        // so extensions can shadow built-in JSON names (SQLite: user
+        // functions override core ones registered in the same "override"
+        // slot). Unknown names error like SQLite ("no such function").
         _ => {
             if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
                 return r;
             }
-            crate::executor::json::call_json_function(&fname, args)?.unwrap_or(Value::Null)
+            match crate::executor::json::call_json_function(&fname, args)? {
+                Some(v) => v,
+                None => {
+                    return Err(Error::semantic(format!("no such function: {}", name)));
+                }
+            }
         }
     })
 }

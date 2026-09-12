@@ -15,7 +15,8 @@ use crate::error::{Error, Result};
 use crate::executor::{execute, ExecContext};
 use crate::planner::plan::Plan;
 use crate::planner::Planner;
-use crate::schema::{build_table, Catalog, Index, Table};
+use crate::schema::{build_table, Catalog, Index, Table, View};
+use crate::executor::StmtMaps;
 use crate::sql::ast::*;
 use crate::sql::parse;
 use crate::storage::btree::Btree;
@@ -2037,6 +2038,87 @@ fn stmt_ref_pre(stmt: &Statement) -> StmtPre {
         },
         _ => StmtPre::Other,
     }
+}
+
+/// DML target that names a VIEW rather than a table (INSERT INTO v,
+/// UPDATE v, DELETE FROM v). Returns the view name when the target is
+/// a view (whether or not INSTEAD OF triggers exist — the caller
+/// errors when none do, matching SQLite's "cannot modify <view>").
+fn probe_insert_view_target(sql: &str, catalog: &Catalog) -> Option<String> {
+    // Cheap byte-level probe for `INSERT [OR ...] INTO <name>`: skip the
+    // full parse when the target is clearly a table. Quoted names and
+    // schema qualifiers fall through to the parsed path (None here).
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' || b[i] == b'\n') {
+        i += 1;
+    }
+    // Match INSERT (case-insensitive).
+    if b.len() < i + 6 || !b[i..i + 6].eq_ignore_ascii_case(b"insert") {
+        return None;
+    }
+    i += 6;
+    // Optional OR <resolution>.
+    let save = i;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if b.len() >= i + 2 && b[i..i + 2].eq_ignore_ascii_case(b"or") {
+        // Skip to INTO.
+        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
+            i += 1;
+        }
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        // Skip the resolution word.
+        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
+            i += 1;
+        }
+    } else {
+        i = save;
+    }
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
+        i += 1;
+    }
+    if b.len() < i + 4 || !b[i..i + 4].eq_ignore_ascii_case(b"into") {
+        return None;
+    }
+    i += 4;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if start == i || (i < b.len() && b[i] == b'.') {
+        return None; // quoted / qualified: parsed path handles it
+    }
+    let name = std::str::from_utf8(&b[start..i]).ok()?;
+    if catalog.get_table(name).is_some() {
+        return None;
+    }
+    catalog.get_view(name).map(|v| v.name.clone())
+}
+
+fn dml_view_target(stmt: &Statement, catalog: &Catalog) -> Option<String> {    let name = match stmt {
+        Statement::Insert(i) => &i.table,
+        Statement::Update(u) => &u.table,
+        Statement::Delete(d) => &d.from,
+        _ => return None,
+    };
+    if catalog.get_table(name).is_some() {
+        return None;
+    }
+    catalog
+        .get_view(name)
+        .map(|v| v.name.clone())
+        .or_else(|| {
+            // Unknown name: let the normal path produce its error, unless
+            // a view of that name exists under different case.
+            None
+        })
 }
 
 /// Scope guard: drain allocator wakes when a query completes on ANY
@@ -4340,6 +4422,19 @@ impl Database {
                 fast_path: None,
             }));
         }
+        // View-DML targets (INSERT/UPDATE/DELETE on a VIEW) are NEVER
+        // cached and never planned here: planning resolves tables only
+        // and would fail with "not found: table". The execute() path
+        // intercepts these via dml_view_target and runs the INSTEAD OF
+        // trigger bodies per affected view row.
+        if dml_view_target(&stmt, &self.catalog).is_some() {
+            return Ok(Arc::new(CachedStmt {
+                stmt: Arc::new(stmt),
+                plan: None,
+                has_subqueries: false,
+                fast_path: None,
+            }));
+        }
         let t1 = profile::now();
         let plan_opt = Self::plan_for_statement(&self.catalog, &stmt)?;
         profile::span(t1, &profile::PLAN_NS);
@@ -4663,6 +4758,30 @@ impl Database {
         // and can never observe a torn epoch.
         self.write_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // ---- VIEW-DML INTERCEPT (before the fast INSERT path) ----
+        // INSERT INTO a view never takes the table fast paths: it runs
+        // the view's INSTEAD OF triggers per row. A cheap catalog probe
+        // on INSERT-shaped text avoids a full parse for the common table
+        // case (views are rare; the probe is a name lookup).
+        if let Some(first) = sql
+            .as_bytes()
+            .iter()
+            .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            if *first == b'I' || *first == b'i' {
+                if let Some(target) = probe_insert_view_target(sql, &self.catalog) {
+                    // Break any hot chain (a view write is still a write
+                    // for allocator accounting) and route via the cached
+                    // statement (which skips planning for view targets).
+                    self.break_insert_chain();
+                    let cached = self.get_or_cache_stmt(sql)?;
+                    let stmt_clone = cached.stmt.clone();
+                    let params_vec: Vec<Value> = params.into_iter().collect();
+                    drop(cached);
+                    return self.exec_view_dml(&target, &stmt_clone, params_vec);
+                }
+            }
+        }
         // ---- FAST INSERT PATH ----
         // Single-row literal VALUES inserts are the hottest statement shape
         // in OLTP. Two tiers:
@@ -4860,6 +4979,18 @@ impl Database {
                 return Ok(());
             }
             StmtPre::Other => {}
+        }
+        // INSTEAD OF triggers on views: DML targeting a VIEW runs the
+        // view's INSTEAD OF trigger bodies per affected view row INSTEAD
+        // of any table write (SQLite). Without an INSTEAD OF trigger the
+        // statement errors (SQLite: "cannot modify <view> because it is
+        // a view"). Checked here — before planning, which only resolves
+        // tables — so INSERT/UPDATE/DELETE on views route correctly.
+        if let Some(view_name) = dml_view_target(cached.stmt.as_ref(), &self.catalog) {
+            let stmt_clone = cached.stmt.clone();
+            let params_vec: Vec<Value> = params.into_iter().collect();
+            drop(cached);
+            return self.exec_view_dml(&view_name, &stmt_clone, params_vec);
         }
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
@@ -6098,6 +6229,384 @@ impl Database {
         res
     }
 
+    /// Reader ctx for view-DML evaluation (shares the read-maps snapshot
+    /// + bound params; the caller installs plugin/corr guards).
+    fn view_reader_ctx(&self, params: &[Value]) -> (ExecContext<'_>, Arc<StmtMaps>) {
+        let catalog_ptr: *const Catalog = &self.catalog;
+        let shared = self.read_maps();
+        let maps = shared.clone();
+        let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+        for v in params.iter().cloned() {
+            ctx.bind_positional(v);
+        }
+        (ctx, maps)
+    }
+
+    /// Evaluate an INSERT-into-view's source rows and map them onto the
+    /// view's columns positionally (SQLite: INSERT INTO v VALUES (...)
+    /// maps positionally; a column list renames positions).
+    fn eval_view_insert_rows(
+        &self,
+        view: &Arc<View>,
+        ins: &InsertStatement,
+        view_cols: &[String],
+        params: Vec<Value>,
+    ) -> Result<Vec<Row>> {
+        let (mut ctx, _maps) = self.view_reader_ctx(&params);
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        // Evaluate the source to rows.
+        let source_rows: Vec<Row> = match &ins.source {
+            InsertSource::Values(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for exprs in rows {
+                    let mut row = Vec::with_capacity(exprs.len());
+                    for e in exprs {
+                        row.push(crate::executor::eval_row_public(
+                            e,
+                            &[],
+                            &[],
+                            &ctx.params,
+                            &ctx.named_params,
+                        )?);
+                    }
+                    out.push(row);
+                }
+                out
+            }
+            InsertSource::Select(s) => {
+                let mut planner = Planner::new(&self.catalog);
+                let plan = planner.plan_select(s)?;
+                let mut plan = plan;
+                if crate::executor::plan_has_subqueries(&plan) {
+                    plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+                }
+                crate::executor::execute(&plan, &mut ctx)?.rows
+            }
+            InsertSource::DefaultValues => vec![vec![Value::Null; view_cols.len()]],
+        };
+        // Map onto view columns: explicit column list selects positions,
+        // else positional across all view columns.
+        let n = view_cols.len();
+        let mut out = Vec::with_capacity(source_rows.len());
+        for src in source_rows {
+            let mut row = vec![Value::Null; n];
+            if let Some(cols) = &ins.columns {
+                if cols.len() != src.len() {
+                    return Err(Error::semantic(format!(
+                        "table {} has {} columns but {} values were supplied",
+                        view.name,
+                        cols.len(),
+                        src.len()
+                    )));
+                }
+                for (v, name) in <Vec<Value> as IntoIterator>::into_iter(src).zip(cols.iter()) {
+                    let pos = view_cols
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| {
+                            Error::semantic(format!(
+                                "column {} not in view {}",
+                                name, view.name
+                            ))
+                        })?;
+                    row[pos] = v;
+                }
+            } else {
+                if src.len() != n {
+                    return Err(Error::semantic(format!(
+                        "table {} has {} columns but {} values were supplied",
+                        view.name, n,
+                        src.len()
+                    )));
+                }
+                row = src;
+            }
+            let _ = view;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// Evaluate an UPDATE-on-view's affected rows: run the view SELECT
+    /// with the UPDATE's WHERE applied, returning (new_view_row,
+    /// old_view_row) pairs. SET expressions evaluate against the OLD
+    /// view row (SQLite: NEW is the updated view row).
+    fn eval_view_update_rows(
+        &self,
+        view_name: &str,
+        view: &Arc<View>,
+        upd: &UpdateStatement,
+        view_cols: &[String],
+        params: Vec<Value>,
+    ) -> Result<Vec<(Option<Row>, Option<Row>)>> {
+        let (mut ctx, _maps) = self.view_reader_ctx(&params);
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        // View rows: execute the view SELECT.
+        let mut planner = Planner::new(&self.catalog);
+        let plan = planner.plan_select(&view.select)?;
+        let mut plan = plan;
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+        }
+        let res = crate::executor::execute(&plan, &mut ctx)?;
+        // Column names of the view result (suffix form for matching).
+        let result_cols: Vec<String> = res.columns.iter().map(|c| {
+            c.rsplit('.').next().unwrap_or(c).to_string()
+        }).collect();
+        // Resolve SET targets to view-column positions.
+        let mut set_idx: Vec<(usize, crate::sql::ast::Expr)> = Vec::new();
+        for (col, expr) in &upd.set {
+            // Allow table-qualified SET targets (UPDATE v SET v.a = ...).
+            let bare = col.rsplit('.').next().unwrap_or(col);
+            let pos = view_cols
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(bare))
+                .ok_or_else(|| {
+                    Error::semantic(format!("column {} not in view {}", col, view_name))
+                })?;
+            set_idx.push((pos, expr.clone()));
+        }
+        let mut out = Vec::new();
+        for (ri, row) in res.rows.iter().enumerate() {
+            // Map the result row onto view-column positions.
+            let mut old_view = vec![Value::Null; view_cols.len()];
+            for (i, v) in row.iter().enumerate() {
+                let name = result_cols.get(i).map(|s| s.as_str()).unwrap_or("");
+                if let Some(pos) = view_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                    old_view[pos] = v.clone();
+                } else if i < old_view.len() {
+                    old_view[i] = v.clone();
+                }
+            }
+            // WHERE against the view row (view-column names + params).
+            if let Some(w) = &upd.where_clause {
+                let v = crate::executor::eval_row_public(
+                    w, &old_view, view_cols, &ctx.params, &ctx.named_params,
+                )?;
+                if !v.is_truthy() {
+                    continue;
+                }
+            }
+            // NEW view row: apply SETs.
+            let mut new_view = old_view.clone();
+            for (pos, expr) in &set_idx {
+                let v = crate::executor::eval_row_public(
+                    expr, &old_view, view_cols, &ctx.params, &ctx.named_params,
+                )?;
+                new_view[*pos] = v;
+            }
+            let _ = ri;
+            out.push((Some(new_view), Some(old_view)));
+        }
+        Ok(out)
+    }
+
+    /// Evaluate a DELETE-on-view's affected rows: view rows matching the
+    /// WHERE clause (OLD rows for the trigger bodies).
+    fn eval_view_delete_rows(
+        &self,
+        _view_name: &str,
+        view: &Arc<View>,
+        del: &DeleteStatement,
+        view_cols: &[String],
+        params: Vec<Value>,
+    ) -> Result<Vec<Row>> {
+        let (mut ctx, _maps) = self.view_reader_ctx(&params);
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        let mut planner = Planner::new(&self.catalog);
+        let plan = planner.plan_select(&view.select)?;
+        let mut plan = plan;
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+        }
+        let res = crate::executor::execute(&plan, &mut ctx)?;
+        let result_cols: Vec<String> = res.columns.iter().map(|c| {
+            c.rsplit('.').next().unwrap_or(c).to_string()
+        }).collect();
+        let mut out = Vec::new();
+        for row in res.rows {
+            let mut old_view = vec![Value::Null; view_cols.len()];
+            for (i, v) in row.iter().enumerate() {
+                let name = result_cols.get(i).map(|s| s.as_str()).unwrap_or("");
+                if let Some(pos) = view_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                    old_view[pos] = v.clone();
+                } else if i < old_view.len() {
+                    old_view[i] = v.clone();
+                }
+            }
+            if let Some(w) = &del.where_clause {
+                let v = crate::executor::eval_row_public(
+                    w, &old_view, view_cols, &ctx.params, &ctx.named_params,
+                )?;
+                if !v.is_truthy() {
+                    continue;
+                }
+            }
+            out.push(old_view);
+        }
+        Ok(out)
+    }
+
+    /// Fire INSTEAD OF triggers per affected view row (NEW/OLD bound to
+    /// the VIEW row + view column names). Runs in a full write ctx so
+    /// trigger bodies write through the normal machinery.
+    fn fire_view_triggers(
+        &mut self,
+        view_name: &str,
+        view_cols: &[String],
+        triggers: &[Arc<crate::schema::Trigger>],
+        _phase: crate::sql::ast::TriggerWhen,
+        rows: Vec<(Option<Row>, Option<Row>)>,
+        params: Vec<Value>,
+    ) -> Result<()> {
+        let _thread_db = crate::plugin::abi::ThreadDbGuard::install(
+            self as *const Database as *mut Database,
+        );
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot.get_mut().take();
+        let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        let catalog_ptr: *const Catalog = &self.catalog;
+        let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = deferred_flush;
+        ctx.txn_snapshot = txn_snap;
+        ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+        ctx.shared_detached = true;
+        for v in <Vec<Value> as IntoIterator>::into_iter(params) {
+            ctx.bind_positional(v);
+        }
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        // Fire per row through the shared trigger runner with a
+        // view-scoped pseudo-table (name = view, columns = view cols).
+        let pseudo = crate::schema::Table {
+            name: view_name.to_string(),
+            columns: Vec::new(),
+            root_page: 0,
+            without_rowid: false,
+            strict: false,
+            rowid_alias: None,
+            create_sql: String::new(),
+            check_exprs: Vec::new(),
+            foreign_keys: Vec::new(),
+            col_names: view_cols.iter().cloned().collect::<Vec<_>>().into(),
+            qualified_col_names: view_cols.iter().cloned().collect::<Vec<_>>().into(),
+            vtab: None,
+        };
+        for (new_row, old_row) in &rows {
+            // WHEN guard + body per trigger (INSTEAD OF semantics =
+            // the trigger body IS the write).
+            for trig in triggers {
+                // WHEN guard.
+                if let Some(w) = &trig.when_clause {
+                    let v = crate::executor::triggers::eval_with_new_old_pub(
+                        w,
+                        new_row.as_ref(),
+                        old_row.as_ref(),
+                        view_cols,
+                        &ctx,
+                    )?;
+                    if !v.is_truthy() {
+                        continue;
+                    }
+                }
+                if ctx.trigger_stack.iter().any(|n| n.eq_ignore_ascii_case(&trig.name))
+                    && !ctx.pager.recursive_triggers_enabled()
+                {
+                    continue;
+                }
+                ctx.trigger_depth += 1;
+                ctx.trigger_stack.push(trig.name.clone());
+                let _pre = crate::preupdate::enter_nested_change();
+                let r = (|| -> Result<()> {
+                    for stmt in &trig.body {
+                        let mut s = stmt.clone();
+                        crate::executor::triggers::substitute_new_old_pub(
+                            &mut s,
+                            new_row.as_ref(),
+                            old_row.as_ref(),
+                            view_cols,
+                        )?;
+                        // Plan against the live catalog (bodies touch
+                        // real tables, never the view itself).
+                        let plan = match &s {
+                            Statement::Insert(_) => {
+                                Self::plan_insert(&self.catalog, &s)?
+                            }
+                            Statement::Update(_) => {
+                                Self::plan_update(&self.catalog, &s)?
+                            }
+                            Statement::Delete(_) => {
+                                Self::plan_delete(&self.catalog, &s)?
+                            }
+                            Statement::Select(sel) => {
+                                let mut planner = Planner::new(&self.catalog);
+                                planner.plan_select(sel)?
+                            }
+                            _ => {
+                                return Err(Error::semantic(format!(
+                                    "unsupported statement in trigger {} body",
+                                    trig.name
+                                )));
+                            }
+                        };
+                        let mut plan = plan;
+                        if crate::executor::plan_has_subqueries(&plan) {
+                            plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+                        }
+                        crate::executor::execute(&plan, &mut ctx)?;
+                    }
+                    Ok(())
+                })();
+                ctx.trigger_depth -= 1;
+                ctx.trigger_stack.pop();
+                r?;
+            }
+            let _ = &pseudo;
+        }
+        self.in_transaction
+            .store(ctx.in_transaction, Ordering::Release);
+        self.set_last_insert_rowid(ctx.last_insert_rowid);
+        *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        crate::executor::change_counters::record(ctx.changes);
+        self.pager.note_rows_modified(ctx.changes);
+        if ctx.roots_changed {
+            Arc::make_mut(&mut ctx.shared)
+                .roots
+                .extend(ctx.root_overrides.drain());
+        }
+        if ctx.max_rowids_changed {
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.max_rowids.extend(ctx.max_rowids.drain());
+            for k in ctx.max_rowids_invalidated.drain(..) {
+                shared.max_rowids.remove(&k);
+            }
+        }
+        if ctx.index_roots_changed {
+            Arc::make_mut(&mut ctx.shared)
+                .index_roots
+                .extend(ctx.index_roots.drain());
+        }
+        *self.maps.get_mut() = ctx.shared;
+        self.refresh_maps_flag();
+        if ctx.roots_changed {
+            self.sync_schema_roots_inner()?;
+        }
+        if let Some(foreign) = self.foreign.as_ref() {
+            foreign
+                .dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+            if !self.in_transaction.load(Ordering::Acquire) {
+                self.dump_foreign()?;
+            }
+        }
+        self.maybe_drain_after_burst();
+        Ok(())
+    }
+
     /// Execute a WITH-clause DML statement (INSERT / UPDATE / DELETE):
     /// materialize the CTEs, plan the DML with them in scope, substitute
     /// uncorrelated subqueries, execute. Mirrors exec_select_with_ctes
@@ -6153,6 +6662,126 @@ impl Database {
         let res = crate::executor::execute(&plan, ctx);
         ctx.ctes = None;
         res.map(|_| ())
+    }
+
+    /// Execute DML targeting a VIEW via INSTEAD OF triggers (SQLite).
+    /// Each affected view row fires the view's INSTEAD OF triggers with
+    /// NEW/OLD bound to the view row; the trigger bodies perform the
+    /// real writes. Without an INSTEAD OF trigger for the event the
+    /// statement errors ("cannot modify <view> because it is a view").
+    fn exec_view_dml(
+        &mut self,
+        view_name: &str,
+        stmt: &Statement,
+        params: Vec<Value>,
+    ) -> Result<()> {
+        let view = self
+            .catalog
+            .get_view(view_name)
+            .ok_or_else(|| Error::NotFound(format!("table: {}", view_name)))?;
+        // View output column names (execution-time: star expansion needs
+        // the live catalog).
+        let view_cols: Vec<String> = {
+            let mut planner = Planner::new(&self.catalog);
+            let plan = planner.plan_select(&view.select)?;
+            let catalog_ptr: *const Catalog = &self.catalog;
+            let shared = self.read_maps();
+            let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+            for v in params.clone() {
+                ctx.bind_positional(v);
+            }
+            let _plugin_guard = self.plugin_scope();
+            let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            // Plan-only column probe: execute with LIMIT 0 via the plan.
+            let res = crate::executor::execute(&plan, &mut ctx)?;
+            res.columns.iter().map(|c| {
+                c.rsplit('.').next().unwrap_or(c).to_string()
+            }).collect()
+        };
+        // INSTEAD OF triggers on this view for the statement's event.
+        let (event_kind, phase) = match stmt {
+            Statement::Insert(_) => ("insert", crate::sql::ast::TriggerWhen::InsteadOf),
+            Statement::Update(_) => ("update", crate::sql::ast::TriggerWhen::InsteadOf),
+            Statement::Delete(_) => ("delete", crate::sql::ast::TriggerWhen::InsteadOf),
+            _ => return Err(Error::semantic("cannot modify view")),
+        };
+        let _ = event_kind;
+        let triggers: Vec<Arc<crate::schema::Trigger>> = self
+            .catalog
+            .triggers_on_table(view_name)
+            .into_iter()
+            .filter(|t| {
+                t.when == crate::sql::ast::TriggerWhen::InsteadOf
+                    && match stmt {
+                        Statement::Insert(_) => t.events.iter().any(|e| {
+                            matches!(e, crate::sql::ast::TriggerEvent::Insert)
+                        }),
+                        Statement::Update(u) => t.events.iter().any(|e| match e {
+                            crate::sql::ast::TriggerEvent::Update(list) => {
+                                list.is_empty()
+                                    || list.iter().any(|c| {
+                                        u.set.iter().any(|(col, _)| col.eq_ignore_ascii_case(c))
+                                    })
+                            }
+                            _ => false,
+                        }),
+                        Statement::Delete(_) => t.events.iter().any(|e| {
+                            matches!(e, crate::sql::ast::TriggerEvent::Delete)
+                        }),
+                        _ => false,
+                    }
+            })
+            .collect();
+        if triggers.is_empty() {
+            return Err(Error::semantic(format!(
+                "cannot modify {} because it is a view",
+                view_name
+            )));
+        }
+        // Build the affected view rows per statement kind, then fire the
+        // triggers per row with NEW/OLD bound to the VIEW row.
+        match stmt {
+            Statement::Insert(ins) => {
+                // Evaluate the source rows (VALUES / SELECT) in a reader
+                // ctx, map them positionally onto the view columns, and
+                // fire per row.
+                let rows =
+                    self.eval_view_insert_rows(&view, ins, &view_cols, params.clone())?;
+                self.fire_view_triggers(
+                    view_name,
+                    &view_cols,
+                    &triggers,
+                    phase,
+                    rows.iter()
+                        .map(|r| (Some(r.clone()), None))
+                        .collect(),
+                    params,
+                )
+            }
+            Statement::Update(upd) => {
+                let rows = self.eval_view_update_rows(view_name, &view, upd, &view_cols, params.clone())?;
+                self.fire_view_triggers(
+                    view_name,
+                    &view_cols,
+                    &triggers,
+                    phase,
+                    rows,
+                    params,
+                )
+            }
+            Statement::Delete(del) => {
+                let rows = self.eval_view_delete_rows(view_name, &view, del, &view_cols, params.clone())?;
+                self.fire_view_triggers(
+                    view_name,
+                    &view_cols,
+                    &triggers,
+                    phase,
+                    rows.into_iter().map(|r| (None, Some(r))).collect(),
+                    params,
+                )
+            }
+            _ => Err(Error::semantic("cannot modify view")),
+        }
     }
 
     /// Materialize every CTE of a WITH clause into (rows, qualified column
