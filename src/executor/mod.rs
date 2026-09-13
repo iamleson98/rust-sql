@@ -850,6 +850,18 @@ pub struct ExecContext<'a> {
     /// next INSERT on another statement reads a stale max and skips
     /// rowids (SQLite reuses rowids after the max row is deleted).
     pub max_rowids_invalidated: Vec<String>,
+    /// Table-name keys whose cached ROOT was retired by DDL in this
+    /// statement (DROP TABLE, table rename). The shared-roots merge is
+    /// `extend`, so removals must be recorded and replayed like
+    /// `max_rowids_invalidated` — without this, DROP TABLE + CREATE
+    /// TABLE of the same name left the shared map pointing at the OLD
+    /// root (which the freelist had just handed to the recreated
+    /// table's implicit PK index): every later scan read an index page
+    /// and failed with "unexpected page type in scan: LeafIndex".
+    pub roots_invalidated: Vec<String>,
+    /// Index-name keys whose cached root was retired by DDL (DROP INDEX,
+    /// DROP TABLE's implicit-index cleanup).
+    pub index_roots_invalidated: Vec<String>,
     /// Set when `index_roots` gained local entries this statement.
     pub index_roots_changed: bool,
     /// True when `shared` was DETACHED from the Database's maps slot by
@@ -916,6 +928,8 @@ impl<'a> ExecContext<'a> {
             roots_changed: false,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
+            roots_invalidated: Vec::new(),
+            index_roots_invalidated: Vec::new(),
             index_roots_changed: false,
             shared_detached: false,
             table_append_hint: None,
@@ -956,6 +970,8 @@ impl<'a> ExecContext<'a> {
             roots_changed: false,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
+            roots_invalidated: Vec::new(),
+            index_roots_invalidated: Vec::new(),
             index_roots_changed: false,
             shared_detached: false,
             table_append_hint: None,
@@ -1110,6 +1126,26 @@ impl<'a> ExecContext<'a> {
         self.max_rowids.remove(table_name_lc);
         self.max_rowids_invalidated.push(table_name_lc.to_string());
         self.max_rowids_changed = true;
+    }
+
+    /// Retire the cached ROOT for a table from both the local overlay and
+    /// (via the merge-time replay list) the SHARED map. Called by DDL:
+    /// DROP TABLE and table renames. See `roots_invalidated` for the
+    /// corruption this prevents.
+    pub fn invalidate_table_root(&mut self, table_name: &str) {
+        let lc = table_name.to_ascii_lowercase();
+        self.root_overrides.remove(&lc);
+        self.roots_invalidated.push(lc);
+        self.roots_changed = true;
+    }
+
+    /// Retire the cached root for an INDEX (DROP INDEX, or the implicit
+    /// indexes of a dropped table).
+    pub fn invalidate_index_root(&mut self, index_name: &str) {
+        let lc = index_name.to_ascii_lowercase();
+        self.index_roots.remove(&lc);
+        self.index_roots_invalidated.push(lc);
+        self.index_roots_changed = true;
     }
 
     /// DELETE-path helper: invalidate the cached max-rowid when the

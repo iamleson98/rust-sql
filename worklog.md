@@ -427,3 +427,21 @@ Work Log:
 
 Stage Summary:
 - The reliability task is delivered end-to-end: 31 durability tests riding the full CI matrix, one real engine bug found and fixed (TEMP-object persistence), master green at 59d76a5.
+
+---
+
+---
+Task ID: 20
+Agent: main (Super Z — backend audit, app-repo task)
+Task: Fix DROP TABLE -> CREATE TABLE same-name scan corruption (found chasing the v0.5.1 deploy crash), plus the app-side seaql_migrations schema repair that exposed it.
+
+Work Log:
+- The app's boot-time schema repair (rebuilding seaql_migrations.applied_at TEXT -> INTEGER, needed because the v0.5.1 deploy's new task died decoding applied_at as Option<i64> against a TEXT column and Swarm rolled back) hit "unexpected page type in scan: LeafIndex" on its DROP+CREATE sequence.
+- Minimal repro (tests/drop_create_cycle.rs): CREATE t (TEXT PK), INSERT, DROP t, CREATE t again, INSERT, SELECT -> corruption. Diagnostics showed the recreated table's root page IS re-initialized correctly — the scan reads the WRONG root: ctx.shared.roots["t"] still holds the OLD root (2), and the freelist hands that exact page to the recreated table's implicit PK index (LeafIndex), so every later scan descends into an index page.
+- Root cause: DROP TABLE invalidated ctx.root_overrides and max_rowids (local overlays) but NOT the SHARED StmtMaps roots/index_roots. The merge is extend-only, so stale entries are immortal — the same reason max_rowids has an invalidation list.
+- Fix (mirrors max_rowids_invalidated exactly): ExecContext gains roots_invalidated / index_roots_invalidated + invalidate_table_root / invalidate_index_root; all four api.rs merge sites and statement.rs's merge_dml_maps / CtxDeltas replay the lists as REMOVALS. Wired into execute_drop (table + every index on it), DROP INDEX, and ALTER TABLE RENAME (old name retired: a stale old-name entry would hijack a FUTURE table created under that name — pointing its scans at THIS table's pages).
+- Also NOTICED (not fixed here, noted for the engine backlog): raw `SELECT COUNT(*) AS n` through the compat layer reports a column name sqlx does not see as "n" (sea-orm's own count() paths are unaffected — all store tests pass); needs a compat-layer column_name look.
+- Verification: drop_create_cycle 2/2 (both the staged and direct shapes), alter_table 11/11, boundary 6, delete_spill 12, analyze 6, concurrency_stress 10, committed_view 2; the full app suite 345/345 on top of this engine (308 lib incl. 3 new seaql_migrations-repair tests + 32 integration + 5 migrator); fmt clean; clippy -D warnings clean (default + workspace).
+
+Stage Summary:
+- Third engine bug fixed from the one audit: shared-roots staleness across DDL — a correctness bug for ANY drop/recreate or rename-then-reuse pattern, not just the repair path.

@@ -4282,9 +4282,14 @@ impl Database {
         // dropping the root override would lose data. ROLLBACK is the only
         // path that legitimately discards them.
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.shared)
-                .roots
-                .extend(ctx.root_overrides.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.roots.extend(ctx.root_overrides.drain());
+            // DDL retirements (DROP TABLE / rename): replay as REMOVALS —
+            // extend alone leaves the stale root behind (see
+            // ExecContext::invalidate_table_root).
+            for k in ctx.roots_invalidated.drain(..) {
+                shared.roots.remove(&k);
+            }
         }
         if ctx.max_rowids_changed {
             let shared = Arc::make_mut(&mut ctx.shared);
@@ -4294,9 +4299,11 @@ impl Database {
             }
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.shared)
-                .index_roots
-                .extend(ctx.index_roots.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.index_roots.extend(ctx.index_roots.drain());
+            for k in ctx.index_roots_invalidated.drain(..) {
+                shared.index_roots.remove(&k);
+            }
         }
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
@@ -4983,9 +4990,12 @@ impl Database {
                 crate::executor::change_counters::record(ctx.changes);
                 self.pager.note_rows_modified(ctx.changes);
                 if ctx.roots_changed {
-                    Arc::make_mut(&mut ctx.shared)
-                        .roots
-                        .extend(ctx.root_overrides.drain());
+                    let shared = Arc::make_mut(&mut ctx.shared);
+                    shared.roots.extend(ctx.root_overrides.drain());
+                    // DDL retirements (DROP TABLE / rename): replay as REMOVALS.
+                    for k in ctx.roots_invalidated.drain(..) {
+                        shared.roots.remove(&k);
+                    }
                 }
                 if ctx.max_rowids_changed {
                     let shared = Arc::make_mut(&mut ctx.shared);
@@ -4995,9 +5005,11 @@ impl Database {
                     }
                 }
                 if ctx.index_roots_changed {
-                    Arc::make_mut(&mut ctx.shared)
-                        .index_roots
-                        .extend(ctx.index_roots.drain());
+                    let shared = Arc::make_mut(&mut ctx.shared);
+                    shared.index_roots.extend(ctx.index_roots.drain());
+                    for k in ctx.index_roots_invalidated.drain(..) {
+                        shared.index_roots.remove(&k);
+                    }
                 }
                 *self.maps.get_mut() = ctx.shared;
                 self.refresh_maps_flag();
@@ -5186,9 +5198,14 @@ impl Database {
         // are not undone by error propagation); ROLLBACK is the only path
         // that legitimately discards them.
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.shared)
-                .roots
-                .extend(ctx.root_overrides.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.roots.extend(ctx.root_overrides.drain());
+            // DDL retirements (DROP TABLE / rename): replay as REMOVALS —
+            // extend alone leaves the stale root behind (see
+            // ExecContext::invalidate_table_root).
+            for k in ctx.roots_invalidated.drain(..) {
+                shared.roots.remove(&k);
+            }
         }
         if ctx.max_rowids_changed {
             let shared = Arc::make_mut(&mut ctx.shared);
@@ -5198,9 +5215,11 @@ impl Database {
             }
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.shared)
-                .index_roots
-                .extend(ctx.index_roots.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.index_roots.extend(ctx.index_roots.drain());
+            for k in ctx.index_roots_invalidated.drain(..) {
+                shared.index_roots.remove(&k);
+            }
         }
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
@@ -6699,9 +6718,14 @@ impl Database {
         crate::executor::change_counters::record(ctx.changes);
         self.pager.note_rows_modified(ctx.changes);
         if ctx.roots_changed {
-            Arc::make_mut(&mut ctx.shared)
-                .roots
-                .extend(ctx.root_overrides.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.roots.extend(ctx.root_overrides.drain());
+            // DDL retirements (DROP TABLE / rename): replay as REMOVALS —
+            // extend alone leaves the stale root behind (see
+            // ExecContext::invalidate_table_root).
+            for k in ctx.roots_invalidated.drain(..) {
+                shared.roots.remove(&k);
+            }
         }
         if ctx.max_rowids_changed {
             let shared = Arc::make_mut(&mut ctx.shared);
@@ -6711,9 +6735,11 @@ impl Database {
             }
         }
         if ctx.index_roots_changed {
-            Arc::make_mut(&mut ctx.shared)
-                .index_roots
-                .extend(ctx.index_roots.drain());
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.index_roots.extend(ctx.index_roots.drain());
+            for k in ctx.index_roots_invalidated.drain(..) {
+                shared.index_roots.remove(&k);
+            }
         }
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
@@ -9001,14 +9027,22 @@ impl Database {
                 }
                 ctx.pager.free_page(table.root_page)?;
                 delete_schema_row(ctx.pager, "table", &d.name)?;
+                // Retire the cached table root AND every implicit/explicit
+                // index root from the shared bookkeeping maps (the merge
+                // is extend-only, so removals must be replayed). Without
+                // this, DROP TABLE + CREATE TABLE of the same name left
+                // shared.roots pointing at the OLD root — which the
+                // freelist just handed to the recreated table's implicit
+                // PK index, so every later scan read an index page
+                // ("unexpected page type in scan: LeafIndex").
+                ctx.invalidate_table_root(&d.name);
+                for idx in &indexes_on_it {
+                    ctx.invalidate_index_root(&idx.name);
+                }
                 // The dropped name's cached max-rowid / roots go stale: a
                 // recreated table must NOT inherit the old values (a
                 // fresh AUTOINCREMENT table starts at 1 again).
                 ctx.invalidate_max_rowid(&d.name.to_ascii_lowercase());
-                ctx.root_overrides.remove(&d.name);
-                ctx.root_overrides.remove(&d.name.to_ascii_lowercase());
-                ctx.max_rowids.remove(&d.name);
-                ctx.max_rowids.remove(&d.name.to_ascii_lowercase());
                 // DROP TABLE removes the table's row from sqlite_sequence
                 // (the sequence TABLE itself survives — SQLite's observed
                 // behavior: the high-water machinery stays armed for any
@@ -9053,6 +9087,9 @@ impl Database {
                     .ok_or_else(|| Error::NotFound(format!("no such index: {}", d.name)))?;
                 ctx.pager.free_page(idx.root_page)?;
                 delete_schema_row(ctx.pager, "index", &d.name)?;
+                // Same shared-map retirement as DROP TABLE (the freed
+                // root page will be handed out again).
+                ctx.invalidate_index_root(&d.name);
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -9115,6 +9152,12 @@ impl Database {
                     .ok_or_else(|| Error::AlreadyExists(format!("table: {}", new_name)))?;
                 // Replace the moved entry's Arc with the rebuilt table.
                 catalog.replace_table(&new_name, rebuilt);
+                // The OLD name's cached root must be retired from the
+                // shared map: the root itself is unchanged (the entry
+                // moved), but a stale old-name entry would hijack a
+                // FUTURE table created under the old name — pointing its
+                // scans at THIS table's pages.
+                ctx.invalidate_table_root(&old_name);
 
                 // Other tables' REFERENCES clauses follow the rename
                 // (SQLite modern rename mode rewrites them).

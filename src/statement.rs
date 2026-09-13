@@ -199,6 +199,12 @@ struct CtxDeltas {
     max_rowids: HashMap<String, i64>,
     max_rowids_invalidated: Vec<String>,
     max_rowids_changed: bool,
+    /// DDL-retired table roots (DROP TABLE / rename) — replayed as
+    /// REMOVALS at merge time (extend alone cannot delete keys).
+    roots_invalidated: Vec<String>,
+    /// DDL-retired index roots (DROP INDEX / dropped-table implicit
+    /// indexes) — same replay-on-merge semantics.
+    index_roots_invalidated: Vec<String>,
 }
 
 enum StreamState {
@@ -868,6 +874,8 @@ impl<'a> Statement<'a> {
             max_rowids: ctx.max_rowids.clone(),
             max_rowids_invalidated: ctx.max_rowids_invalidated.clone(),
             max_rowids_changed: ctx.max_rowids_changed || !ctx.max_rowids_invalidated.is_empty(),
+            roots_invalidated: ctx.roots_invalidated.clone(),
+            index_roots_invalidated: ctx.index_roots_invalidated.clone(),
         };
         Ok(out)
     }
@@ -886,9 +894,15 @@ impl<'a> Statement<'a> {
         let bk = Arc::make_mut(&mut *m);
         if self.deltas.roots_changed {
             bk.roots.extend(self.deltas.root_overrides.drain());
+            for k in self.deltas.roots_invalidated.drain(..) {
+                bk.roots.remove(&k);
+            }
         }
         if self.deltas.index_roots_changed {
             bk.index_roots.extend(self.deltas.index_roots.drain());
+            for k in self.deltas.index_roots_invalidated.drain(..) {
+                bk.index_roots.remove(&k);
+            }
         }
         if self.deltas.max_rowids_changed {
             bk.max_rowids.extend(self.deltas.max_rowids.drain());
