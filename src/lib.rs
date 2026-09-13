@@ -199,10 +199,20 @@ fn engine_init() {
     disable_thp_for_process();
 }
 
+/// SCRAM-SHA-256 authentication (Postgres's exact SASL mechanism,
+/// RFC 7677) for `rustqlite-server`, plus the client side used by
+/// `rustqlite-cli --connect`: verifiers, the handshake state machines,
+/// the user-store file, and bearer-session tokens.
+#[cfg(feature = "auth")]
+pub mod auth;
 pub mod error;
 /// SQLite-style C ABI (`rustqlite_open` / `rustqlite_prepare` /
 /// `rustqlite_step` / ...) plus the extension loading entry points.
 pub mod ffi;
+/// Minimal dependency-free JSON for the HTTP server's and CLI's wire
+/// protocol (request parsing, response formatting, remote-mode result
+/// decoding). Not part of the SQL engine proper.
+pub mod json;
 /// OOM fault-injection allocator (`oom-injection` feature).
 #[cfg(feature = "oom-injection")]
 pub mod oom_alloc;

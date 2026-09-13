@@ -318,3 +318,34 @@ Work Log:
 
 Stage Summary:
 - The engine's last documented open compat gap is closed and verified end-to-end. Master green at 5c87464.
+
+---
+Task ID: 18
+Agent: main (Super Z)
+Task: Two user-requested features: (1) username/password authentication for rustqlite-server (Postgres-style, fail-closed), (2) CLI tooling — export schema, export data, import data, create copy/backup db
+
+Work Log:
+- Fresh sandbox (rustup 1.98.1 installed, repo re-cloned at master 73a96ae — CI-green HEAD).
+- Feature 1 — SCRAM-SHA-256 authentication (Postgres's exact SASL mechanism, RFC 5802/7677):
+  - New `src/auth/` (feature `auth`, default ON): hand-rolled HMAC-SHA-256 + PBKDF2 (RFC 4231/7914 test vectors, verified against Python hashlib before baking them in), ScramVerifier in Postgres rolpassword format (`SCRAM-SHA-256$4096:<salt>$<stored>:<server>`, hex payloads), ServerExchange/ClientExchange state machines (single-use, mutual ServerSignature), UserStore (JSON file, atomic 0600 writes, username charset [A-Za-z0-9_.-]{1,63}), SessionStore (256-bit OS-random bearer tokens, TTL, constant-time compare), shared hidden-password prompt (RUSTQLITE_PASSWORD -> --password -> termios no-echo -> visible stdin). Deps: sha2 + rand (both already in the lock graph) + libc (unix-only, for termios).
+  - New `src/json.rs`: dependency-free JSON for the wire protocol — fixes a REAL server bug found on the way: the old hand-rolled param splitter broke any string containing a comma (`["a,b"]` parsed as two params). Blob values now ride a tagged `{"blob":"<hex>"}` object; NaN/inf serialize as null (the old emitter printed bare `NaN`, which no JSON parser accepts).
+  - Server: fail-closed (refuses to start without a user store, exit + guidance); --add-user/--del-user/--list-users/--auth-file/--auth-ttl/--no-auth/--password flags; POST /auth/start + /auth/finish + /auth/logout; Authorization: Bearer on /query + /execute; unknown users get fabricated challenges + byte-identical 401 bodies (no enumeration); both auth paths pay one PBKDF2 at /auth/start (timing-equalized); pending handshakes single-use, 60s TTL; port 0 reports the kernel-assigned address; user store re-read per handshake (external --add-user picked up without restart).
+  - CLI remote mode: `--connect URL --user NAME` — full SCRAM client, verifies the server signature (mutual auth) before running anything; SQL + all dot commands except .backup work remotely; minimal std-only HTTP/1.1 client.
+  - Cross-validated the whole protocol with an INDEPENDENT Python SCRAM client (hashlib/hmac from scratch): login, mutual auth, param/blob round-trips, comma-in-string params, logout invalidation, tampered proof + session replay rejection, wrong-password/unknown-user identical failures.
+  - tests/auth unit tests (21) + tests/server_auth.rs (8 end-to-end: fail-closed startup, empty-store refusal, 401s, full session, identical failure bodies, single-use pending, TTL expiry, --no-auth escape hatch, CLI connect end-to-end, live user reload).
+- Feature 2 — CLI tooling:
+  - Real .tables/.schema via sqlite_master (the old ones printed "(schema introspection not exposed via SQL yet)" stubs).
+  - .dump / --dump, .export-schema / --export-schema, .export-data / --export-data: sqlite3 .dump's exact shape (PRAGMA foreign_keys=OFF + BEGIN/COMMIT; tables+data before indexes/views/triggers so triggers never fire on re-import; sqlite_sequence/sqlite_stat1 high-water preservation; NaN->NULL, ±inf->±9.0e999, REAL shape preserved with .0 suffix, blobs X'hex', text '' doubling). Pure SQL — works over local AND remote sessions.
+  - .read / .import (SQL script via multi-statement execute) + .import FILE TABLE / --import-csv (RFC 4180 CSV parser: quoted commas/newlines/""-escapes; sqlite3's exact rules — existing table: all rows are data; missing table: created from header with TEXT columns; column-count errors with line numbers).
+  - .backup / --backup: byte-exact physical copy via db.image() (both disk formats; the sqlite-format backup is re-opened and verified by real SQLite).
+- Engine bugs found and fixed along the way (all surfaced by the new tooling):
+  1. create_sql stored DDL verbatim INCLUDING the trailing `;` (real SQLite strips it) — .schema printed `CREATE TABLE t(...);;`. Fixed with ddl_source_sql (per-kind rules empirically pinned against SQLite 3.53: INDEX keeps pre-`;` trivia, TABLE/VIEW/TRIGGER trim it, leading trivia always stripped). Differential regression test added.
+  2. sqlite-format databases never created the catalog sqlite_sequence table (CREATE TABLE ... AUTOINCREMENT was gated on foreign.is_none()) — dumps with sqlite_sequence statements couldn't import into a sqlite-format target, and sequence floors silently degraded to max(rowid) after reopen. Now the catalog table exists in both formats (CREATE path unconditionally; loader registers the file's DDL + rows with a DELETE-first materialization so load-time bumps don't win; writer's synthesis guarded to legacy fallback).
+  3. Database::image() on a sqlite-format file read the STALE MAIN FILE when a WAL sidecar held committed frames (mid-load incremental commits leave the main file behind) — serialize/backup produced truncated databases. Now image() checkpoints first (full atomic write + sidecar retire + session reset), byte-stable when clean.
+- Verification: default matrix 990/990 integration + 186 lib tests, 0 failures (965 without the auth-gated suites; sqlx config: cli_ops/server_auth/sqlite_interop/sqlite_master/gap_closure/sqlx_driver/differential/error_parity all green — full-matrix runs blocked only by the sandbox's 9.9G disk against ~6G of test binaries); cargo fmt clean; clippy -D warnings clean in all 4 configs (default/sqlx/no-default/workspace).
+- README: Tooling bullets rewritten; CLI usage + dump/export/import/backup examples; HTTP server section rewritten around the auth model (fail-closed, user management, handshake wire shapes, TLS guidance, --no-auth); two new testing-table rows; counts 952+ -> 1000+.
+
+Stage Summary:
+- Both features delivered and differentially proven: Postgres-grade SCRAM auth (fail-closed server, mutual-auth client, no enumeration, replay-proof) and a full dump/export/import/backup CLI surface whose output real SQLite executes.
+- Three engine bugs fixed (DDL text parity, sqlite_sequence in foreign mode, image() WAL staleness) — each found by exercising the new tools, each pinned by a regression test.
+- Ready to push.

@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **952+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **1000+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -102,8 +102,8 @@ for row in &rows {
 
 ### Tooling
 
-- **CLI shell**: `rustqlite-cli` with table/JSON/CSV/line output modes and dot commands
-- **HTTP/JSON server**: `rustqlite-server` with `/query`, `/execute`, `/health` endpoints
+- **CLI shell**: `rustqlite-cli` with table/JSON/CSV/line output modes; real `.tables`/`.schema` (sqlite_master-driven); `.dump`/`.export-schema`/`.export-data` (pure-SQL dumps — loadable by the `sqlite3` CLI itself, verified by tests); `.read`/`.import` (SQL scripts + CSV with sqlite3's exact header/create rules); `.backup` (byte-exact physical copy, both disk formats); one-shot batch flags (`--dump`, `--export-schema`, `--export-data`, `--import`, `--import-csv`, `--backup`) for scripting; and `--connect URL --user NAME` for an authenticated remote session
+- **HTTP/JSON server**: `rustqlite-server` with `/query`, `/execute`, `/health` endpoints and **SCRAM-SHA-256 authentication** — Postgres's exact SASL mechanism, fail-closed by default (the server refuses to start without a user store)
 - **Benchmarks**: criterion harnesses against rusqlite (SQLite) for point lookups, range scans, inserts, joins, concurrency; `bench_compare` head-to-head with answer-equality asserts; sqlx-native vs sqlx-sqlite comparison
 
 ### Plugin system (SQLite-style extensions)
@@ -1127,11 +1127,89 @@ rustqlite> SELECT * FROM t;
 rustqlite> .quit
 ```
 
+Dump, export, import, and backup — interactive dot commands and one-shot
+batch flags (the same operations work over `--connect` remote sessions,
+except `.backup`, which needs the local file):
+
+```bash
+# Full SQL dump (schema + data) — pure SQL, loadable by the sqlite3 CLI itself
+rustqlite-cli --dump backup.sql data.db
+rustqlite-cli --export-schema schema.sql data.db   # CREATE statements only
+rustqlite-cli --export-data rows.sql data.db       # INSERT statements only
+
+# Import an SQL script (or CSV into a table)
+rustqlite-cli --import backup.sql new.db
+rustqlite-cli --import-csv people.csv people new.db
+
+# Physical byte-copy backup (native or SQLite format)
+rustqlite-cli --backup copy.db data.db
+```
+
+```sql
+rustqlite> .tables              -- tables and views
+rustqlite> .schema users        -- CREATE statements, filtered
+rustqlite> .dump dump.sql       -- full dump to a file
+rustqlite> .read script.sql     -- execute a script
+rustqlite> .import data.csv t   -- CSV rows into table t
+rustqlite> .backup copy.db      -- byte-exact physical backup
+```
+
+The dump format matches `sqlite3 .dump`'s shape: `PRAGMA foreign_keys=OFF`
+first, one transaction wrapping the load, tables and data before indexes,
+views and triggers (so triggers never fire during a re-import and
+`AUTOINCREMENT` high-water marks survive via `sqlite_sequence`), NaN as
+NULL, `±inf` as `±9.0e999`, blobs as `X'hex'`. Round-trips are verified
+against real SQLite in `tests/cli_ops.rs` (the dump itself is executed by
+bundled SQLite and row-compared) and across both disk formats.
+
 ### HTTP server
 
 ```bash
 cargo run --release --bin rustqlite-server -- --db /path/to/db.sqlite --port 8080
 ```
+
+The server is **fail-closed**: without a user store it refuses to start.
+Create users first (password via prompt, `$RUSTQLITE_PASSWORD`, or `--password`):
+
+```bash
+rustqlite-server --db /path/to/db.sqlite --add-user alice   # exits after
+rustqlite-server --db /path/to/db.sqlite --list-users
+rustqlite-server --db /path/to/db.sqlite --del-user alice
+# the user store defaults to <db>.auth.json; --auth-file overrides
+```
+
+Every `/query` and `/execute` request then needs a session token from the
+two-step SCRAM-SHA-256 handshake — the password itself never crosses the
+wire and is stored only as a salted, iterated verifier
+(`SCRAM-SHA-256$4096:<salt>$<stored>:<server>`, Postgres's `rolpassword`
+format). Unknown users get a fabricated challenge and byte-identical
+failures (no enumeration); both paths cost one PBKDF2 per handshake
+(timing-equalized); tokens are 256-bit random with a TTL
+(`--auth-ttl`, default 3600s) and revocable via `/auth/logout`.
+
+The easiest client is the CLI itself (hidden password prompt, mutual
+authentication — the server's signature is verified before any query
+runs):
+
+```bash
+rustqlite-cli --connect http://127.0.0.1:8080 --user alice
+```
+
+For programmatic clients the handshake (any SCRAM-SHA-256 implementation
+works — the field layout is RFC 5802's with hex instead of base64):
+
+```text
+POST /auth/start  {"username":"alice","client_nonce":"<hex>"}
+  -> {"session":"<hex>","nonce":"<combined hex>","salt":"<hex>","iterations":4096}
+POST /auth/finish {"session":"<hex>","client_final":"c=biws,r=<combined>","proof":"<hex>"}
+  -> {"token":"<hex>","expires_in":3600,"server_signature":"<hex>"}   # verify it!
+Authorization: Bearer <token> on /query and /execute
+```
+
+The `--no-auth` flag is the explicit escape hatch for development servers
+(it prints a warning).
+
+Unsecured example (the same request shapes apply with a Bearer header):
 
 ```bash
 curl -X POST http://localhost:8080/execute \
@@ -1144,6 +1222,13 @@ curl -X POST http://localhost:8080/query \
   -d '{"sql":"SELECT * FROM t"}'
 # {"columns":["id","name"],"rows":[[1,"alice"]]}
 ```
+
+HTTP is plaintext — SCRAM protects the credentials exactly like Postgres
+with `scram-sha-256` over a non-SSL connection. Terminate TLS in front of
+the server when the network is untrusted. `tests/server_auth.rs` spawns
+the real server and drives the full contract from an independent client
+(fail-closed, 401s, handshake, tamper/replay, logout, TTL, live user-store
+reload, CLI end-to-end).
 
 ### Library
 
@@ -1244,7 +1329,7 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 952+ tests in the
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1000+ tests in the
 default matrix, all passing, plus the sqlx feature suite:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
@@ -1260,6 +1345,8 @@ default matrix, all passing, plus the sqlx feature suite:
 | SQL fuzz (§4.1) | `tests/sql_fuzz.rs` | mutation + structured fuzz run against BOTH engines — results must match |
 | Differential testing | `tests/differential.rs` | randomized workloads vs real SQLite; row sets identical |
 | Error-text parity | `tests/error_parity.rs` | 16 suites: every lookup-family / column-family / object-existence error is byte-identical to bundled SQLite's `sqlite3_errmsg` (both engines must agree on success/failure AND the text); lazy contracts (view/trigger/FK bodies) pinned at their use sites; a valid-SQL battery guards against false positives |
+| Server authentication | `tests/server_auth.rs` | spawns the real `rustqlite-server` and drives the SCRAM-SHA-256 contract from an independent HTTP client: fail-closed startup (no/empty user store), 401 + WWW-Authenticate on data endpoints, full handshake with mutual-signature verification, wrong-password and unknown-user failures byte-identical (no enumeration), single-use pending sessions, tampered proofs, session-replay rejection, TTL expiry, logout revocation, live user-store reload, and the CLI's `--connect` end-to-end (valid login + clean wrong-password failure) |
+| CLI tooling | `tests/cli_ops.rs` | drives the real `rustqlite-cli` binary: full dump→import round-trips in both disk formats with schema/data equality against the engine AND against real SQLite (the dump is executed by bundled SQLite and row-compared), export-schema/export-data splits, `.backup` byte-copies reopened by SQLite, CSV import (existing-table + header-created-table modes, quoted commas/newlines, column-count errors), `.tables`/`.schema` over stdin, and the trailing-semicolon `sqlite_master.sql` regression pinned differentially |
 | `integrity_check` | `tests/integrity_check.rs` | full structural walk: freelist chains, every b-tree, bidirectional index↔table cross-verification |
 | Soak / long-run | `concurrency_stress.rs`, `RUSTQLITE_FUZZ_ITERS` | 32-thread mixed workloads; long fuzz iterations |
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |

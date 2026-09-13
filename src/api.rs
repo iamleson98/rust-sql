@@ -2459,13 +2459,22 @@ impl Database {
                 *next_rowid = (*next_rowid).max(row.rowid);
             }
         }
-        // 1. Tables (sqlite_sequence is tracked in the foreign state).
+        // 1. Tables. `sqlite_sequence` loads like any other table: the
+        // catalog copy becomes the live high-water store (bump helper)
+        // and the user-visible surface SQLite exposes (dumps DELETE/INSERT
+        // its rows); the `foreign.sequences` map stays as a load-time
+        // snapshot for the writer's legacy synthesis fallback.
         for row in &image.schema {
             if row.kind != "table" {
                 continue;
             }
             let name_lc = row.name.to_ascii_lowercase();
-            if name_lc == "sqlite_sequence" {
+            // `sqlite_sequence` may already exist: an earlier schema
+            // row's CREATE TABLE ... AUTOINCREMENT synthesized it (SQLite
+            // files carry the sequence row AFTER its table). Replaying
+            // its own DDL would be an "already exists" error — skip it;
+            // the rows still load in section 2.
+            if name_lc == "sqlite_sequence" && self.catalog.get_table("sqlite_sequence").is_some() {
                 continue;
             }
             let Some(sql) = &row.sql else { continue };
@@ -2477,14 +2486,36 @@ impl Database {
                 continue;
             }
             let name_lc = row.name.to_ascii_lowercase();
-            if name_lc == "sqlite_sequence" {
-                continue;
-            }
             let rows = match image.table_rows.get(&name_lc) {
                 Some(r) => r,
                 None => continue,
             };
             self.load_foreign_table_rows(&row.name, rows)?;
+        }
+        // 2b. sqlite_sequence rows: the image reader routes them into
+        // `sequences` (not `table_rows`). Materialize them into the
+        // catalog table — the live high-water store — so AUTOINCREMENT
+        // floors, user DELETE/INSERT, and the writer all see the exact
+        // rows the file carries. Row loading above BUMPED the sequence
+        // (each preserved rowid is an insert); those derived rows are
+        // cleared first — SQLite's own contract (DELETE FROM
+        // sqlite_sequence resets the floor) makes this the exact
+        // semantics of "the file's rows win".
+        if self.catalog.get_table("sqlite_sequence").is_some() && !image.sequences.is_empty() {
+            self.execute("DELETE FROM sqlite_sequence", ())?;
+            let seq_rows: Vec<crate::storage::sqlitefmt::RawRow> = image
+                .sequences
+                .iter()
+                .enumerate()
+                .map(|(i, (name, seq))| crate::storage::sqlitefmt::RawRow {
+                    rowid: i as i64 + 1,
+                    values: vec![
+                        crate::types::Value::Text(crate::types::text::Text::from(name.as_str())),
+                        crate::types::Value::Integer(*seq),
+                    ],
+                })
+                .collect();
+            self.load_foreign_table_rows("sqlite_sequence", &seq_rows)?;
         }
         // 3. Indexes (explicit CREATE INDEX; autoindexes are synthesized
         //    by the engine's CREATE TABLE path — matching SQLite's own
@@ -2835,9 +2866,11 @@ impl Database {
         for key in &order {
             match key {
                 SchemaOrderKey::Table(name) => {
-                    if name == "sqlite_sequence" {
-                        continue; // synthesized below
-                    }
+                    // `sqlite_sequence` is a REAL catalog table since the
+                    // foreign loader stopped skipping it — emitted like
+                    // any other table with its live (bump-maintained)
+                    // rows. The synthesis below is the fallback for
+                    // images that predate that.
                     let Some(table) = tables.get(name) else {
                         continue;
                     };
@@ -2920,7 +2953,9 @@ impl Database {
             }
         }
 
-        // ---- sqlite_sequence ----
+        // ---- sqlite_sequence (synthesis fallback) ----
+        // Only when the catalog does NOT carry the table (legacy images);
+        // the normal path emits the real table with its live rows above.
         let mut any_autoinc = false;
         for t in tables.values() {
             if t.columns.iter().any(|c| c.autoincrement) {
@@ -2928,7 +2963,7 @@ impl Database {
                 break;
             }
         }
-        if any_autoinc {
+        if any_autoinc && !tables.contains_key("sqlite_sequence") {
             let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
             let seqs = foreign.sequences.lock();
             for (name, t) in &tables {
@@ -5091,7 +5126,10 @@ impl Database {
                 stmt_ref,
                 &mut ctx,
                 &mut self.catalog,
-                sql,
+                ddl_source_sql(
+                    sql,
+                    matches!(stmt_ref, Statement::Create(CreateStatement::Index { .. })),
+                ),
                 self.foreign.as_ref(),
             )
         };
@@ -5833,12 +5871,57 @@ impl Database {
             // Lazy write-back mode: the cache IS the store — snapshot the
             // merged cache+store state (a flush would be a no-op).
             self.pager.memory_image_current()
+        } else if self.foreign.is_some() {
+            // SQLite-format file: SQLite's serialize contract is "the
+            // image reflects the CURRENT committed state". The main file
+            // can legitimately sit BEHIND a live WAL sidecar (mid-load
+            // incremental commits, WAL-appended transactions) — a plain
+            // read-back would serialize stale bytes. Checkpoint first:
+            // fold pending state into the main file (full atomic write,
+            // sidecar removed, session reset), then read it back.
+            self.checkpoint_foreign_image()?;
+            std::fs::read(&self.path).map_err(Error::from)
         } else {
             // A flush failure on a read-only handle must not fail the
             // read-back (the file holds the last committed state).
             let _ = self.pager.flush();
             std::fs::read(&self.path).map_err(Error::from)
         }
+    }
+
+    /// Foreign-file checkpoint for [`Self::image`]: fold the current
+    /// committed state into the main file atomically and retire any WAL
+    /// sidecar (the same clean-close semantics `Drop` applies). No write
+    /// when the main file is already current (clean AND sidecar-less) —
+    /// `image()` on an untouched database must be byte-stable.
+    fn checkpoint_foreign_image(&self) -> Result<()> {
+        let Some(foreign) = self.foreign.as_ref() else {
+            return Ok(());
+        };
+        let dirty = foreign.dirty.load(Ordering::Acquire);
+        let had_wal = foreign.had_wal.load(Ordering::Acquire);
+        let live_frames = foreign
+            .wal
+            .lock()
+            .as_ref()
+            .is_some_and(|sess| sess.writer.has_frames());
+        if !dirty && !had_wal && !live_frames {
+            return Ok(());
+        }
+        let out = self.collect_foreign_dump()?;
+        let bytes = crate::storage::sqlitefmt::build_bytes(&out)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        crate::storage::sqlitefmt::writer::write_image_atomic(&foreign.path, &bytes)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        // Retire the sidecar + reset the session so the next commit
+        // re-establishes WAL state from the now-current main file.
+        let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(&foreign.path);
+        let _ = std::fs::remove_file(&wal_path);
+        let mut session = foreign.wal.lock();
+        *session = None;
+        foreign.dirty.store(false, Ordering::Release);
+        foreign.had_wal.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Get a reference to the catalog (for debugging/testing).
@@ -8000,7 +8083,7 @@ impl Database {
     ) -> Result<()> {
         match stmt {
             Statement::Create(c) => {
-                let r = Self::execute_create(c.clone(), ctx, catalog, original_sql, foreign);
+                let r = Self::execute_create(c.clone(), ctx, catalog, original_sql);
                 if r.is_ok() {
                     // Every schema change advances the schema cookie
                     // (SQLite's `PRAGMA schema_version` — other connections
@@ -8126,7 +8209,6 @@ impl Database {
         ctx: &mut ExecContext,
         catalog: &mut Catalog,
         original_sql: &str,
-        foreign: Option<&ForeignSqlite>,
     ) -> Result<()> {
         match c {
             CreateStatement::Table {
@@ -8493,8 +8575,12 @@ impl Database {
                 // creates `sqlite_sequence` (a real, user-visible table —
                 // exactly SQLite's `CREATE TABLE sqlite_sequence(name,seq)`
                 // row, allocated AFTER the table and its autoindexes).
-                // Foreign-mode databases carry their own sequence state
-                // (loaded from the file, re-synthesized on dump).
+                // Foreign-mode databases get it too: the catalog table is
+                // the live high-water store (bump/read helpers) AND the
+                // user-visible surface (SQLite lets clients DELETE/INSERT
+                // its rows — `sqlite3 .dump` output depends on that). The
+                // file writer's own synthesis is guarded on the catalog
+                // table's absence, so nothing double-emits.
                 if columns.iter().any(|c| {
                     c.constraints.iter().any(|cc| {
                         matches!(
@@ -8505,8 +8591,7 @@ impl Database {
                             }
                         )
                     })
-                }) && foreign.is_none()
-                    && catalog.get_table("sqlite_sequence").is_none()
+                }) && catalog.get_table("sqlite_sequence").is_none()
                 {
                     if let Ok(Statement::Create(CreateStatement::Table {
                         name: seq_name,
@@ -12251,6 +12336,35 @@ impl<'a> Params for &'a [Value] {
     }
     fn as_slice(&self) -> Option<&[Value]> {
         Some(self)
+    }
+}
+
+/// The DDL source text stored in `sqlite_master.sql` — SQLite's exact
+/// per-kind capture rules, empirically pinned against SQLite 3.53:
+///
+/// * every kind: leading trivia stripped, ONE trailing `;` removed.
+/// * TABLE / VIEW / TRIGGER: trailing whitespace before the `;` also
+///   stripped (capture ends at the statement's last token).
+/// * INDEX: the trivia before the `;` is KEPT (byte-for-byte what
+///   `sqlite3 .schema` shows for indexes typed with trailing spaces).
+///
+/// The engine previously stored the statement verbatim INCLUDING the
+/// `;`, which diverged from SQLite for the most common input shape
+/// (interactive/`split_script` statements end with `;`).
+fn ddl_source_sql(sql: &str, index_like: bool) -> &str {
+    let s = sql.trim_start();
+    let stripped = s.trim_end();
+    if let Some(body) = stripped.strip_suffix(';') {
+        if index_like {
+            body
+        } else {
+            body.trim_end()
+        }
+    } else if index_like {
+        // No `;`: the INDEX capture runs to the end of the input.
+        s
+    } else {
+        stripped
     }
 }
 

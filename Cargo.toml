@@ -131,6 +131,13 @@ libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 # Optional: disable with `default-features = false` for a hardened build
 # (mirrors SQLite's SQLITE_OMIT_LOAD_EXTENSION).
 libloading = { version = "0.8", optional = true }
+# --- SCRAM-SHA-256 authentication (feature `auth`) ----------------------
+# Server-side username/password auth uses Postgres's exact SASL mechanism
+# (RFC 7677): the password never crosses the wire and is stored only as a
+# salted, iterated verifier. sha2 provides the hash primitive (already in
+# the lock graph); rand provides OS randomness for salts/nonces/tokens.
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
 # --- Native sqlx driver (feature `sqlx`) -------------------------------
 # sqlx-core's driver traits, implemented directly against the engine —
 # sqlx works with rustqlite as a plain Rust crate dependency: no C ABI,
@@ -171,12 +178,17 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
-default = ["mimalloc", "extension"]
+default = ["mimalloc", "extension", "auth"]
 # SQLite's SQLITE_MEMDEBUG/memsys2 equivalent: replace the global allocator
 # with a counting allocator that can fail at allocation #N. Enables the
 # `oom_fault` test (see tests/oom_fault.rs) and disables mimalloc for that
 # build (only one global allocator may exist per binary).
 oom-injection = []
+# SCRAM-SHA-256 authentication for `rustqlite-server` (+ `--connect`
+# client mode in the CLI): Postgres's exact SASL mechanism. On by default;
+# `default-features = false` sheds it (the server then refuses to start
+# in auth mode with a clear message).
+auth = ["dep:sha2", "dep:rand", "dep:libc"]
 # Fast global allocator (see the mimalloc dependency note above).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 extension = ["dep:libloading"]
@@ -233,6 +245,13 @@ harness = false
 [[bench]]
 name = "sqlite_comparison"
 harness = false
+
+# Hidden (no-echo) password prompt for `rustqlite-server --add-user` and
+# `rustqlite-cli --connect`: termios echo-off on unix. Windows builds read
+# the password with echo (a warning is printed); scripting uses
+# RUSTQLITE_PASSWORD instead.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [profile.release]
 opt-level = 3
