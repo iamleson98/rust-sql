@@ -305,3 +305,16 @@ Stage Summary:
 - The engine's last open compat item is closed, and closing it surfaced + fixed a data-corrupting silent-NULL family (unknown UPDATE SET targets bound to slot 0) plus a dozen silent-success DDL/DML shapes.
 - Error surface is byte-identical to SQLite on both the Rust Display and the C ABI.
 - Ready to push after the 4 bench gates pass.
+
+---
+Task ID: 17-verify
+Agent: main (Super Z)
+Task: Push + remote CI verification for 5c87464
+
+Work Log:
+- Committed and pushed 5c87464 to master (namecheck + error_parity + README + worklog).
+- Local pre-push verification: default 952/952, sqlx 987/987, no-default 567/567, compat 61/61, doc 5/5; fmt clean; clippy -D warnings clean in all 4 configs; 4/4 bench gates PASS locally (bench_full_vs_sqlite 18/18, bench_compare 20/20, criterion sqlite_comparison 8/8, bench_sqlx_native 11/11 — every row beats SQLite).
+- Remote CI run 34739568615: COMPLETED SUCCESS — 21/21 jobs (rustfmt, clippy x4, tests ubuntu/windows/macos all configs, torture x3 OSes incl. the S12 regression guard, sqlite file interop x3, oom-injection, compat ABI, bench-gates x3).
+
+Stage Summary:
+- The engine's last documented open compat gap is closed and verified end-to-end. Master green at 5c87464.
