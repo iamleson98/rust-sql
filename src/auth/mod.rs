@@ -861,12 +861,16 @@ mod tests {
         proof[0] ^= 1;
         assert!(exchange.finish(&client_final, &proof).is_err());
 
-        // Wrong nonce echo in client-final.
+        // Wrong nonce echo in client-final: swap the last hex digit for a
+        // DIFFERENT one (a fixed "0" would be a no-op whenever the random
+        // nonce already ends in '0' — a 1-in-16 flake, caught by CI).
         let client = ClientExchange::start("alice");
         let (exchange, challenge) =
             ServerExchange::start("alice", client.client_nonce_hex(), Some(&verifier)).unwrap();
         let (mut client_final, proof, _) = client.finish("s3cret", &challenge).unwrap();
-        client_final.replace_range(client_final.len() - 1.., "0");
+        let last = client_final.chars().last().unwrap();
+        let replacement = if last == '0' { '1' } else { '0' };
+        client_final.replace_range(client_final.len() - 1.., &replacement.to_string());
         assert!(exchange.finish(&client_final, &proof).is_err());
     }
 

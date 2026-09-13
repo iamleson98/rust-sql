@@ -349,3 +349,16 @@ Stage Summary:
 - Both features delivered and differentially proven: Postgres-grade SCRAM auth (fail-closed server, mutual-auth client, no enumeration, replay-proof) and a full dump/export/import/backup CLI surface whose output real SQLite executes.
 - Three engine bugs fixed (DDL text parity, sqlite_sequence in foreign mode, image() WAL staleness) — each found by exercising the new tools, each pinned by a regression test.
 - Ready to push.
+
+---
+Task ID: 18-fix
+Agent: main (Super Z)
+Task: CI triage for e1aabab — ubuntu default job red, fix, re-push
+
+Work Log:
+- CI run 34748745117 on e1aabab: 20/21 jobs green (all clippy x4, rustfmt, all 3 bench-gates, all 3 torture jobs, interop x3, sqlx/no-default/all-configs tests) — one failure: `auth::tests::tampered_proof_and_nonce_fail` on ubuntu.
+- Root cause: the nonce-echo tamper replaced the client-final's last hex char with a fixed "0" — a NO-OP whenever the random combined nonce already ends in '0' (1-in-16 per run). Test-only flake, not a crypto issue (flipping a real proof byte is deterministic and always rejected).
+- Fix: swap the last digit for a guaranteed-DIFFERENT character ('0' <-> '1'). Verified 5 consecutive local runs green.
+
+Stage Summary:
+- Flaky-test fix ready to push; the auth implementation itself was never wrong.
