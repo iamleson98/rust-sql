@@ -3068,8 +3068,23 @@ fn expr_display(e: &Expr) -> String {
         Expr::Column {
             table: Some(t),
             name,
-        } => format!("{}.{}", t, name),
-        Expr::Column { table: None, name } => name.clone(),
+        } => {
+            if crate::planner::is_hidden_rowid(name) {
+                // Hidden rowid slot renders under its user spelling
+                // (SQLite reports "rowid") — the NUL marker must never
+                // leak into an output column name.
+                "rowid".to_string()
+            } else {
+                format!("{}.{}", t, name)
+            }
+        }
+        Expr::Column { table: None, name } => {
+            if crate::planner::is_hidden_rowid(name) {
+                "rowid".to_string()
+            } else {
+                name.clone()
+            }
+        }
         Expr::Literal(Value::Text(s)) => s.as_str().to_string(),
         Expr::Literal(Value::Integer(i)) => i.to_string(),
         Expr::Literal(Value::Real(f)) => f.to_string(),

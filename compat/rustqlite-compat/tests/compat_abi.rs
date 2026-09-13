@@ -1900,3 +1900,80 @@ fn abi_serialize_deserialize_argument_checks() {
     };
     assert!(p.is_null());
 }
+
+#[test]
+fn abi_count_alias_fast_paths_report_alias() {
+    let db = open_memory();
+    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec(&db, "CREATE INDEX idx_v ON t(v)");
+    exec(&db, "INSERT INTO t (v) VALUES (1),(1),(2),(2),(2)");
+
+    // Bare COUNT(*) AS n (CountStar fast path). sqlx reads column_name at
+    // prepare time and resolves fetch targets BY NAME — the alias must be
+    // reported exactly (regression: fast path reported "COUNT(*)").
+    let (stmt, _) = prepare(&db, "SELECT COUNT(*) AS n FROM t");
+    assert_eq!(unsafe { sqlite3_column_count(stmt.0) }, 1);
+    let c0 = cstr(unsafe { sqlite3_column_name(stmt.0, 0) });
+    assert_eq!(c0, "n", "AS alias must win over the COUNT(*) display name");
+    assert_eq!(unsafe { sqlite3_step(stmt.0) }, 100); // SQLITE_ROW
+    assert_eq!(unsafe { sqlite3_column_int64(stmt.0, 0) }, 5);
+
+    // Covering-index COUNT with alias and a bound key.
+    let (stmt2, _) = prepare(&db, "SELECT COUNT(*) AS hits FROM t WHERE v = ?");
+    let c1 = cstr(unsafe { sqlite3_column_name(stmt2.0, 0) });
+    assert_eq!(c1, "hits");
+    unsafe { sqlite3_bind_int64(stmt2.0, 1, 2) };
+    assert_eq!(unsafe { sqlite3_step(stmt2.0) }, 100);
+    assert_eq!(unsafe { sqlite3_column_int64(stmt2.0, 0) }, 3);
+
+    // Unaliased forms keep SQLite's COUNT(*) short-column name.
+    let (stmt3, _) = prepare(&db, "SELECT COUNT(*) FROM t");
+    assert_eq!(cstr(unsafe { sqlite3_column_name(stmt3.0, 0) }), "COUNT(*)");
+    let (stmt4, _) = prepare(&db, "SELECT COUNT(*) FROM t WHERE v = 1");
+    assert_eq!(cstr(unsafe { sqlite3_column_name(stmt4.0, 0) }), "COUNT(*)");
+}
+
+#[test]
+fn abi_rowid_pseudo_column_names() {
+    let db = open_memory();
+    exec(&db, "CREATE TABLE t (a INTEGER, b TEXT)");
+    exec(&db, "CREATE TABLE u (a INTEGER, x INTEGER)");
+    exec(&db, "INSERT INTO t (a, b) VALUES (1,'one'),(2,'two')");
+    exec(&db, "INSERT INTO u (a, x) VALUES (1,10),(2,20)");
+
+    // Regression: the engine's hidden rowid slot leaked a NUL-prefixed
+    // sentinel name, and CString::new (interior NUL) failed — the name
+    // list came back EMPTY and column_name(0) reported nothing. sqlx
+    // resolves output by name, so SELECT rowid was unnameable. The ABI
+    // must report "rowid" exactly like SQLite.
+    let (stmt, _) = prepare(&db, "SELECT rowid FROM t");
+    assert_eq!(unsafe { sqlite3_column_count(stmt.0) }, 1);
+    let c0 = cstr(unsafe { sqlite3_column_name(stmt.0, 0) });
+    assert_eq!(c0, "rowid");
+    assert_eq!(unsafe { sqlite3_step(stmt.0) }, 100);
+    assert_eq!(unsafe { sqlite3_column_int64(stmt.0, 0) }, 1);
+
+    // Aliased rowid and join-qualified rowid.
+    let (stmt2, _) = prepare(&db, "SELECT rowid AS r FROM t");
+    assert_eq!(cstr(unsafe { sqlite3_column_name(stmt2.0, 0) }), "r");
+    let (stmt3, _) = prepare(&db, "SELECT a.rowid FROM t a JOIN u b ON a.a = b.a");
+    assert_eq!(unsafe { sqlite3_column_count(stmt3.0) }, 1);
+    let c3 = cstr(unsafe { sqlite3_column_name(stmt3.0, 0) });
+    assert_eq!(
+        c3, "rowid",
+        "qualified hidden slot must unqualify + sanitize"
+    );
+
+    // A real column named "rowid" shadows the pseudo-column.
+    exec(&db, "CREATE TABLE s (rowid TEXT, v INTEGER)");
+    exec(&db, "INSERT INTO s (rowid, v) VALUES ('k', 1)");
+    let (stmt4, _) = prepare(&db, "SELECT rowid FROM s");
+    let c4 = cstr(unsafe { sqlite3_column_name(stmt4.0, 0) });
+    assert_eq!(c4, "rowid");
+    assert_eq!(unsafe { sqlite3_step(stmt4.0) }, 100);
+    let txt = unsafe { sqlite3_column_text(stmt4.0, 0) };
+    let s = unsafe { CStr::from_ptr(txt as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(s, "k", "real column value, not the integer rowid");
+}

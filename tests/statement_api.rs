@@ -255,3 +255,66 @@ fn concurrent_readers_through_statements() {
         assert_eq!(sums[t as usize], full - dropped);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fast-path output naming: COUNT fast paths must honor AS aliases
+// (regression: the CountStar / IndexCount fast paths reported the
+// aggregate's display name ("COUNT(*)") and dropped the alias, so
+// name-based consumers — sqlx/sea-orm via the compat ABI — could not
+// resolve `SELECT COUNT(*) AS n` by column name).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prepare_count_star_alias_name() {
+    let db = setup();
+    // CountStar fast path (bare COUNT, no WHERE): alias must win.
+    let mut stmt = db.prepare("SELECT COUNT(*) AS n FROM t").unwrap();
+    assert_eq!(stmt.step().unwrap(), StepResult::Row);
+    assert_eq!(stmt.column_int(0), 100);
+    assert_eq!(
+        stmt.column_name(0),
+        Some("n"),
+        "AS alias must win on the COUNT fast path"
+    );
+    // Unaliased: SQLite's short-column-name form is preserved.
+    let mut plain = db.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(plain.step().unwrap(), StepResult::Row);
+    assert_eq!(plain.column_int(0), 100);
+    assert_eq!(plain.column_name(0), Some("COUNT(*)"));
+}
+
+#[test]
+fn prepare_index_count_alias_name() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+        .unwrap();
+    db.execute("CREATE INDEX idx_v ON t(v)", []).unwrap();
+    for i in 0..50 {
+        db.execute("INSERT INTO t (v) VALUES (?)", vec![Value::Integer(i % 5)])
+            .unwrap();
+    }
+    // IndexCount fast path with a bound parameter key: alias must win.
+    let mut stmt = db
+        .prepare("SELECT COUNT(*) AS hits FROM t WHERE v = ?")
+        .unwrap();
+    stmt.bind(1, Value::Integer(2)).unwrap();
+    assert_eq!(stmt.step().unwrap(), StepResult::Row);
+    assert_eq!(stmt.column_int(0), 10);
+    assert_eq!(
+        stmt.column_name(0),
+        Some("hits"),
+        "AS alias must win on the index-count fast path"
+    );
+    // Literal-key form (pre-encoded key) keeps the alias too.
+    let mut lit = db
+        .prepare("SELECT COUNT(*) AS hits FROM t WHERE v = 3")
+        .unwrap();
+    assert_eq!(lit.step().unwrap(), StepResult::Row);
+    assert_eq!(lit.column_int(0), 10);
+    assert_eq!(lit.column_name(0), Some("hits"));
+    // Unaliased literal-key form: display name preserved.
+    let mut plain = db.prepare("SELECT COUNT(*) FROM t WHERE v = 4").unwrap();
+    assert_eq!(plain.step().unwrap(), StepResult::Row);
+    assert_eq!(plain.column_int(0), 10);
+    assert_eq!(plain.column_name(0), Some("COUNT(*)"));
+}

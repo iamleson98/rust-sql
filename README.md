@@ -1338,6 +1338,7 @@ default matrix, all passing, plus the sqlx feature suite:
 | Branch coverage (§2.1) | `cargo test` + clippy exhaustive-match lint | every `Plan`/`Expr` arm handled and driven |
 | Regression tests (§2.2) | `tests/regression.rs` | one test per historically-found bug, pinned forever |
 | Persistence / reopen (§2) | `tests/durability.rs` | the close-then-reopen matrix: every constraint flavor (rowid-alias PK, TEXT/uuid PK, WITHOUT ROWID composite PK, UNIQUE + NULL multiplicity, CHECK, NOT NULL, FK actions, AUTOINCREMENT floors, collated UNIQUE) re-probed with NEGATIVE tests after EVERY reopen; schema objects (indexes in every shape incl. partial/expression/DESC, views, triggers, generated columns, stat1, ALTER evolution) keep working; value fidelity for i64/f64 extremes, subnormals, astral Unicode, 64 KiB blobs; 12-generation churn soak with per-generation checksums; committed-vs-uncommitted and WAL close semantics; byte-stable idle reopen; VACUUM + `image()` round-trips; the same battery on the SQLite on-disk format; and TEMP objects proven session-scoped (gone after reopen — the temp-persistence bug this suite found) |
+| Result-column naming (colname.test) | `tests/column_names.rs` | SQLite's output-column-name contract: AS alias always wins on EVERY route (materialized executor, COUNT fast paths, scan/range/group drivers, RETURNING); short unqualified names for `t.a`; star/table-star/join-star/subquery-star expansion; the rowid pseudo-column renders "rowid" and its hidden-slot NUL sentinel never leaks (a leak would blank `sqlite3_column_name` through the C ABI); aggregate display names ("COUNT(*)" unaliased); query-route == statement-route name parity; RETURNING rowid values on INSERT/UPDATE/DELETE (incl. rowid-moves and upserts); view aliases survive close/reopen; the compat ABI reports the same names at prepare time |
 | Boundary values | `tests/boundary.rs` | i64 MIN/MAX rowids, extreme index keys, LIKE/GLOB edges, deep nesting |
 | I/O error injection (§3.2) | `tests/io_fault.rs` | ENOSPC, truncation, deleted files, read-only dirs — graceful `Err` + intact `integrity_check` |
 | Crash / power-loss (§3.3) | `tests/crash_recovery.rs` | child process `abort()`s at EVERY statement boundary; committed baseline survives, in-flight txn is all-or-nothing, both journal modes |
@@ -1367,6 +1368,7 @@ cargo test --features sqlx --test sqlx_driver           # native sqlx driver
 cargo test --test parallel_scan                         # parallel-vs-serial equality
 cargo test --test crash_recovery                        # crash simulation
 cargo test --test durability                            # close/reopen matrix
+cargo test --test column_names                          # output-column-name contract
 cargo test --features oom-injection --test oom_fault    # OOM injection
 cargo clippy --all-targets --features sqlx              # 0 warnings (all configs)
 cargo run --release --example bench_compare             # vs SQLite

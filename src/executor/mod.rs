@@ -2615,10 +2615,19 @@ fn enforce_parent_update_fks(
 
 /// Project the RETURNING clause for one affected row.
 /// `Star` expands to all columns; `Expr` is evaluated against the row.
+///
+/// `rowid` (with `table`) resolves the rowid pseudo-column: SQLite
+/// allows `RETURNING rowid` (and the `_rowid_`/`oid` spellings,
+/// optionally qualified by the target table's name), which is NOT a
+/// real column of the row payload — it resolves to the affected row's
+/// rowid. A real column with the spelling's name shadows it, and
+/// WITHOUT ROWID / virtual tables have no rowid to report.
 fn project_returning_row(
     returning: &[crate::sql::ast::ResultColumn],
     row: &[Value],
     col_names: &[String],
+    table: &crate::schema::Table,
+    rowid: Option<i64>,
     params: &[Value],
     named_params: &HashMap<String, Value>,
 ) -> Result<Vec<Value>> {
@@ -2628,11 +2637,65 @@ fn project_returning_row(
             crate::sql::ast::ResultColumn::Star => out.extend_from_slice(row),
             crate::sql::ast::ResultColumn::TableStar(_) => out.extend_from_slice(row),
             crate::sql::ast::ResultColumn::Expr { expr, .. } => {
-                out.push(eval_row(expr, row, col_names, params, named_params)?);
+                if let Some(v) = returning_rowid_value(expr, col_names, table, rowid) {
+                    out.push(v);
+                } else {
+                    out.push(eval_row(expr, row, col_names, params, named_params)?);
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// The rowid pseudo-column in a RETURNING projection, if this expression
+/// resolves to it. See `project_returning_row` for the rules.
+fn returning_rowid_value(
+    expr: &crate::sql::ast::Expr,
+    col_names: &[String],
+    table: &crate::schema::Table,
+    rowid: Option<i64>,
+) -> Option<Value> {
+    if table.vtab.is_some() || table.without_rowid {
+        return None;
+    }
+    let crate::sql::ast::Expr::Column { table: qual, name } = expr else {
+        return None;
+    };
+    if let Some(q) = qual {
+        // Qualified reference: must name the target table.
+        if !q.eq_ignore_ascii_case(&table.name) {
+            return None;
+        }
+    }
+    let is_spelling = name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid");
+    if !is_spelling {
+        return None;
+    }
+    // A real column with the spelling's name shadows the pseudo-column
+    // (SQLite's resolution rule).
+    if col_names.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    rowid.map(Value::Integer)
+}
+
+/// The rowid a RETURNING projection should report for an UPDATE: the
+/// NEW row's rowid-alias value when the row moved (`UPDATE t SET id=X`),
+/// else the row's current rowid.
+fn effective_returning_rowid(
+    table: &crate::schema::Table,
+    new_row: &[Value],
+    fallback: i64,
+) -> i64 {
+    table
+        .rowid_alias
+        .and_then(|a| new_row.get(a))
+        .filter(|v| matches!(v, Value::Integer(_)))
+        .map(|v| v.as_integer())
+        .unwrap_or(fallback)
 }
 
 /// Extract the WHERE predicate from an UPDATE/DELETE source plan: the
@@ -4906,6 +4969,13 @@ pub fn expr_display_name(e: &Expr) -> String {
                 // original function name here without more context. The Project's
                 // caller should supply an alias.
                 name.clone()
+            } else if crate::planner::is_hidden_rowid(name) {
+                // The internal hidden rowid slot ("\0rowid" /
+                // "prefix.\0rowid") renders under its user spelling —
+                // SQLite reports "rowid"; the NUL marker must never leak
+                // into an output column name (CString::new rejects NULs,
+                // so the compat ABI would report no name at all).
+                "rowid".to_string()
             } else if let Some(pos) = name.rfind('.') {
                 name[pos + 1..].to_string()
             } else {
@@ -15819,6 +15889,10 @@ fn exec_insert_inner(
                     ret,
                     row,
                     &col_names,
+                    &table,
+                    // The module assigns the rowid inside xUpdate;
+                    // RETURNING rowid reports NULL there (as before).
+                    None,
                     &ctx.params,
                     &ctx.named_params,
                 )?);
@@ -16025,7 +16099,7 @@ fn exec_insert_inner(
                 }
                 ctx.table_append_hint = None;
             }
-            let outcome = exec_insert_one_row(
+            let (outcome, landed_rowid) = exec_insert_one_row(
                 ctx,
                 &table,
                 &table_name_lc,
@@ -16064,6 +16138,8 @@ fn exec_insert_inner(
                             ret,
                             &full_row,
                             &col_names,
+                            &table,
+                            Some(landed_rowid),
                             &ctx.params,
                             &ctx.named_params,
                         )?);
@@ -16076,6 +16152,8 @@ fn exec_insert_inner(
                             ret,
                             &full_row,
                             &col_names,
+                            &table,
+                            Some(landed_rowid),
                             &ctx.params,
                             &ctx.named_params,
                         )?);
@@ -16225,7 +16303,7 @@ fn exec_insert_inner(
         )?;
         enforce_child_fks(ctx, &table, &full_row)?;
 
-        let outcome = exec_insert_one_row(
+        let (outcome, landed_rowid) = exec_insert_one_row(
             ctx,
             &table,
             &table_name_lc,
@@ -16247,6 +16325,8 @@ fn exec_insert_inner(
                         ret,
                         &full_row,
                         &col_names,
+                        &table,
+                        Some(landed_rowid),
                         &ctx.params,
                         &ctx.named_params,
                     )?);
@@ -16474,7 +16554,7 @@ pub fn fast_insert_literal_rows(
             ctx.table_append_hint = None;
         }
 
-        let outcome = exec_insert_one_row(
+        let (outcome, _landed_rowid) = exec_insert_one_row(
             ctx,
             table,
             &table_name_lc,
@@ -16577,7 +16657,7 @@ pub fn fast_insert_single_row(
     )?;
     enforce_child_fks(ctx, table, &full_row)?;
 
-    let outcome = exec_insert_one_row(
+    let (outcome, _landed_rowid) = exec_insert_one_row(
         ctx,
         table,
         &table_name_lc,
@@ -16665,7 +16745,11 @@ fn exec_insert_one_row(
     upsert: Option<&crate::sql::ast::UpsertClause>,
     rowid_autogen_hint: bool,
     explicit_rowid: Option<i64>,
-) -> Result<InsertOutcome> {
+) -> Result<(InsertOutcome, i64)> {
+    // Returns (outcome, landed rowid) — the RETURNING projection needs
+    // the affected row's rowid (`RETURNING rowid`), which lives in no
+    // row payload column on tables without an INTEGER PRIMARY KEY
+    // alias.
     // Compute rowid. `rowid_was_autogenerated` tracks whether WE assigned
     // the rowid (vs. the user providing it explicitly). This is used below
     // to skip the redundant `lookup_table` check when we KNOW the rowid is
@@ -16859,7 +16943,7 @@ fn exec_insert_one_row(
             }
         }
         match on_conflict {
-            ConflictResolution::Ignore => return Ok(InsertOutcome::Skipped),
+            ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
             ConflictResolution::Replace => {
                 // Delete the conflicting row from the table and from
                 // all indexes (we'll re-insert the new row below).
@@ -17057,7 +17141,7 @@ fn exec_insert_one_row(
                             bt.delete_table(rowid)?;
                             bt.insert_table(rowid, payload)?;
                         }
-                        ConflictResolution::Ignore => return Ok(InsertOutcome::Skipped),
+                        ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
                         _ => {
                             let pk = table
                                 .rowid_alias
@@ -17141,7 +17225,7 @@ fn exec_insert_one_row(
     ctx.last_insert_rowid = rowid;
     ctx.changes += 1;
     ctx.set_max_rowid_lc(table_name_lc, rowid);
-    Ok(InsertOutcome::Inserted)
+    Ok((InsertOutcome::Inserted, rowid))
 }
 
 /// Consume an unused payload (helper to make the control flow above clear).
@@ -17166,9 +17250,9 @@ fn exec_upsert_row(
     index_states: &mut [IndexMaintState],
     existing_rowid: i64,
     upsert: &crate::sql::ast::UpsertClause,
-) -> Result<InsertOutcome> {
+) -> Result<(InsertOutcome, i64)> {
     match &upsert.action {
-        crate::sql::ast::UpsertAction::DoNothing => Ok(InsertOutcome::Skipped),
+        crate::sql::ast::UpsertAction::DoNothing => Ok((InsertOutcome::Skipped, existing_rowid)),
         crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } => {
             // Read the existing row.
             let mut bt = Btree::new(ctx.pager, *current_root, false);
@@ -17176,14 +17260,14 @@ fn exec_upsert_row(
                 LookupResult::Found(p) => p,
                 LookupResult::NotFound => {
                     // Shouldn't happen (index said it exists) — treat as insert.
-                    return Ok(InsertOutcome::Skipped);
+                    return Ok((InsertOutcome::Skipped, existing_rowid));
                 }
             };
             let n_cols = table.n_columns();
             let old_row = match decode_row(&old_payload, n_cols, existing_rowid, table.rowid_alias)
             {
                 Ok(r) => r,
-                Err(_) => return Ok(InsertOutcome::Skipped),
+                Err(_) => return Ok((InsertOutcome::Skipped, existing_rowid)),
             };
 
             // Build a combined evaluation context: unqualified refs → the
@@ -17239,7 +17323,7 @@ fn exec_upsert_row(
             if let Some(w) = where_clause {
                 let v = eval_row(w, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
                 if !v.is_truthy() {
-                    return Ok(InsertOutcome::Skipped);
+                    return Ok((InsertOutcome::Skipped, existing_rowid));
                 }
             }
 
@@ -17306,7 +17390,7 @@ fn exec_upsert_row(
             *full_row = new_row;
             ctx.changes += 1;
             ctx.last_insert_rowid = existing_rowid;
-            Ok(InsertOutcome::UpdatedExisting)
+            Ok((InsertOutcome::UpdatedExisting, existing_rowid))
         }
     }
 }
@@ -18314,6 +18398,8 @@ fn exec_update(
                                 ret,
                                 &new_row,
                                 &col_names,
+                                &table,
+                                Some(effective_returning_rowid(&table, &new_row, rowid)),
                                 &ctx.params,
                                 &ctx.named_params,
                             )?);
@@ -18409,6 +18495,8 @@ fn exec_update(
                 ret,
                 &new_row,
                 &col_names,
+                &table,
+                Some(effective_returning_rowid(&table, &new_row, rowid)),
                 &ctx.params,
                 &ctx.named_params,
             )?);
@@ -18612,6 +18700,8 @@ fn exec_update_from(
                                 ret,
                                 &new_row,
                                 &plain_cols,
+                                table,
+                                Some(effective_returning_rowid(table, &new_row, rowid)),
                                 &ctx.params,
                                 &ctx.named_params,
                             )?);
@@ -18679,6 +18769,8 @@ fn exec_update_from(
                 ret,
                 &new_row,
                 &plain_cols,
+                table,
+                Some(effective_returning_rowid(table, &new_row, rowid)),
                 &ctx.params,
                 &ctx.named_params,
             )?);
@@ -19167,6 +19259,8 @@ fn try_streaming_update(
                         ret,
                         &new_row,
                         col_names,
+                        table,
+                        Some(effective_returning_rowid(table, &new_row, rowid)),
                         &params,
                         &named_params,
                     )?);
@@ -20604,6 +20698,8 @@ fn process_update_row(
             ret,
             new_row,
             col_names,
+            table,
+            Some(effective_returning_rowid(table, new_row, rowid)),
             params,
             named_params,
         )?);
@@ -21153,6 +21249,8 @@ fn try_streaming_delete(
                     ret,
                     &row,
                     &col_names,
+                    table,
+                    Some(rid),
                     &params,
                     &named_params,
                 )?);
@@ -21325,6 +21423,8 @@ fn exec_delete(
                             ret,
                             &row,
                             names,
+                            &table,
+                            Some(rowid_val),
                             &ctx.params,
                             &ctx.named_params,
                         )?);
@@ -21391,6 +21491,8 @@ fn exec_delete(
                 ret,
                 row,
                 &col_names,
+                &table,
+                Some(rowid),
                 &ctx.params,
                 &ctx.named_params,
             )?);

@@ -445,3 +445,32 @@ Work Log:
 
 Stage Summary:
 - Third engine bug fixed from the one audit: shared-roots staleness across DDL — a correctness bug for ANY drop/recreate or rename-then-reuse pattern, not just the repair path.
+
+---
+Task ID: 20-verify
+Agent: main (Super Z)
+Task: Remote CI verification for 2d3e15c (the shared-roots fix)
+
+Work Log:
+- CI check-runs for 2d3e15c queried via the API: 22/22 completed success, including the ci-ok aggregate (rustfmt, clippy x4 configs, tests on all 3 OSes x all feature configs, oom-injection, compat ABI, torture x3, sqlite file interop x3, bench-gates x3).
+
+Stage Summary:
+- Master green at 2d3e15c. The roots-retirement fix rides the full matrix.
+
+---
+Task ID: 21
+Agent: main (Super Z)
+Task: Solve the remaining two threads: (1) the compat-layer `SELECT COUNT(*) AS n` column-name bug noted in Task 20's backlog; (2) keep expanding the reliability test suite (SQLite-harness practices) with everything green.
+
+Work Log:
+- TDD: pinned the reported bug first — tests/statement_api.rs `prepare_count_star_alias_name` + `prepare_index_count_alias_name` FAILED as expected (column_name == "COUNT(*)" instead of the alias).
+- BUG 1 fixed — COUNT fast paths dropped the AS alias: the CountStar / IndexCount precompiled paths (api.rs) built their output columns from AggExpr::display_name only. Now the explicit AS alias wins (ProjectExpr alias -> AggExpr alias -> display name), matching SQLite's short-column-name rule and every other route (resolve_projection and bare_column_projection already honored pe.alias; the materialized Project path always did).
+- Suite expansion, SQLite colname.test-inspired: new tests/column_names.rs (11 tests) — alias precedence across expression shapes; short unqualified names for t.a; star / table-star / join-star / subquery-star expansion; rowid pseudo-column contract; aggregate display names; ROUTE PARITY (query_with_columns vs prepare/step, 27 shapes — the divergence catcher for exactly the fast-path bug class); COUNT fast path names vs materialized; view + subquery names; RETURNING names AND values; NUL-sentinel leak battery across 10 shapes x 2 routes; view aliases survive close/reopen (durability tie-in).
+- The suite's probe found BUG 2 — hidden-rowid sentinel leaked into output names: `SELECT rowid FROM t` reported "\0rowid" (the internal hidden-slot marker, planner's rewrite_rowid_in_expr_inner) — and because CString::new rejects interior NULs, the C ABI's sqlite3_column_name returned NOTHING for it (sqlx saw an unnameable column). Fixed at both naming boundaries: executor expr_display_name + statement.rs expr_display render hidden-rowid slots as "rowid" (engine normalizes all spellings rowid/_rowid_/oid to the canonical form — pinned as documented behavior).
+- Value probe found BUG 3 — `RETURNING rowid` reported the name but NULL/0 as the VALUE: the RETURNING projection evaluates against the row payload, where the rowid pseudo-column doesn't exist on tables without an INTEGER PRIMARY KEY alias. Fixed: project_returning_row now takes the affected row's rowid + the table; returning_rowid_value resolves the pseudo-column spellings (qualified by the target table's name, real column shadows, WITHOUT ROWID/vtab excluded); effective_returning_rowid handles UPDATE rowid-moves (reports the NEW rowid, SQLite NEW-row semantics). exec_insert_one_row now returns (InsertOutcome, landed_rowid) — threaded to all 11 projection sites (INSERT x3 routes + vtab(None), UPDATE x5, DELETE x3). exec_upsert_row propagates the existing row's rowid for DO UPDATE.
+- Compat-ABI counterparts (the sqlx-visible surface): compat_abi.rs +2 tests — `abi_count_alias_fast_paths_report_alias` (the original report: prepare-time column_name for COUNT(*) AS n / AS hits, aliased and bound-parameter forms, unaliased keeps "COUNT(*)") and `abi_rowid_pseudo_column_names` (rowid/qualified join rowid/aliased/real-column-shadow; would have been blank names before the NUL fix).
+- README: column_names row in the testing table + run command.
+- Verification: column_names 11/11, statement_api 16/16, compat_abi 55/55, sqlx_driver 35/35 (--features sqlx), full default matrix 65 suites green via the sequential runner (crash_recovery re-verified standalone after the runner's capture timeout; oom_fault green under --features oom-injection, 516 fault points), lib 186 green, doc-tests 5/5, fmt clean, clippy -D warnings clean in all 4 configs (default/no-default/sqlx/workspace + compat crate all-targets).
+
+Stage Summary:
+- Three real engine bugs found by the new suite and fixed (COUNT-alias drop, NUL-sentinel name leak, RETURNING rowid value NULL) — each pinned by failing-first tests at the engine level AND at the C-ABI level where sqlx sees them. Suite count: tests/column_names.rs 11 + statement_api +2 + compat_abi +2.

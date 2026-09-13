@@ -7219,12 +7219,19 @@ impl Database {
                         .map(bind_expr)
                         .collect::<Option<Vec<_>>>()?;
                     let pre_encoded = pre_encode_literal_keys(&keys, index);
+                    // Output name: an explicit AS alias wins (SQLite's
+                    // short-column-name rule — name-based consumers like
+                    // sqlx resolve by the alias), else the display form.
+                    let out_name = agg
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| agg.display_name.clone());
                     Some(FastPath::IndexCount {
                         table: table.clone(),
                         index: index.clone(),
                         keys,
                         pre_encoded,
-                        columns: std::sync::Arc::from(vec![agg.display_name.clone()]),
+                        columns: std::sync::Arc::from(vec![out_name]),
                     })
                 }
                 _ => None,
@@ -7262,9 +7269,15 @@ impl Database {
             if table.vtab.is_some() {
                 return None;
             }
+            // Output name: an explicit AS alias wins (SQLite's
+            // short-column-name rule), else the display form.
+            let out_name = agg
+                .alias
+                .clone()
+                .unwrap_or_else(|| agg.display_name.clone());
             Some(FastPath::CountStar {
                 table: table.clone(),
-                columns: std::sync::Arc::from(vec![agg.display_name.clone()]),
+                columns: std::sync::Arc::from(vec![out_name]),
             })
         }
         if let Plan::Aggregate {
@@ -7396,14 +7409,20 @@ impl Database {
                                 .map(bind_expr)
                                 .collect::<Option<Vec<_>>>()?;
                             let pre_encoded = pre_encode_literal_keys(&keys, index);
+                            // The Project's column may carry the alias
+                            // (the `__agg_N` rewrite keeps it); fall back
+                            // to the aggregate's own alias, then display.
+                            let out_name = columns[0]
+                                .alias
+                                .clone()
+                                .or_else(|| aggregates[0].alias.clone())
+                                .unwrap_or_else(|| aggregates[0].display_name.clone());
                             Some(FastPath::IndexCount {
                                 table: table.clone(),
                                 index: index.clone(),
                                 keys,
                                 pre_encoded,
-                                columns: std::sync::Arc::from(vec![aggregates[0]
-                                    .display_name
-                                    .clone()]),
+                                columns: std::sync::Arc::from(vec![out_name]),
                             })
                         } else {
                             bare_count_star_fp(input, group_by, aggregates)
