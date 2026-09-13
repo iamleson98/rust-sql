@@ -474,3 +474,14 @@ Work Log:
 
 Stage Summary:
 - Three real engine bugs found by the new suite and fixed (COUNT-alias drop, NUL-sentinel name leak, RETURNING rowid value NULL) — each pinned by failing-first tests at the engine level AND at the C-ABI level where sqlx sees them. Suite count: tests/column_names.rs 11 + statement_api +2 + compat_abi +2.
+
+---
+Task ID: 21-verify
+Agent: main (Super Z)
+Task: Remote CI verification for b8a26ed
+
+Work Log:
+- CI run 34788558466: COMPLETED SUCCESS — 22/22 jobs (rustfmt, clippy x4 configs, tests ubuntu/windows/macos across default/no-default/sqlx configs — the column_names suite runs in every one, compat ABI, oom-injection, torture x3 OSes, sqlite file interop x3, bench-gates x3 — every performance gate held, ci-ok aggregate green).
+
+Stage Summary:
+- The naming-contract task is delivered end-to-end: 3 engine bugs fixed (COUNT fast-path AS-alias drop, hidden-rowid NUL-sentinel leak, RETURNING rowid value), 15 new tests riding the full CI matrix, master green at b8a26ed.
