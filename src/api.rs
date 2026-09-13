@@ -2831,7 +2831,7 @@ impl Database {
             .into_iter()
             .filter(|(n, _)| {
                 let n = n.as_str();
-                n != "sqlite_master" && n != "sqlite_schema"
+                n != "sqlite_master" && n != "sqlite_schema" && !self.catalog.is_temp(n)
             })
             .collect();
         let indexes: HashMap<String, std::sync::Arc<Index>> = self
@@ -2840,12 +2840,24 @@ impl Database {
             .into_iter()
             // The WITHOUT ROWID PK index is engine-internal: SQLite files
             // never carry one (the table b-tree is the PK index there).
-            .filter(|(_, i)| i.origin != crate::schema::IndexOrigin::WithoutRowidPk)
+            // TEMP indexes (explicit or on temp tables) never persist.
+            .filter(|(_, i)| {
+                i.origin != crate::schema::IndexOrigin::WithoutRowidPk
+                    && !self.catalog.is_temp(&i.name)
+            })
             .collect();
-        let views: HashMap<String, std::sync::Arc<crate::schema::View>> =
-            self.catalog.all_views().into_iter().collect();
-        let triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>> =
-            self.catalog.all_triggers().into_iter().collect();
+        let views: HashMap<String, std::sync::Arc<crate::schema::View>> = self
+            .catalog
+            .all_views()
+            .into_iter()
+            .filter(|(n, _)| !self.catalog.is_temp(n))
+            .collect();
+        let triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>> = self
+            .catalog
+            .all_triggers()
+            .into_iter()
+            .filter(|(n, _)| !self.catalog.is_temp(n))
+            .collect();
 
         // ---- Emit-order resolution ----
         let mut order = foreign.order.lock().clone();
@@ -7954,12 +7966,15 @@ impl Database {
                 }
             }
             None => {
-                // Every user table (skip the schema pseudo-tables and
-                // sqlite_stat1 itself).
+                // Every user table (skip the schema pseudo-tables,
+                // sqlite_stat1 itself, and TEMP tables — temp stats would
+                // persist rows referencing a table that is gone on reopen).
                 catalog
                     .all_tables()
                     .into_iter()
-                    .filter(|(name, t)| !name.starts_with("sqlite_") && t.vtab.is_none())
+                    .filter(|(name, t)| {
+                        !name.starts_with("sqlite_") && t.vtab.is_none() && !catalog.is_temp(name)
+                    })
                     .map(|(_, t)| t)
                     .collect()
             }
@@ -8218,6 +8233,7 @@ impl Database {
                 without_rowid,
                 strict,
                 if_not_exists,
+                temp,
                 as_select,
             } => {
                 // Tables and views share one namespace (see the View arm).
@@ -8375,14 +8391,22 @@ impl Database {
                         ));
                     }
                 }
-                let schema_row = crate::schema::encode_schema_row(
-                    "table",
-                    &table.name,
-                    &table.name,
-                    root_page,
-                    &table.create_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // TEMP tables are connection-scoped: catalog-only, no
+                // schema-btree row, nothing persisted (SQLite temp-schema
+                // semantics — gone after close/reopen).
+                if !temp {
+                    let schema_row = crate::schema::encode_schema_row(
+                        "table",
+                        &table.name,
+                        &table.name,
+                        root_page,
+                        &table.create_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                }
+                if temp {
+                    catalog.mark_temp(&table.name);
+                }
                 catalog.add_table(table.clone());
 
                 // Implicit UNIQUE indexes — mirrors SQLite's
@@ -8504,14 +8528,19 @@ impl Database {
                     // keeps the synthesized DDL for reopen (load_schema
                     // rebuilds implicit indexes from the TABLE's DDL and
                     // matches them to these rows by name + rootpage).
-                    let schema_row = crate::schema::encode_schema_row_opt(
-                        "index",
-                        &index.name,
-                        &index.table,
-                        idx_root,
-                        None,
-                    );
-                    insert_schema_row(ctx.pager, &schema_row)?;
+                    // A temp table's autoindexes are temp too: catalog-only.
+                    if !temp {
+                        let schema_row = crate::schema::encode_schema_row_opt(
+                            "index",
+                            &index.name,
+                            &index.table,
+                            idx_root,
+                            None,
+                        );
+                        insert_schema_row(ctx.pager, &schema_row)?;
+                    } else {
+                        catalog.mark_temp(&index.name);
+                    }
                     catalog.add_index(index);
                 }
                 // WITHOUT ROWID PRIMARY KEY uniqueness: the internal
@@ -8657,6 +8686,7 @@ impl Database {
             CreateStatement::Index {
                 unique,
                 if_not_exists,
+                temp,
                 name,
                 table: table_name,
                 columns,
@@ -8789,14 +8819,22 @@ impl Database {
                     root_page: final_root,
                     ..index
                 };
-                let schema_row = crate::schema::encode_schema_row(
-                    "index",
-                    &index.name,
-                    &index.table,
-                    final_root,
-                    &index.create_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // SQLite: an index on a TEMP table is itself temp. Either
+                // way (declared TEMP, or temp target), the index is
+                // catalog-only — no schema row, nothing persisted.
+                let is_temp = temp || catalog.is_temp(&index.table);
+                if !is_temp {
+                    let schema_row = crate::schema::encode_schema_row(
+                        "index",
+                        &index.name,
+                        &index.table,
+                        final_root,
+                        &index.create_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                } else {
+                    catalog.mark_temp(&index.name);
+                }
                 catalog.add_index(index);
                 // Post-build warm tap: validate the boundary leaves and
                 // seed the leaf-hint cache through the read path, so the
@@ -8815,6 +8853,7 @@ impl Database {
                 columns,
                 select,
                 if_not_exists,
+                temp,
             } => {
                 // Tables and views share one namespace (SQLite: creating a
                 // view with an existing TABLE's name fails with "table X
@@ -8835,14 +8874,19 @@ impl Database {
                     select: *select,
                     create_sql: original_sql.to_string(),
                 };
-                let schema_row = crate::schema::encode_schema_row(
-                    "view",
-                    &view.name,
-                    &view.name,
-                    0,
-                    &view.create_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // TEMP views are catalog-only (SQLite temp schema).
+                if !temp {
+                    let schema_row = crate::schema::encode_schema_row(
+                        "view",
+                        &view.name,
+                        &view.name,
+                        0,
+                        &view.create_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                } else {
+                    catalog.mark_temp(&view.name);
+                }
                 catalog.add_view(view);
                 ctx.pager.flush()?;
                 Ok(())
@@ -8905,14 +8949,21 @@ impl Database {
                     create_sql: original_sql.to_string(),
                     validated: std::sync::atomic::AtomicBool::new(false),
                 };
-                let schema_row = crate::schema::encode_schema_row(
-                    "trigger",
-                    &trig.name,
-                    &trig.table,
-                    0,
-                    &trig.create_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // SQLite: a trigger on a TEMP table is itself temp.
+                // Either way, catalog-only — no schema row.
+                let is_temp = t.temp || catalog.is_temp(&trig.table);
+                if !is_temp {
+                    let schema_row = crate::schema::encode_schema_row(
+                        "trigger",
+                        &trig.name,
+                        &trig.table,
+                        0,
+                        &trig.create_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                } else {
+                    catalog.mark_temp(&trig.name);
+                }
                 catalog.add_trigger(trig);
                 ctx.pager.flush()?;
                 Ok(())
@@ -9070,15 +9121,20 @@ impl Database {
                 catalog.rename_fk_references(&old_name, &new_name);
 
                 // Schema row: delete old, insert new (kind=table,
-                // name/tbl_name=new, same root, new SQL).
-                delete_schema_row(ctx.pager, "table", &old_name)?;
-                let schema_row =
-                    crate::schema::encode_schema_row("table", &new_name, &new_name, root, &new_sql);
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // name/tbl_name=new, same root, new SQL). TEMP tables
+                // never had a row — and the temp mark already followed
+                // the rename (rename_table) — so this is catalog-only.
+                if !catalog.is_temp(&new_name) {
+                    delete_schema_row(ctx.pager, "table", &old_name)?;
+                    let schema_row = crate::schema::encode_schema_row(
+                        "table", &new_name, &new_name, root, &new_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
 
-                // Index schema rows keep name and SQL but tbl_name follows.
-                rewrite_index_tbl_names(ctx.pager, &old_name, &new_name)?;
-                rewrite_trigger_tbl_names(ctx.pager, &old_name, &new_name)?;
+                    // Index schema rows keep name and SQL but tbl_name follows.
+                    rewrite_index_tbl_names(ctx.pager, &old_name, &new_name)?;
+                    rewrite_trigger_tbl_names(ctx.pager, &old_name, &new_name)?;
+                }
 
                 ctx.pager.flush()?;
                 Ok(())
@@ -9166,19 +9222,27 @@ impl Database {
                     )?;
                 }
                 let table_name = rebuilt.name.clone();
+                // drop_table clears the temp mark — carry it across the
+                // drop/re-add dance (TEMP scope survives ADD COLUMN).
+                let was_temp = catalog.is_temp(&a.table);
                 catalog.drop_table(&a.table);
                 catalog.add_table(rebuilt);
+                if was_temp {
+                    catalog.mark_temp(&table_name);
+                }
 
-                // Schema row rewrite.
-                delete_schema_row(ctx.pager, "table", &table.name)?;
-                let schema_row = crate::schema::encode_schema_row(
-                    "table",
-                    &table_name,
-                    &table_name,
-                    root,
-                    &new_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // Schema row rewrite (TEMP tables: catalog-only, skip).
+                if !was_temp {
+                    delete_schema_row(ctx.pager, "table", &table.name)?;
+                    let schema_row = crate::schema::encode_schema_row(
+                        "table",
+                        &table_name,
+                        &table_name,
+                        root,
+                        &new_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                }
 
                 // Physical back-fill: append the default to every existing
                 // row. (SQLite stores the default in the schema and
@@ -9334,15 +9398,17 @@ impl Database {
                             let other_root = ctx.table_root(&other);
                             let other_display = other.name.clone();
                             catalog.replace_table(&other_name, rebuilt_other);
-                            delete_schema_row(ctx.pager, "table", &other_display)?;
-                            let schema_row = crate::schema::encode_schema_row(
-                                "table",
-                                &other_display,
-                                &other_display,
-                                other_root,
-                                &new_other_sql,
-                            );
-                            insert_schema_row(ctx.pager, &schema_row)?;
+                            if !catalog.is_temp(&other_display) {
+                                delete_schema_row(ctx.pager, "table", &other_display)?;
+                                let schema_row = crate::schema::encode_schema_row(
+                                    "table",
+                                    &other_display,
+                                    &other_display,
+                                    other_root,
+                                    &new_other_sql,
+                                );
+                                insert_schema_row(ctx.pager, &schema_row)?;
+                            }
                         }
                     }
                 }
@@ -9372,8 +9438,9 @@ impl Database {
                                 idx.origin == crate::schema::IndexOrigin::WithoutRowidPk;
                             catalog.replace_index(&idx_name, rebuilt_idx);
                             // The WITHOUT ROWID PK index has no schema row
-                            // (engine-internal) — catalog-only rename.
-                            if !internal_wr_pk {
+                            // (engine-internal) — catalog-only rename; TEMP
+                            // indexes never had one either.
+                            if !internal_wr_pk && !catalog.is_temp(&display_name) {
                                 delete_schema_row(ctx.pager, "index", &display_name)?;
                                 let schema_row = crate::schema::encode_schema_row(
                                     "index",
@@ -9393,16 +9460,18 @@ impl Database {
                 //    lists, INSERT column lists, SET targets).
                 rewrite_object_sql_column_refs(ctx.pager, catalog, &table_name, &old_name, &new)?;
 
-                // 6. Rewrite this table's schema row.
-                delete_schema_row(ctx.pager, "table", &table_name)?;
-                let schema_row = crate::schema::encode_schema_row(
-                    "table",
-                    &table_name,
-                    &table_name,
-                    root,
-                    &new_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // 6. Rewrite this table's schema row (TEMP: catalog-only).
+                if !catalog.is_temp(&table_name) {
+                    delete_schema_row(ctx.pager, "table", &table_name)?;
+                    let schema_row = crate::schema::encode_schema_row(
+                        "table",
+                        &table_name,
+                        &table_name,
+                        root,
+                        &new_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                }
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -9634,16 +9703,18 @@ impl Database {
                     let _ = new_n_cols;
                 }
 
-                // 4. Rewrite the schema row.
-                delete_schema_row(ctx.pager, "table", &table_name)?;
-                let schema_row = crate::schema::encode_schema_row(
-                    "table",
-                    &table_name,
-                    &table_name,
-                    root,
-                    &new_sql,
-                );
-                insert_schema_row(ctx.pager, &schema_row)?;
+                // 4. Rewrite the schema row (TEMP: catalog-only).
+                if !catalog.is_temp(&table_name) {
+                    delete_schema_row(ctx.pager, "table", &table_name)?;
+                    let schema_row = crate::schema::encode_schema_row(
+                        "table",
+                        &table_name,
+                        &table_name,
+                        root,
+                        &new_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                }
                 ctx.pager.flush()?;
                 Ok(())
             }

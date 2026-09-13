@@ -289,6 +289,13 @@ pub struct Catalog {
     /// by `load_schema`'s stat-table walk; read on every indexed lookup
     /// plan decision.
     stat1: HashMap<String, IndexStats>,
+    /// TEMP-object names (lowercased) — `CREATE TEMP TABLE/INDEX/VIEW/
+    /// TRIGGER` (and indexes/triggers on temp tables). Connection-scoped
+    /// exactly like SQLite's temp schema: fully usable this session,
+    /// NEVER persisted to the schema b-tree or any dump/image, gone
+    /// after close/reopen. Kept as a side registry (not a struct field)
+    /// so `load_schema` needs no changes — persisted rows are never temp.
+    temp_objects: std::collections::HashSet<String>,
 }
 
 /// One `sqlite_stat1` row: the planner's estimate inputs for an index.
@@ -617,6 +624,30 @@ impl Catalog {
             return None;
         }
         let t = self.tables.remove(&old_key)?;
+        // TEMP scope capture BEFORE the moves: autoindexes get NEW names
+        // on rename (sqlite_autoindex_<table>_<n>), so old marks are
+        // collected now and re-keyed to the moved entries afterwards.
+        let was_temp = self.temp_objects.remove(&old_key);
+        let temp_moved_idx: Vec<String> = self
+            .indexes_by_table
+            .get(&old_key)
+            .map(|l| {
+                l.iter()
+                    .map(|i| i.name.to_ascii_lowercase())
+                    .filter(|n| self.temp_objects.remove(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let temp_moved_trig: Vec<String> = self
+            .triggers_by_table
+            .get(&old_key)
+            .map(|l| {
+                l.iter()
+                    .map(|t| t.name.to_ascii_lowercase())
+                    .filter(|n| self.temp_objects.remove(n))
+                    .collect()
+            })
+            .unwrap_or_default();
         // Move index registrations.
         if let Some(idx_list) = self.indexes_by_table.remove(&old_key) {
             for idx in &idx_list {
@@ -659,9 +690,45 @@ impl Catalog {
                     .push(t2);
             }
         }
+        // Re-key the TEMP marks under the new names.
+        if was_temp {
+            self.temp_objects.insert(new_key.clone());
+            // Every index on a temp table is temp (create-time invariant:
+            // autoindexes are marked at CREATE, explicit indexes follow
+            // the table's scope) — mark by the MOVED entries' new names.
+            if let Some(l) = self.indexes_by_table.get(&new_key) {
+                for i in l {
+                    self.temp_objects.insert(i.name.to_ascii_lowercase());
+                }
+            }
+        } else {
+            // A table rename doesn't change explicit index names —
+            // restore the individually-temp-marked ones (CREATE TEMP
+            // INDEX ON <permanent table> keeps its scope).
+            for n in temp_moved_idx {
+                self.temp_objects.insert(n);
+            }
+        }
+        for n in temp_moved_trig {
+            // Trigger names never change on table rename.
+            self.temp_objects.insert(n);
+        }
         self.tables.insert(new_key, t);
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
         Some(())
+    }
+
+    /// Mark an object as TEMP: connection-scoped, never persisted.
+    /// Called by the CREATE paths for `CREATE TEMP ...` (and for objects
+    /// that follow a temp table's scope — indexes, triggers).
+    pub fn mark_temp(&mut self, name: &str) {
+        self.temp_objects.insert(name.to_ascii_lowercase());
+        self.schema_cookie = self.schema_cookie.wrapping_add(1);
+    }
+
+    /// Is this object TEMP (connection-scoped, not persisted)?
+    pub fn is_temp(&self, name: &str) -> bool {
+        self.temp_objects.contains(&name.to_ascii_lowercase())
     }
 
     /// Replace a table's Arc in place (used by ALTER TABLE RENAME after
@@ -679,16 +746,19 @@ impl Catalog {
     pub fn drop_table(&mut self, name: &str) -> Option<Arc<Table>> {
         let key = name.to_ascii_lowercase();
         let t = self.tables.remove(&key)?;
+        self.temp_objects.remove(&key);
         // Remove all indexes on this table.
         if let Some(idx_list) = self.indexes_by_table.remove(&key) {
             for idx in idx_list {
                 self.indexes.remove(&idx.name.to_ascii_lowercase());
+                self.temp_objects.remove(&idx.name.to_ascii_lowercase());
             }
         }
         // Remove triggers on this table.
         if let Some(trig_list) = self.triggers_by_table.remove(&key) {
             for trig in trig_list {
                 self.triggers.remove(&trig.name.to_ascii_lowercase());
+                self.temp_objects.remove(&trig.name.to_ascii_lowercase());
             }
         }
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
@@ -698,6 +768,7 @@ impl Catalog {
     pub fn drop_index(&mut self, name: &str) -> Option<Arc<Index>> {
         let key = name.to_ascii_lowercase();
         let idx = self.indexes.remove(&key)?;
+        self.temp_objects.remove(&key);
         if let Some(list) = self
             .indexes_by_table
             .get_mut(&idx.table.to_ascii_lowercase())
@@ -711,6 +782,7 @@ impl Catalog {
     pub fn drop_view(&mut self, name: &str) -> Option<Arc<View>> {
         let key = name.to_ascii_lowercase();
         let v = self.views.remove(&key)?;
+        self.temp_objects.remove(&key);
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
         Some(v)
     }
@@ -718,6 +790,7 @@ impl Catalog {
     pub fn drop_trigger(&mut self, name: &str) -> Option<Arc<Trigger>> {
         let key = name.to_ascii_lowercase();
         let t = self.triggers.remove(&key)?;
+        self.temp_objects.remove(&key);
         if let Some(list) = self
             .triggers_by_table
             .get_mut(&t.table.to_ascii_lowercase())

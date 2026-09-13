@@ -245,23 +245,23 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Statement> {
         self.advance(); // CREATE
                         // TEMP / TEMPORARY (and SQL-standard GLOBAL/LOCAL, which SQLite
-                        // accepts and ignores for temp objects). Temp objects live in the
-                        // same catalog with temp semantics — the executor already treats
-                        // them uniformly.
-        let _temp = self.consume_keyword("TEMP") || self.consume_keyword("TEMPORARY");
+                        // accepts and ignores for temp objects). TEMP objects are
+                        // connection-scoped: usable for the session, never persisted,
+                        // gone after close/reopen (SQLite temp-schema semantics).
+        let temp = self.consume_keyword("TEMP") || self.consume_keyword("TEMPORARY");
         let _global = self.consume_keyword("GLOBAL") || self.consume_keyword("LOCAL");
         let unique = self.consume_keyword("UNIQUE");
         if unique || self.peek().is_keyword("INDEX") {
-            return self.parse_create_index(unique);
+            return self.parse_create_index(unique, temp);
         }
         if self.peek().is_keyword("TABLE") {
-            return self.parse_create_table();
+            return self.parse_create_table(temp);
         }
         if self.peek().is_keyword("VIEW") {
-            return self.parse_create_view();
+            return self.parse_create_view(temp);
         }
         if self.peek().is_keyword("TRIGGER") {
-            return self.parse_create_trigger();
+            return self.parse_create_trigger(temp);
         }
         if self.peek().is_keyword("VIRTUAL") {
             return self.parse_create_virtual_table();
@@ -277,7 +277,7 @@ impl Parser {
         ))
     }
 
-    fn parse_create_table(&mut self) -> Result<Statement> {
+    fn parse_create_table(&mut self, temp: bool) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let if_not_exists = if self.peek().is_keyword("IF") {
             self.advance();
@@ -295,6 +295,7 @@ impl Parser {
             let select = self.parse_select()?;
             return Ok(Statement::Create(CreateStatement::Table {
                 if_not_exists,
+                temp,
                 name,
                 columns: Vec::new(),
                 constraints: Vec::new(),
@@ -341,6 +342,7 @@ impl Parser {
             }
             return Ok(Statement::Create(CreateStatement::Table {
                 if_not_exists,
+                temp,
                 name,
                 columns,
                 constraints: Vec::new(),
@@ -370,6 +372,7 @@ impl Parser {
         }
         Ok(Statement::Create(CreateStatement::Table {
             if_not_exists,
+            temp,
             name,
             columns,
             constraints,
@@ -863,7 +866,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {
+    fn parse_create_index(&mut self, unique: bool, temp: bool) -> Result<Statement> {
         self.expect_keyword("INDEX")?;
         let if_not_exists = if self.peek().is_keyword("IF") {
             self.advance();
@@ -888,6 +891,7 @@ impl Parser {
         Ok(Statement::Create(CreateStatement::Index {
             unique,
             if_not_exists,
+            temp,
             name,
             table,
             columns,
@@ -978,7 +982,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn parse_create_view(&mut self) -> Result<Statement> {
+    fn parse_create_view(&mut self, temp: bool) -> Result<Statement> {
         self.expect_keyword("VIEW")?;
         let if_not_exists = if self.peek().is_keyword("IF") {
             self.advance();
@@ -1001,13 +1005,14 @@ impl Parser {
         let select = self.parse_select()?;
         Ok(Statement::Create(CreateStatement::View {
             if_not_exists,
+            temp,
             name,
             columns,
             select: Box::new(select),
         }))
     }
 
-    fn parse_create_trigger(&mut self) -> Result<Statement> {
+    fn parse_create_trigger(&mut self, temp: bool) -> Result<Statement> {
         self.expect_keyword("TRIGGER")?;
         let name = self.parse_ident()?;
         let when = if self.peek().is_keyword("BEFORE") {
@@ -1076,6 +1081,7 @@ impl Parser {
         self.expect_keyword("END")?;
         Ok(Statement::Create(CreateStatement::Trigger(CreateTrigger {
             name,
+            temp,
             table,
             when,
             events,

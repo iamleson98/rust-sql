@@ -378,3 +378,40 @@ Work Log:
 
 Stage Summary:
 - Three real leaks fixed (allocator family, engine registry, root-children cache); the compat ABI now honors SQLite's memory contract; app-side fixes continue in the parent repo (rust-be-template).
+Task ID: 18-verify
+Agent: main (Super Z)
+Task: Remote CI verification for 7a095f6
+
+Work Log:
+- Pushed the flake fix as 7a095f6; CI run 34749076456 COMPLETED SUCCESS — 21/21 jobs (rustfmt, clippy x4 configs, tests ubuntu/windows/macos all configs incl. the de-flaked auth suite, torture x3 OSes, sqlite file interop x3, oom-injection, compat ABI, bench-gates x3 — every performance gate held).
+
+Stage Summary:
+- Both user-requested features are merged, verified end-to-end locally AND on remote CI. Master green at 7a095f6.
+
+---
+Task ID: 19
+Agent: main (Super Z)
+Task: Comprehensive reliability/durability test suite (SQLite-harness practices), CI green; fix any bugs found
+
+Work Log:
+- New tests/durability.rs (31 tests) — the close-then-reopen matrix, modeled on SQLite's persist.test / trans2.test / autoindex1.test / boundary2.test practices:
+  - Constraint survival battery: rowid-alias PK, TEXT/uuid PK (the reported bug class — autoindex rebuild), WITHOUT ROWID composite PK, UNIQUE (column + composite, NULL multiplicity), COLLATE NOCASE UNIQUE, CHECK, NOT NULL, DEFAULT, FK actions (CASCADE/SET NULL/RESTRICT), AUTOINCREMENT floors — every flavor re-probed with NEGATIVE tests after EVERY reopen cycle (constraint loosening is the failure mode; data re-query alone never catches it).
+  - Schema-object survival: indexes (plain/UNIQUE/partial/expression/DESC — INDEXED BY resolution, index-scan == table-scan checksums, DDL DESC persistence), views (join+aggregate), triggers (AFTER/BEFORE/INSTEAD OF firing post-reopen), generated columns (VIRTUAL + STORED), sqlite_stat1, ALTER evolution (ADD COLUMN default read-back, RENAME, DROP COLUMN).
+  - Value fidelity: i64 MIN/MAX, f64 extremes/subnormals/-0.0, empty text, astral/combining Unicode, embedded NUL, blobs (empty/0x00/0xFF/64 KiB) — bit-exact round-trips.
+  - 12-generation churn soak with per-generation FNV checksums + per-generation constraint probes + quick_check (native format); 6-generation variant on sqlite-format.
+  - Durability semantics: committed survives / uncommitted absent on graceful close (SQLite sqlite3_close contract), WAL commits survive without explicit checkpoint, idle reopen byte-stable (3 cycles), VACUUM + reopen, image() -> open_in_memory_with_image full re-verification (backup-API contract).
+  - sqlite-format (foreign) battery: the full constraint matrix + generation soak + byte stability through open_sqlite_format; format-confusion contract pinned (native file refused by open_sqlite_format + undamaged; sqlite-format file BRIDGED by native open with identical data — the documented interop sniff).
+  - rapid_open_close_churn: 40 open/verify/append/close cycles.
+- REAL BUG FOUND AND FIXED — TEMP objects persisted to disk: the parser consumed and DISCARDED the TEMP keyword (`let _temp = ...`), so `CREATE TEMP TABLE` wrote a permanent sqlite_master row — connection-scoped scratch data silently became durable (privacy + correctness: SQLite temp objects are session-scoped and never touch the main file). Fix (SQLite temp-schema semantics, minimal surface):
+  - ast.rs: `temp: bool` threaded through CreateStatement::Table/Index/View + CreateTrigger.
+  - parser.rs: parse_create captures TEMP/TEMPORARY into the statement.
+  - schema/mod.rs: Catalog gains a temp_objects registry (mark_temp/is_temp) with hooks so marks survive rename (autoindexes re-key), drop, and the ALTER drop/re-add dance.
+  - api.rs: temp CREATE paths skip every schema-row persistence (table row, implicit autoindex rows, index/view/trigger rows); indexes/triggers on temp tables follow the table's scope (SQLite rule); ALTER RENAME/ADD COLUMN/RENAME COLUMN/DROP COLUMN guards; ANALYZE skips temp tables (no stat rows referencing session-scoped tables); collect_foreign_dump filters temp objects from sqlite-format files/images.
+  - Residual documented limitation: temp data pages may occupy unreferenced pages in the file until DROP/VACUUM reclaims them (bytes-on-disk, not visibility; crash-safe either way) — full byte isolation needs a separate temp pager (major executor refactor, deferred).
+  - 3 new tests pin the contract: temp table scoped, temp view/index/trigger scoped (incl. CREATE INDEX on temp table + trigger side-effects on permanent tables persisting), temp survives ALTER and vanishes.
+- Two other probes confirmed CORRECT (no fix needed): graceful close rolls back open transactions (uncommitted zero-leak); COMMIT without explicit flush is durable.
+- Verification: default matrix 63/63 suites green sequentially (crash_recovery "all crash points passed" delete+wal; oom_fault green under --features oom-injection; sqlx config: durability/regression/differential/cli_ops/sqlx_driver/feature_parity green; no-default config: 8 key suites green); doc-tests 5/5; cargo fmt clean; clippy -D warnings clean in all 4 configs (default/sqlx/no-default/workspace); durability suite 5 consecutive runs green (no flakes); disk-constrained sandbox handled via sequential build-run-delete runner (scripts/run_tests_seq.sh preserved under /home/z/my-project/scripts/).
+- README: durability row added to the testing table; run command listed.
+
+Stage Summary:
+- 31 new durability tests + one real engine bug fixed (TEMP persistence) with the fix pinned by tests. Suite rides the existing CI matrix automatically (cargo test --lib --tests on ubuntu/windows/macos x3 configs).

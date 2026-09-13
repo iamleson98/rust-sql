@@ -56,12 +56,19 @@ pub enum CreateStatement {
         constraints: Vec<TableConstraint>,
         without_rowid: bool,
         strict: bool,
+        /// `CREATE TEMP TABLE` — the object is connection-scoped: usable
+        /// for the session, never persisted, gone after close/reopen
+        /// (SQLite temp-schema semantics).
+        temp: bool,
         /// CREATE TABLE t AS SELECT ... — materialize this query.
         as_select: Option<Box<SelectStatement>>,
     },
     Index {
         unique: bool,
         if_not_exists: bool,
+        /// `CREATE TEMP INDEX` — or an index on a temp table (SQLite: the
+        /// index follows its table's scope).
+        temp: bool,
         name: String,
         table: String,
         columns: Vec<IndexedColumn>,
@@ -69,6 +76,8 @@ pub enum CreateStatement {
     },
     View {
         if_not_exists: bool,
+        /// `CREATE TEMP VIEW` — connection-scoped, never persisted.
+        temp: bool,
         name: TableName,
         columns: Option<Vec<String>>,
         select: Box<SelectStatement>,
@@ -88,6 +97,8 @@ pub enum CreateStatement {
 #[derive(Clone, Debug)]
 pub struct CreateTrigger {
     pub name: String,
+    /// `CREATE TEMP TRIGGER` — connection-scoped, never persisted.
+    pub temp: bool,
     pub table: String,
     pub when: TriggerWhen,
     pub events: Vec<TriggerEvent>,
