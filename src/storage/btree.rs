@@ -1300,10 +1300,35 @@ thread_local! {
 /// the root's own search would). Only armed in scattered mode (see
 /// `Btree::tl_hint_miss_streak`) so single point lookups never pay the
 /// recording pass.
-type RootChildrenMap = std::collections::HashMap<PageId, (u64, Vec<(i64, PageId)>)>;
+///
+/// ## Boundedness (the unbounded-growth fix)
+///
+/// Entries are keyed by `PageId` only. When a table's root SPLITS the
+/// tree grows a NEW root — the old root's entry stays behind as dead
+/// weight forever (it is still a valid page, but no longer any tree's
+/// root: nothing probes it, nothing replaces it, nothing removes it).
+/// One stale entry per root split per thread, accumulating for the
+/// process lifetime — a slow, permanent RSS leak under write churn.
+///
+/// The epoch guard makes every entry from a PRIOR epoch useless (the
+/// probe path already rejects them), so the fix is the same shape
+/// `LeafHintCache` uses: when a recording arrives under a new epoch,
+/// drop the WHOLE map. That bounds it to the roots actively recorded
+/// in the current epoch — a handful — with zero behavioral change
+/// (cross-epoch entries could never produce a hit anyway).
+struct RootChildrenCache {
+    /// Epoch the current entries were recorded under (`u64::MAX` forces
+    /// the initial clear). Epochs pack (instance_id, write_version), so
+    /// a different database object also reads as "moved".
+    epoch: u64,
+    map: std::collections::HashMap<PageId, (u64, Vec<(i64, PageId)>)>,
+}
 thread_local! {
-    static ROOT_CHILDREN: std::cell::RefCell<RootChildrenMap> =
-        std::cell::RefCell::new(std::collections::HashMap::default());
+    static ROOT_CHILDREN: std::cell::RefCell<RootChildrenCache> =
+        std::cell::RefCell::new(RootChildrenCache {
+            epoch: u64::MAX, // force clear on first use
+            map: std::collections::HashMap::default(),
+        });
 }
 
 /// Probe the root-children routing for `rowid`: the first entry whose
@@ -1313,7 +1338,7 @@ thread_local! {
 #[inline]
 fn root_child_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageId> {
     ROOT_CHILDREN.with(|c| {
-        let m = c.borrow();
+        let m = &c.borrow().map;
         let (ep, entries) = m.get(&root)?;
         if *ep != epoch {
             return None;
@@ -1325,11 +1350,18 @@ fn root_child_page(root: PageId, rowid: i64, epoch: u64) -> Option<PageId> {
 
 /// Record the root's full (separator, child) routing under `epoch`.
 /// Replaces any previous mapping for this root (an epoch change means
-/// the old separators may no longer route correctly).
+/// the old separators may no longer route correctly); a recording under
+/// a NEW epoch first drops every stale entry (see the struct docs —
+/// split-off roots would otherwise accumulate forever).
 #[inline]
 fn set_root_children(root: PageId, epoch: u64, entries: Vec<(i64, PageId)>) {
     ROOT_CHILDREN.with(|c| {
-        c.borrow_mut().insert(root, (epoch, entries));
+        let mut cache = c.borrow_mut();
+        if cache.epoch != epoch {
+            cache.map.clear();
+            cache.epoch = epoch;
+        }
+        cache.map.insert(root, (epoch, entries));
     });
 }
 

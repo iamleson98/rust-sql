@@ -228,6 +228,9 @@ extern "C" {
         flags: c_int,
     ) -> c_int;
     fn sqlite3_free(p: *mut c_void);
+    fn sqlite3_malloc(n: c_int) -> *mut c_void;
+    fn sqlite3_malloc64(n: u64) -> *mut c_void;
+    fn sqlite3_realloc(p: *mut c_void, n: c_int) -> *mut c_void;
 }
 
 #[test]
@@ -1640,6 +1643,105 @@ fn abi_probe_delete_in_subquery_returning() {
 // ---------------------------------------------------------------------------
 // sqlite3_serialize / sqlite3_deserialize
 // ---------------------------------------------------------------------------
+
+/// The allocator contract, verified through the C ABI: malloc'd blocks
+/// are writeable, distinct, 8-aligned, and genuinely released by
+/// free; realloc preserves the prefix and releases the old block;
+/// free(NULL) and realloc(NULL, n) are safe. Guards the regression
+/// where `sqlite3_free` reconstructed a ZERO-CAPACITY Vec (deallocating
+/// nothing — every block leaked byte-for-byte) and `sqlite3_realloc`
+/// orphaned the old buffer on every resize.
+#[test]
+fn abi_malloc_free_realloc_round_trip() {
+    unsafe {
+        // Distinct, aligned, writeable allocations.
+        let a = sqlite3_malloc(64);
+        assert!(!a.is_null(), "malloc(64) returned NULL");
+        assert_eq!(a as usize % 8, 0, "malloc must be 8-aligned");
+        let b = sqlite3_malloc64(64);
+        assert!(
+            !b.is_null() && b != a,
+            "distinct allocations must not alias"
+        );
+        std::ptr::write_bytes(a as *mut u8, 0xAB, 64);
+        assert_eq!(*(a as *mut u8), 0xAB, "allocated memory must be writeable");
+
+        // realloc: contents preserved, old block released, grown region
+        // writeable.
+        let a2 = sqlite3_realloc(a, 128);
+        assert!(!a2.is_null(), "realloc grow failed");
+        assert_eq!(*(a2 as *mut u8), 0xAB, "realloc must preserve the prefix");
+        std::ptr::write_bytes(a2 as *mut u8, 0xCD, 128);
+
+        // realloc shrink keeps the prefix too.
+        let a3 = sqlite3_realloc(a2, 16);
+        assert!(!a3.is_null(), "realloc shrink failed");
+        assert_eq!(*(a3 as *mut u8), 0xCD, "shrink must preserve the prefix");
+
+        // realloc(NULL, n) == malloc(n); realloc(p, 0) == free + NULL.
+        let from_null = sqlite3_realloc(std::ptr::null_mut(), 32);
+        assert!(!from_null.is_null(), "realloc(NULL, n) must allocate");
+        let zero = sqlite3_realloc(from_null, 0);
+        assert!(zero.is_null(), "realloc(p, 0) must free and return NULL");
+
+        // free on every surviving block; free(NULL) is a no-op.
+        sqlite3_free(a3 as *mut c_void);
+        sqlite3_free(b as *mut c_void);
+        sqlite3_free(std::ptr::null_mut());
+    }
+}
+
+/// A large churn loop through malloc/free — with the leaking
+/// implementation this grew RSS monotonically (every block retained,
+/// ~100 MB of cumulative traffic across these iterations); with the
+/// tracked allocator the footprint is flat. The threshold is generous
+/// because /proc/self/status sees the WHOLE test binary (sibling tests
+/// running in parallel threads allocate too) and the global allocator
+/// may retain arenas — but none of that approaches the old leak's
+/// full-traffic growth.
+#[test]
+fn abi_malloc_free_churn_stays_bounded() {
+    let rss_kib = || -> i64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                return rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        0
+    };
+    // Warm up allocator arenas so the first measurement is not noise.
+    unsafe {
+        for i in 0..64 {
+            let p = sqlite3_malloc(1024 + i * 37);
+            sqlite3_free(p);
+        }
+    }
+    let before = rss_kib();
+    unsafe {
+        // ~100 MB of cumulative allocation traffic, freed in lockstep.
+        for i in 0..2048 {
+            let size = 64 + (i * 131) % 131_072; // varied sizes, ~48 KB avg
+            let p = sqlite3_malloc(size as c_int);
+            assert!(!p.is_null());
+            std::ptr::write_bytes(p as *mut u8, 0, size.min(16) as usize);
+            sqlite3_free(p);
+        }
+    }
+    let after = rss_kib();
+    // Live data must be flat: with the old zero-capacity-free bug this
+    // loop added the full ~100 MB to RSS. Allow a 48 MiB slack for
+    // sibling-test allocation and allocator-arena retention on CI boxes.
+    let growth = after - before;
+    assert!(
+        growth < 48 * 1024,
+        "malloc/free churn grew RSS by {growth} KiB — blocks are leaking"
+    );
+}
 
 /// Serialize -> deserialize round trip through the C ABI: build data,
 /// take the image, open a FRESH connection, deserialize into it, and

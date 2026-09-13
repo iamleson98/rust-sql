@@ -362,3 +362,19 @@ Work Log:
 
 Stage Summary:
 - Flaky-test fix ready to push; the auth implementation itself was never wrong.
+
+---
+Task ID: 19
+Agent: main (Super Z — backend audit, app-repo task)
+Task: Memory-leak audit of the compat layer + engine hot paths commissioned by the parent app's "gradual idle RSS growth" investigation; fix every unbounded-growth bug found.
+
+Work Log:
+- Audited the whole compat crate + the engine's idle write path (0-row DELETE...RETURNING poll, 1/s): statement step/reset/clear, pager/WAL/journal, executor contexts, plan cache — all verified bounded; the app's idle loop set is clean in isolation.
+- Fix 1 — sqlite3_malloc/free/realloc leaked EVERY block (HIGH, latent): free/realloc reconstructed `Vec::from_raw_parts(p, 0, 0)` — a zero-length AND zero-capacity Vec whose drop deallocates nothing; realloc also orphaned the old buffer on every resize. Replaced with a 16-byte header (capacity + 8-alignment) so free/realloc reconstruct the exact Layout and hand the block back to the global allocator; sqlite3_realloc now implements SQLite's contract (NULL-in == malloc, n<=0 == free+NULL, failure leaves the old block untouched, prefix copied on resize). sqlite3_serialize now allocates through the tracked path (the old Vec+forget shape leaked one whole DB image per serialize round-trip, FREED by deserialize's FREEONCE... into the no-op free).
+- Fix 2 — engines() registry held strong Arcs forever (MED): every distinct database file ever opened retained a whole Database (page cache, catalog, stmt cache, WAL state). Entries are now Weak — engine lifetime = its connections' lifetime; acquire_engine upgrades-or-recreates under the registry lock (close/open races structurally safe: no split-state window); engine_stats() sweeps dead Weaks under the same lock.
+- Fix 3 — ROOT_CHILDREN thread-local routing cache never evicted split-off roots (MED): entries keyed by PageId only; a root split leaves the old root's entry as unreachable dead weight forever (one per split per thread — permanent slow leak under write churn). Recording under a new epoch now clears the map first (cross-epoch entries were already useless to the probe path; epochs pack instance_id+write_version so a different Database also reads as "moved").
+- tests/compat_abi.rs: allocator contract suite (distinct/aligned/writeable blocks, realloc prefix preservation grow+shrink, realloc(NULL,n)/realloc(p,0), free(NULL)) + a malloc/free churn test asserting flat RSS (~100MB of traffic; the old bug retained all of it) + the serialize/deserialize round-trips now exercise the tracked allocator end-to-end via FREEONCE.
+- Verified: compat_abi 53/53 (incl. 3 new/updated), fmt clean, clippy -D warnings clean (default + workspace configs).
+
+Stage Summary:
+- Three real leaks fixed (allocator family, engine registry, root-children cache); the compat ABI now honors SQLite's memory contract; app-side fixes continue in the parent repo (rust-be-template).

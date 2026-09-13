@@ -274,8 +274,19 @@ pub fn engine_stats() -> EngineStats {
     let mut tx_begun: u64 = 0;
     let mut tx_committed: u64 = 0;
     let mut tx_rolled_back: u64 = 0;
-    if let Ok(map) = engines().lock() {
-        for (name, engine) in map.iter() {
+    if let Ok(mut map) = engines().lock() {
+        // Housekeeping: sweep entries whose engine died (the map is the
+        // only Weak holder, so dead Weaks otherwise linger until the
+        // next same-key open replaces them — unbounded map growth by
+        // itself, even though the engines are long gone).
+        map.retain(|_, weak| weak.strong_count() > 0);
+        for (name, weak) in map.iter() {
+            // Skip engines whose connections are all gone — they are
+            // no longer part of the live footprint (and their Weak is
+            // about to be swept by the retain above on the NEXT call).
+            let Some(engine) = weak.upgrade() else {
+                continue;
+            };
             let db = engine.db.read();
             let pager = db.pager();
             tx_begun += pager.tx_begun_total();
@@ -431,8 +442,22 @@ impl Engine {
     }
 }
 
-fn engines() -> &'static StdMutex<HashMap<String, Arc<Engine>>> {
-    static ENGINES: OnceLock<StdMutex<HashMap<String, Arc<Engine>>>> = OnceLock::new();
+/// Registry of live shared engines, keyed by canonical database
+/// identity (file path or shared-memory name).
+///
+/// Entries are `Weak`: the ENGINE's lifetime is the lifetime of its
+/// CONNECTIONS (each `Conn` holds a strong `Arc`), not the process.
+/// Before the Weak change the map held strong Arcs and never removed
+/// entries — every distinct database file ever opened (rotating temp
+/// files, pool-created-then-dropped test DBs, serialize staging)
+/// leaked a WHOLE `Database` (page cache, catalog, statement cache, WAL
+/// state, ~2-4 MiB each) for the process lifetime. A weak entry simply
+/// dies with the last connection; the next open upgrades-or-recreates
+/// under the registry lock, which makes close/open races structurally
+/// safe: either the opener upgrades the still-live engine (shared) or
+/// it builds a fresh one from the on-disk file — no split-state window.
+fn engines() -> &'static StdMutex<HashMap<String, std::sync::Weak<Engine>>> {
+    static ENGINES: OnceLock<StdMutex<HashMap<String, std::sync::Weak<Engine>>>> = OnceLock::new();
     ENGINES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -655,6 +680,11 @@ impl Drop for Conn {
             // other blocked connections' callbacks.
             unsafe { fire_unlock_waiters(engine) };
         }
+        // NOTE: no registry cleanup needed here — the engines() map
+        // holds its engines WEAKLY (see `engines`): when this was the
+        // last connection, the engine (page cache, catalog, WAL state)
+        // is freed simply by the Arc dropping, and the stale Weak entry
+        // is swept by the next engine_stats()/open pass.
     }
 }
 
@@ -1271,19 +1301,22 @@ fn acquire_engine(
         }
         OpenTarget::Shared(key) => {
             let mut map = engines().lock().unwrap();
-            if let Some(e) = map.get(key) {
-                Ok((Some(e.clone()), false))
-            } else {
-                let db = open_engine(target, create, readonly)?;
-                let e = Arc::new(Engine {
-                    db: parking_lot::RwLock::new(db),
-                    tx_owner: AtomicUsize::new(0),
-                    live_connections: AtomicUsize::new(0),
-                    unlock_waiters: StdMutex::new(Vec::new()),
-                });
-                map.insert(key.clone(), e.clone());
-                Ok((Some(e), false))
+            // Weak upgrade-or-recreate under the registry lock: a live
+            // engine (some connection still holds it) is shared; a dead
+            // one is replaced from the on-disk file. Both orders are
+            // correct for close/open races (see `engines` docs).
+            if let Some(e) = map.get(key).and_then(std::sync::Weak::upgrade) {
+                return Ok((Some(e), false));
             }
+            let db = open_engine(target, create, readonly)?;
+            let e = Arc::new(Engine {
+                db: parking_lot::RwLock::new(db),
+                tx_owner: AtomicUsize::new(0),
+                live_connections: AtomicUsize::new(0),
+                unlock_waiters: StdMutex::new(Vec::new()),
+            });
+            map.insert(key.clone(), Arc::downgrade(&e));
+            Ok((Some(e), false))
         }
         OpenTarget::File(p) => {
             // Existence-independent key (see engine_file_key): the flip
@@ -1292,19 +1325,20 @@ fn acquire_engine(
             // not split one file across two engines.
             let key = engine_file_key(p);
             let mut map = engines().lock().unwrap();
-            if let Some(e) = map.get(&key) {
-                Ok((Some(e.clone()), false))
-            } else {
-                let db = open_engine(target, create, readonly)?;
-                let e = Arc::new(Engine {
-                    db: parking_lot::RwLock::new(db),
-                    tx_owner: AtomicUsize::new(0),
-                    live_connections: AtomicUsize::new(0),
-                    unlock_waiters: StdMutex::new(Vec::new()),
-                });
-                map.insert(key, e.clone());
-                Ok((Some(e), false))
+            // Same weak upgrade-or-recreate discipline as the Shared
+            // arm — see the comment there and the `engines` docs.
+            if let Some(e) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+                return Ok((Some(e), false));
             }
+            let db = open_engine(target, create, readonly)?;
+            let e = Arc::new(Engine {
+                db: parking_lot::RwLock::new(db),
+                tx_owner: AtomicUsize::new(0),
+                live_connections: AtomicUsize::new(0),
+                unlock_waiters: StdMutex::new(Vec::new()),
+            });
+            map.insert(key, Arc::downgrade(&e));
+            Ok((Some(e), false))
         }
     }
 }
@@ -4064,13 +4098,19 @@ pub unsafe extern "C" fn sqlite3_serialize(
             if !size.is_null() {
                 *size = bytes.len() as i64;
             }
-            // sqlite3_malloc's allocation discipline: capacity-backed
-            // Vec, forgotten here, freed by sqlite3_free.
-            let mut v = Vec::<u8>::with_capacity(bytes.len().max(1));
-            v.extend_from_slice(&bytes);
-            let p = v.as_mut_ptr() as *mut c_uchar;
-            std::mem::forget(v);
-            p
+            // Allocate through the tracked sqlite3_malloc discipline so
+            // the caller's sqlite3_free actually releases the image
+            // (the old Vec+forget shape leaked the whole DB image on
+            // every serialize round-trip).
+            let p = sqlite_alloc(bytes.len().max(1));
+            if p.is_null() {
+                if !size.is_null() {
+                    *size = 0;
+                }
+                return std::ptr::null_mut();
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+            p as *mut c_uchar
         }
         Err(_) => {
             if !size.is_null() {
@@ -4157,40 +4197,116 @@ fn load_image_as_database(bytes: &[u8]) -> Result<rustqlite::Database, ()> {
 }
 
 // ---------------------------------------------------------------------------
-// Memory (libc-backed)
+// Memory (header-tracked, genuinely freed)
 // ---------------------------------------------------------------------------
+//
+// SQLite's allocator contract: blocks from sqlite3_malloc/realloc are
+// released by sqlite3_free / resized by sqlite3_realloc, and realloc's
+// copy length is the caller's burden to know (it knows the old size).
+//
+// The previous implementation leaked EVERY block: malloc built a
+// `Vec::with_capacity(n)` and forgot it (a real allocation), but free
+// reconstructed `Vec::from_raw_parts(p, 0, 0)` — a Vec with length 0 AND
+// capacity 0 whose drop deallocates NOTHING (a zero-capacity Vec does
+// not own its pointer). realloc likewise dropped a zero-capacity Vec
+// (leaking the old block) and allocated a fresh one. Any consumer of
+// these symbols (sqlite3_serialize round-trips, future backup/C code)
+// grew RSS monotonically, byte-for-byte with its allocations.
+//
+// The fix tracks the allocation size in a 16-byte header immediately
+// before the returned pointer, so free/realloc can reconstruct the
+// exact `Layout` and give the block back to the global allocator.
+//
+// Layout:  [ header (16 B) ][ user bytes (cap) ]
+//            ^-- capacity     ^-- returned pointer (8-aligned)
+// A 16-byte header keeps the returned pointer 8-aligned (SQLite's
+// documented guarantee) given the base allocation's 8-byte alignment,
+// and leaves room for the `usize` capacity plus padding.
+
+/// Header size prepended to every sqlite3_malloc block (see above).
+const SQLITE_MEM_HDR: usize = 16;
+/// Alignment guaranteed to the caller (SQLite's `SQLITE_PTR_SZ` world).
+const SQLITE_MEM_ALIGN: usize = 8;
+
+/// Allocate `n` bytes (n clamped to >= 1 — the historical behavior of
+/// this layer returns a non-NULL pointer for zero) and return the
+/// user pointer. `NULL` only on allocator exhaustion.
+fn sqlite_alloc(n: usize) -> *mut c_void {
+    let cap = n.max(1);
+    // The only failure mode is size overflow — impossible for any
+    // realistic request (c_int / u64 from SQLite call sites) but
+    // handled anyway instead of panicking inside FFI.
+    let layout = match std::alloc::Layout::from_size_align(SQLITE_MEM_HDR + cap, SQLITE_MEM_ALIGN) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let base = unsafe { std::alloc::alloc(layout) };
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (base as *mut usize).write(cap) };
+    unsafe { base.add(SQLITE_MEM_HDR) as *mut c_void }
+}
+
+/// Reconstruct the allocation `Layout` from a user pointer previously
+/// returned by [`sqlite_alloc`]. `None` on a corrupt header.
+unsafe fn sqlite_layout_of(p: *mut c_void) -> Option<std::alloc::Layout> {
+    let base = (p as *mut u8).sub(SQLITE_MEM_HDR);
+    let cap = unsafe { (base as *const usize).read() };
+    std::alloc::Layout::from_size_align(SQLITE_MEM_HDR + cap, SQLITE_MEM_ALIGN).ok()
+}
+
+/// Free a block, giving its bytes AND header back to the allocator.
+unsafe fn sqlite_dealloc(p: *mut c_void) {
+    if let Some(layout) = sqlite_layout_of(p) {
+        let base = (p as *mut u8).sub(SQLITE_MEM_HDR);
+        unsafe { std::alloc::dealloc(base, layout) };
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_malloc(n: c_int) -> *mut c_void {
-    let n = n.max(0) as usize;
-    let mut v = Vec::<u8>::with_capacity(n.max(1));
-    let p = v.as_mut_ptr() as *mut c_void;
-    std::mem::forget(v);
-    p
+    sqlite_alloc(n.max(0) as usize)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_malloc64(n: u64) -> *mut c_void {
-    let mut v = Vec::<u8>::with_capacity((n as usize).max(1));
-    let p = v.as_mut_ptr() as *mut c_void;
-    std::mem::forget(v);
-    p
+    sqlite_alloc(n as usize)
 }
 
+/// SQLite semantics: `realloc(NULL, n)` == `malloc(n)`;
+/// `realloc(p, 0)` == `free(p)` + NULL; on failure the old block is
+/// left untouched and NULL is returned.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_realloc(p: *mut c_void, n: c_int) -> *mut c_void {
     if p.is_null() {
         return sqlite3_malloc(n);
     }
-    let old = Vec::from_raw_parts(p as *mut u8, 0, 0);
-    drop(old);
-    sqlite3_malloc(n.max(0))
+    if n <= 0 {
+        unsafe { sqlite_dealloc(p) };
+        return std::ptr::null_mut();
+    }
+    let new = sqlite_alloc(n as usize);
+    if new.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Copy min(old capacity, new request) — the caller's data is only
+    // defined up to whichever is smaller.
+    if let Some(old_layout) = sqlite_layout_of(p) {
+        let old_cap = old_layout.size() - SQLITE_MEM_HDR;
+        let copy_len = old_cap.min(n as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(p as *const u8, new as *mut u8, copy_len);
+        };
+    }
+    unsafe { sqlite_dealloc(p) };
+    new
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_free(p: *mut c_void) {
     if !p.is_null() {
-        drop(unsafe { Vec::from_raw_parts(p as *mut u8, 0, 0) });
+        unsafe { sqlite_dealloc(p) };
     }
 }
 
