@@ -1528,7 +1528,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             match crate::executor::json::call_json_function(&fname, args)? {
                 Some(v) => v,
                 None => {
-                    return Err(Error::semantic(format!("no such function: {}", name)));
+                    return Err(Error::NotFound(format!("no such function: {}", name)));
                 }
             }
         }

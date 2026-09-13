@@ -381,12 +381,11 @@ fn decline_under_left_join() {
 
 #[test]
 fn decline_ambiguous_unqualified() {
-    // `k` is exposed by BOTH atoms: ambiguous. The engine's documented
-    // policy is first-match (the left atom — s), SQLite errors; the
-    // pushdown must NOT resolve the ambiguity itself (pushing into u
-    // would flip the answer). Disjoint k-ranges make the resolutions
-    // distinguishable: s-resolution -> 2 s-rows x 3 u-rows = 6;
-    // u-resolution -> 3 x 3 = 9.
+    // `k` is exposed by BOTH atoms: ambiguous — SQLite errors at prepare
+    // and so does the engine now (namecheck: `ambiguous column name: k`).
+    // Historically the engine's policy was silent first-match (the left
+    // atom), which let the pushdown's decline semantics matter; the
+    // divergence is closed — the error arrives before any planning.
     let setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
                  CREATE INDEX idx_t_k ON t(k);
                  CREATE TABLE u (id INTEGER PRIMARY KEY, k INT, v INT);";
@@ -401,29 +400,32 @@ fn decline_ambiguous_unqualified() {
     for ins in inserts {
         eng.execute(ins, []).unwrap();
     }
-    // The pushdown must DECLINE the ambiguous conjunct: the subquery's
-    // body stays a plain scan (an index-driven body would mean the term
-    // was pushed — silently re-resolving the ambiguity).
-    let plan = explain(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, v INT);
-         CREATE INDEX idx_t_k ON t(k);
-         CREATE TABLE u (id INTEGER PRIMARY KEY, k INT, v INT)",
-        &[],
-        "SELECT COUNT(*) FROM (SELECT k, v FROM t) s, u WHERE k > 1",
-    );
-    assert!(
-        !plan.iter().any(|p| p.contains("SEARCH t USING INDEX")),
-        "the ambiguous conjunct must not be pushed into the subquery body, got {plan:?}"
-    );
-    // And the query itself must still execute (the engine's own
-    // ambiguity policy — first-match across atoms — is unchanged).
-    let rows = eng
+    // SQLite's own contract now governs (namecheck closes the historic
+    // first-match divergence): an unqualified name exposed by TWO
+    // same-level atoms errors `ambiguous column name: k` at PREPARE
+    // time — before the pushdown could ever re-resolve it silently.
+    // The plan shape is therefore moot; the error IS the contract.
+    let err = eng
         .query(
             "SELECT COUNT(*) FROM (SELECT k, v FROM t) s, u WHERE k > 1",
             [],
         )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ambiguous column name: k",
+        "the engine follows SQLite: ambiguous unqualified refs error at prepare"
+    );
+    // A QUALIFIED rewrite of the same query still plans and runs (the
+    // pushdown's decline behavior for the un-ambiguous spelling).
+    let rows = eng
+        .query(
+            "SELECT COUNT(*) FROM (SELECT k, v FROM t) s, u WHERE u.k > 10",
+            [],
+        )
         .unwrap();
-    let _ = rows;
+    // 3 s-rows x 2 qualifying u-rows (k=20,30) = 6.
+    assert_eq!(rows[0][0].as_integer(), 6);
 }
 
 #[test]

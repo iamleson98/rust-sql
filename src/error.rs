@@ -47,7 +47,14 @@ pub enum Error {
     Runtime(String),
     /// Caller asked for something that is not yet implemented.
     Unsupported(&'static str),
-    /// Schema object does not exist.
+    /// A prepare-time or execution-time lookup failure with SQLite's
+    /// EXACT message text (`no such table: x`, `no such column: t.x`,
+    /// `no such index: x`, `no such column: "old"`, `no such table:
+    /// main.x`, `unable to identify the object to be reindexed`, …).
+    /// The Display is deliberately prefix-free — SQLite's
+    /// `sqlite3_errmsg` renders these verbatim and ORMs pattern-match
+    /// the exact bytes. The payload carries the full message, not a
+    /// kind-qualified fragment.
     NotFound(String),
     /// Schema object already exists.
     AlreadyExists(String),
@@ -103,7 +110,9 @@ impl fmt::Display for Error {
             Error::Planner(m) => write!(f, "planner: {}", m),
             Error::Runtime(m) => write!(f, "runtime error: {}", m),
             Error::Unsupported(m) => write!(f, "unsupported: {}", m),
-            Error::NotFound(m) => write!(f, "not found: {}", m),
+            // Prefix-free: byte-identical to SQLite's errmsg (see the
+            // NotFound doc below).
+            Error::NotFound(m) => write!(f, "{}", m),
             Error::AlreadyExists(m) => write!(f, "already exists: {}", m),
             Error::InvalidArgument(m) => write!(f, "invalid argument: {}", m),
         }

@@ -26,8 +26,15 @@ pub enum Statement {
     Detach(DetachStatement),
     Vacuum(VacuumStatement),
     Alter(AlterStatement),
-    /// REINDEX — accepted grammar, a catalog no-op (B+tree indexes are
-    /// built page-identically on insert; rebuilding changes nothing).
+    /// REINDEX [schema.][table|index] — a catalog no-op (B+tree indexes are
+    /// built page-identically on insert; rebuilding changes nothing), but
+    /// the target must NAME something (SQLite: `unable to identify the
+    /// object to be reindexed`) — validated at prepare time.
+    Reindex {
+        target: Option<String>,
+    },
+    /// Legacy no-op marker (no longer produced by the parser; kept for
+    /// statement-match exhaustiveness during the transition).
     NoOp,
     /// ANALYZE [schema.][table|index] — collects index statistics into
     /// `sqlite_stat1` (SQLite's own contract: one row per index with

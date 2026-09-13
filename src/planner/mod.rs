@@ -5,6 +5,7 @@
 //! 2. **Plan shape**: SELECT → Project → (Filter → (Aggregate → (Sort → (Limit → Source))))
 //! 3. **Optimization**: index selection, predicate pushdown, join reordering.
 
+pub mod namecheck;
 pub mod plan;
 
 pub use plan::*;
@@ -742,7 +743,7 @@ impl<'a> Planner<'a> {
                 let table = self
                     .catalog
                     .get_table(name)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", name)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", name)))?;
                 // Pending virtual table (module not registered yet): the
                 // column list is unknown until xConnect, so planning
                 // would produce a wrong schema. Modules must be

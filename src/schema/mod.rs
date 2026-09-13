@@ -226,7 +226,7 @@ pub struct View {
 }
 
 /// A trigger in the catalog.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Trigger {
     pub name: String,
     pub table: String,
@@ -236,6 +236,31 @@ pub struct Trigger {
     pub when_clause: Option<crate::sql::ast::Expr>,
     pub body: Vec<crate::sql::ast::Statement>,
     pub create_sql: String,
+    /// First-fire validation gate (SQLite validates trigger bodies
+    /// lazily — at FIRE time, not CREATE time): flipped once the WHEN
+    /// clause and body statements have passed prepare-time name
+    /// resolution with NEW/OLD in scope. DDL replaces the whole Arc,
+    /// so the flag can never go stale against the schema it checked.
+    pub validated: std::sync::atomic::AtomicBool,
+}
+
+impl Clone for Trigger {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            table: self.table.clone(),
+            when: self.when,
+            events: self.events.clone(),
+            for_each_row: self.for_each_row,
+            when_clause: self.when_clause.clone(),
+            body: self.body.clone(),
+            create_sql: self.create_sql.clone(),
+            // A clone is a fresh registration: re-validate at first fire.
+            validated: std::sync::atomic::AtomicBool::new(
+                self.validated.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        }
+    }
 }
 
 /// The in-memory catalog: maps names to tables, indexes, views, triggers.
@@ -459,6 +484,10 @@ impl Catalog {
 
     pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         self.views.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+        self.triggers.get(&name.to_ascii_lowercase()).cloned()
     }
 
     pub fn indexes_on_table(&self, table: &str) -> Vec<Arc<Index>> {

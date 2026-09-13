@@ -152,18 +152,25 @@ impl Parser {
                 "REINDEX" => {
                     // REINDEX [collation | table | index]... — rebuilds
                     // indexes. B+tree indexes are built page-identically on
-                    // insert; rebuilding is a no-op that accepts the
-                    // grammar.
+                    // insert; rebuilding is a no-op — but the target, when
+                    // named, must exist (prepare-time validation in
+                    // namecheck: `unable to identify the object to be
+                    // reindexed`).
                     self.advance();
+                    let mut target = None;
                     if !self.peek().is_punct(';') && !matches!(self.peek().token, Token::Eof) {
                         let first = self.parse_ident_or_keyword()?;
                         if self.peek().is_punct('.') {
+                            // Schema-qualified: the object name is the part
+                            // after the dot (collations cannot be qualified).
                             self.advance();
-                            let _ = self.parse_ident_or_keyword()?;
+                            let obj = self.parse_ident_or_keyword()?;
+                            target = Some(obj);
+                        } else {
+                            target = Some(first);
                         }
-                        let _ = first;
                     }
-                    Ok(Statement::NoOp)
+                    Ok(Statement::Reindex { target })
                 }
                 _ => Err(Error::parse(
                     t.line,

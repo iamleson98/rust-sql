@@ -365,6 +365,11 @@ pub struct Database {
     /// plugin-scope guard entirely — one relaxed atomic load instead of
     /// a RwLock read + Arc clone + thread-local install per statement.
     has_plugins: std::sync::atomic::AtomicBool,
+    /// ATTACH-registered schema names (lowercased). The engine is
+    /// single-database: ATTACH accepts and records the name (matching
+    /// SQLite's observable ATTACH-then-DETACH round trip); DETACH of an
+    /// unregistered name errors `no such database: x`.
+    attached_schemas: Mutex<Vec<String>>,
     /// Hashes of SQL statements seen at least once ("cache on second
     /// sight" filter). Populating the statement cache costs ~1 µs (two
     /// String allocations for the key + FIFO order entry, write-lock, Arc
@@ -1972,6 +1977,7 @@ fn rewrite_object_sql_column_refs(
                                 when_clause: ct.when_clause,
                                 body: ct.body,
                                 create_sql: sql.to_string(),
+                                validated: std::sync::atomic::AtomicBool::new(false),
                             },
                         );
                     }
@@ -2186,6 +2192,7 @@ impl Database {
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
+            attached_schemas: Mutex::new(Vec::new()),
             foreign: None,
         })
     }
@@ -2315,6 +2322,7 @@ impl Database {
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
             has_plugins: std::sync::atomic::AtomicBool::new(false),
+            attached_schemas: Mutex::new(Vec::new()),
             foreign: None,
         }
     }
@@ -4158,7 +4166,7 @@ impl Database {
                         seen.push(idx);
                     }
                     None => {
-                        return Err(Error::semantic(format!(
+                        return Err(Error::NotFound(format!(
                             "table {} has no column named {}",
                             table.name, name
                         )));
@@ -4307,6 +4315,9 @@ impl Database {
             let t0 = profile::now();
             let stmt = parse(sql)?;
             profile::span(t0, &profile::PARSE_NS);
+            // Prepare-time name resolution (SQLite's resolver contract:
+            // unknown columns/tables error BEFORE any row is evaluated).
+            self.namecheck(&stmt)?;
             // View-DML targets are never planned (the planner resolves
             // tables only): resolve once and carry the target in the
             // entry — same contract as the cached path below. Without
@@ -4370,6 +4381,8 @@ impl Database {
         let t0 = profile::now();
         let stmt = parse(sql)?;
         profile::span(t0, &profile::PARSE_NS);
+        // Prepare-time name resolution — see the cache-disabled branch.
+        self.namecheck(&stmt)?;
         // WITH-clause statements are NEVER cached (and never hit): their
         // plans embed materialized CTE rows that must be recomputed per
         // execution. Planning here would also be wrong — the caller
@@ -4457,6 +4470,21 @@ impl Database {
         let mut memo = self.last_stmt.write();
         *memo = Some((sql.to_string(), Arc::clone(&entry)));
         Ok(entry)
+    }
+
+    /// Prepare-time name resolution: SQLite's resolver contract applied
+    /// to a freshly parsed statement (see `planner::namecheck`). Runs at
+    /// cache-fill time — DDL invalidates the cache, so the validation
+    /// can never go stale against the schema it checked.
+    fn namecheck(&self, stmt: &Statement) -> Result<()> {
+        // Plugin collations extend the collation universe (CREATE INDEX
+        // / COLLATE validation must accept them).
+        let extra: Vec<String> = if self.has_plugins.load(Ordering::Relaxed) {
+            self.plugins.read().collation_names()
+        } else {
+            Vec::new()
+        };
+        crate::planner::namecheck::validate_statement(&self.catalog, &extra, stmt)
     }
 
     /// Persist root-page moves (from B+tree splits) into the schema rows.
@@ -4777,6 +4805,35 @@ impl Database {
             let v = v.clone();
             drop(cached);
             return self.execute_vacuum(&v);
+        }
+        // ATTACH / DETACH: the engine is single-database, but the
+        // observable ATTACH→DETACH round trip must behave like SQLite's
+        // (DETACH of a never-attached name errors `no such database: x`).
+        if let Statement::Attach(a) = cached.stmt.as_ref() {
+            let name = a.schema.to_ascii_lowercase();
+            drop(cached);
+            let mut list = self.attached_schemas.lock();
+            if name == "main" {
+                return Err(Error::semantic("database main is already in use"));
+            }
+            if list.contains(&name) {
+                return Err(Error::semantic(format!(
+                    "database {} is already in use",
+                    name
+                )));
+            }
+            list.push(name);
+            return Ok(());
+        }
+        if let Statement::Detach(d) = cached.stmt.as_ref() {
+            let name = d.schema.clone();
+            drop(cached);
+            let mut list = self.attached_schemas.lock();
+            if let Some(pos) = list.iter().position(|s| s.eq_ignore_ascii_case(&name)) {
+                list.remove(pos);
+                return Ok(());
+            }
+            return Err(Error::NotFound(format!("no such database: {}", name)));
         }
         // `PRAGMA encoding = X` (write form): needs &self — ForeignSqlite
         // owns the encoding and the executor context cannot reach it.
@@ -6602,10 +6659,9 @@ impl Database {
                 match &ins.source {
                     InsertSource::Select(s) => {
                         let source_plan = planner.plan_select(s)?;
-                        let table = self
-                            .catalog
-                            .get_table(&ins.table)
-                            .ok_or_else(|| Error::NotFound(format!("table: {}", ins.table)))?;
+                        let table = self.catalog.get_table(&ins.table).ok_or_else(|| {
+                            Error::NotFound(format!("no such table: {}", ins.table))
+                        })?;
                         let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
                         crate::planner::plan::Plan::Insert {
                             table,
@@ -6651,7 +6707,7 @@ impl Database {
         let view = self
             .catalog
             .get_view(view_name)
-            .ok_or_else(|| Error::NotFound(format!("table: {}", view_name)))?;
+            .ok_or_else(|| Error::NotFound(format!("no such table: {}", view_name)))?;
         // View output column names (execution-time: star expansion needs
         // the live catalog).
         let view_cols: Vec<String> = {
@@ -7542,7 +7598,7 @@ impl Database {
         };
         let table = catalog
             .get_table(&ins.table)
-            .ok_or_else(|| Error::NotFound(format!("table: {}", ins.table)))?;
+            .ok_or_else(|| Error::NotFound(format!("no such table: {}", ins.table)))?;
         // Plan the source.
         let source_plan = match &ins.source {
             InsertSource::Values(rows) => crate::planner::plan::Plan::Values { rows: rows.clone() },
@@ -7576,7 +7632,7 @@ impl Database {
             let mut v = Vec::with_capacity(cols.len());
             for c in cols {
                 let idx = resolve_insert_column(table, c).ok_or_else(|| {
-                    Error::semantic(format!("column {} not in table {}", c, table.name))
+                    Error::NotFound(format!("table {} has no column named {}", table.name, c))
                 })?;
                 if idx != usize::MAX
                     && table
@@ -7624,7 +7680,7 @@ impl Database {
         };
         let table = catalog
             .get_table(&upd.table)
-            .ok_or_else(|| Error::NotFound(format!("table: {}", upd.table)))?;
+            .ok_or_else(|| Error::NotFound(format!("no such table: {}", upd.table)))?;
         let scan = crate::planner::plan::Plan::Scan {
             table: table.clone(),
             alias: upd.alias.clone(),
@@ -7743,7 +7799,7 @@ impl Database {
         };
         let table = catalog
             .get_table(&del.from)
-            .ok_or_else(|| Error::NotFound(format!("table: {}", del.from)))?;
+            .ok_or_else(|| Error::NotFound(format!("no such table: {}", del.from)))?;
         let scan = crate::planner::plan::Plan::Scan {
             table: table.clone(),
             alias: del.alias.clone(),
@@ -7811,7 +7867,7 @@ impl Database {
                 } else if let Some(idx) = catalog.get_index(t) {
                     catalog.get_table(&idx.table).into_iter().collect()
                 } else {
-                    return Err(Error::semantic(format!("no such table or index: {t}")));
+                    return Err(Error::NotFound(format!("no such table: {t}")));
                 }
             }
             None => {
@@ -8034,6 +8090,7 @@ impl Database {
             Statement::Analyze { target } => Self::execute_analyze(target.clone(), ctx, catalog),
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
+            Statement::Reindex { .. } => Ok(()),
             Statement::NoOp => Ok(()),
             Statement::Explain(_) => Ok(()),
             // Savepoint statements are intercepted in execute() (they need
@@ -8490,7 +8547,7 @@ impl Database {
                 if !ctas_rows.is_empty() {
                     let table_arc = catalog
                         .get_table(&name.name)
-                        .ok_or_else(|| Error::NotFound(format!("table: {}", name.name)))?;
+                        .ok_or_else(|| Error::NotFound(format!("no such table: {}", name.name)))?;
                     let values: Vec<Vec<crate::sql::ast::Expr>> = ctas_rows
                         .iter()
                         .map(|r| {
@@ -8528,7 +8585,7 @@ impl Database {
                 }
                 let table = catalog
                     .get_table(&table_name)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", table_name)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", table_name)))?;
                 let root_page = ctx.pager.allocate_page()?;
                 {
                     let page = ctx.pager.get_page(root_page)?;
@@ -8761,6 +8818,7 @@ impl Database {
                     when_clause: t.when_clause,
                     body: t.body,
                     create_sql: original_sql.to_string(),
+                    validated: std::sync::atomic::AtomicBool::new(false),
                 };
                 let schema_row = crate::schema::encode_schema_row(
                     "trigger",
@@ -8794,7 +8852,7 @@ impl Database {
                 let indexes_on_it = catalog.indexes_on_table(&d.name);
                 let table = catalog
                     .drop_table(&d.name)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", d.name)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", d.name)))?;
                 if let Some(vtab) = &table.vtab {
                     // Virtual table: no pages to free; run xDestroy on the
                     // module so it can drop external state.
@@ -8856,7 +8914,7 @@ impl Database {
             DropKind::Index => {
                 let idx = catalog
                     .drop_index(&d.name)
-                    .ok_or_else(|| Error::NotFound(format!("index: {}", d.name)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such index: {}", d.name)))?;
                 ctx.pager.free_page(idx.root_page)?;
                 delete_schema_row(ctx.pager, "index", &d.name)?;
                 ctx.pager.flush()?;
@@ -8894,7 +8952,7 @@ impl Database {
                 // Arc so the original stays in the catalog until the move).
                 let table = catalog
                     .get_table(&a.table)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
                 if catalog.get_table(&new_name).is_some() {
                     return Err(Error::AlreadyExists(format!("table: {}", new_name)));
                 }
@@ -8943,7 +9001,7 @@ impl Database {
             AlterAction::AddColumn { column } => {
                 let table = catalog
                     .get_table(&a.table)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
                 let root = table.root_page;
                 // SQLite restrictions: the new column may not be PRIMARY
                 // KEY or UNIQUE, and must either be nullable or carry a
@@ -9079,7 +9137,7 @@ impl Database {
             AlterAction::RenameColumn { old, new } => {
                 let table = catalog
                     .get_table(&a.table)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
                 // LIVE root (catalog Arc may lag a split).
                 // LIVE root (catalog Arc may lag a split): use the
                 // override-aware root for both the rebuilt table entry and
@@ -9091,7 +9149,7 @@ impl Database {
                     .columns
                     .iter()
                     .position(|c| c.name.to_ascii_lowercase() == old_name_lc)
-                    .ok_or_else(|| Error::NotFound(format!("column: {}", old)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such column: \"{}\"", old)))?;
                 // New name must be unique in the table.
                 if table
                     .columns
@@ -9266,13 +9324,13 @@ impl Database {
             AlterAction::DropColumn { name } => {
                 let table = catalog
                     .get_table(&a.table)
-                    .ok_or_else(|| Error::NotFound(format!("table: {}", a.table)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
                 let name_lc = name.to_ascii_lowercase();
                 let col_idx = table
                     .columns
                     .iter()
                     .position(|c| c.name.to_ascii_lowercase() == name_lc)
-                    .ok_or_else(|| Error::NotFound(format!("column: {}", name)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such column: {}", name)))?;
                 // Rowid alias (INTEGER PRIMARY KEY) can't be dropped.
                 if table.rowid_alias == Some(col_idx) {
                     return Err(Error::semantic(
@@ -9419,7 +9477,7 @@ impl Database {
 
                 // 1. Rewrite the CREATE statement without the column.
                 let new_sql = drop_column_from_create_table(&table.create_sql, &name)?
-                    .ok_or_else(|| Error::NotFound(format!("column: {}", name)))?;
+                    .ok_or_else(|| Error::NotFound(format!("no such column: {}", name)))?;
 
                 // 2. Rebuild the catalog entry.
                 let mut rebuilt = (*table).clone();
@@ -11353,6 +11411,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             when_clause: t.when_clause,
                             body: t.body,
                             create_sql: sql.to_string(),
+                            validated: std::sync::atomic::AtomicBool::new(false),
                         });
                     }
                 }

@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **936+ tests** in the default matrix (crash / power-loss
+> **Status**: production-ready core. **952+ tests** in the default matrix (crash / power-loss
 > simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
@@ -66,6 +66,7 @@ for row in &rows {
 - **Subqueries**: uncorrelated scalar / `IN (SELECT ...)` / `EXISTS (SELECT ...)` — executed once per statement, arbitrarily nested; correlated subqueries execute per outer row with SQLite's scoping
 - **Queries**: `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING` (aggregate functions AND projection aliases — `HAVING s > 4` where the SELECT list has `SUM(v) AS s`, and `HAVING v2 > 2` where it has `v AS v2`), `ORDER BY` (multi-key, `COLLATE`, NULLs-last), `LIMIT`/`OFFSET`
 - **Bare columns in aggregate queries (SQLite-exact)**: `SELECT k, v FROM c GROUP BY k` projects the group's REPRESENTATIVE row value for `v` — first-seen, or the row achieving the extreme when the query's last-declared plain `min()`/`max()` strictly improves (differential-pinned in `tests/bare_columns.rs`, 18 suites: projection/HAVING/ORDER BY, aliased refs, expressions over bare columns, star-over-GROUP-BY expansion — `SELECT * FROM c GROUP BY k` projects every FROM column — ORDER-ONLY aggregates riding the Aggregate node's output (`ORDER BY sum(v)` with sum nowhere in the SELECT list), joins, composite keys, collated groups, NULL first-rows, FILTERed co-aggregates, and the register-writer declaration-order rules). `likelihood(X, P)` validates P like SQLite (`datatype` range error); multi-row `VALUES` chains follow SQLite's grammar exactly — a trailing-VALUES core cannot carry `ORDER BY`/`LIMIT` (`VALUES (1) UNION VALUES (2) ORDER BY 1` is SQLite's own syntax error, and so is bare `VALUES (1),(2) ORDER BY 1`), with VALUES output columns named `column1, column2, …`
+- **Prepare-time name resolution (SQLite's resolver contract)**: every column reference resolves at PREPARE time — before a row is evaluated — against the FROM-clause scope chain, exactly SQLite's model. Unknown names error with SQLite's byte-exact text (`no such column: x` / `no such column: t.x` as written); two same-level sources exposing one bare name error `ambiguous column name: x` (the historic silent first-match divergence is closed); `rowid` spellings bind only on rowid tables; USING/NATURAL coalesced columns are exempt from ambiguity; output aliases resolve in WHERE / GROUP BY / HAVING / ORDER BY (SQLite's documented extension); correlated references walk scopes inner-first; CTE names (including the recursive self-reference) shadow catalog tables in FROM; compound ORDER BY resolves output names only; UPDATE-FROM resolves the target table first (no false ambiguity); the upsert `excluded.` pseudo-table is qualified-only; complex nested subquery/view outputs whose names cannot be computed validate permissively (the historic behavior for exactly those shapes). Object-existence and DDL validation is in the same pass: `DROP VIEW/TRIGGER` on missing objects, `INDEXED BY` a missing or wrong-table index, `REINDEX` an unknown target (`unable to identify the object to be reindexed`), `DETACH` an unknown database, `CREATE INDEX`/`CREATE TRIGGER` on missing tables (`no such table: main.x`), unknown collations in indexes / column defs / `ALTER ADD COLUMN` (`no such collation sequence: x`), CHECK / generated-column / expression-index / partial-index WHERE references, `USING` a column missing from one side (SQLite's exact two-part text), and `ALTER RENAME/DROP COLUMN`'s quoted `no such column: "old"`. SQLite's LAZY contracts are preserved: `CREATE VIEW` / `CREATE TRIGGER` bodies and `REFERENCES` clauses accept unknown names at create and error at first use — trigger bodies at FIRE time, validated once per registration with NEW/OLD in scope (`no such column: NEW.x` / `OLD.x` / a bare WHEN-clause column), views at first SELECT. Differential-pinned against bundled SQLite (`tests/error_parity.rs`, 16 suites: the lookup family, column families across SELECT/DML/DDL/RETURNING/upsert, ambiguity, USING, collations, REINDEX/DETACH/ANALYZE, rowid-over-WITHOUT-ROWID, the lazy contracts, trigger fire-time, and a 31-shape valid-SQL battery guarding against false positives).
 - **Joins**: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`, with `ON` / `USING`
 - **Set operations**: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
 - **CTEs**: `WITH` (non-recursive) and `WITH RECURSIVE` — full execution
@@ -1085,17 +1086,27 @@ compat surface. Every entry says what it costs and why it exists.
   `PRAGMA journal_mode = delete` / `= WAL` switch a foreign file's mode
   both ways with real SQLite verifying the result
   (`tests/sqlite_interop.rs`).
-- **Error-message text parity (open, small)**: the engine errors on the
-  right CONDITIONS everywhere the differential suites probe, but a few
-  message TEXTS still differ from SQLite's canonical wording — e.g. an
-  INSERT naming a missing table reports `not found: table: nosuch`
-  where SQLite says `no such table: nosuch` (the byte-scanner fast
-  path now falls through to the general path, so at least both routes
-  produce the SAME engine text — before the PR #2 hardening they
-  diverged). No test or driver asserts these strings today; closing
-  them is a sweep over ~15 `Error::NotFound("table: …")` sites plus
-  the `Display` prefix, deferred until something actually compares
-  `sqlite3_errmsg` strings byte-for-byte.
+- **Error-message text parity — CLOSED (and the silent-NULL family it
+  hid)**: the engine's errors now carry SQLite's exact text everywhere
+  the differential battery probes — `Error::NotFound` payloads are
+  full SQLite messages rendered VERBATIM by both the Rust `Display`
+  and the C ABI's `sqlite3_errmsg` (`no such table: x`, `no such
+  index: x`, `no such trigger/view/database: x`, `table t has no
+  column named y`, `no such collation sequence: x`, …). Closing the
+  text sweep exposed something much bigger: the engine resolved column
+  names at RUNTIME, silently evaluating unknown names to NULL — a
+  typo'd `SELECT nosuchcol FROM t` returned a column of NULLs, a
+  typo'd `UPDATE SET nosuchcol = 1` bound to slot 0 (data-corrupting),
+  `DROP TRIGGER/VIEW` of missing objects silently succeeded,
+  `INDEXED BY` a missing index was ignored, `REINDEX`/`DETACH`/unknown
+  collations were silent no-ops. The prepare-time resolver (see the
+  SQL-surface bullet) closed the whole family — behavior AND text —
+  with `tests/error_parity.rs` pinning both engines byte-for-byte.
+  The one residual text latitude: SQLite prefixes trigger-BODY table
+  errors with the schema (`no such table: main.x` inside a fired
+  body; the engine reports the unprefixed form — both error, same
+  shape), and parse-error wording remains engine-formatted on both
+  sides (SQLite's is compiler-specific too).
 
 ## Usage
 
@@ -1233,7 +1244,7 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 702+ tests in the
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 952+ tests in the
 default matrix, all passing, plus the sqlx feature suite:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
@@ -1248,6 +1259,7 @@ default matrix, all passing, plus the sqlx feature suite:
 | Corruption fuzz (§4.4) | `tests/db_corrupt_fuzz.rs` | byte strikes, structural strikes, truncations, corrupt WALs — never a panic or hang |
 | SQL fuzz (§4.1) | `tests/sql_fuzz.rs` | mutation + structured fuzz run against BOTH engines — results must match |
 | Differential testing | `tests/differential.rs` | randomized workloads vs real SQLite; row sets identical |
+| Error-text parity | `tests/error_parity.rs` | 16 suites: every lookup-family / column-family / object-existence error is byte-identical to bundled SQLite's `sqlite3_errmsg` (both engines must agree on success/failure AND the text); lazy contracts (view/trigger/FK bodies) pinned at their use sites; a valid-SQL battery guards against false positives |
 | `integrity_check` | `tests/integrity_check.rs` | full structural walk: freelist chains, every b-tree, bidirectional index↔table cross-verification |
 | Soak / long-run | `concurrency_stress.rs`, `RUSTQLITE_FUZZ_ITERS` | 32-thread mixed workloads; long fuzz iterations |
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |

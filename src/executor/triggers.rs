@@ -25,6 +25,37 @@ const MAX_TRIGGER_DEPTH: u32 = 64;
 /// * `new_row` — the post-change row (INSERT/UPDATE), or None (DELETE).
 /// * `old_row` — the pre-change row (UPDATE/DELETE), or None (INSERT).
 /// * `col_names` — the table's column names, positional (for NEW.x/OLD.x).
+// First-fire name resolution for a trigger: the WHEN clause and every
+// body statement are validated against a scope of the trigger TABLE's
+// columns (bare) plus the NEW/OLD pseudo-tables (qualified-only, the
+// table's columns). SQLite's fire-time contract — `no such column:
+// NEW.x` / `no such column: x` — before any body statement executes.
+fn validate_trigger_first_fire(
+    catalog: &crate::schema::Catalog,
+    trig: &crate::schema::Trigger,
+    table: &crate::schema::Table,
+) -> crate::error::Result<()> {
+    use crate::planner::namecheck as nc;
+    // Reuse the module's public entry on a synthetic scope: the body
+    // statements are full Statements — validate each with NEW/OLD
+    // exposed as ordinary (qualified) sources through a wrapper scope.
+    // namecheck's public API validates standalone statements; the
+    // NEW/OLD layer is provided via a one-shot wrapper that walks the
+    // statement with the trigger scope as the outer level.
+    let cols: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    let new_old_as_sources = || -> nc::TriggerScope {
+        nc::TriggerScope::new(&table.name, cols.clone(), !table.without_rowid)
+    };
+    let scope = new_old_as_sources();
+    if let Some(w) = &trig.when_clause {
+        nc::validate_expr_in_scope(catalog, w, &scope)?;
+    }
+    for stmt in &trig.body {
+        nc::validate_stmt_in_scope(catalog, stmt, &scope)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn fire_triggers(
     ctx: &mut ExecContext<'_>,
     table: &crate::schema::Table,
@@ -68,6 +99,18 @@ pub(crate) fn fire_triggers(
         });
         if !matches_event {
             continue;
+        }
+        // First-fire validation (SQLite's lazy trigger contract: bodies
+        // and WHEN clauses resolve at FIRE time, not CREATE time). The
+        // NEW/OLD substitution below rewrites bound refs to literals; a
+        // NEW/OLD ref that is UNKNOWN here (not a column of the table)
+        // must error with SQLite's exact text before any body statement
+        // runs. Validated once per Trigger registration (the Arc is
+        // replaced by DDL, so the flag can never go stale).
+        if !trig.validated.load(std::sync::atomic::Ordering::Acquire) {
+            validate_trigger_first_fire(ctx.catalog(), &trig, table)?;
+            trig.validated
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         // WHEN guard: evaluate with NEW/OLD bound as a combined row.
         if let Some(w) = &trig.when_clause {
@@ -223,8 +266,10 @@ fn substitute_new_old(
                 if let Some(v) = lookup(t, name) {
                     *e = Expr::Literal(v);
                 } else if t.eq_ignore_ascii_case("new") || t.eq_ignore_ascii_case("old") {
-                    return Err(crate::error::Error::semantic(format!(
-                        "no such column: {}.{} (NEW is only bound in INSERT/UPDATE triggers, OLD in UPDATE/DELETE)",
+                    // SQLite-exact text (the same error covers both an
+                    // unknown column AND the not-bound-here case).
+                    return Err(crate::error::Error::NotFound(format!(
+                        "no such column: {}.{}",
                         t, name
                     )));
                 }
