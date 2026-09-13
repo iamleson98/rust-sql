@@ -415,3 +415,15 @@ Work Log:
 
 Stage Summary:
 - 31 new durability tests + one real engine bug fixed (TEMP persistence) with the fix pinned by tests. Suite rides the existing CI matrix automatically (cargo test --lib --tests on ubuntu/windows/macos x3 configs).
+
+---
+Task ID: 19-verify
+Agent: main (Super Z)
+Task: Remote CI verification for 59d76a5
+
+Work Log:
+- Pushed as 59d76a5 (rebased on the remote's 4c174fc memory-leak fixes; re-verified locally after the rebase: lib 186, durability 31, regression/cli_ops/alter/analyze/schema_parity/feature_parity/wal all green, fmt clean, clippy clean).
+- CI run 34753595823: COMPLETED SUCCESS — 22/22 jobs (rustfmt, clippy x4, tests ubuntu/windows/macos all configs — the durability suite runs in every one, oom-injection, compat ABI, torture x3 OSes, sqlite file interop x3, bench-gates x3 — every performance gate held, ci-ok aggregate).
+
+Stage Summary:
+- The reliability task is delivered end-to-end: 31 durability tests riding the full CI matrix, one real engine bug found and fixed (TEMP-object persistence), master green at 59d76a5.
