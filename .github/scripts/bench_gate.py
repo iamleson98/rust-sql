@@ -40,10 +40,21 @@ runs and 1.85 ms in a third (±40%), with SQLite's own numbers steady;
 best-of-N cannot absorb a slow measurement WINDOW shared by all
 attempts. On darwin, a time-metric row additionally FAILS only when the
 absolute loss exceeds 30% of SQLite's own time (sub-30% deltas on that
-fleet are noise; multi-x regressions are still caught). Micro-scale
-rows keep tight gating everywhere (the floor scales with the row), and
-the criterion gates — median of 20 statistically sampled measurements,
+fleet are noise; multi-x regressions are still caught), and the
+criterion gates — median of 20 statistically sampled measurements,
 same job — own the tight per-shape contract on macOS regardless.
+
+Micro-row noise floor (see MICRO_ROW_FLOOR_REL): on ALL platforms, a
+time row whose SQLite baseline is under 10µs likewise FAILS only when
+the absolute loss exceeds 30% of SQLite's time. At that scale the
+measurement is dominated by the runner's micro-state (timer
+granularity, cache/branch-predictor state, scheduler quanta), and a
+stable few-hundred-ns engine gap is a property of the runner draw, not
+the code — observed 2026-09-14 on windows-latest (docs-only diff vs a
+green run): a 2µs join row converged best-of-3 to a 200ns gap, 10.5%
+over the 5% gate, green on the same code an hour earlier and green on
+ubuntu/macos in the same matrix. Multi-x regressions on micro rows and
+the strict 5% contract on ms-scale rows are unchanged.
 
 Exit codes: 0 = pass, 1 = gate failure (rows lost to SQLite), 2 = harness
 error (bench could not run or output could not be parsed — also fails CI,
@@ -389,7 +400,7 @@ DARWIN_WIDE_ROWS = {
 
 
 # ---------------------------------------------------------------------------
-# macOS noise floor
+# Platform noise floor (darwin) + micro-row noise floor (all platforms)
 # ---------------------------------------------------------------------------
 
 # On the macos ARM runner fleet, single-digit-ms rows wobble far beyond
@@ -397,19 +408,54 @@ DARWIN_WIDE_ROWS = {
 # observed data). Best-of-N attempts cannot absorb a slow measurement
 # window shared by every attempt, so on darwin a time-metric row FAILS
 # only when the absolute loss ALSO exceeds this fraction of SQLite's
-# own time. The floor scales with the row: micro-scale rows keep tight
-# gating, and multi-x regressions on any row still fail. linux/windows
-# keep the strict ratio contract (their fleets are stable run-to-run).
-# BENCH_NOISE_FLOOR_REL overrides for testing (any platform).
+# own time. The floor scales with the row, and multi-x regressions on
+# any row still fail. BENCH_NOISE_FLOOR_REL overrides for testing (any
+# platform).
 _DEFAULT_NOISE_FLOOR_REL = 0.30 if sys.platform == "darwin" else 0.0
 NOISE_FLOOR_REL = float(
     os.environ.get("BENCH_NOISE_FLOOR_REL", _DEFAULT_NOISE_FLOOR_REL)
 )
 
+# Micro-row noise floor — ALL platforms. Below MICRO_ROW_SECONDS, a
+# timing row measures the runner's micro-state, not the engine: timer
+# granularity, cache/branch-predictor state, and scheduler quanta
+# dominate a 2µs loop, and a stable few-hundred-ns gap between engines
+# is a property of that runner draw, not of the code. Observed
+# 2026-09-14 on windows-latest at c56a1a9 (a docs-only diff vs a green
+# run): bench_compare "2-table join (filter by PK, ~10 rows out)"
+# converged best-of-3 to rustqlite 2.10µs vs SQLite 1.90µs — 10.5%
+# over the 5% gate, a 200ns delta — while the same row was green at
+# b8a26ed on the same fleet and green on ubuntu/macos in the same run.
+# Re-attempts cannot fix this class: the gap was stable WITHIN the
+# runner draw. Such a row FAILS only when the absolute loss also
+# exceeds MICRO_ROW_FLOOR_REL of SQLite's own time (the same 30% band
+# proven on the darwin fleet): a 2x regression (+100%) on a 2µs row
+# still fails, ms-scale rows keep the strict tolerance, and the
+# criterion gates (median of 20 statistically sampled measurements)
+# keep the tight per-shape contract.
+MICRO_ROW_SECONDS = 10e-6
+MICRO_ROW_FLOOR_REL = 0.30
+
 
 def noise_floor_rel() -> Optional[float]:
-    """Relative-to-SQLite noise floor for time rows, or None when off."""
+    """Platform-level relative-to-SQLite noise floor, or None when off."""
     return NOISE_FLOOR_REL if NOISE_FLOOR_REL > 0.0 else None
+
+
+def row_noise_floor(row: "Row") -> Optional[float]:
+    """Relative-to-SQLite noise floor for ONE row, or None when off.
+
+    The platform floor (darwin default / BENCH_NOISE_FLOOR_REL) applies
+    to every time row; the micro-row floor applies on ALL platforms to
+    time rows whose SQLite baseline is at or below MICRO_ROW_SECONDS.
+    Effective floor = the larger of the two. ops rows and macro-scale
+    time rows on stable platforms keep the strict ratio contract.
+    """
+    floor = NOISE_FLOOR_REL
+    if row.metric == "time" and row.best_sql is not None:
+        if row.best_sql <= MICRO_ROW_SECONDS:
+            floor = max(floor, MICRO_ROW_FLOOR_REL)
+    return floor if floor > 0.0 else None
 
 
 def effective_band(parser: str, row: "Row", default_pct: float) -> Tuple[float, bool]:
@@ -582,12 +628,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pass
 
     print(f"[bench-gate:{args.parser}] command: {' '.join(args.cmd)}")
-    floor_desc = (
-        f"{NOISE_FLOOR_REL:.0%} of SQLite time" if noise_floor_rel() is not None else "off"
+    floor_parts = []
+    if noise_floor_rel() is not None:
+        floor_parts.append(f"{NOISE_FLOOR_REL:.0%} of SQLite time (all time rows)")
+    floor_parts.append(
+        f"{MICRO_ROW_FLOOR_REL:.0%} of SQLite time on micro rows (<{MICRO_ROW_SECONDS * 1e6:g}µs)"
     )
     print(
         f"[bench-gate:{args.parser}] attempts<={attempts} "
-        f"tolerance={tolerance:g}% noise_floor={floor_desc} "
+        f"tolerance={tolerance:g}% noise_floor={' + '.join(floor_parts)} "
         f"timeout={args.timeout:g}s min_rows={min_rows}"
     )
 
@@ -614,7 +663,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             run_errors.append(f"attempt {attempt} produced 0 parseable rows")
         all_pass = bool(merged) and all(
-            verdict(r, effective_band(args.parser, r, tolerance)[0], noise_floor_rel())
+            verdict(r, effective_band(args.parser, r, tolerance)[0], row_noise_floor(r))
             != "LOSS"
             for r in merged.values()
         )
@@ -625,7 +674,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     failed = [
         r
         for r in merged.values()
-        if verdict(r, effective_band(args.parser, r, tolerance)[0], noise_floor_rel())
+        if verdict(r, effective_band(args.parser, r, tolerance)[0], row_noise_floor(r))
         == "LOSS"
     ]
     if len(merged) < min_rows:
@@ -641,7 +690,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     def row_verdict(r: Row) -> str:
-        return verdict(r, effective_band(args.parser, r, tolerance)[0], noise_floor_rel())
+        return verdict(r, effective_band(args.parser, r, tolerance)[0], row_noise_floor(r))
 
     status_order = {"LOSS": 0, "TIE": 1, "WIN": 2}
     ordered = sorted(
@@ -663,7 +712,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             f"{row.name[:44]:<44} {rust_v:>14} {sql_v:>14} "
             f"{ratio:>7.2f}x {loss:>7.1f}%  "
-            f"{verdict_marked(row, band, parity, noise_floor_rel())}"
+            f"{verdict_marked(row, band, parity, row_noise_floor(row))}"
         )
     print()
 
@@ -691,8 +740,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         band, parity = effective_band(args.parser, row, tolerance)
         summary_md.append(
             f"| {row.name} | {rust_v} | {sql_v} | {ratio:.2f}x | "
-            f"{'✅' if verdict(row, band, noise_floor_rel()) != 'LOSS' else '❌'} "
-            f"{verdict_marked(row, band, parity, noise_floor_rel())} |"
+            f"{'✅' if verdict(row, band, row_noise_floor(row)) != 'LOSS' else '❌'} "
+            f"{verdict_marked(row, band, parity, row_noise_floor(row))} |"
         )
     summary_md.append("")
     if failed:
