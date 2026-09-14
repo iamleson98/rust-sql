@@ -324,9 +324,15 @@ The API is rusqlite-shaped: `execute` for statements without rows, `query` for t
 src/
 ├── lib.rs              # Crate root, re-exports, sqlx_driver feature gate
 ├── error.rs            # Error enum + Result alias
-├── api.rs              # Database, Params, execute/query
+├── api.rs              # Database, Params, execute/query, SQLite-format mode
 ├── statement.rs        # Streaming prepared statements
 ├── ffi.rs              # SQLite-shaped C ABI (rustqlite_* family)
+├── preupdate.rs        # Preupdate-hook event machinery
+├── json.rs             # Dependency-free JSON wire protocol (server)
+├── oom_alloc.rs        # Counting allocator (oom-injection feature)
+├── auth/               # SCRAM-SHA-256 auth (RFC 5802), user/session stores
+├── sqlx_driver/        # Native sqlx 0.9 driver (Pool, ConnectOptions, rows)
+├── bin/                # rustqlite-cli, rustqlite-server
 ├── types/              # Value, Affinity, Row
 ├── storage/
 │   ├── page.rs         # Page, PageType, FileHeader
@@ -336,6 +342,8 @@ src/
 │   ├── mvcc.rs         # Snapshot, VersionTracker, committed view
 │   ├── row_codec.rs    # encode_row / decode_row (+ selective decode)
 │   ├── tempstore.rs    # Ephemeral spill files (GROUP BY temp-store)
+│   ├── join_cache.rs   # Cross-statement join-build cache (epoch-validated)
+│   ├── vacuum.rs       # In-place compaction planner
 │   ├── sqlitefmt/      # SQLite fileformat2 read/write (interop)
 │   └── integrity.rs    # PRAGMA integrity_check walker
 ├── sql/                # Lexer, AST, Parser
@@ -351,7 +359,7 @@ compat/                 # Drop-in libsqlite3 C ABI + libsqlite3-sys replacement
 sqlx-interop/           # sea-orm 2.0 + sqlx 0.9 integration testbed
 plugins/                # Extension examples in C, C++, Zig, Rust
 benches/                # criterion harnesses vs rusqlite
-examples/               # 145 probes/benchmarks (bench_compare, probe_*, ...)
+examples/               # 178 probes/benchmarks (bench_compare, probe_*, ...)
 tests/                  # The full test matrix (see Testing)
 include/rustqlite_ext.h # Extension header for C/C++/Zig
 ```

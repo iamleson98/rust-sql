@@ -542,3 +542,19 @@ Work Log:
 
 Stage Summary:
 - Both user-requested tracks are delivered and CI-verified end-to-end: (1) Postgres-grade SCRAM-SHA-256 auth + full dump/export/import/backup CLI (e1aabab, verified green); (2) the reliability suite + green-CI mandate — extended through today with the durability suite (59d76a5), naming contracts (b8a26ed), and three distinct shared-runner noise classes fixed durably (c56a1a9 confirmation re-sample, 94c9017 micro-row floor, 63899b3 darwin band). Master green at 63899b3.
+
+---
+Task ID: 25
+Agent: main (Super Z)
+Task: Deep research: rust-sql vs SQLite gaps; VS Code "not a database" report; full README audit + one-batch statistics correction.
+
+Work Log:
+- Root cause of the VS Code report: native files carry the `RSQLDB04` magic; SQLite-only tooling checks the 16-byte `SQLite format 3\0` header and correctly rejects native files. Not a corruption bug — a format-identity issue that needed (a) the documented guidance and (b) a working export path.
+- Found + fixed the divergence behind it: the README claimed `VACUUM INTO` writes a SQLite file from ANY database, but the native-format branch wrote native image bytes. Probed real SQLite's VACUUM INTO output shape first (examples/probe_vacuum_into_shape.rs: page size preserved, 18/19 = 1/1 rollback marker even from WAL sources, change counter 1, UTF-8), then implemented the true native→SQLite export: collect_foreign_dump refactored into a shared collect_sqlite_objects walk; new collect_native_sqlite_export; execute_vacuum's native INTO branch writes through write_sqlite_file and returns before the native compact image is built. Foreign path untouched.
+- 3 new differential tests in tests/sqlite_interop.rs (full-surface export verified by real SQLite incl. constraint enforcement + AUTOINCREMENT high-water; 5-query data equality; WAL-source export) + standalone probe examples/probe_native_export.rs.
+- Gap research (code-verified, not README-trusted): confirmed absent — FTS3/4/5, R*Tree, Geopoly, session extension, sqlite3_backup_*/sqlite3_blob_* C APIs, dbstat/sqlite_dbdata, sqlite_stat4; ATTACH is name-only; native format is single-process (no OS locks); CLI is a 12-command subset. Confirmed present — STRICT tables, window GROUPS/EXCLUDE frames, 124 C ABI symbols, broad PRAGMA dispatch.
+- README one-batch: Quick-start VS Code/tooling callout (three paths to a SQLite-openable file); interop VACUUM INTO claim now matches reality with shape proof + tests; new "open ledger" of 11 not-implemented items each with workaround; native single-process note in concurrency gaps; corrected statistics (1100+ tests = 1041 default matrix + 65 C ABI; 178 examples; source layout now lists auth/, sqlx_driver/, bin/, preupdate.rs, json.rs, oom_alloc.rs, join_cache.rs, vacuum.rs); Testing table gains the feature/semantics parity row.
+
+Stage Summary:
+- Local: sqlite_interop 25/25, feature_parity 62/62, durability 31/31, cli_ops 9/9, regression 27/27; clippy 0 warnings in all configs; fmt clean.
+- f3428a8 pushed and CI-verified: run 34805526558 COMPLETED SUCCESS — 22/22 jobs green (incl. sqlite file interop on all three OSes carrying the new export tests). Master green at f3428a8.
