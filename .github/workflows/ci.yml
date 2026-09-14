@@ -249,6 +249,11 @@ jobs:
       # Best-of-N child runs per engine per section: shared runners swing a
       # single sample 2x (SQLite's S09 blob scan measured 5.9ms and 3.7ms
       # across two consecutive runs of identical code). 3 samples.
+      # When a perf gate still fires marginally after best-of-N, the
+      # harness takes ONE confirmation re-sample of BOTH engines before
+      # recording the verdict — real regressions reproduce under added
+      # sampling, runner jitter does not (observed flake: 2026-09-14,
+      # windows S12 15.7% vs a 15% gate on a docs-only diff).
       TORTURE_RUNS: "3"
       # Lean mimalloc startup (see src/lib.rs's allocator docs): the
       # default 1 GiB arena + THP materialize ~4 MB of RSS before the

@@ -485,3 +485,18 @@ Work Log:
 
 Stage Summary:
 - The naming-contract task is delivered end-to-end: 3 engine bugs fixed (COUNT fast-path AS-alias drop, hidden-rowid NUL-sentinel leak, RETURNING rowid value), 15 new tests riding the full CI matrix, master green at b8a26ed.
+
+---
+Task ID: 22
+Agent: main (Super Z)
+Task: CI triage for 85e795b — windows torture flake; fix durably and re-verify full green
+
+Work Log:
+- CI check-runs for 85e795b (docs-only): 20/22 green, `test (windows, all configs)` still running, `torture (windows-latest)` FAILED — "S12 5-index load + lookups: rq 131.7ms vs sq 113.8ms (time > 15% slower)" — 15.7% over a 15% gate, 0.8ms past the line, on a docs-only diff, with the same section green on ubuntu and macos: shared-runner timing noise, the exact class the harness's best-of-N + floors already fight.
+- Durable fix (a re-run would only hide it): confirmation re-sample in examples/prod_torture.rs — when ANY perf gate would fire on a section's current best-of-N samples, take ONE extra best-of-N round for BOTH engines (symmetric, fair), merge per-metric minima (new shared merge_best), and only then record verdicts. Rationale: per-metric minima converge monotonically toward each engine's true capability floor, so a real multi-x regression reproduces under added samples (SQLite's floor improves too) while runner jitter does not survive them.
+- Refactor: spawn_child_best's inline min-merge extracted into merge_best (used by both the N-loop and the confirmation); primary-time extraction into primary_time (replaces the duplicated 3-key scan in main); new any_perf_gate_fires mirrors the exact gate expressions main records verdicts with (primary time, extras with per-metric floors, mem when TORTURE_MEM_TOLERANCE_PCT is set) so the retry decision can never diverge from the recorded verdicts.
+- ci.yml: torture env comment documents the confirmation re-sample + the observed flake.
+- Verification: full matrix at ubuntu-CI parity (scale 0.25, best-of-3, 15% gate, lean mimalloc env): gate failures 0, exit 0 — S12 locally a TIE (rq 111.5 vs sq 115.8ms), independently confirming the Windows number was noise, not regression. Confirmation path exercised deterministically (TORTURE_MEM_TOLERANCE_PCT=0, best-of-1): S03/S14/S17 probed marginal -> re-sampled; real S03 mem excess reproduced and was recorded FAIL, S14/S17 noise cleared by the merge, exit 1 exactly as the forced gate demands. cargo fmt clean; clippy -D warnings clean on the example.
+
+Stage Summary:
+- The torture gate is now two-layer noise-robust (best-of-N + marginal confirmation re-sample) without loosening the 15% contract for real regressions; ready to push and watch CI to full green.

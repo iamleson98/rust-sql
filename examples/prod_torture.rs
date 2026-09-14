@@ -2028,12 +2028,33 @@ fn spawn_child(engine: &str, section: &str) -> ChildOut {
     ChildOut { metrics, checks }
 }
 
+/// Merge one more sample into `best`: per METRIC the minimum across
+/// runs is kept (every torture metric is lower-is-better — time and RSS
+/// alike); CHECKS pass if any run passed.
+fn merge_best(best: &mut ChildOut, extra: ChildOut) {
+    for (k, v) in extra.metrics {
+        let e = best.metrics.entry(k).or_insert(f64::MAX);
+        if v < *e {
+            *e = v;
+        }
+    }
+    for (k, ok) in extra.checks {
+        if ok {
+            if let Some(existing) = best.checks.iter_mut().find(|(bk, _)| bk == &k) {
+                existing.1 = true;
+            } else {
+                best.checks.push((k, true));
+            }
+        } else if !best.checks.iter().any(|(bk, _)| bk == &k) {
+            best.checks.push((k, false));
+        }
+    }
+}
+
 /// Best-of-N child runs: shared CI runners steal memory bandwidth and
 /// CPU mid-section, so a single sample can be 2x off the engine's real
 /// capability (observed: SQLite's S09 scan swinging 5.9ms <-> 3.7ms
-/// across two consecutive CI runs of identical code). Per METRIC the
-/// minimum across runs is kept (every torture metric is lower-is-better
-/// — time and RSS alike); CHECKS pass if any run passed. Same
+/// across two consecutive CI runs of identical code). Same
 /// steady-state discipline as the bench gate's 3-attempt retry.
 fn spawn_child_best(engine: &str, section: &str, runs: usize) -> ChildOut {
     let mut best: Option<ChildOut> = None;
@@ -2042,23 +2063,7 @@ fn spawn_child_best(engine: &str, section: &str, runs: usize) -> ChildOut {
         best = Some(match best {
             None => c,
             Some(mut b) => {
-                for (k, v) in c.metrics {
-                    let e = b.metrics.entry(k).or_insert(f64::MAX);
-                    if v < *e {
-                        *e = v;
-                    }
-                }
-                for (k, ok) in c.checks {
-                    if ok {
-                        if let Some(existing) = b.checks.iter_mut().find(|(bk, _)| bk == &k) {
-                            existing.1 = true;
-                        } else {
-                            b.checks.push((k, true));
-                        }
-                    } else if !b.checks.iter().any(|(bk, _)| bk == &k) {
-                        b.checks.push((k, false));
-                    }
-                }
+                merge_best(&mut b, c);
                 b
             }
         });
@@ -2150,6 +2155,66 @@ fn extra_floor(section: &str, metric: &str) -> f64 {
     }
 }
 
+/// The section's primary time metric — the first present of the
+/// standard keys; the value the headline `[TORTURE ...]` line and the
+/// primary time gate use.
+fn primary_time(c: &ChildOut) -> f64 {
+    ["time_ms", "insert_ms", "rollback_ms"]
+        .iter()
+        .map(|k| c.get(k))
+        .find(|v| *v > 0.0)
+        .unwrap_or(0.0)
+}
+
+/// Would any performance gate fire on the section as currently sampled?
+/// Primary time, the section-specific extras, and — when mem gating is
+/// enabled via TORTURE_MEM_TOLERANCE_PCT — peak RSS. Mirrors exactly the
+/// gate expressions main() records verdicts with, so a section that
+/// would FAIL can be re-sampled BEFORE the failure is recorded.
+///
+/// Confirmation re-sample rationale (the second line of defense on top
+/// of best-of-N): a marginal best-of-N miss can still happen when the
+/// whole N-sample window lands on a noisy stretch of a shared runner —
+/// observed 2026-09-14 on windows-latest at 85e795b (docs-only diff):
+/// S12 rq 131.7ms vs sq 113.8ms, 15.7% over a 15% gate while the same
+/// section was green on ubuntu and macos. Re-sampling BOTH engines
+/// symmetrically keeps the comparison fair: per-metric minima converge
+/// monotonically toward each engine's true capability floor, so a real
+/// multi-x regression reproduces under the added samples (SQLite's
+/// floor improves too), while runner jitter does not survive them.
+fn any_perf_gate_fires(
+    rq: &ChildOut,
+    sq: &ChildOut,
+    section: &str,
+    time_tol: f64,
+    mem_tol: f64,
+) -> bool {
+    let rt = primary_time(rq);
+    let st = primary_time(sq);
+    if verdict(rt, st, true).contains("LOSS") && gated(rt, st, time_tol) {
+        return true;
+    }
+    for k in [
+        "lookup_ms",
+        "scan_ms",
+        "vacuum_ms",
+        "open_first_query_ms",
+        "delete_ms",
+    ] {
+        if rq.get(k) > 0.0 || sq.get(k) > 0.0 {
+            let v = verdict(rq.get(k), sq.get(k), true);
+            if v.contains("LOSS")
+                && gated_with_floor(rq.get(k), sq.get(k), time_tol, extra_floor(section, k))
+            {
+                return true;
+            }
+        }
+    }
+    let rq_hwm = rq.get("hwm_mb");
+    let sq_hwm = sq.get("hwm_mb");
+    verdict(rq_hwm, sq_hwm, true).contains("LOSS") && gated(rq_hwm, sq_hwm, mem_tol)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 4 && args[1] == "--child" {
@@ -2204,24 +2269,25 @@ fn main() {
     let mut losses: Vec<String> = Vec::new();
 
     for (id, title) in sections {
-        let rq = spawn_child_best("rq", id, runs);
-        let sq = spawn_child_best("sq", id, runs);
+        let mut rq = spawn_child_best("rq", id, runs);
+        let mut sq = spawn_child_best("sq", id, runs);
+        // Marginal-gate confirmation: one extra best-of-N round for BOTH
+        // engines, merged per-metric, before any verdict is recorded —
+        // see any_perf_gate_fires for the rationale and the observed
+        // flake that motivated it.
+        if any_perf_gate_fires(&rq, &sq, id, time_tol, mem_tol) {
+            println!("    {id} marginal gate after best-of-{runs} — confirmation re-sample");
+            merge_best(&mut rq, spawn_child_best("rq", id, runs));
+            merge_best(&mut sq, spawn_child_best("sq", id, runs));
+        }
         for (k, ok) in rq.checks.iter().chain(sq.checks.iter()) {
             if !ok {
                 failures.push(format!("{id} {k}"));
             }
         }
-        // The primary time metric of each section.
-        let rq_time = ["time_ms", "insert_ms", "rollback_ms"]
-            .iter()
-            .map(|k| rq.get(k))
-            .find(|v| *v > 0.0)
-            .unwrap_or(0.0);
-        let sq_time = ["time_ms", "insert_ms", "rollback_ms"]
-            .iter()
-            .map(|k| sq.get(k))
-            .find(|v| *v > 0.0)
-            .unwrap_or(0.0);
+        // The primary time metric of each section (post-confirmation).
+        let rq_time = primary_time(&rq);
+        let sq_time = primary_time(&sq);
         let time_v = verdict(rq_time, sq_time, true);
         if time_v.contains("LOSS") {
             losses.push(format!("{id} {title} (time)"));
