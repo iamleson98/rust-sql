@@ -254,6 +254,11 @@ jobs:
       # recording the verdict — real regressions reproduce under added
       # sampling, runner jitter does not (observed flake: 2026-09-14,
       # windows S12 15.7% vs a 15% gate on a docs-only diff).
+      # On macOS the whole job can land in one slow measurement window
+      # (the fleet behavior bench_gate.py already floors with a 30%
+      # darwin band), so a time FAIL there additionally requires the
+      # absolute loss to exceed 30% of SQLite's own time — multi-x
+      # regressions still fail; linux/windows keep the strict contract.
       TORTURE_RUNS: "3"
       # Lean mimalloc startup (see src/lib.rs's allocator docs): the
       # default 1 GiB arena + THP materialize ~4 MB of RSS before the
