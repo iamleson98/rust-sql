@@ -205,6 +205,16 @@ impl<'a> Lexer<'a> {
         if c == b'[' {
             return self.lex_quoted_ident(b']', false);
         }
+        // `@@` (PostgreSQL tsvector @@ tsquery match operator) BEFORE the
+        // parameter branch — `@` alone starts a named parameter (`@name`),
+        // but two consecutive `@` are the FTS operator. Previously `a @@ b`
+        // lexed as a parameter named `@` (a parse error downstream), so no
+        // existing behavior changes.
+        if c == b'@' && self.peek(1) == Some(b'@') {
+            self.advance();
+            self.advance();
+            return Ok(Token::Op("@@"));
+        }
         // Parameter placeholder
         if c == b'?' || c == b':' || c == b'@' || c == b'$' {
             return self.lex_parameter();
@@ -525,6 +535,14 @@ impl<'a> Lexer<'a> {
             self.advance();
             self.advance();
             return Some("->>");
+        }
+        // `<->` (PostGIS KNN distance operator) before `<<`/`<=` — a lone
+        // `<-` is not an operator, so this changes no existing parse.
+        if a == b'<' && b == b'-' && self.src.get(self.pos + 2) == Some(&b'>') {
+            self.advance();
+            self.advance();
+            self.advance();
+            return Some("<->");
         }
         let op: &'static str = match (a, b) {
             (b'<', b'=') => "<=",

@@ -4182,6 +4182,10 @@ impl Database {
         };
         let affinities: Vec<crate::types::Affinity> =
             col_idx.iter().map(|&i| table.columns[i].affinity).collect();
+        // DECIMAL(p,s) scale specs parallel to `affinities` — the chain
+        // fast path must enforce them exactly like [`crate::schema::Column::coerce`].
+        let decimals: Vec<Option<(u8, u8)>> =
+            col_idx.iter().map(|&i| table.columns[i].decimal).collect();
         let not_null: Vec<usize> = table
             .columns
             .iter()
@@ -4197,6 +4201,7 @@ impl Database {
             col_names,
             col_indices: col_idx,
             affinities,
+            decimals,
             not_null,
             rowid_alias: table.rowid_alias,
             root,
@@ -11212,6 +11217,8 @@ pub(crate) fn expr_to_sql(e: &Expr) -> String {
                 Or => "OR",
                 Arrow => "->",
                 ArrowText => "->>",
+                FtsMatch => "@@",
+                Distance => "<->",
             };
             format!("{} {} {}", expr_to_sql(left), sym, expr_to_sql(right))
         }
@@ -12287,6 +12294,9 @@ struct InsertChain {
     col_indices: Vec<usize>,
     /// Column affinity per VALUES position (parallel to `col_indices`).
     affinities: Vec<crate::types::Affinity>,
+    /// DECIMAL(p,s) scale spec per VALUES position (parallel to
+    /// `col_indices`); `None` = not enforced.
+    decimals: Vec<Option<(u8, u8)>>,
     /// Column indices that enforce NOT NULL.
     not_null: Vec<usize>,
     /// Rowid-alias column (INTEGER PRIMARY KEY), if any.
@@ -12409,7 +12419,7 @@ fn parse_chain_row(sql: &str, ch: &mut InsertChain) -> ChainParse {
             // executor's conflict-checking path.
             return ChainParse::Mismatch;
         }
-        ch.full_row[target] = ch.affinities[k].coerce(v);
+        ch.full_row[target] = crate::schema::coerce_with(ch.affinities[k], ch.decimals[k], v);
         k += 1;
         i = skip_ws(b, ni);
         if i < b.len() && b[i] == b',' {

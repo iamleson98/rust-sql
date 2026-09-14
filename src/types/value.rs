@@ -678,13 +678,22 @@ pub enum Affinity {
     Real,
     Text,
     Blob,
+    /// SQLite's NUMERIC affinity — the "everything else" bucket
+    /// (NUMERIC, DECIMAL, DEC, FIXED, MONEY, BOOLEAN, DATE, DATETIME, ...).
+    /// Numeric-looking TEXT coerces to INTEGER or REAL (integer preferred);
+    /// numbers pass through; other values keep their storage class.
+    Numeric,
     /// No affinity (NULL or expression result).
     None,
 }
 
 impl Affinity {
-    /// SQLite's affinity rules: a column declared INTEGER gets INTEGER affinity,
-    /// REAL/FLOAT/DOUBLE → REAL, CHAR/CLOB/TEXT → TEXT, BLOB or no type → BLOB.
+    /// SQLite's affinity rules (datatype3.html §3.1): a column declared
+    /// INT* gets INTEGER affinity, CHAR/CLOB/TEXT → TEXT, BLOB or no type →
+    /// BLOB, REAL/FLOA/DOUB → REAL, and EVERYTHING ELSE → NUMERIC. The
+    /// final else previously fell through to BLOB — the affinity defect
+    /// that made `DECIMAL`, `NUMERIC`, `DATE`, `BOOLEAN` and `MONEY`
+    /// columns blob-affine; now they are NUMERIC like real SQLite.
     pub fn from_declared_type(decl: &str) -> Affinity {
         let d = decl.to_ascii_uppercase();
         if d.contains("INT") {
@@ -696,7 +705,7 @@ impl Affinity {
         } else if d.contains("REAL") || d.contains("FLOA") || d.contains("DOUB") {
             Affinity::Real
         } else {
-            Affinity::Blob
+            Affinity::Numeric
         }
     }
 
@@ -752,6 +761,32 @@ impl Affinity {
             // (sqlx stores UUIDs as 16-byte BLOBs in uuid-text columns).
             (Affinity::Text, Value::Blob(b)) => Value::Blob(b),
             (Affinity::Text, Value::Null) => Value::Null,
+
+            // NUMERIC affinity (pinned against real SQLite 3.53 via
+            // examples/probe_numeric_affinity.rs): numeric-looking text
+            // coerces to INTEGER (preferred) or REAL; lossless-integral
+            // REALs squeeze to INTEGER (inserting 5.0 yields typeof
+            // 'integer' 5); non-numeric text keeps its TEXT storage class;
+            // BLOBs are never converted by any affinity.
+            (Affinity::Numeric, Value::Integer(i)) => Value::Integer(i),
+            (Affinity::Numeric, Value::Real(f)) => {
+                if f.is_finite() && f.trunc() == f && f.abs() <= 9.007_199_254_740_992e15 {
+                    Value::Integer(f as i64)
+                } else {
+                    Value::Real(f)
+                }
+            }
+            (Affinity::Numeric, Value::Text(s)) => {
+                let trimmed = s.trim();
+                if let Ok(i) = trimmed.parse::<i64>() {
+                    Value::Integer(i)
+                } else if let Ok(f) = trimmed.parse::<f64>() {
+                    Value::Real(f)
+                } else {
+                    Value::Text(s)
+                }
+            }
+            (Affinity::Numeric, v) => v,
 
             // BLOB and None: leave as-is
             (_, v) => v,

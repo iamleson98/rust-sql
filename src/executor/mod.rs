@@ -14,6 +14,8 @@
 pub mod datetime;
 pub(crate) mod explain;
 pub mod expr;
+pub mod fts;
+pub mod geo;
 pub mod json;
 pub mod jsonb;
 pub(crate) mod parallel;
@@ -1712,7 +1714,7 @@ pub(crate) fn apply_generated_columns(
     for (i, col) in table.columns.iter().enumerate() {
         if let Some((expr, _stored)) = &col.generated {
             let v = eval_row(expr, row, col_names, params, named_params)?;
-            let coerced = col.affinity.coerce(v);
+            let coerced = col.coerce(v);
             if i < row.len() {
                 row[i] = coerced;
             }
@@ -12272,10 +12274,16 @@ fn compile_join_jexpr(
         )),
         Expr::Binary { op, left, right } => {
             // JSON path operators can RAISE in the serial evaluator —
-            // decline (the compiled set must be infallible).
+            // decline (the compiled set must be infallible). The
+            // PostgreSQL-borrowed `@@` (FTS match) and `<->` (KNN distance)
+            // operators parse their operands (tsvector/tsquery, WKT) and
+            // can raise the same way — decline them too.
             if matches!(
                 op,
-                crate::sql::ast::BinaryOp::Arrow | crate::sql::ast::BinaryOp::ArrowText
+                crate::sql::ast::BinaryOp::Arrow
+                    | crate::sql::ast::BinaryOp::ArrowText
+                    | crate::sql::ast::BinaryOp::FtsMatch
+                    | crate::sql::ast::BinaryOp::Distance
             ) {
                 return None;
             }
@@ -16016,8 +16024,9 @@ fn exec_insert_inner(
                         explicit_rowid = rowid_from_value(&val)?;
                         continue;
                     }
-                    let affinity = table.columns[col_idx].affinity;
-                    full_row[col_idx] = affinity.coerce(val);
+                    // Column-level coercion (affinity + DECIMAL(p,s)
+                    // rounding for declared precision/scale columns).
+                    full_row[col_idx] = table.columns[col_idx].coerce(val);
                 }
             }
             // Apply column defaults.
@@ -16256,8 +16265,9 @@ fn exec_insert_inner(
                     };
                     continue;
                 }
-                let affinity = table.columns[col_idx].affinity;
-                full_row[col_idx] = affinity.coerce(val.clone());
+                // Column-level coercion (affinity + DECIMAL(p,s)
+                // rounding for declared precision/scale columns).
+                full_row[col_idx] = table.columns[col_idx].coerce(val.clone());
             }
         }
 
@@ -16486,7 +16496,7 @@ pub fn fast_insert_literal_rows(
                 )));
             }
             for (i, v) in row.into_iter().enumerate() {
-                full_row[i] = table.columns[i].affinity.coerce(v);
+                full_row[i] = table.columns[i].coerce(v);
             }
         } else {
             if row.len() != col_indices.len() {
@@ -16501,7 +16511,7 @@ pub fn fast_insert_literal_rows(
                     explicit_rowid = rowid_from_value(&v)?;
                     continue;
                 }
-                full_row[col_idx] = table.columns[col_idx].affinity.coerce(v);
+                full_row[col_idx] = table.columns[col_idx].coerce(v);
             }
         }
 
@@ -17301,8 +17311,7 @@ fn exec_upsert_row(
                     )));
                 }
                 let v = eval_row(expr, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
-                let aff = table.columns[col_idx].affinity;
-                new_row[col_idx] = aff.coerce(v);
+                new_row[col_idx] = table.columns[col_idx].coerce(v);
             }
             // GENERATED columns recompute on the merged row (plain names
             // resolve against the table's columns).
@@ -18251,8 +18260,7 @@ fn exec_update(
         let mut new_row: Vec<Value> = row[..n_cols].to_vec();
         for (col_idx, expr) in assignments {
             new_row[*col_idx] = eval_row(expr, row, &col_names, &ctx.params, &ctx.named_params)?;
-            let aff = table.columns[*col_idx].affinity;
-            new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
+            new_row[*col_idx] = table.columns[*col_idx].coerce(new_row[*col_idx].clone());
         }
         // GENERATED columns recompute when a referenced column changes
         // (the persisted value is refreshed, mirroring SQLite's recompute).
@@ -18601,8 +18609,7 @@ fn exec_update_from(
                 &ctx.params,
                 &ctx.named_params,
             )?;
-            let aff = table.columns[*col_idx].affinity;
-            new_row[*col_idx] = aff.coerce(new_row[*col_idx].clone());
+            new_row[*col_idx] = table.columns[*col_idx].coerce(new_row[*col_idx].clone());
         }
         // GENERATED columns recompute against the new target-row values
         // (exprs resolve against plain_cols — table column names).
@@ -19244,8 +19251,7 @@ fn try_streaming_update(
                 new_row.extend_from_slice(&row_buf);
                 for (col_idx, expr) in assignments {
                     let v = eval_row(expr, &row_buf, col_names, &params, &named_params)?;
-                    let aff = table.columns[*col_idx].affinity;
-                    new_row[*col_idx] = aff.coerce(v);
+                    new_row[*col_idx] = table.columns[*col_idx].coerce(v);
                 }
                 // GENERATED columns recompute (single-row path).
                 apply_generated_columns(table, &mut new_row, col_names, &params, &named_params)?;
@@ -20376,7 +20382,7 @@ fn fused_patch_row(
             // Eligibility guarantees Some — unreachable; fall back safely.
             _ => return None,
         };
-        let v = table.columns[*col_idx].affinity.coerce(v);
+        let v = table.columns[*col_idx].coerce(v);
         let off = pc.staging.len();
         v.encode_into(&mut pc.staging);
         pc.slot_regions.push((off, pc.staging.len() - off));
@@ -20578,7 +20584,7 @@ fn process_update_row(
                         Some(Some(cexpr)) => cexpr.eval(row_buf, params),
                         _ => Value::Null, // eligibility guaranteed Some — unreachable
                     };
-                    let v = table.columns[*col_idx].affinity.coerce(v);
+                    let v = table.columns[*col_idx].coerce(v);
                     let off = pc.staging.len();
                     v.encode_into(&mut pc.staging);
                     pc.slot_regions.push((off, pc.staging.len() - off));
@@ -20676,8 +20682,7 @@ fn process_update_row(
         } else {
             eval_row(expr, row_buf, col_names, params, named_params)?
         };
-        let aff = table.columns[*col_idx].affinity;
-        new_row[*col_idx] = aff.coerce(v);
+        new_row[*col_idx] = table.columns[*col_idx].coerce(v);
     }
     // GENERATED columns recompute when a referenced column changes.
     apply_generated_columns(table, new_row, col_names, params, named_params)?;

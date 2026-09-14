@@ -19,6 +19,14 @@ pub struct Column {
     pub name: String,
     pub affinity: Affinity,
     pub declared_type: String,
+    /// PostgreSQL-borrowed DECIMAL(p,s) / NUMERIC(p,s) enforcement:
+    /// when the declared type carries an explicit precision and scale,
+    /// writes are ROUNDED to `s` decimal places (half away from zero,
+    /// like PG's numeric). This is an intentional divergence from SQLite,
+    /// which silently ignores the precision/scale (probe-pinned footgun:
+    /// inserting 1.555 into DECIMAL(10,2) keeps 1.555). Scale 0 columns
+    /// store INTEGER; otherwise REAL (f64 approximation, documented).
+    pub decimal: Option<(u8, u8)>,
     pub nullable: bool,
     pub default: Option<crate::sql::ast::Expr>,
     pub primary_key: bool,
@@ -39,10 +47,65 @@ pub struct Column {
 }
 
 impl Column {
-    /// Apply this column's affinity to a value.
+    /// Apply this column's affinity (and, for declared DECIMAL(p,s) /
+    /// NUMERIC(p,s) columns, PostgreSQL-style scale rounding) to a value.
     pub fn coerce(&self, v: Value) -> Value {
-        self.affinity.coerce(v)
+        coerce_with(self.affinity, self.decimal, v)
     }
+}
+
+/// Affinity + optional DECIMAL(p,s) scale enforcement — the write-path
+/// coercion for callers that hold the pieces separately (e.g. the INSERT
+/// chain fast path, which pre-extracts per-column affinities). This is
+/// the exact equivalent of [`Column::coerce`].
+pub fn coerce_with(aff: Affinity, decimal: Option<(u8, u8)>, v: Value) -> Value {
+    let v = aff.coerce(v);
+    match (decimal, &v) {
+        (Some((_, s)), Value::Real(f)) => Value::Real(round_scale(*f, s)),
+        (Some((_, 0)), Value::Integer(_)) => v,
+        _ => v,
+    }
+}
+
+/// Round to `s` decimal places, half away from zero (PG numeric rule;
+/// Rust's f64::round already rounds halves away from zero).
+fn round_scale(f: f64, s: u8) -> f64 {
+    let m = 10f64.powi(s as i32);
+    // guard the multiply against overflow to inf
+    if f.is_finite() && (f * m).is_finite() {
+        (f * m).round() / m
+    } else {
+        f
+    }
+}
+
+/// Parse `DECIMAL(p,s)` / `NUMERIC(p,s)` / `DEC(p,s)` / `DECIMAL(p)` from
+/// a declared type. Returns (precision, scale); scale defaults to 0 like
+/// PostgreSQL. Plain `DECIMAL` (no parens) is NOT enforced (SQLite
+/// semantics — nothing to round to).
+pub fn parse_decimal_spec(declared: &str) -> Option<(u8, u8)> {
+    let d = declared.trim().to_ascii_uppercase();
+    let base = d
+        .strip_prefix("DECIMAL")
+        .or_else(|| d.strip_prefix("NUMERIC"))
+        .or_else(|| d.strip_prefix("DEC"))
+        .or_else(|| d.strip_prefix("FIXED"))?;
+    let base = base.trim_start();
+    let rest = base.strip_prefix('(')?;
+    let inner = rest.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
+    let p: u8 = parts
+        .first()?  
+        .parse()
+        .ok()?;
+    let s: u8 = match parts.get(1) {
+        Some(sp) => sp.parse().ok()?,
+        None => 0,
+    };
+    if s > p {
+        return None; // PG rejects s > p; treat as unenforced
+    }
+    Some((p, s))
 }
 
 /// One FOREIGN KEY clause of a table (from a column-level `REFERENCES` or
@@ -854,6 +917,7 @@ pub fn build_table(
         } else {
             Affinity::from_declared_type(&col.type_name)
         };
+        let decimal = parse_decimal_spec(&col.type_name);
         let mut nullable = true;
         let mut primary_key = false;
         let mut primary_key_order = Order::Asc;
@@ -906,6 +970,7 @@ pub fn build_table(
             name: col.name.clone(),
             affinity,
             declared_type: col.type_name.clone(),
+            decimal,
             nullable,
             default,
             primary_key,
@@ -1163,6 +1228,7 @@ pub fn sqlite_master_table() -> Table {
             name: (*c).to_string(),
             affinity: crate::types::Affinity::from_declared_type(t),
             declared_type: (*t).to_string(),
+            decimal: None, // TEXT/INTEGER schema columns: no decimal spec
             nullable: true,
             default: None,
             primary_key: false,

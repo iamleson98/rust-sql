@@ -413,16 +413,33 @@ impl Parser {
         } else {
             return Ok(parts);
         }
-        // Optional `(n)` or `(n, m)` after the type.
+        // Optional `(n)` or `(n, m)` after the type. The spec is captured
+        // into the declared type name (space-free, e.g. `DECIMAL(10,2)`)
+        // so DECIMAL(p,s)/NUMERIC(p,s) scale enforcement can see it.
+        // SQLite itself ignores the spec — but keeping it is lossless for
+        // every other consumer (affinity matching is substring-based,
+        // schema SQL round-trips closer to what the user wrote).
         if self.peek().is_punct('(') {
             self.advance();
-            // Skip until matching close paren.
+            let mut spec = String::from("(");
             let mut depth = 1;
             while depth > 0 && !matches!(self.peek().token, Token::Eof) {
                 if self.peek().is_punct('(') {
                     depth += 1;
+                    spec.push('(');
                 } else if self.peek().is_punct(')') {
                     depth -= 1;
+                    if depth > 0 {
+                        spec.push(')');
+                    }
+                } else {
+                    match &self.peek().token {
+                        Token::Integer(n) => spec.push_str(&n.to_string()),
+                        Token::HugeInteger(n) => spec.push_str(&n.to_string()),
+                        Token::Ident(s) => spec.push_str(s), // e.g. VARCHAR(max)
+                        Token::Punct(',') => spec.push(','),
+                        _ => {}
+                    }
                 }
                 if depth > 0 {
                     self.advance();
@@ -430,6 +447,13 @@ impl Parser {
             }
             if self.peek().is_punct(')') {
                 self.advance();
+                spec.push(')');
+                // attach directly to the FIRST part: `DECIMAL(10,2)`, not
+                // `DECIMAL (10,2)` — parse_decimal_spec strips the exact
+                // `(p,s)` suffix.
+                if let Some(first) = parts.first_mut() {
+                    first.push_str(&spec);
+                }
             }
         }
         // Additional type name parts (e.g. "DOUBLE PRECISION", "UNSIGNED BIG INT")
@@ -2543,6 +2567,8 @@ impl Parser {
                 ">=" => Some(BinaryOp::GtEq),
                 "->" => Some(BinaryOp::Arrow),
                 "->>" => Some(BinaryOp::ArrowText),
+                "@@" => Some(BinaryOp::FtsMatch),
+                "<->" => Some(BinaryOp::Distance),
                 _ => None,
             },
             Token::Keyword(k) => match *k {

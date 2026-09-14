@@ -407,6 +407,7 @@ pub(crate) fn vtab_columns_to_schema(
             name: name.clone(),
             affinity,
             declared_type: ty.clone(),
+            decimal: crate::schema::parse_decimal_spec(ty),
             nullable: true,
             default: None,
             primary_key: false,

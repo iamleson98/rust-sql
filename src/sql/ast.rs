@@ -678,6 +678,17 @@ pub enum BinaryOp {
     Arrow,
     /// JSON path access `->>` (returns the SQL value of the target).
     ArrowText,
+    /// Full-text search match `tsvector @@ tsquery` (PostgreSQL).
+    /// Sits at the `=`/`<>` precedence level (a boolean-ish predicate);
+    /// evaluates via `fts::eval_match_op` and can RAISE on malformed
+    /// operands.
+    FtsMatch,
+    /// Geospatial KNN distance `geom <-> geom` (PostGIS): planar minimum
+    /// distance. Sits at the `<`/`<=`/`>`/`>=` level so the filter idiom
+    /// `geom <-> origin < 100` parses as `(geom <-> origin) < 100`;
+    /// evaluates via `geo::eval_distance_op` and can RAISE on malformed
+    /// geometries.
+    Distance,
 }
 
 impl BinaryOp {
@@ -712,8 +723,8 @@ impl BinaryOp {
         match self {
             Or => 1,
             And => 2,
-            Eq | NotEq => 4,
-            Lt | LtEq | Gt | GtEq => 5,
+            Eq | NotEq | FtsMatch => 4,
+            Lt | LtEq | Gt | GtEq | Distance => 5,
             BitOr | BitXor | BitAnd | ShiftLeft | ShiftRight => 7,
             Add | Sub => 8,
             Mul | Div | Mod => 9,

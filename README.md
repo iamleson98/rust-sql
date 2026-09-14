@@ -97,6 +97,9 @@ for row in &rows {
 - **JSON path operators (SQLite 3.38+)**: `->` (JSON text result) and `->>` (SQL value result), with SQLite's precedence (tighter than `||`, looser than unary minus), field shorthand (`x -> 'a'`), bracket-index form (`x -> '[1]'`), negative integer indices, and chaining
 - **`json_each()` / `json_tree()`**: both one-level and recursive walks with the full 8-column schema — `key`, `value`, `type`, `atom`, `id`/`parent` (byte offsets into the canonical JSONB, matching SQLite exactly), `fullkey`, `path` — plus the second path argument and JSONB-blob input; `soundex()`, `unistr()` / `unistr_quote()`, `sqlite_compileoption_get()` / `sqlite_compileoption_used()`
 - **Date/time (full SQLite compatibility)**: `date()`, `time()`, `datetime()`, `julianday()`, `unixepoch()`, `strftime()`, `timediff()` with all modifiers (`+N days/months/years`, `start of month/year/day`, `end of month`, `weekday N`, `unixepoch`, `localtime`/`utc`, `subsec`) — a faithful port of SQLite's `date.c`
+- **Full-text search (PostgreSQL tsvector/tsquery)**: `to_tsvector()`, `to_tsquery()`, `plainto_tsquery()`, `phraseto_tsquery()`, `websearch_to_tsquery()` (quoted phrases → `<->` chains, `OR` → `|`, `-term` → NOT), the `tsvector @@ tsquery` match operator, `ts_rank()` / `ts_rank_cd()`, `ts_headline()`, `strip()`, `numnode()`, and tsvector concatenation via `tsvector_concat()` (Postgres `||`). Both types live in the TEXT storage class in their canonical forms (`'lex':1,3 'lex2':2`, `'cat' & 'dog' | !'pig'`) — the same layering SQLite's FTS5 uses (inverted structures above the row store). The `english` config applies a Snowball-derived stop-word list + a conservative Porter-style stemmer; `simple` is lowercase-only. Positions are 1-based with stop words counted (PG semantics), phrases use `<->`, prefix queries use `lexeme:*`, and only-stop-word queries error with PG's exact message. The dictionary applies at index/query-formation time — never when comparing stored values (`@@`, `ts_rank`), so results are self-consistent exactly like PG (`tsv @@ 'lazy'` does not match a stemmed `lazi`; `tsv @@ to_tsquery('lazy')` does). All functions are STRICT (NULL in → NULL out). The recommended indexing pattern works end-to-end: `tsv TEXT GENERATED ALWAYS AS (to_tsvector('english', body))` + an index + `WHERE tsv @@ ...` (`tests/fts_search.rs`, 9 suites)
+- **Geospatial (PostGIS-style)**: WKT geometry over TEXT — `POINT` / `LINESTRING` / `POLYGON` (with holes), EWKT `SRID=` prefixes rejected/round-tripped via `ST_SetSRID`/`ST_SRID`. Constructors: `ST_GeomFromText()`, `ST_Point()` / `ST_MakePoint()`, `ST_MakeEnvelope()`. Accessors: `ST_X()`, `ST_Y()`, `ST_GeometryType()` (ST_-prefixed names like PostGIS), `ST_NPoints()`, `ST_IsValid()`, `ST_AsText()`, `ST_AsGeoJSON()`. Measurements: `ST_Distance()` (planar), `ST_DistanceSphere()` (haversine, IUGG mean radius or a custom 3rd argument), `ST_DistanceSpheroid()` (Vincenty inverse on WGS84 — the classic Flinders Peak→Buninyong vector lands 54,972.271 m and is mirror-symmetric), `ST_Area()` (shoelace, holes subtracted), `ST_Length()` (open linestring path), `ST_Perimeter()` (closed rings), `ST_Centroid()`. Predicates: `ST_DWithin()`, `ST_Contains()` / `ST_Within()` (with hole semantics), `ST_Intersects()`. Shapes: `ST_Envelope()`, `ST_Expand()`. The KNN operator `geom <-> geom` (planar minimum distance) works in expressions, `WHERE` filters, and the classic `ORDER BY geom <-> origin LIMIT k` nearest-neighbor shape; WKT rendering is PostGIS-style (integral coordinates trim their `.0`). 2D only — Z/M, curves, and geometry collections are rejected (`tests/geo_spatial.rs`, 9 suites)
+- **PostgreSQL-borrowed static typing**: NUMERIC affinity is real (SQLite datatype3 §3.1's final bucket — columns declared `NUMERIC`/`DECIMAL`/`DATE`/`BOOLEAN`/`MONEY` are NUMERIC-affine, never blob-affine; numeric-looking TEXT coerces on write with integer preferred, `5.0` squeezes to INTEGER 5, BLOBs never convert — pinned against real SQLite in `tests/pg_types.rs`). `DECIMAL(p,s)` / `NUMERIC(p,s)` / `DEC(p,s)` enforcement rounds writes to `s` places half-away-from-zero on EVERY write path (INSERT executor, INSERT chain fast path, UPDATE — including in-place page patches), an intentional, documented divergence from SQLite which ignores the spec; plain `DECIMAL` without parens stays SQLite-exact. `pg_typeof()` maps storage classes to PG type names (`integer` / `double precision` / `text` / `bytea` / `unknown`); `CAST(x AS NUMERIC)` follows SQLite's numeric-prefix semantics bit-exactly (differential-pinned), and `CAST(x AS BOOLEAN)` is PG-borrowed — `true/false/t/f/yes/no/on/off/1/0` (case-insensitive) map to 1/0
 - **Transactions**: `BEGIN [DEFERRED]`, `COMMIT`, `ROLLBACK`, savepoints (`SAVEPOINT` / `RELEASE` / `ROLLBACK TO`) with nested capture/rollback; auto-commit per statement
 - **ANALYZE + statistics-driven planning**: `ANALYZE [schema.][table|index]` collects `sqlite_stat1` in SQLite's exact row format (`"rows D1 D2 …"` distinct-prefix counts, an `idx = NULL` row per index-less table, a real table that round-trips through files and reopen) and refreshes the planner's cost model: candidates rank by SQLite's estimate model (`rows / (D1 × … × Dk)`) with the covered-prefix heuristic breaking ties, and an index estimated to match > 75% of the table is declined in favor of a sequential scan — SQLite's own cost-model call. Stats survive close/reopen (`tests/analyze.rs`)
 - **Pragmas**: `foreign_keys`, `page_size` (512 B–64 KiB), `parallel_scan` (intra-statement worker split), `temp_store` (0/FILE/2-MEMORY — gates the GROUP BY temp-store spill), `integrity_check`, `codec`, `journal_mode` (WAL / delete), `busy_timeout`, and more — others parse and are accepted as no-ops, exactly like SQLite does for unknown pragmas
@@ -352,6 +355,10 @@ src/
 ├── executor/
 │   ├── mod.rs          # Operators, streaming drivers, fused scans
 │   ├── expr.rs         # Expression evaluation, scalar functions
+│   ├── datetime.rs     # SQLite-compatible date/time engine
+│   ├── json.rs / jsonb.rs # JSON1 + JSONB function families
+│   ├── fts.rs          # PostgreSQL-style full-text search (tsvector/tsquery)
+│   ├── geo.rs          # PostGIS-style geometry (WKT, ST_*, Vincenty, KNN)
 │   ├── parallel.rs     # Intra-statement worker split (aggregates, top-N)
 │   └── vtab_exec.rs    # Virtual-table scan/update drivers
 └── plugin/             # Registry, ABIs, dynamic extension loading
@@ -359,7 +366,7 @@ compat/                 # Drop-in libsqlite3 C ABI + libsqlite3-sys replacement
 sqlx-interop/           # sea-orm 2.0 + sqlx 0.9 integration testbed
 plugins/                # Extension examples in C, C++, Zig, Rust
 benches/                # criterion harnesses vs rusqlite
-examples/               # 178 probes/benchmarks (bench_compare, probe_*, ...)
+examples/               # 179 probes/benchmarks (bench_compare, probe_*, ...)
 tests/                  # The full test matrix (see Testing)
 include/rustqlite_ext.h # Extension header for C/C++/Zig
 ```
@@ -1420,7 +1427,7 @@ let rows = db.query("SELECT rot13('hello')", [])?;   // "uryyb"
 
 ## Examples
 
-See [`examples/`](examples/) — 178 probes and benchmarks:
+See [`examples/`](examples/) — 179 probes and benchmarks:
 
 - `basic.rs`: create, insert, query, update, delete, aggregates, group by
 - `transaction.rs`: atomic transfer between accounts
@@ -1440,8 +1447,8 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1041 tests in
-the default matrix (187 unit + 854 integration across 67 files), plus 65 C ABI
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1098 tests in
+the default matrix (219 unit + 879 integration across 70 files), plus 65 C ABI
 suites in `compat/` and the sqlx feature suite — all passing:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
@@ -1468,6 +1475,9 @@ suites in `compat/` and the sqlx feature suite — all passing:
 | Rowid in joins | `tests/rowid_join.rs` | rowid pseudo-column refs in join conditions/projections/filters differential-pinned vs bundled SQLite (rowid↔rowid, rowid↔column, outer-join NULL semantics, 3-table chains, self-joins, INTEGER-PK alias tables, `COLLATE BINARY` as the default collation, `:memory:` purity) |
 | Non-equi joins | `tests/nested_join.rs` | compiled nested-loop conditions differential-pinned vs bundled SQLite (every join flavor × comparison/arithmetic/collate/AND-OR-NOT/NULL shapes, implicit-join fusion), 150k-row parallel==serial equality for INNER/LEFT/RIGHT/FULL, transaction-decline + PRAGMA gates, SQLite cross-checks at scale, and SQLite-exact boolean truthiness (`'abc'`/`'1x'` prefix coercion, blob rules, `NOT NULL` three-valued logic) |
 | Numeric parity | `tests/numeric_parity.rs` | SUM/TOTAL/AVG/window arithmetic vs bundled SQLite at the **f64-bit** level (integer-exact + Kahan–Babuška compensation, flip semantics, NULL rules, worker-split equality) |
+| Full-text search | `tests/fts_search.rs` | the PostgreSQL FTS surface end-to-end: canonical tsvector/tsquery forms, config resolution (english/simple/pg_catalog-qualified), `@@` in WHERE with AND/NOT/prefix/phrase shapes, STRICT NULL propagation, `ts_rank` ordering, `ts_headline`, `strip`/`numnode`/`tsvector_concat`, and the GENERATED ALWAYS indexing pattern (stored canonical value, recompute on UPDATE, index present) |
+| Geospatial | `tests/geo_spatial.rs` | the PostGIS surface end-to-end: WKT constructors/accessors, SRID tagging, GeoJSON, planar + spherical (haversine) + spheroidal (Vincenty — the classic 54,972.271 m Flinders Peak→Buninyong vector) distances, area/length/perimeter/centroid, predicates with hole semantics, envelope/expand shapes, the `<->` operator in expressions/WHERE/`ORDER BY ... LIMIT k` KNN, and a table workflow (bounding-box containment + nearest-neighbor ranking) |
+| PostgreSQL typing | `tests/pg_types.rs` | NUMERIC-affinity storage classes differential-pinned against bundled SQLite for every catch-bucket declaration (NUMERIC/DECIMAL/DEC/FIXED/MONEY/BOOLEAN/DATE/DATETIME), `CAST AS NUMERIC` bit-parity vs SQLite, DECIMAL(p,s) scale enforcement (round-half-away-from-zero on INSERT/UPDATE/chain fast-path, plain-DECIMAL non-enforcement), `pg_typeof`, and PG-borrowed `CAST AS BOOLEAN` |
 | Temp-store spill | `tests/tempstore.rs` | forced multi-chunk spills match the RAM reference for every aggregate family; streaming driver = buffered; parallel = serial; key-sorted spill order; `PRAGMA temp_store` round-trip; ephemeral files always cleaned up |
 | Statistics | `tests/analyze.rs` | sqlite_stat1 rows in SQLite's exact format, targeted ANALYZE, cost-based index choice (unselective indexes declined), reopen persistence, compound/expression-index prefixes |
 | SQL Logic Tests | `tests/slt_runner.rs` + `tests/slt/` | the SLT format SQLite's core team uses |
@@ -1482,6 +1492,9 @@ cargo test --test parallel_scan                         # parallel-vs-serial equ
 cargo test --test crash_recovery                        # crash simulation
 cargo test --test durability                            # close/reopen matrix
 cargo test --test column_names                          # output-column-name contract
+cargo test --test fts_search                            # PostgreSQL-style FTS
+cargo test --test geo_spatial                           # PostGIS-style geometry
+cargo test --test pg_types                              # NUMERIC affinity + DECIMAL(p,s)
 cargo test --features oom-injection --test oom_fault    # OOM injection
 cargo clippy --all-targets --features sqlx              # 0 warnings (all configs)
 cargo run --release --example bench_compare             # vs SQLite

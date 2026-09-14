@@ -88,8 +88,44 @@ fn substr_range(n: i64, y: i64, z: i64) -> (i64, i64) {
 /// while affinity conversion only fires when the WHOLE string looks numeric.
 /// Overflow saturates to i64::MIN/MAX, `CAST('inf' AS REAL)` is 0.0, and
 /// NUMERIC keeps integral values as INTEGER (`CAST('12.0' AS NUMERIC)` is
-/// the integer 12).
+/// the integer 12). `CAST(x AS BOOLEAN)` is PostgreSQL-borrowed: the PG
+/// boolean literal words map to 1/0 (see the arm below).
 fn cast_value(v: Value, type_name: &str) -> Value {
+    // PostgreSQL CAST AS BOOLEAN: 'true'/'false'/'t'/'f'/'yes'/'no'/
+    // 'on'/'off'/'1'/'0' (case-insensitive, surrounding whitespace
+    // allowed) map to 1/0; numbers map by truthiness. Unrecognized text
+    // falls through to the SQLite NUMERIC cast below (numeric prefix →
+    // 0), so `CAST('maybe' AS BOOLEAN)` is 0, not an error — the engine's
+    // CAST is infallible by design (SQLite semantics).
+    {
+        let t = type_name.trim().to_ascii_uppercase();
+        if t == "BOOLEAN" || t == "BOOL" {
+            return match v {
+                Value::Null => Value::Null,
+                Value::Integer(i) => Value::Integer((i != 0) as i64),
+                Value::Real(f) => Value::Integer((f != 0.0) as i64),
+                Value::Text(_) | Value::Blob(_) => {
+                    let s = v.as_text().trim().to_ascii_lowercase();
+                    match s.as_str() {
+                        "true" | "t" | "yes" | "on" | "1" => Value::Integer(1),
+                        "false" | "f" | "no" | "off" | "0" => Value::Integer(0),
+                        _ => {
+                            // SQLite NUMERIC-cast fallback (numeric prefix)
+                            let f =
+                                crate::types::value::parse_real_prefix(&v.as_text());
+                            if f.is_finite() && f.trunc() == f
+                                && f.abs() <= 9.007_199_254_740_992e15
+                            {
+                                Value::Integer(f as i64)
+                            } else {
+                                Value::Real(f)
+                            }
+                        }
+                    }
+                }
+            };
+        }
+    }
     let affinity = Affinity::from_declared_type(type_name);
     match affinity {
         Affinity::Integer => match v {
@@ -130,6 +166,25 @@ fn cast_value(v: Value, type_name: &str) -> Value {
                         text.as_str(),
                         enc,
                     ))
+                }
+            }
+        },
+        // NUMERIC cast: longest numeric PREFIX (CAST semantics, not
+        // affinity — pinned via examples/probe_numeric_affinity.rs):
+        // `CAST('123' AS NUMERIC)` is INTEGER 123, `CAST('1.5' AS NUMERIC)`
+        // is REAL 1.5, `CAST('abc' AS NUMERIC)` is INTEGER 0, and — unlike
+        // column affinity — `CAST(12.0 AS NUMERIC)` stays REAL 12.0 (CAST
+        // never squeezes a REAL down to INTEGER).
+        Affinity::Numeric => match v {
+            Value::Null => Value::Null,
+            Value::Integer(i) => Value::Integer(i),
+            Value::Real(f) => Value::Real(f),
+            Value::Text(_) | Value::Blob(_) => {
+                let f = crate::types::value::parse_real_prefix(&v.as_text());
+                if f.is_finite() && f.trunc() == f && f.abs() <= 9.007_199_254_740_992e15 {
+                    Value::Integer(f as i64)
+                } else {
+                    Value::Real(f)
                 }
             }
         },
@@ -380,6 +435,16 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             // operator and can RAISE (malformed JSON / bad path).
             if matches!(op, BinaryOp::Arrow | BinaryOp::ArrowText) {
                 return arrow_eval(*op, &l, &r);
+            }
+            // PostgreSQL-borrowed operators, also RAISE-capable (they parse
+            // their operands as tsvector/tsquery / WKT geometry):
+            //   `tsvector @@ tsquery` — full-text match
+            //   `geom <-> geom`       — PostGIS-style planar KNN distance
+            if matches!(op, BinaryOp::FtsMatch) {
+                return crate::executor::fts::eval_match_op(&l, &r);
+            }
+            if matches!(op, BinaryOp::Distance) {
+                return crate::executor::geo::eval_distance_op(&l, &r);
             }
             // COLLATE on either comparison operand applies a collation to
             // text comparison (SQLite: `a < b COLLATE NOCASE`). Only
@@ -1517,19 +1582,44 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 None => Value::Null,
             }
         }
+        // pg_typeof(X) — PostgreSQL's type-name introspection, mapped to
+        // the closest PG type of our storage classes: NULL → 'unknown',
+        // INTEGER → 'integer', REAL → 'double precision' (SQLite REAL is
+        // an IEEE float8; PG 'real' is float4), TEXT → 'text', BLOB →
+        // 'bytea'. (The SQLite-native typeof() keeps its storage-class
+        // names.)
+        "pg_typeof" => Value::Text(
+            match args.first() {
+                Some(Value::Null) | None => "unknown",
+                Some(Value::Integer(_)) => "integer",
+                Some(Value::Real(_)) => "double precision",
+                Some(Value::Text(_)) => "text",
+                Some(Value::Blob(_)) => "bytea",
+            }
+            .into(),
+        ),
         // JSON1 — see json.rs. USER FUNCTIONS take priority over JSON1
         // so extensions can shadow built-in JSON names (SQLite: user
         // functions override core ones registered in the same "override"
         // slot). Unknown names error like SQLite ("no such function").
+        // Full-text search (to_tsvector family) and geospatial (ST_*
+        // family) dispatch the same way — after user functions (they can
+        // be shadowed by plugins), before the final error.
         _ => {
             if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
                 return r;
             }
             match crate::executor::json::call_json_function(&fname, args)? {
                 Some(v) => v,
-                None => {
-                    return Err(Error::NotFound(format!("no such function: {}", name)));
-                }
+                None => match crate::executor::fts::call_fts_function(&fname, args)? {
+                    Some(v) => v,
+                    None => match crate::executor::geo::call_geo_function(&fname, args)? {
+                        Some(v) => v,
+                        None => {
+                            return Err(Error::NotFound(format!("no such function: {}", name)));
+                        }
+                    },
+                },
             }
         }
     })
@@ -1608,8 +1698,12 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "max",
         "min",
         "nullif",
+        "numnode",
         "octet_length",
+        "pg_typeof",
+        "phraseto_tsquery",
         "pi",
+        "plainto_tsquery",
         "power",
         "printf",
         "quote",
@@ -1624,21 +1718,55 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "sqlite_version",
         "sqlite_source_id",
         "sqrt",
+        "st_area",
+        "st_asgeojson",
+        "st_astext",
+        "st_centroid",
+        "st_contains",
+        "st_distancesphere",
+        "st_distancespheroid",
+        "st_dwithin",
+        "st_envelope",
+        "st_expand",
+        "st_geometrytype",
+        "st_geomfromtext",
+        "st_intersects",
+        "st_isvalid",
+        "st_length",
+        "st_makeenvelope",
+        "st_makepoint",
+        "st_npoints",
+        "st_perimeter",
+        "st_point",
+        "st_setsrid",
+        "st_srid",
+        "st_within",
+        "st_x",
+        "st_y",
         "strftime",
+        "strip",
         "substr",
         "substring",
         "sum",
         "time",
         "timediff",
+        "to_tsquery",
+        "to_tsvector",
         "total",
         "total_changes",
         "trim",
         "true",
         "trunc",
+        "ts_headline",
+        "ts_match",
+        "ts_rank",
+        "ts_rank_cd",
+        "tsvector_concat",
         "typeof",
         "unicode",
         "unixepoch",
         "upper",
+        "websearch_to_tsquery",
         "zeroblob",
     ];
     let lowered = name.to_ascii_lowercase();
@@ -1722,7 +1850,10 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
     match op {
         // JSON path operators are intercepted in `evaluate` (they can
         // raise); reaching here means a fallback context — treat as NULL.
-        Arrow | ArrowText => Value::Null,
+        // Same for the FTS `@@` and KNN `<->` operators (their RAISE-free
+        // compiled fallbacks simply never run — the join compiler declines
+        // them, see executor/mod.rs compile_join_jexpr).
+        Arrow | ArrowText | FtsMatch | Distance => Value::Null,
         // Integer overflow PROMOTES TO REAL (SQLite: 9223372036854775807 + 1
         // is 9.223372036854776e18, never a wrapped i64).
         Add => arith_checked(l, r, i64::checked_add, |a, b| a + b),
