@@ -530,3 +530,15 @@ Work Log:
 
 Stage Summary:
 - The torture gate now has three noise defenses (best-of-N, marginal confirmation re-sample, darwin relative floor) mirroring the bench gate's proven layering, each catching a distinct documented flake class without loosening the multi-x regression contract; ready to push and watch CI to full green.
+
+---
+Task ID: 24-verify
+Agent: main (Super Z)
+Task: Remote CI verification for 63899b3
+
+Work Log:
+- CI run 34794329181: COMPLETED SUCCESS — 22/22 jobs (rustfmt, clippy x4 configs, tests on ubuntu/windows/macos across default/sqlx/no-default configs, oom-injection, compat ABI, torture x3 OSes, bench-gates x3 OSes, sqlite file interop x3, ci-ok aggregate).
+- The three noise defenses each held where they were built to: windows torture green (confirmation re-sample), windows bench-gate green (micro-row floor), macOS torture green (darwin relative floor).
+
+Stage Summary:
+- Both user-requested tracks are delivered and CI-verified end-to-end: (1) Postgres-grade SCRAM-SHA-256 auth + full dump/export/import/backup CLI (e1aabab, verified green); (2) the reliability suite + green-CI mandate — extended through today with the durability suite (59d76a5), naming contracts (b8a26ed), and three distinct shared-runner noise classes fixed durably (c56a1a9 confirmation re-sample, 94c9017 micro-row floor, 63899b3 darwin band). Master green at 63899b3.
