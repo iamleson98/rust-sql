@@ -46,7 +46,10 @@ fn to_tsvector_canonical_form_and_config() {
     let d = db();
     // positions count stop words; stems applied; lexemes sorted.
     assert_eq!(
-        text(&d, "SELECT to_tsvector('english', 'The quick brown foxes jumped over the lazy dogs')"),
+        text(
+            &d,
+            "SELECT to_tsvector('english', 'The quick brown foxes jumped over the lazy dogs')"
+        ),
         "'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2"
     );
     // simple: lowercase only, stop words kept
@@ -70,8 +73,14 @@ fn to_tsvector_canonical_form_and_config() {
 #[test]
 fn to_tsquery_forms() {
     let d = db();
-    assert_eq!(text(&d, "SELECT to_tsquery('english', 'cat & dog')"), "'cat' & 'dog'");
-    assert_eq!(text(&d, "SELECT to_tsquery('english', 'cat | dog')"), "'cat' | 'dog'");
+    assert_eq!(
+        text(&d, "SELECT to_tsquery('english', 'cat & dog')"),
+        "'cat' & 'dog'"
+    );
+    assert_eq!(
+        text(&d, "SELECT to_tsquery('english', 'cat | dog')"),
+        "'cat' | 'dog'"
+    );
     assert_eq!(text(&d, "SELECT to_tsquery('english', '!cat')"), "!'cat'");
     assert_eq!(text(&d, "SELECT to_tsquery('english', 'run:*')"), "'run':*");
     assert_eq!(
@@ -79,9 +88,14 @@ fn to_tsquery_forms() {
         "'cat' <-> 'dog'"
     );
     // stop word dropped from a mixed query
-    assert_eq!(text(&d, "SELECT to_tsquery('english', 'cat & the')"), "'cat'");
+    assert_eq!(
+        text(&d, "SELECT to_tsquery('english', 'cat & the')"),
+        "'cat'"
+    );
     // only-stop-word query errors like PostgreSQL
-    assert!(d.query("SELECT to_tsquery('english', 'the & was')", []).is_err());
+    assert!(d
+        .query("SELECT to_tsquery('english', 'the & was')", [])
+        .is_err());
     // precedence: & binds tighter than |
     assert_eq!(
         text(&d, "SELECT to_tsquery('english', 'cat & dog | pig' )"),
@@ -106,7 +120,10 @@ fn plainto_phraseto_websearch() {
         "'fat' <-> 'cat'"
     );
     assert_eq!(
-        text(&d, "SELECT websearch_to_tsquery('english', 'fat cats mouse')"),
+        text(
+            &d,
+            "SELECT websearch_to_tsquery('english', 'fat cats mouse')"
+        ),
         "'fat' & 'cat' & 'mouse'"
     );
     assert_eq!(
@@ -114,7 +131,10 @@ fn plainto_phraseto_websearch() {
         "'fat' | 'cat'"
     );
     assert_eq!(
-        text(&d, "SELECT websearch_to_tsquery('english', '\"fat cats\" -mouse')"),
+        text(
+            &d,
+            "SELECT websearch_to_tsquery('english', '\"fat cats\" -mouse')"
+        ),
         "'fat' <-> 'cat' & !'mouse'"
     );
     // trailing OR with no operand is dropped
@@ -222,7 +242,10 @@ fn generated_column_pattern() {
     // and it updates when the source column changes
     d.execute("UPDATE docs SET body = 'sleepy cat' WHERE id = 1", [])
         .unwrap();
-    assert_eq!(text(&d, "SELECT tsv FROM docs WHERE id = 1"), "'cat':2 'sleepi':1");
+    assert_eq!(
+        text(&d, "SELECT tsv FROM docs WHERE id = 1"),
+        "'cat':2 'sleepi':1"
+    );
 }
 
 #[test]
@@ -248,17 +271,26 @@ fn ts_rank_orders_documents() {
     assert_eq!(ranked[0][0], Value::Integer(2));
     assert_eq!(ranked[1][0], Value::Integer(1));
     // rank values are positive REALs
-    assert!(real(&d, "SELECT ts_rank(to_tsvector('simple', 'postgres postgres'), 'postgres')") > 0.0);
+    assert!(
+        real(
+            &d,
+            "SELECT ts_rank(to_tsvector('simple', 'postgres postgres'), 'postgres')"
+        ) > 0.0
+    );
     // ts_rank_cd is accepted as an alias
-    assert!(real(
-        &d,
-        "SELECT ts_rank_cd(to_tsvector('simple', 'postgres postgres'), 'postgres')"
-    ) > 0.0);
+    assert!(
+        real(
+            &d,
+            "SELECT ts_rank_cd(to_tsvector('simple', 'postgres postgres'), 'postgres')"
+        ) > 0.0
+    );
     // 3-arg with weights array literal
-    assert!(real(
-        &d,
-        "SELECT ts_rank('{0.1,0.2,0.4,1.0}', to_tsvector('simple', 'postgres'), 'postgres')"
-    ) > 0.0);
+    assert!(
+        real(
+            &d,
+            "SELECT ts_rank('{0.1,0.2,0.4,1.0}', to_tsvector('simple', 'postgres'), 'postgres')"
+        ) > 0.0
+    );
     // NULL tsvector ranks NULL
     assert_eq!(one(&d, "SELECT ts_rank(NULL, 'postgres')"), Value::Null);
 }
@@ -274,9 +306,15 @@ fn headline_and_utilities() {
         "The <b>quick</b> brown <b>fox</b>"
     );
     // strip() drops positions
-    assert_eq!(text(&d, "SELECT strip(to_tsvector('english', 'cats and dogs'))"), "'cat' 'dog'");
+    assert_eq!(
+        text(&d, "SELECT strip(to_tsvector('english', 'cats and dogs'))"),
+        "'cat' 'dog'"
+    );
     // numnode counts query nodes
-    assert_eq!(int(&d, "SELECT numnode(to_tsquery('simple', 'a & b | !c'))"), 6);
+    assert_eq!(
+        int(&d, "SELECT numnode(to_tsquery('simple', 'a & b | !c'))"),
+        6
+    );
     // tsvector_concat = Postgres || for tsvectors ('simple' config: no
     // stemming, so 'apples' keeps its plural)
     assert_eq!(
@@ -293,11 +331,16 @@ fn match_operator_null_and_errors() {
     let d = db();
     // NULL operands propagate to NULL
     assert_eq!(one(&d, "SELECT NULL @@ 'cat'"), Value::Null);
-    assert_eq!(one(&d, "SELECT to_tsvector('simple', 'cat') @@ NULL"), Value::Null);
+    assert_eq!(
+        one(&d, "SELECT to_tsvector('simple', 'cat') @@ NULL"),
+        Value::Null
+    );
     // malformed stored tsvector raises
     assert!(d.query("SELECT 'garbage' @@ 'cat'", []).is_err());
     // malformed stored tsquery raises
-    assert!(d.query("SELECT to_tsvector('simple', 'cat') @@ '&&'", []).is_err());
+    assert!(d
+        .query("SELECT to_tsvector('simple', 'cat') @@ '&&'", [])
+        .is_err());
 }
 
 #[test]

@@ -29,16 +29,17 @@ fn main() {
     let mut stmt = conn
         .prepare("SELECT rowid, typeof(a), CAST(a AS TEXT), typeof(b), CAST(b AS TEXT) FROM t ORDER BY rowid")
         .unwrap();
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-        ))
-    })
-    .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .unwrap();
     for row in rows {
         let (id, ta, va, tb, vb) = row.unwrap();
         println!("row {id}: typeof(a)={ta} a={va} | typeof(b)={tb} b={vb}");
@@ -60,7 +61,9 @@ fn main() {
     ];
     for c in cases {
         let v: String = conn
-            .query_row(&format!("SELECT typeof({c}) || ' -> ' || {c}"), [], |r| r.get(0))
+            .query_row(&format!("SELECT typeof({c}) || ' -> ' || {c}"), [], |r| {
+                r.get(0)
+            })
             .unwrap();
         println!("{c:32} => {v}");
     }
@@ -74,16 +77,21 @@ fn main() {
         )
         .unwrap();
     println!("inserted 1.5 into DECIMAL(10,2): {v} (SQLite: no rounding)");
-    conn.execute("INSERT INTO t(b) VALUES ('1.555')", []).unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('1.555')", [])
+        .unwrap();
     let v2: String = conn
-        .query_row("SELECT typeof(b) || ' ' || b FROM t WHERE rowid = 9", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT typeof(b) || ' ' || b FROM t WHERE rowid = 9",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     println!("inserted 1.555 into DECIMAL(10,2): {v2} (SQLite: no rounding — the footgun)");
 
     println!("\n=== typeof/affinity of declared names ===");
-    for ty in ["NUMERIC", "DECIMAL", "DEC", "FIXED", "MONEY", "BOOLEAN", "DATE"] {
+    for ty in [
+        "NUMERIC", "DECIMAL", "DEC", "FIXED", "MONEY", "BOOLEAN", "DATE",
+    ] {
         let v: String = conn
             .query_row(
                 &format!("SELECT typeof(CAST(1 AS {ty})) || ', ' || typeof(CAST('x' AS {ty}))"),

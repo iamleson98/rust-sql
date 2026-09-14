@@ -49,15 +49,33 @@ fn constructors_and_accessors() {
     let d = db();
     assert_eq!(real(&d, "SELECT ST_X(ST_Point(1.5, 2.5))"), 1.5);
     assert_eq!(real(&d, "SELECT ST_Y(ST_MakePoint(1.5, 2.5))"), 2.5);
-    assert_eq!(text(&d, "SELECT ST_AsText(ST_GeomFromText('POINT(3 4)'))"), "POINT(3 4)");
-    assert_eq!(int(&d, "SELECT ST_NPoints(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))"), 3);
+    assert_eq!(
+        text(&d, "SELECT ST_AsText(ST_GeomFromText('POINT(3 4)'))"),
+        "POINT(3 4)"
+    );
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_NPoints(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))"
+        ),
+        3
+    );
     // ST_GeometryType returns the ST_-prefixed name (PostGIS behavior;
     // the unprefixed GEOMETRYTYPE() spelling is not implemented)
     assert_eq!(
-        text(&d, "SELECT ST_GeometryType(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))"),
+        text(
+            &d,
+            "SELECT ST_GeometryType(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))"
+        ),
         "ST_Polygon"
     );
-    assert_eq!(int(&d, "SELECT ST_IsValid(ST_GeomFromText('LINESTRING(0 0, 1 1)'))"), 1);
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_IsValid(ST_GeomFromText('LINESTRING(0 0, 1 1)'))"
+        ),
+        1
+    );
     // GeoJSON rendering (PostGIS trims integral .0)
     assert_eq!(
         text(&d, "SELECT ST_AsGeoJSON(ST_GeomFromText('POINT(1 2)'))"),
@@ -66,7 +84,10 @@ fn constructors_and_accessors() {
     // SRID tagging (default 0, set/query round-trip)
     assert_eq!(int(&d, "SELECT ST_SRID(ST_GeomFromText('POINT(1 2)'))"), 0);
     assert_eq!(
-        int(&d, "SELECT ST_SRID(ST_SetSRID(ST_GeomFromText('POINT(1 2)'), 4326))"),
+        int(
+            &d,
+            "SELECT ST_SRID(ST_SetSRID(ST_GeomFromText('POINT(1 2)'), 4326))"
+        ),
         4326
     );
 }
@@ -75,24 +96,39 @@ fn constructors_and_accessors() {
 fn measurements() {
     let d = db();
     // planar distance
-    assert_eq!(real(&d, "SELECT ST_Distance(ST_Point(0,0), ST_Point(3,4))"), 5.0);
+    assert_eq!(
+        real(&d, "SELECT ST_Distance(ST_Point(0,0), ST_Point(3,4))"),
+        5.0
+    );
     // area with a hole: 16 - 4
     let donut = "ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 3 1, 3 3, 1 3, 1 1))')";
     assert_eq!(real(&d, &format!("SELECT ST_Area({donut})")), 12.0);
     // linestring length is the OPEN path
     assert_eq!(
-        real(&d, "SELECT ST_Length(ST_GeomFromText('LINESTRING(0 0, 3 4)'))"),
+        real(
+            &d,
+            "SELECT ST_Length(ST_GeomFromText('LINESTRING(0 0, 3 4)'))"
+        ),
         5.0
     );
     // polygon perimeter closes every ring
     assert_eq!(
-        real(&d, "SELECT ST_Perimeter(ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'))"),
+        real(
+            &d,
+            "SELECT ST_Perimeter(ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'))"
+        ),
         16.0
     );
     // centroid of the unit square shifted by 1
     let (cx, cy) = (
-        real(&d, "SELECT ST_X(ST_Centroid(ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')))"),
-        real(&d, "SELECT ST_Y(ST_Centroid(ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')))"),
+        real(
+            &d,
+            "SELECT ST_X(ST_Centroid(ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')))",
+        ),
+        real(
+            &d,
+            "SELECT ST_Y(ST_Centroid(ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')))",
+        ),
     );
     assert!((cx - 1.0).abs() < 1e-9 && (cy - 1.0).abs() < 1e-9);
 }
@@ -116,7 +152,10 @@ fn spheroid_and_sphere_distances() {
         "SELECT ST_DistanceSphere(ST_GeomFromText('POINT(-73.7781 40.6413)'),
                                   ST_GeomFromText('POINT(-0.1276 51.5053)'))",
     );
-    assert!((sph / 1000.0 - 5554.0).abs() < 30.0, "haversine got {sph} m");
+    assert!(
+        (sph / 1000.0 - 5554.0).abs() < 30.0,
+        "haversine got {sph} m"
+    );
     // custom radius argument
     let r6 = real(
         &d,
@@ -129,17 +168,48 @@ fn spheroid_and_sphere_distances() {
 fn predicates() {
     let d = db();
     let square = "ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')";
-    assert_eq!(int(&d, &format!("SELECT ST_Contains({square}, ST_Point(5, 5))")), 1);
-    assert_eq!(int(&d, &format!("SELECT ST_Contains({square}, ST_Point(15, 5))")), 0);
+    assert_eq!(
+        int(&d, &format!("SELECT ST_Contains({square}, ST_Point(5, 5))")),
+        1
+    );
+    assert_eq!(
+        int(
+            &d,
+            &format!("SELECT ST_Contains({square}, ST_Point(15, 5))")
+        ),
+        0
+    );
     // hole semantics: point in the hole is NOT contained
-    let donut = "ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))')";
-    assert_eq!(int(&d, &format!("SELECT ST_Contains({donut}, ST_Point(5, 5))")), 0);
-    assert_eq!(int(&d, &format!("SELECT ST_Contains({donut}, ST_Point(2, 2))")), 1);
+    let donut =
+        "ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))')";
+    assert_eq!(
+        int(&d, &format!("SELECT ST_Contains({donut}, ST_Point(5, 5))")),
+        0
+    );
+    assert_eq!(
+        int(&d, &format!("SELECT ST_Contains({donut}, ST_Point(2, 2))")),
+        1
+    );
     // ST_Within is ST_Contains with swapped arguments
-    assert_eq!(int(&d, &format!("SELECT ST_Within(ST_Point(5, 5), {square})")), 1);
+    assert_eq!(
+        int(&d, &format!("SELECT ST_Within(ST_Point(5, 5), {square})")),
+        1
+    );
     // ST_Intersects: touching counts
-    assert_eq!(int(&d, &format!("SELECT ST_Intersects({square}, ST_Point(10, 5))")), 1);
-    assert_eq!(int(&d, &format!("SELECT ST_Intersects({square}, ST_Point(20, 5))")), 0);
+    assert_eq!(
+        int(
+            &d,
+            &format!("SELECT ST_Intersects({square}, ST_Point(10, 5))")
+        ),
+        1
+    );
+    assert_eq!(
+        int(
+            &d,
+            &format!("SELECT ST_Intersects({square}, ST_Point(20, 5))")
+        ),
+        0
+    );
     // ST_DWithin (comma-separated coordinates — `ST_Point(0 0)` is
     // invalid PostGIS function syntax)
     assert_eq!(
@@ -162,13 +232,19 @@ fn shapes() {
     );
     // Envelope of a diagonal linestring is its bounding box
     assert_eq!(
-        text(&d, "SELECT ST_AsText(ST_Envelope(ST_GeomFromText('LINESTRING(1 2, 5 8)')))"),
+        text(
+            &d,
+            "SELECT ST_AsText(ST_Envelope(ST_GeomFromText('LINESTRING(1 2, 5 8)')))"
+        ),
         "POLYGON((1 2, 5 2, 5 8, 1 8, 1 2))"
     );
     // Expand grows a geometry's bbox by a delta (returns the expanded
     // envelope polygon)
     assert_eq!(
-        text(&d, "SELECT ST_AsText(ST_Expand(ST_GeomFromText('POINT(1 1)'), 2.0))"),
+        text(
+            &d,
+            "SELECT ST_AsText(ST_Expand(ST_GeomFromText('POINT(1 1)'), 2.0))"
+        ),
         "POLYGON((-1 -1, 3 -1, 3 3, -1 3, -1 -1))"
     );
 }
@@ -185,7 +261,10 @@ fn knn_operator_expressions() {
     assert_eq!(int(&d, "SELECT (ST_Point(0, 0) <-> ST_Point(3, 4)) < 6"), 1);
     // point-to-linestring minimum distance
     assert_eq!(
-        real(&d, "SELECT ST_GeomFromText('LINESTRING(0 0, 0 10)') <-> ST_Point(3, 5)"),
+        real(
+            &d,
+            "SELECT ST_GeomFromText('LINESTRING(0 0, 0 10)') <-> ST_Point(3, 5)"
+        ),
         3.0
     );
 }
@@ -224,7 +303,10 @@ fn knn_order_by_nearest_neighbors() {
     assert_eq!(names, vec!["nearest", "near", "middle"]);
 
     // KNN + filter: within 10 units of the origin
-    let n = int(&d, "SELECT COUNT(*) FROM cafes WHERE (geom <-> ST_Point(0, 0)) < 10");
+    let n = int(
+        &d,
+        "SELECT COUNT(*) FROM cafes WHERE (geom <-> ST_Point(0, 0)) < 10",
+    );
     assert_eq!(n, 3);
 }
 
@@ -268,11 +350,16 @@ fn geo_sql_table_workflow() {
 #[test]
 fn null_handling() {
     let d = db();
-    assert_eq!(one(&d, "SELECT ST_Distance(NULL, ST_Point(0, 0))"), Value::Null);
+    assert_eq!(
+        one(&d, "SELECT ST_Distance(NULL, ST_Point(0, 0))"),
+        Value::Null
+    );
     assert_eq!(one(&d, "SELECT ST_X(NULL)"), Value::Null);
     assert_eq!(one(&d, "SELECT ST_Area(NULL)"), Value::Null);
     // bad WKT errors (matching ST_GeomFromText strictness)
-    assert!(d.query("SELECT ST_GeomFromText('NOT A GEOMETRY')", []).is_err());
+    assert!(d
+        .query("SELECT ST_GeomFromText('NOT A GEOMETRY')", [])
+        .is_err());
     // unknown ST_ function still errors as "no such function"
     assert!(d.query("SELECT ST_NoSuchFunction(1)", []).is_err());
 }

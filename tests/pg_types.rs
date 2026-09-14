@@ -33,7 +33,9 @@ fn sqlite_typeof(create: &str, insert: &str) -> Vec<String> {
     let sq = Connection::open_in_memory().unwrap();
     sq.execute_batch(&format!("{create}; {insert};")).unwrap();
     let mut out = Vec::new();
-    let mut stmt = sq.prepare("SELECT typeof(v) FROM t ORDER BY rowid").unwrap();
+    let mut stmt = sq
+        .prepare("SELECT typeof(v) FROM t ORDER BY rowid")
+        .unwrap();
     let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
     for r in rows {
         out.push(r.unwrap());
@@ -56,7 +58,9 @@ fn our_typeof(create: &str, insert: &str) -> Vec<String> {
 
 #[test]
 fn numeric_affinity_matches_sqlite() {
-    for decl in ["NUMERIC", "DECIMAL", "DEC", "FIXED", "MONEY", "BOOLEAN", "DATE", "DATETIME"] {
+    for decl in [
+        "NUMERIC", "DECIMAL", "DEC", "FIXED", "MONEY", "BOOLEAN", "DATE", "DATETIME",
+    ] {
         let create = format!("CREATE TABLE t(v {decl})");
         // numeric-looking text coerces; integer preferred
         let insert = "INSERT INTO t VALUES ('123'), ('1.5'), (5.0), ('abc'), (x'41')";
@@ -67,7 +71,11 @@ fn numeric_affinity_matches_sqlite() {
             "{decl}: typeof mismatch — ours {got:?} vs sqlite {expected:?}"
         );
         // the concrete expectations (also guards SQLite changes):
-        assert_eq!(got, vec!["integer", "real", "integer", "text", "blob"], "{decl}");
+        assert_eq!(
+            got,
+            vec!["integer", "real", "integer", "text", "blob"],
+            "{decl}"
+        );
     }
 }
 
@@ -84,10 +92,16 @@ fn numeric_affinity_integer_squeeze() {
     assert_eq!(one(&d, "SELECT v FROM t WHERE rowid = 2"), Value::Real(1.5));
     // non-numeric text keeps TEXT storage class
     d.execute("INSERT INTO t VALUES ('hello')", []).unwrap();
-    assert_eq!(one(&d, "SELECT v FROM t WHERE rowid = 3"), Value::Text("hello".into()));
+    assert_eq!(
+        one(&d, "SELECT v FROM t WHERE rowid = 3"),
+        Value::Text("hello".into())
+    );
     // blobs are never converted by any affinity
     d.execute("INSERT INTO t VALUES (x'42')", []).unwrap();
-    assert!(matches!(one(&d, "SELECT v FROM t WHERE rowid = 4"), Value::Blob(_)));
+    assert!(matches!(
+        one(&d, "SELECT v FROM t WHERE rowid = 4"),
+        Value::Blob(_)
+    ));
 }
 
 #[test]
@@ -96,8 +110,11 @@ fn decimal_scale_enforcement() {
     // (PG numeric behavior; SQLite ignores the spec — documented
     // intentional divergence).
     let mut d = rq();
-    d.execute("CREATE TABLE prices(id INTEGER PRIMARY KEY, v DECIMAL(10,2))", [])
-        .unwrap();
+    d.execute(
+        "CREATE TABLE prices(id INTEGER PRIMARY KEY, v DECIMAL(10,2))",
+        [],
+    )
+    .unwrap();
     d.execute(
         "INSERT INTO prices VALUES (1, 1.555), (2, 2.554), (3, -1.555), (4, 3.0), (5, '4.126')",
         [],
@@ -106,15 +123,30 @@ fn decimal_scale_enforcement() {
     let v = |id: i64| one(&d, &format!("SELECT v FROM prices WHERE id = {id}"));
     assert_eq!(v(1), Value::Real(1.56), "1.555 rounds half away from zero");
     assert_eq!(v(2), Value::Real(2.55));
-    assert_eq!(v(3), Value::Real(-1.56), "negative half rounds away from zero");
+    assert_eq!(
+        v(3),
+        Value::Real(-1.56),
+        "negative half rounds away from zero"
+    );
     assert_eq!(v(4), Value::Real(3.0), "integral value keeps scale");
-    assert_eq!(v(5), Value::Real(4.13), "numeric text is coerced THEN rounded");
+    assert_eq!(
+        v(5),
+        Value::Real(4.13),
+        "numeric text is coerced THEN rounded"
+    );
 
     // DECIMAL(5,0) / plain INTEGER-style: scale 0 stores INTEGER
     d.execute("CREATE TABLE units(v DECIMAL(5,0))", []).unwrap();
-    d.execute("INSERT INTO units VALUES (2.6), (2.4)", []).unwrap();
-    assert_eq!(one(&d, "SELECT v FROM units WHERE rowid = 1"), Value::Integer(3));
-    assert_eq!(one(&d, "SELECT v FROM units WHERE rowid = 2"), Value::Integer(2));
+    d.execute("INSERT INTO units VALUES (2.6), (2.4)", [])
+        .unwrap();
+    assert_eq!(
+        one(&d, "SELECT v FROM units WHERE rowid = 1"),
+        Value::Integer(3)
+    );
+    assert_eq!(
+        one(&d, "SELECT v FROM units WHERE rowid = 2"),
+        Value::Integer(2)
+    );
 
     // NUMERIC(8,3) gets the same treatment via the NUMERIC alias
     d.execute("CREATE TABLE m(v NUMERIC(8,3))", []).unwrap();
@@ -127,8 +159,12 @@ fn decimal_scale_enforcement() {
     assert_eq!(one(&d, "SELECT v FROM plain"), Value::Real(1.55555));
 
     // UPDATE re-applies the scale
-    d.execute("UPDATE prices SET v = 9.999 WHERE id = 1", []).unwrap();
-    assert_eq!(one(&d, "SELECT v FROM prices WHERE id = 1"), Value::Real(10.0));
+    d.execute("UPDATE prices SET v = 9.999 WHERE id = 1", [])
+        .unwrap();
+    assert_eq!(
+        one(&d, "SELECT v FROM prices WHERE id = 1"),
+        Value::Real(10.0)
+    );
 }
 
 #[test]
@@ -148,13 +184,19 @@ fn pg_typeof_storage_classes() {
 fn cast_numeric_semantics() {
     let d = rq();
     // longest numeric prefix, CAST never squeezes REAL down to INTEGER
-    assert_eq!(one(&d, "SELECT CAST('123' AS NUMERIC)"), Value::Integer(123));
+    assert_eq!(
+        one(&d, "SELECT CAST('123' AS NUMERIC)"),
+        Value::Integer(123)
+    );
     assert_eq!(one(&d, "SELECT CAST('1.5' AS NUMERIC)"), Value::Real(1.5));
     assert_eq!(one(&d, "SELECT CAST('abc' AS NUMERIC)"), Value::Integer(0));
     assert_eq!(one(&d, "SELECT CAST(12.0 AS NUMERIC)"), Value::Real(12.0));
     assert_eq!(one(&d, "SELECT CAST(12.0 AS DECIMAL)"), Value::Real(12.0));
     // trailing junk after the numeric prefix is dropped
-    assert_eq!(one(&d, "SELECT CAST('123abc' AS NUMERIC)"), Value::Integer(123));
+    assert_eq!(
+        one(&d, "SELECT CAST('123abc' AS NUMERIC)"),
+        Value::Integer(123)
+    );
     // NULL casts to NULL
     assert_eq!(one(&d, "SELECT CAST(NULL AS NUMERIC)"), Value::Null);
 }
@@ -213,28 +255,49 @@ fn boolean_column_and_cast() {
     .unwrap();
     let n = int(&d, "SELECT COUNT(*) FROM flags WHERE active = 1");
     assert_eq!(n, 1);
-    assert_eq!(one(&d, "SELECT active FROM flags WHERE id = 4"), Value::Null);
+    assert_eq!(
+        one(&d, "SELECT active FROM flags WHERE id = 4"),
+        Value::Null
+    );
     // pg_typeof of a numeric-affine boolean column holding 1
-    assert_eq!(text(&d, "SELECT pg_typeof(active) FROM flags WHERE id = 1"), "integer");
+    assert_eq!(
+        text(&d, "SELECT pg_typeof(active) FROM flags WHERE id = 1"),
+        "integer"
+    );
 
     // CAST AS BOOLEAN is PostgreSQL-borrowed: the PG boolean literal
     // words map to 1/0; numbers map by truthiness; unrecognized text
     // falls back to the SQLite numeric-prefix cast (0).
     let d2 = rq();
-    assert_eq!(one(&d2, "SELECT CAST('true' AS BOOLEAN)"), Value::Integer(1));
-    assert_eq!(one(&d2, "SELECT CAST('FALSE' AS BOOLEAN)"), Value::Integer(0));
+    assert_eq!(
+        one(&d2, "SELECT CAST('true' AS BOOLEAN)"),
+        Value::Integer(1)
+    );
+    assert_eq!(
+        one(&d2, "SELECT CAST('FALSE' AS BOOLEAN)"),
+        Value::Integer(0)
+    );
     assert_eq!(one(&d2, "SELECT CAST('t' AS BOOLEAN)"), Value::Integer(1));
     assert_eq!(one(&d2, "SELECT CAST('yes' AS BOOLEAN)"), Value::Integer(1));
     assert_eq!(one(&d2, "SELECT CAST('off' AS BOOLEAN)"), Value::Integer(0));
     assert_eq!(one(&d2, "SELECT CAST(' 1 ' AS BOOLEAN)"), Value::Integer(1));
     assert_eq!(one(&d2, "SELECT CAST(0 AS BOOLEAN)"), Value::Integer(0));
     assert_eq!(one(&d2, "SELECT CAST(2.5 AS BOOLEAN)"), Value::Integer(1));
-    assert_eq!(one(&d2, "SELECT CAST('maybe' AS BOOLEAN)"), Value::Integer(0));
+    assert_eq!(
+        one(&d2, "SELECT CAST('maybe' AS BOOLEAN)"),
+        Value::Integer(0)
+    );
     assert_eq!(one(&d2, "SELECT CAST(NULL AS BOOLEAN)"), Value::Null);
     // BOOL is the PG short alias
     assert_eq!(one(&d2, "SELECT CAST('true' AS BOOL)"), Value::Integer(1));
     // truthiness flows into WHERE
-    assert_eq!(int(&d2, "SELECT COUNT(*) FROM (SELECT 1 x) WHERE CAST('yes' AS BOOLEAN)"), 1);
+    assert_eq!(
+        int(
+            &d2,
+            "SELECT COUNT(*) FROM (SELECT 1 x) WHERE CAST('yes' AS BOOLEAN)"
+        ),
+        1
+    );
 }
 
 #[test]
@@ -248,8 +311,14 @@ fn date_column_stays_numeric_affine() {
         [],
     )
     .unwrap();
-    assert_eq!(one(&d, "SELECT v FROM ev WHERE rowid = 1"), Value::Text("2026-09-14".into()));
-    assert_eq!(one(&d, "SELECT v FROM ev WHERE rowid = 2"), Value::Integer(20260914));
+    assert_eq!(
+        one(&d, "SELECT v FROM ev WHERE rowid = 1"),
+        Value::Text("2026-09-14".into())
+    );
+    assert_eq!(
+        one(&d, "SELECT v FROM ev WHERE rowid = 2"),
+        Value::Integer(20260914)
+    );
 }
 
 // small helper used above

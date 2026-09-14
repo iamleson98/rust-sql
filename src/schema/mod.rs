@@ -94,10 +94,7 @@ pub fn parse_decimal_spec(declared: &str) -> Option<(u8, u8)> {
     let rest = base.strip_prefix('(')?;
     let inner = rest.strip_suffix(')')?;
     let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
-    let p: u8 = parts
-        .first()?  
-        .parse()
-        .ok()?;
+    let p: u8 = parts.first()?.parse().ok()?;
     let s: u8 = match parts.get(1) {
         Some(sp) => sp.parse().ok()?,
         None => 0,

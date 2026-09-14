@@ -162,21 +162,150 @@ fn normalize_word(w: &str) -> String {
 /// of the contracted forms included to match our tokenizer). SORTED —
 /// [`is_stop_word`] binary-searches it.
 const STOP_WORDS: &[&str] = &[
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
-    "any", "are", "arent", "as", "at", "be", "because", "been", "before", "being",
-    "below", "between", "both", "but", "by", "can", "cannot", "cant", "could",
-    "couldnt", "did", "didnt", "do", "does", "doesnt", "doing", "dont", "down",
-    "during", "each", "few", "for", "from", "further", "had", "hadnt", "has", "hasnt",
-    "have", "havent", "having", "he", "her", "here", "hers", "herself", "him",
-    "himself", "his", "how", "i", "if", "in", "into", "is", "isnt", "it", "its",
-    "itself", "just", "me", "more", "most", "mustnt", "my", "myself", "no", "nor",
-    "not", "of", "off", "on", "once", "only", "or", "other", "ought", "our", "ours",
-    "ourselves", "out", "over", "own", "same", "shant", "she", "should", "shouldnt",
-    "so", "some", "such", "than", "that", "the", "their", "theirs", "them",
-    "themselves", "then", "there", "these", "they", "this", "those", "through", "to",
-    "too", "under", "until", "up", "very", "was", "wasnt", "we", "were", "werent",
-    "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with",
-    "wont", "would", "wouldnt", "you", "your", "yours", "yourself", "yourselves",
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "arent",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "cannot",
+    "cant",
+    "could",
+    "couldnt",
+    "did",
+    "didnt",
+    "do",
+    "does",
+    "doesnt",
+    "doing",
+    "dont",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "hadnt",
+    "has",
+    "hasnt",
+    "have",
+    "havent",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "isnt",
+    "it",
+    "its",
+    "itself",
+    "just",
+    "me",
+    "more",
+    "most",
+    "mustnt",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "ought",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "same",
+    "shant",
+    "she",
+    "should",
+    "shouldnt",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "wasnt",
+    "we",
+    "were",
+    "werent",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "wont",
+    "would",
+    "wouldnt",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
 ];
 
 fn is_stop_word(w: &str) -> bool {
@@ -458,11 +587,7 @@ pub fn parse_tsvector(s: &str) -> Result<TsVector> {
 /// `strip()` — drop positions, keep lexemes.
 fn strip(v: &TsVector) -> TsVector {
     TsVector {
-        lexemes: v
-            .lexemes
-            .keys()
-            .map(|k| (k.clone(), Vec::new()))
-            .collect(),
+        lexemes: v.lexemes.keys().map(|k| (k.clone(), Vec::new())).collect(),
     }
 }
 
@@ -492,7 +617,10 @@ fn tsvector_concat(a: &TsVector, b: &TsVector) -> TsVector {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TsQuery {
     /// A lexeme; `prefix` = the `:*` suffix match.
-    Lex { word: String, prefix: bool },
+    Lex {
+        word: String,
+        prefix: bool,
+    },
     And(Box<TsQuery>, Box<TsQuery>),
     Or(Box<TsQuery>, Box<TsQuery>),
     Not(Box<TsQuery>),
@@ -664,9 +792,7 @@ fn lex_tsquery(s: &str) -> Result<Vec<TsTok>> {
             out.push(TsTok::Word(w));
         } else if c.is_alphanumeric() || c == '_' || c == '-' {
             let start = i;
-            while i < b.len()
-                && ((b[i] as char).is_alphanumeric() || matches!(b[i], b'_' | b'-'))
-            {
+            while i < b.len() && ((b[i] as char).is_alphanumeric() || matches!(b[i], b'_' | b'-')) {
                 i += 1;
             }
             out.push(TsTok::Word(s[start..i].to_string()));
@@ -853,11 +979,9 @@ fn simplify_drop(q: TsQuery, cfg: TsConfig) -> Result<Option<TsQuery>> {
                 }
                 match simplify_drop(e, cfg)? {
                     Some(se) => out.push(se),
-                    None => {
-                        return Err(Error::runtime(
-                            "stop word inside a phrase cannot be dropped without breaking positions",
-                        ))
-                    }
+                    None => return Err(Error::runtime(
+                        "stop word inside a phrase cannot be dropped without breaking positions",
+                    )),
                 }
             }
             if out.is_empty() {
@@ -1142,7 +1266,9 @@ fn ts_headline(cfg: TsConfig, text: &str, q: &TsQuery) -> String {
         if tok.word.is_empty() {
             continue;
         }
-        let Some(stemmed) = cfg.lexeme(&tok.word) else { continue };
+        let Some(stemmed) = cfg.lexeme(&tok.word) else {
+            continue;
+        };
         let hit = terms.iter().any(|(word, prefix)| {
             if *prefix {
                 stemmed.starts_with(word.as_str())
@@ -1208,14 +1334,15 @@ fn config_and_text(args: &[Value]) -> Result<Option<(TsConfig, String)>> {
 fn parse_weights(v: &Value) -> Result<[f64; 4]> {
     let text = v.as_text();
     let s = text.trim();
-    let inner = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).ok_or_else(
-        || Error::runtime("weights must be an array literal like '{0.1,0.2,0.4,1.0}'"),
-    )?;
+    let inner = s
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or_else(|| {
+            Error::runtime("weights must be an array literal like '{0.1,0.2,0.4,1.0}'")
+        })?;
     let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
     if parts.len() != 4 {
-        return Err(Error::runtime(
-            "weights array must have exactly 4 elements",
-        ));
+        return Err(Error::runtime("weights array must have exactly 4 elements"));
     }
     let mut out = [0.1f64; 4];
     for (i, p) in parts.iter().enumerate() {
@@ -1301,11 +1428,9 @@ pub fn call_fts_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
                 3 if is_weights_literal(&args[0]) => (parse_weights(&args[0])?, &args[1], &args[2]),
                 3 => ([0.1; 4], &args[0], &args[1]),
                 4 => (parse_weights(&args[0])?, &args[1], &args[2]),
-                _ => {
-                    return Err(Error::runtime(
-                        "ts_rank([weights,] tsvector, tsquery [, normalization]) takes 2-4 arguments",
-                    ))
-                }
+                _ => return Err(Error::runtime(
+                    "ts_rank([weights,] tsvector, tsquery [, normalization]) takes 2-4 arguments",
+                )),
             };
             if v.is_null() || q.is_null() {
                 return Ok(Some(Value::Null));
@@ -1557,14 +1682,20 @@ mod tests {
         let doc = to_tsvector(TsConfig::Simple, "running fast");
         let q_stored = "'running'";
         assert_eq!(
-            eval_match_op(&Value::Text(doc.render().into()), &Value::Text(q_stored.into()))
-                .unwrap(),
+            eval_match_op(
+                &Value::Text(doc.render().into()),
+                &Value::Text(q_stored.into())
+            )
+            .unwrap(),
             Value::Integer(1)
         );
         let q_stemmed = "'run'"; // stored 'run' does NOT match 'running'
         assert_eq!(
-            eval_match_op(&Value::Text(doc.render().into()), &Value::Text(q_stemmed.into()))
-                .unwrap(),
+            eval_match_op(
+                &Value::Text(doc.render().into()),
+                &Value::Text(q_stemmed.into())
+            )
+            .unwrap(),
             Value::Integer(0)
         );
         // NULL propagation

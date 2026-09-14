@@ -111,9 +111,9 @@ fn cast_value(v: Value, type_name: &str) -> Value {
                         "false" | "f" | "no" | "off" | "0" => Value::Integer(0),
                         _ => {
                             // SQLite NUMERIC-cast fallback (numeric prefix)
-                            let f =
-                                crate::types::value::parse_real_prefix(&v.as_text());
-                            if f.is_finite() && f.trunc() == f
+                            let f = crate::types::value::parse_real_prefix(&v.as_text());
+                            if f.is_finite()
+                                && f.trunc() == f
                                 && f.abs() <= 9.007_199_254_740_992e15
                             {
                                 Value::Integer(f as i64)

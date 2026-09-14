@@ -237,7 +237,9 @@ pub fn parse_geometry(s: &str) -> Result<Geo> {
     // EWKT prefix: SRID=4326;
     if let Some(rest) = s.strip_prefix("SRID=") {
         let Some(semi) = rest.find(';') else {
-            return Err(Error::runtime("parse error - invalid geometry (SRID without ';')"));
+            return Err(Error::runtime(
+                "parse error - invalid geometry (SRID without ';')",
+            ));
         };
         srid = rest[..semi]
             .trim()
@@ -318,7 +320,9 @@ pub fn parse_geometry(s: &str) -> Result<Geo> {
         }
     };
     if !sc.done() {
-        return Err(Error::runtime("parse error - invalid geometry (trailing input)"));
+        return Err(Error::runtime(
+            "parse error - invalid geometry (trailing input)",
+        ));
     }
     Ok(Geo { srid, geom })
 }
@@ -362,7 +366,10 @@ fn on_segment(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> bool {
     if cross.abs() > EPS {
         return false;
     }
-    px >= ax.min(bx) - EPS && px <= ax.max(bx) + EPS && py >= ay.min(by) - EPS && py <= ay.max(by) + EPS
+    px >= ax.min(bx) - EPS
+        && px <= ax.max(bx) + EPS
+        && py >= ay.min(by) - EPS
+        && py <= ay.max(by) + EPS
 }
 
 /// Point-segment distance.
@@ -381,8 +388,14 @@ fn point_seg_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
 
 /// Do segments a1a2 and b1b2 properly share any point?
 fn segments_intersect(
-    a1x: f64, a1y: f64, a2x: f64, a2y: f64,
-    b1x: f64, b1y: f64, b2x: f64, b2y: f64,
+    a1x: f64,
+    a1y: f64,
+    a2x: f64,
+    a2y: f64,
+    b1x: f64,
+    b1y: f64,
+    b2x: f64,
+    b2y: f64,
 ) -> bool {
     let d = |ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64| -> f64 {
         (bx - ax) * (py - ay) - (by - ay) * (px - ax)
@@ -405,8 +418,14 @@ fn segments_intersect(
 
 /// Segment-segment distance (0 when intersecting).
 fn seg_seg_dist(
-    a1x: f64, a1y: f64, a2x: f64, a2y: f64,
-    b1x: f64, b1y: f64, b2x: f64, b2y: f64,
+    a1x: f64,
+    a1y: f64,
+    a2x: f64,
+    a2y: f64,
+    b1x: f64,
+    b1y: f64,
+    b2x: f64,
+    b2y: f64,
 ) -> f64 {
     if segments_intersect(a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y) {
         return 0.0;
@@ -524,12 +543,10 @@ fn geo_contains(outer: &Geometry, g: &Geometry) -> bool {
             .all(|(x, y)| point_in_polygon(*x, *y, rings) == RingPos::Inside),
         (Geometry::Polygon(a), Geometry::Polygon(b)) => {
             // all vertices of b strictly inside a, and boundaries disjoint
-            let b_inside = b
-                .iter()
-                .all(|r| {
-                    r.iter()
-                        .all(|(x, y)| point_in_polygon(*x, *y, a) == RingPos::Inside)
-                });
+            let b_inside = b.iter().all(|r| {
+                r.iter()
+                    .all(|(x, y)| point_in_polygon(*x, *y, a) == RingPos::Inside)
+            });
             b_inside && {
                 let ea = rings_edges(a);
                 let eb = rings_edges(b);
@@ -727,9 +744,9 @@ fn polygon_centroid(rings: &[Vec<(f64, f64)>]) -> (f64, f64) {
     }
     if a.abs() < EPS {
         // degenerate: average the vertices
-        let (sx, sy): (f64, f64) = ext.iter().fold((0.0, 0.0), |(ax, ay), (x, y)| {
-            (ax + x, ay + y)
-        });
+        let (sx, sy): (f64, f64) = ext
+            .iter()
+            .fold((0.0, 0.0), |(ax, ay), (x, y)| (ax + x, ay + y));
         return (sx / n as f64, sy / n as f64);
     }
     (cx / (3.0 * a), cy / (3.0 * a))
@@ -796,11 +813,13 @@ pub fn vincenty_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> Option<f64> {
         // lambda), NOT sin_sigma — using sin_sigma loses the sign of the
         // longitude difference and skews the fixed point (~74 m on the
         // classic Flinders–Buninyong vector, plus a mirror asymmetry).
-        lambda = l + (1.0 - c) * f * sin_alpha
-            * (sigma
-                + c * sin_sigma
-                    * (cos2_sigma_m
-                        + c * cos_sigma * (-1.0 + 2.0 * cos2_sigma_m.powi(2))));
+        lambda = l
+            + (1.0 - c)
+                * f
+                * sin_alpha
+                * (sigma
+                    + c * sin_sigma
+                        * (cos2_sigma_m + c * cos_sigma * (-1.0 + 2.0 * cos2_sigma_m.powi(2))));
         if (lambda - lambda_prev).abs() < 1e-12 {
             break;
         }
@@ -827,11 +846,14 @@ pub fn vincenty_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> Option<f64> {
     let u2 = cos2_alpha * (a * a - b * b) / (b * b);
     let big_a = 1.0 + u2 / 16384.0 * (4096.0 + u2 * (-768.0 + u2 * (320.0 - 175.0 * u2)));
     let big_b = u2 / 1024.0 * (256.0 + u2 * (-128.0 + u2 * (74.0 - 47.0 * u2)));
-    let delta_sigma = big_b * sin_sigma
+    let delta_sigma = big_b
+        * sin_sigma
         * (cos2_sigma_m
             + big_b / 4.0
                 * (cos_sigma * (-1.0 + 2.0 * cos2_sigma_m.powi(2))
-                    - big_b / 6.0 * cos2_sigma_m * (-3.0 + 4.0 * sin_sigma.powi(2))
+                    - big_b / 6.0
+                        * cos2_sigma_m
+                        * (-3.0 + 4.0 * sin_sigma.powi(2))
                         * (-3.0 + 4.0 * cos2_sigma_m.powi(2))));
     Some(b * big_a * (sigma - delta_sigma))
 }
@@ -1027,9 +1049,7 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
         },
         "st_perimeter" => match geo_arg(args, 0)? {
             Some(g) => Value::Real(match &g.geom {
-                Geometry::Polygon(rings) => {
-                    rings.iter().map(|r| ring_perimeter(r)).sum::<f64>()
-                }
+                Geometry::Polygon(rings) => rings.iter().map(|r| ring_perimeter(r)).sum::<f64>(),
                 _ => 0.0,
             }),
             None => Value::Null,
@@ -1048,8 +1068,9 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
                 match (pa, pb) {
                     (Some(pa), Some(pb)) => {
                         if bool_arg(args, 3) {
-                            let dd = vincenty_m(pa.0, pa.1, pb.0, pb.1)
-                                .unwrap_or_else(|| haversine_m(pa.0, pa.1, pb.0, pb.1, EARTH_RADIUS_M));
+                            let dd = vincenty_m(pa.0, pa.1, pb.0, pb.1).unwrap_or_else(|| {
+                                haversine_m(pa.0, pa.1, pb.0, pb.1, EARTH_RADIUS_M)
+                            });
                             dd <= d
                         } else {
                             haversine_m(pa.0, pa.1, pb.0, pb.1, EARTH_RADIUS_M) <= d
@@ -1108,14 +1129,16 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
                 return Ok(Some(Value::Null));
             };
             let (xmin, ymin, xmax, ymax) = g.geom.bbox();
-            Value::Text(render(&make_envelope(
-                xmin - d,
-                ymin - d,
-                xmax + d,
-                ymax + d,
-                g.srid,
-            ))
-            .into())
+            Value::Text(
+                render(&make_envelope(
+                    xmin - d,
+                    ymin - d,
+                    xmax + d,
+                    ymax + d,
+                    g.srid,
+                ))
+                .into(),
+            )
         }
         "st_centroid" => match geo_arg(args, 0)? {
             Some(g) => {
@@ -1129,7 +1152,13 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
                         (sx / n as f64, sy / n as f64)
                     }
                 };
-                Value::Text(render(&Geo { srid: g.srid, geom: Geometry::Point(x, y) }).into())
+                Value::Text(
+                    render(&Geo {
+                        srid: g.srid,
+                        geom: Geometry::Point(x, y),
+                    })
+                    .into(),
+                )
             }
             None => Value::Null,
         },
@@ -1148,7 +1177,9 @@ fn point_of(g: &Geometry) -> Option<(f64, f64)> {
 fn is_valid(g: &Geometry) -> bool {
     match g {
         Geometry::Point(x, y) => x.is_finite() && y.is_finite(),
-        Geometry::LineString(v) => v.len() >= 2 && v.iter().all(|(x, y)| x.is_finite() && y.is_finite()),
+        Geometry::LineString(v) => {
+            v.len() >= 2 && v.iter().all(|(x, y)| x.is_finite() && y.is_finite())
+        }
         Geometry::Polygon(rings) => {
             rings.iter().all(|r| {
                 r.len() >= 3 && {
@@ -1158,8 +1189,7 @@ fn is_valid(g: &Geometry) -> bool {
                     let distinct = r
                         .windows(2)
                         .any(|w| (w[0].0 - w[1].0).abs() > EPS || (w[0].1 - w[1].1).abs() > EPS);
-                    distinct
-                        && r.iter().all(|(x, y)| x.is_finite() && y.is_finite())
+                    distinct && r.iter().all(|(x, y)| x.is_finite() && y.is_finite())
                 }
             })
         }
@@ -1278,10 +1308,9 @@ mod tests {
         assert!(geo_intersects(&sq.geom, &edge.geom)); // ...but intersects
         assert!(!geo_intersects(&sq.geom, &outer.geom));
         // hole semantics
-        let donut = parse_geometry(
-            "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))",
-        )
-        .unwrap();
+        let donut =
+            parse_geometry("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))")
+                .unwrap();
         let in_hole = parse_geometry(&pt(5.0, 5.0)).unwrap();
         let in_ring = parse_geometry(&pt(2.0, 2.0)).unwrap();
         assert!(!geo_contains(&donut.geom, &in_hole.geom));
@@ -1303,22 +1332,26 @@ mod tests {
     #[test]
     fn area_and_perimeter() {
         let sq = parse_geometry("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))").unwrap();
-        let Geometry::Polygon(rings) = &sq.geom else { unreachable!() };
+        let Geometry::Polygon(rings) = &sq.geom else {
+            unreachable!()
+        };
         assert!((polygon_area(rings) - 16.0).abs() < 1e-9);
         assert!((rings.iter().map(|r| ring_perimeter(r)).sum::<f64>() - 16.0).abs() < 1e-9);
         // with a 2x2 hole: 16 - 4
-        let donut = parse_geometry(
-            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 3 1, 3 3, 1 3, 1 1))",
-        )
-        .unwrap();
-        let Geometry::Polygon(r2) = &donut.geom else { unreachable!() };
+        let donut = parse_geometry("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 3 1, 3 3, 1 3, 1 1))")
+            .unwrap();
+        let Geometry::Polygon(r2) = &donut.geom else {
+            unreachable!()
+        };
         assert!((polygon_area(r2) - 12.0).abs() < 1e-9);
     }
 
     #[test]
     fn centroid_unit_square() {
         let sq = parse_geometry("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))").unwrap();
-        let Geometry::Polygon(rings) = &sq.geom else { unreachable!() };
+        let Geometry::Polygon(rings) = &sq.geom else {
+            unreachable!()
+        };
         let (cx, cy) = polygon_centroid(rings);
         assert!((cx - 1.0).abs() < 1e-9 && (cy - 1.0).abs() < 1e-9);
     }
@@ -1372,28 +1405,26 @@ mod tests {
     #[test]
     fn geo_dispatch_shapes() {
         // ST_Point + ST_X/ST_Y
-        let p = call_geo_function(
-            "st_point",
-            &[Value::Real(1.5), Value::Real(-2.5)],
-        )
-        .unwrap()
-        .unwrap();
+        let p = call_geo_function("st_point", &[Value::Real(1.5), Value::Real(-2.5)])
+            .unwrap()
+            .unwrap();
         assert_eq!(p, Value::Text("POINT(1.5 -2.5)".into()));
-        let x = call_geo_function("st_x", std::slice::from_ref(&p)).unwrap().unwrap();
+        let x = call_geo_function("st_x", std::slice::from_ref(&p))
+            .unwrap()
+            .unwrap();
         assert_eq!(x, Value::Real(1.5));
         // unknown name → None
         assert!(call_geo_function("nope", &[]).unwrap().is_none());
         // ST_DWithin planar
         let a = Value::Text(pt(0.0, 0.0).into());
         let b = Value::Text(pt(3.0, 4.0).into());
-        let hit = call_geo_function(
-            "st_dwithin",
-            &[a.clone(), b.clone(), Value::Real(5.0)],
-        )
-        .unwrap()
-        .unwrap();
+        let hit = call_geo_function("st_dwithin", &[a.clone(), b.clone(), Value::Real(5.0)])
+            .unwrap()
+            .unwrap();
         assert_eq!(hit, Value::Integer(1));
-        let miss = call_geo_function("st_dwithin", &[a, b, Value::Real(4.99)]).unwrap().unwrap();
+        let miss = call_geo_function("st_dwithin", &[a, b, Value::Real(4.99)])
+            .unwrap()
+            .unwrap();
         assert_eq!(miss, Value::Integer(0));
     }
 
@@ -1424,7 +1455,12 @@ mod tests {
     fn envelope_expand_make() {
         let env = call_geo_function(
             "st_makeenvelope",
-            &[Value::Real(0.0), Value::Real(0.0), Value::Real(2.0), Value::Real(2.0)],
+            &[
+                Value::Real(0.0),
+                Value::Real(0.0),
+                Value::Real(2.0),
+                Value::Real(2.0),
+            ],
         )
         .unwrap()
         .unwrap();
@@ -1438,7 +1474,9 @@ mod tests {
         match exp {
             Value::Text(s) => {
                 let g = parse_geometry(&s).unwrap();
-                let Geometry::Polygon(rings) = g.geom else { unreachable!() };
+                let Geometry::Polygon(rings) = g.geom else {
+                    unreachable!()
+                };
                 assert!((polygon_area(&rings) - 16.0).abs() < 1e-9); // 4x4 now
             }
             other => panic!("{other:?}"),
@@ -1466,7 +1504,10 @@ mod tests {
         );
         // fractional values keep their decimals; integral ones trim
         let f = parse_geometry("POINT(1.5 2)").unwrap();
-        assert_eq!(as_geojson(&f.geom), "{\"type\":\"Point\",\"coordinates\":[1.5,2]}");
+        assert_eq!(
+            as_geojson(&f.geom),
+            "{\"type\":\"Point\",\"coordinates\":[1.5,2]}"
+        );
         assert_eq!(render(&f), "POINT(1.5 2)");
         assert_eq!(render(&parse_geometry("POINT(3 4)").unwrap()), "POINT(3 4)");
     }
@@ -1476,14 +1517,15 @@ mod tests {
         // the classic ORDER BY geom <-> point nearest-neighbor pattern
         let origin = Value::Text(pt(0.0, 0.0).into());
         let mut pts: Vec<(String, f64)> = (1..=5)
-            .map(|i| (pt(i as f64, i as f64), (i as f64) * std::f64::consts::SQRT_2))
+            .map(|i| {
+                (
+                    pt(i as f64, i as f64),
+                    (i as f64) * std::f64::consts::SQRT_2,
+                )
+            })
             .collect();
         pts.sort_by(|a, b| {
-            let da = eval_distance_op(
-                &Value::Text(a.0.clone().into()),
-                &origin,
-            )
-            .unwrap();
+            let da = eval_distance_op(&Value::Text(a.0.clone().into()), &origin).unwrap();
             let db = eval_distance_op(&Value::Text(b.0.clone().into()), &origin).unwrap();
             da.as_real().partial_cmp(&db.as_real()).unwrap()
         });
