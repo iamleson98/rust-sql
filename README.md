@@ -2,8 +2,9 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **1000+ tests** in the default matrix (crash / power-loss
-> simulation, OOM + I/O fault injection, corruption + SQL fuzzing, differential verification
+> **Status**: production-ready core. **1100+ tests** (1041 in the default matrix
+> + 65 C ABI suites; crash / power-loss simulation, OOM + I/O fault injection,
+> corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
 > sort, and now **join** splits), and bit-exact f64 parity suites for SUM/AVG/window
 > arithmetic against bundled SQLite).
@@ -50,6 +51,23 @@ for row in &rows {
     println!("{}: {}", row[0], row[1]);
 }
 ```
+
+> **Opening the file in VS Code SQLite extensions, DB Browser, or the `sqlite3`
+> CLI?** The files rustqlite creates by default use its own native `RSQLDB04`
+> container — SQLite-only tooling checks the 16-byte `SQLite format 3\0` magic
+> and correctly reports "not a database" for it. That is expected, and there are
+> two ways to have every SQLite tool open your file:
+>
+> - **Create it in SQLite's format from the start** — `rustqlite-cli
+>   --sqlite-format app.db` or `Database::open_sqlite_format("app.db")?`.
+> - **Export any database at any time** — `VACUUM INTO 'share.db'` works from
+>   both containers (native included) and writes a genuine SQLite database:
+>   SQLite's own VACUUM INTO output shape, `PRAGMA integrity_check`-clean, with
+>   schema, data, indexes, views, triggers, and AUTOINCREMENT high-water marks
+>   — verified by real SQLite in CI (`tests/sqlite_interop.rs`).
+>
+> See [SQLite file-format interop](#sqlite-file-format-interop) for the full
+> two-container story (both directions open each other's files).
 
 ## Feature list
 
@@ -611,8 +629,18 @@ rustqlite-cli data.db                  # opens SQLite or native files
 rustqlite-cli --sqlite-format new.db   # creates a SQLite-format file
 ```
 
-`VACUUM INTO 'out.db'` on any database writes `out.db` as a SQLite file
-(the native→SQLite export path).
+`VACUUM INTO 'out.db'` on **any** database — native-format included, the
+native→SQLite export path — writes `out.db` as a real SQLite database with
+SQLite's own VACUUM INTO output shape (probed against bundled SQLite,
+`examples/probe_vacuum_into_shape.rs`): the source's page size, a
+rollback-journal header marker (18/19 = 1/1 — SQLite writes that even from
+WAL-mode sources), a fresh change counter, UTF-8. Schema, data, indexes
+(unique, DESC, expression), views, triggers, WITHOUT ROWID tables with their
+collation-ordered PKs, and AUTOINCREMENT high-water marks all round-trip —
+and real SQLite re-opens the file, passes `integrity_check`, and enforces
+the exported constraints itself (`tests/sqlite_interop.rs`, 3 export
+suites: full-surface verification, differential data equality, WAL-source
+export; `examples/probe_native_export.rs` is the standalone probe).
 
 ### Verified by tests
 
@@ -623,7 +651,10 @@ PRIMARY KEY` alias storage, `TEXT PRIMARY KEY` autoindexes, unique and
 expression indexes, `AUTOINCREMENT` + `sqlite_sequence` high-water
 preservation, `user_version` / `application_id`, views, triggers,
 `WITHOUT ROWID` records, explicit transactions, ROLLBACK, dump-on-drop,
-and a live-WAL-sidecar read. `tests/utf16_interop.rs` does the same for
+a live-WAL-sidecar read, and the native→SQLite `VACUUM INTO` export
+(full-surface + differential data + WAL-source, the last item also
+probing that the export header matches real SQLite's own VACUUM INTO
+shape byte for byte). `tests/utf16_interop.rs` does the same for
 UTF-16le/UTF-16be files: adversarial code-point/astral text round-trips
 through records, indexes, `WITHOUT ROWID` PKs, NOCASE, overflow chains
 and non-ASCII schema identifiers; engine-created UTF-16 files are
@@ -950,6 +981,13 @@ compat surface. Every entry says what it costs and why it exists.
   open and each commit rewrites the file — O(file) per commit boundary.
   The native format carries the MRMW pager; interchange is the
   SQLite-format mode's job.
+- **Native-format files are single-process**: the MRMW pager
+  coordinates threads inside one process; it takes no OS file locks, so
+  two *processes* should not hold the same native file concurrently
+  (SQLite's multi-process contract lives in its POSIX locks). The
+  SQLite-format container is the cross-process interchange path — its
+  commits are atomic full-image writes and its `-wal` sidecar is
+  byte-compatible with real SQLite processes.
 
 ### Missing parts (feature & compat surface)
 
@@ -1108,6 +1146,68 @@ compat surface. Every entry says what it costs and why it exists.
   shape), and parse-error wording remains engine-formatted on both
   sides (SQLite's is compiler-specific too).
 
+#### The open ledger — not implemented (and the workaround today)
+
+Everything above is closed. This is the honest list of what SQLite ships
+that rustqlite does NOT, each with what to use instead. All of it is
+verifiable absence: the engine's `module_list` / `function_list` /
+`compile_options` report what is actually compiled in, and the C ABI
+exports exactly its 124 implemented symbols.
+
+- **FTS3 / FTS4 / FTS5 (full-text search)**: not implemented — no
+  `fts5` module, no `MATCH` index paths, no tokenizers (unicode61,
+  porter, trigram). Workaround today: `LIKE`/`GLOB` (index-eligible on
+  prefixes with `case_sensitive_like` semantics), `instr()`, or an
+  inverted-index table maintained by triggers. The virtual-table
+  callback protocol (`xBestIndex` pushdown, writable `xUpdate`) is real
+  and battle-tested, so an FTS module can be built as a plugin without
+  touching the core.
+- **R*Tree and Geopoly (spatial indexes)**: not implemented. Workaround:
+  2D ranges over B-tree-indexed `(min_x, max_x)` column pairs with a
+  WHERE overlap predicate (the same query shape SQLite's rtree module
+  answers with its own structure).
+- **Session extension (`sqlite3_session_*`, changesets, rebasing)**: not
+  implemented. Workaround: the preupdate-hook event stream
+  (`sqlite3_preupdate_hook`, fully real and differential-pinned) drives
+  equivalent change capture.
+- **`sqlite3_backup_*` (online backup C API)**: not exported. The
+  engine-level equivalents exist and are tested: `.backup` CLI
+  (byte-exact physical copy), `VACUUM INTO` (compact SQLite-format
+  export), and `sqlite3_serialize`/`sqlite3_deserialize` (real, both
+  native and SQLite-format images).
+- **`sqlite3_blob_*` (incremental blob I/O)**: not exported — blobs are
+  read and written whole (the engine streams overflow chains without
+  buffering, so large-blob SELECTs stay memory-bounded, but there is no
+  open/read/write/close incremental handle).
+- **`sqlite_stat4` / ANALYZE depth**: `sqlite_stat1` only — SQLite's own
+  default recommendation set; the planner consumes the prefix-distinct
+  model plus its own rowid-alias and index-estimate heuristics.
+- **`dbstat` and `sqlite_dbdata` virtual tables**: not shipped. The
+  same information is available through `PRAGMA page_count`,
+  `freelist_count`, `integrity_check` (full structural walk), and
+  `engine_stats()` (C ABI observability).
+- **ATTACH is name-only round trip**: the engine is single-database —
+  `ATTACH x AS y` records the name (so `ATTACH`→`DETACH` and the
+  `database_list` / error surface behave like SQLite's), but there is
+  no second database file behind it and no cross-database queries.
+- **Native-format multi-process access**: the native container is a
+  single-process, multi-threaded (MRMW readers) engine — no cross-process
+  file locking. Two processes should not hold one native file
+  concurrently; the SQLite-format mode is the interchange container
+  (its commits are atomic temp+fsync+rename writes, and its WAL sidecar
+  is byte-compatible with real SQLite processes). SQLite's own
+  multi-process story lives in its POSIX file locks, which the native
+  pager deliberately does not replicate.
+- **CLI dot-command surface**: 12 commands (`.tables` `.schema` `.dump`
+  `.export-schema` `.export-data` `.read` `.import` `.backup` `.mode`
+  `.help` `.quit`) plus the one-shot flags — not sqlite3's full shell
+  (no `.mode insert`, `.excel`, `.archive`, `.timer`, `.stats`, …).
+- **SQLite loadable-extension binary compatibility**: the plugin system
+  is the engine's OWN ABI (`rustqlite_extension_init`,
+  `include/rustqlite_ext.h` — working examples in C, C++, Zig, Rust);
+  a compiled SQLite `.so`/`.dylib` extension will not load as-is
+  (different init symbol, different handle types).
+
 ## Usage
 
 ### CLI
@@ -1116,6 +1216,8 @@ compat surface. Every entry says what it costs and why it exists.
 cargo run --release --bin rustqlite-cli -- /path/to/db.sqlite
 # Or in-memory:
 cargo run --release --bin rustqlite-cli -- :memory:
+# Create a file in REAL SQLite format from the start (every SQLite tool opens it):
+cargo run --release --bin rustqlite-cli -- --sqlite-format /path/to/db.sqlite
 ```
 
 ```sql
@@ -1152,6 +1254,7 @@ rustqlite> .dump dump.sql       -- full dump to a file
 rustqlite> .read script.sql     -- execute a script
 rustqlite> .import data.csv t   -- CSV rows into table t
 rustqlite> .backup copy.db      -- byte-exact physical backup
+rustqlite> VACUUM INTO 'share.db'  -- compact export as a REAL SQLite file
 ```
 
 The dump format matches `sqlite3 .dump`'s shape: `PRAGMA foreign_keys=OFF`
@@ -1309,7 +1412,7 @@ let rows = db.query("SELECT rot13('hello')", [])?;   // "uryyb"
 
 ## Examples
 
-See [`examples/`](examples/) — 145 probes and benchmarks:
+See [`examples/`](examples/) — 178 probes and benchmarks:
 
 - `basic.rs`: create, insert, query, update, delete, aggregates, group by
 - `transaction.rs`: atomic transfer between accounts
@@ -1329,8 +1432,9 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1000+ tests in the
-default matrix, all passing, plus the sqlx feature suite:
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1041 tests in
+the default matrix (187 unit + 854 integration across 67 files), plus 65 C ABI
+suites in `compat/` and the sqlx feature suite — all passing:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
 |---|---|---|
@@ -1359,6 +1463,7 @@ default matrix, all passing, plus the sqlx feature suite:
 | Temp-store spill | `tests/tempstore.rs` | forced multi-chunk spills match the RAM reference for every aggregate family; streaming driver = buffered; parallel = serial; key-sorted spill order; `PRAGMA temp_store` round-trip; ephemeral files always cleaned up |
 | Statistics | `tests/analyze.rs` | sqlite_stat1 rows in SQLite's exact format, targeted ANALYZE, cost-based index choice (unselective indexes declined), reopen persistence, compound/expression-index prefixes |
 | SQL Logic Tests | `tests/slt_runner.rs` + `tests/slt/` | the SLT format SQLite's core team uses |
+| Feature & semantics parity | `feature_parity.rs`, `foreign_keys.rs`, `savepoints.rs`, `alter_table.rs`, `alter_column.rs`, `json1.rs`, `jsonb_differential.rs`, `boolean_literals.rs`, `statement_api.rs`, `in_list.rs`, `rowid_expressions.rs`, `rowid_join.rs`, `update_from_collate.rs`, `correlated.rs`, `pushdown_subquery.rs`, `fused_range_scan.rs`, `count_cache.rs`, `replace_cell.rs`, `delete_spill.rs`, `overflow.rs`, `page_size.rs`, `drop_create_cycle.rs`, `engine_ledger.rs`, `gap_closure.rs`, `turso_compat.rs`, `sqlite_master.rs`, `pragma_introspect.rs`, `plugins.rs`, `ffi.rs` | every SQL-language feature exercised against SQLite's documented semantics — FK actions, savepoint nesting, ALTER evolution, JSON/JSONB byte-parity, statement streaming, expression pushdown, spill paths, plugin/vtab contracts, and the engine's own behavioral ledger |
 
 Every fuzzer is seeded (`RUSTQLITE_FUZZ_SEED`) so failures reproduce exactly.
 

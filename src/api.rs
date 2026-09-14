@@ -2814,9 +2814,68 @@ impl Database {
 
     /// Collect the complete committed state as a SQLite-format build.
     fn collect_foreign_dump(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
-        use crate::storage::sqlitefmt::{OutDb, OutObject};
-
         let foreign = self.foreign.as_ref().unwrap();
+        let objects =
+            self.collect_sqlite_objects(foreign.order.lock().clone(), &foreign.sequences.lock())?;
+        Ok(crate::storage::sqlitefmt::OutDb {
+            page_size: foreign.page_size,
+            user_version: self.pager.user_version(),
+            application_id: self.pager.application_id(),
+            change_counter: foreign.change_counter.load(Ordering::Acquire).max(1),
+            schema_cookie: foreign.schema_cookie.load(Ordering::Acquire).max(1),
+            text_enc: foreign.text_enc(),
+            auto_vacuum: foreign.auto_vacuum(),
+            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
+            objects,
+        })
+    }
+
+    /// The engine's native `RSQLDB04` container as a real SQLite-format
+    /// build — the native→SQLite export path behind `VACUUM INTO 'file'`
+    /// on a native-format database.
+    ///
+    /// Header shape matches real SQLite's own `VACUUM INTO` output
+    /// (probed against bundled SQLite,
+    /// `examples/probe_vacuum_into_shape.rs`): the source's page size, a
+    /// rollback-journal marker (header 18/19 = 1/1 — SQLite writes that
+    /// even when the source is in WAL mode), a fresh change counter of
+    /// 1, UTF-8 text. The native container is always dense, so no
+    /// auto-vacuum pointer map. The output is a standalone file with no
+    /// sidecar — openable by the `sqlite3` CLI, VS Code SQLite
+    /// extensions and every SQLite tool.
+    fn collect_native_sqlite_export(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
+        // Empty initial order: every object is engine-created, so the
+        // walk appends them in stable alphabetical order per kind.
+        let objects = self.collect_sqlite_objects(Vec::new(), &HashMap::new())?;
+        Ok(crate::storage::sqlitefmt::OutDb {
+            page_size: self.pager.page_size(),
+            user_version: self.pager.user_version(),
+            application_id: self.pager.application_id(),
+            change_counter: 1,
+            schema_cookie: self.pager.schema_cookie().max(1),
+            text_enc: crate::storage::sqlitefmt::record::TextEnc::Utf8,
+            auto_vacuum: 0,
+            journal_wal: false,
+            objects,
+        })
+    }
+
+    /// The shared sqlite_schema object walk for every SQLite-format dump
+    /// (foreign rewrites and native exports): tables — each followed by
+    /// its `sqlite_autoindex_*` rows — then standalone indexes, views
+    /// and triggers, in the given emit order (entries whose catalog
+    /// object is gone are skipped silently). `sequences` backs the
+    /// `sqlite_sequence` synthesis fallback for catalogs that do not
+    /// carry the table as a real rowid table (the native engine always
+    /// does once AUTOINCREMENT is used — its live rows are emitted by
+    /// the normal table path).
+    fn collect_sqlite_objects(
+        &self,
+        order: Vec<SchemaOrderKey>,
+        sequences: &HashMap<String, i64>,
+    ) -> Result<Vec<crate::storage::sqlitefmt::OutObject>> {
+        use crate::storage::sqlitefmt::OutObject;
+
         let mut objects: Vec<OutObject> = Vec::new();
         // Connection plugin registry: custom collations order the written
         // index/PK records (see collation_of).
@@ -2860,7 +2919,7 @@ impl Database {
             .collect();
 
         // ---- Emit-order resolution ----
-        let mut order = foreign.order.lock().clone();
+        let mut order = order;
         let known: std::collections::HashSet<String> = order.iter().map(order_key_name).collect();
         // Append engine-created objects (stable alphabetical within each
         // kind — deterministic across dumps).
@@ -2977,7 +3036,10 @@ impl Database {
         }
         if any_autoinc && !tables.contains_key("sqlite_sequence") {
             let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-            let seqs = foreign.sequences.lock();
+            // `sequences` is the caller's high-water map (the foreign
+            // session's for interop files; empty for native exports,
+            // whose sqlite_sequence is a real catalog table).
+            let seqs = sequences;
             for (name, t) in &tables {
                 if !t.columns.iter().any(|c| c.autoincrement) {
                     continue;
@@ -3002,21 +3064,7 @@ impl Database {
             }
         }
 
-        // ---- Header counters ----
-        let change_counter = foreign.change_counter.load(Ordering::Acquire).max(1);
-        let schema_cookie = foreign.schema_cookie.load(Ordering::Acquire).max(1);
-
-        Ok(OutDb {
-            page_size: foreign.page_size,
-            user_version: self.pager.user_version(),
-            application_id: self.pager.application_id(),
-            change_counter,
-            schema_cookie,
-            text_enc: foreign.text_enc(),
-            auto_vacuum: foreign.auto_vacuum(),
-            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
-            objects,
-        })
+        Ok(objects)
     }
 
     /// `(rowid, values)` for a rowid table, in rowid order. The alias
@@ -3208,6 +3256,14 @@ impl Database {
     /// it to `INTO` (self untouched) or replace this database's state
     /// in place.
     ///
+    /// `VACUUM INTO` writes the copy as a REAL SQLite-format database
+    /// (both container modes): native-format sources take the
+    /// native→SQLite export path (`collect_native_sqlite_export`), and
+    /// the file is openable by SQLite tooling (the `sqlite3` CLI, VS
+    /// Code SQLite extensions) — SQLite's own `VACUUM INTO` output
+    /// shape: rollback-journal marker, the source's page size, fresh
+    /// counters, UTF-8.
+    ///
     /// The compact build runs in a temporary FILE database (so every
     /// durability path — flush ordering, freelist allocation, codec —
     /// applies exactly as in a real file), streaming every table's rows
@@ -3283,7 +3339,7 @@ impl Database {
         // DELETE churn) moves NOTHING. Shapes an in-place plan cannot
         // cover (an object root would move — schema rootpage columns
         // would need re-encoding) keep the image path below; VACUUM INTO
-        // always takes the image path (it needs the bytes).
+        // never reaches it (the SQLite-format export returns first).
         if wal_install && v.into.is_none() {
             let roots = self.object_roots_from_schema()?;
             let plan = crate::storage::vacuum::plan_in_place_compaction(&self.pager, &roots)?;
@@ -3302,9 +3358,14 @@ impl Database {
             }
         }
 
-        let image = self.build_compact_image()?;
-
-        // VACUUM INTO 'file': SQLite refuses to overwrite.
+        // VACUUM INTO 'file': SQLite refuses to overwrite. The output is
+        // a REAL SQLite-format database — SQLite's own VACUUM INTO shape
+        // (rollback-journal marker, source page size, fresh counters;
+        // see `collect_native_sqlite_export`) — so the copy opens in the
+        // `sqlite3` CLI, VS Code SQLite extensions and every SQLite
+        // tool. This database's own native container is untouched. It
+        // returns before the compact image is built: the export reads
+        // rows through the SQL layer, not the image bytes.
         if let Some(into) = &v.into {
             let p = std::path::Path::new(into);
             if p.exists() {
@@ -3312,11 +3373,14 @@ impl Database {
                     "cannot VACUUM INTO existing file: {into}"
                 )));
             }
-            std::fs::write(p, &image).map_err(|e| {
+            let out = self.collect_native_sqlite_export()?;
+            crate::storage::sqlitefmt::write_sqlite_file(p, &out).map_err(|e| {
                 Error::Io(std::io::Error::other(format!("vacuum into {into}: {e}")))
             })?;
             return Ok(());
         }
+
+        let image = self.build_compact_image()?;
 
         // In-place: re-seed self from the compact image.
         // Connection-scoped bookkeeping (last_insert_rowid) survives the

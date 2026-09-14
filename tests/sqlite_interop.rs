@@ -1448,3 +1448,232 @@ fn custom_collation_orders_written_index() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&wal);
 }
+
+// ---------------------------------------------------------------------------
+// native -> SQLite export: `VACUUM INTO` on a NATIVE (RSQLDB04) database
+// writes a real SQLite-format file — the interchange path for SQLite
+// tooling (sqlite3 CLI, VS Code SQLite extensions). Probed against real
+// SQLite's own VACUUM INTO output shape (rollback-journal marker, source
+// page size, fresh counters — examples/probe_vacuum_into_shape.rs).
+// ---------------------------------------------------------------------------
+
+/// Full-surface export: tables, AUTOINCREMENT high-water, unique + DESC
+/// indexes, view, trigger, WITHOUT ROWID + NOCASE PK — verified by real
+/// SQLite (integrity_check, data equality, constraint enforcement), with
+/// the source untouched in native format.
+#[test]
+fn native_vacuum_into_exports_real_sqlite_file() {
+    let src = temp_path("nvac_src");
+    let dst = temp_path("nvac_out");
+    {
+        let mut db = Database::open(&src).unwrap();
+        assert_eq!(db.disk_format(), "native");
+        db.execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT, c REAL);
+             CREATE UNIQUE INDEX idx_b ON t(b);
+             CREATE INDEX idx_c ON t(c DESC);
+             CREATE VIEW big AS SELECT a, b FROM t WHERE c > 3.0;
+             CREATE TRIGGER trg AFTER INSERT ON t BEGIN
+               UPDATE t SET b = 'trg' || NEW.a WHERE a = NEW.a;
+             END;
+             CREATE TABLE wr(k TEXT COLLATE NOCASE, v INT, PRIMARY KEY(k, v)) WITHOUT ROWID;",
+            (),
+        )
+        .unwrap();
+        for i in 1..=50i64 {
+            db.execute(
+                "INSERT INTO t(b, c) VALUES (?, ?)",
+                [
+                    Value::Text(format!("row{}", i).as_str().into()),
+                    Value::Real(i as f64 / 7.0),
+                ],
+            )
+            .unwrap();
+        }
+        db.execute("INSERT INTO wr VALUES ('B', 2), ('a', 1), ('b', 3)", ())
+            .unwrap();
+        // AUTOINCREMENT high-water: delete the top row.
+        db.execute("DELETE FROM t WHERE a = 50", ()).unwrap();
+
+        db.execute(format!("VACUUM INTO '{}'", dst.display()).as_str(), ())
+            .unwrap();
+
+        // Source untouched: native magic, still queryable.
+        let head = std::fs::read(&src).unwrap();
+        assert_eq!(&head[0..8], b"RSQLDB04", "source stays native format");
+        let n = rows_of(&db, "SELECT COUNT(*) FROM t");
+        assert_eq!(n[0][0], Value::Integer(49));
+    }
+
+    // Output is a genuine SQLite file.
+    let bytes = std::fs::read(&dst).unwrap();
+    assert_eq!(&bytes[0..16], b"SQLite format 3\0", "export magic");
+    // Rollback-journal marker, exactly real SQLite's VACUUM INTO shape.
+    assert_eq!(
+        u16::from_be_bytes([bytes[18], bytes[19]]),
+        0x0101,
+        "18/19 = 1/1 rollback marker"
+    );
+    // No sidecar for the export (standalone file).
+    assert!(!rustqlite::storage::sqlitefmt::reader::wal_path_of(&dst).exists());
+
+    // Real SQLite verifies it end to end.
+    {
+        let con = rusqlite::Connection::open(&dst).unwrap();
+        assert_eq!(integrity_check(&con), "ok");
+        let n: i64 = con
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 49);
+        // Trigger-rewritten value survived.
+        let b: String = con
+            .query_row("SELECT b FROM t WHERE a = 49", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(b, "trg49");
+        // View reads: c = i/7 for i in 1..=49 (50 deleted) — c > 3.0
+        // means i > 21, so rows 22..=49 → 28 rows.
+        let v: i64 = con
+            .query_row("SELECT COUNT(*) FROM big", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 28, "view over c > 3.0 (i > 21) covers rows 22..=49");
+        // WITHOUT ROWID NOCASE PK order preserved (SQLite's own scan).
+        let ks: Vec<String> = {
+            let mut stmt = con.prepare("SELECT k FROM wr").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(ks, vec!["a".to_string(), "B".to_string(), "b".to_string()]);
+        // Unique index enforced by SQLite itself on the exported file.
+        let dup = con.execute("INSERT INTO t(a, b, c) VALUES (900, 'trg49', 0.0)", []);
+        assert!(
+            matches!(dup, Err(rusqlite::Error::SqliteFailure(e, _)) if e.code
+                == rusqlite::ErrorCode::ConstraintViolation),
+            "UNIQUE idx_b enforced, got {dup:?}"
+        );
+        // AUTOINCREMENT high-water survived (deleted top rowid 50).
+        let seq: i64 = con
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name='t'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(seq, 50);
+    }
+
+    // Engine re-opens its own export via the magic sniff.
+    {
+        let db = Database::open(&dst).unwrap();
+        assert_eq!(db.disk_format(), "sqlite");
+        let n = rows_of(&db, "SELECT COUNT(*) FROM t");
+        assert_eq!(n[0][0], Value::Integer(49));
+    }
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+/// Differential data equality: every engine query answer on the native
+/// source must match real SQLite's answer on the exported copy.
+#[test]
+fn native_vacuum_into_differential_data() {
+    let src = temp_path("nvac_diff_src");
+    let dst = temp_path("nvac_diff_out");
+    {
+        let mut db = Database::open(&src).unwrap();
+        db.execute(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, cat TEXT, val REAL, blob BLOB);
+             CREATE INDEX ix_cat ON items(cat);
+             INSERT INTO items VALUES
+               (1, 'a', 1.5, x'01'),
+               (2, 'a', -2.5, NULL),
+               (3, 'b', 3.25, x'00ff'),
+               (4, NULL, 1e10, x''),
+               (5, 'c', 0.0, NULL);",
+            (),
+        )
+        .unwrap();
+        db.execute(format!("VACUUM INTO '{}'", dst.display()).as_str(), ())
+            .unwrap();
+    }
+    let con = rusqlite::Connection::open(&dst).unwrap();
+    assert_eq!(integrity_check(&con), "ok");
+
+    let queries = [
+        "SELECT id, cat, val FROM items ORDER BY id",
+        "SELECT cat, COUNT(*), SUM(val), MIN(val), MAX(val) FROM items GROUP BY cat ORDER BY cat",
+        "SELECT id FROM items WHERE val BETWEEN 0 AND 4 ORDER BY val",
+        "SELECT id, cat FROM items WHERE cat IS NULL OR cat > 'a' ORDER BY id DESC",
+        "SELECT COUNT(*) FROM items WHERE blob IS NOT NULL",
+    ];
+    {
+        let db = Database::open(&dst).unwrap();
+        for sql in queries {
+            let engine = rows_of(&db, sql);
+            let sqlite: Vec<Vec<Value>> = {
+                let mut stmt = con.prepare(sql).unwrap();
+                let n = stmt.column_count();
+                let mut rows = stmt.query([]).unwrap();
+                let mut out = Vec::new();
+                while let Some(r) = rows.next().unwrap() {
+                    let mut row = Vec::with_capacity(n);
+                    for i in 0..n {
+                        row.push(match r.get_ref(i).unwrap() {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(v) => Value::Integer(v),
+                            rusqlite::types::ValueRef::Real(v) => Value::Real(v),
+                            rusqlite::types::ValueRef::Text(v) => {
+                                Value::Text(String::from_utf8_lossy(v).into_owned().into())
+                            }
+                            rusqlite::types::ValueRef::Blob(v) => Value::Blob(v.to_vec()),
+                        });
+                    }
+                    out.push(row);
+                }
+                out
+            };
+            assert_eq!(engine, sqlite, "divergence on: {sql}");
+        }
+    }
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+/// WAL-mode native source: the export is still a standalone rollback-mode
+/// SQLite file (real SQLite's own VACUUM INTO writes 18/19 = 1/1 from WAL
+/// sources — probed), and the native sidecar is untouched.
+#[test]
+fn native_wal_vacuum_into_exports_rollback_sqlite() {
+    let src = temp_path("nvac_wal_src");
+    let dst = temp_path("nvac_wal_out");
+    {
+        let mut db = Database::open(&src).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
+        db.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+            .unwrap();
+        db.execute("INSERT INTO t(b) VALUES ('w1'), ('w2')", ())
+            .unwrap();
+        db.execute(format!("VACUUM INTO '{}'", dst.display()).as_str(), ())
+            .unwrap();
+        // Source still WAL-mode native with a live sidecar session.
+        assert_eq!(db.disk_format(), "native");
+        let n = rows_of(&db, "SELECT COUNT(*) FROM t");
+        assert_eq!(n[0][0], Value::Integer(2));
+    }
+    let bytes = std::fs::read(&dst).unwrap();
+    assert_eq!(&bytes[0..16], b"SQLite format 3\0");
+    assert_eq!(
+        u16::from_be_bytes([bytes[18], bytes[19]]),
+        0x0101,
+        "rollback marker"
+    );
+    let con = rusqlite::Connection::open(&dst).unwrap();
+    assert_eq!(integrity_check(&con), "ok");
+    let n: i64 = con
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_file(rustqlite::storage::sqlitefmt::reader::wal_path_of(&src));
+}
