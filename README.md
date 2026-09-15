@@ -427,6 +427,19 @@ rustqlite splits the scan across worker threads; SQLite's executor is single-thr
 | 2-table equi-JOIN (1M × 1M, 3M out)   | **451.6 ms**| 624.2 ms  | **1.38x faster** |
 | 3-table adversarial ORDER (50k×50k×5) | **5.3 ms**  | 0.7 ms     | 0.13x — was 482 ms before the reorder (**~90x engine-side**) |
 
+### Specialized index access methods (GIN inverted + spatial KNN)
+
+Engine-vs-engine (`cargo run --release --example bench_index_am`): the same query with and without the specialized index, 100k rows, **every row carries an answer-equality assert between the indexed and unindexed paths before it is timed**.
+
+| Workload (100k rows)                                    | Unindexed    | Indexed    | Ratio           |
+|---------------------------------------------------------|--------------|------------|-----------------|
+| FTS rare-term query (`@@ to_tsquery('tok417')`, 100 hits)| 667.6 ms     | **0.8 ms** | **850x faster** |
+| Spatial KNN (`ORDER BY geom <-> p LIMIT 10`)            | 58.3 ms      | **0.2 ms** | **320x faster** |
+| GIN index build (100k docs, ~16 lexemes each)           | —            | 1.5 s      | —               |
+| GIST index build (100k points, resolution 1.0)          | —            | 106 ms     | —               |
+
+The FTS row is the difference between parsing 100k stored tsvector strings and evaluating `@@` per row versus parsing the query **once** and seeking one term's contiguous postings run. The KNN row is the difference between fetching and distance-ranking all 100k rows through a sort versus the expanding-window scan, which touches only the candidates inside windows it can prove sufficient.
+
 ### Where the wins come from
 
 - **OLTP inserts**: a byte-level fast-path scanner executes single-row literal `INSERT ... VALUES (...)` without building tokens, an AST, or a plan — and `:memory:` databases skip per-statement file writes entirely (lazy write-back). Even with unique SQL text per statement (the worst case for caching), we beat SQLite's re-prepare cost.
@@ -1437,7 +1450,7 @@ let rows = db.query("SELECT rot13('hello')", [])?;   // "uryyb"
 
 ## Examples
 
-See [`examples/`](examples/) — 181 probes and benchmarks:
+See [`examples/`](examples/) — 182 probes and benchmarks:
 
 - `basic.rs`: create, insert, query, update, delete, aggregates, group by
 - `transaction.rs`: atomic transfer between accounts
@@ -1448,6 +1461,7 @@ See [`examples/`](examples/) — 181 probes and benchmarks:
 - `probe_1w7r.rs`: 1-writer/7-reader concurrency probe
 - `probe_dirty_read.rs`: snapshot-isolation verification
 - `index_am_smoke.rs`: GIN inverted + GIST spatial index end-to-end (EXPLAIN plan shapes, persistence reopen)
+- `bench_index_am.rs`: the specialized-AM benchmarks (FTS inverted scan 850x, spatial KNN 320x, with answer-equality asserts)
 
 ```bash
 cargo run --example basic

@@ -611,3 +611,17 @@ Work Log:
 
 Stage Summary:
 - The Tier-1 keystone is delivered: FTS queries over GIN inverted indexes and PostGIS-contract KNN over spatial grid indexes, both on the existing B+tree with key discipline (no new page format), planner-shaped (dedicated plan nodes, residual-filter soundness), write-maintained, persistent, and EXPLAIN-visible. 1201-test default matrix green end-to-end.
+
+---
+Task ID: TIER1-AM-BENCH
+Agent: main (Super Z)
+Task: Benchmark evidence for the specialized index access methods (the "FTS at scale" / "KNN acceleration" claims) + README performance section.
+
+Work Log:
+- New examples/bench_index_am.rs: GIN phase (100k docs of ~16 lexemes each; rare-term @@ queries full-scan vs inverted scan; build time; EXPLAIN asserts the INVERTED plan; answer-equality asserts on the result id sets) + GIST phase (100k LCG points in [0,1000)^2 at resolution 1.0; KNN ORDER BY geom <-> p LIMIT 10 brute-force vs expanding-window scan; build time; EXPLAIN asserts the KNN plan; (dist,id) pair equality asserts vs brute force).
+- Release-profile results on this 2-vCPU sandbox: FTS rare-term query 667.6 ms full scan vs 0.8 ms gin scan = 850x; KNN 58.3 ms brute force vs 0.2 ms knn scan = 320x; builds 1.5 s (gin, 100k docs) / 106 ms (gist, 100k points).
+- README: new "Specialized index access methods (GIN inverted + spatial KNN)" performance subsection (engine-vs-engine table + the two one-paragraph explanations), examples list + bench_index_am.rs entry, count 181 -> 182.
+- Verified fmt --check clean and clippy --examples -D warnings clean.
+
+Stage Summary:
+- The Tier-1 AM acceleration is now measured, not just asserted: 850x (FTS inverted scan) and 320x (spatial KNN) at 100k rows with answer-equality guards. README carries the numbers.
