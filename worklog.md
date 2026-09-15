@@ -625,3 +625,22 @@ Work Log:
 
 Stage Summary:
 - The Tier-1 AM acceleration is now measured, not just asserted: 850x (FTS inverted scan) and 320x (spatial KNN) at 100k rows with answer-equality guards. README carries the numbers.
+
+---
+Task ID: GEO-TIER2
+Agent: main (Super Z)
+Task: PostGIS second-tier surface: the OGC topology predicate family (ST_Touches/ST_Crosses/ST_Overlaps/ST_Equals/ST_Disjoint), line/ring accessors, closure/simplicity analysis, affine transforms, ST_MakeLine, ST_ConvexHull — 21 new ST_* functions.
+
+Work Log:
+- Topology core: interior/boundary reasoning (a line's boundary is its two ENDPOINTS — interior vertices are interior points; a point's boundary is empty). proper_cross (strict crossing), collinear_overlap (positive-length overlap), point_interior_to_line, line_interiors_meet, line_polygon_interiors_meet (endpoints-inside implies adjacent open segment inside; proper ring crossings; midpoint+quarter sampling for chords), polygon_interiors_meet.
+- Predicates on top: touches = intersects && !interiors_intersect (clean OGC reduction); crosses (line×line proper crossings only — T-junctions are touches; line×polygon pass-through-not-contained; points/polygons never cross); overlaps (line: collinear overlap neither covering; polygon: interiors meet, neither contains, not equal); equals (lines: same vertex+edge sets direction-insensitive; polygons: ring cycles canonicalized by smallest-vertex rotation + direction normalization, compared as unordered sets); disjoint = !intersects.
+- Simplicity (ST_IsRing): restructured around the adjacent-edge rule — adjacent edges (incl. the closing pair) share ONLY their vertex: collinear adjacency is legal only when the shared vertex lies strictly between the outer endpoints (subdivision OK; fold/backtrack/overlap not) — plus non-adjacent edges must not touch at all; pinched-ring closure check.
+- Accessors: ST_StartPoint/ST_EndPoint/ST_PointN (1-based, negative backwards, out-of-range NULL)/ST_NumPoints/ST_NumInteriorRings/ST_ExteriorRing/ST_InteriorRingN; type mismatches → NULL (documented convention).
+- Transforms: ST_Translate/ST_Scale (origin or point)/ST_Rotate (origin or point)/ST_Reverse — SRID preserved; ST_MakeLine (point×point/point×line/line×point/line×line, polygons error); ST_ConvexHull (Andrew monotone chain; hull ring stored CLOSED per module convention; collinear clouds collapse to the extreme LINESTRING, single points to POINT — GEOS behavior).
+- BUGS FOUND IN MY OWN NEW CODE VIA TESTS: canon_ring reversed the whole vector (the canonical start vertex ended up mid-ring — reversal-insensitive rings never matched); adjacent-edge collinear overlap (LINESTRING a-b-a backtrack) escaped simplicity via the adjacency skip; hull ring stored open against the module's closed-ring convention; one test expected isring for an open line; one workflow test's road was fully contained (crosses correctly false). All fixed against correct OGC semantics, not the other way.
+- expr.rs is_builtin_scalar: +21 names (alphabetical in the st_ region; restored st_geometrytype which the first batch edit accidentally dropped).
+- Tests: 9 new unit suites in geo.rs (topology touches/crosses/overlaps/equals/disjoint, closure_and_ring incl. bowtie/backtrack/fold/subdivided, accessors, transforms, makeline+hull) + 4 integration suites in tests/geo_spatial.rs (predicate SQL incl. NULLs, closure/accessors, transforms/constructors, road-crosses-zones + overlap-join + equality-under-rotation table workflow). Matrix: 1214 tests (263 unit + 951 integration / 75 files) green; fmt + clippy -D warnings clean.
+- README: geo bullet rewritten for the full OGC family + accessors + transforms + hull; geo_spatial testing row updated; counts 1201 → 1214.
+
+Stage Summary:
+- The geospatial surface now covers the PostGIS second tier: 21 new functions (47 ST_* total), real OGC interior/boundary predicate semantics, genuine simplicity analysis, and affine/hull constructors — all NULL-safe, SRID-preserving, and table-workflow tested.

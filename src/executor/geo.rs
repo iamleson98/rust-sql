@@ -607,6 +607,551 @@ fn geo_intersects(a: &Geometry, b: &Geometry) -> bool {
 }
 
 // ============================================================================
+// OGC topology: interiors, touches/crosses/overlaps/equals
+// ============================================================================
+//
+// The interior of a geometry is its point set minus its boundary: a
+// line's boundary is its two endpoints (interior vertices are INTERIOR
+// points), a polygon's boundary is its rings, a point's interior is the
+// point itself (its boundary is empty).
+
+/// Strict (proper) crossing of two segments: their interiors intersect
+/// at exactly one point, with no collinearity and no endpoint touch.
+fn proper_cross(a1: Pt, a2: Pt, b1: Pt, b2: Pt) -> bool {
+    let cross =
+        |o: Pt, x: Pt, y: Pt| -> f64 { (x.0 - o.0) * (y.1 - o.1) - (x.1 - o.1) * (y.0 - o.0) };
+    let d1 = cross(b1, b2, a1);
+    let d2 = cross(b1, b2, a2);
+    let d3 = cross(a1, a2, b1);
+    let d4 = cross(a1, a2, b2);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+/// Do two collinear segments overlap with positive length?
+fn collinear_overlap(a1: Pt, a2: Pt, b1: Pt, b2: Pt) -> bool {
+    let cross =
+        |o: Pt, x: Pt, y: Pt| -> f64 { (x.0 - o.0) * (y.1 - o.1) - (x.1 - o.1) * (y.0 - o.0) };
+    // all four endpoints mutually collinear with both segments
+    if cross(a1, a2, b1).abs() > EPS || cross(a1, a2, b2).abs() > EPS {
+        return false;
+    }
+    // project onto the dominant axis of a
+    let axis_x = (a2.0 - a1.0).abs() >= (a2.1 - a1.1).abs();
+    let t = |p: Pt| -> f64 {
+        if axis_x {
+            p.0
+        } else {
+            p.1
+        }
+    };
+    let (alo, ahi) = (t(a1).min(t(a2)), t(a1).max(t(a2)));
+    let (blo, bhi) = (t(b1).min(t(b2)), t(b1).max(t(b2)));
+    let lo = alo.max(blo);
+    let hi = ahi.min(bhi);
+    hi > lo + EPS
+}
+
+/// Is `p` an interior point of line `v` (on its point set, not an
+/// endpoint)?
+fn point_interior_to_line(p: Pt, v: &[Pt]) -> bool {
+    let is_endpoint = |q: Pt| -> bool {
+        (q.0 - v[0].0).abs() <= EPS && (q.1 - v[0].1).abs() <= EPS
+            || (q.0 - v[v.len() - 1].0).abs() <= EPS && (q.1 - v[v.len() - 1].1).abs() <= EPS
+    };
+    if is_endpoint(p) {
+        return false;
+    }
+    v.windows(2)
+        .any(|w| on_segment(p.0, p.1, w[0].0, w[0].1, w[1].0, w[1].1))
+}
+
+/// Do the INTERIORS of two linestrings share any point? (Proper
+/// crossings, collinear overlaps, or interior vertices of one lying on
+/// the other.)
+fn line_interiors_meet(u: &[Pt], v: &[Pt]) -> bool {
+    for uw in u.windows(2) {
+        for vw in v.windows(2) {
+            if proper_cross(uw[0], uw[1], vw[0], vw[1])
+                || collinear_overlap(uw[0], uw[1], vw[0], vw[1])
+            {
+                return true;
+            }
+        }
+    }
+    // interior vertices of one on the other's point set
+    if u.len() >= 3 {
+        for p in &u[1..u.len() - 1] {
+            if point_interior_to_line(*p, v) {
+                return true;
+            }
+        }
+    }
+    if v.len() >= 3 {
+        for p in &v[1..v.len() - 1] {
+            if point_interior_to_line(*p, u) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does a line's interior pass strictly inside a polygon? (Interior
+/// vertices or endpoints strictly inside — an endpoint inside implies
+/// the adjacent open segment portion is too — or ring edges properly
+/// crossed, or an open-segment midpoint inside for chords.)
+fn line_polygon_interiors_meet(v: &[Pt], rings: &[Vec<Pt>]) -> bool {
+    for w in v.windows(2) {
+        let mid = ((w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0);
+        let q = ((w[0].0 + mid.0) / 2.0, (w[0].1 + mid.1) / 2.0);
+        for p in [mid, q, w[0], w[1]] {
+            if point_in_polygon(p.0, p.1, rings) == RingPos::Inside {
+                return true;
+            }
+        }
+        for ring in rings {
+            // close the ring implicitly
+            let mut rb = ring.clone();
+            if ring[0] != ring[ring.len() - 1] {
+                rb.push(ring[0]);
+            }
+            for rw in rb.windows(2) {
+                if proper_cross(w[0], w[1], rw[0], rw[1]) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Do the interiors of two polygons overlap?
+fn polygon_interiors_meet(a: &[Vec<Pt>], b: &[Vec<Pt>]) -> bool {
+    let test =
+        |p: Pt, rings: &[Vec<Pt>]| -> bool { point_in_polygon(p.0, p.1, rings) == RingPos::Inside };
+    for p in a.iter().flat_map(|r| r.iter()) {
+        if test(*p, b) {
+            return true;
+        }
+    }
+    for ring in a {
+        for w in ring.windows(2) {
+            let mid = ((w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0);
+            if test(mid, b) {
+                return true;
+            }
+            for br in b {
+                let mut brb = br.clone();
+                if br[0] != br[br.len() - 1] {
+                    brb.push(br[0]);
+                }
+                for bw in brb.windows(2) {
+                    if proper_cross(w[0], w[1], bw[0], bw[1]) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // symmetric direction: b's vertices/midpoints inside a
+    for p in b.iter().flat_map(|r| r.iter()) {
+        if test(*p, a) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Do the interiors of any two geometries intersect?
+fn interiors_intersect(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::Point(x1, y1), Geometry::Point(x2, y2)) => {
+            (x1 - x2).abs() <= EPS && (y1 - y2).abs() <= EPS
+        }
+        (Geometry::Point(x, y), Geometry::Polygon(rings))
+        | (Geometry::Polygon(rings), Geometry::Point(x, y)) => {
+            point_in_polygon(*x, *y, rings) == RingPos::Inside
+        }
+        (Geometry::Point(x, y), Geometry::LineString(v))
+        | (Geometry::LineString(v), Geometry::Point(x, y)) => point_interior_to_line((*x, *y), v),
+        (Geometry::LineString(u), Geometry::LineString(v)) => line_interiors_meet(u, v),
+        (Geometry::LineString(v), Geometry::Polygon(rings))
+        | (Geometry::Polygon(rings), Geometry::LineString(v)) => {
+            line_polygon_interiors_meet(v, rings)
+        }
+        (Geometry::Polygon(ra), Geometry::Polygon(rb)) => polygon_interiors_meet(ra, rb),
+    }
+}
+
+/// OGC touches: interiors disjoint, boundaries (or interior-boundary)
+/// meet. Equivalently: they intersect at all, but NOT through their
+/// interiors.
+fn geo_touches(a: &Geometry, b: &Geometry) -> bool {
+    geo_intersects(a, b) && !interiors_intersect(a, b)
+}
+
+/// OGC crosses: valid for line×line (proper interior crossing) and
+/// line×polygon (the line passes through the interior without being
+/// contained). Never true when a point or two polygons are involved
+/// (those are equals/intersects/overlaps territory in OGC terms).
+fn geo_crosses(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::Point(..), _) | (_, Geometry::Point(..)) => false,
+        (Geometry::LineString(u), Geometry::LineString(v)) => u.windows(2).any(|uw| {
+            v.windows(2)
+                .any(|vw| proper_cross(uw[0], uw[1], vw[0], vw[1]))
+        }),
+        (Geometry::LineString(v), Geometry::Polygon(_))
+        | (Geometry::Polygon(_), Geometry::LineString(v)) => {
+            let rings = match (a, b) {
+                (Geometry::Polygon(r), _) => r,
+                (_, Geometry::Polygon(r)) => r,
+                _ => unreachable!("matched shape above"),
+            };
+            line_polygon_interiors_meet(v, rings) && !geo_contains(a, b) && !geo_contains(b, a)
+        }
+        (Geometry::Polygon(..), Geometry::Polygon(..)) => false,
+    }
+}
+
+/// Is every point of line `v` on line `u`'s point set? (Approximation:
+/// every vertex and each edge's midpoint/quarter-point of v on u.)
+fn line_covers(u: &[Pt], v: &[Pt]) -> bool {
+    if v.is_empty() {
+        return true;
+    }
+    v.iter()
+        .copied()
+        .chain(v.windows(2).flat_map(|w| {
+            let mid = ((w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0);
+            let q1 = ((w[0].0 + mid.0) / 2.0, (w[0].1 + mid.1) / 2.0);
+            let q2 = ((mid.0 + w[1].0) / 2.0, (mid.1 + w[1].1) / 2.0);
+            [mid, q1, q2]
+        }))
+        .chain(v.first().copied().into_iter().chain([v[v.len() - 1]]))
+        .all(|p| {
+            u.windows(2)
+                .any(|uw| on_segment(p.0, p.1, uw[0].0, uw[0].1, uw[1].0, uw[1].1))
+                || u.iter()
+                    .any(|q| (q.0 - p.0).abs() <= EPS && (q.1 - p.1).abs() <= EPS)
+        })
+}
+
+/// OGC overlaps: same dimension, interiors intersect, neither contains
+/// the other (and not equal).
+fn geo_overlaps(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::LineString(u), Geometry::LineString(v)) => {
+            line_interiors_meet(u, v) && !line_covers(u, v) && !line_covers(v, u)
+        }
+        (Geometry::Polygon(ra), Geometry::Polygon(rb)) => {
+            polygon_interiors_meet(ra, rb)
+                && !geo_contains(a, b)
+                && !geo_contains(b, a)
+                && !geo_equals(a, b)
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// Equality (topological, direction-insensitive)
+// ============================================================================
+
+fn pt_eq(a: Pt, b: Pt) -> bool {
+    (a.0 - b.0).abs() <= EPS && (a.1 - b.1).abs() <= EPS
+}
+
+/// Canonical form of a ring's vertex cycle: start at the
+/// lexicographically smallest vertex, take the direction whose second
+/// vertex is smaller. Two rings describe the same cycle iff their
+/// canonical forms are equal.
+fn canon_ring(r: &[Pt]) -> Vec<Pt> {
+    let n = r.len();
+    let pts: Vec<Pt> = if n >= 2 && pt_eq(r[0], r[n - 1]) {
+        r[..n - 1].to_vec()
+    } else {
+        r.to_vec()
+    };
+    let n = pts.len();
+    if n == 0 {
+        return pts;
+    }
+    let start = (0..n)
+        .min_by(|&i, &j| {
+            pts[i]
+                .0
+                .partial_cmp(&pts[j].0)
+                .unwrap()
+                .then(pts[i].1.partial_cmp(&pts[j].1).unwrap())
+        })
+        .unwrap_or(0);
+    // walk forwards and backwards from the same smallest vertex; the
+    // canonical form is the lexicographically smaller walk, so a ring
+    // and its reversal/rotation produce the same canonical form.
+    let fwd: Vec<Pt> = (0..n).map(|k| pts[(start + k) % n]).collect();
+    let mut bwd: Vec<Pt> = vec![pts[start]];
+    for k in (1..n).rev() {
+        bwd.push(pts[(start + k) % n]);
+    }
+    if bwd < fwd {
+        bwd
+    } else {
+        fwd
+    }
+}
+
+/// Topological equality: points coincide; lines have the same vertex
+/// and edge sets (direction-insensitive, but subdivisions of a segment
+/// are NOT equal — a documented divergence from GEOS's point-set
+/// equality); polygons have the same ring cycles (start/direction
+/// insensitive), compared as unordered sets.
+fn geo_equals(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::Point(x1, y1), Geometry::Point(x2, y2)) => {
+            (x1 - x2).abs() <= EPS && (y1 - y2).abs() <= EPS
+        }
+        (Geometry::LineString(u), Geometry::LineString(v)) => {
+            // same vertex multiset...
+            let mut us = u.clone();
+            let mut vs = v.clone();
+            us.sort_by(|p, q| {
+                p.0.partial_cmp(&q.0)
+                    .unwrap()
+                    .then(p.1.partial_cmp(&q.1).unwrap())
+            });
+            vs.sort_by(|p, q| {
+                p.0.partial_cmp(&q.0)
+                    .unwrap()
+                    .then(p.1.partial_cmp(&q.1).unwrap())
+            });
+            if us.len() != vs.len() || !us.iter().zip(&vs).all(|(p, q)| pt_eq(*p, *q)) {
+                return false;
+            }
+            // ...and the same edge set (normalized endpoints)
+            let seg_key = |mut s: (Pt, Pt)| -> (Pt, Pt) {
+                if (s.1 .0, s.1 .1) < (s.0 .0, s.0 .1) {
+                    std::mem::swap(&mut s.0, &mut s.1);
+                }
+                s
+            };
+            let mut ue: Vec<(Pt, Pt)> = u.windows(2).map(|w| seg_key((w[0], w[1]))).collect();
+            let mut ve: Vec<(Pt, Pt)> = v.windows(2).map(|w| seg_key((w[0], w[1]))).collect();
+            ue.sort_by(|p, q| {
+                (p.0 .0, p.0 .1)
+                    .partial_cmp(&(q.0 .0, q.0 .1))
+                    .unwrap()
+                    .then((p.1 .0, p.1 .1).partial_cmp(&(q.1 .0, q.1 .1)).unwrap())
+            });
+            ve.sort_by(|p, q| {
+                (p.0 .0, p.0 .1)
+                    .partial_cmp(&(q.0 .0, q.0 .1))
+                    .unwrap()
+                    .then((p.1 .0, p.1 .1).partial_cmp(&(q.1 .0, q.1 .1)).unwrap())
+            });
+            ue.len() == ve.len()
+                && ue
+                    .iter()
+                    .zip(&ve)
+                    .all(|(p, q)| pt_eq(p.0, q.0) && pt_eq(p.1, q.1))
+        }
+        (Geometry::Polygon(ra), Geometry::Polygon(rb)) => {
+            if ra.len() != rb.len() {
+                return false;
+            }
+            let mut ca: Vec<Vec<Pt>> = ra.iter().map(|r| canon_ring(r)).collect();
+            let mut cb: Vec<Vec<Pt>> = rb.iter().map(|r| canon_ring(r)).collect();
+            let cmp = |p: &Vec<Pt>, q: &Vec<Pt>| -> std::cmp::Ordering {
+                for (a, b) in p.iter().zip(q.iter()) {
+                    match a
+                        .0
+                        .partial_cmp(&b.0)
+                        .unwrap()
+                        .then(a.1.partial_cmp(&b.1).unwrap())
+                    {
+                        std::cmp::Ordering::Equal => continue,
+                        o => return o,
+                    }
+                }
+                p.len().cmp(&q.len())
+            };
+            ca.sort_by(cmp);
+            cb.sort_by(cmp);
+            ca.len() == cb.len()
+                && ca
+                    .iter()
+                    .zip(&cb)
+                    .all(|(p, q)| p.len() == q.len() && p.iter().zip(q).all(|(a, b)| pt_eq(*a, *b)))
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// Simplicity / closure
+// ============================================================================
+
+fn line_is_closed(v: &[Pt]) -> bool {
+    v.len() >= 2 && pt_eq(v[0], v[v.len() - 1])
+}
+
+/// A linestring is simple when it does not pass through the same point
+/// twice (except the closing point of a ring): no repeated vertices, no
+/// adjacent edges folding back or overlapping collinearly, and no two
+/// non-adjacent edges touching at all.
+fn line_is_simple(v: &[Pt]) -> bool {
+    let n = v.len();
+    if n < 3 {
+        return true;
+    }
+    // repeated consecutive vertices
+    for w in v.windows(2) {
+        if pt_eq(w[0], w[1]) {
+            return false;
+        }
+    }
+    let closed = line_is_closed(v);
+    if closed && v[1..n - 1].iter().any(|p| pt_eq(*p, v[0])) {
+        return false; // pinched ring: interior vertex repeats the closure
+    }
+    let edges: Vec<(Pt, Pt)> = v.windows(2).map(|w| (w[0], w[1])).collect();
+    let m = edges.len();
+    // adjacent edges (sharing one vertex, including the closing pair of a
+    // ring) must share ONLY that vertex: either they turn, or the shared
+    // vertex lies strictly between the outer endpoints on their line.
+    for i in 0..m {
+        let next = if closed && i == m - 1 { 0 } else { i + 1 };
+        if next >= m {
+            break; // open line: the last edge has no successor
+        }
+        let (a, b) = edges[i];
+        let (_, c) = edges[next];
+        let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        if cross.abs() <= EPS {
+            // collinear: legal only when b is strictly between a and c
+            let between = on_segment(b.0, b.1, a.0, a.1, c.0, c.1) && !pt_eq(b, a) && !pt_eq(b, c);
+            if !between {
+                return false; // fold / backtrack / collinear overlap
+            }
+        }
+    }
+    // non-adjacent edges must not touch at all
+    for i in 0..m {
+        for j in (i + 1)..m {
+            if j == i + 1 {
+                continue;
+            }
+            if closed && i == 0 && j == m - 1 {
+                continue;
+            }
+            if segments_intersect(
+                edges[i].0 .0,
+                edges[i].0 .1,
+                edges[i].1 .0,
+                edges[i].1 .1,
+                edges[j].0 .0,
+                edges[j].0 .1,
+                edges[j].1 .0,
+                edges[j].1 .1,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ============================================================================
+// Affine transforms + hull + reverse
+// ============================================================================
+
+fn map_geom_vertices(g: &Geometry, f: &impl Fn(Pt) -> Pt) -> Geometry {
+    match g {
+        Geometry::Point(x, y) => {
+            let p = f((*x, *y));
+            Geometry::Point(p.0, p.1)
+        }
+        Geometry::LineString(v) => Geometry::LineString(v.iter().map(|p| f(*p)).collect()),
+        Geometry::Polygon(rings) => Geometry::Polygon(
+            rings
+                .iter()
+                .map(|r| r.iter().map(|p| f(*p)).collect())
+                .collect(),
+        ),
+    }
+}
+
+fn reverse_geom(g: &Geometry) -> Geometry {
+    match g {
+        Geometry::Point(..) => g.clone(),
+        Geometry::LineString(v) => {
+            let mut w = v.clone();
+            w.reverse();
+            Geometry::LineString(w)
+        }
+        Geometry::Polygon(rings) => Geometry::Polygon(
+            rings
+                .iter()
+                .map(|r| {
+                    let mut w = r.clone();
+                    w.reverse();
+                    w
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Convex hull (Andrew's monotone chain). Degenerate inputs collapse:
+/// one distinct point → POINT, two (or collinear sets) → LINESTRING of
+/// the extremes, else the hull POLYGON.
+fn convex_hull(g: &Geometry) -> Geometry {
+    let mut pts: Vec<Pt> = g.vertices();
+    pts.sort_by(|p, q| {
+        p.0.partial_cmp(&q.0)
+            .unwrap()
+            .then(p.1.partial_cmp(&q.1).unwrap())
+    });
+    pts.dedup();
+    if pts.len() <= 1 {
+        return Geometry::Point(pts[0].0, pts[0].1);
+    }
+    if pts.len() == 2 {
+        return Geometry::LineString(pts);
+    }
+    let cross =
+        |o: Pt, a: Pt, b: Pt| -> f64 { (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0) };
+    let mut lower: Vec<Pt> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<Pt> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    let mut hull: Vec<Pt> = lower;
+    hull.extend(upper);
+    if hull.len() == 2 {
+        return Geometry::LineString(hull);
+    }
+    if hull.len() < 3 {
+        return Geometry::Point(hull[0].0, hull[0].1);
+    }
+    // store the ring closed (module convention: make_envelope, PG output)
+    hull.push(hull[0]);
+    Geometry::Polygon(vec![hull])
+}
+
+// ============================================================================
 // Planar measurements
 // ============================================================================
 
@@ -1010,6 +1555,105 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
             Some(g) => Value::Text(as_geojson(&g.geom).into()),
             None => Value::Null,
         },
+        // ---- accessors (PostGIS shape; type mismatches → NULL) ----
+        "st_startpoint" => match geo_arg(args, 0)? {
+            Some(g) => match &g.geom {
+                Geometry::LineString(v) => Value::Text(
+                    render(&Geo {
+                        srid: g.srid,
+                        geom: Geometry::Point(v[0].0, v[0].1),
+                    })
+                    .into(),
+                ),
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
+        "st_endpoint" => match geo_arg(args, 0)? {
+            Some(g) => match &g.geom {
+                Geometry::LineString(v) => Value::Text(
+                    render(&Geo {
+                        srid: g.srid,
+                        geom: Geometry::Point(v[v.len() - 1].0, v[v.len() - 1].1),
+                    })
+                    .into(),
+                ),
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
+        "st_pointn" => {
+            let (Some(g), Some(n)) = (geo_arg(args, 0)?, int_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            let v = match &g.geom {
+                Geometry::LineString(v) => v,
+                _ => return Ok(Some(Value::Null)),
+            };
+            // 1-based; negative counts backwards (PG semantics)
+            let idx = if n >= 1 {
+                (n - 1) as usize
+            } else if n <= -1 {
+                v.len().saturating_sub((-n) as usize)
+            } else {
+                usize::MAX
+            };
+            match v.get(idx) {
+                Some((x, y)) => Value::Text(
+                    render(&Geo {
+                        srid: g.srid,
+                        geom: Geometry::Point(*x, *y),
+                    })
+                    .into(),
+                ),
+                None => Value::Null,
+            }
+        }
+        "st_numpoints" => match geo_arg(args, 0)? {
+            Some(g) => match &g.geom {
+                Geometry::LineString(v) => Value::Integer(v.len() as i64),
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
+        "st_numinteriorrings" => match geo_arg(args, 0)? {
+            Some(g) => match &g.geom {
+                Geometry::Polygon(rings) => Value::Integer(rings.len().saturating_sub(1) as i64),
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
+        "st_exteriorring" => match geo_arg(args, 0)? {
+            Some(g) => match &g.geom {
+                Geometry::Polygon(rings) => Value::Text(
+                    render(&Geo {
+                        srid: g.srid,
+                        geom: Geometry::LineString(rings[0].clone()),
+                    })
+                    .into(),
+                ),
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
+        "st_interiorringn" => {
+            let (Some(g), Some(n)) = (geo_arg(args, 0)?, int_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            match &g.geom {
+                Geometry::Polygon(rings) => match rings.get(n.max(1) as usize) {
+                    Some(r) => Value::Text(
+                        render(&Geo {
+                            srid: g.srid,
+                            geom: Geometry::LineString(r.clone()),
+                        })
+                        .into(),
+                    ),
+                    None => Value::Null,
+                },
+                _ => Value::Null,
+            }
+        }
         // ---- measurements ----
         "st_distance" => {
             let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
@@ -1101,6 +1745,54 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
             };
             Value::Integer(i64::from(geo_intersects(&a.geom, &b.geom)))
         }
+        "st_disjoint" => {
+            let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            Value::Integer(i64::from(!geo_intersects(&a.geom, &b.geom)))
+        }
+        "st_touches" => {
+            let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            Value::Integer(i64::from(geo_touches(&a.geom, &b.geom)))
+        }
+        "st_crosses" => {
+            let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            Value::Integer(i64::from(geo_crosses(&a.geom, &b.geom)))
+        }
+        "st_overlaps" => {
+            let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            Value::Integer(i64::from(geo_overlaps(&a.geom, &b.geom)))
+        }
+        "st_equals" => {
+            let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            Value::Integer(i64::from(geo_equals(&a.geom, &b.geom)))
+        }
+        "st_isclosed" => match geo_arg(args, 0)? {
+            Some(g) => Value::Integer(i64::from(match &g.geom {
+                Geometry::LineString(v) => line_is_closed(v),
+                // rings are closed by construction
+                Geometry::Polygon(..) => true,
+                Geometry::Point(..) => false,
+            })),
+            None => Value::Null,
+        },
+        "st_isring" => match geo_arg(args, 0)? {
+            Some(g) => match &g.geom {
+                Geometry::LineString(v) => {
+                    Value::Integer(i64::from(line_is_closed(v) && line_is_simple(v)))
+                }
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
         // ---- shapes ----
         "st_makeenvelope" => {
             let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) = (
@@ -1160,6 +1852,128 @@ pub fn call_geo_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
                     .into(),
                 )
             }
+            None => Value::Null,
+        },
+        // ---- transforms + constructors (PG-borrowed) ----
+        "st_translate" => {
+            let (Some(g), Some(dx), Some(dy)) =
+                (geo_arg(args, 0)?, real_arg(args, 1)?, real_arg(args, 2)?)
+            else {
+                return Ok(Some(Value::Null));
+            };
+            Value::Text(
+                render(&Geo {
+                    srid: g.srid,
+                    geom: map_geom_vertices(&g.geom, &|(x, y)| (x + dx, y + dy)),
+                })
+                .into(),
+            )
+        }
+        "st_scale" => {
+            // ST_Scale(g, sx, sy) about the origin; ST_Scale(g, sx, sy, ox, oy)
+            // about (ox, oy) — PG's origin-point form.
+            let (Some(g), Some(sx), Some(sy)) =
+                (geo_arg(args, 0)?, real_arg(args, 1)?, real_arg(args, 2)?)
+            else {
+                return Ok(Some(Value::Null));
+            };
+            let (ox, oy) = match (real_arg(args, 3)?, real_arg(args, 4)?) {
+                (Some(ox), Some(oy)) => (ox, oy),
+                _ => (0.0, 0.0),
+            };
+            Value::Text(
+                render(&Geo {
+                    srid: g.srid,
+                    geom: map_geom_vertices(&g.geom, &|(x, y)| {
+                        (ox + (x - ox) * sx, oy + (y - oy) * sy)
+                    }),
+                })
+                .into(),
+            )
+        }
+        "st_rotate" => {
+            // ST_Rotate(g, radians) about the origin; the 3/4-arg forms
+            // rotate about (x, y).
+            let (Some(g), Some(rad)) = (geo_arg(args, 0)?, real_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            let (ox, oy) = match (real_arg(args, 2)?, real_arg(args, 3)?) {
+                (Some(x), Some(y)) => (x, y),
+                _ => (0.0, 0.0),
+            };
+            let (c, s) = (rad.cos(), rad.sin());
+            Value::Text(
+                render(&Geo {
+                    srid: g.srid,
+                    geom: map_geom_vertices(&g.geom, &|(x, y)| {
+                        let dx = x - ox;
+                        let dy = y - oy;
+                        (ox + dx * c - dy * s, oy + dx * s + dy * c)
+                    }),
+                })
+                .into(),
+            )
+        }
+        "st_reverse" => match geo_arg(args, 0)? {
+            Some(g) => Value::Text(
+                render(&Geo {
+                    srid: g.srid,
+                    geom: reverse_geom(&g.geom),
+                })
+                .into(),
+            ),
+            None => Value::Null,
+        },
+        "st_makeline" => {
+            // ST_MakeLine(a, b): point×point, point×line, line×point,
+            // line×line (concatenated).
+            let (Some(a), Some(b)) = (geo_arg(args, 0)?, geo_arg(args, 1)?) else {
+                return Ok(Some(Value::Null));
+            };
+            let pts: Vec<Pt> = match (&a.geom, &b.geom) {
+                (Geometry::Point(x, y), Geometry::Point(x2, y2)) => {
+                    vec![(*x, *y), (*x2, *y2)]
+                }
+                (Geometry::Point(x, y), Geometry::LineString(v)) => {
+                    let mut out = vec![(*x, *y)];
+                    out.extend(v.iter().copied());
+                    out
+                }
+                (Geometry::LineString(v), Geometry::Point(x, y)) => {
+                    let mut out: Vec<Pt> = v.clone();
+                    out.push((*x, *y));
+                    out
+                }
+                (Geometry::LineString(u), Geometry::LineString(v)) => {
+                    let mut out: Vec<Pt> = u.clone();
+                    out.extend(v.iter().copied());
+                    out
+                }
+                _ => {
+                    return Err(Error::runtime(
+                        "ST_MakeLine only accepts points and linestrings",
+                    ))
+                }
+            };
+            if pts.len() < 2 {
+                return Err(Error::runtime("ST_MakeLine needs at least two points"));
+            }
+            Value::Text(
+                render(&Geo {
+                    srid: a.srid,
+                    geom: Geometry::LineString(pts),
+                })
+                .into(),
+            )
+        }
+        "st_convexhull" => match geo_arg(args, 0)? {
+            Some(g) => Value::Text(
+                render(&Geo {
+                    srid: g.srid,
+                    geom: convex_hull(&g.geom),
+                })
+                .into(),
+            ),
             None => Value::Null,
         },
         _ => return Ok(None),
@@ -1234,6 +2048,7 @@ fn as_geojson(g: &Geometry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn pt(x: f64, y: f64) -> String {
         render(&Geo {
@@ -1531,5 +2346,620 @@ mod tests {
         });
         // nearest-first ordering
         assert!(pts.windows(2).all(|w| w[0].1 <= w[1].1));
+    }
+
+    // ===== topology predicates (touches/crosses/overlaps/equals) =====
+
+    fn pred(name: &str, a: &str, b: &str) -> Value {
+        call_geo_function(name, &[Value::Text(a.into()), Value::Text(b.into())])
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn topology_touches() {
+        // point on polygon edge: touches
+        assert_eq!(
+            pred(
+                "st_touches",
+                "POINT(1 0)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(1)
+        );
+        // point strictly inside: no
+        assert_eq!(
+            pred(
+                "st_touches",
+                "POINT(1 1)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(0)
+        );
+        // point outside: no
+        assert_eq!(
+            pred(
+                "st_touches",
+                "POINT(5 5)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(0)
+        );
+        // adjacent polygons sharing an edge
+        assert_eq!(
+            pred(
+                "st_touches",
+                "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+                "POLYGON((1 0, 2 0, 2 1, 1 1, 1 0))"
+            ),
+            Value::Integer(1)
+        );
+        // overlapping polygons: no
+        assert_eq!(
+            pred(
+                "st_touches",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON((1 0, 3 0, 3 2, 1 2, 1 0))"
+            ),
+            Value::Integer(0)
+        );
+        // line ending ON another line (T junction): touches
+        assert_eq!(
+            pred("st_touches", "LINESTRING(0 0, 2 0)", "LINESTRING(1 0, 1 3)"),
+            Value::Integer(1)
+        );
+        // lines properly crossing: no (that's crosses)
+        assert_eq!(
+            pred("st_touches", "LINESTRING(0 0, 2 2)", "LINESTRING(0 2, 2 0)"),
+            Value::Integer(0)
+        );
+        // identical points: no (empty boundary)
+        assert_eq!(
+            pred("st_touches", "POINT(1 1)", "POINT(1 1)"),
+            Value::Integer(0)
+        );
+        // point at a line's endpoint: touches
+        assert_eq!(
+            pred("st_touches", "POINT(0 0)", "LINESTRING(0 0, 1 1)"),
+            Value::Integer(1)
+        );
+        // point in a line's interior: no
+        assert_eq!(
+            pred("st_touches", "POINT(0.5 0.5)", "LINESTRING(0 0, 1 1)"),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn topology_crosses() {
+        // X crossing
+        assert_eq!(
+            pred("st_crosses", "LINESTRING(0 0, 2 2)", "LINESTRING(0 2, 2 0)"),
+            Value::Integer(1)
+        );
+        // T junction: touches, not crosses
+        assert_eq!(
+            pred("st_crosses", "LINESTRING(0 0, 2 0)", "LINESTRING(1 0, 1 3)"),
+            Value::Integer(0)
+        );
+        // collinear overlap: overlaps, not crosses
+        assert_eq!(
+            pred("st_crosses", "LINESTRING(0 0, 2 0)", "LINESTRING(1 0, 3 0)"),
+            Value::Integer(0)
+        );
+        // line passing through a polygon
+        assert_eq!(
+            pred(
+                "st_crosses",
+                "LINESTRING(-1 1, 3 1)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(1)
+        );
+        // line fully inside a polygon: contains, not crosses
+        assert_eq!(
+            pred(
+                "st_crosses",
+                "LINESTRING(0.5 1, 1.5 1)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(0)
+        );
+        // line merely touching the boundary from outside
+        assert_eq!(
+            pred(
+                "st_crosses",
+                "LINESTRING(1 -1, 1 0)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(0)
+        );
+        // points never cross
+        assert_eq!(
+            pred("st_crosses", "POINT(1 1)", "LINESTRING(0 0, 2 2)"),
+            Value::Integer(0)
+        );
+        // polygons never cross (they overlap)
+        assert_eq!(
+            pred(
+                "st_crosses",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON((1 0, 3 0, 3 2, 1 2, 1 0))"
+            ),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn topology_overlaps() {
+        // partial polygon overlap
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON((1 0, 3 0, 3 2, 1 2, 1 0))"
+            ),
+            Value::Integer(1)
+        );
+        // containment: no overlap
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))",
+                "POLYGON((1 1, 2 1, 2 2, 1 2, 1 1))"
+            ),
+            Value::Integer(0)
+        );
+        // identical polygons: equals, not overlaps
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON((2 2, 0 2, 0 0, 2 0, 2 2))"
+            ),
+            Value::Integer(0)
+        );
+        // disjoint: no
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+                "POLYGON((2 2, 3 2, 3 3, 2 3, 2 2))"
+            ),
+            Value::Integer(0)
+        );
+        // collinear partial line overlap
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "LINESTRING(0 0, 2 0)",
+                "LINESTRING(1 0, 3 0)"
+            ),
+            Value::Integer(1)
+        );
+        // one line contained in the other
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "LINESTRING(0 0, 4 0)",
+                "LINESTRING(1 0, 2 0)"
+            ),
+            Value::Integer(0)
+        );
+        // mixed dimensions never overlap
+        assert_eq!(
+            pred(
+                "st_overlaps",
+                "POINT(1 1)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn topology_equals() {
+        // identical points
+        assert_eq!(
+            pred("st_equals", "POINT(1 2)", "POINT(1 2)"),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            pred("st_equals", "POINT(1 2)", "POINT(1 3)"),
+            Value::Integer(0)
+        );
+        // same line, reversed direction
+        assert_eq!(
+            pred(
+                "st_equals",
+                "LINESTRING(0 0, 1 1, 2 2)",
+                "LINESTRING(2 2, 1 1, 0 0)"
+            ),
+            Value::Integer(1)
+        );
+        // different vertex sets
+        assert_eq!(
+            pred(
+                "st_equals",
+                "LINESTRING(0 0, 2 2)",
+                "LINESTRING(0 0, 1 1, 2 2)"
+            ),
+            Value::Integer(0)
+        );
+        // polygon with the same ring, different start vertex + direction
+        assert_eq!(
+            pred(
+                "st_equals",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON((2 2, 0 2, 0 0, 2 0, 2 2))"
+            ),
+            Value::Integer(1)
+        );
+        // same polygon with hole, both rings reversed + rotated
+        assert_eq!(
+            pred(
+                "st_equals",
+                "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))",
+                "POLYGON((4 4, 0 4, 0 0, 4 0, 4 4), (2 1, 1 1, 1 2, 2 2, 2 1))"
+            ),
+            Value::Integer(1)
+        );
+        // different hole
+        assert_eq!(
+            pred(
+                "st_equals",
+                "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))",
+                "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (3 3, 3.5 3, 3.5 3.5, 3 3.5, 3 3))"
+            ),
+            Value::Integer(0)
+        );
+        // mixed kinds
+        assert_eq!(
+            pred("st_equals", "POINT(1 1)", "LINESTRING(0 0, 1 1)"),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn topology_disjoint() {
+        assert_eq!(
+            pred(
+                "st_disjoint",
+                "POINT(5 5)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            pred(
+                "st_disjoint",
+                "POINT(1 1)",
+                "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+            ),
+            Value::Integer(0)
+        );
+        // NULL propagation
+        assert_eq!(
+            call_geo_function(
+                "st_disjoint",
+                &[Value::Null, Value::Text("POINT(1 1)".into())]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Null
+        );
+    }
+
+    // ===== closure / simplicity =====
+
+    #[test]
+    fn closure_and_ring() {
+        let open = "LINESTRING(0 0, 1 0, 1 1)";
+        let ring = "LINESTRING(0 0, 1 0, 1 1, 0 0)";
+        let bowtie = "LINESTRING(0 0, 2 2, 2 0, 0 2, 0 0)";
+        let backtrack = "LINESTRING(0 0, 1 0, 0 0)";
+        let subdivided = "LINESTRING(0 0, 1 1, 2 2)";
+        let fold = "LINESTRING(0 0, 2 2, 1 1)";
+        for (name, wkt, want_closed, want_ring) in [
+            ("open", open, false, false),
+            ("ring", ring, true, true),
+            ("bowtie", bowtie, true, false),
+            ("backtrack", backtrack, true, false),
+            ("subdivided", subdivided, false, false), // simple but not closed → not a ring
+            ("fold", fold, false, false),
+        ] {
+            let v = call_geo_function("st_isclosed", &[Value::Text(wkt.into())])
+                .unwrap()
+                .unwrap();
+            assert_eq!(v, Value::Integer(i64::from(want_closed)), "{name} closed");
+            let r = call_geo_function("st_isring", &[Value::Text(wkt.into())])
+                .unwrap()
+                .unwrap();
+            assert_eq!(r, Value::Integer(i64::from(want_ring)), "{name} ring");
+        }
+        // polygons are closed; isring is NULL for non-lines
+        assert_eq!(
+            call_geo_function(
+                "st_isclosed",
+                &[Value::Text("POLYGON((0 0, 1 0, 1 1, 0 0))".into())]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            call_geo_function("st_isring", &[Value::Text("POINT(0 0)".into())])
+                .unwrap()
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    // ===== accessors =====
+
+    #[test]
+    fn line_and_ring_accessors() {
+        let ls = "LINESTRING(0 0, 1 1, 2 2, 3 3)";
+        assert_eq!(
+            call_geo_function("st_startpoint", &[Value::Text(ls.into())])
+                .unwrap()
+                .unwrap(),
+            Value::Text("POINT(0 0)".into())
+        );
+        assert_eq!(
+            call_geo_function("st_endpoint", &[Value::Text(ls.into())])
+                .unwrap()
+                .unwrap(),
+            Value::Text("POINT(3 3)".into())
+        );
+        assert_eq!(
+            call_geo_function("st_pointn", &[Value::Text(ls.into()), Value::Integer(2)])
+                .unwrap()
+                .unwrap(),
+            Value::Text("POINT(1 1)".into())
+        );
+        // negative counts backwards
+        assert_eq!(
+            call_geo_function("st_pointn", &[Value::Text(ls.into()), Value::Integer(-1)])
+                .unwrap()
+                .unwrap(),
+            Value::Text("POINT(3 3)".into())
+        );
+        // out of range → NULL
+        assert_eq!(
+            call_geo_function("st_pointn", &[Value::Text(ls.into()), Value::Integer(9)])
+                .unwrap()
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            call_geo_function("st_numpoints", &[Value::Text(ls.into())])
+                .unwrap()
+                .unwrap(),
+            Value::Integer(4)
+        );
+        // non-linestring → NULL for these
+        assert_eq!(
+            call_geo_function("st_numpoints", &[Value::Text("POINT(0 0)".into())])
+                .unwrap()
+                .unwrap(),
+            Value::Null
+        );
+        // polygon rings
+        let poly = "POLYGON((0 0, 4 0, 4 4, 0 0), (1 1, 2 1, 2 2, 1 1))";
+        assert_eq!(
+            call_geo_function("st_numinteriorrings", &[Value::Text(poly.into())])
+                .unwrap()
+                .unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            call_geo_function("st_exteriorring", &[Value::Text(poly.into())])
+                .unwrap()
+                .unwrap(),
+            Value::Text("LINESTRING(0 0, 4 0, 4 4, 0 0)".into())
+        );
+        assert_eq!(
+            call_geo_function(
+                "st_interiorringn",
+                &[Value::Text(poly.into()), Value::Integer(1)]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("LINESTRING(1 1, 2 1, 2 2, 1 1)".into())
+        );
+        // no hole 2 → NULL
+        assert_eq!(
+            call_geo_function(
+                "st_interiorringn",
+                &[Value::Text(poly.into()), Value::Integer(2)]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Null
+        );
+        // non-polygon → NULL
+        assert_eq!(
+            call_geo_function("st_exteriorring", &[Value::Text(ls.into())])
+                .unwrap()
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    // ===== transforms + constructors =====
+
+    #[test]
+    fn affine_transforms() {
+        assert_eq!(
+            call_geo_function(
+                "st_translate",
+                &[
+                    Value::Text("POINT(1 2)".into()),
+                    Value::Real(10.0),
+                    Value::Real(-1.0)
+                ]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("POINT(11 1)".into())
+        );
+        assert_eq!(
+            call_geo_function(
+                "st_scale",
+                &[
+                    Value::Text("LINESTRING(1 1, 3 5)".into()),
+                    Value::Real(2.0),
+                    Value::Real(0.5)
+                ]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("LINESTRING(2 0.5, 6 2.5)".into())
+        );
+        // scale about a custom origin
+        assert_eq!(
+            call_geo_function(
+                "st_scale",
+                &[
+                    Value::Text("POINT(2 2)".into()),
+                    Value::Real(2.0),
+                    Value::Real(2.0),
+                    Value::Real(1.0),
+                    Value::Real(1.0)
+                ]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("POINT(3 3)".into())
+        );
+        // rotate 90° CCW about the origin: (1, 0) → (0, 1)
+        let r = call_geo_function(
+            "st_rotate",
+            &[
+                Value::Text("POINT(1 0)".into()),
+                Value::Real(std::f64::consts::FRAC_PI_2),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        match r {
+            Value::Text(t) => {
+                let p = parse_geometry(&t).unwrap();
+                match p.geom {
+                    Geometry::Point(x, y) => {
+                        assert!((x - 0.0).abs() < 1e-12, "x {x}");
+                        assert!((y - 1.0).abs() < 1e-12, "y {y}");
+                    }
+                    other => panic!("expected point, got {other:?}"),
+                }
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        // reverse
+        assert_eq!(
+            call_geo_function(
+                "st_reverse",
+                &[Value::Text("LINESTRING(0 0, 1 1, 2 2)".into())]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("LINESTRING(2 2, 1 1, 0 0)".into())
+        );
+        // SRID preserved through transforms
+        assert_eq!(
+            call_geo_function(
+                "st_translate",
+                &[
+                    Value::Text("SRID=4326;POINT(1 1)".into()),
+                    Value::Real(1.0),
+                    Value::Real(1.0)
+                ]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("SRID=4326;POINT(2 2)".into())
+        );
+    }
+
+    #[test]
+    fn make_line_and_hull() {
+        // point × point
+        assert_eq!(
+            call_geo_function(
+                "st_makeline",
+                &[
+                    Value::Text("POINT(0 0)".into()),
+                    Value::Text("POINT(1 1)".into())
+                ]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("LINESTRING(0 0, 1 1)".into())
+        );
+        // line × line concatenation
+        assert_eq!(
+            call_geo_function(
+                "st_makeline",
+                &[
+                    Value::Text("LINESTRING(0 0, 1 1)".into()),
+                    Value::Text("LINESTRING(2 2, 3 3)".into())
+                ]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("LINESTRING(0 0, 1 1, 2 2, 3 3)".into())
+        );
+        // polygons rejected
+        assert!(call_geo_function(
+            "st_makeline",
+            &[
+                Value::Text("POINT(0 0)".into()),
+                Value::Text("POLYGON((0 0, 1 0, 1 1, 0 0))".into())
+            ]
+        )
+        .is_err());
+
+        // convex hull of a square's vertices + interior + edge points
+        let cloud = "LINESTRING(0 0, 1 0.5, 2 0, 2 2, 0.5 1, 0 2)";
+        let hull = call_geo_function("st_convexhull", &[Value::Text(cloud.into())])
+            .unwrap()
+            .unwrap();
+        match hull {
+            Value::Text(t) => {
+                let h = parse_geometry(&t).unwrap();
+                match h.geom {
+                    Geometry::Polygon(rings) => {
+                        let got: BTreeSet<(i64, i64)> = rings[0]
+                            .iter()
+                            .map(|(x, y)| (*x as i64, *y as i64))
+                            .collect();
+                        let want: BTreeSet<(i64, i64)> =
+                            [(0, 0), (2, 0), (2, 2), (0, 2)].into_iter().collect();
+                        assert_eq!(got, want);
+                        assert_eq!(rings[0].len(), 5); // closed ring
+                    }
+                    other => panic!("expected polygon hull, got {other:?}"),
+                }
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        // collinear cloud → LINESTRING of the extremes
+        assert_eq!(
+            call_geo_function(
+                "st_convexhull",
+                &[Value::Text("LINESTRING(0 0, 1 1, 2 2, 3 3)".into())]
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Text("LINESTRING(0 0, 3 3)".into())
+        );
+        // single point
+        assert_eq!(
+            call_geo_function("st_convexhull", &[Value::Text("POINT(5 5)".into())])
+                .unwrap()
+                .unwrap(),
+            Value::Text("POINT(5 5)".into())
+        );
     }
 }

@@ -363,3 +363,380 @@ fn null_handling() {
     // unknown ST_ function still errors as "no such function"
     assert!(d.query("SELECT ST_NoSuchFunction(1)", []).is_err());
 }
+
+// ============================================================================
+// Second-tier PostGIS surface: OGC topology predicates, accessors,
+// affine transforms, ST_MakeLine, ST_ConvexHull.
+// ============================================================================
+
+fn pred(db: &Database, name: &str, a: &str, b: &str) -> i64 {
+    int(
+        db,
+        &format!("SELECT {name}(ST_GeomFromText('{a}'), ST_GeomFromText('{b}'))"),
+    )
+}
+
+#[test]
+fn topology_predicates_sql() {
+    let d = db();
+    // touches: point on edge, T-junction lines, adjacent polygons
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Touches",
+            "POINT(1 0)",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Touches",
+            "POINT(1 1)",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+        ),
+        0
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Touches",
+            "LINESTRING(0 0, 2 0)",
+            "LINESTRING(1 0, 1 3)"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Touches",
+            "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+            "POLYGON((1 0, 2 0, 2 1, 1 1, 1 0))"
+        ),
+        1
+    );
+    // crosses: X lines, line through polygon
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Crosses",
+            "LINESTRING(0 0, 2 2)",
+            "LINESTRING(0 2, 2 0)"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Crosses",
+            "LINESTRING(-1 1, 3 1)",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Crosses",
+            "LINESTRING(0 5, 3 5)",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+        ),
+        0
+    );
+    // overlaps: partial polygon + collinear line overlap
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Overlaps",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+            "POLYGON((1 0, 3 0, 3 2, 1 2, 1 0))"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Overlaps",
+            "LINESTRING(0 0, 2 0)",
+            "LINESTRING(1 0, 3 0)"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Overlaps",
+            "LINESTRING(0 0, 4 0)",
+            "LINESTRING(1 0, 2 0)"
+        ),
+        0
+    );
+    // equals: direction-insensitive lines, rotation/reversal-insensitive rings
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Equals",
+            "LINESTRING(0 0, 1 1, 2 2)",
+            "LINESTRING(2 2, 1 1, 0 0)"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Equals",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))",
+            "POLYGON((2 2, 0 2, 0 0, 2 0, 2 2))"
+        ),
+        1
+    );
+    assert_eq!(pred(&d, "ST_Equals", "POINT(1 2)", "POINT(1 3)"), 0);
+    // disjoint is the complement of intersects
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Disjoint",
+            "POINT(5 5)",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+        ),
+        1
+    );
+    assert_eq!(
+        pred(
+            &d,
+            "ST_Disjoint",
+            "POINT(1 1)",
+            "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+        ),
+        0
+    );
+    // NULL propagation through the predicate family
+    assert_eq!(
+        one(&d, "SELECT ST_Touches(NULL, ST_GeomFromText('POINT(0 0)'))"),
+        Value::Null
+    );
+}
+
+#[test]
+fn closure_simplicity_accessors_sql() {
+    let d = db();
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_IsClosed(ST_GeomFromText('LINESTRING(0 0, 1 1, 0 0)'))"
+        ),
+        1
+    );
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_IsClosed(ST_GeomFromText('LINESTRING(0 0, 1 1)'))"
+        ),
+        0
+    );
+    // a valid square ring: closed AND simple
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_IsRing(ST_GeomFromText('LINESTRING(0 0, 1 0, 1 1, 0 1, 0 0)'))"
+        ),
+        1
+    );
+    // bowtie: closed but not simple
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_IsRing(ST_GeomFromText('LINESTRING(0 0, 2 2, 2 0, 0 2, 0 0)'))"
+        ),
+        0
+    );
+    // backtrack: closed but not simple
+    assert_eq!(
+        int(
+            &d,
+            "SELECT ST_IsRing(ST_GeomFromText('LINESTRING(0 0, 1 0, 0 0)'))"
+        ),
+        0
+    );
+    // line accessors
+    let ls = "ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2, 3 3)')";
+    assert_eq!(
+        text(&d, &format!("SELECT ST_AsText(ST_StartPoint({ls}))")),
+        "POINT(0 0)"
+    );
+    assert_eq!(
+        text(&d, &format!("SELECT ST_AsText(ST_EndPoint({ls}))")),
+        "POINT(3 3)"
+    );
+    assert_eq!(
+        text(&d, &format!("SELECT ST_AsText(ST_PointN({ls}, 2))")),
+        "POINT(1 1)"
+    );
+    assert_eq!(
+        text(&d, &format!("SELECT ST_AsText(ST_PointN({ls}, -1))")),
+        "POINT(3 3)"
+    );
+    assert_eq!(int(&d, &format!("SELECT ST_NumPoints({ls})")), 4);
+    // type mismatch → NULL
+    assert_eq!(
+        one(&d, "SELECT ST_NumPoints(ST_GeomFromText('POINT(0 0)'))"),
+        Value::Null
+    );
+    assert_eq!(
+        one(&d, "SELECT ST_StartPoint(ST_GeomFromText('POINT(0 0)'))"),
+        Value::Null
+    );
+    // polygon ring accessors
+    let poly = "ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))')";
+    assert_eq!(int(&d, &format!("SELECT ST_NumInteriorRings({poly})")), 1);
+    assert_eq!(
+        text(&d, &format!("SELECT ST_AsText(ST_ExteriorRing({poly}))")),
+        "LINESTRING(0 0, 4 0, 4 4, 0 4, 0 0)"
+    );
+    assert_eq!(
+        text(
+            &d,
+            &format!("SELECT ST_AsText(ST_InteriorRingN({poly}, 1))")
+        ),
+        "LINESTRING(1 1, 2 1, 2 2, 1 2, 1 1)"
+    );
+    assert_eq!(
+        one(&d, &format!("SELECT ST_InteriorRingN({poly}, 2)")),
+        Value::Null
+    );
+}
+
+#[test]
+fn transforms_and_constructors_sql() {
+    let d = db();
+    // translate / scale / rotate / reverse
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_Translate(ST_GeomFromText('POINT(1 2)'), 10, -1))"
+        ),
+        "POINT(11 1)"
+    );
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_Scale(ST_GeomFromText('LINESTRING(1 1, 3 5)'), 2, 0.5))"
+        ),
+        "LINESTRING(2 0.5, 6 2.5)"
+    );
+    // rotate a point 90 degrees CCW about (1, 1): (2, 1) -> (1, 2)... wait
+    // (2,1) relative to (1,1) is (1,0); rotated 90° CCW -> (0,1) -> (1, 2)
+    let r = text(
+        &d,
+        "SELECT ST_AsText(ST_Rotate(ST_GeomFromText('POINT(2 1)'), 1.5707963267948966, 1, 1))",
+    );
+    let p = one(&d, &format!("SELECT ST_X(ST_GeomFromText('{r}'))")).as_real();
+    let q = one(&d, &format!("SELECT ST_Y(ST_GeomFromText('{r}'))")).as_real();
+    assert!((p - 1.0).abs() < 1e-9, "x {p}");
+    assert!((q - 2.0).abs() < 1e-9, "y {q}");
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_Reverse(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)')))"
+        ),
+        "LINESTRING(2 2, 1 1, 0 0)"
+    );
+    // SRID survives transforms
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_Translate(ST_GeomFromText('SRID=4326;POINT(1 1)'), 1, 1))"
+        ),
+        "SRID=4326;POINT(2 2)"
+    );
+    // ST_MakeLine: point-point and line-line
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_MakeLine(ST_GeomFromText('POINT(0 0)'), ST_GeomFromText('POINT(1 1)')))"
+        ),
+        "LINESTRING(0 0, 1 1)"
+    );
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_MakeLine(ST_GeomFromText('LINESTRING(0 0, 1 1)'), ST_GeomFromText('LINESTRING(2 2, 3 3)')))"
+        ),
+        "LINESTRING(0 0, 1 1, 2 2, 3 3)"
+    );
+    // ST_ConvexHull: square cloud → the corner square, closed ring
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_ConvexHull(ST_GeomFromText('LINESTRING(0 0, 1 0.5, 2 0, 2 2, 0.5 1, 0 2)')))"
+        ),
+        "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"
+    );
+    // collinear cloud → the extremes as a LINESTRING
+    assert_eq!(
+        text(
+            &d,
+            "SELECT ST_AsText(ST_ConvexHull(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2, 3 3)')))"
+        ),
+        "LINESTRING(0 0, 3 3)"
+    );
+}
+
+#[test]
+fn topology_over_table_workflow() {
+    // a realistic query combining predicates + transforms + the hull
+    let mut d = db();
+    d.execute("CREATE TABLE zones(id INTEGER PRIMARY KEY, geom TEXT)", [])
+        .unwrap();
+    d.execute(
+        "INSERT INTO zones VALUES \
+         (1, 'POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'), \
+         (2, 'POLYGON((5 5, 15 5, 15 15, 5 15, 5 5))'), \
+         (3, 'POLYGON((20 20, 25 20, 25 25, 20 25, 20 20))')",
+        [],
+    )
+    .unwrap();
+    // which zones does the (translated) road cross?
+    let rows = d
+        .query(
+            "SELECT id FROM zones \
+             WHERE ST_Crosses(ST_Translate(ST_GeomFromText('LINESTRING(-4 7, 13 7)'), 3, 0), geom) \
+             ORDER BY id",
+            [],
+        )
+        .unwrap();
+    // translated road: LINESTRING(-1 7, 16 7) passes through zones 1 and 2
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(2));
+    // which zones merely touch zone 3?
+    let rows = d
+        .query(
+            "SELECT a.id, b.id FROM zones a JOIN zones b ON ST_Touches(a.geom, b.geom) \
+             WHERE a.id < b.id",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 0); // zones 1 and 2 OVERLAP, none merely touch
+                               // overlapping pairs
+    let rows = d
+        .query(
+            "SELECT a.id, b.id FROM zones a JOIN zones b ON ST_Overlaps(a.geom, b.geom) \
+             WHERE a.id < b.id",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][1], Value::Integer(2));
+    // equality after canonicalization differences
+    let rows = d
+        .query(
+            "SELECT id FROM zones WHERE ST_Equals(geom, ST_GeomFromText('POLYGON((0 10, 0 0, 10 0, 10 10, 0 10))'))",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+}
