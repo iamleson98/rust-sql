@@ -644,3 +644,23 @@ Work Log:
 
 Stage Summary:
 - The geospatial surface now covers the PostGIS second tier: 21 new functions (47 ST_* total), real OGC interior/boundary predicate semantics, genuine simplicity analysis, and affine/hull constructors — all NULL-safe, SRID-preserving, and table-workflow tested.
+
+---
+Task ID: PDF-TTS-1
+Agent: main (Super Z)
+Task: pdf-tts migration prep — make the sqlx 0.8 + sea-orm 1.1 stack (pdf-tts's production versions) run correctly through the C ABI compat layer
+
+Work Log:
+- Built an interop probe replicating pdf-tts's exact patterns (SqlitePoolOptions + mode=rwc, the full startup PRAGMA battery incl. journal_mode=WAL, SqlxSqliteConnector, ActiveModel CRUD, raw sqlx queries + binds, tx rollback, unique-violation error surfacing, pragma_table_info / sqlite_master discovery, wal_checkpoint(TRUNCATE), close/reopen persistence). Found two engine bugs:
+- BUG 1 (correctness): the single-row OLTP UPDATE fast path (UPDATE t SET ... WHERE id = ?) applied the row but returned WITHOUT bumping ctx.changes — changes()/total_changes()/sqlite3_changes all reported 0 (sqlx: rows_affected()==0; sea-orm: RecordNotUpdated). INSERT/DELETE counted correctly; only UPDATE's single-row arm missed it. Fix: ctx.changes += 1 before the fast-path return in try_streaming_update (mirrors try_streaming_delete's established pattern). Verified with the engine probe: execute path INSERT=1/UPDATE=1/DELETE=1, statement path UPDATE delta=1.
+- BUG 2 (durability): the streaming-statement path (what the C ABI layer drives for EVERY prepared DML) bypassed Database::execute, so on SQLite-format (foreign) databases committed rows lived only in memory: the Drop checkpoint published the stale pre-DML image AND deleted the WAL sidecar — total data loss on close; crash lost everything since the last Once/DDL/COMMIT statement. Fix: Database::note_foreign_stmt_commit() (pub &self mirror of note_foreign_write) called from the statement DML epilogue — mark dirty + dump_foreign at autocommit boundaries, so every prepared DML commit appends real WAL frames. Verified: file stays SQLite magic, real SQLite (python3 sqlite3) reads the engine's WAL with integrity ok, engine reopen sees all rows, UPDATE persisted.
+- compat: new opt-in RUSTQLITE_SQLITE_FORMAT env knob — new files created through sqlite3_open_v2 land in SQLite's own disk format instead of the native RSQLDB04 container (fresh deployments of SQLite-ecosystem consumers stay readable by sqlite3 CLI / sea-orm-cli / python sqlite3 / backup agents). Existing files unaffected (format sniffed on open either way).
+- README: drop-in section gained the knob + the pdf-tts consumer note; also fixed a pre-existing doc bug (the [patch.crates-io] example pointed at compat/rustqlite-compat instead of compat/libsqlite3-sys).
+- tests/stmt_path_durability.rs (3 regression tests): UPDATE change accounting across all paths (statement fast path, execute, zero-row, multi-row range, DELETE guard); SQLite-format durability through prepare/step ONLY + Drop + engine reopen + real-SQLite verification; BEGIN/COMMIT statement-path durability.
+- Verification: fmt clean, clippy -D warnings clean (rustqlite + rustqlite-compat, all targets); targeted release suites all green: lib 263, compat_abi 55, durability 31, sqlite_interop 25, committed_view 46, savepoints 7, regression 11, error_parity 16, column_names 27, wal 10, update_from_collate 6, delete_spill 2, preupdate_differential 9, stmt_path_durability 3 (new). Full matrix runs in CI on push.
+- sqlx 0.8 + sea-orm 1.1.20 now passes the full pdf-tts-pattern probe end to end on the engine ("ALL PROBES PASSED"), including the PRAGMA battery and error-code parity (2067 UNIQUE constraint).
+
+Stage Summary:
+- The C ABI compat path is now production-usable for pdf-tts's EXACT dependency stack (no sqlx/sea-orm upgrade needed); the two blocking engine bugs are fixed with pinned regression tests.
+- RUSTQLITE_SQLITE_FORMAT=1 is the deployment knob for fresh-file SQLite-format creation; existing SQLite files always stay SQLite format (interop mode).
+- Next: pdf-tts repo — submodule, [patch.crates-io], engine link anchor, CI/Docker build recipe (build the compat cdylib first, then RUSTQLITE_LIB_DIR + LD_LIBRARY_PATH so sqlx_macros dlopens rustqlite's libsqlite3.so).

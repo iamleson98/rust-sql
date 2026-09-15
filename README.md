@@ -59,7 +59,9 @@ for row in &rows {
 > two ways to have every SQLite tool open your file:
 >
 > - **Create it in SQLite's format from the start** — `rustqlite-cli
->   --sqlite-format app.db` or `Database::open_sqlite_format("app.db")?`.
+>   --sqlite-format app.db` or `Database::open_sqlite_format("app.db")?`;
+>   through the libsqlite3 compat layer (sqlx / sea-orm consumers), set
+>   `RUSTQLITE_SQLITE_FORMAT=1` in the process environment.
 > - **Export any database at any time** — `VACUUM INTO 'share.db'` works from
 >   both containers (native included) and writes a genuine SQLite database:
 >   SQLite's own VACUUM INTO output shape, `PRAGMA integrity_check`-clean, with
@@ -1407,12 +1409,21 @@ let total: i64 = sqlx::query_scalar("SELECT SUM(x) FROM t").fetch_one(&pool).awa
 ```toml
 # your app's Cargo.toml
 [patch.crates-io]
-libsqlite3-sys = { path = "path/to/rust-sql/compat/rustqlite-compat" }
+libsqlite3-sys = { path = "path/to/rust-sql/compat/libsqlite3-sys" }
 ```
 
 Unmodified sqlx 0.9 and sea-orm 2.0 then run against rustqlite's `libsqlite3.so`
 (124 `sqlite3_*` symbols, SQLite-exact error messages and extended result codes).
-`sqlx-interop/` is the checked-in testbed that proves it.
+`sqlx-interop/` is the checked-in testbed that proves it; pdf-tts (this
+repo's production consumer) runs the same path on sqlx 0.8 + sea-orm 1.1.
+
+New files created through the C ABI default to the engine's native
+`RSQLDB04` container; set **`RUSTQLITE_SQLITE_FORMAT=1`** in the process
+environment to create them in SQLite's own disk format instead, so
+every real-SQLite tool (`sqlite3` CLI, sea-orm-cli, Python's `sqlite3`,
+backup agents) keeps reading what the process writes. Existing files are
+unaffected — their format is sniffed on open either way (a SQLite file
+stays a real SQLite database at all times).
 
 ### Plugins & streaming statements
 
