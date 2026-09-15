@@ -20,7 +20,16 @@ pub enum Statement {
     Rollback(RollbackStatement),
     Savepoint(String),
     Release(String),
-    Explain(Box<Statement>),
+    /// EXPLAIN [QUERY PLAN | ANALYZE] <statement>.
+    /// `analyze = false`: plan-only rendering (SQLite's EXPLAIN QUERY PLAN
+    /// shape: id/parent/notused/detail) — the inner statement is NEVER
+    /// executed. `analyze = true` (PostgreSQL's EXPLAIN ANALYZE): the
+    /// inner statement EXECUTES once with per-node instrumentation and
+    /// the output carries actual rows + elapsed time per plan node.
+    Explain {
+        inner: Box<Statement>,
+        analyze: bool,
+    },
     Pragma(PragmaStatement),
     Attach(AttachStatement),
     Detach(DetachStatement),

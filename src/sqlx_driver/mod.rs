@@ -359,7 +359,10 @@ enum Kind {
 
 fn classify(stmt: &Ast) -> Kind {
     match stmt {
-        Ast::Select(_) | Ast::Explain(_) => Kind::Rows,
+        // EXPLAIN (any flavor) — Rows-shaped: static QUERY PLAN renders
+        // plan rows; ANALYZE executes its inner SELECT with instrumentation
+        // (the analysis output replaces the result rows).
+        Ast::Select(_) | Ast::Explain { .. } => Kind::Rows,
         Ast::Pragma(p) => {
             if p.value.is_some() {
                 Kind::Once

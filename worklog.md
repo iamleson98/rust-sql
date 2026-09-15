@@ -558,3 +558,37 @@ Work Log:
 Stage Summary:
 - Local: sqlite_interop 25/25, feature_parity 62/62, durability 31/31, cli_ops 9/9, regression 27/27; clippy 0 warnings in all configs; fmt clean.
 - f3428a8 pushed and CI-verified: run 34805526558 COMPLETED SUCCESS — 22/22 jobs green (incl. sqlite file interop on all three OSes carrying the new export tests). Master green at f3428a8.
+
+---
+Task ID: IMPL-1
+Agent: main (Super Z)
+Task: PostgreSQL-borrowed Tier-1 core: full-text search (tsvector/tsquery + @@), geospatial (WKT + ST_* + <->), static typing (NUMERIC affinity, DECIMAL(p,s), pg_typeof, CAST extensions).
+
+Work Log:
+- Implemented src/executor/fts.rs (tsvector/tsquery parsing, english/simple configs with Snowball-derived stopwords + Porter-style stemmer, @@ operator, ts_rank, ts_headline, STRICT NULLs) and src/executor/geo.rs (WKT, 26 ST_* functions, haversine + Vincenty spheroid, KNN <-> operator).
+- Static typing: NUMERIC affinity (datatype3's final bucket), DECIMAL(p,s) rounding on every write path, pg_typeof, CAST AS NUMERIC bit-parity with SQLite, PG-borrowed CAST AS BOOLEAN.
+- Real bugs found en route: Vincenty used sin_sigma instead of sin_alpha (74.5 m error on Flinders Peak→Buninyong); ST_Length closed ring semantics; DECIMAL(p,s) spec was parsed away and never enforced; FTS NULL strictness; WKT .0 rendering.
+- Tests: tests/fts_search.rs (9), tests/geo_spatial.rs (9), tests/pg_types.rs (8). Full matrix green; clippy 0 warnings; fmt clean.
+
+Stage Summary:
+- Landed as a5255ff + fmt follow-up 4dbb222; CI run 34840666561 COMPLETED SUCCESS — 21/21 jobs green on all platforms.
+
+---
+Task ID: TIER0
+Agent: main (Super Z)
+Task: Tier-0 quick wins from the PostgreSQL gap-analysis roadmap: real REGEXP engine, EXPLAIN ANALYZE, constant folding, LIKE/GLOB-prefix index pushdown, covering index scans, pg_trgm functions.
+
+Work Log:
+- REGEXP: new src/executor/regex.rs — dependency-free POSIX ERE engine (recursive-descent parser, Thompson NFA compiler, Pike VM) with POSIX leftmost-longest semantics, captures, first-char prefilter, literal fast paths, thread-local compiled-pattern cache. Linear-time guarantee (no backtracking — (a+)+b cannot blow up). Surface: REGEXP/NOT REGEXP operator (was a LIKE-shaped fallback), SQLite-convention regexp(pattern, string), PG15 regexp_like/regexp_replace/regexp_substr/regexp_instr/regexp_count with flags (i/c/g), 1-based char positions, NULL-in-NULL-out. 15 unit tests + tests/regexp_engine.rs (14).
+- pg_trgm: src/executor/trgm.rs — similarity (Jaccard over pg_trgm trigram sets), word_similarity (windowed, cap 32), show_trgm (JSON array). 4 unit tests; ordering use case covered.
+- EXPLAIN ANALYZE: AST gained the analyze flag (Explain { inner, analyze }); the executor's execute() dispatcher records per-node AnalyzeStat (detail, depth, actual rows, inclusive wall time) when ctx.explain_stats is armed; api.rs explain_analyze_select executes the inner SELECT (CTEs materialized, subqueries substituted, params bound) and renders (id, depth, actual_rows, elapsed_ms, detail) + Total runtime. SELECT-only (documented divergence). Static EXPLAIN QUERY PLAN untouched. tests/explain_analyze.rs (6).
+- Constant folding: src/planner/fold.rs — full-literal folds through apply_binary (exact runtime semantics: 1/0 → NULL, overflow → real), boolean-root identity simplification (TRUE AND x → x — value contexts keep SQLite's 0/1/NULL since AND never returns the operand's own value), coalesce/ifnull pruning, Filter(TRUE) elimination. Never folds functions or raise-capable ->/->>/@@/<->. Hooked at the end of Planner::plan_select. 5 unit tests.
+- LIKE/GLOB-prefix pushdown in try_index_range: literal-prefix conjuncts derive [prefix, prefix_succ) ranges under soundness gates (TEXT affinity; letter prefixes need NOCASE for case-insensitive LIKE; GLOB case-sensitive → any collation is a superset; conjunct stays in the residual). Fixed a REAL pre-existing bug en route: same-direction multi-bound ranges (b > 'c' AND b > 'a') overwrote the tighter bound and consumed BOTH conjuncts — wrong rows; now bound slots are claimed once and later conjuncts ride the residual.
+- Covering scans: rowid-only projections over IndexLookup/IndexRange are answered from the index entries (the rowid IS the B+tree key — no table descent, no row decode); EXPLAIN reports SEARCH t USING COVERING INDEX i (SQLite wording). Rowid-only by design: order keys are type-lossy for values (Integer(5) == Real(5.0) encodings), so value projections still fetch. bare_column_projection now resolves the planner's hidden rowid-slot spellings (t.\0rowid) with the canonical "rowid" display name (the Task-22 NUL-leak contract preserved).
+- ENGINE BUG FIXED (found by the folding tests): apply_binary's AND/OR collapsed NULL operands to 0 — SELECT NULL AND 1 answered 0 instead of NULL, and NULL OR 0 answered 0 instead of NULL. Now proper three-valued logic (decisive FALSE short-circuits AND, decisive TRUE short-circuits OR, else NULL) — SQLite + PG truth tables.
+- Tests: tests/optimizer_tier0.rs (13) covering folding results + value-context non-identity, pushdown results + EXPLAIN shapes + all decline gates, covering results + EXPLAIN + non-covering mixed projections, the multi-bound regression, fold+pushdown composition.
+- Verification: 243 lib tests, 73/73 integration suites (crash_recovery + oom_fault re-verified standalone — 517 fault points now, one more than before: the new code added a fault-tested allocation site), compat 55/55 + 4 + 1, sqlx + no-default configs green, doc tests 5/5, fmt clean, clippy -D warnings clean in all 4 configs + compat crate.
+- README: new SQL-surface bullets (REGEXP engine, trigram, EXPLAIN ANALYZE, folding, LIKE-prefix, covering), planner paragraph updated, source layout entries, Testing table +3 rows, counts 1098 → 1155 (243 unit + 912 integration / 73 files), examples 179 → 180 (probe_covering).
+
+Stage Summary:
+- Six Tier-0 roadmap items delivered: REGEXP engine (real POSIX ERE, linear-time), EXPLAIN ANALYZE (per-node actual rows + time), constant folding, LIKE/GLOB-prefix pushdown, covering index scans, pg_trgm functions — plus two real engine bugs fixed along the way (3VL AND/OR, multi-bound range overwrite). 1155-test default matrix green end-to-end.

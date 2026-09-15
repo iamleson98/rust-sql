@@ -20,7 +20,9 @@ pub mod json;
 pub mod jsonb;
 pub(crate) mod parallel;
 pub(crate) mod predicate;
+pub mod regex;
 pub(crate) mod tableval;
+pub mod trgm;
 pub(crate) mod triggers;
 pub(crate) mod vtab_exec;
 
@@ -899,6 +901,14 @@ pub struct ExecContext<'a> {
     pub(crate) subquery_plans: HashMap<usize, SubqPlanEntry>,
     /// Current trigger-firing depth (guards runaway recursion).
     pub trigger_depth: u32,
+    /// EXPLAIN ANALYZE instrumentation: `Some` while the statement runs
+    /// under analysis — the executor's `execute()` dispatcher records one
+    /// entry per plan node it actually runs (detail, output row count,
+    /// inclusive wall time). `None` on every normal statement (zero cost).
+    pub(crate) explain_stats: Option<Vec<crate::executor::explain::AnalyzeStat>>,
+    /// Nesting depth of `execute()` dispatches while analyzing (for the
+    /// depth column of EXPLAIN ANALYZE rows).
+    pub(crate) explain_depth: usize,
     /// Trigger names currently executing (a stack). SQLite's
     /// `recursive_triggers = OFF` stops a trigger from firing ITSELF —
     /// directly or through a chain — but NOT different triggers chained
@@ -939,6 +949,8 @@ impl<'a> ExecContext<'a> {
             subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
+            explain_stats: None,
+            explain_depth: 0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -981,6 +993,8 @@ impl<'a> ExecContext<'a> {
             subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
+            explain_stats: None,
+            explain_depth: 0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1306,7 +1320,38 @@ pub mod change_counters {
     }
 }
 
+/// Plan dispatcher. When `ctx.explain_stats` is armed (EXPLAIN ANALYZE),
+/// every node dispatch is timed (inclusive of its subtree — PostgreSQL's
+/// "actual time" semantics) and its output row count recorded; the rows
+/// the statement produces are still returned to the caller as usual.
 pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
+    if ctx.explain_stats.is_some() {
+        let depth = ctx.explain_depth;
+        ctx.explain_depth = depth + 1;
+        let detail = crate::executor::explain::node_detail(plan);
+        let t0 = std::time::Instant::now();
+        let r = execute_inner(plan, ctx);
+        let elapsed = t0.elapsed();
+        ctx.explain_depth = depth;
+        let rows = r.as_ref().map(|x| x.rows.len()).unwrap_or(0);
+        // Take-replace avoids holding a &mut borrow across the recursive
+        // execute() calls that produced `r`.
+        if let Some(stats) = ctx.explain_stats.take() {
+            let mut stats = stats;
+            stats.push(crate::executor::explain::AnalyzeStat {
+                detail: detail.unwrap_or_default(),
+                depth,
+                rows,
+                secs: elapsed.as_secs_f64(),
+            });
+            ctx.explain_stats = Some(stats);
+        }
+        return r;
+    }
+    execute_inner(plan, ctx)
+}
+
+fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     match plan {
         Plan::Scan { table, alias, .. } => exec_scan(ctx, table.clone(), alias.clone()),
         Plan::Values { rows } => exec_values(ctx, rows),
@@ -14704,16 +14749,22 @@ pub(crate) fn bare_column_projection(
                             .unwrap_or_else(|| table.columns[idx].name.clone()),
                     );
                 } else if !table.without_rowid
-                    && (name.eq_ignore_ascii_case("rowid")
-                        || name.eq_ignore_ascii_case("_rowid_")
-                        || name.eq_ignore_ascii_case("oid"))
+                    && (crate::planner::is_rowid_spelling(name)
+                        || crate::planner::is_hidden_rowid(name))
                 {
                     // Rowid pseudo-column (SQLite): the B+tree cell key.
                     // Valid on every rowid table (WITH an INTEGER PRIMARY
                     // KEY alias too — rowid is the alias); the selective
                     // decoders fill the sentinel slot from the cell key.
+                    // The hidden-slot spellings ("\0rowid",
+                    // "t.\0rowid") are the planner's REWRITTEN forms of
+                    // bare rowid refs on no-alias tables — same sentinel.
                     idxs.push(crate::storage::row_codec::ROWID_PROJ);
-                    names.push(pe.alias.clone().unwrap_or_else(|| name.clone()));
+                    // Canonical display name: every spelling (rowid, oid,
+                    // _rowid_, the rewritten hidden slot) reports "rowid"
+                    // — the NUL-bearing slot name must NEVER leak into
+                    // output columns (C ABI CString rejection, sqlx).
+                    names.push(pe.alias.clone().unwrap_or_else(|| "rowid".to_string()));
                 } else {
                     return None;
                 }
@@ -14980,6 +15031,32 @@ fn exec_index_lookup_impl(
     let mut index_bt = Btree::new(ctx.pager, index_root, true);
     let mut rowids: Vec<i64> = Vec::new();
     index_bt.lookup_index_into(&key_bytes, &mut rowids)?;
+
+    // COVERING INDEX (SQLite's wording, PG's index-only scan idea): a
+    // projection that consists ONLY of rowid spellings is answerable
+    // from the INDEX alone — the rowid IS the index entry's B+tree key,
+    // so no table descent (and no row decode) is needed at all. The
+    // engine's order keys are type-lossy for VALUES (Integer(5) and
+    // Real(5.0) encode identically), which is exactly why only the
+    // rowid-only shape is sound to cover — projected VALUES must come
+    // from the table row.
+    if let Some(idxs) = project {
+        if !idxs.is_empty()
+            && idxs
+                .iter()
+                .all(|i| *i == crate::storage::row_codec::ROWID_PROJ)
+        {
+            let width = idxs.len();
+            let rows: Vec<Row> = rowids
+                .iter()
+                .map(|rid| vec![Value::Integer(*rid); width])
+                .collect();
+            return Ok(ExecResult {
+                columns: out_cols,
+                rows,
+            });
+        }
+    }
 
     // Fetch each row by rowid from the table B+tree. Use the
     // override-aware root: the catalog's Arc<Table> holds the root from
@@ -15452,6 +15529,31 @@ fn exec_index_range_projected(
             rowids.push(rowid);
             true
         })?;
+    }
+
+    // COVERING INDEX: a rowid-only projection with NO residual is
+    // answerable straight from the index entries — the rowid is the
+    // B+tree key. (With a residual the re-check needs real column values,
+    // so the table fetches stay.) The engine's order keys are type-lossy
+    // for VALUES, which is why only rowid-only shapes are covered.
+    if residual.is_none() {
+        if let Some(idxs) = project {
+            if !idxs.is_empty()
+                && idxs
+                    .iter()
+                    .all(|i| *i == crate::storage::row_codec::ROWID_PROJ)
+            {
+                let width = idxs.len();
+                let rows: Vec<Row> = rowids
+                    .iter()
+                    .map(|rid| vec![Value::Integer(*rid); width])
+                    .collect();
+                return Ok(ExecResult {
+                    columns: out_cols,
+                    rows,
+                });
+            }
+        }
     }
 
     let n_cols = table.n_columns();

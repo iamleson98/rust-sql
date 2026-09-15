@@ -5,6 +5,7 @@
 //! 2. **Plan shape**: SELECT → Project → (Filter → (Aggregate → (Sort → (Limit → Source))))
 //! 3. **Optimization**: index selection, predicate pushdown, join reordering.
 
+pub(crate) mod fold;
 pub mod namecheck;
 pub mod plan;
 
@@ -162,6 +163,14 @@ impl<'a> Planner<'a> {
                 None => {}
             }
         }
+
+        // Constant folding (PostgreSQL's eval_const_expressions, borrowed
+        // conservatively): literal arithmetic/comparison/logical folds,
+        // partial AND/OR simplification, coalesce pruning, and no-op
+        // Filter(TRUE) elimination — applied to the FINAL plan shape so
+        // pushed-down predicates and range bounds fold too. Idempotent
+        // and parameter-independent: safe on cached plans.
+        fold::fold_constants_in_plan(&mut plan);
 
         Ok(plan)
     }
@@ -2886,9 +2895,17 @@ fn try_index_range(
                 |s: &str| -> String { s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase() };
             // BETWEEN (collation must match the index column's — same
             // gate as equality: a NOCASE index can't bound a BINARY range
-            // and vice versa).
+            // and vice versa). Slot-occupation rule: BETWEEN claims BOTH
+            // bounds — when either is already claimed the conjunct stays
+            // in the residual (sound per-row re-check) instead of
+            // OVERWRITING the earlier bound. The overwrite used to
+            // consume BOTH conjuncts and answer `b > 'c' AND b > 'a'`
+            // with the looser [a, inf) range — no residual — wrong rows.
             if let Some((col, lo, hi)) = extract_between(conjunct) {
-                if bare_col(&col) == first_name && index_column_serves_conjunct(conjunct, first_col)
+                if bare_col(&col) == first_name
+                    && index_column_serves_conjunct(conjunct, first_col)
+                    && start.is_none()
+                    && end.is_none()
                 {
                     matched = true;
                     start = Some((lo, true));
@@ -2896,19 +2913,56 @@ fn try_index_range(
                     continue;
                 }
             }
-            // Range ops.
+            // Range ops. Same slot rule: a bound already claimed by an
+            // earlier conjunct means this one rides in the residual.
             if let Some((col, op, val)) = extract_range(conjunct) {
                 if bare_col(&col) == first_name && index_column_serves_conjunct(conjunct, first_col)
                 {
-                    matched = true;
-                    match op.as_str() {
-                        ">" => start = Some((val, false)),
-                        ">=" => start = Some((val, true)),
-                        "<" => end = Some((val, false)),
-                        "<=" => end = Some((val, true)),
-                        _ => {}
+                    let (slot, inclusive) = match op.as_str() {
+                        ">" => (&mut start, false),
+                        ">=" => (&mut start, true),
+                        "<" => (&mut end, false),
+                        "<=" => (&mut end, true),
+                        _ => (&mut start, false),
+                    };
+                    if slot.is_none() {
+                        matched = true;
+                        *slot = Some((val, inclusive));
+                        continue;
                     }
-                    continue;
+                }
+            }
+            // LIKE / GLOB prefix pushdown (SQLite's "LIKE optimization",
+            // PostgreSQL's btree-prefix idea): `col LIKE 'lit%'` derives
+            // an index range [lit, lit_succ) when it is SOUND —
+            // - the pattern is a string LITERAL whose only wildcard is a
+            //   trailing `%` (LIKE) / `*` (GLOB), or no wildcard at all;
+            // - the index column's table column has TEXT affinity (a
+            //   numeric value's LIKE text form doesn't order like its
+            //   numeric key — under-select);
+            // - for case-INSENSITIVE LIKE, ASCII letters in the prefix
+            //   require a NOCASE-collated index (folding covers the case
+            //   variants); a BINARY/RTRIM index only accepts letter-free
+            //   prefixes. GLOB is case-sensitive, so any collation is a
+            //   sound SUPERSET (the residual re-filters).
+            // The LIKE/GLOB conjunct ALWAYS stays in the residual — the
+            // range is a pure accelerator, never the match definition.
+            if start.is_none() && end.is_none() {
+                if let Some((col, prefix, exact, glob)) = extract_like_prefix(conjunct) {
+                    if bare_col(&col) == first_name
+                        && like_prefix_is_sound(table, first_col, &prefix, glob)
+                    {
+                        matched = true;
+                        start = Some((Expr::Literal(Value::Text(prefix.clone().into())), true));
+                        if exact {
+                            end = Some((Expr::Literal(Value::Text(prefix.into())), true));
+                        } else {
+                            end = prefix_successor(&prefix)
+                                .map(|s| (Expr::Literal(Value::Text(s.into())), false));
+                        }
+                        // no `continue`: the conjunct falls through to the
+                        // residual list below by design.
+                    }
                 }
             }
             residual.push(conjunct.clone());
@@ -2981,6 +3035,103 @@ fn extract_range(expr: &Expr) -> Option<(String, String, Expr)> {
         }
     }
     None
+}
+
+/// Extract a pushdown-able LIKE / GLOB prefix conjunct:
+/// `col LIKE 'lit%'`, `col GLOB 'lit*'`, or the wildcard-free exact forms
+/// `col LIKE 'lit'` / `col GLOB 'lit'`. Returns
+/// (column_name, prefix, is_exact, is_glob) — `None` for anything else
+/// (negated, ESCAPE clause, non-literal pattern, embedded wildcards,
+/// LIKE with a case-sensitive escape... conservative by design).
+///
+/// Only the TRAILING wildcard is allowed: an embedded `%` / `_` (LIKE) or
+/// `*` / `?` (GLOB) makes the prefix non-constant. LIKE additionally
+/// treats backslash as a plain character (no escape unless ESCAPE is
+/// given, and an ESCAPE clause disqualifies the conjunct here).
+fn extract_like_prefix(expr: &Expr) -> Option<(String, String, bool, bool)> {
+    let Expr::Like {
+        op,
+        expr,
+        pattern,
+        escape,
+        negated: false,
+    } = expr
+    else {
+        return None;
+    };
+    if escape.is_some() {
+        return None; // escaped metacharacters: the prefix isn't literal
+    }
+    let glob = matches!(op, LikeOp::Glob);
+    if !matches!(op, LikeOp::Like | LikeOp::Glob) {
+        return None;
+    }
+    let col = column_name_of(expr.as_ref())?;
+    let Expr::Literal(Value::Text(pat)) = pattern.as_ref() else {
+        return None;
+    };
+    let p = pat.as_str();
+    let (wc_any, wc_one) = if glob { ('*', '?') } else { ('%', '_') };
+    let body = if let Some(rest) = p.strip_suffix(wc_any) {
+        rest
+    } else {
+        p
+    };
+    let exact = !p.ends_with(wc_any);
+    if body.contains(wc_any) || body.contains(wc_one) {
+        return None;
+    }
+    // A GLOB/LIKE with no trailing wildcard is an exact-match form.
+    Some((col.to_string(), body.to_string(), exact, glob))
+}
+
+/// Soundness gate for the LIKE/GLOB prefix range (see try_index_range):
+/// TEXT affinity on the underlying table column + collation-aware case
+/// rules.
+fn like_prefix_is_sound(
+    table: &Arc<Table>,
+    index_first_col: &crate::schema::IndexColumn,
+    prefix: &str,
+    glob: bool,
+) -> bool {
+    // The indexed name must resolve to the table column (expression
+    // indexes can carry names that don't).
+    let Some(col_idx) = table.find_column(&index_first_col.name) else {
+        return false;
+    };
+    // TEXT affinity only: numeric values coerce to text for LIKE, but
+    // their NUMERIC index keys order differently than their text forms —
+    // the range would under-select (SQLite's own rule).
+    if table.columns[col_idx].affinity != crate::types::Affinity::Text {
+        return false;
+    }
+    if glob {
+        // GLOB is case-sensitive: every collation yields a superset range
+        // (the residual GLOB re-filters whatever the range lets through).
+        return true;
+    }
+    // LIKE (ASCII case-insensitive): ASCII letters in the prefix can match
+    // case variants, so the range only covers them when the index collation
+    // folds keys the same way (NOCASE). Letter-free prefixes are safe on
+    // any collation.
+    let has_ascii_letters = prefix.chars().any(|c| c.is_ascii_alphabetic());
+    if !has_ascii_letters {
+        return true;
+    }
+    index_first_col.collation.eq_ignore_ascii_case("NOCASE")
+}
+
+/// Smallest string strictly greater than every string starting with
+/// `prefix` (the classic b-tree upper bound for a prefix range). None
+/// when no such string exists (empty prefix, or the successor code point
+/// is not a valid char) — callers then leave the upper bound open, which
+/// is still a sound superset.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let next = char::from_u32(last as u32 + 1)?;
+    chars.push(next);
+    Some(chars.into_iter().collect())
 }
 
 /// Split a predicate that may be an AND-chain into its individual conjuncts.

@@ -63,12 +63,27 @@ impl Parser {
         let t = self.peek();
         if t.is_keyword("EXPLAIN") {
             self.advance();
+            // EXPLAIN QUERY PLAN — static plan rendering (SQLite shape).
+            let mut query_plan = false;
             if self.peek().is_keyword("QUERY") {
                 self.advance();
                 self.expect_keyword("PLAN")?;
+                query_plan = true;
+            }
+            // EXPLAIN ANALYZE — PostgreSQL: execute with instrumentation.
+            // (ANALYZE [table] as a standalone statement is parsed after
+            // EXPLAIN, so there is no ambiguity to resolve here.)
+            let analyze = !query_plan && self.peek().is_keyword("ANALYZE");
+            if analyze {
+                self.advance();
+                // Optional bare keyword that must not swallow the inner
+                // statement's first keyword: nothing to consume.
             }
             let inner = self.parse_statement()?;
-            return Ok(Statement::Explain(Box::new(inner)));
+            return Ok(Statement::Explain {
+                inner: Box::new(inner),
+                analyze,
+            });
         }
         if t.is_keyword("WITH") {
             // CTEs are part of SELECT/INSERT/UPDATE/DELETE

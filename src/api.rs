@@ -5549,9 +5549,14 @@ impl Database {
                 return Ok(pr.rows);
             }
         }
-        // EXPLAIN [QUERY PLAN]: plan the inner statement and render rows;
-        // never execute it.
-        if let Statement::Explain(inner) = cached.stmt.as_ref() {
+        // EXPLAIN [QUERY PLAN | ANALYZE]: ANALYZE executes the inner SELECT
+        // with instrumentation; QUERY PLAN / plain EXPLAIN plan the inner
+        // statement and render rows — never executes it.
+        if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
+            if *analyze {
+                let (_cols, rows) = self.explain_analyze_select(inner, params)?;
+                return Ok(rows);
+            }
             let plan = self.explain_plan_for_statement(inner)?;
             return Ok(match plan {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),
@@ -5766,7 +5771,10 @@ impl Database {
                 return Ok((pr.columns, pr.rows));
             }
         }
-        if let Statement::Explain(inner) = cached.stmt.as_ref() {
+        if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
+            if *analyze {
+                return self.explain_analyze_select(inner, params);
+            }
             let plan = self.explain_plan_for_statement(inner)?;
             let rows = match plan {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),
@@ -7187,6 +7195,84 @@ impl Database {
         Self::plan_for_statement(&self.catalog, inner)
     }
 
+    /// EXPLAIN ANALYZE (PostgreSQL): execute the inner SELECT once with
+    /// per-node instrumentation and render (id, depth, actual_rows,
+    /// elapsed_ms, detail) rows plus a total-runtime row. The statement's
+    /// own result rows are discarded — ANALYZE output replaces them.
+    ///
+    /// SELECT only (read-only): PG executes DML under ANALYZE too, but the
+    /// engine's query path here is a reader context — instrumenting DML
+    /// through it would need the full write epilogue; that stays a
+    /// documented divergence.
+    fn explain_analyze_select<P: Params>(
+        &self,
+        inner: &Statement,
+        params: P,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let sel = match inner {
+            Statement::Select(sel) => sel,
+            _ => {
+                return Err(Error::semantic(
+                    "EXPLAIN ANALYZE supports SELECT statements (DML analysis is not implemented)"
+                        .to_string(),
+                ));
+            }
+        };
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = if in_txn {
+            self.txn_snapshot.lock().clone()
+        } else {
+            None
+        };
+        let shared = self.read_maps();
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        ctx.txn_snapshot = txn_snap;
+        for v in params.into_iter() {
+            ctx.bind_positional(v);
+        }
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        let t0 = std::time::Instant::now();
+        // CTEs first (same order as the normal WITH path) — materialization
+        // time lands in the total, not in any plan node.
+        let plan = if let Some(with) = &sel.with {
+            let cte_map = self.materialize_ctes(with, &HashMap::new(), &mut ctx)?;
+            let mut planner = Planner::new(&self.catalog);
+            planner.set_ctes(cte_map);
+            planner.plan_select(sel)?
+        } else {
+            let mut planner = Planner::new(&self.catalog);
+            planner.plan_select(sel)?
+        };
+        // Substitute uncorrelated subqueries (same contract as the cached
+        // plan path) so ANALYZE reflects the executed shape.
+        let plan = if crate::executor::plan_has_subqueries(&plan) {
+            crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?
+        } else {
+            plan
+        };
+        // Arm instrumentation and execute; the produced rows are discarded.
+        ctx.explain_stats = Some(Vec::new());
+        let _ = crate::executor::execute(&plan, &mut ctx)?;
+        let total = t0.elapsed();
+        let stats = ctx.explain_stats.take().unwrap_or_default();
+        let rows = crate::executor::explain::explain_analyze_rows(&stats, total.as_secs_f64());
+        Ok((crate::executor::explain::explain_analyze_columns(), rows))
+    }
+
+    /// Public wrapper for the streaming statement API (statement.rs holds
+    /// its own positional parameter Vec).
+    pub(crate) fn explain_analyze_select_public(
+        &self,
+        inner: &Statement,
+        params: Vec<Value>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        self.explain_analyze_select(inner, params)
+    }
+
     pub(crate) fn plan_for_statement(
         catalog: &Catalog,
         stmt: &Statement,
@@ -8304,7 +8390,7 @@ impl Database {
             Statement::Vacuum(_) => Ok(()),
             Statement::Reindex { .. } => Ok(()),
             Statement::NoOp => Ok(()),
-            Statement::Explain(_) => Ok(()),
+            Statement::Explain { .. } => Ok(()),
             // Savepoint statements are intercepted in execute() (they need
             // &self for the bookkeeping-map snapshots); reaching this arm
             // means they were executed through a path without map access —

@@ -696,8 +696,19 @@ impl<'a> Statement<'a> {
             return Ok(());
         }
 
-        // EXPLAIN: plan rows, never execute.
-        if let AstStatement::Explain(inner) = self.stmt.as_ref() {
+        // EXPLAIN: QUERY PLAN renders static plan rows (never executes);
+        // ANALYZE executes the inner SELECT with instrumentation
+        // (PostgreSQL semantics — result rows are replaced by the
+        // analysis output).
+        if let AstStatement::Explain { inner, analyze } = self.stmt.as_ref() {
+            if *analyze {
+                let (cols, rows) = self
+                    .db
+                    .explain_analyze_select_public(inner, self.params.clone())?;
+                self.columns = Some(Arc::from(cols));
+                self.stream = StreamState::Materialized(rows.into_iter());
+                return Ok(());
+            }
             let plan = Database::plan_for_statement(&self.db.catalog, inner)?;
             let rows = match plan {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),

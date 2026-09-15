@@ -712,7 +712,9 @@ fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
     use rustqlite::sql::ast::Statement as S;
     match stmt {
         S::Select(_) => StmtKind::Select,
-        S::Explain(_) => StmtKind::Select,
+        // EXPLAIN ANALYZE executes its inner SELECT but still returns
+        // analysis rows — Select-shaped either way.
+        S::Explain { .. } => StmtKind::Select,
         S::Insert(i) => StmtKind::Dml {
             returning: i.returning.is_some(),
         },
@@ -936,7 +938,7 @@ fn set_conn_err(conn: &Conn, e: &rustqlite::Error) -> c_int {
 fn ast_mutates_database(stmt: &rustqlite::sql::ast::Statement) -> bool {
     use rustqlite::sql::ast::Statement as S;
     match stmt {
-        S::Select(_) | S::Explain(_) => false,
+        S::Select(_) | S::Explain { .. } => false,
         S::Begin(_) | S::Commit | S::Rollback(_) | S::Savepoint(_) | S::Release(_) => false,
         S::Pragma(p) => p.value.is_some() && !is_table_valued_read_pragma(&p.name),
         // INSERT / UPDATE / DELETE / CREATE / DROP / ALTER / ATTACH /

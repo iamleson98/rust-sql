@@ -538,10 +538,20 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             let result = match op {
                 LikeOp::Like => like_match(&v, &p, esc.as_ref(), false),
                 LikeOp::Glob => glob_match(&v, &p),
-                LikeOp::Regexp | LikeOp::Match => {
-                    // We don't ship a regex engine; fall back to LIKE semantics.
-                    like_match(&v, &p, esc.as_ref(), false)
+                // REGEXP: POSIX ERE via the engine's own NFA (regex.rs),
+                // leftmost-longest, linear-time. NULL handling is the
+                // shared 3VL block above. `x REGEXP y` puts the pattern on
+                // the RIGHT (SQLite's regexp(y, x) convention).
+                LikeOp::Regexp => {
+                    // Compile through the thread-local cache: WHERE clauses
+                    // evaluate this per row, and re-parsing per row is pure
+                    // waste.
+                    let re = crate::executor::regex::cached_compile(&p.as_text(), false)?;
+                    re.find(&v.as_text()).is_some()
                 }
+                // MATCH stays SQLite-compat: no core match() function
+                // exists (FTS5's hook); LIKE-shaped fallback.
+                LikeOp::Match => like_match(&v, &p, esc.as_ref(), false),
             };
             Ok(Value::Integer(if result ^ negated { 1 } else { 0 }))
         }
@@ -1615,9 +1625,20 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     Some(v) => v,
                     None => match crate::executor::geo::call_geo_function(&fname, args)? {
                         Some(v) => v,
-                        None => {
-                            return Err(Error::NotFound(format!("no such function: {}", name)));
-                        }
+                        None => match crate::executor::regex::call_regex_function(&fname, args)? {
+                            Some(v) => v,
+                            None => {
+                                match crate::executor::trgm::call_trgm_function(&fname, args)? {
+                                    Some(v) => v,
+                                    None => {
+                                        return Err(Error::NotFound(format!(
+                                            "no such function: {}",
+                                            name
+                                        )));
+                                    }
+                                }
+                            }
+                        },
                     },
                 },
             }
@@ -1681,6 +1702,8 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "jsonb_remove",
         "jsonb_replace",
         "jsonb_set",
+        "show_trgm",
+        "similarity",
         "soundex",
         "sqlite_compileoption_get",
         "sqlite_compileoption_used",
@@ -1710,6 +1733,12 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "random",
         "randomblob",
         "rank",
+        "regexp",
+        "regexp_count",
+        "regexp_instr",
+        "regexp_like",
+        "regexp_replace",
+        "regexp_substr",
         "replace",
         "round",
         "row_number",
@@ -1767,6 +1796,7 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "unixepoch",
         "upper",
         "websearch_to_tsquery",
+        "word_similarity",
         "zeroblob",
     ];
     let lowered = name.to_ascii_lowercase();
@@ -1963,8 +1993,33 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
                 )
             }
         }
-        And => Value::Integer(if l.is_truthy() && r.is_truthy() { 1 } else { 0 }),
-        Or => Value::Integer(if l.is_truthy() || r.is_truthy() { 1 } else { 0 }),
+        // SQL three-valued logic for AND / OR (SQLite AND PostgreSQL):
+        // NULL is UNKNOWN — a decisive FALSE short-circuits AND to 0, a
+        // decisive TRUE short-circuits OR to 1, and every remaining
+        // UNKNOWN combination yields NULL. Previously both operators
+        // collapsed NULL operands to 0 (`SELECT NULL AND 1` answered 0
+        // instead of NULL), diverging from SQLite's documented truth
+        // tables.
+        And => {
+            let l_false = !l.is_null() && !l.is_truthy();
+            let r_false = !r.is_null() && !r.is_truthy();
+            if l_false || r_false {
+                Value::Integer(0)
+            } else if l.is_truthy() && r.is_truthy() {
+                Value::Integer(1)
+            } else {
+                Value::Null
+            }
+        }
+        Or => {
+            if l.is_truthy() || r.is_truthy() {
+                Value::Integer(1)
+            } else if (!l.is_null() && !l.is_truthy()) && (!r.is_null() && !r.is_truthy()) {
+                Value::Integer(0)
+            } else {
+                Value::Null
+            }
+        }
     }
 }
 

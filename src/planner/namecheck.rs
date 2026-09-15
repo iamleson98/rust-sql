@@ -433,7 +433,7 @@ fn validate_stmt(ctx: &Ctx<'_>, stmt: &Statement, scope: &mut Scope) -> Result<(
         Statement::Create(c) => validate_create(ctx, c, scope),
         Statement::Drop(d) => validate_drop(ctx, d),
         Statement::Alter(a) => validate_alter(ctx, a),
-        Statement::Explain(inner) => validate_stmt(ctx, inner, scope),
+        Statement::Explain { inner, .. } => validate_stmt(ctx, inner, scope),
         Statement::Analyze { target } => {
             if let Some(name) = target {
                 // ANALYZE accepts a TABLE or INDEX name (an index target
