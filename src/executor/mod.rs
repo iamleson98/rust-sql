@@ -19962,6 +19962,15 @@ fn try_streaming_update(
                 if bt.root != root {
                     ctx.set_table_root(&table.name, bt.root);
                 }
+                // Change accounting: this row was applied through the
+                // fused single-row path, so it never entered `updates`
+                // (whose lengths feed `ctx.changes` at the tail) — bump
+                // here. Without this, `changes()` / `total_changes()` /
+                // `sqlite3_changes` all reported 0 for the OLTP
+                // workhorse `UPDATE t SET ... WHERE id = ?`, which
+                // sqlx surfaces as rows_affected() == 0 and sea-orm
+                // turns into `RecordNotUpdated`.
+                ctx.changes += 1;
                 return Ok(Some(ExecResult {
                     columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names)
                         .into(),
@@ -19972,7 +19981,8 @@ fn try_streaming_update(
                 // Row exists but was skipped (decode failure) — fall through
                 // to the general path for identical semantics.
             } else {
-                // Rowid absent: zero rows updated.
+                // Rowid absent: zero rows updated (ctx.changes stays 0 —
+                // the completion epilogue records it like SQLite does).
                 return Ok(Some(ExecResult {
                     columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names)
                         .into(),

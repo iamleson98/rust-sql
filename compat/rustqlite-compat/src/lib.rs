@@ -1250,6 +1250,24 @@ fn engine_file_key(p: &std::path::Path) -> String {
     canonical_parent.join(name).to_string_lossy().into_owned()
 }
 
+/// `RUSTQLITE_SQLITE_FORMAT` — opt-in: create NEW database files in
+/// SQLite's own disk format (instead of the engine's native `RSQLDB04`
+/// container). Existing files are untouched by this switch: their format
+/// is sniffed on open either way (a SQLite file stays a real SQLite
+/// database — the interop path; a native file stays native).
+///
+/// Consumers that live in a real-SQLite ecosystem (the `sqlite3` CLI,
+/// `sea-orm-cli` entity generation, Python's `sqlite3`, backup agents)
+/// reading what this process writes should set
+/// `RUSTQLITE_SQLITE_FORMAT=1` so fresh deployments produce files those
+/// tools can open. Accepted truthy values: any non-empty value other
+/// than `0` / `false` (case-insensitive).
+fn sqlite_format_for_new_files() -> bool {
+    std::env::var("RUSTQLITE_SQLITE_FORMAT")
+        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
 fn open_engine(target: &OpenTarget, create: bool, readonly: bool) -> Result<Database, String> {
     let db = match target {
         OpenTarget::PrivateMemory => Database::open_in_memory(),
@@ -1262,7 +1280,8 @@ fn open_engine(target: &OpenTarget, create: bool, readonly: bool) -> Result<Data
             }
         }
         OpenTarget::File(p) => {
-            if !p.as_os_str().is_empty() && !p.exists() {
+            let creating = !p.as_os_str().is_empty() && !p.exists();
+            if creating {
                 if !create {
                     return Err("unable to open database file".to_string());
                 }
@@ -1272,7 +1291,15 @@ fn open_engine(target: &OpenTarget, create: bool, readonly: bool) -> Result<Data
                     }
                 }
             }
-            Database::open(p.to_str().unwrap_or_default())
+            // Existing files keep their on-disk format (auto-sniffed).
+            // New files: native container by default, SQLite's own disk
+            // format when RUSTQLITE_SQLITE_FORMAT is set — see
+            // [`sqlite_format_for_new_files`].
+            if creating && sqlite_format_for_new_files() {
+                Database::open_sqlite_format(p.to_str().unwrap_or_default())
+            } else {
+                Database::open(p.to_str().unwrap_or_default())
+            }
         }
     };
     let db = db.map_err(|e| e.to_string())?;

@@ -2694,6 +2694,23 @@ impl Database {
         Ok(())
     }
 
+    /// [`note_foreign_write`] for the streaming-statement (prepare/step)
+    /// path: DML executed through `Statement` bypasses
+    /// `Database::execute` entirely, so the statement epilogue calls this
+    /// to keep the SQLite-format file durable — mark dirty, and when the
+    /// statement ran in autocommit mode, append the commit's frames to
+    /// the WAL sidecar (or full-write on the first commit) exactly like
+    /// the execute paths do. Without it, prepared DML commits live only
+    /// in memory and the Drop checkpoint publishes a stale image.
+    pub fn note_foreign_stmt_commit(&self) {
+        if let Some(f) = &self.foreign {
+            f.dirty.store(true, Ordering::Release);
+            if !self.in_transaction.load(Ordering::Acquire) {
+                let _ = self.dump_foreign();
+            }
+        }
+    }
+
     /// Rewrite the persistent file in SQLite's disk format when the
     /// in-memory state has committed writes. No-op when clean.
     ///

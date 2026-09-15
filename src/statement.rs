@@ -822,6 +822,18 @@ impl<'a> Statement<'a> {
                 {
                     self.db.pager.note_tx_autocommit();
                 }
+                // Foreign (SQLite-format) durability: `Database::execute`
+                // dumps at every autocommit boundary
+                // (`note_foreign_write`); the streaming-statement path —
+                // which is what the C ABI compat layer drives for every
+                // prepared DML — must do the same, or committed rows live
+                // only in memory: the Drop checkpoint would then write the
+                // stale pre-DML image AND delete the WAL sidecar (total
+                // data loss on close), and a crash would lose everything
+                // since the last Once/DDL/COMMIT statement. A WAL frame
+                // append per autocommit DML is exactly what SQLite itself
+                // does in this mode.
+                self.db.note_foreign_stmt_commit();
             } else if self.deltas.max_rowids_changed && !self.db.pager.committed_reads_armed() {
                 // Committed-view reads never merge (see query()).
                 self.merge_max_rowids();
