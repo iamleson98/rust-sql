@@ -76,6 +76,48 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
                 ),
             );
         }
+        Plan::InvertedIndexScan {
+            table,
+            alias,
+            index,
+            ..
+        } => {
+            let a = alias_of(alias, &table.name);
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INDEX {} (INVERTED tsquery=?)", index.name),
+            );
+        }
+        Plan::SpatialIndexScan {
+            table,
+            alias,
+            index,
+            ..
+        } => {
+            let a = alias_of(alias, &table.name);
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INDEX {} (SPATIAL box ~ ?>?)", index.name),
+            );
+        }
+        Plan::SpatialKnn {
+            table,
+            alias,
+            index,
+            ..
+        } => {
+            let a = alias_of(alias, &table.name);
+            push_row(
+                parent,
+                rows,
+                next_id,
+                format!("SEARCH {a} USING INDEX {} (KNN <-> ? LIMIT ?)", index.name),
+            );
+        }
         Plan::RowidIn {
             table,
             alias,
@@ -363,6 +405,42 @@ pub(crate) fn node_detail(plan: &Plan) -> Option<String> {
                 a,
                 index.name,
                 key_exprs.len()
+            ))
+        }
+        Plan::InvertedIndexScan {
+            table,
+            alias,
+            index,
+            ..
+        } => {
+            let a = alias_of(alias, &table.name);
+            Some(format!(
+                "SEARCH {a} USING INDEX {} (INVERTED tsquery=?)",
+                index.name
+            ))
+        }
+        Plan::SpatialIndexScan {
+            table,
+            alias,
+            index,
+            ..
+        } => {
+            let a = alias_of(alias, &table.name);
+            Some(format!(
+                "SEARCH {a} USING INDEX {} (SPATIAL box ~ ?>?)",
+                index.name
+            ))
+        }
+        Plan::SpatialKnn {
+            table,
+            alias,
+            index,
+            ..
+        } => {
+            let a = alias_of(alias, &table.name);
+            Some(format!(
+                "SEARCH {a} USING INDEX {} (KNN <-> ? LIMIT ?)",
+                index.name
             ))
         }
         Plan::RowidIn {

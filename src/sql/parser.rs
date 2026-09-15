@@ -918,6 +918,31 @@ impl Parser {
         let name = self.parse_ident()?;
         self.expect_keyword("ON")?;
         let table = self.parse_ident()?;
+        // PostgreSQL's `USING <method>` clause (borrowed):
+        //   CREATE INDEX ... ON t USING gin(to_tsvector('english', body))
+        //   CREATE INDEX ... ON t USING gist(geom [, 0.001])
+        // SQLite's plain form (no USING) is the ordinary btree.
+        let using = if self.peek().is_keyword("USING") {
+            self.advance();
+            let method = self.parse_ident()?;
+            match method.to_ascii_lowercase().as_str() {
+                "gin" => Some(crate::sql::ast::IndexMethod::Gin),
+                "gist" | "spatial" | "rtree" => Some(crate::sql::ast::IndexMethod::Gist),
+                "btree" => None,
+                other => {
+                    let t = self.peek();
+                    return Err(Error::parse(
+                        t.line,
+                        t.col,
+                        format!(
+                            "unknown index access method: {other} (expected gin, gist, or btree)"
+                        ),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         self.expect_punct('(')?;
         let columns = self.parse_indexed_columns()?;
         self.expect_punct(')')?;
@@ -935,6 +960,7 @@ impl Parser {
             table,
             columns,
             where_clause,
+            using,
         }))
     }
 

@@ -135,7 +135,7 @@ impl Geometry {
         }
     }
 
-    fn bbox(&self) -> (f64, f64, f64, f64) {
+    pub(crate) fn bbox(&self) -> (f64, f64, f64, f64) {
         // (xmin, ymin, xmax, ymax)
         let v = self.vertices();
         let mut xmin = f64::INFINITY;

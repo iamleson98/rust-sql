@@ -210,6 +210,109 @@ pub struct Index {
     /// storage; never dumped to the SQLite-format file, where the
     /// table b-tree IS the PK index, and never listed in sqlite_master).
     pub origin: IndexOrigin,
+    /// Access method (PostgreSQL's `USING` clause, borrowed):
+    /// `btree` (default) keys whole column values; `gin` stores one
+    /// (lexeme, rowid) entry PER TERM of the indexed tsvector
+    /// expression; `gist` (spatial) stores one (level, cell-x, cell-y,
+    /// rowid) entry per grid cell covered by the geometry's bounding
+    /// box. GIN/GIST indexes are NEVER unique.
+    pub kind: IndexKind,
+}
+
+/// The index access method family (see `Index::kind`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum IndexKind {
+    /// The ordinary B+tree over whole column/expression values.
+    #[default]
+    Btree,
+    /// PostgreSQL-GIN-style inverted index over a tsvector: the indexed
+    /// expression (or column) must evaluate to tsvector text; each
+    /// lexeme becomes one key with the row's rowid.
+    Inverted,
+    /// GiST-borrowed spatial grid over a geometry column: entries are
+    /// the grid cells covered by each geometry's bounding box, at a
+    /// per-geometry zoom level (coarsened for huge bboxes). The
+    /// resolution is the cell edge in coordinate units at level 0.
+    Spatial {
+        /// Cell edge length at level 0 (level j cells are
+        /// `resolution * 2^j`). Default 0.01 (≈1.1 km for lon/lat).
+        resolution: f64,
+    },
+}
+
+/// Derive the [`IndexKind`] from a parsed `CREATE INDEX` statement's
+/// `USING` clause + column list — shared by CREATE-time execution and
+/// the schema-load path (which re-parses the persisted `create_sql`).
+/// Validates the specialized kinds' shape; special AMs are never unique.
+pub fn index_kind_from_using(
+    using: Option<&crate::sql::ast::IndexMethod>,
+    columns: &[crate::sql::ast::IndexedColumn],
+    unique: bool,
+) -> Result<IndexKind> {
+    let method = match using {
+        None => return Ok(IndexKind::Btree),
+        Some(m) => m,
+    };
+    match method {
+        crate::sql::ast::IndexMethod::Gin => {
+            if unique {
+                return Err(crate::error::Error::semantic(
+                    "UNIQUE is not supported for gin indexes",
+                ));
+            }
+            if columns.len() != 1 {
+                return Err(crate::error::Error::semantic(
+                    "gin index takes exactly one indexed expression",
+                ));
+            }
+            // The key must be a tsvector-valued expression:
+            // `to_tsvector(...)` or a plain column holding tsvector text.
+            let is_tsvector_expr = columns[0].expr.as_ref().map_or(true, |e| {
+                matches!(&**e, crate::sql::ast::Expr::Function { ref name, .. }
+                    if name.eq_ignore_ascii_case("to_tsvector"))
+            });
+            if !is_tsvector_expr {
+                return Err(crate::error::Error::semantic(
+                    "gin index requires to_tsvector(...) or a tsvector column",
+                ));
+            }
+            Ok(IndexKind::Inverted)
+        }
+        crate::sql::ast::IndexMethod::Gist => {
+            if unique {
+                return Err(crate::error::Error::semantic(
+                    "UNIQUE is not supported for gist/spatial indexes",
+                ));
+            }
+            if columns.is_empty() || columns.len() > 2 {
+                return Err(crate::error::Error::semantic(
+                    "gist index takes a geometry column and an optional resolution",
+                ));
+            }
+            let resolution = if columns.len() == 2 {
+                match columns[1].expr.as_deref() {
+                    Some(crate::sql::ast::Expr::Literal(crate::types::Value::Real(r)))
+                        if *r > 0.0 && r.is_finite() =>
+                    {
+                        *r
+                    }
+                    Some(crate::sql::ast::Expr::Literal(crate::types::Value::Integer(i)))
+                        if *i > 0 =>
+                    {
+                        *i as f64
+                    }
+                    _ => {
+                        return Err(crate::error::Error::semantic(
+                            "gist resolution must be a positive number literal",
+                        ));
+                    }
+                }
+            } else {
+                0.01
+            };
+            Ok(IndexKind::Spatial { resolution })
+        }
+    }
 }
 
 /// Provenance of a catalog index.

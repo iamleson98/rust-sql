@@ -429,6 +429,34 @@ pub(crate) fn fold_constants_in_plan(plan: &mut Plan) {
             .chain(end.iter_mut().map(|(e, _)| e))
             .chain(residual.iter_mut())
             .collect(),
+        Plan::InvertedIndexScan {
+            tsquery_expr,
+            residual,
+            ..
+        } => residual
+            .iter_mut()
+            .chain(std::iter::once(tsquery_expr))
+            .collect(),
+        Plan::SpatialIndexScan {
+            point_expr,
+            radius_expr,
+            residual,
+            ..
+        } => residual
+            .iter_mut()
+            .chain(std::iter::once(point_expr))
+            .chain(std::iter::once(radius_expr))
+            .collect(),
+        Plan::SpatialKnn {
+            point_expr,
+            limit_expr,
+            residual,
+            ..
+        } => residual
+            .iter_mut()
+            .chain(std::iter::once(point_expr))
+            .chain(std::iter::once(limit_expr))
+            .collect(),
         Plan::Values { rows } => rows.iter_mut().flatten().collect(),
         Plan::Filter { input, .. } => {
             fold_constants_in_plan(input);

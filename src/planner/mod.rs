@@ -115,6 +115,18 @@ impl<'a> Planner<'a> {
             plan
         };
 
+        // SPATIAL KNN REWRITE (PostGIS's `ORDER BY geom <-> p LIMIT k`
+        // contract, borrowed): a single-table query whose Sort term is a
+        // constant-point `<->` distance with a small LIMIT becomes an
+        // expanding-window grid scan — O(nearest k) row fetches instead
+        // of a full scan + sort. The rewrite only fires on the exact
+        // `Limit(Sort(Project?(Filter?(Scan))))` chain it can honor;
+        // anything else keeps the general plan.
+        let mut plan = plan;
+        if let Some(knn) = try_rewrite_spatial_knn(self.catalog, &plan) {
+            plan = knn;
+        }
+
         // SINGLE-TABLE ROWID-IN-EXPRESSION REWRITE: `rowid`/`_rowid_`/`oid`
         // referenced INSIDE an expression (`SELECT rowid*2`, `max(rowid)`,
         // `WHERE rowid % 2 = 0`, `ORDER BY rowid % 3`) evaluates against
@@ -131,7 +143,6 @@ impl<'a> Planner<'a> {
         // joins/multi-table bodies are skipped entirely (bare rowid is
         // ambiguous there). No-alias tables keep the documented gap (the
         // rowid has no in-row value to rewrite to).
-        let mut plan = plan;
         if let SelectBody::Simple(s) = &stmt.body {
             match &s.from {
                 Some(TableExpression::Table {
@@ -2397,6 +2408,18 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 predicate: combine_and(&residual_conjuncts),
             };
         }
+        // GIN-style inverted index (PostgreSQL's `USING gin`, borrowed):
+        // `WHERE tsv @@ q` / `WHERE to_tsvector(x) @@ q`. The node keeps
+        // the FULL original predicate as its residual, so it only ever
+        // refines — never replaces — the @@ semantics.
+        if let Some(plan) = try_inverted_index(catalog, &conjuncts, table, alias) {
+            return plan;
+        }
+        // Spatial grid index (GiST-borrowed): `WHERE ST_DWithin(geom, p, r)`
+        // / `geom <-> p < r`. Same residual-retention contract.
+        if let Some(plan) = try_spatial_range(catalog, &conjuncts, table, alias) {
+            return plan;
+        }
         // Indexed-column IN-list: `WHERE indexed_col IN (v1, v2, ...)` —
         // one index seek per member instead of a full table scan.
         if let Some((in_plan, residual_conjuncts)) = try_index_in(catalog, &conjuncts, table, alias)
@@ -3132,6 +3155,365 @@ fn prefix_successor(prefix: &str) -> Option<String> {
     let next = char::from_u32(last as u32 + 1)?;
     chars.push(next);
     Some(chars.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Specialized index recognition (GIN inverted / GiST spatial)
+// ---------------------------------------------------------------------------
+
+/// Constant-shaped expression gate for specialized-index operands:
+/// literals, parameters, CAST/COLLATE wrappers, and CALLS TO AN
+/// ALLOWLISTED pure function family only. Anything that references a
+/// column, a subquery, or an unlisted (potentially volatile) function
+/// disqualifies the index — the node evaluates the expression ONCE per
+/// statement, which must agree with the residual's per-row view.
+fn expr_is_constant_shaped(e: &Expr, allowed_fns: &[&str]) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Function { name, args, .. } => {
+            allowed_fns.iter().any(|f| name.eq_ignore_ascii_case(f))
+                && args.iter().all(|a| expr_is_constant_shaped(a, allowed_fns))
+        }
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+            expr_is_constant_shaped(expr, allowed_fns)
+        }
+        _ => false,
+    }
+}
+
+/// Function names allowed in an inverted-index tsquery operand.
+const FTS_QUERY_FNS: &[&str] = &[
+    "to_tsquery",
+    "plainto_tsquery",
+    "phraseto_tsquery",
+    "websearch_to_tsquery",
+];
+
+/// Function names allowed in a spatial-index point operand.
+const GEO_POINT_FNS: &[&str] = &["st_point", "st_makepoint", "st_geomfromtext"];
+
+/// True when `lhs` is exactly what `index` keys: a bare reference to
+/// the index's column (plain-column index) or the identical expression
+/// (expression index; Debug-string equality, the same trick as
+/// `exprs_equal_conjunct`).
+fn index_serves_expr(index: &Arc<Index>, lhs: &Expr) -> bool {
+    let Some(col) = index.columns.first() else {
+        return false;
+    };
+    match &col.expr {
+        None => {
+            let inner = match lhs {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                other => other,
+            };
+            matches!(inner, Expr::Column { name, .. } if name.eq_ignore_ascii_case(&col.name))
+        }
+        Some(idx_expr) => format!("{:?}", idx_expr) == format!("{:?}", lhs),
+    }
+}
+
+/// Recognize `tsv @@ q` / `to_tsvector(x) @@ q` / `ts_match(v, q)`
+/// conjuncts served by a GIN inverted index on this table. The returned
+/// node carries the FULL original predicate as its residual — the `@@`
+/// conjunct included — so the inverted index only ever narrows the
+/// candidate set, never redefines the match semantics.
+fn try_inverted_index(
+    catalog: &Catalog,
+    conjuncts: &[Expr],
+    table: &Arc<Table>,
+    alias: &Option<String>,
+) -> Option<Plan> {
+    for conjunct in conjuncts {
+        let (lhs, rhs) = match conjunct {
+            Expr::Binary {
+                op: BinaryOp::FtsMatch,
+                left,
+                right,
+            } => ((**left).clone(), (**right).clone()),
+            Expr::Function { name, args, .. }
+                if name.eq_ignore_ascii_case("ts_match") && args.len() == 2 =>
+            {
+                (args[0].clone(), args[1].clone())
+            }
+            _ => continue,
+        };
+        // The query operand must be evaluable once per statement.
+        if !expr_is_constant_shaped(&rhs, FTS_QUERY_FNS) {
+            continue;
+        }
+        for index in catalog.indexes_on_table(&table.name) {
+            if !matches!(index.kind, crate::schema::IndexKind::Inverted) {
+                continue;
+            }
+            if index_serves_expr(&index, &lhs) {
+                return Some(Plan::InvertedIndexScan {
+                    table: table.clone(),
+                    alias: alias.clone(),
+                    index,
+                    tsquery_expr: rhs,
+                    residual: Some(combine_and(conjuncts)),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Recognize `ST_DWithin(geom, p, r)` and `geom <-> p < r` conjuncts
+/// served by a spatial grid index on this table. Same residual-retention
+/// contract as the inverted index.
+fn try_spatial_range(
+    catalog: &Catalog,
+    conjuncts: &[Expr],
+    table: &Arc<Table>,
+    alias: &Option<String>,
+) -> Option<Plan> {
+    for conjunct in conjuncts {
+        // (geometry operand, constant point, constant radius)
+        let triple: Option<(&Expr, &Expr, &Expr)> = match conjunct {
+            Expr::Function { name, args, .. }
+                if name.eq_ignore_ascii_case("st_dwithin") && args.len() == 3 =>
+            {
+                match (
+                    expr_is_constant_shaped(&args[0], GEO_POINT_FNS),
+                    expr_is_constant_shaped(&args[1], GEO_POINT_FNS),
+                ) {
+                    (false, true) => Some((&args[0], &args[1], &args[2])),
+                    (true, false) => Some((&args[1], &args[0], &args[2])),
+                    _ => None,
+                }
+            }
+            // `(geom <-> p) < r` and `r > (geom <-> p)` — the distance
+            // comparison form of ST_DWithin.
+            Expr::Binary {
+                op: BinaryOp::Lt | BinaryOp::LtEq,
+                left,
+                right,
+            } => match &**left {
+                Expr::Binary {
+                    op: BinaryOp::Distance,
+                    left: d,
+                    right: p,
+                } => {
+                    if expr_is_constant_shaped(p, GEO_POINT_FNS) {
+                        Some((d, p, right))
+                    } else if expr_is_constant_shaped(d, GEO_POINT_FNS) {
+                        Some((p, d, right))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            Expr::Binary {
+                op: BinaryOp::Gt | BinaryOp::GtEq,
+                left,
+                right,
+            } => match &**right {
+                Expr::Binary {
+                    op: BinaryOp::Distance,
+                    left: d,
+                    right: p,
+                } => {
+                    if expr_is_constant_shaped(p, GEO_POINT_FNS) {
+                        Some((d, p, left))
+                    } else if expr_is_constant_shaped(d, GEO_POINT_FNS) {
+                        Some((p, d, left))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((geom_expr, point_expr, radius_expr)) = triple else {
+            continue;
+        };
+        // Radius: literal or parameter only (a number).
+        if !matches!(radius_expr, Expr::Literal(_) | Expr::Parameter(_)) {
+            continue;
+        }
+        for index in catalog.indexes_on_table(&table.name) {
+            if !matches!(index.kind, crate::schema::IndexKind::Spatial { .. }) {
+                continue;
+            }
+            if index_serves_expr(&index, geom_expr) {
+                return Some(Plan::SpatialIndexScan {
+                    table: table.clone(),
+                    alias: alias.clone(),
+                    index,
+                    point_expr: point_expr.clone(),
+                    radius_expr: radius_expr.clone(),
+                    residual: Some(combine_and(conjuncts)),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Split a KNN ORDER BY term into (geometry operand, constant point):
+/// `geom <-> p`, `p <-> geom`, `ST_Distance(geom, p)` and the swapped
+/// argument form all qualify; the geometry side must be the scanned
+/// table's column (checked by the caller), the point side
+/// constant-shaped.
+fn split_knn_distance_expr(e: &Expr) -> Option<(&Expr, &Expr)> {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::Distance,
+            left,
+            right,
+        } => {
+            if expr_is_constant_shaped(right, GEO_POINT_FNS) {
+                Some((left, right))
+            } else if expr_is_constant_shaped(left, GEO_POINT_FNS) {
+                Some((right, left))
+            } else {
+                None
+            }
+        }
+        Expr::Function { name, args, .. }
+            if name.eq_ignore_ascii_case("st_distance") && args.len() == 2 =>
+        {
+            if expr_is_constant_shaped(&args[1], GEO_POINT_FNS) {
+                Some((&args[0], &args[1]))
+            } else if expr_is_constant_shaped(&args[0], GEO_POINT_FNS) {
+                Some((&args[1], &args[0]))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite `Limit{k}(Sort{[geom <-> p ASC]}(Project?(Filter?(Scan))))`
+/// into `Project?(SpatialKnn{...})` when a spatial grid index serves
+/// `geom`. The node emits at most k rows in ascending `<->` distance —
+/// the Sort and Limit become redundant and are dropped. Anything the
+/// pattern doesn't cover (offset, DESC, multiple terms, aggregates,
+/// joins, DISTINCT, non-constant points) returns None and keeps the
+/// general plan.
+fn try_rewrite_spatial_knn(catalog: &Catalog, plan: &Plan) -> Option<Plan> {
+    let Plan::Limit {
+        count,
+        offset,
+        input,
+    } = plan
+    else {
+        return None;
+    };
+    // LIMIT k (literal, >= 1) with no OFFSET.
+    if !matches!(offset, Expr::Literal(Value::Integer(0))) {
+        return None;
+    }
+    let Expr::Literal(Value::Integer(k)) = count else {
+        return None;
+    };
+    if *k < 1 {
+        return None;
+    }
+    // insert_sort_below_top places the Sort UNDER the Project (so it can
+    // see all input columns): the chain is Limit(Project?(Sort(Filter?
+    // (Scan)))).
+    let mut node = &**input;
+    let project: Option<&Vec<ProjectExpr>> = if let Plan::Project {
+        input: inner,
+        columns,
+    } = node
+    {
+        node = inner;
+        Some(columns)
+    } else {
+        None
+    };
+    let Plan::Sort {
+        input: sorted,
+        terms,
+    } = node
+    else {
+        return None;
+    };
+    // The FIRST term must be the ascending distance expression.
+    if terms.is_empty() || terms[0].order != Order::Asc {
+        return None;
+    }
+    let (geom_expr, point_expr) = split_knn_distance_expr(&terms[0].expr)?;
+
+    // Walk down through one optional Filter to the base Scan
+    // (apply_where_for_scan's shape for single-table queries; an
+    // eq-index plan instead of a Scan bails out here).
+    let mut node = &**sorted;
+    let residual: Option<&Expr> = if let Plan::Filter {
+        input: inner,
+        predicate,
+    } = node
+    {
+        node = inner;
+        Some(predicate)
+    } else {
+        None
+    };
+    let Plan::Scan {
+        table,
+        alias,
+        index: scan_index,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    // A SECOND sort term is allowed only when it's the ascending
+    // ROWID-ALIAS column — exactly the node's own (dist, rowid) output
+    // order, so `ORDER BY geom <-> p, id` rewrites when id IS the
+    // rowid alias. Anything else bails (the dropped Sort would change
+    // observable ordering).
+    if terms.len() > 1 {
+        let second_is_rowid_alias = terms.len() == 2
+            && terms[1].order == Order::Asc
+            && matches!(
+                &terms[1].expr,
+                Expr::Column { table: _, name }
+                    if table.rowid_alias
+                        .map(|ra| table.columns[ra].name.eq_ignore_ascii_case(name))
+                        .unwrap_or(false)
+            );
+        if !second_is_rowid_alias {
+            return None;
+        }
+    }
+    // The scan must be the plain table b-tree (not already an index
+    // path), and the spatial index must key the distance's geometry
+    // operand.
+    if scan_index.is_some() {
+        return None;
+    }
+    for index in catalog.indexes_on_table(&table.name) {
+        if !matches!(index.kind, crate::schema::IndexKind::Spatial { .. }) {
+            continue;
+        }
+        if !index_serves_expr(&index, geom_expr) {
+            continue;
+        }
+        let knn = Plan::SpatialKnn {
+            table: table.clone(),
+            alias: alias.clone(),
+            index,
+            point_expr: point_expr.clone(),
+            limit_expr: count.clone(),
+            residual: residual.cloned(),
+        };
+        let rewritten = match project {
+            Some(columns) => Plan::Project {
+                input: Box::new(knn),
+                columns: columns.clone(),
+            },
+            None => knn,
+        };
+        return Some(rewritten);
+    }
+    None
 }
 
 /// Split a predicate that may be an AND-chain into its individual conjuncts.
@@ -6994,6 +7376,9 @@ fn plan_output_width(plan: &Plan) -> usize {
         Plan::IndexIn { table, .. } => table.n_columns(),
         Plan::IndexLookup { table, .. } => table.n_columns(),
         Plan::IndexRange { table, .. } => table.n_columns(),
+        Plan::InvertedIndexScan { table, .. } => table.n_columns(),
+        Plan::SpatialIndexScan { table, .. } => table.n_columns(),
+        Plan::SpatialKnn { table, .. } => table.n_columns(),
         Plan::RowidRange { table, .. } => table.n_columns(),
         Plan::Values { rows } => rows.first().map(|r| r.len()).unwrap_or(0),
         Plan::Filter { input, .. } => plan_output_width(input),

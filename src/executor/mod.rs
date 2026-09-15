@@ -16,6 +16,7 @@ pub(crate) mod explain;
 pub mod expr;
 pub mod fts;
 pub mod geo;
+pub mod index_am;
 pub mod json;
 pub mod jsonb;
 pub(crate) mod parallel;
@@ -1637,6 +1638,52 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             end.as_ref(),
             residual.as_ref(),
         ),
+        Plan::InvertedIndexScan {
+            table,
+            alias,
+            index,
+            tsquery_expr,
+            residual,
+        } => exec_inverted_index_scan(
+            ctx,
+            table.clone(),
+            alias.clone(),
+            index.clone(),
+            tsquery_expr,
+            residual.as_ref(),
+        ),
+        Plan::SpatialIndexScan {
+            table,
+            alias,
+            index,
+            point_expr,
+            radius_expr,
+            residual,
+        } => exec_spatial_index_scan(
+            ctx,
+            table.clone(),
+            alias.clone(),
+            index.clone(),
+            point_expr,
+            radius_expr,
+            residual.as_ref(),
+        ),
+        Plan::SpatialKnn {
+            table,
+            alias,
+            index,
+            point_expr,
+            limit_expr,
+            residual,
+        } => exec_spatial_knn(
+            ctx,
+            table.clone(),
+            alias.clone(),
+            index.clone(),
+            point_expr,
+            limit_expr,
+            residual.as_ref(),
+        ),
         Plan::Insert {
             table,
             source,
@@ -3038,6 +3085,40 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                     out.push(k);
                 }
             }
+            Plan::InvertedIndexScan {
+                tsquery_expr,
+                residual,
+                ..
+            } => {
+                out.push(tsquery_expr);
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
+            Plan::SpatialIndexScan {
+                point_expr,
+                radius_expr,
+                residual,
+                ..
+            } => {
+                out.push(point_expr);
+                out.push(radius_expr);
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
+            Plan::SpatialKnn {
+                point_expr,
+                limit_expr,
+                residual,
+                ..
+            } => {
+                out.push(point_expr);
+                out.push(limit_expr);
+                if let Some(r) = residual.as_ref() {
+                    out.push(r);
+                }
+            }
             Plan::IndexRange {
                 start,
                 end,
@@ -3220,6 +3301,40 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::IndexLookup { key_exprs, .. } => {
             for k in key_exprs.iter_mut() {
                 rewrite_expr_in_place(k, ctx)?;
+            }
+        }
+        Plan::InvertedIndexScan {
+            tsquery_expr,
+            residual,
+            ..
+        } => {
+            rewrite_expr_in_place(tsquery_expr, ctx)?;
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
+            }
+        }
+        Plan::SpatialIndexScan {
+            point_expr,
+            radius_expr,
+            residual,
+            ..
+        } => {
+            rewrite_expr_in_place(point_expr, ctx)?;
+            rewrite_expr_in_place(radius_expr, ctx)?;
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
+            }
+        }
+        Plan::SpatialKnn {
+            point_expr,
+            limit_expr,
+            residual,
+            ..
+        } => {
+            rewrite_expr_in_place(point_expr, ctx)?;
+            rewrite_expr_in_place(limit_expr, ctx)?;
+            if let Some(r) = residual.as_mut() {
+                rewrite_expr_in_place(r, ctx)?;
             }
         }
         Plan::IndexRange {
@@ -14565,6 +14680,405 @@ fn exec_index_in(
 }
 
 // ============================================================================
+// Specialized index scans (GIN inverted / GiST spatial) — index_am.rs
+// ============================================================================
+
+/// Shared row-fetch-by-rowid + residual helper for the specialized
+/// index scans: fetches each candidate row, appends the hidden rowid
+/// slot when the table wants one, and applies the residual predicate.
+fn fetch_candidate_rows(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowids: &[i64],
+    residual: Option<&Expr>,
+) -> Result<Vec<Row>> {
+    let table_root = ctx.table_root(table);
+    let mut table_bt = Btree::new(ctx.pager, table_root, false);
+    let n_cols = table.n_columns();
+    let alias = table.rowid_alias;
+    let append_rowid = crate::planner::wants_rowid_slot(table);
+    let mut rows = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        if let Some(mut row) = table_bt
+            .lookup_table_with(*rowid, |payload| decode_row(payload, n_cols, *rowid, alias))?
+        {
+            if let Some(pred) = residual {
+                let pv = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                if !pv.is_truthy() {
+                    continue;
+                }
+            }
+            if append_rowid {
+                row.push(Value::Integer(*rowid));
+            }
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// InvertedIndexScan (GIN-borrowed): evaluate the constant/param-shaped
+/// tsquery ONCE, drive its boolean structure through the inverted
+/// index's postings, fetch the candidate SUPERSET by rowid, and refine
+/// with the residual — which still carries the original `@@` conjunct,
+/// so the output is exact regardless of postings precision. A query
+/// whose positive lexemes can't bound the result (an `All` propagation,
+/// e.g. `!a | b`) degenerates to a full table scan with the same
+/// residual — byte-identical to the unindexed plan.
+fn exec_inverted_index_scan(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    alias: Option<String>,
+    index: Arc<crate::schema::Index>,
+    tsquery_expr: &Expr,
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let qv = evaluate(tsquery_expr, &eval_ctx)?;
+    // NULL query: `@@` is NULL for every row — no rows either way.
+    if qv.is_null() {
+        let append_rowid = crate::planner::wants_rowid_slot(&table);
+        let columns = scan_output_columns(&table, &alias, append_rowid);
+        return Ok(ExecResult {
+            columns,
+            rows: Vec::new(),
+        });
+    }
+    let candidates = {
+        let index_root = ctx.index_root(&index);
+        let mut index_bt = Btree::new(ctx.pager, index_root, true);
+        crate::executor::index_am::inverted_candidates(&mut index_bt, &qv.as_text())?
+    };
+    let rows = match candidates {
+        Some(rowids) => fetch_candidate_rows(ctx, &table, &rowids, residual)?,
+        None => {
+            // Fall back to a full table scan + residual (identical
+            // semantics to Filter-over-Scan).
+            let table_root = ctx.table_root(&table);
+            let mut table_bt = Btree::new(ctx.pager, table_root, false);
+            let n_cols = table.n_columns();
+            let ralias = table.rowid_alias;
+            let append_rowid = crate::planner::wants_rowid_slot(&table);
+            let mut out: Vec<Row> = Vec::new();
+            table_bt.scan_table_borrowed(|rowid, payload| {
+                if let Ok(mut row) = decode_row(payload, n_cols, rowid, ralias) {
+                    if let Some(pred) = residual {
+                        if let Ok(pv) =
+                            eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)
+                        {
+                            if !pv.is_truthy() {
+                                return true;
+                            }
+                        } else {
+                            return true;
+                        }
+                    }
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
+                    out.push(row);
+                }
+                true
+            })?;
+            out
+        }
+    };
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
+    let columns = scan_output_columns(&table, &alias, append_rowid);
+    Ok(ExecResult { columns, rows })
+}
+
+/// SpatialIndexScan (GiST-borrowed) for `ST_DWithin(geom, p, r)` /
+/// `geom <-> p < r`: a geometry within planar distance r of p lies
+/// entirely inside the square `[p-r, p+r]^2`, so its covered cells lie
+/// inside the square's cells — one multi-level window scan produces the
+/// candidate superset; the residual (which still carries the original
+/// predicate) refines. NULL point/radius -> no rows (the predicate is
+/// NULL for every row).
+fn exec_spatial_index_scan(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    alias: Option<String>,
+    index: Arc<crate::schema::Index>,
+    point_expr: &Expr,
+    radius_expr: &Expr,
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let pv = evaluate(point_expr, &eval_ctx)?;
+    let rv = evaluate(radius_expr, &eval_ctx)?;
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
+    let columns = scan_output_columns(&table, &alias, append_rowid);
+    if pv.is_null() || rv.is_null() {
+        return Ok(ExecResult {
+            columns,
+            rows: Vec::new(),
+        });
+    }
+    let radius = rv.as_real();
+    let point = crate::executor::geo::parse_geometry(&pv.as_text())
+        .map_err(|e| Error::runtime(format!("{e} (spatial index scan)")))?;
+    let (px, py) = point_center(&point.geom);
+    let resolution = match &index.kind {
+        crate::schema::IndexKind::Spatial { resolution } => *resolution,
+        _ => 0.01,
+    };
+    let mut found: Vec<i64> = Vec::new();
+    {
+        let index_root = ctx.index_root(&index);
+        let mut index_bt = Btree::new(ctx.pager, index_root, true);
+        crate::executor::index_am::window_rowids(
+            &mut index_bt,
+            resolution,
+            px - radius,
+            py - radius,
+            px + radius,
+            py + radius,
+            &mut found,
+        )?;
+    }
+    found.sort_unstable();
+    found.dedup();
+    let rows = fetch_candidate_rows(ctx, &table, &found, residual)?;
+    Ok(ExecResult { columns, rows })
+}
+
+/// Center of a geometry's bounding box (the window anchor for spatial
+/// scans). For points this is the point itself.
+fn point_center(g: &crate::executor::geo::Geometry) -> (f64, f64) {
+    let (xmin, ymin, xmax, ymax) = g.bbox();
+    ((xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
+}
+
+/// SpatialKnn (PostGIS's KNN contract): expanding windows around the
+/// query point collect candidates (window_rowids across all grid
+/// levels, deduped by a seen-set); true `<->` distances rank rows that
+/// pass the residual; the k-th best distance vs the window rectangle's
+/// point-distance lower bound proves when no uncollected geometry can
+/// beat the current top-k. Rounds double the window half-extent; after
+/// [`KNN_MAX_ROUNDS`] the final round sweeps the ENTIRE index (every
+/// level's whole key range), guaranteeing termination when fewer than
+/// k rows pass the residual. Rows with NULL geometry are not indexed
+/// and thus never emitted — PostgreSQL's KNN semantics (NULLS LAST),
+/// a deliberate divergence from SQLite's NULLS-FIRST ORDER BY rule.
+fn exec_spatial_knn(
+    ctx: &mut ExecContext<'_>,
+    table: Arc<Table>,
+    alias: Option<String>,
+    index: Arc<crate::schema::Index>,
+    point_expr: &Expr,
+    limit_expr: &Expr,
+    residual: Option<&Expr>,
+) -> Result<ExecResult> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    let pv = evaluate(point_expr, &eval_ctx)?;
+    let kv = evaluate(limit_expr, &eval_ctx)?;
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
+    let columns = scan_output_columns(&table, &alias, append_rowid);
+    let k = kv.as_integer();
+    if k <= 0 {
+        return Ok(ExecResult {
+            columns,
+            rows: Vec::new(),
+        });
+    }
+    let k = k as usize;
+    // NULL point: every distance is NULL. SQLite's stable sort keeps
+    // scan (rowid) order among the equal NULL keys, so the result is
+    // the FIRST k residual-passing rows in rowid order.
+    if pv.is_null() {
+        let table_root = ctx.table_root(&table);
+        let mut table_bt = Btree::new(ctx.pager, table_root, false);
+        let n_cols = table.n_columns();
+        let ralias = table.rowid_alias;
+        let mut out: Vec<Row> = Vec::new();
+        table_bt.scan_table_borrowed(|rowid, payload| {
+            if out.len() >= k {
+                return false;
+            }
+            if let Ok(mut row) = decode_row(payload, n_cols, rowid, ralias) {
+                if let Some(pred) = residual {
+                    if let Ok(pv) =
+                        eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)
+                    {
+                        if !pv.is_truthy() {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                }
+                if append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
+                out.push(row);
+            }
+            true
+        })?;
+        return Ok(ExecResult { columns, rows: out });
+    }
+    let point_text = pv.as_text();
+    let point = crate::executor::geo::parse_geometry(&point_text)
+        .map_err(|e| Error::runtime(format!("{e} (KNN point)")))?;
+    let (px, py) = point_center(&point.geom);
+    let resolution = match &index.kind {
+        crate::schema::IndexKind::Spatial { resolution } => *resolution,
+        _ => 0.01,
+    };
+    // Max-heap of the k best (distance, rowid): peek() is the WORST of
+    // the kept k — the eviction candidate when a better row arrives.
+    // Row payloads are held aside (fetched at most once per rowid).
+    let mut heap: std::collections::BinaryHeap<(OrderKey, i64)> =
+        std::collections::BinaryHeap::new();
+    let mut fetched: std::collections::HashMap<i64, Row> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let index_root = ctx.index_root(&index);
+    let table_root = ctx.table_root(&table);
+    let n_cols = table.n_columns();
+    let ralias = table.rowid_alias;
+    for round in 0..=crate::executor::index_am::KNN_MAX_ROUNDS {
+        // The window: round r covers half-extent resolution * 2^r; the
+        // FINAL round sweeps the whole key space (completion).
+        let fresh: Vec<i64> = if round == crate::executor::index_am::KNN_MAX_ROUNDS {
+            let mut all: Vec<i64> = Vec::new();
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            index_bt.scan_index(|rowid, _key| {
+                if seen.insert(rowid) {
+                    all.push(rowid);
+                }
+                true
+            })?;
+            all
+        } else {
+            let (x0, y0, x1, y1) = crate::executor::index_am::knn_window(resolution, round, px, py);
+            let mut index_bt = Btree::new(ctx.pager, index_root, true);
+            crate::executor::index_am::knn_collect_new(
+                &mut index_bt,
+                resolution,
+                x0,
+                y0,
+                x1,
+                y1,
+                &mut seen,
+            )?
+        };
+        // Fetch + rank the fresh candidates.
+        if !fresh.is_empty() {
+            let mut table_bt = Btree::new(ctx.pager, table_root, false);
+            for rowid in fresh {
+                if let Some(mut row) = table_bt.lookup_table_with(rowid, |payload| {
+                    decode_row(payload, n_cols, rowid, ralias)
+                })? {
+                    if let Some(pred) = residual {
+                        let passed =
+                            eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                        if !passed.is_truthy() {
+                            continue;
+                        }
+                    }
+                    // True distance: the geometry column's value vs the
+                    // query point (the `<->` metric exactly).
+                    let geom_v = indexed_geometry_value(&index, &table, &row);
+                    let dist = match &geom_v {
+                        Some(v) if !v.is_null() => {
+                            crate::executor::index_am::knn_true_distance(&v.as_text(), &point_text)?
+                        }
+                        _ => continue, // NULL geometry: never emitted (PG KNN)
+                    };
+                    let key = OrderKey { dist, rowid };
+                    if heap.len() < k {
+                        heap.push((key, rowid));
+                    } else if let Some(&(worst, _)) = heap.peek() {
+                        if key < worst {
+                            heap.pop();
+                            heap.push((key, rowid));
+                        }
+                    }
+                    if append_rowid {
+                        row.push(Value::Integer(rowid));
+                    }
+                    fetched.insert(rowid, row);
+                }
+            }
+        }
+        // STOP RULE: the window is centered on p with half-extent h; an
+        // uncollected geometry's bbox is disjoint from the window, so
+        // every one of its points lies strictly outside it and is at
+        // distance > h from p (Chebyshev bounds Euclidean). Once h
+        // exceeds the k-th best passing distance, no uncollected row can
+        // beat — or tie with — the current top-k.
+        if heap.len() == k {
+            if let Some(&(worst, _)) = heap.peek() {
+                let half = if round == crate::executor::index_am::KNN_MAX_ROUNDS {
+                    f64::INFINITY
+                } else {
+                    resolution * ((1u64 << round.min(63)) as f64)
+                };
+                if half > worst.dist {
+                    break;
+                }
+            }
+        }
+    }
+    // Emit ascending (dist, rowid).
+    let mut ranked: Vec<(OrderKey, i64)> = heap.into_iter().collect();
+    ranked.sort_by_key(|a| a.0);
+    let mut rows = Vec::with_capacity(ranked.len());
+    for (_, rowid) in ranked {
+        if let Some(row) = fetched.remove(&rowid) {
+            rows.push(row);
+        }
+    }
+    Ok(ExecResult { columns, rows })
+}
+
+/// Ord key for KNN ranking: ascending distance, rowid as the
+/// deterministic tiebreak (PostGIS tie behavior is unspecified; a
+/// total order keeps results stable across plan choices).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrderKey {
+    dist: f64,
+    rowid: i64,
+}
+impl Eq for OrderKey {}
+impl PartialOrd for OrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .partial_cmp(&other.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.rowid.cmp(&other.rowid))
+    }
+}
+
+/// The geometry VALUE an index's key expression reads from a row (the
+/// spatial index's indexed column / expression).
+fn indexed_geometry_value(
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+) -> Option<Value> {
+    let col = index.columns.first()?;
+    if let Some(e) = &col.expr {
+        let named = HashMap::new();
+        return eval_row(e, row, &table.col_names, &[], &named).ok();
+    }
+    table
+        .find_column(&col.name)
+        .and_then(|p| row.get(p).cloned())
+}
+
+// ============================================================================
 // RowidRange (WHERE id BETWEEN ? AND ?, id > ?, id < ?, id >= ?, id <= ?)
 // ============================================================================
 
@@ -17082,9 +17596,15 @@ fn exec_insert_one_row(
                         table.rowid_alias,
                     ) {
                         for st in index_states.iter_mut() {
-                            let old_key = encode_index_key(&st.idx, table, &old_row);
+                            // Multi-entry (gin/gist): delete every key the
+                            // old row contributed.
+                            let old_keys = crate::executor::index_am::index_entry_keys(
+                                &st.idx, table, &old_row,
+                            )?;
                             let mut ibt = Btree::new(ctx.pager, st.root, true);
-                            ibt.delete_index(&old_key, existing_rowid)?;
+                            for old_key in &old_keys {
+                                ibt.delete_index(old_key, existing_rowid)?;
+                            }
                             st.root = ibt.root;
                         }
                     }
@@ -17304,9 +17824,14 @@ fn exec_insert_one_row(
                     {
                         continue;
                     }
-                    let old_key = encode_index_key(&st.idx, table, &old_row);
+                    // Multi-entry (gin/gist): delete every key the old
+                    // row contributed.
+                    let old_keys =
+                        crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
                     let mut ibt = Btree::new(ctx.pager, st.root, true);
-                    ibt.delete_index(&old_key, rowid)?;
+                    for old_key in &old_keys {
+                        ibt.delete_index(old_key, rowid)?;
+                    }
                     st.root = ibt.root;
                 }
             }
@@ -17322,6 +17847,20 @@ fn exec_insert_one_row(
         if st.idx.partial_expr.is_some()
             && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)
         {
+            continue;
+        }
+        // Specialized access methods (gin/gist) contribute MULTIPLE
+        // entries per row and never use the append hint (their keys are
+        // not monotonically ascending across a bulk load).
+        if !matches!(st.idx.kind, crate::schema::IndexKind::Btree) {
+            let keys =
+                crate::executor::index_am::index_entry_keys(&st.idx, table, full_row.as_slice())?;
+            let root = st.root;
+            let mut ibt = Btree::new(ctx.pager, root, true);
+            for key_bytes in &keys {
+                ibt.insert_index(key_bytes, rowid)?;
+            }
+            st.root = ibt.root;
             continue;
         }
         // Copy the root/hint out first: `encode_key` holds a mutable
@@ -17482,18 +18021,25 @@ fn exec_upsert_row(
 
             // Index maintenance: update entries whose key changed.
             for st in index_states.iter_mut() {
-                let old_key = encode_index_key(&st.idx, table, &old_row);
-                let new_key = encode_index_key(&st.idx, table, &new_row);
-                if old_key == new_key {
+                // Multi-entry keys (gin/gist): diff the whole key SETS —
+                // delete every old key, insert every new key.
+                let old_keys =
+                    crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
+                let new_keys =
+                    crate::executor::index_am::index_entry_keys(&st.idx, table, &new_row)?;
+                if old_keys == new_keys {
                     continue;
                 }
                 // The tree shape changes here — drop any append hint.
                 st.hint = None;
                 let mut ibt = Btree::new(ctx.pager, st.root, true);
-                ibt.delete_index(&old_key, existing_rowid)?;
-                st.root = ibt.root;
-                let mut ibt = Btree::new(ctx.pager, st.root, true);
-                ibt.insert_index(&new_key, existing_rowid)?;
+                for old_key in &old_keys {
+                    ibt.delete_index(old_key, existing_rowid)?;
+                }
+                let mut ibt = Btree::new(ctx.pager, ibt.root, true);
+                for new_key in &new_keys {
+                    ibt.insert_index(new_key, existing_rowid)?;
+                }
                 st.root = ibt.root;
             }
 
@@ -17956,7 +18502,10 @@ fn apply_rowid_alias_move(
     Ok(true)
 }
 
-/// Insert an entry into an index for a given row.
+/// Insert an entry into an index for a given row. Specialized access
+/// methods (GIN inverted / GiST spatial) contribute MULTIPLE keys per
+/// row — one per tsvector lexeme / covered grid cell — inserted in one
+/// B+tree handle so a root split between keys is still tracked.
 fn insert_index_entry(
     ctx: &mut ExecContext<'_>,
     index: &crate::schema::Index,
@@ -17964,19 +18513,27 @@ fn insert_index_entry(
     row: &[Value],
     rowid: i64,
 ) -> Result<()> {
-    let key_bytes = encode_index_key(index, table, row);
+    let keys = crate::executor::index_am::index_entry_keys(index, table, row)?;
+    if keys.is_empty() {
+        return Ok(());
+    }
     // Override-aware root: an earlier split may have moved this index's
     // root since the catalog snapshot was taken.
     let root = ctx.index_root(index);
     let mut bt = Btree::new(ctx.pager, root, true);
-    bt.insert_index(&key_bytes, rowid)?;
+    for key_bytes in &keys {
+        bt.insert_index(key_bytes, rowid)?;
+    }
     if bt.root != root {
         ctx.set_index_root(&index.name, bt.root);
     }
     Ok(())
 }
 
-/// Delete an entry from an index for a given row.
+/// Delete an entry from an index for a given row. Specialized access
+/// methods contribute multiple keys per row (per lexeme / per covered
+/// cell) — every key computed from the OLD row must be removed, in one
+/// B+tree handle (root-split tracking).
 fn delete_index_entry(
     ctx: &mut ExecContext<'_>,
     index: &crate::schema::Index,
@@ -17984,10 +18541,15 @@ fn delete_index_entry(
     row: &[Value],
     rowid: i64,
 ) -> Result<()> {
-    let key_bytes = encode_index_key(index, table, row);
+    let keys = crate::executor::index_am::index_entry_keys(index, table, row)?;
+    if keys.is_empty() {
+        return Ok(());
+    }
     let root = ctx.index_root(index);
     let mut bt = Btree::new(ctx.pager, root, true);
-    bt.delete_index(&key_bytes, rowid)?;
+    for key_bytes in &keys {
+        bt.delete_index(key_bytes, rowid)?;
+    }
     if bt.root != root {
         ctx.set_index_root(&index.name, bt.root);
     }
@@ -20346,8 +20908,11 @@ fn try_streaming_update(
                     continue;
                 }
                 for (ti, idx) in touched_indexes.iter().enumerate() {
-                    let old_key = encode_index_key(idx, table, &old_row_buf);
-                    let new_key = encode_index_key(idx, table, &new_row);
+                    // Multi-entry keys (gin/gist): diff the whole key SETS.
+                    let old_keys =
+                        crate::executor::index_am::index_entry_keys(idx, table, &old_row_buf)?;
+                    let new_keys =
+                        crate::executor::index_am::index_entry_keys(idx, table, &new_row)?;
                     let (old_in, new_in) = partial_membership_pair(
                         idx,
                         table,
@@ -20356,7 +20921,7 @@ fn try_streaming_update(
                         &params,
                         &named_params,
                     );
-                    if old_key == new_key && old_in == new_in {
+                    if old_keys == new_keys && old_in == new_in {
                         continue;
                     }
                     let ibt = &mut index_bts[ti];
@@ -20366,12 +20931,21 @@ fn try_streaming_update(
                     // one). The delete of a non-existent entry is a
                     // tolerated miss (old_in false skips it entirely).
                     let mut maintenance_failed = false;
-                    if old_in && ibt.delete_index(&old_key, *rowid).is_err() {
-                        maintenance_failed = true;
+                    if old_in {
+                        for old_key in &old_keys {
+                            if ibt.delete_index(old_key, *rowid).is_err() {
+                                maintenance_failed = true;
+                                break;
+                            }
+                        }
                     }
-                    if !maintenance_failed && new_in && ibt.insert_index(&new_key, *rowid).is_err()
-                    {
-                        maintenance_failed = true;
+                    if !maintenance_failed && new_in {
+                        for new_key in &new_keys {
+                            if ibt.insert_index(new_key, *rowid).is_err() {
+                                maintenance_failed = true;
+                                break;
+                            }
+                        }
                     }
                     if maintenance_failed {
                         return Err(Error::corruption(format!(

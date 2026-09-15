@@ -56,6 +56,19 @@ pub enum Statement {
     },
 }
 
+/// The `USING` access method of a `CREATE INDEX` statement (the
+/// PostgreSQL clause, borrowed). `Gin`/`Gist` select the specialized
+/// index kinds; the default (no USING clause) is the ordinary btree.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IndexMethod {
+    /// `USING gin(<tsvector expr>)` — inverted index; one entry per
+    /// tsvector lexeme.
+    Gin,
+    /// `USING gist(<geom> [, <resolution>])` / `USING spatial(...)` —
+    /// spatial grid index over a geometry column.
+    Gist,
+}
+
 #[derive(Clone, Debug)]
 pub enum CreateStatement {
     Table {
@@ -82,6 +95,12 @@ pub enum CreateStatement {
         table: String,
         columns: Vec<IndexedColumn>,
         where_clause: Option<Expr>,
+        /// PostgreSQL's `CREATE INDEX ... USING <method> (...)` clause
+        /// (borrowed): `gin` = inverted index over a tsvector-valued
+        /// expression, `gist`/`spatial` = spatial grid over a geometry
+        /// column (with optional resolution argument). `None` = the
+        /// ordinary btree.
+        using: Option<IndexMethod>,
     },
     View {
         if_not_exists: bool,

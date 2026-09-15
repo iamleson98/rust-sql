@@ -8723,6 +8723,7 @@ impl Database {
                         partial_expr: None,
                         create_sql: idx_sql.clone(),
                         origin: crate::schema::IndexOrigin::Autoindex,
+                        kind: crate::schema::IndexKind::Btree,
                     };
                     // SQLite stores NULL sql for auto-indexes; the catalog
                     // keeps the synthesized DDL for reopen (load_schema
@@ -8797,6 +8798,7 @@ impl Database {
                             partial_expr: None,
                             create_sql: idx_sql,
                             origin: crate::schema::IndexOrigin::WithoutRowidPk,
+                            kind: crate::schema::IndexKind::Btree,
                         });
                     }
                 }
@@ -8891,6 +8893,7 @@ impl Database {
                 table: table_name,
                 columns,
                 where_clause,
+                using,
             } => {
                 if catalog.get_index(&name).is_some() {
                     if if_not_exists {
@@ -8898,6 +8901,11 @@ impl Database {
                     }
                     return Err(Error::AlreadyExists(format!("index: {}", name)));
                 }
+                // Specialized access methods (PostgreSQL's USING clause,
+                // borrowed): validate shape and derive the IndexKind.
+                // GIN/GIST indexes are NEVER unique (their entries are
+                // per-term / per-cell, not per-row).
+                let kind = crate::schema::index_kind_from_using(using.as_ref(), &columns, unique)?;
                 let table = catalog
                     .get_table(&table_name)
                     .ok_or_else(|| Error::NotFound(format!("no such table: {}", table_name)))?;
@@ -8916,6 +8924,7 @@ impl Database {
                     partial_expr: where_clause,
                     create_sql: original_sql.to_string(),
                     origin: crate::schema::IndexOrigin::CreateIndex,
+                    kind,
                 };
                 // ---- BACKFILL ----
                 // Populate the index from rows that already exist in the
@@ -8980,32 +8989,49 @@ impl Database {
                                 .map(|v| v.is_null())
                                 .unwrap_or(false)
                         });
-                        let key = crate::executor::encode_index_key(&index, &table, &row_buf);
+                        // Multi-entry keys: specialized access methods
+                        // contribute one entry PER tsvector lexeme /
+                        // covered grid cell (validated tsvector / geometry
+                        // errors abort the CREATE INDEX, matching
+                        // PostgreSQL's GIN input strictness).
+                        let entry_keys = match crate::executor::index_am::index_entry_keys(
+                            &index, &table, &row_buf,
+                        ) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                backfill_err = Some(e);
+                                return false;
+                            }
+                        };
                         if is_unique && !has_null_key {
-                            match index_bt.lookup_index(&key) {
-                                Ok(existing) if !existing.is_empty() => {
-                                    backfill_err = Some(Error::constraint(format!(
-                                        "UNIQUE constraint failed: {}.{}",
-                                        table_name,
-                                        index
-                                            .columns
-                                            .iter()
-                                            .map(|c| c.name.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    )));
-                                    return false; // stop the scan
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    backfill_err = Some(e);
-                                    return false;
+                            if let Some(key) = entry_keys.first() {
+                                match index_bt.lookup_index(key) {
+                                    Ok(existing) if !existing.is_empty() => {
+                                        backfill_err = Some(Error::constraint(format!(
+                                            "UNIQUE constraint failed: {}.{}",
+                                            table_name,
+                                            index
+                                                .columns
+                                                .iter()
+                                                .map(|c| c.name.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )));
+                                        return false; // stop the scan
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        backfill_err = Some(e);
+                                        return false;
+                                    }
                                 }
                             }
                         }
-                        if let Err(e) = index_bt.insert_index(&key, rowid) {
-                            backfill_err = Some(e);
-                            return false;
+                        for entry_key in &entry_keys {
+                            if let Err(e) = index_bt.insert_index(entry_key, rowid) {
+                                backfill_err = Some(e);
+                                return false;
+                            }
                         }
                         true
                     })?;
@@ -11737,6 +11763,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                         table,
                         columns,
                         where_clause,
+                        using,
                         ..
                     })) = parse(sql)
                     {
@@ -11747,6 +11774,10 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             ))
                         })?;
                         let idx_columns = crate::schema::build_index_columns(&columns, &table_obj)?;
+                        // Reconstruct the access method from the persisted
+                        // USING clause (plain CREATE INDEX -> Btree).
+                        let kind =
+                            crate::schema::index_kind_from_using(using.as_ref(), &columns, unique)?;
                         catalog.add_index(crate::schema::Index {
                             name: idx_name,
                             table,
@@ -11756,6 +11787,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             partial_expr: where_clause,
                             create_sql: sql.to_string(),
                             origin: crate::schema::IndexOrigin::CreateIndex,
+                            kind,
                         });
                     }
                 }
@@ -11848,6 +11880,7 @@ fn rebuild_without_rowid_pk_index(
         partial_expr: None,
         create_sql: String::new(),
         origin: crate::schema::IndexOrigin::WithoutRowidPk,
+        kind: crate::schema::IndexKind::Btree,
     };
     // Backfill from the table's existing rows (native-format files keep
     // the index pages; this index is invisible, so its pages are not in
@@ -12004,6 +12037,7 @@ fn rebuild_implicit_indexes(
             partial_expr: None,
             create_sql: idx_sql,
             origin: crate::schema::IndexOrigin::Autoindex,
+            kind: crate::schema::IndexKind::Btree,
         });
     }
 }

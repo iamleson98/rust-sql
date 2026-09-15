@@ -94,6 +94,56 @@ pub enum Plan {
         /// Remaining predicates that can't be expressed as a range bound.
         residual: Option<Expr>,
     },
+    /// A GIN-style inverted-index scan (PostgreSQL's `USING gin`, borrowed):
+    /// `WHERE to_tsvector(x) @@ q` / `WHERE tsv @@ q` over an inverted
+    /// index. The constant/param-shaped tsquery is evaluated ONCE, its
+    /// boolean structure drives postings lookups (AND = intersection,
+    /// OR = union, NOT = fall back), and the resulting rowid SUPERSET is
+    /// fetched by rowid and refined by `residual` — which ALWAYS still
+    /// contains the original `@@` conjunct, so soundness needs only
+    /// no-false-negatives, never exactness.
+    InvertedIndexScan {
+        table: Arc<Table>,
+        alias: Option<String>,
+        index: Arc<Index>,
+        /// The tsquery TEXT expression (constant/parameter shaped).
+        tsquery_expr: Expr,
+        /// Residual predicate — includes the original `@@` conjunct.
+        residual: Option<Expr>,
+    },
+    /// A spatial-grid range scan (GiST-borrowed) for
+    /// `WHERE ST_DWithin(geom, p, r)` / `geom <-> p < r` over a spatial
+    /// index: scans the cells of the rectangle around `p` expanded by
+    /// `r`, fetches candidates by rowid, and refines with `residual`
+    /// (which keeps the original predicate).
+    SpatialIndexScan {
+        table: Arc<Table>,
+        alias: Option<String>,
+        index: Arc<Index>,
+        /// Center geometry text expression (constant/parameter shaped).
+        point_expr: Expr,
+        /// Search radius expression (coordinate units).
+        radius_expr: Expr,
+        /// Residual predicate — includes the original distance predicate.
+        residual: Option<Expr>,
+    },
+    /// A spatial-grid KNN scan (PostGIS's `ORDER BY geom <-> p LIMIT k`
+    /// contract, borrowed): expanding windows around `p` collect
+    /// candidates; true `<->` distances rank them; the k-th best
+    /// distance vs the window rectangle's lower bound proves when no
+    /// uncollected geometry can beat the top-k. Emits AT MOST `limit`
+    /// rows in ascending `<->` distance, all passing `residual`.
+    SpatialKnn {
+        table: Arc<Table>,
+        alias: Option<String>,
+        index: Arc<Index>,
+        /// Query point geometry text expression (constant/parameter shaped).
+        point_expr: Expr,
+        /// k (LIMIT count expression — evaluated once).
+        limit_expr: Expr,
+        /// Residual predicate (the WHERE conjuncts).
+        residual: Option<Expr>,
+    },
     /// A constant single-row source. Columns are filled with the given expressions.
     /// Used for `SELECT 1+1` without a FROM clause.
     Values {
