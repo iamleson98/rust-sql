@@ -2051,24 +2051,53 @@ fn merge_best(best: &mut ChildOut, extra: ChildOut) {
     }
 }
 
-/// Best-of-N child runs: shared CI runners steal memory bandwidth and
-/// CPU mid-section, so a single sample can be 2x off the engine's real
-/// capability (observed: SQLite's S09 scan swinging 5.9ms <-> 3.7ms
-/// across two consecutive CI runs of identical code). Same
-/// steady-state discipline as the bench gate's 3-attempt retry.
-fn spawn_child_best(engine: &str, section: &str, runs: usize) -> ChildOut {
-    let mut best: Option<ChildOut> = None;
-    for _ in 0..runs.max(1) {
-        let c = spawn_child(engine, section);
-        best = Some(match best {
-            None => c,
+/// Interleaved best-of-N sampling for a section: rq and sq child runs
+/// alternate within the SAME wall-clock window (engine order flips each
+/// round), merged per-engine by `merge_best`.
+///
+/// Replaces the old per-engine-window sampling (all of rq's N children
+/// back-to-back, then all of sq's): a shared-runner noise burst or a
+/// fast/slow runner-class stretch that lands inside ONE engine's window
+/// skews the ratio by itself. Observed 2026-09-16 on ubuntu-latest: S09
+/// insert rq 12.8 vs sq 9.0 (1.42x FAIL at 99fd261) and rq 16.7 vs sq
+/// 11.9 (1.40x FAIL at e6fe547 — a DDL-only commit that never touched
+/// the insert path, so a code-regression story is incoherent there)
+/// while SQLite's own best-of-4 minima swung 4.9 -> 16.4 ms across runs
+/// of unchanged code. A quiet-machine A/B (best-of-5 per build, same
+/// box) measured HEAD's insert at parity with the pre-concurrency
+/// baseline (28.8 vs 28.2 ms minima; sq's unchanged code wobbled
+/// +/-3 ms across draws) — the gate was measuring the runner lottery,
+/// not the engines. Interleaving makes both engines sample the same
+/// lottery: per-metric minima converge toward each engine's true floor
+/// under equal conditions, and the ratio measures the engine. The spawn
+/// order flips per round so neither side systematically gets a round's
+/// fresher cache/CPU (first-spawn advantage).
+fn spawn_interleaved(id: &str, runs: usize) -> (ChildOut, ChildOut) {
+    fn fold_best(acc: Option<ChildOut>, next: ChildOut) -> Option<ChildOut> {
+        Some(match acc {
+            None => next,
             Some(mut b) => {
-                merge_best(&mut b, c);
+                merge_best(&mut b, next);
                 b
             }
-        });
+        })
     }
-    best.unwrap()
+    let mut rq: Option<ChildOut> = None;
+    let mut sq: Option<ChildOut> = None;
+    for round in 0..runs.max(1) {
+        let (r, s) = if round % 2 == 0 {
+            let r = spawn_child("rq", id);
+            let s = spawn_child("sq", id);
+            (r, s)
+        } else {
+            let s = spawn_child("sq", id);
+            let r = spawn_child("rq", id);
+            (r, s)
+        };
+        rq = fold_best(rq, r);
+        sq = fold_best(sq, s);
+    }
+    (rq.unwrap(), sq.unwrap())
 }
 
 fn verdict(rq: f64, sq: f64, lower_is_better: bool) -> String {
@@ -2114,6 +2143,25 @@ fn env_tolerance(var: &str, default: f64) -> f64 {
 /// tight throughput contract; this gate catches multi-x regressions.
 fn gated(rq: f64, sq: f64, tolerance_pct: f64) -> bool {
     gated_with_floor(rq, sq, tolerance_pct, 2.0)
+}
+
+/// Absolute-jitter floor for a section's PRIMARY time metric — the
+/// same judgment `extra_floor` already makes for these sections' extra
+/// metrics, applied to the headline metric. The single-digit-to-teens-
+/// ms bulk sections (S08 wide rows, S09 blobs) have inserts in the same
+/// noise class their scans already acknowledge: SQLite's own insert
+/// minima swung 4.9 -> 16.4 ms across ubuntu runs of unchanged code,
+/// and DDL-only e6fe547 gate-failed S09 insert at 4.8 ms absolute
+/// without touching the insert path. 3 ms separates that jitter tail
+/// from the regression class at this scale (a real regression is
+/// multi-x: +9 ms at 2x); the correlated-window shapes that exceed the
+/// floor (12.8 vs 9.0 = 3.8 ms) are owned by the interleaved sampling,
+/// not by this floor.
+fn primary_floor(section: &str) -> f64 {
+    match section {
+        "S08" | "S09" => 3.0,
+        _ => 2.0,
+    }
 }
 
 /// `gated` with an explicit absolute-jitter floor (milliseconds).
@@ -2233,7 +2281,9 @@ fn any_perf_gate_fires(
 ) -> bool {
     let rt = primary_time(rq);
     let st = primary_time(sq);
-    if verdict(rt, st, true).contains("LOSS") && gated_time(rt, st, time_tol, 2.0) {
+    if verdict(rt, st, true).contains("LOSS")
+        && gated_time(rt, st, time_tol, primary_floor(section))
+    {
         return true;
     }
     for k in [
@@ -2306,21 +2356,21 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(2);
-    println!("best-of-{runs} child runs per engine per section (shared-runner noise guard)");
+    println!("best-of-{runs} child runs per engine per section, interleaved rq/sq rounds (shared-runner noise guard)");
     let mut failures: Vec<String> = Vec::new();
     let mut losses: Vec<String> = Vec::new();
 
     for (id, title) in sections {
-        let mut rq = spawn_child_best("rq", id, runs);
-        let mut sq = spawn_child_best("sq", id, runs);
-        // Marginal-gate confirmation: one extra best-of-N round for BOTH
-        // engines, merged per-metric, before any verdict is recorded —
-        // see any_perf_gate_fires for the rationale and the observed
-        // flake that motivated it.
+        let (mut rq, mut sq) = spawn_interleaved(id, runs);
+        // Marginal-gate confirmation: one extra interleaved best-of-N
+        // round for BOTH engines, merged per-metric, before any verdict
+        // is recorded — see any_perf_gate_fires for the rationale and
+        // the observed flake that motivated it.
         if any_perf_gate_fires(&rq, &sq, id, time_tol, mem_tol) {
             println!("    {id} marginal gate after best-of-{runs} — confirmation re-sample");
-            merge_best(&mut rq, spawn_child_best("rq", id, runs));
-            merge_best(&mut sq, spawn_child_best("sq", id, runs));
+            let (r2, s2) = spawn_interleaved(id, runs);
+            merge_best(&mut rq, r2);
+            merge_best(&mut sq, s2);
         }
         for (k, ok) in rq.checks.iter().chain(sq.checks.iter()) {
             if !ok {
@@ -2333,7 +2383,7 @@ fn main() {
         let time_v = verdict(rq_time, sq_time, true);
         if time_v.contains("LOSS") {
             losses.push(format!("{id} {title} (time)"));
-            if gated_time(rq_time, sq_time, time_tol, 2.0) {
+            if gated_time(rq_time, sq_time, time_tol, primary_floor(id)) {
                 failures.push(format!(
                     "{id} {title}: rq {rq_time:.1}ms vs sq {sq_time:.1}ms (time > {time_tol:.0}% slower)"
                 ));
@@ -2515,5 +2565,72 @@ mod gate_tests {
         // the parse/default contract, not the platform, from here.
         let v = darwin_time_noise_rel();
         assert!(v >= 0.0);
+    }
+
+    #[test]
+    fn s09_insert_primary_floor_absorbs_marginal_jitter_tail() {
+        // The marginal tail of the 2026-09-16 ubuntu S09 insert flakes:
+        // 12.0 vs 9.0 ms = 3.0 ms absolute, 1.33x — inside the documented
+        // single-digit-to-teens-ms wobble class (sq's own minima swung
+        // 4.9 -> 16.4 ms across runs of unchanged code). The generic
+        // 2.0 ms primary floor fires on this shape; the section-aware
+        // 3.0 ms floor (same judgment extra_floor already makes for
+        // S09's scan) absorbs exactly this tail.
+        assert!(gated_with_floor(12.0, 9.0, 15.0, 2.0));
+        assert!(!gated_with_floor(12.0, 9.0, 15.0, primary_floor("S09")));
+        // ...and a real multi-x regression at the same scale (+9 ms at
+        // 2x) still fails through the 3.0 ms floor:
+        assert!(gated_with_floor(18.0, 9.0, 15.0, primary_floor("S09")));
+        assert!(gated_with_floor(18.0, 9.0, 15.0, primary_floor("S08")));
+    }
+
+    #[test]
+    fn correlated_window_flake_shape_owned_by_interleave_not_floor() {
+        // 99fd261's ubuntu S09 insert FAIL: rq 12.8 vs sq 9.0 = 3.8 ms
+        // absolute, 1.42x — post-confirmation (best-of-4 per engine), so
+        // the whole sample window was correlated: rq drew slow-class
+        // while sq drew fast-class. The primary floor does NOT absorb
+        // this shape (deliberately — a floor that big would also eat
+        // real 1.4x regressions); the interleaved sampling owns clearing
+        // it: both engines sample the same window, so the ratio measures
+        // the engine, not the window draw.
+        assert!(gated_with_floor(12.8, 9.0, 15.0, primary_floor("S09")));
+        assert!(gated_with_floor(12.8, 9.0, 15.0, 2.0));
+        // e6fe547's shape (DDL-only commit — no insert-path change —
+        // failing at 4.8 ms absolute): likewise still strict under the
+        // floor; likewise owned by the interleave.
+        assert!(gated_with_floor(16.7, 11.9, 15.0, primary_floor("S09")));
+    }
+
+    #[test]
+    fn primary_floor_table_sections() {
+        // Only the two single-digit-to-teens-ms bulk sections carry the
+        // elevated primary floor; everything else keeps the strict 2.0.
+        assert_eq!(primary_floor("S08"), 3.0);
+        assert_eq!(primary_floor("S09"), 3.0);
+        for s in ["S01", "S02", "S07", "S12", "S15", "S17"] {
+            assert_eq!(primary_floor(s), 2.0);
+        }
+    }
+
+    #[test]
+    fn interleave_merge_minima_converge_monotonically() {
+        // The convergence property spawn_interleaved relies on: merging
+        // one more sample into a best can only improve (or keep) each
+        // metric, and a check passes if ANY sample passed it. Both
+        // engines fold samples through the same merge, so per-metric
+        // minima converge toward each engine's floor under equal noise.
+        let sample = |ins: f64, ok: bool| ChildOut {
+            metrics: [("insert_ms".to_string(), ins)].into_iter().collect(),
+            checks: vec![("integrity".to_string(), ok)],
+        };
+        let mut best = sample(12.8, false);
+        merge_best(&mut best, sample(10.2, true));
+        assert_eq!(best.get("insert_ms"), 10.2);
+        assert!(best.checks.iter().any(|(k, ok)| k == "integrity" && *ok));
+        merge_best(&mut best, sample(11.0, true));
+        assert_eq!(best.get("insert_ms"), 10.2); // minima never regress
+        merge_best(&mut best, sample(9.7, true));
+        assert_eq!(best.get("insert_ms"), 9.7);
     }
 }
