@@ -102,7 +102,11 @@ pub const SQLITE_DONE: c_int = 101;
 // Extended codes (libsqlite3-sys reports these when
 // sqlite3_extended_result_codes is on — sqlx always turns it on).
 pub const SQLITE_BUSY_TIMEOUT: c_int = 5 | (2 << 8);
-// Exact values from sqlite3.h (see compat/libsqlite3-sys bindings).
+/// SQLITE_BUSY_SNAPSHOT — a BEGIN CONCURRENT transaction lost the
+/// first-committer-wins race (the engine's optimistic multi-writer
+/// conflict; SQLite's begin_concurrent branch surfaces the same code).
+pub const SQLITE_BUSY_SNAPSHOT: c_int = 5 | (4 << 8); // 517
+                                                      // Exact values from sqlite3.h (see compat/libsqlite3-sys bindings).
 pub const SQLITE_CONSTRAINT_CHECK: c_int = 275;
 pub const SQLITE_CONSTRAINT_NOTNULL: c_int = 1299;
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: c_int = 1555;
@@ -919,6 +923,9 @@ fn engine_err_code(e: &rustqlite::Error) -> c_int {
             }
         }
         E::Transaction(_) => SQLITE_BUSY,
+        // Optimistic multi-writer conflict (BEGIN CONCURRENT): the exact
+        // extended code SQLite's own branch reports.
+        E::SnapshotConflict(_) => SQLITE_BUSY_SNAPSHOT,
         E::Lex { .. } | E::Parse { .. } => SQLITE_ERROR,
         E::Semantic(_) => SQLITE_ERROR, // already-exists and other semantic errors share SQLITE_ERROR
         E::NotFound(_) => SQLITE_ERROR,

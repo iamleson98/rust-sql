@@ -604,7 +604,7 @@ mod driver {
         // single-writer model — with interleaved DML on disjoint tables.
         c1.execute("BEGIN CONCURRENT").await.unwrap();
         c2.execute("BEGIN CONCURRENT").await.unwrap();
-        for i in 0..50i64 {
+        for _ in 0..50i64 {
             c1.execute("INSERT INTO a (v) VALUES ('a')").await.unwrap();
             c2.execute("INSERT INTO b (v) VALUES ('b')").await.unwrap();
         }
