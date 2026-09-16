@@ -244,3 +244,193 @@ fn alter_rename_column_and_drop_work() {
     db2.execute("CREATE TABLE u (only INTEGER)", []).unwrap();
     assert!(db2.execute("ALTER TABLE u DROP COLUMN only", []).is_err());
 }
+
+#[test]
+fn alter_add_column_lands_before_table_constraints() {
+    // SQLite places an ADD COLUMN definition with the column defs,
+    // BEFORE table-level constraints. Appending it after a trailing
+    // FOREIGN KEY produced DDL that C SQLite rejects when re-reading
+    // sqlite_master ("malformed database schema — near '<col>': syntax
+    // error"), which broke every external tool opening the file
+    // (sqlite3 CLI, python sqlite3, backup agents). This is the exact
+    // shape the pdf-tts migration chain produces via sea-orm.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child (\
+         id INTEGER PRIMARY KEY, \
+         pid INTEGER, \
+         FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE)",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO child (pid) VALUES (1)", [])
+        .unwrap();
+    db.execute("ALTER TABLE child ADD COLUMN speed REAL", [])
+        .unwrap();
+
+    let ddl = db
+        .query("SELECT sql FROM sqlite_master WHERE name = 'child'", [])
+        .unwrap();
+    let sql = match &ddl[0][0] {
+        Value::Text(s) => s.clone(),
+        v => panic!("expected TEXT ddl, got {v:?}"),
+    };
+    // The new column must precede the table-level FOREIGN KEY…
+    let col_pos = sql.find("speed REAL").expect("column in ddl");
+    let fk_pos = sql.find("FOREIGN KEY").expect("constraint in ddl");
+    assert!(
+        col_pos < fk_pos,
+        "added column must precede table constraints, ddl: {sql}"
+    );
+    // …and the constraint must still close the list.
+    let close_pos = sql.rfind(')').unwrap();
+    assert!(
+        fk_pos < close_pos,
+        "constraint still inside the list, ddl: {sql}"
+    );
+
+    // Column order is unchanged for positional access (speed is still
+    // the LAST column) and the value semantics survive.
+    let rows = db.query("SELECT id, pid, speed FROM child", []).unwrap();
+    assert_eq!(rows[0][2], Value::Null);
+    db.execute("INSERT INTO child (pid, speed) VALUES (1, 1.5)", [])
+        .unwrap();
+    let rows = db
+        .query("SELECT speed FROM child WHERE id = 2", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Real(1.5));
+}
+
+#[test]
+fn alter_add_column_before_named_constraint_and_quoted_ddl() {
+    // sea-orm-style quoted DDL with a NAMED table constraint: the added
+    // column must land before `CONSTRAINT … FOREIGN KEY`, and quoted
+    // identifiers / nested parens must not confuse the scanner.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS \"ver\" (\
+         \"id\" varchar NOT NULL PRIMARY KEY, \
+         \"doc\" varchar NOT NULL, \
+         \"cfg\" varchar NULL DEFAULT 'a,b(c)', \
+         CONSTRAINT \"fk_ver_doc\" FOREIGN KEY (\"doc\") REFERENCES \"docs\" (\"id\") ON DELETE CASCADE)",
+        [],
+    )
+    .unwrap();
+    db.execute("ALTER TABLE \"ver\" ADD COLUMN speed double NULL", [])
+        .unwrap();
+
+    let ddl = db
+        .query("SELECT sql FROM sqlite_master WHERE name = 'ver'", [])
+        .unwrap();
+    let sql = match &ddl[0][0] {
+        Value::Text(s) => s.clone(),
+        v => panic!("expected TEXT ddl, got {v:?}"),
+    };
+    let col_pos = sql.find("speed double NULL").expect("column in ddl");
+    let named_fk = sql.find("CONSTRAINT \"fk_ver_doc\"").expect("named fk");
+    assert!(
+        col_pos < named_fk,
+        "column must precede the named constraint, ddl: {sql}"
+    );
+    // The string-literal DEFAULT with commas+parens survived intact.
+    assert!(
+        sql.contains("'a,b(c)'"),
+        "default literal intact, ddl: {sql}"
+    );
+
+    // Roundtrip: reopen and the schema still parses + the column reads.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path();
+    {
+        let mut file_db = Database::open(path).unwrap();
+        file_db
+            .execute("CREATE TABLE docs (id varchar PRIMARY KEY)", [])
+            .unwrap();
+        file_db.execute(
+            "CREATE TABLE IF NOT EXISTS \"ver\" (\
+             \"id\" varchar NOT NULL PRIMARY KEY, \
+             \"doc\" varchar NOT NULL, \
+             CONSTRAINT \"fk_ver_doc\" FOREIGN KEY (\"doc\") REFERENCES \"docs\" (\"id\") ON DELETE CASCADE)",
+            [],
+        )
+        .unwrap();
+        file_db
+            .execute(
+                "INSERT INTO \"ver\" (\"id\", \"doc\") VALUES ('v1', 'd1')",
+                [],
+            )
+            .unwrap();
+        file_db
+            .execute("ALTER TABLE \"ver\" ADD COLUMN speed double NULL", [])
+            .unwrap();
+        file_db
+            .execute("UPDATE \"ver\" SET speed = 2.5 WHERE \"id\" = 'v1'", [])
+            .unwrap();
+    }
+    let file_db = Database::open(path).unwrap();
+    let rows = file_db
+        .query("SELECT \"id\", speed FROM \"ver\"", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Text("v1".into()));
+    assert_eq!(rows[0][1], Value::Real(2.5));
+}
+
+#[test]
+fn alter_add_column_preserves_statement_tail() {
+    // STRICT / WITHOUT ROWID live AFTER the closing ')' — the rewrite
+    // must keep them (the old splice dropped everything past ')').
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t (a TEXT, b TEXT CHECK (length(b) < 10), PRIMARY KEY (a)) STRICT",
+        [],
+    )
+    .unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN c TEXT", []).unwrap();
+    let ddl = db
+        .query("SELECT sql FROM sqlite_master WHERE name = 't'", [])
+        .unwrap();
+    let sql = match &ddl[0][0] {
+        Value::Text(s) => s.clone(),
+        v => panic!("expected TEXT ddl, got {v:?}"),
+    };
+    assert!(sql.contains("STRICT"), "tail preserved, ddl: {sql}");
+    // Column inserted before the table-level PRIMARY KEY (…), the CHECK
+    // inside a column def does not count as a table constraint.
+    let c_pos = sql.find("c TEXT").expect("new col");
+    let pk_pos = sql.find("PRIMARY KEY (a)").expect("table pk");
+    assert!(c_pos < pk_pos, "column before table PK, ddl: {sql}");
+    // STRICT tables still work after the widen.
+    db.execute("INSERT INTO t (a, b, c) VALUES ('x', 'yy', 'zz')", [])
+        .unwrap();
+    let rows = db.query("SELECT c FROM t WHERE a = 'x'", []).unwrap();
+    assert_eq!(rows[0][0], Value::Text("zz".into()));
+}
+
+#[test]
+fn alter_add_column_plain_table_still_appends_at_end() {
+    // No table-level constraints: the column is appended after the last
+    // column definition exactly as before.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (a INTEGER, b INTEGER)", [])
+        .unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN c INTEGER", [])
+        .unwrap();
+    let ddl = db
+        .query("SELECT sql FROM sqlite_master WHERE name = 't'", [])
+        .unwrap();
+    let sql = match &ddl[0][0] {
+        Value::Text(s) => s.clone(),
+        v => panic!("expected TEXT ddl, got {v:?}"),
+    };
+    // Column ORDER is positional — c must be the LAST column.
+    assert!(
+        sql.find("b INTEGER").unwrap() < sql.find("c INTEGER").unwrap(),
+        "appended after last column, ddl: {sql}"
+    );
+    // Positional insert reflects the order.
+    db.execute("INSERT INTO t VALUES (1, 2, 3)", []).unwrap();
+    let rows = db.query("SELECT c FROM t", []).unwrap();
+    assert_eq!(rows[0][0], Value::Integer(3));
+}

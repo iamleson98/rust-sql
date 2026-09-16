@@ -12099,15 +12099,225 @@ fn rewrite_create_table_add_column(sql: &str, column: &crate::sql::ast::ColumnDe
             }
         }
     }
-    // Insert before the LAST ')' of the statement.
-    match sql.rfind(')') {
-        Some(close) => {
-            // trim trailing whitespace/comma before the close paren
-            let before = &sql[..close];
-            let trimmed = before.trim_end();
-            format!("{}, {})", trimmed, col_sql)
+    // Insert into the column list. SQLite semantics: the added column
+    // belongs WITH the column definitions — BEFORE any table-level
+    // constraint clause (PRIMARY KEY(…)/UNIQUE(…)/CHECK(…)/FOREIGN KEY/
+    // CONSTRAINT …). Appending after a trailing FOREIGN KEY (what a naive
+    // "insert before the last ')'" does) produces DDL that C SQLite's
+    // parser rejects when reading sqlite_master back:
+    //   "malformed database schema (t) — near 'speed': syntax error"
+    // — breaking every external tool that opens the file (sqlite3 CLI,
+    // python sqlite3, backup agents). The statement tail (STRICT /
+    // WITHOUT ROWID) is preserved.
+    match column_list_insertion_point(sql) {
+        Some(Insertion::BeforeConstraint(at)) => {
+            // `sql[..at]` ends right after the separating comma (and any
+            // whitespace); splice "<col>, " in front of the constraint.
+            format!("{}{}, {}", &sql[..at], col_sql, &sql[at..])
+        }
+        Some(Insertion::AtEnd(close)) => {
+            // No table constraints — append after the last column def.
+            let before = sql[..close].trim_end();
+            let tail = &sql[close + 1..];
+            format!("{}, {}){}", before, col_sql, tail)
         }
         None => sql.to_string(),
+    }
+}
+
+/// Where `rewrite_create_table_add_column` should splice the new column.
+enum Insertion {
+    /// Byte offset of the first table-level CONSTRAINT clause — the new
+    /// column is inserted immediately before it.
+    BeforeConstraint(usize),
+    /// Byte offset of the column list's closing ')' — no table-level
+    /// constraints, so the column is appended at the end of the list.
+    AtEnd(usize),
+}
+
+/// True when one comma-separated item of a CREATE TABLE column list is a
+/// TABLE-level constraint clause (not a column definition). SQLite's
+/// grammar (verified against C SQLite) REJECTS `primary`/`foreign`/
+/// `unique`/`check` as unquoted column names, so items starting with
+/// those keywords are always table constraints. `constraint` IS a legal
+/// unquoted column name, so a `CONSTRAINT`-led item is only a table
+/// constraint when the name is followed by a kind keyword:
+/// `CONSTRAINT <name> PRIMARY KEY|UNIQUE|CHECK|FOREIGN KEY`.
+/// Quoted names (`"check"` etc.) never match — the quotes make the
+/// first token `"CHECK"`, not `CHECK`.
+fn is_table_constraint(item: &str) -> bool {
+    let s = item.trim_start();
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    // `UNIQUE(a, b)` has no whitespace before the '(' — trim the first
+    // token at '(' so it still compares as UNIQUE/CHECK.
+    let first = match tokens.first() {
+        Some(t) => t.split('(').next().unwrap_or(t).to_ascii_uppercase(),
+        None => return false,
+    };
+    if first.is_empty() {
+        return false;
+    }
+    let is_kind = |t: &str| {
+        matches!(
+            t.to_ascii_uppercase().as_str(),
+            "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+        )
+    };
+    match first.as_str() {
+        "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK" => true,
+        "CONSTRAINT" => tokens.iter().skip(1).take(2).any(|t| is_kind(t)),
+        _ => false,
+    }
+}
+
+/// Scan a CREATE TABLE statement for where ALTER TABLE ADD COLUMN must
+/// splice the new column definition. Returns the byte offset of the
+/// first table-level constraint inside the column list (the new column
+/// goes before it), or the offset of the list's closing ')' when the
+/// table has no table-level constraints. `None` when the statement
+/// shape is unrecognizable.
+fn column_list_insertion_point(sql: &str) -> Option<Insertion> {
+    // Column list body: first '(' .. its MATCHING ')' (not rfind — the
+    // statement tail can contain parens in comments).
+    let open = sql.find('(')?;
+    let bytes = sql.as_bytes();
+    let mut depth = 1usize;
+    let mut i = open + 1;
+    let mut close = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == q {
+                        if bytes.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close?;
+
+    // Walk the body's top-level comma-separated items; the first item
+    // that is a table-level constraint marks the insertion point.
+    let body = &sql[open + 1..close];
+    let b = body.as_bytes();
+    let mut item_start = 0usize;
+    let mut constraint_at: Option<usize> = None;
+    let mut j = 0usize;
+    let mut d = 0usize;
+    while j < b.len() {
+        match b[j] {
+            b'\'' => {
+                j += 1;
+                while j < b.len() {
+                    if b[j] == b'\'' {
+                        if b.get(j + 1) == Some(&b'\'') {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            b'"' | b'`' => {
+                let q = b[j];
+                j += 1;
+                while j < b.len() {
+                    if b[j] == q {
+                        if b.get(j + 1) == Some(&q) {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            b'[' => {
+                while j < b.len() && b[j] != b']' {
+                    j += 1;
+                }
+            }
+            b'-' if b.get(j + 1) == Some(&b'-') => {
+                while j < b.len() && b[j] != b'\n' {
+                    j += 1;
+                }
+            }
+            b'/' if b.get(j + 1) == Some(&b'*') => {
+                j += 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j += 1;
+            }
+            b'(' => d += 1,
+            b')' => d = d.saturating_sub(1),
+            b',' if d == 0 => {
+                if constraint_at.is_none() && is_table_constraint(&body[item_start..j]) {
+                    constraint_at = Some(open + 1 + item_start);
+                }
+                item_start = j + 1;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    // Trailing item (no comma after it).
+    if constraint_at.is_none() && is_table_constraint(&body[item_start..]) {
+        constraint_at = Some(open + 1 + item_start);
+    }
+
+    match constraint_at {
+        Some(at) => Some(Insertion::BeforeConstraint(at)),
+        None => Some(Insertion::AtEnd(close)),
     }
 }
 
