@@ -172,6 +172,14 @@ pub struct Statement<'a> {
     /// BEGIN-time bookkeeping). Held for the statement's lifetime so the
     /// streaming drivers' `next_batch` calls stay inside the scope.
     view_guard: Option<crate::storage::pager::CommittedViewGuard<'a>>,
+    /// BEGIN CONCURRENT owner's page-shadow scope for this statement's
+    /// WHOLE streaming lifetime (RAII: dropped on reset/finalize, restoring
+    /// the previous TLS value). The fast-path / streaming-driver shortcuts
+    /// in `start()` bypass `exec_with_ctx` (which arms per step), so
+    /// without THIS arm a concurrent owner's bare `SELECT count(*)` / rowid
+    /// point lookup / driver scan would read the COMMITTED state instead
+    /// of its own shadows — a read-your-own-writes breach.
+    writer_guard: Option<crate::storage::concurrent::WriterScopeGuard<'a>>,
     /// The file text encoding armed for this statement's WHOLE streaming
     /// lifetime (RAII: dropped on reset/finalize, restoring the previous
     /// tag). The first `step()`'s `start()` runs comparisons under it,
@@ -282,6 +290,7 @@ impl<'a> Statement<'a> {
             deltas: CtxDeltas::default(),
             changes_at_start: db.total_changes(),
             view_guard: None,
+            writer_guard: None,
             enc_guard: None,
         })
     }
@@ -373,8 +382,10 @@ impl<'a> Statement<'a> {
         // Drop the committed-view scope: a re-executed statement re-arms
         // (or not) against the CURRENT transaction state at its next
         // start(). The encoding guard drops with it — restored tag, and
-        // the next first step() re-arms.
+        // the next first step() re-arms. The concurrent owner's writer
+        // scope follows the same lifecycle.
         self.view_guard = None;
+        self.writer_guard = None;
         self.enc_guard = None;
     }
 
@@ -683,6 +694,20 @@ impl<'a> Statement<'a> {
         self.view_guard = self
             .db
             .committed_view_guard(matches!(self.stmt.as_ref(), AstStatement::Select(_)));
+
+        // BEGIN CONCURRENT owner (SELECT statements): arm the page-shadow
+        // scope for the whole statement lifetime — the fast-path and
+        // streaming-driver shortcuts below do NOT pass through
+        // `exec_with_ctx` (which arms per step), so this is the only scope
+        // they run under. DML statements arm inside `exec_with_ctx` per
+        // step (their execution always goes through it).
+        self.writer_guard = if matches!(self.stmt.as_ref(), AstStatement::Select(_)) {
+            self.db
+                .concurrent_txn_for_caller()
+                .map(|txn| self.db.pager.arm_writer_scope(txn))
+        } else {
+            None
+        };
 
         // PRAGMA reads: single row for value pragmas, N rows for
         // table-valued pragmas (table_info etc.).

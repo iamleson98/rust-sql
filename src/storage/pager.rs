@@ -2041,6 +2041,30 @@ impl Pager {
     /// dirty pages; the invariant `dirty_count_approx == 0 ⟹ no dirty
     /// pages` is what we rely on for `flush()`'s fast path.
     ///
+    /// Writer-scope routing check for the concurrent regime. The combined
+    /// gate's bit1 is a HINT: another thread's interleaved
+    /// `refresh_concurrent_gate` store can transiently CLEAR it (a plain
+    /// read-counters-then-store lost update — the same race bit0 has).
+    /// A stale-zero bit1 once routed an armed concurrent writer's page
+    /// fetches to the LIVE cache: the writer's B-tree surgery landed on
+    /// live pages (isolation breach), the shadow set never saw them, the
+    /// COMMIT installed nothing for them, and the flush never persisted
+    /// them — leaving the committed tree missing interior-cell updates
+    /// (misordered separators, subtrees reachable only through stale
+    /// in-memory state, rows skipped by ordered walks). The OWNER's own
+    /// arm, however, is always visible in THIS thread's TLS (same-thread
+    /// coherence — no cross-thread store can hide it), so consult it
+    /// directly. Stale-ONE readings (a plain thread seeing bit1 set) are
+    /// filtered by `armed_writer_scope()`'s authoritative counter check,
+    /// so this is exact in both directions.
+    #[inline]
+    fn writer_scope_routed_from(&self, gate: usize) -> bool {
+        if gate & 0x2 != 0 {
+            return true;
+        }
+        crate::storage::concurrent::writer_scope().is_some()
+    }
+
     /// Cost: O(1). This replaced an O(cache_size) scan on every
     /// `Database::query()` call (the 9.2× point-lookup gap vs SQLite).
     pub fn note_write(&self) {
@@ -2049,7 +2073,7 @@ impl Pager {
         // state the transaction is building) but NOT the live dirty
         // counter — the live cache was never touched, and flush() for
         // this work happens at the concurrent COMMIT.
-        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0
+        if self.writer_scope_routed_from(self.concurrent_gate.load(Ordering::Relaxed))
             && self.armed_writer_scope().is_some()
         {
             self.write_version.fetch_add(1, Ordering::Relaxed);
@@ -2142,7 +2166,7 @@ impl Pager {
     /// valid across bulk in-place UPDATEs. Any op that can move keys,
     /// split pages, or recycle pages must use the full `note_write`.
     pub fn note_write_in_place(&self) {
-        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0
+        if self.writer_scope_routed_from(self.concurrent_gate.load(Ordering::Relaxed))
             && self.armed_writer_scope().is_some()
         {
             return; // shadow in-place patch: no live dirty counter
@@ -2230,7 +2254,7 @@ impl Pager {
         // Concurrent regime: route the dirty note into the armed
         // transaction (shadow pages are WAL-emitted by the concurrent
         // COMMIT install, never by the plain flush paths).
-        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0 {
+        if self.writer_scope_routed_from(self.concurrent_gate.load(Ordering::Relaxed)) {
             if let Some(txn) = self.armed_writer_scope() {
                 self.writer_shadow_note_dirty(txn, id);
                 return;
@@ -2329,8 +2353,12 @@ impl Pager {
         // READERS, bounded by the COMMITTED page count — other writers'
         // uncommitted allocations must be invisible). Zero = the
         // overwhelming common case: one load, one branch, live path.
+        // (Both bits are HINTS subject to transient cross-thread staleness
+        // — see `writer_scope_routed_from` and the cold-path bound
+        // re-check below; the authoritative counters decide the rare
+        // cases.)
         let cw_gate = self.concurrent_gate.load(Ordering::Acquire);
-        if cw_gate & 0x2 != 0 {
+        if self.writer_scope_routed_from(cw_gate) {
             if let Some(txn) = self.armed_writer_scope() {
                 return self.writer_shadow_fetch(txn, id);
             }
@@ -2363,10 +2391,24 @@ impl Pager {
             }
         }
         if id >= n_pages_val && id != 0 {
-            return Err(Error::corruption(format!(
-                "page {} out of range (n_pages={})",
-                id, n_pages_val
-            )));
+            // Cold path (about to error): re-derive the bound
+            // AUTHORITATIVELY. The combined gate's bit0 can be transiently
+            // stale (see `concurrent_writers_active`): a stale-zero would
+            // bound this fetch by the live `n_pages`, letting a plain
+            // reader reach for another transaction's uncommitted
+            // allocation and short-read the file. The authoritative
+            // `any_active` re-check decides correctly either way.
+            let bound = if self.concurrent.any_active() {
+                self.committed_n_pages.load(Ordering::Acquire)
+            } else {
+                self.n_pages.load(Ordering::Acquire)
+            };
+            if id >= bound && id != 0 {
+                return Err(Error::corruption(format!(
+                    "page {} out of range (n_pages={})",
+                    id, bound
+                )));
+            }
         }
 
         // Slow path: cache miss — take write lock, double-check, then read from disk.

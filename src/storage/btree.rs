@@ -2948,7 +2948,13 @@ impl<'a> Btree<'a> {
             return Ok(false);
         }
         let n = borrowed.n_cells();
-        if n > 0 {
+        if n == 0 {
+            // EMPTY leaf: no last key bounds the append, and the leaf's
+            // separator context may not cover the rowid (the mass-DELETE
+            // stale-interior shape). Route through the full descent.
+            return Ok(false);
+        }
+        {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
             if let Some((last_rowid, _)) =
                 varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
@@ -3072,7 +3078,20 @@ impl<'a> Btree<'a> {
             return Ok(None); // stale hint pointing at a non-leaf page
         }
         let n = borrowed.n_cells();
-        if n > 0 {
+        if n == 0 {
+            // EMPTY leaf: refuse the fast path. An empty leaf has no last
+            // key to bound the append, so ANY rowid would be accepted —
+            // but the leaf's POSITION in the tree (its separator context)
+            // may not cover the rowid. The classic shape: a mass DELETE
+            // leaves the interior with stale cells over empty leaves; the
+            // rightmost empty leaf then swallows low rowids that belong
+            // in a LEFT subtree (their separator-correct home), breaking
+            // the tree order — ordered scans misroute, bulk deletes skip
+            // ranges. The full descent routes via the separators and is
+            // always correct.
+            return Ok(None);
+        }
+        {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
             if let Some((last_rowid, _)) =
                 varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
@@ -3338,7 +3357,13 @@ impl<'a> Btree<'a> {
             return Ok(None); // stale hint pointing at a non-index page
         }
         let n = borrowed.n_cells();
-        if n > 0 {
+        if n == 0 {
+            // EMPTY leaf: refuse the fast path (no last key bounds the
+            // append; the leaf's separator context may not cover the
+            // entry — see the table-leaf mirror in try_append_into_leaf).
+            return Ok(None);
+        }
+        {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
             let psz = borrowed.page_size();
             if let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)

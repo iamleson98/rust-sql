@@ -221,6 +221,12 @@ struct ConcurrentTxnEntry {
     txn_id: u64,
     /// Transaction-private bookkeeping overlay.
     maps: std::sync::Arc<crate::executor::StmtMaps>,
+    /// Overlay snapshots aligned with the pager-side savepoint stack
+    /// (index i corresponds to concurrent savepoint i — the mirror of
+    /// the plain path's `savepoint_maps`). ROLLBACK TO restores the
+    /// snapshot: root overrides and max-rowid caches recorded after the
+    /// savepoint are undone with the pages.
+    savepoint_maps: Vec<std::sync::Arc<crate::executor::StmtMaps>>,
 }
 
 thread_local! {
@@ -5256,28 +5262,45 @@ impl Database {
                 self.rollback_concurrent_txn()?;
                 return Ok(());
             }
+            // SAVEPOINT support inside concurrent transactions: the ops
+            // are fully transaction-local (shadow-page undo — see
+            // `storage/concurrent.rs`), so they intercept here instead of
+            // the single-writer savepoint machinery.
+            Statement::Savepoint(name) if conc_owner_txn.is_some() => {
+                let name = name.clone();
+                drop(cached);
+                self.savepoint_concurrent_txn(&name)?;
+                return Ok(());
+            }
+            Statement::Release(name) if conc_owner_txn.is_some() => {
+                let name = name.clone();
+                drop(cached);
+                self.release_concurrent_savepoint(&name)?;
+                return Ok(());
+            }
+            Statement::Rollback(rb) if rb.savepoint.is_some() && conc_owner_txn.is_some() => {
+                let name = rb.savepoint.clone().expect("checked above");
+                drop(cached);
+                self.rollback_to_concurrent_savepoint(&name)?;
+                return Ok(());
+            }
             _ => {}
         }
         if conc_owner_txn.is_some() {
-            // Restrictions inside a concurrent transaction: SAVEPOINT
-            // (the undo-log machinery is single-writer), DDL (the
+            // Restrictions inside a concurrent transaction: DDL (the
             // in-memory catalog is shared), PRAGMA (journal/lock flips
             // would break the regime's invariants), VACUUM/ATTACH-level
             // structural statements, and view DML (its INSTEAD-OF trigger
             // driver replays statements through `&mut self` machinery
-            // outside the shadow-scope region). DML on tables and SELECT
-            // proceed.
+            // outside the shadow-scope region). SAVEPOINT ops are
+            // transaction-local and intercepted above; plain DML on
+            // tables and SELECT proceed.
             if cached.view_target.is_some() {
                 return Err(Error::Unsupported(
                     "view DML is not allowed inside a BEGIN CONCURRENT transaction",
                 ));
             }
             match cached.stmt.as_ref() {
-                Statement::Savepoint(_) | Statement::Release(_) | Statement::Rollback(_) => {
-                    return Err(Error::Unsupported(
-                        "SAVEPOINT statements are not allowed inside a BEGIN CONCURRENT transaction",
-                    ));
-                }
                 Statement::Create(_)
                 | Statement::Drop(_)
                 | Statement::Alter(_)
@@ -6710,6 +6733,7 @@ impl Database {
         let entry = ConcurrentTxnEntry {
             txn_id,
             maps: self.maps.read().clone(),
+            savepoint_maps: Vec::new(),
         };
         self.concurrent_txns.lock().insert(conn, entry);
         self.concurrent_active.store(true, Ordering::Release);
@@ -6835,6 +6859,99 @@ impl Database {
         // plan re-resolves from the shared (committed) maps.
         self.invalidate_stmt_cache();
         r
+    }
+
+    /// `SAVEPOINT <name>` inside this connection's concurrent
+    /// transaction: a transaction-local savepoint level (shadow-page undo
+    /// on the pager side) plus an overlay-maps snapshot on the engine
+    /// side, so ROLLBACK TO undoes root overrides and rowid caches
+    /// recorded after the savepoint together with the pages.
+    fn savepoint_concurrent_txn(&mut self, name: &str) -> Result<()> {
+        let conn = conn_identity();
+        let txn_id = {
+            let txns = self.concurrent_txns.lock();
+            match txns.get(&conn) {
+                Some(e) => e.txn_id,
+                None => return Err(Error::semantic("no transaction is active")),
+            }
+        };
+        self.pager.savepoint_concurrent(txn_id, name)?;
+        let mut txns = self.concurrent_txns.lock();
+        if let Some(entry) = txns.get_mut(&conn) {
+            let snap = entry.maps.clone();
+            entry.savepoint_maps.push(snap);
+        }
+        Ok(())
+    }
+
+    /// `ROLLBACK TO SAVEPOINT <name>` inside this connection's concurrent
+    /// transaction: restore the transaction's private page state, its
+    /// row journal, and its bookkeeping overlay to the savepoint. The
+    /// transaction stays open (SQLite semantics).
+    fn rollback_to_concurrent_savepoint(&mut self, name: &str) -> Result<()> {
+        let conn = conn_identity();
+        let txn_id = {
+            let txns = self.concurrent_txns.lock();
+            match txns.get(&conn) {
+                Some(e) => e.txn_id,
+                None => return Err(Error::semantic("no transaction is active")),
+            }
+        };
+        match self.pager.rollback_concurrent_savepoint(txn_id, name)? {
+            Some(depth) => {
+                let restored = {
+                    let mut txns = self.concurrent_txns.lock();
+                    match txns.get_mut(&conn) {
+                        Some(entry) => {
+                            entry.savepoint_maps.truncate(depth);
+                            entry.savepoint_maps.last().cloned()
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(maps) = restored {
+                    if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+                        entry.maps = maps;
+                    }
+                    // Cached plans may embed roots from the rolled-back
+                    // overlay; a fresh plan re-resolves from the restored
+                    // maps. Count memos key on the write epoch — the
+                    // rolled-back writes changed row counts.
+                    self.invalidate_stmt_cache();
+                    self.write_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    self.break_insert_chain();
+                }
+                Ok(())
+            }
+            None => Err(Error::semantic(format!("no such savepoint: {name}"))),
+        }
+    }
+
+    /// `RELEASE [SAVEPOINT] <name>` inside this connection's concurrent
+    /// transaction: discard the savepoint (and everything above it)
+    /// without rolling back. Releasing the OUTERMOST savepoint does NOT
+    /// commit — the transaction was started by `BEGIN CONCURRENT`, not
+    /// by the savepoint (SQLite commits on outermost release only for
+    /// savepoint-started transactions).
+    fn release_concurrent_savepoint(&mut self, name: &str) -> Result<()> {
+        let conn = conn_identity();
+        let txn_id = {
+            let txns = self.concurrent_txns.lock();
+            match txns.get(&conn) {
+                Some(e) => e.txn_id,
+                None => return Err(Error::semantic("no transaction is active")),
+            }
+        };
+        match self.pager.release_concurrent_savepoint(txn_id, name)? {
+            Some(remaining) => {
+                if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+                    entry.savepoint_maps.truncate(remaining);
+                }
+                Ok(())
+            }
+            None => Err(Error::semantic(format!("no such savepoint: {name}"))),
+        }
     }
 
     /// Shared tail of COMMIT/ROLLBACK: global transaction flags flip off

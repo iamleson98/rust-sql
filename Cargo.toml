@@ -84,6 +84,15 @@ name = "probe_conc_cost"
 path = "examples/probe_conc_cost.rs"
 required-features = ["sqlx"]
 
+# Multi-writer OLTP burst benchmark: BEGIN CONCURRENT (group commit) vs
+# plain single-writer across synchronous=NORMAL/FULL, with per-mode
+# integrity and durability asserts.
+# Run: cargo run --release --example bench_oltp_concurrent --features sqlx
+[[example]]
+name = "bench_oltp_concurrent"
+path = "examples/bench_oltp_concurrent.rs"
+required-features = ["sqlx"]
+
 # Dirty-read probe: WAL snapshots + writer gate vs read-uncommitted.
 # Run: cargo run --release --example probe_dirty_read --features sqlx
 [[example]]

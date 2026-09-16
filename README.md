@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **1200+ tests** (1247 in the default matrix
+> **Status**: production-ready core. **1200+ tests** (1265 in the default matrix
 > + 65 C ABI suites; crash / power-loss simulation, OOM + I/O fault injection,
 > corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
@@ -321,7 +321,7 @@ The API is rusqlite-shaped: `execute` for statements without rows, `query` for t
 - **B+tree correctness** — randomized insert/lookup/scan/delete testing; the split logic is the trickiest part and is well-tested.
 - **WAL integrity** — CRC32 + salt + running checksum makes torn-write recovery robust; verified by crash tests that abort at every statement boundary.
 - **Concurrency model** — `&self` reads + per-page locks + scoped worker threads give three distinct concurrency tiers with zero unsafe code in the engine.
-- **Multi-writer transactions** — `BEGIN CONCURRENT` lifts SQLite's one-writer limit with optimistic concurrency (`storage/concurrent.rs`): N write transactions open at once over private page shadows, first-committer-wins with ROW-level conflict granularity (`SQLITE_BUSY_SNAPSHOT`, retriable — two writers on different rows of the same hot leaf page both commit; the second MERGES its row journal onto the current trees instead of retrying), readers never block and never see uncommitted bytes, and group commit amortizes one fsync across concurrent committers under `PRAGMA synchronous=FULL`. The commit critical section is just validate + install/merge + WAL append — the fsync waits outside it.
+- **Multi-writer transactions** — `BEGIN CONCURRENT` lifts SQLite's one-writer limit with optimistic concurrency (`storage/concurrent.rs`): N write transactions open at once over private page shadows, first-committer-wins with ROW-level conflict granularity (`SQLITE_BUSY_SNAPSHOT`, retriable — two writers on different rows of the same hot leaf page both commit; the second MERGES its row journal onto the current trees instead of retrying), SAVEPOINT/ROLLBACK TO/RELEASE fully supported inside the transaction (shadow-page undo + journal marks + overlay snapshots), readers never block and never see uncommitted bytes, and group commit amortizes one fsync across concurrent committers under `PRAGMA synchronous=FULL` (measured ~5x single-writer throughput and ~0.25 fsync/txn in an 8-connection OLTP burst — `examples/bench_oltp_concurrent.rs`). The commit critical section is just validate + install/merge + WAL append — the fsync waits outside it.
 - **Parallel determinism** — workers run the serial path's own machinery and merge in range order, so answers are identical by construction (the one documented latitude: the last ULP of a REAL SUM, below).
 
 **What we cut (deliberate omissions)**
@@ -1087,18 +1087,35 @@ COMMIT;                      -- validate + install + WAL append
   instead of N; `NORMAL/OFF` skip the wait exactly as before (the
   durability point stays the checkpoint). CRC-checked frames, recovered
   by the crash-recovery matrix on reopen.
+- **SAVEPOINT inside concurrent transactions**: savepoints are fully
+  supported — transaction-local nested undo over the shadow pages (fetch
+  -time pre-image capture, the same discipline as the plain pager's
+  savepoints), with marks into the transaction's allocation/free intents,
+  row journal, root-split lineage, and bookkeeping overlay, all restored
+  atomically by `ROLLBACK TO`. Post-savepoint page allocations are
+  recycled (freelist splice at end), a rollback to a net-zero page state
+  (the only write was undone) re-drops the shadow so a later sibling
+  commit to that page does not false-conflict, and `RELEASE` of the
+  outermost savepoint keeps the transaction open (SQLite semantics —
+  only savepoint-STARTED transactions commit on outermost release).
 
-Restrictions inside a concurrent transaction (v1): DDL, PRAGMA, and
-SAVEPOINT statements are rejected (the in-memory catalog, savepoint undo
-logs, and journal-mode switches are single-writer structures); plain
-(non-`CONCURRENT`) write statements from other connections wait for the
-regime to drain (readers pass). Schema changes belong between
-transactions. The merge covers standard rowid-table and index DML (the
-statement shapes allowed inside the regime); structural-only conflicts
-(root splits colliding on the same interior pages, an unjournaled write
-path) fall back to page-granularity abort — retry, never corruption.
+Restrictions inside a concurrent transaction: DDL and PRAGMA are
+rejected (the in-memory catalog and journal-mode switches are
+single-writer structures); plain (non-`CONCURRENT`) write statements
+from other connections wait for the regime to drain (readers pass).
+Schema changes belong between transactions. The merge covers standard
+rowid-table and index DML (the statement shapes allowed inside the
+regime); structural-only conflicts (root splits colliding on the same
+interior pages, an unjournaled write path) fall back to page-granularity
+abort — retry, never corruption. Commit validation is layered so every
+view straddling a concurrent split is caught: page stamps, tree ROOT
+views (a sibling's split above your view — the origin-folding map keeps
+root views comparable across splits), and ROW stamps on the fast install
+path too (a leaf split between snapshots can move the same rowid's home
+page, leaving the two transactions' dirty pages disjoint — the row
+stamp is the authority).
 
-Testing: `tests/concurrent_writes.rs` — 22 engine-level suites (two
+Testing: `tests/concurrent_writes.rs` — 28 engine-level suites (two
 writers over disjoint tables, snapshot isolation both directions,
 first-committer-wins conflicts, fail-fast on moved pages, regime gating
 of plain writers, unblocked readers, 2k-row bulk insert/rollback with
@@ -1108,11 +1125,35 @@ granularity: disjoint-row inserts/updates/deletes on one hot page MERGE,
 same-row updates conflict, index-maintained merges stay consistent, a
 merge that re-splits the tree lands a correct catalog rootpage and
 reopens clean, and a mixed mergeable+conflicting transaction still
-aborts atomically) + 4 sqlx-driver suites (two real connections with
+aborts atomically; SAVEPOINT: nested levels, rollback-to-twice, release,
+allocation recycling, net-zero rollback followed by a sibling commit,
+root-split integrity after undo, index-consistent merges with savepoint
+-cleaned journals, and the statement-step SELECT paths reading the
+owner's shadows) + 7 sqlx-driver suites (two real connections with
 interleaved statements, conflict → error code 517, reader unblocked
-mid-transaction, and barrier-aligned four-connection commits under
+mid-transaction, barrier-aligned four-connection commits under
 `synchronous=FULL` amortizing to fewer fsyncs than commits with every
-row durable on reopen).
+row durable on reopen, LAZY POOL OPENS during an active regime, savepoint
+round-trips through raw SQL, and the sqlx-`Transaction`-over-`BEGIN
+CONCURRENT` guard) + 3 stress harnesses: a barrier-aligned threaded
+burst with per-round accounting, a split-scale burst whose tree grows
+from empty inside the regime (splits + merges + reopen), and the full
+OLTP phase sequence (plain burst → concurrent burst → plain full-table
+DELETE — the shape that once exposed a corrupted interior and skipped
+ranges; every phase's row count, id contiguity, duplicate check, and
+reconciliation are asserted).
+
+The whole contract is quantified by `cargo run --release --example
+bench_oltp_concurrent --features sqlx` — a realistic N-connection OLTP
+burst (payment-shaped transactions: point UPDATE + audit append + verify
+read, think-time between statements, barrier-aligned rounds): at 8
+connections × 200 transactions over 10k accounts, `BEGIN CONCURRENT` +
+group commit sustains **~5x the single-writer throughput under `PRAGMA
+synchronous=FULL`** (~4100 vs ~800 txns/s on the reference box) at
+**~0.25 fsync per transaction** (one group fsync covers ~4 commits; the
+plain regime pays exactly 1.0 per commit), with per-mode history row
+counts, balance reconciliation, and a fresh-engine durability check
+asserted after every mode.
 
 ### Missing parts (feature & compat surface)
 
@@ -1547,7 +1588,7 @@ let rows = db.query("SELECT rot13('hello')", [])?;   // "uryyb"
 
 ## Examples
 
-See [`examples/`](examples/) — 182 probes and benchmarks:
+See [`examples/`](examples/) — 183 probes and benchmarks:
 
 - `basic.rs`: create, insert, query, update, delete, aggregates, group by
 - `transaction.rs`: atomic transfer between accounts
@@ -1559,6 +1600,7 @@ See [`examples/`](examples/) — 182 probes and benchmarks:
 - `probe_dirty_read.rs`: snapshot-isolation verification
 - `index_am_smoke.rs`: GIN inverted + GIST spatial index end-to-end (EXPLAIN plan shapes, persistence reopen)
 - `bench_index_am.rs`: the specialized-AM benchmarks (FTS inverted scan 850x, spatial KNN 320x, with answer-equality asserts)
+- `bench_oltp_concurrent.rs`: the multi-writer OLTP burst benchmark (BEGIN CONCURRENT vs plain single-writer, `--features sqlx`; group-commit fsync amortization + per-mode integrity + durability asserts)
 
 ```bash
 cargo run --example basic
@@ -1569,10 +1611,10 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1247 tests in
-the default matrix (265 unit + 982 integration across 80 files), plus 69 C ABI
-tests in `compat/` and the sqlx feature suite (1280 tests with `--features
-sqlx`) — all passing:
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1265 tests in
+the default matrix (265 unit + 1000 integration across 80 files), plus 69 C ABI
+tests in `compat/` and the sqlx feature suite (1310 tests with `--features
+sqlx`) — all passing:sqlx`) — all passing:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
 |---|---|---|
@@ -1594,7 +1636,7 @@ sqlx`) — all passing:
 | `integrity_check` | `tests/integrity_check.rs` | full structural walk: freelist chains, every b-tree, bidirectional index↔table cross-verification |
 | Soak / long-run | `concurrency_stress.rs`, `RUSTQLITE_FUZZ_ITERS` | 32-thread mixed workloads; long fuzz iterations |
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |
-| Multi-writer (BEGIN CONCURRENT) | `concurrent_writes.rs` | N write txns at once, snapshot isolation, row-level conflict granularity + MERGE (disjoint rows of one hot page both commit; same-row conflicts 517), group-commit fsync amortization, regime gating, allocation recycling, WAL recovery, driver-level 2-conn interleaving + 4-conn group commit |
+| Multi-writer (BEGIN CONCURRENT) | `concurrent_writes.rs` | N write txns at once, snapshot isolation, row-level conflict granularity + MERGE (disjoint rows of one hot page both commit; same-row conflicts 517), SAVEPOINT inside concurrent txns, layered commit validation (page/root-view/row stamps), group-commit fsync amortization, regime gating, allocation recycling, WAL recovery, driver-level 2-conn interleaving + 4-conn group commit + lazy pool opens mid-regime, threaded split-scale + OLTP-phase stress harnesses |
 | Intra-statement parallelism | `tests/parallel_scan.rs` | parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order, top-N order, unbounded ORDER BY with projections/ordinals/hidden-rowid, parameter-filtered fused aggregates), 300k-row SQLite cross-check, transaction-decline + PRAGMA-gate contracts |
 | Rowid in joins | `tests/rowid_join.rs` | rowid pseudo-column refs in join conditions/projections/filters differential-pinned vs bundled SQLite (rowid↔rowid, rowid↔column, outer-join NULL semantics, 3-table chains, self-joins, INTEGER-PK alias tables, `COLLATE BINARY` as the default collation, `:memory:` purity) |
 | Non-equi joins | `tests/nested_join.rs` | compiled nested-loop conditions differential-pinned vs bundled SQLite (every join flavor × comparison/arithmetic/collate/AND-OR-NOT/NULL shapes, implicit-join fusion), 150k-row parallel==serial equality for INNER/LEFT/RIGHT/FULL, transaction-decline + PRAGMA gates, SQLite cross-checks at scale, and SQLite-exact boolean truthiness (`'abc'`/`'1x'` prefix coercion, blob rules, `NOT NULL` three-valued logic) |

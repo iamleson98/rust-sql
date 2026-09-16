@@ -117,7 +117,7 @@ fn concurrent_requires_wal_mode() {
 }
 
 #[test]
-fn concurrent_ddl_and_savepoint_rejected() {
+fn concurrent_ddl_and_pragma_rejected() {
     let (mut db, path) = waldb("cw_ddl");
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
         .unwrap();
@@ -126,12 +126,15 @@ fn concurrent_ddl_and_savepoint_rejected() {
     let ddl = db.execute("CREATE TABLE u (a INT)", []);
     assert!(ddl.is_err());
     assert!(ddl.err().unwrap().to_string().contains("CONCURRENT"));
-    let sp = db.execute("SAVEPOINT s1", []);
-    assert!(sp.is_err());
+    // SAVEPOINT is transaction-local (shadow-page undo) and ALLOWED; its
+    // DDL restriction was lifted in v3.
+    db.execute("SAVEPOINT s1", []).unwrap();
     let pragma = db.execute("PRAGMA synchronous = FULL", []);
     assert!(pragma.is_err());
     // The transaction is still usable for DML after the rejections.
     db.execute("INSERT INTO t (id) VALUES (1)", []).unwrap();
+    db.execute("ROLLBACK TO s1", []).unwrap();
+    db.execute("INSERT INTO t (id) VALUES (2)", []).unwrap();
     db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(0);
     assert_eq!(count(&db, "t"), 1);
@@ -784,6 +787,187 @@ mod driver {
         drop(db);
         cleanup("group");
     }
+
+    // POOL-OPEN HARDENING (v3): a pool that lazily opens connections while
+    // the concurrent regime is active. The connection-setup pragma used to
+    // route through the engine's regime guard and fail with "database is
+    // locked"; the direct FK setter must make lazy opens always succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn driver_lazy_open_during_concurrent_regime() {
+        let opts = file_opts("lazyopen");
+        let mut setup = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        setup.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
+        setup.close().await.unwrap();
+
+        let mut holder = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        holder.execute("BEGIN CONCURRENT").await.unwrap();
+        holder
+            .execute("INSERT INTO t (id, v) VALUES (1, 'open')")
+            .await
+            .unwrap();
+
+        // Six connections open CONCURRENTLY while the regime is active —
+        // the pool's lazy-acquire shape. Every open must succeed, and the
+        // readers must observe the committed (pre-transaction) state.
+        let mut tasks = Vec::new();
+        for i in 0..6 {
+            let opts = opts.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&opts)
+                    .unwrap_or_else(|e| panic!("lazy open during concurrent regime failed: {e}"));
+                let n: i64 = sqlx::query("SELECT count(*) FROM t")
+                    .fetch_one(&mut c)
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(n, 0, "reader {i} must see committed state only");
+                c.close().await.unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // A second wave: opens + a CONCURRENT sibling writer (open, begin,
+        // write, commit) — the full pool burst pattern.
+        let mut tasks = Vec::new();
+        for i in 0..4i64 {
+            let opts = opts.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+                // OCC retry loop: a fetch-time or commit-time 517 rolls the
+                // whole transaction back — re-run it.
+                let v = format!("sibling{}", i);
+                for _attempt in 0..8 {
+                    c.execute("BEGIN CONCURRENT").await.unwrap();
+                    let body = sqlx::query("INSERT INTO t (id, v) VALUES (?, ?)")
+                        .bind(100 + i)
+                        .bind(v.clone())
+                        .execute(&mut c)
+                        .await;
+                    match body {
+                        Ok(_) => match c.execute("COMMIT").await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                let msg = e.to_string().to_lowercase();
+                                assert!(msg.contains("snapshot"), "{e}");
+                            }
+                        },
+                        Err(e) => {
+                            let msg = e.to_string().to_lowercase();
+                            assert!(msg.contains("snapshot"), "{e}");
+                            let _ = c.execute("ROLLBACK").await;
+                        }
+                    }
+                }
+                c.close().await.unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        holder.execute("COMMIT").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut holder)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 5);
+        holder.close().await.unwrap();
+        cleanup("lazyopen");
+    }
+
+    // SAVEPOINT round-trip through the driver: raw SQL savepoint ops route
+    // through run_one's Once arm with the connection identity armed.
+    #[tokio::test]
+    async fn driver_savepoint_inside_concurrent() {
+        let opts = file_opts("spsave");
+        let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        c.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
+        c.execute("BEGIN CONCURRENT").await.unwrap();
+        sqlx::query("INSERT INTO t (id, v) VALUES (1, 'a')")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        c.execute("SAVEPOINT s1").await.unwrap();
+        sqlx::query("INSERT INTO t (id, v) VALUES (2, 'b')")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE t SET v = 'A' WHERE id = 1")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        c.execute("ROLLBACK TO s1").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut c)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 1);
+        c.execute("RELEASE s1").await.unwrap();
+        c.execute("COMMIT").await.unwrap();
+        let rows: Vec<(i64, String)> = sqlx::query("SELECT id, v FROM t ORDER BY id")
+            .fetch_all(&mut c)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(rows, vec![(1, "a".to_string())]);
+        c.close().await.unwrap();
+        cleanup("spsave");
+    }
+
+    // sqlx Transaction::begin over an open BEGIN CONCURRENT must ERROR
+    // (SQLite's BEGIN-in-BEGIN): a silent no-op would drop the wrapper's
+    // writes at close.
+    #[tokio::test]
+    async fn driver_sqlx_begin_over_concurrent_errors() {
+        use sqlx::Connection;
+        let opts = file_opts("beginerr");
+        let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        c.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        c.execute("BEGIN CONCURRENT").await.unwrap();
+        let r = c.begin().await;
+        assert!(r.is_err(), "sqlx begin() over BEGIN CONCURRENT must error");
+        assert!(r.err().unwrap().to_string().contains("BEGIN CONCURRENT"));
+        // The concurrent transaction is unaffected and still committable.
+        c.execute("INSERT INTO t (id) VALUES (1)").await.unwrap();
+        c.execute("COMMIT").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut c)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 1);
+        // And afterwards, plain sqlx transactions work again.
+        {
+            let mut tx = c.begin().await.unwrap();
+            sqlx::query("INSERT INTO t (id) VALUES (2)")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut c)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 2);
+        c.close().await.unwrap();
+        cleanup("beginerr");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,4 +1230,1082 @@ fn concurrent_merge_conflict_still_first_committer_wins_on_row() {
     let rows = db.query("SELECT v FROM t ORDER BY id", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "A");
     assert_eq!(rows[1][0].as_text(), "y");
+}
+
+// ---------------------------------------------------------------------------
+// SAVEPOINT inside concurrent transactions (v3): transaction-local nested
+// undo over the page shadows + row journal + overlay maps.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_savepoint_basic_rollback_to() {
+    let (mut db, path) = waldb("cw_sp_basic");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    db.execute("SAVEPOINT s1", []).unwrap();
+    db.execute("UPDATE t SET v = 'b' WHERE id = 1", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'c')", [])
+        .unwrap();
+    assert_eq!(count(&db, "t"), 2);
+    db.execute("ROLLBACK TO s1", []).unwrap();
+    // Only the pre-savepoint insert remains.
+    assert_eq!(count(&db, "t"), 1);
+    let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "a");
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 1);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 1);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_savepoint_nested_levels() {
+    let (mut db, path) = waldb("cw_sp_nested");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    db.execute("SAVEPOINT outer", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'b')", [])
+        .unwrap();
+    db.execute("SAVEPOINT inner", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (3, 'c')", [])
+        .unwrap();
+    db.execute("UPDATE t SET v = 'B' WHERE id = 2", []).unwrap();
+    // Roll back to the OUTER savepoint: the inner level's writes AND the
+    // inner level itself are discarded.
+    db.execute("ROLLBACK TO outer", []).unwrap();
+    assert_eq!(count(&db, "t"), 1);
+    // The inner savepoint is gone with the rollback.
+    let r = db.execute("ROLLBACK TO inner", []);
+    assert!(r.is_err());
+    assert!(r.err().unwrap().to_string().contains("no such savepoint"));
+    // The outer savepoint is still active and re-rollbackable.
+    db.execute("INSERT INTO t (id, v) VALUES (4, 'd')", [])
+        .unwrap();
+    db.execute("ROLLBACK TO outer", []).unwrap();
+    assert_eq!(count(&db, "t"), 1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 1);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 1);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_savepoint_release_keeps_changes() {
+    let (mut db, path) = waldb("cw_sp_release");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("SAVEPOINT s1", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    db.execute("RELEASE s1", []).unwrap();
+    assert_eq!(count(&db, "t"), 1);
+    // The released savepoint no longer exists.
+    let r = db.execute("ROLLBACK TO s1", []);
+    assert!(r.is_err());
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 1);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 1);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_savepoint_outermost_release_does_not_commit() {
+    let (mut db, _) = waldb("cw_sp_outer_release");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    db.execute("SAVEPOINT s1", []).unwrap();
+    db.execute("RELEASE s1", []).unwrap();
+    // Releasing the outermost savepoint of a BEGIN CONCURRENT transaction
+    // does NOT commit (SQLite: only savepoint-STARTED transactions commit
+    // on outermost release). The row is still uncommitted...
+    db.execute("ROLLBACK", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 0);
+}
+
+#[test]
+fn concurrent_savepoint_unknown_name_errors() {
+    let (mut db, _) = waldb("cw_sp_unknown");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    let r = db.execute("ROLLBACK TO nope", []);
+    assert!(r.is_err());
+    assert!(r.err().unwrap().to_string().contains("no such savepoint"));
+    let r = db.execute("RELEASE nope", []);
+    assert!(r.is_err());
+    assert!(r.err().unwrap().to_string().contains("no such savepoint"));
+    // The transaction is unaffected and still usable.
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 1);
+}
+
+#[test]
+fn concurrent_savepoint_allocations_recycled() {
+    let (mut db, path) = waldb("cw_sp_recycle");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    // Pre-savepoint bulk insert: forces fresh page allocations.
+    for i in 0..200 {
+        let v = format!("val-{}", i);
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(v.into())],
+        )
+        .unwrap();
+    }
+    db.execute("SAVEPOINT bulk", []).unwrap();
+    // Post-savepoint bulk insert: more allocations + leaf splits.
+    for i in 200..500 {
+        let v = format!("post-{}", i);
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(v.into())],
+        )
+        .unwrap();
+    }
+    assert_eq!(count(&db, "t"), 500);
+    db.execute("ROLLBACK TO bulk", []).unwrap();
+    assert_eq!(count(&db, "t"), 200);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 200);
+    // The discarded allocations were recycled at COMMIT: the database
+    // stays writable and durable (freelist splice + WAL commit).
+    db.execute("INSERT INTO t (id, v) VALUES (1000, 'after')", [])
+        .unwrap();
+    assert_eq!(count(&db, "t"), 201);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 201);
+    let rows = db2.query("SELECT v FROM t WHERE id = 42", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "val-42");
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_savepoint_full_rollback_after_rollback_to() {
+    let (mut db, path) = waldb("cw_sp_full_rb");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    db.execute("SAVEPOINT s1", []).unwrap();
+    for i in 2..120 {
+        let v = format!("x{}", i);
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(v.into())],
+        )
+        .unwrap();
+    }
+    db.execute("ROLLBACK TO s1", []).unwrap();
+    // Full ROLLBACK discards everything incl. the pre-savepoint write;
+    // pre-savepoint AND discarded allocations are both recycled.
+    db.execute("ROLLBACK", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 0);
+    db.execute("INSERT INTO t (id, v) VALUES (9, 'fresh')", [])
+        .unwrap();
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 1);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_savepoint_conflict_after_rollback_to() {
+    let (mut db, _) = waldb("cw_sp_conflict");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'x')", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("SAVEPOINT s1", []).unwrap();
+    // A same-row write through this txn, then rolled back.
+    db.execute("UPDATE t SET v = 'mine' WHERE id = 1", [])
+        .unwrap();
+    db.execute("ROLLBACK TO s1", []).unwrap();
+    // A sibling commits a write to that row.
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'sibling' WHERE id = 1", [])
+        .unwrap();
+    db.execute("COMMIT", []).unwrap();
+    // This txn's rolled-back write is gone from the journal; committing
+    // now (no further writes) must succeed — the txn made NO net writes.
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "sibling");
+}
+
+#[test]
+fn concurrent_savepoint_root_split_integrity() {
+    let (mut db, path) = waldb("cw_sp_split");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    // Enough rows to split the root multiple times.
+    for i in 0..400 {
+        let v = format!("r{}", i);
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(v.into())],
+        )
+        .unwrap();
+    }
+    db.execute("SAVEPOINT split", []).unwrap();
+    for i in 400..900 {
+        let v = format!("s{}", i);
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(v.into())],
+        )
+        .unwrap();
+    }
+    db.execute("ROLLBACK TO split", []).unwrap();
+    assert_eq!(count(&db, "t"), 400);
+    // Tree order integrity after undoing post-savepoint splits.
+    let rows = db.query("SELECT id FROM t ORDER BY id", []).unwrap();
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(r[0].as_integer(), i as i64);
+    }
+    // Further writes post-rollback work through the restored view.
+    for i in 400..450 {
+        let v = format!("again{}", i);
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(v.into())],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 450);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 450);
+    let rows = db2.query("SELECT id FROM t ORDER BY id", []).unwrap();
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(r[0].as_integer(), i as i64);
+    }
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_savepoint_with_index_merge() {
+    let (mut db, path) = waldb("cw_sp_merge");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_x ON t(x)", []).unwrap();
+    for i in 0..50 {
+        db.execute(
+            "INSERT INTO t (id, v, x) VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Text(format!("v{}", i).into()),
+                Value::Integer(i * 10),
+            ],
+        )
+        .unwrap();
+    }
+    // Two concurrent txns on DIFFERENT rows of the same hot leaf, each
+    // using savepoints; the second COMMIT must MERGE (row granularity).
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'A', x = 111 WHERE id = 1", [])
+        .unwrap();
+    db.execute("SAVEPOINT one", []).unwrap();
+    db.execute("UPDATE t SET x = 112 WHERE id = 1", []).unwrap();
+    db.execute("ROLLBACK TO one", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'B', x = 222 WHERE id = 2", [])
+        .unwrap();
+    db.execute("SAVEPOINT two", []).unwrap();
+    db.execute("DELETE FROM t WHERE id = 3", []).unwrap();
+    db.execute("ROLLBACK TO two", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap(); // MERGE path with savepoint-cleaned journals
+    Database::set_conn_identity(0);
+    let rows = db
+        .query("SELECT v, x FROM t WHERE id IN (1, 2) ORDER BY id", [])
+        .unwrap();
+    assert_eq!(rows[0][0].as_text(), "A");
+    assert_eq!(rows[0][1].as_integer(), 111);
+    assert_eq!(rows[1][0].as_text(), "B");
+    assert_eq!(rows[1][1].as_integer(), 222);
+    assert_eq!(count(&db, "t"), 50);
+    // Index-resolved lookup stays consistent.
+    let rows = db.query("SELECT id FROM t WHERE x = 222", []).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_integer(), 2);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 50);
+    let rows = db2.query("SELECT id FROM t WHERE x = 111", []).unwrap();
+    assert_eq!(rows.len(), 1);
+    drop(db2);
+    cleanup(&path);
+}
+
+// The statement-path SELECT shortcuts (fast paths / streaming drivers)
+// must serve the concurrent owner's SHADOWS, not the committed state —
+// the v3 fix armed the writer scope for the statement's whole lifetime.
+#[test]
+fn concurrent_statement_path_reads_own_writes() {
+    let (mut db, _) = waldb("cw_sp_probe");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    // Statement-path INSERT (what the driver's Dml arm does).
+    let mut s = db.prepare("INSERT INTO t (id, v) VALUES (?, ?)").unwrap();
+    s.bind(1, Value::Integer(1)).unwrap();
+    s.bind(2, Value::Text("a".into())).unwrap();
+    while matches!(s.step().unwrap(), rustqlite::StepResult::Row) {}
+    s.finalize().unwrap();
+    let n1: i64 = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+    db.execute("SAVEPOINT s1", []).unwrap();
+    let mut s = db.prepare("INSERT INTO t (id, v) VALUES (?, ?)").unwrap();
+    s.bind(1, Value::Integer(2)).unwrap();
+    s.bind(2, Value::Text("b".into())).unwrap();
+    while matches!(s.step().unwrap(), rustqlite::StepResult::Row) {}
+    s.finalize().unwrap();
+    let n2: i64 = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+    db.execute("ROLLBACK TO s1", []).unwrap();
+    let n3: i64 = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+    // Statement-step SELECT (what the driver's fetch_one does).
+    let mut sel = db.prepare("SELECT count(*) FROM t").unwrap();
+    let n4 = if matches!(sel.step().unwrap(), rustqlite::StepResult::Row) {
+        sel.row().unwrap()[0].as_integer()
+    } else {
+        -1
+    };
+    sel.finalize().unwrap();
+    assert_eq!((n1, n2), (1, 2));
+    assert_eq!(n3, 1);
+    assert_eq!(n4, 1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+}
+
+// MINIMIZED from the OLTP benchmark: after a concurrent regime with
+// conflict-retries, a subsequent plain full-table DELETE leaves rows
+// behind (post-reset history=300 of 1600 in the benchmark).
+
+#[test]
+fn probe_delete_all_after_regime_scaled() {
+    // Variant B: the benchmark shape at deterministic scale — plain seed,
+    // a long 2-connection conflict-retry cascade (WAL crosses the
+    // auto-checkpoint threshold inside the regime), then plain delete-all.
+    let (mut db, _) = waldb("cw_probe_del_scaled");
+    db.execute("CREATE TABLE history (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, delta INTEGER NOT NULL)", []).unwrap();
+    for i in 1..=1600i64 {
+        db.execute(
+            "INSERT INTO history (id, account_id, delta) VALUES (?, 1, -1)",
+            [Value::Integer(i)],
+        )
+        .unwrap();
+    }
+    assert_eq!(count(&db, "history"), 1600);
+    for _round in 0..200 {
+        Database::set_conn_identity(1);
+        db.execute("BEGIN CONCURRENT", []).unwrap();
+        Database::set_conn_identity(2);
+        db.execute("BEGIN CONCURRENT", []).unwrap();
+        Database::set_conn_identity(1);
+        db.execute("INSERT INTO history (account_id, delta) VALUES (1, -1)", [])
+            .unwrap();
+        Database::set_conn_identity(2);
+        db.execute("INSERT INTO history (account_id, delta) VALUES (2, -2)", [])
+            .unwrap();
+        Database::set_conn_identity(1);
+        db.execute("COMMIT", []).unwrap();
+        Database::set_conn_identity(2);
+        let r = db.execute("COMMIT", []);
+        if r.is_err() {
+            db.execute("BEGIN CONCURRENT", []).unwrap();
+            db.execute("INSERT INTO history (account_id, delta) VALUES (2, -2)", [])
+                .unwrap();
+            db.execute("COMMIT", []).unwrap();
+        }
+    }
+    Database::set_conn_identity(0);
+    let n = count(&db, "history");
+    eprintln!("after regime: history = {}", n);
+    assert_eq!(n, 2000, "1600 seed + 200 rounds x 2 rows");
+    db.execute("DELETE FROM history", []).unwrap();
+    let n = count(&db, "history");
+    eprintln!("after delete-all: history = {}", n);
+    assert_eq!(n, 0, "full-table DELETE must remove every row");
+}
+
+#[cfg(feature = "sqlx")]
+mod burst_shape {
+    use rustqlite::sqlx_driver::RustqliteConnectOptions;
+    use sqlx::{Connection, Executor, Row};
+    use std::sync::{Arc, Barrier};
+
+    fn opts(name: &str) -> (RustqliteConnectOptions, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("cwleak-{}.db", name));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.to_str().unwrap()));
+        (
+            RustqliteConnectOptions::filename(&path).create_if_missing(true),
+            path,
+        )
+    }
+
+    // The benchmark's failing shape at test scale: a threaded
+    // concurrent-normal burst (implicit-rowid collision cascade through
+    // the DRIVER), then a plain full-table DELETE from another connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn driver_delete_all_after_concurrent_burst() {
+        let (o, _path) = opts("burst");
+        let mut setup = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+        setup.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        setup
+            .execute("CREATE TABLE history (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, delta INTEGER NOT NULL)")
+            .await
+            .unwrap();
+        // Plain seed: 400 rows.
+        let mut seed = String::new();
+        for i in 1..=400i64 {
+            if i > 1 {
+                seed.push(',');
+            }
+            seed.push_str(&format!("({}, 1, -1)", i));
+        }
+        let seed_sql: &'static str = Box::leak(
+            format!(
+                "INSERT INTO history (id, account_id, delta) VALUES {}",
+                seed
+            )
+            .into_boxed_str(),
+        );
+        setup.execute(seed_sql).await.unwrap();
+        setup.execute("PRAGMA synchronous = NORMAL").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 400);
+
+        // 4 connections x 50 rounds, barrier lock-step, implicit-rowid
+        // inserts (every round all four claim the same next rowid — the
+        // collision cascade with retries, through the real driver).
+        const CONNS: usize = 4;
+        const ROUNDS: usize = 50;
+        let barrier = Arc::new(Barrier::new(CONNS));
+        let mut joins = Vec::new();
+        for i in 0..CONNS {
+            let barrier = barrier.clone();
+            let o = o.clone();
+            joins.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+                    let mut committed = 0usize;
+                    'rounds: for r in 0..ROUNDS {
+                        let account = (i * 7 + r) as i64;
+                        for _attempt in 0..8 {
+                            c.execute("BEGIN CONCURRENT").await.unwrap();
+                            let sql = "INSERT INTO history (account_id, delta) VALUES (?, -1)";
+                            let body = sqlx::query(sql).bind(account).execute(&mut c).await;
+                            match body {
+                                Ok(_) => match c.execute("COMMIT").await {
+                                    Ok(_) => {
+                                        committed += 1;
+                                        barrier.wait();
+                                        continue 'rounds;
+                                    }
+                                    // Commit-time 517: the engine rolled the
+                                    // whole txn back — retry it.
+                                    Err(e) => {
+                                        assert!(
+                                            e.to_string().to_lowercase().contains("snapshot"),
+                                            "COMMIT: {e}"
+                                        );
+                                    }
+                                },
+                                // Fetch-time 517 (snapshot moved since BEGIN):
+                                // the txn is still open — ROLLBACK it, then
+                                // retry (the benchmark's discipline).
+                                Err(e) => {
+                                    assert!(
+                                        e.to_string().to_lowercase().contains("snapshot"),
+                                        "INSERT: {e}"
+                                    );
+                                    let _ = c.execute("ROLLBACK").await;
+                                }
+                            }
+                        }
+                        barrier.wait();
+                    }
+                    c.close().await.unwrap();
+                    committed
+                })
+            }));
+        }
+        let mut total = 0usize;
+        for j in joins {
+            total += j.join().unwrap();
+        }
+        let n: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        let n2: i64 = sqlx::query("SELECT sum(1) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        let ids: Vec<i64> = sqlx::query("SELECT id FROM history ORDER BY id")
+            .fetch_all(&mut setup)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        let missing: Vec<i64> = (1..=(400 + total) as i64)
+            .filter(|x| !ids.contains(x))
+            .collect();
+        eprintln!(
+            "DIAG count={n} sum(1)={n2} committed={} missing_ids={:?} max_id={:?}",
+            total,
+            missing,
+            ids.last()
+        );
+        // Which (thread, round) does the missing rowid belong to? Dump the
+        // account_id of every row >= 400 and look for duplicates/absences.
+        let pairs: Vec<(i64, i64)> =
+            sqlx::query("SELECT id, account_id FROM history WHERE id >= 400 ORDER BY id")
+                .fetch_all(&mut setup)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+        let accounts: Vec<i64> = pairs.iter().map(|p| p.1).collect();
+        let mut sorted_accounts = accounts.clone();
+        sorted_accounts.sort();
+        sorted_accounts.dedup();
+        eprintln!(
+            "DIAG2 burst_rows={} unique_accounts={} dup_accounts={:?}",
+            pairs.len(),
+            sorted_accounts.len(),
+            {
+                let mut d = accounts.clone();
+                d.sort();
+                let mut out = Vec::new();
+                for w in d.windows(2) {
+                    if w[0] == w[1] && out.last() != Some(&w[0]) {
+                        out.push(w[0]);
+                    }
+                }
+                out
+            }
+        );
+        assert_eq!(
+            n,
+            (400 + total) as i64,
+            "committed inserts must all be visible"
+        );
+        assert_eq!(n2, n, "count(*) and sum(1) must agree");
+
+        // THE BUG: plain full-table DELETE leaves rows behind.
+        setup.execute("DELETE FROM history").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 0, "full-table DELETE must remove every row");
+        setup.close().await.unwrap();
+    }
+}
+
+#[cfg(feature = "sqlx")]
+mod split_scale {
+    use rustqlite::sqlx_driver::RustqliteConnectOptions;
+    use sqlx::{Connection, Executor, Row};
+    use std::sync::{Arc, Barrier};
+
+    fn opts(name: &str) -> (RustqliteConnectOptions, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("cwleak2-{}.db", name));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.to_str().unwrap()));
+        (
+            RustqliteConnectOptions::filename(&path).create_if_missing(true),
+            path,
+        )
+    }
+
+    // Split-scale variant: enough rows that the burst SPLITS the tree many
+    // times (multi-leaf, root splits, merges) — then a plain full-table
+    // DELETE must still remove every row and the inorder walk must be
+    // contiguous.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn driver_delete_all_after_split_scale_burst() {
+        let (o, _path) = opts("splits");
+        let mut setup = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+        setup.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        setup
+            .execute("CREATE TABLE history (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, delta INTEGER NOT NULL)")
+            .await
+            .unwrap();
+        // Plain seed: 2000 rows via multi-VALUES (multiple leaves + a split).
+        let mut seed = String::new();
+        for i in 1..=2000i64 {
+            if i > 1 {
+                seed.push(',');
+            }
+            seed.push_str(&format!("({}, 1, -1)", i));
+        }
+        let seed_sql: &'static str = Box::leak(
+            format!(
+                "INSERT INTO history (id, account_id, delta) VALUES {}",
+                seed
+            )
+            .into_boxed_str(),
+        );
+        setup.execute(seed_sql).await.unwrap();
+        setup.execute("PRAGMA synchronous = NORMAL").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 2000);
+
+        // 4 connections x 120 rounds of implicit-rowid inserts (the tree
+        // grows ~480 rows -> multiple splits + merges).
+        const CONNS: usize = 4;
+        const ROUNDS: usize = 120;
+        let barrier = Arc::new(Barrier::new(CONNS));
+        let mut joins = Vec::new();
+        for i in 0..CONNS {
+            let barrier = barrier.clone();
+            let o = o.clone();
+            joins.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+                    let mut committed = 0usize;
+                    'rounds: for r in 0..ROUNDS {
+                        let account = (i * 13 + r) as i64;
+                        for _attempt in 0..8 {
+                            c.execute("BEGIN CONCURRENT").await.unwrap();
+                            let sql = "INSERT INTO history (account_id, delta) VALUES (?, -1)";
+                            let body = sqlx::query(sql).bind(account).execute(&mut c).await;
+                            match body {
+                                Ok(_) => match c.execute("COMMIT").await {
+                                    Ok(_) => {
+                                        committed += 1;
+                                        barrier.wait();
+                                        continue 'rounds;
+                                    }
+                                    Err(e) => {
+                                        assert!(
+                                            e.to_string().to_lowercase().contains("snapshot"),
+                                            "COMMIT: {e}"
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    assert!(
+                                        e.to_string().to_lowercase().contains("snapshot"),
+                                        "INSERT: {e}"
+                                    );
+                                    let _ = c.execute("ROLLBACK").await;
+                                }
+                            }
+                        }
+                        barrier.wait();
+                    }
+                    c.close().await.unwrap();
+                    committed
+                })
+            }));
+        }
+        let mut total = 0usize;
+        for j in joins {
+            total += j.join().unwrap();
+        }
+        let n: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            n,
+            (2000 + total) as i64,
+            "committed inserts must all be visible"
+        );
+
+        // Inorder contiguity BEFORE the delete (tree integrity).
+        let ids: Vec<i64> = sqlx::query("SELECT id FROM history ORDER BY id")
+            .fetch_all(&mut setup)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        let gaps: Vec<i64> = (1..=(2000 + total as i64))
+            .filter(|x| !ids.contains(x))
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "inorder gaps before delete: {:?}",
+            &gaps[..gaps.len().min(10)]
+        );
+
+        // THE BUG SHAPE: plain full-table DELETE must remove every row.
+        setup.execute("DELETE FROM history").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 0, "full-table DELETE must remove every row (got {})", n);
+        setup.close().await.unwrap();
+    }
+}
+
+#[cfg(feature = "sqlx")]
+mod oltp_phases {
+    use rustqlite::sqlx_driver::RustqliteConnectOptions;
+    use sqlx::{Connection, Executor, Row};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    fn think() {
+        std::thread::sleep(Duration::from_micros(300));
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn opts(name: &str) -> (RustqliteConnectOptions, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("cwleak3-{}.db", name));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.to_str().unwrap()));
+        (
+            RustqliteConnectOptions::filename(&path)
+                .create_if_missing(true)
+                .busy_timeout(Duration::from_secs(30)),
+            path,
+        )
+    }
+
+    // The benchmark's failing PHASE SEQUENCE at test scale:
+    // plain burst -> concurrent burst -> plain delete-all. The plain phase
+    // running FIRST is the trigger (bisected).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn driver_plain_then_concurrent_then_delete_all() {
+        let (o, _path) = opts("phases");
+        let mut setup = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+        setup.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        setup
+            .execute(
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, \
+                 name TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        setup
+            .execute("CREATE INDEX idx_accounts_name ON accounts(name)")
+            .await
+            .unwrap();
+        setup
+            .execute(
+                "CREATE TABLE history (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, \
+                 delta INTEGER NOT NULL)",
+            )
+            .await
+            .unwrap();
+        let mut seed = String::new();
+        for i in 0..10_000i64 {
+            if i > 0 {
+                seed.push(',');
+            }
+            seed.push_str(&format!("({}, 10000, 'acct-{}')", i, i));
+        }
+        let seed_sql: &'static str = Box::leak(
+            format!("INSERT INTO accounts (id, balance, name) VALUES {}", seed).into_boxed_str(),
+        );
+        setup.execute(seed_sql).await.unwrap();
+        setup.execute("PRAGMA synchronous = NORMAL").await.unwrap();
+
+        const CONNS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        // ---- Phase 1: plain burst (BEGIN, UPDATE accounts, INSERT history,
+        // SELECT, COMMIT) — the serialized single-writer workload.
+        {
+            let barrier = Arc::new(Barrier::new(CONNS));
+            let mut joins = Vec::new();
+            for i in 0..CONNS {
+                let barrier = barrier.clone();
+                let o = o.clone();
+                joins.push(std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+                        let mut rng = Rng((i as u64 + 1).wrapping_mul(0x2545F4914F6CDD1D) | 1);
+                        for r in 0..ROUNDS {
+                            let _ = r;
+                            let account = rng.below(10_000) as i64;
+                            c.execute("BEGIN").await.unwrap();
+                            sqlx::query("UPDATE accounts SET balance = balance - 1 WHERE id = ?")
+                                .bind(account)
+                                .execute(&mut c)
+                                .await
+                                .unwrap();
+                            think();
+                            sqlx::query("INSERT INTO history (account_id, delta) VALUES (?, -1)")
+                                .bind(account)
+                                .execute(&mut c)
+                                .await
+                                .unwrap();
+                            think();
+                            let _: i64 = sqlx::query("SELECT balance FROM accounts WHERE id = ?")
+                                .bind(account)
+                                .fetch_one(&mut c)
+                                .await
+                                .unwrap()
+                                .get(0);
+                            think();
+                            c.execute("COMMIT").await.unwrap();
+                            barrier.wait();
+                        }
+                        c.close().await.unwrap();
+                    })
+                }));
+            }
+            for j in joins {
+                j.join().unwrap();
+            }
+        }
+        let h1: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(h1, (CONNS * ROUNDS) as i64);
+
+        // ---- Reset between phases (the benchmark's per-mode reset: mode 2
+        // grows the tree from EMPTY inside the concurrent regime — every
+        // split happens under concurrency).
+        setup
+            .execute("UPDATE accounts SET balance = 10000")
+            .await
+            .unwrap();
+        setup.execute("DELETE FROM history").await.unwrap();
+        let h0: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(h0, 0);
+
+        // ---- Phase 2: concurrent burst (same shape, BEGIN CONCURRENT).
+        {
+            let barrier = Arc::new(Barrier::new(CONNS));
+            let mut joins = Vec::new();
+            for i in 0..CONNS {
+                let barrier = barrier.clone();
+                let o = o.clone();
+                joins.push(std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&o).unwrap();
+                        let mut rng = Rng((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15) | 1);
+                        'rounds: for r in 0..ROUNDS {
+                            let _ = r;
+                            let account = rng.below(10_000) as i64;
+                            for _attempt in 0..8 {
+                                c.execute("BEGIN CONCURRENT").await.unwrap();
+                                let body = sqlx::query(
+                                    "UPDATE accounts SET balance = balance - 1 WHERE id = ?",
+                                )
+                                .bind(account)
+                                .execute(&mut c)
+                                .await;
+                                if body.is_ok() {
+                                    think();
+                                }
+                                if body.is_err() {
+                                    let msg = body.err().unwrap().to_string().to_lowercase();
+                                    assert!(msg.contains("snapshot"), "{}", msg);
+                                    let _ = c.execute("ROLLBACK").await;
+                                    continue;
+                                }
+                                let body = sqlx::query(
+                                    "INSERT INTO history (account_id, delta) VALUES (?, -1)",
+                                )
+                                .bind(account)
+                                .execute(&mut c)
+                                .await;
+                                if body.is_ok() {
+                                    think();
+                                }
+                                if body.is_err() {
+                                    let msg = body.err().unwrap().to_string().to_lowercase();
+                                    assert!(msg.contains("snapshot"), "{}", msg);
+                                    let _ = c.execute("ROLLBACK").await;
+                                    continue;
+                                }
+                                match c.execute("COMMIT").await {
+                                    Ok(_) => {
+                                        barrier.wait();
+                                        continue 'rounds;
+                                    }
+                                    Err(e) => {
+                                        let msg = e.to_string().to_lowercase();
+                                        assert!(msg.contains("snapshot"), "{}", msg);
+                                    }
+                                }
+                            }
+                            barrier.wait();
+                        }
+                        c.close().await.unwrap();
+                    })
+                }));
+            }
+            for j in joins {
+                j.join().unwrap();
+            }
+        }
+        let h2: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(h2, (CONNS * ROUNDS) as i64, "concurrent phase rows");
+
+        // ---- Phase 3: plain reset (UPDATE all + DELETE all) — the leak.
+        // Mirror the benchmark: the failing mode ran at synchronous=FULL.
+        setup.execute("PRAGMA synchronous = FULL").await.unwrap();
+        setup
+            .execute("UPDATE accounts SET balance = 10000")
+            .await
+            .unwrap();
+        // No duplicate rowids and a contiguous inorder walk before the
+        // delete (tree integrity after the concurrent regime grew it from
+        // empty through many splits and merges).
+        let dups: Vec<(i64, i64)> =
+            sqlx::query("SELECT id, count(*) as c FROM history GROUP BY id HAVING c > 1")
+                .fetch_all(&mut setup)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+        assert!(
+            dups.is_empty(),
+            "duplicate rowids after regime: {:?}",
+            &dups[..dups.len().min(8)]
+        );
+        let ids: Vec<i64> = sqlx::query("SELECT id FROM history ORDER BY id")
+            .fetch_all(&mut setup)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(
+            ids.first().copied(),
+            Some(1),
+            "inorder walk must start at the lowest rowid"
+        );
+        // THE REGRESSION: plain full-table DELETE after the regime must
+        // remove every row (a misordered interior once made the walk skip
+        // whole leaves).
+        setup.execute("DELETE FROM history").await.unwrap();
+        let h3: i64 = sqlx::query("SELECT count(*) FROM history")
+            .fetch_one(&mut setup)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            h3, 0,
+            "full-table DELETE must remove every row (got {})",
+            h3
+        );
+        setup.close().await.unwrap();
+    }
 }

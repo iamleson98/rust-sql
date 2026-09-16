@@ -633,10 +633,20 @@ impl RustqliteConnection {
         // transaction gate — a foreign transaction that is open right now
         // (possibly a leaked one awaiting pool-release cleanup) must never
         // block a new connection from opening.
+        //
+        // POOL-OPEN HARDENING: the flag is set through the direct engine
+        // setter, NOT `PRAGMA foreign_keys = ON`. Executing the PRAGMA
+        // would route through the engine's concurrent-regime guard, which
+        // refuses write-shaped statements from NON-owner connections
+        // while any `BEGIN CONCURRENT` transaction is open — a pool that
+        // lazily opens connections mid-burst (sqlx Pool acquires from
+        // worker threads exactly then) would see the open FAIL with
+        // "database is locked". The setter flips the same pager flag with
+        // no page writes and no regime interaction, so lazy opens always
+        // succeed.
         if options.foreign_keys {
             let mut db = conn.shared.db.write();
-            db.execute("PRAGMA foreign_keys = ON", &[] as &[EngineValue])
-                .map_err(crate::sqlx_driver::error::engine_err)?;
+            db.set_foreign_keys(true);
         }
         Ok(conn)
     }
@@ -1073,11 +1083,14 @@ impl RustqliteConnection {
                         .map_err(crate::sqlx_driver::error::engine_err)
                 };
                 // Transaction bookkeeping for raw SQL control statements —
-                // runs BEFORE the error propagates: a failed concurrent
+                // applied BEFORE the error propagates: a failed concurrent
                 // COMMIT (SQLITE_BUSY_SNAPSHOT conflict) still ENDED the
                 // engine-side transaction (the engine rolled it back), so
-                // the connection must not keep claiming one. The flags
-                // apply AFTER the engine guard drops (it borrows self).
+                // the connection must not keep claiming one and the shared
+                // regime set must drop us (a stale entry keeps every plain
+                // writer waiting on a transaction that no longer exists).
+                // The flags apply AFTER the engine guard drops (it borrows
+                // self).
                 let mut conc_begin = false;
                 let mut conc_end = false;
                 let mut plain_reset = false;
@@ -1102,7 +1115,7 @@ impl RustqliteConnection {
                             // and ended the transaction (committed, or
                             // rolled back on conflict with
                             // SQLITE_BUSY_SNAPSHOT surfacing as the
-                            // statement's error above).
+                            // statement's error below).
                             conc_end = true;
                         } else if self.i_own_engine_tx() {
                             plain_reset = true;
@@ -1120,11 +1133,11 @@ impl RustqliteConnection {
                     Ast::Rollback(_) => {}
                     _ => {}
                 }
-                // Propagate the statement's error AFTER the bookkeeping
-                // decisions (see the comment above the match).
-                exec_result?;
-                rows_affected = db.changes().max(0) as u64;
-                last_rowid = db.last_insert_rowid();
+                // Snapshot the change counters while the guard is alive
+                // (only meaningful on success; the error path ignores them).
+                let counters = exec_result
+                    .is_ok()
+                    .then(|| (db.changes().max(0) as u64, db.last_insert_rowid()));
                 drop(db);
                 if conc_begin {
                     self.concurrent_tx = true;
@@ -1136,6 +1149,13 @@ impl RustqliteConnection {
                 }
                 if plain_reset {
                     self.shared.tx_reset();
+                }
+                // Bookkeeping applied — propagate the statement's result
+                // NOW (after the flags, per the comment above).
+                exec_result?;
+                if let Some((rows, rowid)) = counters {
+                    rows_affected = rows;
+                    last_rowid = rowid;
                 }
                 if let Some(ticket) = durability_ticket {
                     // Durability point, OUTSIDE the engine write lock (the
@@ -1181,6 +1201,20 @@ impl RustqliteConnection {
         let ast = parser::parse(sql).map_err(crate::sqlx_driver::error::engine_err)?;
         match &ast {
             Ast::Begin(_) => {
+                // A `BEGIN CONCURRENT` transaction is open on this
+                // connection: starting a sqlx transaction over it would
+                // commit NOTHING at its outermost COMMIT (the deferred
+                // engine transaction never starts — the concurrent one is
+                // already open) and its writes would silently vanish at
+                // close. SQLite rejects BEGIN-in-BEGIN; mirror that with a
+                // clear message (nest with SAVEPOINT or COMMIT first).
+                if self.concurrent_tx {
+                    return Err(crate::sqlx_driver::error::driver_err(
+                        "cannot start a transaction within a transaction: a BEGIN CONCURRENT \
+                         transaction is open on this connection (use SAVEPOINT, or COMMIT it \
+                         first)",
+                    ));
+                }
                 // DEFERRED: record intent only. The engine tx starts at the
                 // first write statement (see the Dml arm in `run_one`).
                 self.tx_active = true;
@@ -1199,7 +1233,11 @@ impl RustqliteConnection {
             Ast::Rollback(r) => {
                 if r.savepoint.is_some() {
                     // `ROLLBACK TO SAVEPOINT` — the transaction stays open.
-                    if self.i_own_engine_tx() {
+                    // A concurrent owner's savepoints live in its
+                    // BEGIN CONCURRENT transaction (keyed by our armed
+                    // identity), not the plain engine transaction — route
+                    // them through the engine either way.
+                    if self.concurrent_tx || self.i_own_engine_tx() {
                         let mut db = self.acquire_write()?;
                         let _ = db.execute(sql, &[] as &[EngineValue]);
                     }
@@ -1215,11 +1253,14 @@ impl RustqliteConnection {
                 }
             }
             Ast::Savepoint(_) | Ast::Release(_) => {
-                // Savepoints only exist inside a STARTED engine transaction.
-                // A deferred transaction that has not written yet has no
-                // engine transaction, so its savepoints are no-ops (they
-                // guard nothing: there are no changes to unwind).
-                if self.i_own_engine_tx() {
+                // Savepoints only exist inside a STARTED engine
+                // transaction — a plain deferred transaction that has not
+                // written yet has no engine transaction, so its savepoints
+                // are no-ops (they guard nothing). A BEGIN CONCURRENT
+                // owner's engine transaction IS open: its savepoints are
+                // transaction-local (page-shadow undo) and must run
+                // through the engine, keyed by our armed identity.
+                if self.concurrent_tx || self.i_own_engine_tx() {
                     let mut db = self.acquire_write()?;
                     db.execute(sql, &[] as &[EngineValue])
                         .map_err(crate::sqlx_driver::error::engine_err)?;

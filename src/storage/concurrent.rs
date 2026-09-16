@@ -112,6 +112,41 @@ pub struct ConcurrentCommitOutcome {
     pub root_fixups: Vec<(PageId, PageId)>,
 }
 
+/// One `SAVEPOINT` level inside a concurrent transaction. The undo
+/// discipline mirrors the plain pager's savepoints (`SavepointLevel`):
+/// a page's pre-image is captured at FETCH time — the bytes at fetch are
+/// the pre-mutation state, and the first fetch after the savepoint's
+/// creation carries exactly the savepoint-time bytes (a page cannot be
+/// mutated without being fetched first).
+///
+/// Everything this level must restore is PRIVATE to the transaction
+/// (shadow pages, allocation/freelist intents, the row journal, the
+/// root-split lineage) — the live page cache and the shared freelist are
+/// untouched, so a concurrent-txn savepoint never interacts with another
+/// connection's state.
+#[derive(Debug, Clone)]
+pub(crate) struct ConcurrentSavepoint {
+    name: String,
+    /// Shadow page id -> bytes as of this savepoint's creation (captured
+    /// at first fetch after creation; `or_insert` keeps the FIRST capture
+    /// = the savepoint-time state).
+    undo: HashMap<PageId, Vec<u8>>,
+    /// Mark into the transaction's `allocated` vector: pages past it were
+    /// allocated AFTER this savepoint and are DROPPED (never restored) by
+    /// `ROLLBACK TO` — they move to `discarded` for end-of-transaction
+    /// freelist recycling.
+    allocated_mark: usize,
+    /// Mark into `freed`: tree-surgery frees after this savepoint are
+    /// undone (the pages are live tree members again).
+    freed_mark: usize,
+    /// Mark into the row journal (`row_journal` + `op_ok`, parallel
+    /// arrays): journal ops past it describe writes being undone.
+    journal_mark: usize,
+    /// Root-split lineage snapshot (splits are rare — a small map). A
+    /// split performed after this savepoint is undone with the pages.
+    lineage_snap: HashMap<PageId, PageId>,
+}
+
 /// One open `BEGIN CONCURRENT` transaction's pager-side state.
 ///
 /// Lives in the [`ConcurrentManager`] keyed by the engine-issued
@@ -166,6 +201,17 @@ pub struct ConcurrentTxn {
     /// origin root as seen at first touch) and, at install time, to update
     /// the manager's origin -> current-root map.
     pub(crate) root_lineage: HashMap<PageId, PageId>,
+    /// SAVEPOINT stack (SQLite semantics: named, nested, last-wins on
+    /// name lookup). See [`ConcurrentSavepoint`].
+    pub(crate) savepoints: Vec<ConcurrentSavepoint>,
+    /// Page ids allocated by this transaction and then DROPPED by a
+    /// `ROLLBACK TO SAVEPOINT` (post-savepoint allocations whose tree
+    /// links were undone). They are unreferenced garbage in the
+    /// transaction's private view: COMMIT splices them into the live
+    /// freelist alongside `freed` (the flush publishes the page-count
+    /// high-water, so the ids exist in the committed file), and a full
+    /// ROLLBACK recycles them alongside `allocated`.
+    pub(crate) discarded: Vec<PageId>,
 }
 
 impl ConcurrentTxn {
@@ -182,7 +228,24 @@ impl ConcurrentTxn {
             row_journal: Vec::new(),
             op_ok: Vec::new(),
             root_lineage: HashMap::new(),
+            savepoints: Vec::new(),
+            discarded: Vec::new(),
         }
+    }
+
+    /// True when `id` was already part of the transaction's page state at
+    /// the savepoint `sp`'s creation: fetched from committed state (below
+    /// the BEGIN page count) or allocated before the savepoint's
+    /// allocation mark. Per-transaction allocation ids are strictly
+    /// ascending (monotonic `n_pages` counter under the engine statement
+    /// lock), so `allocated[mark-1]` is the boundary.
+    fn existed_at(&self, sp: &ConcurrentSavepoint, id: PageId) -> bool {
+        id < self.begin_n_pages
+            || (sp.allocated_mark > 0
+                && self
+                    .allocated
+                    .get(sp.allocated_mark - 1)
+                    .is_some_and(|&last| id <= last))
     }
 
     /// Canonical (origin) root for a CURRENT root page id: chases this
@@ -224,6 +287,16 @@ pub struct ConcurrentManager {
     /// origin's entry). Absent = the origin root is still current. The
     /// merge's replay resolves each journal op's tree through this map.
     live_roots: RwLock<HashMap<PageId, PageId>>,
+    /// ANY known root of a tree → its ULTIMATE ORIGIN root (the reverse of
+    /// `live_roots`, covering every intermediate split root). Row-stamp
+    /// keys and root-view validation fold through this map so that
+    /// transactions with DIFFERENT (stale vs current) root views of the
+    /// SAME tree agree on the key: a row stamp published under the current
+    /// root is visible to a validator holding an intermediate view, and
+    /// vice versa. Without the fold, two overlapping transactions whose
+    /// views straddled a split could both install/merge the SAME rowid —
+    /// a duplicate cell that breaks ordered walks (mass DELETE skips).
+    root_origin: RwLock<HashMap<PageId, PageId>>,
     /// Monotonic install epoch. Bumped once per concurrent COMMIT; pages
     /// installed by that commit carry the new value.
     commit_epoch: AtomicU64,
@@ -252,6 +325,7 @@ impl ConcurrentManager {
             stamps: RwLock::new(HashMap::new()),
             row_stamps: RwLock::new(HashMap::new()),
             live_roots: RwLock::new(HashMap::new()),
+            root_origin: RwLock::new(HashMap::new()),
             commit_epoch: AtomicU64::new(1),
             next_txn: AtomicU64::new(1),
             commit_lock: Mutex::new(()),
@@ -327,22 +401,32 @@ impl ConcurrentManager {
 
     /// Stamp the rows a committing transaction's journal wrote (row-level
     /// first-committer-wins bookkeeping). Index and table ops both key by
-    /// (root, rowid).
+    /// (ORIGIN root, rowid) — the origin fold makes the key independent of
+    /// which root view the committer held (see `root_origin`).
     fn stamp_rows(&self, ops: impl Iterator<Item = (PageId, i64)>, epoch: u64) {
         let mut rows = self.row_stamps.write();
-        for key in ops {
-            rows.insert(key, epoch);
+        for (root, rowid) in ops {
+            let origin = self.origin_of(root);
+            rows.insert((origin, rowid), epoch);
         }
     }
 
-    /// Committed row stamp of (canonical root, rowid). 0 = never written
-    /// by a concurrent commit.
+    /// Committed row stamp of (ORIGIN root, rowid). 0 = never written
+    /// by a concurrent commit. The origin fold applies on BOTH sides
+    /// (stamp and lookup), so views that straddle a split agree.
     pub(crate) fn row_stamp(&self, root: PageId, rowid: i64) -> u64 {
+        let origin = self.origin_of(root);
         self.row_stamps
             .read()
-            .get(&(root, rowid))
+            .get(&(origin, rowid))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Fold `root` to its ultimate ORIGIN root: the row-stamp key space
+    /// and root-view checks are view-independent through this fold.
+    pub(crate) fn origin_of(&self, root: PageId) -> PageId {
+        self.root_origin.read().get(&root).copied().unwrap_or(root)
     }
 
     /// The CURRENT committed root for the tree whose ORIGIN root is
@@ -357,23 +441,31 @@ impl ConcurrentManager {
 
     /// Record a committed root move (origin -> new current), folding any
     /// intermediate chain: each lineage entry (new -> old) resolves old's
-    /// origin and points it at `new`.
+    /// origin and points it at `new`. Also maintains the REVERSE map
+    /// (`root_origin`): every root in the chain folds to the ultimate
+    /// origin, so row-stamp keys and root-view checks are view-independent.
     fn install_lineage(&self, lineage: &HashMap<PageId, PageId>) {
         if lineage.is_empty() {
             return;
         }
         let mut live = self.live_roots.write();
+        let mut origin = self.root_origin.write();
         for (&new_root, &old_root) in lineage.iter() {
             // Chase the old root's origin through the SAME lineage batch
             // (entries are in split order, so the chain resolves).
-            let mut origin = old_root;
+            let mut o = old_root;
             for _ in 0..64 {
-                match lineage.get(&origin) {
-                    Some(&older) if older != origin => origin = older,
+                match lineage.get(&o) {
+                    Some(&older) if older != o => o = older,
                     _ => break,
                 }
             }
-            live.insert(origin, new_root);
+            // Fold through any previously-committed lineage too.
+            let ultimate = origin.get(&o).copied().unwrap_or(o);
+            origin.insert(new_root, ultimate);
+            origin.insert(old_root, ultimate);
+            origin.insert(ultimate, ultimate);
+            live.insert(ultimate, new_root);
         }
     }
 
@@ -402,6 +494,50 @@ thread_local! {
 /// Current armed scope (instance, txn) — `None` when not armed.
 pub(crate) fn writer_scope() -> Option<(u64, u64)> {
     WRITER_SCOPE.with(|c| c.get())
+}
+
+/// SAVEPOINT undo capture for a shadow-page fetch (the mirror of the
+/// plain pager's `capture_savepoint_undo`, operating on the transaction's
+/// PRIVATE pages instead of the live cache). Called from
+/// `writer_shadow_fetch` while savepoint levels are open.
+///
+/// Discipline: the bytes at fetch time are the pre-mutation state, and
+/// `or_insert` keeps each level's FIRST capture — which is exactly the
+/// savepoint-time state, because a page cannot be mutated without being
+/// fetched first. The newest-level fast exit is sound because capture
+/// fills EVERY eligible level in one pass (eligibility is monotone: a
+/// page that existed at a newer level's creation existed at every older
+/// level's creation too).
+fn capture_shadow_undo(txn: &mut ConcurrentTxn, id: PageId, pr: &PageRef) {
+    // Fast exit: the newest level already has this page (the common
+    // re-fetch loop on a hot page).
+    if txn
+        .savepoints
+        .last()
+        .is_some_and(|s| s.undo.contains_key(&id))
+    {
+        return;
+    }
+    // A page needs a pre-image in a level only if it existed at that
+    // level's creation: fetched from committed state (below the BEGIN
+    // page count) or allocated before the level's mark. Post-savepoint
+    // allocations are DROPPED by ROLLBACK TO, never restored — no
+    // pre-image needed (a bulk-INSERT window between savepoints then
+    // costs ~0 undo bytes, same optimization as the plain pager).
+    let elig: Vec<bool> = txn
+        .savepoints
+        .iter()
+        .map(|s| txn.existed_at(s, id))
+        .collect();
+    if !elig.iter().any(|&e| e) {
+        return;
+    }
+    let bytes = pr.lock().data.clone();
+    for (s, e) in txn.savepoints.iter_mut().zip(elig) {
+        if e {
+            s.undo.entry(id).or_insert_with(|| bytes.clone());
+        }
+    }
 }
 
 /// RAII guard returned by [`Pager::arm_writer_scope`]. Restores the
@@ -510,8 +646,19 @@ impl Pager {
     /// transaction). Readers use the plain live path (the live cache IS
     /// the committed store in this regime) but must bound page ids by
     /// the COMMITTED page count, not the live allocation high-water.
+    ///
+    /// AUTHORITATIVE read (`ConcurrentManager::any_active`): this feeds
+    /// `finish_concurrent_txn` (the engine's regime-lifetime decision) and
+    /// the COUNT(*) memo bypass. The combined `concurrent_gate` fast-path
+    /// word is only a HINT — its bit0 can be transiently stale-zero when
+    /// two threads' `refresh_concurrent_gate` stores interleave (a plain
+    /// read-then-store lost update). A stale-zero here once collapsed the
+    /// regime while transactions were still open: the owners' subsequent
+    /// INSERTs then routed to the PLAIN autocommit path, wrote the live
+    /// cache mid-regime, and clobbered concurrent installs (lost and
+    /// phantom rows). One atomic load, off the per-row hot path.
     pub fn concurrent_writers_active(&self) -> bool {
-        self.concurrent_gate.load(Ordering::Acquire) & 0x1 != 0
+        self.concurrent.any_active()
     }
 
     /// COMMIT a concurrent transaction: validate, then either install the
@@ -591,11 +738,55 @@ impl Pager {
                 }
             }
         }
+        // ---- ROOT-VIEW validation: the fetch-time stamp gate protects
+        // PAGES, not tree ROOTS. A sibling commit may have installed a new
+        // root ABOVE this transaction's view (its descent split the same
+        // subtree); this transaction's later statements then descend a
+        // subtree that is no longer the whole tree, and installing its
+        // shadows would graft a PRIVATE root over the committed one —
+        // forking the tree, with rows stranded behind unreachable
+        // subtrees and the catalog's rootpage flip-flopping between
+        // competing views. The view is current iff the journal's
+        // (origin-folded) canonical root equals the tree's CURRENT root;
+        // a mismatch is a conflict of the same class as a moved page
+        // stamp: route it to the SAME resolution (row validation →
+        // MERGE replays the journal onto the CURRENT roots, or abort).
+        for op in &txn.row_journal {
+            if op.root == 0 {
+                continue; // the catalog root is fixed at page 0
+            }
+            let origin = self.concurrent.origin_of(op.root);
+            if self.concurrent.current_root_of(origin) != op.root && !conflicts.contains(&op.root) {
+                conflicts.push(op.root);
+            }
+        }
+        // ---- ROW-STAMP validation on the FAST path: a sibling commit may
+        // have written the same (tree, rowid) into a DIFFERENT leaf — a
+        // leaf split between the two transactions' snapshots moves the
+        // row's home page, so both transactions' dirty page sets are
+        // DISJOINT and the page/root checks above pass for both. Without
+        // this check both install, grafting DUPLICATE rowid cells into the
+        // tree (duplicate keys break ordered walks — a mass DELETE skips
+        // the whole range). The row stamp is the authority at ROW
+        // granularity: first committer wins; later committers route to
+        // the conflict resolution, whose row validation aborts them with
+        // a retriable 517.
+        if conflicts.is_empty() {
+            for op in &txn.row_journal {
+                if self.concurrent.row_stamp(op.root, op.rowid) > txn.begin_epoch {
+                    conflicts.push(if op.root == 0 { 0 } else { op.root });
+                    break;
+                }
+            }
+        }
         if !conflicts.is_empty() {
             // Any resolution of a page conflict (merge or abort) discards
-            // the page shadows, so this transaction's fresh allocations
-            // are garbage either way — recycle them up front.
-            self.splice_txn_freed(&txn.allocated)?;
+            // the page shadows, so this transaction's fresh allocations —
+            // including savepoint-discarded ones — are garbage either way:
+            // recycle them up front.
+            let mut recycle = txn.allocated.clone();
+            recycle.extend_from_slice(&txn.discarded);
+            self.splice_txn_freed(&recycle)?;
             return self.resolve_page_conflict(
                 txn.row_journal.clone(),
                 txn.op_ok.clone(),
@@ -612,8 +803,13 @@ impl Pager {
         // Page-0 header refresh rides the flush (n_pages high-water,
         // freelist, cookie) — the standard flush_wal path does it.
 
-        // ---- deferred frees → live freelist (trunk-format splice).
-        self.splice_txn_freed(&txn.freed)?;
+        // ---- deferred frees → live freelist (trunk-format splice), plus
+        // the pages a ROLLBACK TO SAVEPOINT discarded mid-transaction
+        // (their ids exist in the committed file — the flush publishes
+        // the high-water — and no committed tree references them).
+        let mut freed_now = txn.freed.clone();
+        freed_now.extend_from_slice(&txn.discarded);
+        self.splice_txn_freed(&freed_now)?;
 
         // ---- WAL commit: frames for every installed page + splice
         // writes + header, one commit marker. The fsync is deferred to
@@ -795,7 +991,8 @@ impl Pager {
                 if c == 0 {
                     continue; // the catalog root is fixed at page 0
                 }
-                let current = self.concurrent.current_root_of(c);
+                let origin = self.concurrent.origin_of(c);
+                let current = self.concurrent.current_root_of(origin);
                 if current != c {
                     outcome.root_fixups.push((c, current));
                 }
@@ -881,15 +1078,29 @@ impl Pager {
         let root = if op.root == 0 {
             0
         } else {
-            view_roots
-                .get(&op.root)
-                .copied()
-                .unwrap_or_else(|| self.concurrent.current_root_of(op.root))
+            view_roots.get(&op.root).copied().unwrap_or_else(|| {
+                self.concurrent
+                    .current_root_of(self.concurrent.origin_of(op.root))
+            })
         };
         let post_root = if op.is_index {
             let mut bt = Btree::new(self, root, true);
             match op.kind {
-                JournalKind::Insert => bt.insert_index(&op.key, op.rowid)?,
+                JournalKind::Insert => {
+                    // Duplicate guard: the current tree must NOT already
+                    // hold this (key, rowid) — a validation gap would
+                    // otherwise graft a duplicate index entry. Divergence
+                    // aborts the merge (the caller surfaces a retriable
+                    // 517) instead of corrupting the index.
+                    let existing = bt.lookup_index(&op.key)?;
+                    if existing.contains(&op.rowid) {
+                        return Err(Error::Transaction(format!(
+                            "index entry ({}, {}) already present during replay",
+                            op.rowid, op.root
+                        )));
+                    }
+                    bt.insert_index(&op.key, op.rowid)?
+                }
                 JournalKind::Delete => {
                     let ok = bt.delete_index(&op.key, op.rowid)?;
                     if ok != expected_ok {
@@ -907,7 +1118,21 @@ impl Pager {
         } else {
             let mut bt = Btree::new(self, root, false);
             match op.kind {
-                JournalKind::Insert => bt.insert_table(op.rowid, &op.payload)?,
+                JournalKind::Insert => {
+                    // Duplicate guard: the current tree must NOT already
+                    // hold this rowid — a validation gap would otherwise
+                    // graft a duplicate cell (duplicate keys break ordered
+                    // walks: a mass DELETE skips the whole range). Divergence
+                    // aborts the merge (retriable 517), never corrupts.
+                    use crate::storage::btree::LookupResult;
+                    if matches!(bt.lookup_table(op.rowid)?, LookupResult::Found(_)) {
+                        return Err(Error::Transaction(format!(
+                            "row {} already present during replay",
+                            op.rowid
+                        )));
+                    }
+                    bt.insert_table(op.rowid, &op.payload)?
+                }
                 JournalKind::Replace => {
                     // No parity check: the in-place "fits" decision depends
                     // on the CURRENT page layout (a concurrent delete may
@@ -977,10 +1202,10 @@ impl Pager {
                 _ => break,
             }
         }
-        let current = view_roots
-            .get(&cur)
-            .copied()
-            .unwrap_or_else(|| self.concurrent.current_root_of(cur));
+        let current = view_roots.get(&cur).copied().unwrap_or_else(|| {
+            self.concurrent
+                .current_root_of(self.concurrent.origin_of(cur))
+        });
         if current != stale_root {
             row[3] = crate::Value::Integer(current as i64 + 1);
             let mut patched = op.clone();
@@ -1007,8 +1232,10 @@ impl Pager {
         // surgery that linked them lived only in shadows), so freelist
         // recycling is safe. Pages in `txn.freed` were live in the
         // committed trees and the freeing lived only in shadows — they
-        // stay live; do NOT recycle them.
-        let recycle = txn.allocated.clone();
+        // stay live; do NOT recycle them. Post-savepoint discards
+        // (ROLLBACK TO victims) are the same kind of garbage.
+        let mut recycle = txn.allocated.clone();
+        recycle.extend_from_slice(&txn.discarded);
         self.splice_txn_freed(&recycle)?;
 
         if !recycle.is_empty() {
@@ -1020,6 +1247,216 @@ impl Pager {
         self.note_tx_rolled_back();
         self.refresh_concurrent_gate();
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // concurrent regime: SAVEPOINT (transaction-local nested undo)
+    // -----------------------------------------------------------------
+
+    /// `SAVEPOINT <name>` inside a concurrent transaction. Creates a
+    /// transaction-local savepoint level: shadow-page pre-images are
+    /// captured lazily at fetch time (see `writer_shadow_fetch`), and the
+    /// level records marks into the transaction's append-only intents
+    /// (allocations / frees / row journal) plus a lineage snapshot.
+    pub fn savepoint_concurrent(&self, txn_id: u64, name: &str) -> Result<()> {
+        let mut guard = self.concurrent.get(txn_id).ok_or_else(|| {
+            Error::Transaction(format!("concurrent transaction {} is not open", txn_id))
+        })?;
+        let Some(txn) = guard.get_mut(&txn_id) else {
+            return Err(Error::Transaction(format!(
+                "concurrent transaction {} is not open",
+                txn_id
+            )));
+        };
+        txn.savepoints.push(ConcurrentSavepoint {
+            name: name.to_ascii_lowercase(),
+            undo: HashMap::new(),
+            allocated_mark: txn.allocated.len(),
+            freed_mark: txn.freed.len(),
+            journal_mark: txn.row_journal.len(),
+            lineage_snap: txn.root_lineage.clone(),
+        });
+        Ok(())
+    }
+
+    /// `ROLLBACK TO SAVEPOINT <name>` inside a concurrent transaction:
+    /// restore the transaction's PRIVATE state (shadow bytes, allocation
+    /// and free intents, row journal, root lineage) to the savepoint. The
+    /// savepoint itself stays active with a reset undo log (SQLite
+    /// semantics — it can be rolled back to again); levels above it are
+    /// discarded. Returns the new savepoint-stack depth, or `None` when no
+    /// savepoint with that name exists. The live page cache and every
+    /// other connection's state are untouched by construction.
+    pub fn rollback_concurrent_savepoint(&self, txn_id: u64, name: &str) -> Result<Option<usize>> {
+        let psz = self.page_size();
+        let junk: Vec<PageId>;
+        let keep_depth: usize;
+        let begin_n_pages: u32;
+        // (page, restored bytes) for the pre-images applied below — phase 2
+        // decides which of them net to NO change against the committed
+        // state.
+        let mut restored: Vec<(PageId, Vec<u8>)> = Vec::new();
+        {
+            let mut guard = self.concurrent.get(txn_id).ok_or_else(|| {
+                Error::Transaction(format!("concurrent transaction {} is not open", txn_id))
+            })?;
+            let Some(txn) = guard.get_mut(&txn_id) else {
+                return Err(Error::Transaction(format!(
+                    "concurrent transaction {} is not open",
+                    txn_id
+                )));
+            };
+            let idx = match txn
+                .savepoints
+                .iter()
+                .rposition(|s| s.name == name.to_ascii_lowercase())
+            {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            // Discard the levels ABOVE the target (their undo journals die
+            // with the work being undone), then take the target's data.
+            txn.savepoints.truncate(idx + 1);
+            let level = txn.savepoints.pop().expect("idx checked above");
+            // Post-savepoint allocations are garbage in the restored view:
+            // the tree surgery that linked them is being undone. Split
+            // them off for end-of-transaction recycling.
+            junk = txn.allocated.split_off(level.allocated_mark);
+            // Post-savepoint tree-surgery frees are undone: those pages are
+            // live tree members again in the restored view.
+            txn.freed.truncate(level.freed_mark);
+            // The row journal shrinks with the page state (parallel arrays).
+            txn.row_journal.truncate(level.journal_mark);
+            txn.op_ok.truncate(level.journal_mark);
+            // Root splits after the savepoint are undone with the pages.
+            txn.root_lineage = level.lineage_snap.clone();
+            // Drop the junk shadows (nothing in the restored view can
+            // reference them) and mark them for recycling.
+            for &id in &junk {
+                txn.shadows.remove(&id);
+                txn.discarded.push(id);
+            }
+            // Restore pre-images: every page fetched since the savepoint
+            // was captured at its savepoint-time bytes. A page whose shadow
+            // is MISSING was freed mid-window by tree surgery (that free is
+            // now undone) — re-create the shadow with the saved bytes so
+            // the restored tree's references resolve.
+            for (id, bytes) in &level.undo {
+                if junk.contains(id) {
+                    continue; // post-savepoint allocation — dropped above
+                }
+                match txn.shadows.get_mut(id) {
+                    Some(pr) => {
+                        let mut b = pr.lock();
+                        if b.data.len() == bytes.len() {
+                            b.data.copy_from_slice(bytes);
+                            b.dirty = true;
+                        } else {
+                            return Err(Error::corruption(format!(
+                                "concurrent savepoint restore: page {id} size mismatch"
+                            )));
+                        }
+                    }
+                    None => {
+                        let mut page = crate::storage::page::Page::new(*id, psz);
+                        page.data.copy_from_slice(bytes);
+                        page.dirty = true;
+                        let pr: PageRef = Arc::new(Mutex::new(page));
+                        txn.shadows.insert(*id, pr);
+                    }
+                }
+                txn.dirtied.insert(*id);
+                restored.push((*id, bytes.clone()));
+            }
+            // Dirtied-set hygiene: no entry may outlive its shadow.
+            txn.dirtied.retain(|id| txn.shadows.contains_key(id));
+            // Re-push the savepoint (stays active, undo reset — SQLite
+            // semantics). The restored state matches the recorded marks
+            // exactly, so the level is re-armed as if just created.
+            txn.savepoints.push(ConcurrentSavepoint {
+                name: level.name,
+                undo: HashMap::new(),
+                allocated_mark: level.allocated_mark,
+                freed_mark: level.freed_mark,
+                journal_mark: level.journal_mark,
+                lineage_snap: level.lineage_snap,
+            });
+            keep_depth = txn.savepoints.len();
+            begin_n_pages = txn.begin_n_pages;
+        }
+        // ---- Phase 2: NET-ZERO page detection (registry lock released —
+        // the committed-bytes fetch takes cache/WAL locks).
+        //
+        // A restored page whose bytes EQUAL the current committed bytes
+        // carries NO net write for this transaction: the ROLLBACK TO undid
+        // every post-savepoint mutation and the page had no pre-savepoint
+        // change (or one that landed byte-identical). Keeping such a
+        // shadow DIRTY would false-conflict at COMMIT against a sibling
+        // commit that touched the page — the classic case is rolling back
+        // the transaction's ONLY write to a hot page. Removing the shadow
+        // reverts the page to "never fetched": it installs nothing,
+        // validates nothing, and a later fetch re-materializes identical
+        // bytes.
+        //
+        // The comparison is atomic with respect to sibling commits: the
+        // engine write lock serializes this whole statement, and the only
+        // later commits that can move the page will meet the standard
+        // validation for pages this transaction actually still writes.
+        let mut removable: Vec<PageId> = Vec::new();
+        for (id, bytes) in &restored {
+            if *id >= begin_n_pages && *id != 0 {
+                continue; // txn-private allocation — no committed image
+            }
+            if let Ok(committed) = self.fetch_committed_bytes(*id, begin_n_pages) {
+                if &committed == bytes {
+                    removable.push(*id);
+                }
+            }
+        }
+        if !removable.is_empty() {
+            if let Some(mut guard) = self.concurrent.get(txn_id) {
+                if let Some(txn) = guard.get_mut(&txn_id) {
+                    for id in &removable {
+                        txn.shadows.remove(id);
+                        txn.dirtied.remove(id);
+                    }
+                }
+            }
+        }
+        // Restored content differs from the pre-rollback shadows: advisory
+        // caches (table-leaf hints pinned to shadow PageRefs, per-thread
+        // memos) must re-derive.
+        self.write_version.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(keep_depth))
+    }
+
+    /// `RELEASE [SAVEPOINT] <name>` inside a concurrent transaction:
+    /// discard the savepoint and everything above it WITHOUT rolling
+    /// back. Returns the remaining stack depth (0 = none left), or `None`
+    /// when the name is unknown. Note: releasing the OUTERMOST savepoint
+    /// does NOT commit here — the transaction was started by
+    /// `BEGIN CONCURRENT`, not by the savepoint (SQLite commits on
+    /// outermost release only for savepoint-started transactions).
+    pub fn release_concurrent_savepoint(&self, txn_id: u64, name: &str) -> Result<Option<usize>> {
+        let mut guard = self.concurrent.get(txn_id).ok_or_else(|| {
+            Error::Transaction(format!("concurrent transaction {} is not open", txn_id))
+        })?;
+        let Some(txn) = guard.get_mut(&txn_id) else {
+            return Err(Error::Transaction(format!(
+                "concurrent transaction {} is not open",
+                txn_id
+            )));
+        };
+        let idx = match txn
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name.to_ascii_lowercase())
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        txn.savepoints.truncate(idx);
+        Ok(Some(txn.savepoints.len()))
     }
 
     /// Push pages onto the LIVE freelist in trunk format. Runs inside
@@ -1121,7 +1558,7 @@ impl Pager {
     /// cannot be reconstructed without WAL version history, so the
     /// transaction fails now rather than at COMMIT).
     pub(crate) fn writer_shadow_fetch(&self, txn_id: u64, id: PageId) -> Result<PageRef> {
-        let guard = match self.concurrent.get(txn_id) {
+        let mut guard = match self.concurrent.get(txn_id) {
             Some(g) => g,
             None => {
                 return Err(Error::Transaction(format!(
@@ -1130,15 +1567,23 @@ impl Pager {
                 )))
             }
         };
-        let Some(txn) = guard.get(&txn_id) else {
+        let Some(txn) = guard.get_mut(&txn_id) else {
             return Err(Error::Transaction(format!(
                 "concurrent transaction {} is not open",
                 txn_id
             )));
         };
         // Fast path: shadow hit (fetched before, or freshly allocated).
-        if let Some(pr) = txn.shadows.get(&id) {
-            return Ok(pr.clone());
+        if let Some(pr) = txn.shadows.get(&id).cloned() {
+            // SAVEPOINT undo capture (only while a savepoint is open): the
+            // bytes at fetch time are the pre-mutation state, and the
+            // FIRST fetch after the savepoint's creation carries exactly
+            // the savepoint-time bytes — a page cannot be mutated without
+            // being fetched first. Zero cost on the savepoint-free path.
+            if !txn.savepoints.is_empty() {
+                capture_shadow_undo(txn, id, &pr);
+            }
+            return Ok(pr);
         }
         // Bounds: pages beyond the BEGIN committed count did not exist
         // in this snapshot.
@@ -1200,6 +1645,14 @@ impl Pager {
         }
         txn.read_stamps.insert(id, stamp);
         txn.shadows.insert(id, pr.clone());
+        // SAVEPOINT undo capture for the freshly materialized page: the
+        // bytes are the committed state, which for every page except the
+        // read-committed page 0 is byte-stable since BEGIN (the stamp gate
+        // above aborts otherwise) — i.e. exactly the savepoint-time bytes
+        // for this first post-savepoint fetch.
+        if !txn.savepoints.is_empty() {
+            capture_shadow_undo(txn, id, &pr);
+        }
         Ok(pr)
     }
 
