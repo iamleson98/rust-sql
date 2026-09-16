@@ -683,3 +683,19 @@ Work Log:
 Stage Summary:
 - The pdf-tts rustqlite integration's SQL-correctness blockers are fixed at the ENGINE level with pinned regressions; the engine .so (libsqlite3.so + librustqlite_sqlite3.so alias) is rebuilt from the final sources.
 - The bug class (alias-dropping lookup executors + over-matching outer-scope fallback) is closed for every lookup node, not just the one pdf-tts triggered.
+
+---
+Task ID: PDF-TTS-3
+Agent: main (Super Z)
+Task: DELETE on composite-PK (rowid-less) tables through Filter(IndexLookup) sources — the last backend blocker (delete_stale_merged_members).
+
+Work Log:
+- Reproduced at engine level: `DELETE FROM layout_block_audio WHERE version_id = ? AND merged_into = ? AND block_id NOT IN (...)` errored "unsupported: DELETE on a table without INTEGER PRIMARY KEY".
+- Root cause: plan_delete routes the WHERE through apply_where_for_scan, which builds Filter(IndexLookup) for an indexed-equality predicate with extra conjuncts; try_streaming_delete accepted only Filter(Scan) — Filter-over-index sources fell to the generic path, which requires a rowid-alias column.
+- Fix: try_streaming_delete's Filter arm now accepts Filter over IndexLookup / IndexIn / IndexRange / RowidRange — the filter predicate ANDs with the inner driver's own residual (and_predicates), the inner shape drives the scan strategy (probe keys / range bounds evaluated exactly like the dedicated arms).
+- Regression tests: tests/correlated_index_leak.rs +2 (DELETE with Filter(IndexLookup) source on the composite-PK table incl. PK-index maintenance of the deleted row; DELETE with a pure IndexLookup source).
+- Verification: 265 unit, correlated_index_leak 6, regression/sqlite_interop/column_names/alter_table/stmt_path_durability/committed_view 87, delete_spill/foreign_keys/concurrent_writes/without_rowid_pk 45, compat 69 — all green; fmt + clippy -D warnings clean.
+- The pdf-tts backend suite is now FULLY green on the engine: 448/448 bin tests + all integration targets (db_engine_contract 3, mirror_sync_bisect 3).
+
+Stage Summary:
+- The third and final SQL blocker for the pdf-tts rustqlite integration is closed; DELETE works on composite-PK tables through every supported source shape.

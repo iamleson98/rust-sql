@@ -196,3 +196,76 @@ fn correlated_exists_and_in_do_not_leak_outer_columns() {
     );
     assert_eq!(v, Value::Integer(0));
 }
+
+/// DELETE through a Filter(IndexLookup) source on a composite-PK
+/// (rowid-less) table — the pdf-tts `delete_stale_merged_members` shape.
+/// The streaming-delete path previously accepted only Filter(Scan), so
+/// these DELETEs fell to the generic path and errored "DELETE on a table
+/// without INTEGER PRIMARY KEY".
+#[test]
+fn delete_with_index_lookup_source_on_composite_pk_table() {
+    let mut db = setup();
+    // Make b1 a merged member of b0; b2 a STALE member of b0.
+    db.execute(
+        "UPDATE layout_block_audio SET merged_into = 'd1-b0' WHERE block_id IN ('d1-b1')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO layout_block_audio VALUES ('d1-b2', 'ver-b', 'audio/d1/ver-b/d1-b2.opus', 't', 'd1-b0')",
+        [],
+    )
+    .unwrap();
+
+    // The store's stale-member cleanup: filter on the indexed column AND
+    // the ALTERed column AND NOT IN over the keep-list.
+    db.execute(
+        "DELETE FROM layout_block_audio WHERE version_id = 'ver-b' AND merged_into = 'd1-b0' \
+         AND block_id NOT IN ('d1-b1')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(db.changes(), 1, "only the stale member (d1-b2) is deleted");
+
+    let rows = db
+        .query(
+            "SELECT block_id FROM layout_block_audio ORDER BY block_id",
+            [],
+        )
+        .unwrap();
+    let ids: Vec<String> = rows.iter().map(|r| r[0].as_text()).collect();
+    assert_eq!(ids, vec!["d1-b0", "d1-b1"]);
+
+    // The composite PK index entries must be maintained (the deleted row
+    // must not resurrect through the PK lookup).
+    let v = db
+        .query(
+            "SELECT audio_url FROM layout_block_audio WHERE block_id = 'd1-b2' AND version_id = 'ver-b'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        v.is_empty(),
+        "deleted row must be gone from the PK index too"
+    );
+}
+
+/// DELETE with only the indexed-column equality (pure IndexLookup source,
+/// no Filter wrapper) on the composite-PK table — also must work.
+#[test]
+fn delete_with_pure_index_lookup_source_on_composite_pk_table() {
+    let mut db = setup();
+    db.execute(
+        "DELETE FROM layout_block_audio WHERE version_id = 'ver-a'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(db.changes(), 1);
+    let rows = db
+        .query(
+            "SELECT block_id FROM layout_block_audio ORDER BY block_id",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1, "only the ver-b row remains");
+}

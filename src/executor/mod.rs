@@ -21470,6 +21470,22 @@ fn process_update_row(
 ///
 /// Returns Ok(None) when the source shape isn't handled here (the caller
 /// falls back to the generic materialize-all path).
+/// AND two optional predicates into one owned expression (None when both
+/// are None). Used to combine a Filter node's predicate with the wrapped
+/// driver shape's own residual.
+fn and_predicates(a: Option<&Expr>, b: Option<&Expr>) -> Option<Expr> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(Expr::Binary {
+            op: crate::sql::ast::BinaryOp::And,
+            left: Box::new(x.clone()),
+            right: Box::new(y.clone()),
+        }),
+        (Some(x), None) => Some(x.clone()),
+        (None, Some(y)) => Some(y.clone()),
+        (None, None) => None,
+    }
+}
+
 fn try_streaming_delete(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -21481,18 +21497,137 @@ fn try_streaming_delete(
     // The source table must be the DELETE target itself. `index_point_keys`
     // carries pre-encoded probe keys for IndexIn / IndexLookup sources
     // (collected here — evaluation needs the statement's bound params).
+    // `combined_pred` holds the AND of a Filter's predicate with an inner
+    // driver's own residual (Filter-over-index sources) — declared here so
+    // the match can return references into it alongside references into
+    // `source`.
+    // Deferred initialization: every arm that reads it assigns first.
+    let combined_pred: Option<crate::sql::ast::Expr>;
     let (src_table, residual_pred, range, index_range, index_point_keys) = match source {
         Plan::Scan {
             table: t,
             predicate,
             ..
         } => (t, predicate.as_ref(), None, None, None),
+        // A Filter over ANY supported driver shape: the filter's
+        // predicate ANDs with the inner shape's own residual, the inner
+        // shape drives the scan strategy. This is the shape
+        // `apply_where_for_scan` builds for `DELETE FROM t WHERE
+        // indexed_col = ? AND <other conjuncts>` (Filter(IndexLookup))
+        // — previously only Filter(Scan) was accepted here, so those
+        // DELETEs fell to the generic path, which requires an INTEGER
+        // PRIMARY KEY rowid alias and errored "DELETE on a table without
+        // INTEGER PRIMARY KEY" on composite-PK tables (pdf-tts's
+        // layout_block_audio).
         Plan::Filter { input, predicate } => match input.as_ref() {
             Plan::Scan {
                 table: t,
                 predicate: None,
                 ..
             } => (t, Some(predicate), None, None, None),
+            Plan::IndexLookup {
+                table: t,
+                index,
+                key_exprs,
+                ..
+            } => {
+                let empty_row: Vec<Value> = Vec::new();
+                let empty_cols: Vec<String> = Vec::new();
+                let eval_ctx =
+                    EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                let key_values: Vec<Value> = key_exprs
+                    .iter()
+                    .map(|e| evaluate(e, &eval_ctx))
+                    .collect::<Result<_>>()?;
+                let probe_keys = if key_values.iter().any(|v| v.is_null()) {
+                    Vec::new()
+                } else {
+                    let mut buf = Vec::with_capacity(16);
+                    crate::plugin::encode_collated_index_key_into(
+                        &index.columns,
+                        &key_values,
+                        &mut buf,
+                    );
+                    vec![buf]
+                };
+                combined_pred = Some(predicate.clone());
+                (
+                    t,
+                    combined_pred.as_ref(),
+                    None,
+                    None,
+                    Some((index.clone(), probe_keys)),
+                )
+            }
+            Plan::IndexIn {
+                table: t,
+                index,
+                key_exprs,
+                residual,
+                ..
+            } => {
+                let empty_row: Vec<Value> = Vec::new();
+                let empty_cols: Vec<String> = Vec::new();
+                let eval_ctx =
+                    EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
+                for e in key_exprs.iter() {
+                    let v = evaluate(e, &eval_ctx)?;
+                    if v.is_null() {
+                        continue;
+                    }
+                    let mut buf = Vec::with_capacity(16);
+                    crate::plugin::encode_collated_index_key_into(
+                        &index.columns,
+                        std::slice::from_ref(&v),
+                        &mut buf,
+                    );
+                    keys.push(buf);
+                }
+                keys.sort();
+                keys.dedup();
+                combined_pred = and_predicates(Some(predicate), residual.as_ref());
+                (
+                    t,
+                    combined_pred.as_ref(),
+                    None,
+                    None,
+                    Some((index.clone(), keys)),
+                )
+            }
+            Plan::IndexRange {
+                table: t,
+                index,
+                start,
+                end,
+                residual,
+                ..
+            } => {
+                combined_pred = and_predicates(Some(predicate), residual.as_ref());
+                (
+                    t,
+                    combined_pred.as_ref(),
+                    None,
+                    Some((index, start.as_ref(), end.as_ref())),
+                    None,
+                )
+            }
+            Plan::RowidRange {
+                table: t,
+                start,
+                end,
+                residual,
+                ..
+            } => {
+                combined_pred = and_predicates(Some(predicate), residual.as_ref());
+                (
+                    t,
+                    combined_pred.as_ref(),
+                    Some((start.as_ref(), end.as_ref())),
+                    None,
+                    None,
+                )
+            }
             _ => return Ok(None),
         },
         Plan::RowidRange {
