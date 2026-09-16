@@ -10090,11 +10090,29 @@ impl Database {
                     )?;
                 }
                 let table_name = rebuilt.name.clone();
+                // drop_table unregisters EVERY index of the table from
+                // the catalog — implicit PK/UNIQUE autoindexes and
+                // explicit CREATE INDEX entries alike. ADD COLUMN does
+                // not touch any index btree or index schema row (the
+                // indexed columns are unchanged), so they must be
+                // re-registered against the rebuilt table: otherwise the
+                // catalog forgets them until a reopen — breaking ON
+                // CONFLICT target resolution ("does not match any
+                // PRIMARY KEY or UNIQUE constraint") and silently
+                // stopping index maintenance on every subsequent write.
+                let live_indexes: Vec<crate::schema::Index> = catalog
+                    .indexes_on_table(&a.table)
+                    .into_iter()
+                    .map(|ix| (*ix).clone())
+                    .collect();
                 // drop_table clears the temp mark — carry it across the
                 // drop/re-add dance (TEMP scope survives ADD COLUMN).
                 let was_temp = catalog.is_temp(&a.table);
                 catalog.drop_table(&a.table);
                 catalog.add_table(rebuilt);
+                for ix in live_indexes {
+                    catalog.add_index(ix);
+                }
                 if was_temp {
                     catalog.mark_temp(&table_name);
                 }

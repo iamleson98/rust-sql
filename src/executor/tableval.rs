@@ -207,27 +207,27 @@ fn truncate_for_err(s: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // pragma_* introspection functions
+//
+// SQLite semantics for ALL of them: a missing table/index (or a non-text
+// argument — an unbound parameter reads as NULL) yields ZERO rows, not
+// an error — schema-discovery tooling (sea-schema, sea-orm-cli,
+// sqlite_master crawlers) relies on the empty result, and the compat
+// layer's prepare-time column discovery executes SELECTs once with
+// UNBOUND parameters, where an error would zero out the column layout.
 // ---------------------------------------------------------------------------
-
-fn table_arg(args: &[Value]) -> Result<String, Error> {
-    match args.first() {
-        Some(Value::Text(t)) => Ok(t.to_string()),
-        _ => Err(Error::semantic(
-            "pragma table-valued function requires a table-name text argument",
-        )),
-    }
-}
 
 fn pragma_table_info(
     ctx: &ExecContext<'_>,
     args: &[Value],
 ) -> Result<(Vec<&'static str>, Vec<Vec<Value>>), Error> {
     const COLS: [&str; 6] = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
-    let name = table_arg(args)?;
-    let table = ctx
-        .catalog()
-        .get_table(&name)
-        .ok_or_else(|| Error::semantic(format!("no such table: {}", name)))?;
+    let name = match args.first() {
+        Some(Value::Text(t)) => t.to_string(),
+        _ => return Ok((COLS.to_vec(), Vec::new())),
+    };
+    let Some(table) = ctx.catalog().get_table(&name) else {
+        return Ok((COLS.to_vec(), Vec::new()));
+    };
     let mut rows = Vec::with_capacity(table.columns.len());
     for (i, c) in table.columns.iter().enumerate() {
         let empty_row: Vec<Value> = Vec::new();
@@ -318,11 +318,13 @@ fn pragma_foreign_key_list(
         "on_delete",
         "match",
     ];
-    let name = table_arg(args)?;
-    let table = ctx
-        .catalog()
-        .get_table(&name)
-        .ok_or_else(|| Error::semantic(format!("no such table: {}", name)))?;
+    let name = match args.first() {
+        Some(Value::Text(t)) => t.to_string(),
+        _ => return Ok((COLS.to_vec(), Vec::new())),
+    };
+    let Some(table) = ctx.catalog().get_table(&name) else {
+        return Ok((COLS.to_vec(), Vec::new()));
+    };
     let mut rows = Vec::new();
     for (id, fk) in table.foreign_keys.iter().enumerate() {
         for (seq, (from_idx, to_col)) in fk.columns.iter().zip(fk.ref_columns.iter()).enumerate() {

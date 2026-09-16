@@ -80,7 +80,58 @@ fn main() {
         "cargo:rerun-if-changed={}",
         lib_dir.join("libsqlite3.so").display()
     );
-    println!("cargo:rustc-link-lib=dylib=sqlite3");
+
+    // Optional unique link name (`RUSTQLITE_LINK_NAME`, default `sqlite3`).
+    //
+    // Motivation: machines with libsqlite3-dev installed expose a REAL
+    // system `libsqlite3.so`, and another dependency's build script can
+    // put the system lib dir ahead of RUSTQLITE_LIB_DIR on the -L search
+    // order — `-lsqlite3` then silently binds the SYSTEM SQLite, which
+    // satisfies every stock sqlite3_* symbol (only consumers calling
+    // engine-specific extensions notice). Linking under a distinctive
+    // name no system library carries removes the ambiguity at build
+    // time AND at runtime: the compat cdylib sets no SONAME, so the
+    // linker records the matched filename as DT_NEEDED — an alias name
+    // makes the binary load the rustqlite engine, and only it, wherever
+    // the loader finds that name (LD_LIBRARY_PATH / rpath / ldconfig).
+    //
+    // The alias file is materialized here (mtime-guarded copy of the
+    // canonical libsqlite3.so), so a plain rebuild of the engine is
+    // enough — no extra recipe step to forget.
+    println!("cargo:rerun-if-env-changed=RUSTQLITE_LINK_NAME");
+    let link_name = env::var("RUSTQLITE_LINK_NAME").unwrap_or_else(|_| "sqlite3".to_owned());
+    if link_name != "sqlite3" {
+        let canonical = lib_dir.join("libsqlite3.so");
+        let alias = lib_dir.join(format!("lib{}.so", link_name));
+        // Copy whenever the alias is missing or older than the engine
+        // artifact (a fresh build refreshes it; no recipe step to forget).
+        let needs_copy = match (
+            std::fs::metadata(&canonical),
+            std::fs::metadata(&alias),
+        ) {
+            (Ok(src), Ok(dst)) => match (src.modified(), dst.modified()) {
+                (Ok(s), Ok(d)) => s > d,
+                _ => true,
+            },
+            _ => true,
+        };
+        if needs_copy {
+            std::fs::copy(&canonical, &alias).unwrap_or_else(|e| {
+                panic!(
+                    "RUSTQLITE_LINK_NAME={} requested, but the rustqlite engine \
+                     library {} could not be aliased to {}: {}. Build the engine \
+                     first (cargo build --release -p rustqlite-compat in the \
+                     rust-sql repo).",
+                    link_name,
+                    canonical.display(),
+                    alias.display(),
+                    e
+                )
+            });
+            println!("cargo:rerun-if-changed={}", alias.display());
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib={}", link_name);
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     // Runtime resolution without LD_LIBRARY_PATH: embed an rpath.
     // (Kept even for static link scenarios — the linker drops unused args.)

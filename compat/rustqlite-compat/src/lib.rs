@@ -865,11 +865,17 @@ struct Stmt {
 /// fetched in a single acquisition.
 const READ_CHUNK: usize = 64;
 
+#[derive(Clone)]
 enum ParamSlot {
-    /// Positional: engine positional index (0-based).
+    /// Positional: engine positional index (0-based) == parameter
+    /// number - 1.
     Positional(usize),
     /// Named: engine named-parameter key (with sigil).
     Named(String),
+    /// A parameter number the SQL never references (e.g. `?1, ?3` skips
+    /// 2): sqlite3_bind_parameter_count still reports it, and binding it
+    /// is a harmless no-op, exactly like SQLite.
+    Unused,
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,160 +1747,198 @@ fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool 
 }
 
 // ---------------------------------------------------------------------------
-// Parameter discovery: walk the AST in appearance order
+// Parameter discovery: SQLite's parameter NUMBERING, reproduced from the
+// AST.
+//
+// SQLite assigns parameter numbers lexically over the statement text:
+// `?NNN` takes N outright; every other parameter (`?`, `:x`, `@x`, `$x`)
+// takes one more than the largest number assigned so far. The engine's
+// lexer implements exactly that rule and canonicalizes each parameter to
+// its 0-based slot name ("0", "1", …) — the index the evaluator reads
+// from the positional Vec. The C ABI's bind index IS the parameter
+// number, so `slots[number - 1]` is the slot `sqlite3_bind(number, …)`
+// must reach: numeric parameters carry their number in their canonical
+// name (order-independent), and the walk visits clauses in lexical order
+// (FROM before WHERE) so named parameters receive the numbers SQLite
+// would have assigned them.
+//
+// The historical bug this replaces: slots were pushed in AST-walk order
+// (WHERE before FROM) and indexed by bind index, so any statement with a
+// parameter inside FROM — e.g. sea-schema 0.16's
+// `SELECT … FROM pragma_table_info(?) WHERE "name" = ?` (sea-orm 1.1
+// SchemaManager::has_column) — bound each value into the OTHER
+// parameter's slot ("no such table: <column>").
 // ---------------------------------------------------------------------------
+
+/// Parameter-number-keyed slot table: `slots[number - 1]` serves
+/// `sqlite3_bind(number, …)`.
+#[derive(Default)]
+struct ParamCollector {
+    slots: Vec<ParamSlot>,
+    /// Largest parameter number assigned so far (SQLite's max_param_num,
+    /// 1-based; 0 = none assigned yet).
+    max_number: usize,
+}
+
+impl ParamCollector {
+    /// A numeric parameter (anonymous `?` or explicit `?N`): the lexer's
+    /// canonical name is the 0-based slot, i.e. number - 1.
+    fn numeric(&mut self, zero_based: usize) {
+        let number = zero_based + 1;
+        if self.slots.len() < number {
+            self.slots.resize(number, ParamSlot::Unused);
+        }
+        self.slots[zero_based] = ParamSlot::Positional(zero_based);
+        self.max_number = self.max_number.max(number);
+    }
+
+    /// A named parameter (`:x` / `@x` / `$x`): number = max so far + 1
+    /// (SQLite's rule); duplicate names collapse to the FIRST number,
+    /// like SQLite exposing one parameter per distinct name.
+    fn named(&mut self, name: &str) {
+        if self
+            .slots
+            .iter()
+            .any(|s| matches!(s, ParamSlot::Named(n) if n == name))
+        {
+            return;
+        }
+        self.slots.push(ParamSlot::Named(name.to_string()));
+        self.max_number += 1;
+    }
+}
 
 fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> {
     use rustqlite::sql::ast::Statement as S;
-    let mut slots = Vec::new();
-    let mut max_explicit = 0usize; // highest ?N seen
+    let mut c = ParamCollector::default();
     match stmt {
-        S::Select(s) => collect_select(s, &mut slots, &mut max_explicit),
+        S::Select(s) => collect_select(s, &mut c),
         S::Insert(i) => {
-            if let Some(cols) = &i.columns {
-                for _ in cols {
-                    // Column names can't hold parameters.
-                }
-            }
             match &i.source {
                 rustqlite::sql::ast::InsertSource::Values(rows) => {
                     for row in rows {
                         for e in row {
-                            walk_expr(e, &mut slots, &mut max_explicit);
+                            walk_expr(e, &mut c);
                         }
                     }
                 }
                 rustqlite::sql::ast::InsertSource::Select(sel) => {
-                    collect_select(sel, &mut slots, &mut max_explicit);
+                    collect_select(sel, &mut c);
                 }
                 _ => {}
             }
             if let Some(u) = &i.upsert {
                 if let rustqlite::sql::ast::UpsertAction::DoUpdate { set, .. } = &u.action {
                     for (_, e) in set {
-                        walk_expr(e, &mut slots, &mut max_explicit);
+                        walk_expr(e, &mut c);
                     }
                 }
             }
             if let Some(rcs) = &i.returning {
-                collect_result_columns(rcs, &mut slots, &mut max_explicit);
+                collect_result_columns(rcs, &mut c);
             }
         }
         S::Update(u) => {
             for (_, e) in &u.set {
-                walk_expr(e, &mut slots, &mut max_explicit);
+                walk_expr(e, &mut c);
             }
             if let Some(w) = &u.where_clause {
-                walk_expr(w, &mut slots, &mut max_explicit);
+                walk_expr(w, &mut c);
             }
             if let Some(rcs) = &u.returning {
-                collect_result_columns(rcs, &mut slots, &mut max_explicit);
+                collect_result_columns(rcs, &mut c);
             }
         }
         S::Delete(d) => {
             if let Some(w) = &d.where_clause {
-                walk_expr(w, &mut slots, &mut max_explicit);
+                walk_expr(w, &mut c);
             }
             if let Some(rcs) = &d.returning {
-                collect_result_columns(rcs, &mut slots, &mut max_explicit);
+                collect_result_columns(rcs, &mut c);
             }
         }
         S::Pragma(rustqlite::sql::ast::PragmaStatement {
             value: Some(rustqlite::sql::ast::PragmaValue::Expr(e)),
             ..
-        }) => walk_expr(e, &mut slots, &mut max_explicit),
+        }) => walk_expr(e, &mut c),
         _ => {}
     }
-    let _ = max_explicit;
-    slots
+    c.slots
 }
 
-fn collect_select(
-    s: &rustqlite::sql::ast::SelectStatement,
-    slots: &mut Vec<ParamSlot>,
-    max_explicit: &mut usize,
-) {
+fn collect_select(s: &rustqlite::sql::ast::SelectStatement, c: &mut ParamCollector) {
     use rustqlite::sql::ast::SelectBody;
     // WITH clause: parameters inside CTE bodies bind on this statement.
     if let Some(w) = &s.with {
         for cte in &w.ctes {
-            collect_select(&cte.select, slots, max_explicit);
+            collect_select(&cte.select, c);
         }
     }
     match &s.body {
-        SelectBody::Simple(sel) => collect_simple_select(sel, slots, max_explicit),
+        SelectBody::Simple(sel) => collect_simple_select(sel, c),
         // Compound selects: SQLite binds EVERY arm's parameters to this
         // statement — walk both sides.
         SelectBody::Binary { left, right, .. } => {
-            collect_body(left, slots, max_explicit);
-            collect_body(right, slots, max_explicit);
+            collect_body(left, c);
+            collect_body(right, c);
         }
     }
     // ORDER BY / LIMIT live on the SelectStatement, not the body.
     for o in &s.order_by {
-        walk_expr(&o.expr, slots, max_explicit);
+        walk_expr(&o.expr, c);
     }
     if let Some(l) = &s.limit {
-        walk_expr(l, slots, max_explicit);
+        walk_expr(l, c);
     }
     if let Some(off) = &s.offset {
-        walk_expr(off, slots, max_explicit);
+        walk_expr(off, c);
     }
 }
 
-fn collect_body(
-    b: &rustqlite::sql::ast::SelectBody,
-    slots: &mut Vec<ParamSlot>,
-    max_explicit: &mut usize,
-) {
+fn collect_body(b: &rustqlite::sql::ast::SelectBody, c: &mut ParamCollector) {
     use rustqlite::sql::ast::SelectBody;
     match b {
-        SelectBody::Simple(sel) => collect_simple_select(sel, slots, max_explicit),
+        SelectBody::Simple(sel) => collect_simple_select(sel, c),
         SelectBody::Binary { left, right, .. } => {
-            collect_body(left, slots, max_explicit);
-            collect_body(right, slots, max_explicit);
+            collect_body(left, c);
+            collect_body(right, c);
         }
     }
 }
 
-fn collect_simple_select(
-    body: &rustqlite::sql::ast::SimpleSelect,
-    slots: &mut Vec<ParamSlot>,
-    max_explicit: &mut usize,
-) {
+fn collect_simple_select(body: &rustqlite::sql::ast::SimpleSelect, c: &mut ParamCollector) {
     for rc in &body.columns {
         if let rustqlite::sql::ast::ResultColumn::Expr { expr, .. } = rc {
-            walk_expr(expr, slots, max_explicit);
+            walk_expr(expr, c);
         }
     }
-    if let Some(w) = &body.where_clause {
-        walk_expr(w, slots, max_explicit);
-    }
+    // Lexical order: FROM precedes WHERE in the SQL text, and SQLite
+    // numbers parameters lexically — walk FROM first so numbering (and
+    // the named-parameter numbers in particular) matches SQLite's.
     // FROM: derived-table subqueries, JOIN ON constraints, and
     // table-valued function arguments can all hold `?` parameters —
     // SQLite binds them on THIS statement (sea-orm's PaginatorTrait::count
     // generates exactly this shape: SELECT COUNT(*) FROM (… WHERE x = ?)).
     if let Some(f) = &body.from {
-        collect_table(f, slots, max_explicit);
+        collect_table(f, c);
+    }
+    if let Some(w) = &body.where_clause {
+        walk_expr(w, c);
     }
     for t in &body.group_by {
-        walk_expr(t, slots, max_explicit);
+        walk_expr(t, c);
     }
     if let Some(h) = &body.having {
-        walk_expr(h, slots, max_explicit);
+        walk_expr(h, c);
     }
 }
 
-fn collect_table(
-    te: &rustqlite::sql::ast::TableExpression,
-    slots: &mut Vec<ParamSlot>,
-    max_explicit: &mut usize,
-) {
+fn collect_table(te: &rustqlite::sql::ast::TableExpression, c: &mut ParamCollector) {
     use rustqlite::sql::ast::JoinConstraint;
     match te {
         rustqlite::sql::ast::TableExpression::Table { .. } => {}
         rustqlite::sql::ast::TableExpression::Subquery { select, .. } => {
-            collect_select(select, slots, max_explicit);
+            collect_select(select, c);
         }
         rustqlite::sql::ast::TableExpression::Join {
             left,
@@ -1902,55 +1946,51 @@ fn collect_table(
             constraint,
             ..
         } => {
-            collect_table(left, slots, max_explicit);
-            collect_table(right, slots, max_explicit);
+            collect_table(left, c);
+            collect_table(right, c);
             if let JoinConstraint::On(e) = constraint {
-                walk_expr(e, slots, max_explicit);
+                walk_expr(e, c);
             }
         }
         rustqlite::sql::ast::TableExpression::Function { args, .. } => {
             for a in args {
-                walk_expr(a, slots, max_explicit);
+                walk_expr(a, c);
             }
         }
     }
 }
 
-fn collect_result_columns(
-    rcs: &[rustqlite::sql::ast::ResultColumn],
-    slots: &mut Vec<ParamSlot>,
-    max_explicit: &mut usize,
-) {
+fn collect_result_columns(rcs: &[rustqlite::sql::ast::ResultColumn], c: &mut ParamCollector) {
     for rc in rcs {
         if let rustqlite::sql::ast::ResultColumn::Expr { expr, .. } = rc {
-            walk_expr(expr, slots, max_explicit);
+            walk_expr(expr, c);
         }
     }
 }
 
-fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_explicit: &mut usize) {
+fn walk_expr(e: &rustqlite::sql::ast::Expr, c: &mut ParamCollector) {
     use rustqlite::sql::ast::Expr;
     match e {
         Expr::Parameter(name) => {
             if name.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() {
                 // Anonymous `?` (lexer emits "0", "1", ...) or `?N` —
-                // numeric names are the engine's positional Vec indices.
-                let idx: usize = name.parse().unwrap_or(0);
-                *max_explicit = (*max_explicit).max(idx + 1);
-                slots.push(ParamSlot::Positional(idx));
+                // numeric names are the engine's positional Vec indices,
+                // i.e. parameter number - 1.
+                let zero_based: usize = name.parse().unwrap_or(0);
+                c.numeric(zero_based);
             } else {
                 // :name / @name / $name — keep the sigil (engine key form).
-                slots.push(ParamSlot::Named(name.clone()));
+                c.named(name);
             }
         }
         Expr::Binary { left, right, .. } => {
-            walk_expr(left, slots, max_explicit);
-            walk_expr(right, slots, max_explicit);
+            walk_expr(left, c);
+            walk_expr(right, c);
         }
-        Expr::Unary { expr, .. } => walk_expr(expr, slots, max_explicit),
+        Expr::Unary { expr, .. } => walk_expr(expr, c),
         Expr::Function { args, .. } => {
             for a in args {
-                walk_expr(a, slots, max_explicit);
+                walk_expr(a, c);
             }
         }
         Expr::Case {
@@ -1959,26 +1999,26 @@ fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_expl
             else_,
         } => {
             if let Some(o) = operand {
-                walk_expr(o, slots, max_explicit);
+                walk_expr(o, c);
             }
             for (w, t) in whens {
-                walk_expr(w, slots, max_explicit);
-                walk_expr(t, slots, max_explicit);
+                walk_expr(w, c);
+                walk_expr(t, c);
             }
             if let Some(el) = else_ {
-                walk_expr(el, slots, max_explicit);
+                walk_expr(el, c);
             }
         }
         Expr::In { source, expr, .. } => {
-            walk_expr(expr, slots, max_explicit);
+            walk_expr(expr, c);
             match source {
                 rustqlite::sql::ast::InSource::List(items) => {
                     for i in items.iter() {
-                        walk_expr(i, slots, max_explicit);
+                        walk_expr(i, c);
                     }
                 }
                 rustqlite::sql::ast::InSource::Subquery(sel) => {
-                    collect_select(sel, slots, max_explicit);
+                    collect_select(sel, c);
                 }
                 rustqlite::sql::ast::InSource::Table(_) => {}
             }
@@ -1986,20 +2026,20 @@ fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_expl
         Expr::Between {
             expr, low, high, ..
         } => {
-            walk_expr(expr, slots, max_explicit);
-            walk_expr(low, slots, max_explicit);
-            walk_expr(high, slots, max_explicit);
+            walk_expr(expr, c);
+            walk_expr(low, c);
+            walk_expr(high, c);
         }
-        Expr::Cast { expr, .. } => walk_expr(expr, slots, max_explicit),
-        Expr::Collate { expr, .. } => walk_expr(expr, slots, max_explicit),
+        Expr::Cast { expr, .. } => walk_expr(expr, c),
+        Expr::Collate { expr, .. } => walk_expr(expr, c),
         // Scalar subqueries / EXISTS: parameters inside them bind on THIS
         // statement (SQLite semantics).
-        Expr::Subquery(sel) => collect_select(sel, slots, max_explicit),
-        Expr::Exists(sel) => collect_select(sel, slots, max_explicit),
-        Expr::IsNull { expr, .. } => walk_expr(expr, slots, max_explicit),
+        Expr::Subquery(sel) => collect_select(sel, c),
+        Expr::Exists(sel) => collect_select(sel, c),
+        Expr::IsNull { expr, .. } => walk_expr(expr, c),
         Expr::Row(items) => {
             for i in items {
-                walk_expr(i, slots, max_explicit);
+                walk_expr(i, c);
             }
         }
         Expr::Like {
@@ -2008,15 +2048,15 @@ fn walk_expr(e: &rustqlite::sql::ast::Expr, slots: &mut Vec<ParamSlot>, max_expl
             escape,
             ..
         } => {
-            walk_expr(expr, slots, max_explicit);
-            walk_expr(pattern, slots, max_explicit);
+            walk_expr(expr, c);
+            walk_expr(pattern, c);
             if let Some(es) = escape {
-                walk_expr(es, slots, max_explicit);
+                walk_expr(es, c);
             }
         }
         Expr::Is { left, right, .. } => {
-            walk_expr(left, slots, max_explicit);
-            walk_expr(right, slots, max_explicit);
+            walk_expr(left, c);
+            walk_expr(right, c);
         }
         _ => {}
     }
@@ -2920,6 +2960,9 @@ unsafe fn bind_value(stmt: *mut sqlite3_stmt, idx: c_int, v: Value) -> c_int {
         match slot {
             ParamSlot::Positional(pidx) => eng.bind(pidx + 1, v),
             ParamSlot::Named(name) => eng.bind_named(name, v),
+            // A number the SQL never references: accept and discard, like
+            // SQLite binding an unallocated parameter slot.
+            ParamSlot::Unused => Ok(()),
         }
     } else {
         Ok(())
@@ -3060,7 +3103,7 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     }
     match &s.params[idx as usize - 1] {
         ParamSlot::Named(name) => name.as_ptr() as *const c_char,
-        ParamSlot::Positional(_) => std::ptr::null(),
+        ParamSlot::Positional(_) | ParamSlot::Unused => std::ptr::null(),
     }
 }
 

@@ -190,19 +190,24 @@ mod corr {
                     }
                 }
                 // Pass 2: bare-name match (frame stores unqualified names —
-                // UPDATE/DELETE source rows).
+                // UPDATE/DELETE source rows). DELIBERATELY NO
+                // suffix-matching on QUALIFIED frame names: a ref
+                // `lba.audio_url` (qualifier = an inner source alias)
+                // must NEVER bind to an outer frame's
+                // `layout_blocks.audio_url` — the qualifiers differ, so
+                // the ref is not about that table at all. The old suffix
+                // pass silently leaked OUTER values into qualified inner
+                // refs whenever the local layout missed them (found via
+                // pdf-tts's mirror-sync: `lba.audio_url` read the OUTER
+                // `layout_blocks.audio_url` and wrote NULLs into the
+                // mirror column). Exact "qual.name" matches are Pass 1's
+                // job; bare frames are this pass's job; nothing else is
+                // a legal bind for a QUALIFIED reference.
                 for frame in c.outer.iter().rev() {
                     let names = frame.names();
                     for (i, n) in names.iter().enumerate() {
                         if n.eq_ignore_ascii_case(name) {
                             return frame.row().get(i).cloned();
-                        }
-                    }
-                    for (i, n) in names.iter().enumerate() {
-                        if let Some(pos) = n.rfind('.') {
-                            if n[pos + 1..].eq_ignore_ascii_case(name) {
-                                return frame.row().get(i).cloned();
-                            }
                         }
                     }
                 }
@@ -1444,7 +1449,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             // projections fall through to the generic Project.
             if let Plan::IndexLookup {
                 table,
-                alias: _,
+                alias,
                 index,
                 key_exprs,
             } = &**input
@@ -1453,6 +1458,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     return exec_index_lookup_projected(
                         ctx,
                         table.clone(),
+                        alias.clone(),
                         index.clone(),
                         key_exprs,
                         Some(columns),
@@ -1490,23 +1496,35 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             // FUSED PATH: Project over an Index Nested-Loop Join — the join
             // emits only the projected columns (no full-width combined row,
             // no second cloning pass). Mirrors the Hash Join fusion.
-            if let Plan::IndexNestedLoopJoin {
-                outer,
-                inner_table,
-                inner_alias,
-                inner_index,
-                outer_key_col,
-            } = &**input
+            // ONLY bare-column projections qualify: the fused resolver is
+            // structural (column indices on the two sides). An expression
+            // projection (e.g. `p.document_id || '-legacy'`, COALESCE(...))
+            // must fall through to the regular Project executor over the
+            // combined row — delegating it here would emit the raw
+            // combined rows and silently DROP the projection (the join's
+            // fused gate declines expressions without applying them).
+            if columns
+                .iter()
+                .all(|c| matches!(&c.expr, Expr::Column { name, .. } if name != "*"))
             {
-                return exec_index_nested_loop_join(
-                    ctx,
+                if let Plan::IndexNestedLoopJoin {
                     outer,
-                    inner_table.clone(),
-                    inner_alias.clone(),
-                    inner_index.clone(),
-                    *outer_key_col,
-                    Some(columns),
-                );
+                    inner_table,
+                    inner_alias,
+                    inner_index,
+                    outer_key_col,
+                } = &**input
+                {
+                    return exec_index_nested_loop_join(
+                        ctx,
+                        outer,
+                        inner_table.clone(),
+                        inner_alias.clone(),
+                        inner_index.clone(),
+                        *outer_key_col,
+                        Some(columns),
+                    );
+                }
             }
             // FUSED PATH: Project over a bare table Scan with a bare-column
             // projection — decode ONLY the projected columns per row
@@ -1583,45 +1601,51 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             columns: columns.clone(),
             rows: rows.as_ref().clone(),
         }),
-        Plan::RowidLookup { table, rowid, .. } => exec_rowid_lookup(ctx, table.clone(), rowid),
+        Plan::RowidLookup {
+            table,
+            alias,
+            rowid,
+        } => exec_rowid_lookup(ctx, table.clone(), alias.clone(), rowid),
         Plan::RowidIn {
             table,
-            alias: _,
+            alias,
             values,
             residual,
-        } => exec_rowid_in(ctx, table.clone(), values, residual.as_ref()),
+        } => exec_rowid_in(ctx, table.clone(), alias.clone(), values, residual.as_ref()),
         Plan::IndexIn {
             table,
-            alias: _,
+            alias,
             index,
             key_exprs,
             residual,
         } => exec_index_in(
             ctx,
             table.clone(),
+            alias.clone(),
             index.clone(),
             key_exprs,
             residual.as_ref(),
         ),
         Plan::RowidRange {
             table,
-            alias: _,
+            alias,
             start,
             end,
             residual,
         } => exec_rowid_range(
             ctx,
             table.clone(),
+            alias.clone(),
             start.as_ref(),
             end.as_ref(),
             residual.as_ref(),
         ),
         Plan::IndexLookup {
             table,
-            alias: _,
+            alias,
             index,
             key_exprs,
-        } => exec_index_lookup(ctx, table.clone(), index.clone(), key_exprs),
+        } => exec_index_lookup(ctx, table.clone(), alias.clone(), index.clone(), key_exprs),
         Plan::IndexRange {
             table,
             alias,
@@ -14514,8 +14538,12 @@ fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<E
 fn exec_rowid_lookup(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
+    alias: Option<String>,
     rowid_expr: &Expr,
 ) -> Result<ExecResult> {
+    // Alias-qualified output columns — see exec_index_lookup's comment.
+    let out_cols: Arc<[String]> =
+        scan_output_columns(&table, &alias, crate::planner::wants_rowid_slot(&table));
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -14528,13 +14556,13 @@ fn exec_rowid_lookup(
         }
         LookupResult::NotFound => {
             return Ok(ExecResult {
-                columns: table.col_names.clone(),
+                columns: out_cols,
                 rows: Vec::new(),
             })
         }
     };
     Ok(ExecResult {
-        columns: table.col_names.clone(),
+        columns: out_cols,
         rows: vec![row],
     })
 }
@@ -14553,9 +14581,13 @@ fn exec_rowid_lookup(
 fn exec_rowid_in(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
+    query_alias: Option<String>,
     values: &[Expr],
     residual: Option<&Expr>,
 ) -> Result<ExecResult> {
+    // Alias-qualified output + residual-eval names — see
+    // exec_index_lookup's comment (the leak fix).
+    let out_cols: Arc<[String]> = scan_output_columns(&table, &query_alias, false);
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -14588,7 +14620,7 @@ fn exec_rowid_in(
         {
             // Residual predicate (e.g. `id IN (...) AND name = 'x'`).
             if let Some(pred) = residual {
-                let v = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                let v = eval_row(pred, &row, &out_cols, &ctx.params, &ctx.named_params)?;
                 if !v.is_truthy() {
                     continue;
                 }
@@ -14597,7 +14629,7 @@ fn exec_rowid_in(
         }
     }
     Ok(ExecResult {
-        columns: table.col_names.clone(),
+        columns: out_cols,
         rows,
     })
 }
@@ -14613,10 +14645,14 @@ fn exec_rowid_in(
 fn exec_index_in(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
+    query_alias: Option<String>,
     index: Arc<crate::schema::Index>,
     key_exprs: &[Expr],
     residual: Option<&Expr>,
 ) -> Result<ExecResult> {
+    // Alias-qualified output + residual-eval names — see
+    // exec_index_lookup's comment (the leak fix).
+    let out_cols: Arc<[String]> = scan_output_columns(&table, &query_alias, false);
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -14663,8 +14699,7 @@ fn exec_index_in(
                 .lookup_table_with(rowid, |payload| decode_row(payload, n_cols, rowid, alias))?
             {
                 if let Some(pred) = residual {
-                    let pv =
-                        eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                    let pv = eval_row(pred, &row, &out_cols, &ctx.params, &ctx.named_params)?;
                     if !pv.is_truthy() {
                         continue;
                     }
@@ -14674,7 +14709,7 @@ fn exec_index_in(
         }
     }
     Ok(ExecResult {
-        columns: table.col_names.clone(),
+        columns: out_cols,
         rows,
     })
 }
@@ -15085,10 +15120,18 @@ fn indexed_geometry_value(
 fn exec_rowid_range(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
+    query_alias: Option<String>,
     start_expr: Option<&Expr>,
     end_expr: Option<&Expr>,
     residual: Option<&Expr>,
 ) -> Result<ExecResult> {
+    // Alias-qualified output columns — see exec_index_lookup's comment
+    // (the leak fix).
+    let out_cols: Arc<[String]> = scan_output_columns(
+        &table,
+        &query_alias,
+        crate::planner::wants_rowid_slot(&table),
+    );
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -15107,16 +15150,8 @@ fn exec_rowid_range(
         None => false,
     };
     if start_null || end_null {
-        let append_rowid = crate::planner::wants_rowid_slot(&table);
-        let columns: Arc<[String]> = if append_rowid {
-            let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-            v.push(crate::planner::hidden_rowid_slot(&table.name));
-            v.into()
-        } else {
-            table.col_names.clone()
-        };
         return Ok(ExecResult {
-            columns,
+            columns: out_cols,
             rows: Vec::new(),
         });
     }
@@ -15165,13 +15200,20 @@ fn exec_rowid_range(
         !table.without_rowid && !has_real_rowid_col
     });
     let eval_cols: Vec<String> = if residual.is_some() {
-        // Bare "rowid" — satisfies both `rowid` and qualified `t.rowid`
-        // references through the evaluator's exact + suffix matching.
-        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        // Alias-qualified names (+ the hidden rowid slot) — a residual
+        // referencing `alias.col` must resolve LOCALLY, not through the
+        // correlated outer-scope fallback (see exec_index_lookup's
+        // comment).
+        let prefix = query_alias.as_deref().unwrap_or(&table.name);
+        let mut v: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect();
         // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
         // bare `rowid` refs still resolve through lookup's rowid special
         // case (is_hidden_rowid matches the qualified spelling).
-        v.push(crate::planner::hidden_rowid_slot(&table.name));
+        v.push(crate::planner::hidden_rowid_slot(prefix));
         v
     } else {
         Vec::new()
@@ -15206,15 +15248,7 @@ fn exec_rowid_range(
         pred_may_reenter,
     )?;
 
-    let columns: Arc<[String]> = if append_rowid {
-        // Side-qualified hidden slot (this driver is alias-less — the
-        // table name is the prefix; atom_out_cols mirrors exactly).
-        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push(crate::planner::hidden_rowid_slot(&table.name));
-        v.into()
-    } else {
-        table.col_names.clone()
-    };
+    let columns = out_cols;
     Ok(ExecResult { columns, rows })
 }
 
@@ -15463,21 +15497,21 @@ fn exec_rowid_lookup_projected(
 fn exec_index_lookup(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
+    alias: Option<String>,
     index: Arc<crate::schema::Index>,
     key_exprs: &[Expr],
 ) -> Result<ExecResult> {
-    // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
-    // full-row fetches carry the trailing rowid.
-    let out_cols: Arc<[String]> = if crate::planner::wants_rowid_slot(&table) {
-        // Side-qualified hidden slot (alias-less driver — table name is
-        // the prefix; atom_out_cols mirrors exactly).
-        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
-        v.push(crate::planner::hidden_rowid_slot(&table.name));
-        v.into()
-    } else {
-        table.col_names.clone()
-    };
-    exec_index_lookup_impl(ctx, table.clone(), index, key_exprs, None, out_cols)
+    // Alias-qualified output columns (the SAME discipline as Scan — see
+    // scan_output_columns): a lookup's rows must answer `alias.col`
+    // references LOCALLY. Bare `table.col_names` here made every
+    // qualified ref above the lookup miss the local layout and fall
+    // through to the correlated outer-scope resolver — which happily
+    // matched the OUTER table's same-named column (a silent value leak:
+    // pdf-tts's mirror-sync read `lba.audio_url` as the OUTER
+    // `layout_blocks.audio_url`).
+    let out_cols: Arc<[String]> =
+        scan_output_columns(&table, &alias, crate::planner::wants_rowid_slot(&table));
+    exec_index_lookup_impl(ctx, table, index, key_exprs, None, out_cols)
 }
 
 /// IndexLookup with the projection FUSED into the fetch: decodes ONLY the
@@ -15489,6 +15523,7 @@ fn exec_index_lookup(
 fn exec_index_lookup_projected(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
+    alias: Option<String>,
     index: Arc<crate::schema::Index>,
     key_exprs: &[Expr],
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
@@ -15499,7 +15534,12 @@ fn exec_index_lookup_projected(
     let (project, out_cols) =
         match projection.and_then(|columns| bare_column_projection(columns, &table)) {
             Some((p, n)) => (p, n),
-            None => (None, table.col_names.clone()),
+            None => (
+                None,
+                // Fallback (non-bare projection): alias-qualified full
+                // table columns — the same leak fix as exec_index_lookup.
+                scan_output_columns(&table, &alias, crate::planner::wants_rowid_slot(&table)),
+            ),
         };
     exec_index_lookup_impl(ctx, table, index, key_exprs, project.as_deref(), out_cols)
 }

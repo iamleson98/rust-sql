@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **1200+ tests** (1241 in the default matrix
+> **Status**: production-ready core. **1200+ tests** (1247 in the default matrix
 > + 65 C ABI suites; crash / power-loss simulation, OOM + I/O fault injection,
 > corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
@@ -1569,9 +1569,9 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1241 tests in
-the default matrix (265 unit + 976 integration across 77 files), plus 65 C ABI
-suites in `compat/` and the sqlx feature suite (1280 tests with `--features
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1247 tests in
+the default matrix (265 unit + 982 integration across 80 files), plus 69 C ABI
+tests in `compat/` and the sqlx feature suite (1280 tests with `--features
 sqlx`) — all passing:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
