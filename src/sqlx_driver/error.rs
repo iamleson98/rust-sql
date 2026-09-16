@@ -59,6 +59,12 @@ fn classify(message: &str) -> (i64, ErrorKind) {
     if message.starts_with("CHECK constraint failed") {
         return (275, ErrorKind::CheckViolation); // SQLITE_CONSTRAINT_CHECK
     }
+    if message.starts_with("database is locked (SQLITE_BUSY_SNAPSHOT)") {
+        // Optimistic-concurrency conflict in a BEGIN CONCURRENT
+        // transaction: SQLite's begin_concurrent branch surfaces this as
+        // SQLITE_BUSY_SNAPSHOT. Retriable by re-running the transaction.
+        return (517, ErrorKind::Other); // SQLITE_BUSY_SNAPSHOT
+    }
     if message.starts_with("database is locked") {
         return (5, ErrorKind::Other); // SQLITE_BUSY
     }

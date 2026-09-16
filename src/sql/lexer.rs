@@ -644,6 +644,7 @@ pub const KEYWORDS: &[&str] = &[
     "COLLATE",
     "COLUMN",
     "COMMIT",
+    "CONCURRENT",
     "CONFLICT",
     "CONSTRAINT",
     "CREATE",

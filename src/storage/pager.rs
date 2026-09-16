@@ -509,7 +509,7 @@ pub struct Pager {
     /// Page size in bytes (immutable after `open`).
     page_size: AtomicU32,
     /// Total number of pages in the file (updated on writes).
-    n_pages: AtomicU32,
+    pub(crate) n_pages: AtomicU32,
     /// Head of the freelist (0 if empty).
     freelist_head: AtomicU32,
     /// Number of pages on the freelist.
@@ -517,9 +517,9 @@ pub struct Pager {
     /// In-memory cache: page_id → page. RwLock so reads on distinct pages
     /// don't serialize; only cache-miss inserts take the write lock.
     /// Direct-indexed Vec for low page ids (see `PageCache`).
-    cache: RwLock<PageCache>,
+    pub(crate) cache: RwLock<PageCache>,
     /// LRU ordering: most recently used at the back.
-    lru: Mutex<VecDeque<PageId>>,
+    pub(crate) lru: Mutex<VecDeque<PageId>>,
     /// Cache capacity in PAGES. Atomic: `PRAGMA cache_size` updates it
     /// at runtime (positive = pages, negative = KiB per SQLite), while
     /// the eviction pass reads it on every cache insert.
@@ -568,7 +568,7 @@ pub struct Pager {
     /// is only a spill area for caches larger than memory, so per-statement
     /// write() syscalls are pure overhead. This is what makes autocommit
     /// INSERTs in `:memory:` mode competitive with SQLite's.
-    lazy_writeback: AtomicBool,
+    pub(crate) lazy_writeback: AtomicBool,
     /// Last page id inserted into `dirty_pages` (see note_dirty's fast
     /// path). u32::MAX = none. Reset by flush().
     last_noted_dirty: std::sync::atomic::AtomicU32,
@@ -612,7 +612,7 @@ pub struct Pager {
     /// resolve a page → frame offset while the (single) writer appends
     /// under the write lock. `Wal` itself is writer-only; the read path
     /// goes through `Wal::read_frame_at` on a shared handle.
-    wal: RwLock<Option<WalState>>,
+    pub(crate) wal: RwLock<Option<WalState>>,
     /// DELETE-mode mid-transaction page spill (see `DeleteSpill`):
     /// `None` until the first cache-pressure eviction of a dirty page
     /// during a write transaction; dropped (file deleted) at COMMIT
@@ -636,7 +636,7 @@ pub struct Pager {
     /// page content changed somewhere, so cached leaf bounds may be stale
     /// and — critically — a page may have been recycled into another tree,
     /// so a hint must never be trusted across a write.
-    write_version: std::sync::atomic::AtomicU64,
+    pub(crate) write_version: std::sync::atomic::AtomicU64,
     /// Count of get_page slow-path (cache-miss → file read) events.
     /// Debug/diagnostic counter.
     cache_misses: std::sync::atomic::AtomicU64,
@@ -673,7 +673,7 @@ pub struct Pager {
     /// hints from a previous database for its own — even when both assign
     /// the same page ids (they always do: roots start at low sequential
     /// ids). See `write_epoch`.
-    instance_id: u64,
+    pub(crate) instance_id: u64,
     /// SAVEPOINT undo stack (SQLite-style nested transactions).
     ///
     /// Each level holds the pager metadata at SAVEPOINT time plus page
@@ -777,6 +777,20 @@ pub struct Pager {
     /// writer's live `note_write` bumps must not rebuild every reader
     /// descent). 0 = no transaction open (never consulted then).
     committed_view_epoch: std::sync::atomic::AtomicU64,
+    /// Optimistic multi-writer regime state (see `storage/concurrent.rs`):
+    /// open `BEGIN CONCURRENT` transactions, their page shadows, and the
+    /// committed page-version stamps that drive first-committer-wins
+    /// conflict detection. Inert (empty registry) unless a concurrent
+    /// transaction is open.
+    pub(crate) concurrent: crate::storage::concurrent::ConcurrentManager,
+    /// COMMITTED page count: the number of pages visible to every
+    /// non-concurrent-owner reader. Equals `n_pages` at every commit
+    /// boundary; lags it mid-transaction while a writer holds uncommitted
+    /// fresh allocations. While the concurrent regime is active, plain
+    /// readers bound their page fetches by THIS value, never the live
+    /// allocation high-water (another writer's uncommitted allocation
+    /// must be invisible — and unfetchable).
+    pub(crate) committed_n_pages: std::sync::atomic::AtomicU32,
     /// PRAGMA user_version / application_id — persisted at the SQLite
     /// header offsets (60..64 / 68..72) inside page 0.
     user_version: std::sync::atomic::AtomicU32,
@@ -1542,6 +1556,8 @@ impl Pager {
             committed_bound_cache: std::sync::atomic::AtomicU32::new(0),
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
             committed_view_epoch: std::sync::atomic::AtomicU64::new(0),
+            concurrent: crate::storage::concurrent::ConcurrentManager::new(),
+            committed_n_pages: std::sync::atomic::AtomicU32::new(0),
             user_version: std::sync::atomic::AtomicU32::new(0),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(0),
             cache_size_setting: std::sync::atomic::AtomicI64::new(-2000),
@@ -1732,6 +1748,7 @@ impl Pager {
             self.store.sync_all()?;
         }
         self.n_pages.store(1, Ordering::Release);
+        self.committed_n_pages.store(1, Ordering::Release);
         self.page_size.store(page_size, Ordering::Release);
         self.schema_cookie.store(0, Ordering::Release);
         self.is_new.store(false, Ordering::Release);
@@ -1797,6 +1814,9 @@ impl Pager {
         self.freelist_head.store(freelist_head, Ordering::Release);
         self.freelist_count.store(freelist_count, Ordering::Release);
         self.schema_cookie.store(schema_cookie, Ordering::Release);
+        // The header's page count IS the committed count at open (any
+        // leftover uncommitted allocations never reached a commit frame).
+        self.committed_n_pages.store(n_pages, Ordering::Release);
         self.user_version
             .store(FileHeader::user_version(&header), Ordering::Release);
         self.application_id
@@ -1948,6 +1968,15 @@ impl Pager {
     /// Cost: O(1). This replaced an O(cache_size) scan on every
     /// `Database::query()` call (the 9.2× point-lookup gap vs SQLite).
     pub fn note_write(&self) {
+        // Concurrent regime: shadow mutations bump the advisory-cache
+        // epoch (hints/memos/chains must re-derive against the new tree
+        // state the transaction is building) but NOT the live dirty
+        // counter — the live cache was never touched, and flush() for
+        // this work happens at the concurrent COMMIT.
+        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+            self.write_version.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
         self.write_version.fetch_add(1, Ordering::Relaxed);
     }
@@ -2035,6 +2064,9 @@ impl Pager {
     /// valid across bulk in-place UPDATEs. Any op that can move keys,
     /// split pages, or recycle pages must use the full `note_write`.
     pub fn note_write_in_place(&self) {
+        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+            return; // shadow in-place patch: no live dirty counter
+        }
         self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2115,6 +2147,15 @@ impl Pager {
     /// Idempotent — calling it twice with the same page ID is fine.
     /// Cost: O(1) HashSet insert.
     pub fn note_dirty(&self, id: PageId) {
+        // Concurrent regime: route the dirty note into the armed
+        // transaction (shadow pages are WAL-emitted by the concurrent
+        // COMMIT install, never by the plain flush paths).
+        if self.concurrent.scope_armed_any() {
+            if let Some(txn) = self.armed_writer_scope() {
+                self.writer_shadow_note_dirty(txn, id);
+                return;
+            }
+        }
         // Fast path: the same page is the last one we inserted — it's
         // already in the set (nothing but flush() removes entries, and
         // flush resets this hint). Bulk inserts dirty the SAME leaf
@@ -2193,7 +2234,27 @@ impl Pager {
                 }
             }
         }
-        let n_pages_val = self.n_pages.load(Ordering::Acquire);
+        // Writer-shadow scope (armed for every statement of an open
+        // BEGIN CONCURRENT transaction on this thread): serve the
+        // transaction's PRIVATE pages — materializing a copy of the
+        // committed bytes on first touch. Same atomic-gate shape as the
+        // committed-view branch above: zero cost when no concurrent
+        // transaction is executing anywhere.
+        if self.concurrent.scope_armed_any() {
+            if let Some(txn) = self.armed_writer_scope() {
+                return self.writer_shadow_fetch(txn, id);
+            }
+        }
+        let n_pages_val = if self.concurrent.any_active() {
+            // Concurrent regime: a plain (unscoped) fetch is a READER —
+            // bound it by the COMMITTED page count. Other concurrent
+            // writers' fresh allocations (n_pages high-water) must be
+            // invisible: the live cache does not contain them, and the
+            // main file does not either.
+            self.committed_n_pages.load(Ordering::Acquire)
+        } else {
+            self.n_pages.load(Ordering::Acquire)
+        };
         if id >= n_pages_val && id != 0 {
             return Err(Error::corruption(format!(
                 "page {} out of range (n_pages={})",
@@ -2706,6 +2767,16 @@ impl Pager {
     /// (K == 0), the trunk page itself is handed out and the head moves
     /// to `next_trunk` — O(1), no re-linking writes.
     pub fn allocate_page(&self) -> Result<PageId> {
+        // Concurrent regime: fresh pages only, parked in the armed
+        // transaction's shadows. The freelist is deliberately bypassed —
+        // popping it would mutate shared state (trunk pages + atomics)
+        // that other concurrent writers' snapshots still depend on.
+        // Deferred frees splice back at COMMIT/ROLLBACK.
+        if self.concurrent.scope_armed_any() {
+            if let Some(txn) = self.armed_writer_scope() {
+                return self.writer_shadow_alloc(txn);
+            }
+        }
         let current_free_count = self.freelist_count.load(Ordering::Acquire);
         if current_free_count > 0 {
             let head = self.freelist_head.load(Ordering::Acquire);
@@ -2819,6 +2890,42 @@ impl Pager {
     pub fn allocate_pages_opts(&self, n: usize, zeroed: bool) -> Result<Vec<(PageId, PageRef)>> {
         if n == 0 {
             return Ok(Vec::new());
+        }
+        // Concurrent regime: fresh shadow pages only (freelist bypassed,
+        // batched fetch_add on n_pages — statement-level exclusion keeps
+        // the ids disjoint across concurrent writers). `zeroed: false`
+        // (overflow chains) is honored identically: the caller fills
+        // every byte before the shadow can be observed.
+        if self.concurrent.scope_armed_any() {
+            if let Some(txn) = self.armed_writer_scope() {
+                let first_id = self.n_pages.fetch_add(n as u32, Ordering::AcqRel);
+                let psz = self.page_size();
+                let mut out: Vec<(PageId, PageRef)> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let id = first_id + i as u32;
+                    let mut page = if zeroed {
+                        Page::new(id, psz)
+                    } else {
+                        Page::new_uninit(id, psz)
+                    };
+                    page.dirty = true;
+                    let pr: PageRef = Arc::new(Mutex::new(page));
+                    out.push((id, pr.clone()));
+                    let mut guard = self.concurrent.get(txn).ok_or_else(|| {
+                        Error::Transaction(format!("concurrent transaction {} is not open", txn))
+                    })?;
+                    let Some(t) = guard.get_mut(&txn) else {
+                        return Err(Error::Transaction(format!(
+                            "concurrent transaction {} is not open",
+                            txn
+                        )));
+                    };
+                    t.shadows.insert(id, pr);
+                    t.allocated.push(id);
+                }
+                self.write_version.fetch_add(1, Ordering::Relaxed);
+                return Ok(out);
+            }
         }
         let mut out: Vec<(PageId, PageRef)> = Vec::with_capacity(n);
         // Phase 1: freelist pops (exact single-page semantics, batched).
@@ -2956,6 +3063,15 @@ impl Pager {
         if id == 0 {
             return Err(Error::InvalidArgument("cannot free page 0".into()));
         }
+        // Concurrent regime: DEFER the free. The shared freelist must
+        // stay untouched mid-transaction (another writer's snapshot
+        // still sees this page as a live tree member); COMMIT/ROLLBACK
+        // splices the deferred ids under the commit mutex.
+        if self.concurrent.scope_armed_any() {
+            if let Some(txn) = self.armed_writer_scope() {
+                return self.writer_shadow_free(txn, id);
+            }
+        }
         // Savepoint undo: capture the freed page's pre-image BEFORE any
         // in-cache mutation below (rollback restores its old bytes even
         // though the durable copy is never touched).
@@ -3040,6 +3156,19 @@ impl Pager {
     pub fn truncate_tail(&self, freed: &[PageId]) -> Result<u32> {
         if freed.is_empty() {
             return Ok(0);
+        }
+        // Concurrent regime: tail truncation rewinds the LIVE n_pages —
+        // another concurrent writer's snapshot or pending allocation
+        // sits above any bound we could pick. Convert the truncation
+        // into deferred frees (the commit splice recycles them) and
+        // report zero pages truncated.
+        if self.concurrent.scope_armed_any() {
+            if let Some(txn) = self.armed_writer_scope() {
+                for &id in freed {
+                    self.writer_shadow_free(txn, id)?;
+                }
+                return Ok(0);
+            }
         }
         let set: PageIdSet = freed.iter().copied().collect();
         let n = self.n_pages.load(Ordering::Acquire);
@@ -3536,7 +3665,7 @@ impl Pager {
     /// WAL-mode commit: append every dirty page as a frame, mark the last
     /// frame as the commit frame, sync per `PRAGMA synchronous`, and
     /// auto-checkpoint when the WAL grows past the threshold.
-    fn flush_wal(&self) -> Result<()> {
+    pub(crate) fn flush_wal(&self) -> Result<()> {
         let psz = self.page_size();
 
         // --- header page: refresh in-cache page 0 and mark it dirty ---
@@ -3674,6 +3803,11 @@ impl Pager {
             // high-water mark bakes them in.
             crate::api::drain_mimalloc_wake();
         }
+        // Publish the committed page count: everything this flush wrote
+        // (installed shadows, freelist splices, file-growth allocations,
+        // and the header's n_pages) is now committed.
+        self.committed_n_pages
+            .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
         Ok(())
     }
 
@@ -3707,6 +3841,7 @@ impl Pager {
         self.freelist_head.store(freelist_head, Ordering::Release);
         self.freelist_count.store(freelist_count, Ordering::Release);
         self.schema_cookie.store(schema_cookie, Ordering::Release);
+        self.committed_n_pages.store(n_pages, Ordering::Release);
         Ok(())
     }
 
@@ -4020,6 +4155,12 @@ impl Pager {
     }
 
     pub fn flush(&self) -> Result<()> {
+        // Concurrent regime: a statement of an open BEGIN CONCURRENT
+        // transaction must NEVER flush — its pages are private shadows;
+        // the WAL commit is the concurrent COMMIT path's exclusive job.
+        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+            return Ok(());
+        }
         // LAZY WRITE-BACK MODE (in-memory databases): pure no-op. Do NOT
         // clear the dirty bookkeeping — the dirty_pages set and count are
         // the record of what a future REAL flush (flush_before_snapshot at
@@ -4059,7 +4200,7 @@ impl Pager {
     /// "file size < n_pages * page_size" corruption is unreachable. The
     /// previous header-first order left a window (header written, new
     /// pages not yet) that the OOM fault-injection suite hits.
-    fn flush_inner_delete(&self) -> Result<()> {
+    pub(crate) fn flush_inner_delete(&self) -> Result<()> {
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
         let freelist_count_val = self.freelist_count.load(Ordering::Acquire);
@@ -4186,6 +4327,9 @@ impl Pager {
         // Mass-delete tail truncation: shrink the file with the commit.
         self.apply_pending_truncate()?;
         self.dirty_count_approx.store(0, Ordering::Release);
+        // Publish the committed page count (see flush_wal).
+        self.committed_n_pages
+            .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
         Ok(())
     }
 
@@ -4311,7 +4455,7 @@ impl Pager {
 
     /// Evict pages from the cache until we're under capacity.
     /// Caller must hold the cache write lock.
-    fn maybe_evict_locked(&self, cache: &mut PageCache) {
+    pub(crate) fn maybe_evict_locked(&self, cache: &mut PageCache) {
         // CACHE-IS-THE-STORE (in-memory databases): never evict. The page
         // cache IS the database image — the backing Vec is never read back
         // (every page enters the cache at first touch and stays), so
@@ -4626,7 +4770,7 @@ impl Pager {
     //       (pread/pwrite vs seek_read/seek_write) live in `Store`, and the
     //       memory store serves reads/writes from its byte image. -----
 
-    fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    pub(crate) fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         Ok(self.store.read_at(offset, buf)?)
     }
 

@@ -5,6 +5,7 @@
 //! table scans, point lookups, inserts, deletes, and index maintenance.
 
 pub mod btree;
+pub mod concurrent;
 pub mod integrity;
 pub mod join_cache;
 pub mod mvcc;

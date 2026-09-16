@@ -210,6 +210,44 @@ pub mod profile {
 /// A (object name, root page) pair used when syncing schema roots.
 type RootEntry = (String, u32);
 
+/// Engine-side state of one open `BEGIN CONCURRENT` transaction (see
+/// `storage/concurrent.rs` for the pager side). The StmtMaps overlay is
+/// the transaction's private bookkeeping: statements of this transaction
+/// detach it as `ctx.shared` (the same zero-copy pattern the shared maps
+/// use) and merge their root-override / max-rowid updates into it; COMMIT
+/// publishes it into the shared maps.
+struct ConcurrentTxnEntry {
+    /// Pager-side transaction id (page shadows, stamps, allocations).
+    txn_id: u64,
+    /// Transaction-private bookkeeping overlay.
+    maps: std::sync::Arc<crate::executor::StmtMaps>,
+}
+
+thread_local! {
+    /// Calling-connection identity for the CURRENT engine call. The sqlx
+    /// driver arms it around every statement (its connections map 1:1 to
+    /// transaction ownership); direct engine-API users leave it at 0 —
+    /// the engine then runs a single anonymous concurrent transaction at
+    /// a time (its own BEGIN guard enforces that).
+    static CONN_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The armed calling-connection identity (0 = engine-API / anonymous).
+fn conn_identity() -> u64 {
+    CONN_ID.with(|c| c.get())
+}
+
+/// Swap the calling-connection identity, returning the previous value
+/// (restore with another `swap`). Driver guard types use this to arm the
+/// connection around engine calls without leaking it across awaits.
+#[cfg_attr(not(feature = "sqlx"), allow(dead_code))]
+pub(crate) mod conn_tls {
+    /// Arm `id` as the calling connection; returns the previous value.
+    pub fn swap(id: u64) -> u64 {
+        super::CONN_ID.with(|c| c.replace(id))
+    }
+}
+
 /// A database. Owns the pager and catalog.
 ///
 /// All mutable state is wrapped in interior-mutability primitives
@@ -271,6 +309,18 @@ pub struct Database {
     schema_epoch: AtomicU64,
     /// `schema_epoch` at the moment BEGIN executed.
     txn_begin_epoch: AtomicU64,
+    /// Open `BEGIN CONCURRENT` transactions, keyed by caller identity:
+    /// the driver's connection id (set via the driver's guards) or 0 for
+    /// direct engine-API users. Each entry pairs the pager-side
+    /// transaction id (page shadows + conflict stamps — see
+    /// `storage/concurrent.rs`) with the transaction-private StmtMaps
+    /// overlay (root overrides and rowid caches accumulate there instead
+    /// of the shared maps, and publish at COMMIT).
+    concurrent_txns: Mutex<std::collections::HashMap<u64, ConcurrentTxnEntry>>,
+    /// True while any concurrent transaction is open — cached fast-path
+    /// for the plain-write guard (a mutex probe per statement would
+    /// contended-bounce across writer threads).
+    concurrent_active: AtomicBool,
     /// Combined bookkeeping maps (table root overrides, index roots,
     /// max-rowid cache) behind ONE Arc — a query snapshot is a single
     /// read-lock + one refcount bump (previously three separate
@@ -2165,6 +2215,8 @@ impl Database {
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
             txn_maps_snap: RwLock::new(None),
+            concurrent_txns: Mutex::new(std::collections::HashMap::new()),
+            concurrent_active: AtomicBool::new(false),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
@@ -2295,6 +2347,8 @@ impl Database {
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
             txn_maps_snap: RwLock::new(None),
+            concurrent_txns: Mutex::new(std::collections::HashMap::new()),
+            concurrent_active: AtomicBool::new(false),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
@@ -4391,6 +4445,8 @@ impl Database {
                 shared.index_roots.remove(&k);
             }
         }
+        // (Concurrent owners never take this path — the fast-insert gate
+        // in `execute` screens them out; plain attach.)
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
         if result.is_ok() && ctx.roots_changed {
@@ -4746,12 +4802,28 @@ impl Database {
     }
 
     fn sync_schema_roots_inner(&self) -> Result<()> {
+        let m = self.maps.read().clone();
+        self.sync_schema_roots_from(&m)
+    }
+
+    /// [`Self::sync_schema_roots_inner`] with an explicit maps source —
+    /// statements of an open `BEGIN CONCURRENT` transaction pass their
+    /// transaction-private overlay (their root moves are uncommitted);
+    /// with the writer scope still armed, the schema-row rewrites land
+    /// in the transaction's page shadows and install at COMMIT.
+    pub(crate) fn sync_schema_roots_from(
+        &self,
+        source: &std::sync::Arc<crate::executor::StmtMaps>,
+    ) -> Result<()> {
         // (object name, root page) pairs for tables and indexes.
         let (tables, indexes): (Vec<RootEntry>, Vec<RootEntry>) = {
-            let m = self.maps.read();
             (
-                m.roots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-                m.index_roots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                source.roots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                source
+                    .index_roots
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect(),
             )
         };
         if tables.is_empty() && indexes.is_empty() {
@@ -4762,6 +4834,23 @@ impl Database {
         for (name, root) in tables {
             let key = format!("table:{}", name);
             if synced.get(&key).copied() != Some(root) {
+                // CREATE-time root with no tracker entry yet (the table was
+                // created this session): the schema row on disk ALREADY
+                // carries this root — seed the tracker instead of rewriting
+                // the row. The no-op rewrite was harmless in the
+                // single-writer world, but in the BEGIN CONCURRENT regime
+                // it dirties page 0's shadow in every transaction that
+                // first touches a fresh table, forcing conflicts.
+                if synced.get(&key).is_none()
+                    && self
+                        .catalog
+                        .get_table(&name)
+                        .map(|t| t.root_page)
+                        .is_some_and(|r| r == root)
+                {
+                    synced.insert(key, root);
+                    continue;
+                }
                 self.rewrite_schema_row_root("table", &name, root)?;
                 synced.insert(key, root);
                 dirty = true;
@@ -4770,6 +4859,17 @@ impl Database {
         for (name, root) in indexes {
             let key = format!("index:{}", name);
             if synced.get(&key).copied() != Some(root) {
+                // Same CREATE-time seeding as tables above.
+                if synced.get(&key).is_none()
+                    && self
+                        .catalog
+                        .get_index(&name)
+                        .map(|i| i.root_page)
+                        .is_some_and(|r| r == root)
+                {
+                    synced.insert(key, root);
+                    continue;
+                }
                 self.rewrite_schema_row_root("index", &name, root)?;
                 synced.insert(key, root);
                 dirty = true;
@@ -4916,14 +5016,27 @@ impl Database {
                 .iter()
                 .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
             if first == Some(&b'I') || first == Some(&b'i') {
-                if self.exec_chained_insert(sql)? {
-                    self.note_foreign_write()?;
-                    return Ok(());
+                // Concurrent regime, two gates:
+                // - a CONCURRENT OWNER never takes the fast insert paths
+                //   (their chained roots / max-rowids / leaf hints are
+                //   shared state — the overlay flow in the general path
+                //   keeps them transaction-private);
+                // - a PLAIN writer is excluded while the regime is active
+                //   (see the regime guard after statement classification).
+                let conc_owner = self.concurrent_txn_for_caller().is_some();
+                if self.concurrent_active.load(Ordering::Acquire) && !conc_owner {
+                    return Err(Self::concurrent_regime_busy());
                 }
-                if let Some(fi) = try_fast_insert_parse(sql) {
-                    if self.exec_fast_insert(fi)? {
+                if !conc_owner {
+                    if self.exec_chained_insert(sql)? {
                         self.note_foreign_write()?;
                         return Ok(());
+                    }
+                    if let Some(fi) = try_fast_insert_parse(sql) {
+                        if self.exec_fast_insert(fi)? {
+                            self.note_foreign_write()?;
+                            return Ok(());
+                        }
                     }
                 }
             } else {
@@ -5115,8 +5228,83 @@ impl Database {
                 return Ok(());
             }
         }
+        // ------------------------------------------------------------------
+        // BEGIN CONCURRENT regime interception: lifecycle statements are
+        // fully handled here (before the plain BEGIN/COMMIT/ROLLBACK
+        // machinery, which assumes the single-writer model), owners' DML
+        // arms the page-shadow scope below, and non-owner writes are
+        // excluded while the regime is active.
+        // ------------------------------------------------------------------
+        let conc_owner_txn = self.concurrent_txn_for_caller();
+        match cached.stmt.as_ref() {
+            Statement::Begin(BeginStatement {
+                mode: crate::sql::ast::BeginMode::Concurrent,
+            }) => {
+                drop(cached);
+                self.begin_concurrent_txn()?;
+                return Ok(());
+            }
+            Statement::Commit if conc_owner_txn.is_some() => {
+                drop(cached);
+                self.commit_concurrent_txn()?;
+                return Ok(());
+            }
+            Statement::Rollback(rb) if rb.savepoint.is_none() && conc_owner_txn.is_some() => {
+                drop(cached);
+                self.rollback_concurrent_txn()?;
+                return Ok(());
+            }
+            _ => {}
+        }
+        if conc_owner_txn.is_some() {
+            // Restrictions inside a concurrent transaction: SAVEPOINT
+            // (the undo-log machinery is single-writer), DDL (the
+            // in-memory catalog is shared), PRAGMA (journal/lock flips
+            // would break the regime's invariants), VACUUM/ATTACH-level
+            // structural statements, and view DML (its INSTEAD-OF trigger
+            // driver replays statements through `&mut self` machinery
+            // outside the shadow-scope region). DML on tables and SELECT
+            // proceed.
+            if cached.view_target.is_some() {
+                return Err(Error::Unsupported(
+                    "view DML is not allowed inside a BEGIN CONCURRENT transaction",
+                ));
+            }
+            match cached.stmt.as_ref() {
+                Statement::Savepoint(_) | Statement::Release(_) | Statement::Rollback(_) => {
+                    return Err(Error::Unsupported(
+                        "SAVEPOINT statements are not allowed inside a BEGIN CONCURRENT transaction",
+                    ));
+                }
+                Statement::Create(_)
+                | Statement::Drop(_)
+                | Statement::Alter(_)
+                | Statement::Vacuum(_)
+                | Statement::Analyze { .. }
+                | Statement::Reindex { .. }
+                | Statement::Attach(_)
+                | Statement::Detach(_)
+                | Statement::Pragma(_)
+                | Statement::Begin(_) => {
+                    return Err(Error::Unsupported(
+                        "DDL and PRAGMA statements are not allowed inside a BEGIN CONCURRENT \
+                         transaction (DML and SELECT only)",
+                    ));
+                }
+                _ => {}
+            }
+        } else if self.concurrent_active.load(Ordering::Acquire)
+            && Self::stmt_is_write_shaped(cached.stmt.as_ref())
+        {
+            // Plain (non-owner) write while the regime is active: the
+            // fast insert paths screened their shapes earlier; this arm
+            // covers every other write shape (BEGIN, DDL, DML, PRAGMA).
+            return Err(Self::concurrent_regime_busy());
+        }
         // SAVEPOINT / RELEASE / ROLLBACK TO SAVEPOINT: need &self for the
         // bookkeeping-map snapshots, so they bypass the static dispatcher.
+        // (Concurrent owners never reach here — the restriction arm above
+        // rejected their savepoint statements.)
         match stmt_ref_pre(&cached.stmt) {
             StmtPre::Savepoint(name) => {
                 self.exec_savepoint(&name)?;
@@ -5144,6 +5332,29 @@ impl Database {
             drop(cached);
             return self.exec_view_dml(&view_name, &stmt_clone, params_vec);
         }
+        // Arm the page-shadow scope for the transaction owner's DML and
+        // SELECT statements: get_page serves this transaction's shadows,
+        // allocation/free/deferred-dirty route into them, and the
+        // epilogue's schema-root sync writes through them. Transaction
+        // control (BEGIN/COMMIT/ROLLBACK) never arms — COMMIT must
+        // install through the LIVE paths. (Armed after every `&mut self`
+        // interception above: the guard holds `&self.pager` for the rest
+        // of the statement, and everything below is `&self` /
+        // field-borrow shaped.)
+        let _writer_scope_guard = match conc_owner_txn {
+            Some(txn) => match cached.stmt.as_ref() {
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                    Some(self.pager.arm_writer_scope(txn))
+                }
+                Statement::Select(_) => {
+                    // SELECTs through execute (scripted/mixed statements)
+                    // read the transaction's own writes, same as query().
+                    Some(self.pager.arm_writer_scope(txn))
+                }
+                _ => None,
+            },
+            None => None,
+        };
         // Deref the Arc<Statement> to a &Statement for execute_statement_static.
         // (The Arc itself stays alive on the stack for the duration of the call.)
         let stmt_ref: &Statement = &cached.stmt;
@@ -5173,8 +5384,29 @@ impl Database {
         // (Cloning the Arc snapshot here instead would keep a second
         // refcount alive and force `Arc::make_mut` to deep-copy the maps
         // on every write-back — a ~30% insert regression.)
-        ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
-        ctx.shared_detached = true;
+        //
+        // CONCURRENT OWNER: the statement detaches the TRANSACTION's
+        // private overlay instead of the shared maps — root overrides and
+        // rowid caches accumulate there (merged back into the overlay at
+        // the epilogue, published to the shared maps only at COMMIT).
+        if conc_owner_txn.is_some() {
+            let conn = conn_identity();
+            let overlay = self
+                .concurrent_txns
+                .lock()
+                .get(&conn)
+                .map(|e| e.maps.clone());
+            if let Some(overlay) = overlay {
+                ctx.shared = overlay;
+                ctx.shared_detached = true;
+            } else {
+                ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+                ctx.shared_detached = true;
+            }
+        } else {
+            ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+            ctx.shared_detached = true;
+        }
         for v in params.into_iter() {
             ctx.bind_positional(v);
         }
@@ -5307,8 +5539,17 @@ impl Database {
                 shared.index_roots.remove(&k);
             }
         }
-        *self.maps.get_mut() = ctx.shared;
-        self.refresh_maps_flag();
+        // Attach the maps back. CONCURRENT OWNER: deferred to AFTER the
+        // roots sync below (which sources from ctx.shared); the overlay
+        // then absorbs the statement's bookkeeping (the shared maps are
+        // untouched until COMMIT publishes them; `Arc::make_mut` above
+        // may have cloned because the registry holds a second reference
+        // — bounded by the table count, negligible against the
+        // statement's own work).
+        if conc_owner_txn.is_none() {
+            *self.maps.get_mut() = ctx.shared.clone();
+            self.refresh_maps_flag();
+        }
         if result.is_ok() && ctx.rolled_back {
             // ROLLBACK restored the file/pager to its BEGIN state (the
             // `__begin__` savepoint's undo log, or the snapshot fallback).
@@ -5402,8 +5643,26 @@ impl Database {
         // Gated on ctx.roots_changed — roots only move on splits, which are
         // rare; previously this ran (two read locks + two Vec<(String,u32)>
         // collects with String clones) after EVERY statement.
+        //
+        // CONCURRENT OWNER: the roots live in the transaction's overlay,
+        // and the writer scope is still armed — the rewrites land in the
+        // transaction's page shadows (transactional schema roots) and
+        // install at COMMIT.
         if result.is_ok() && ctx.roots_changed {
-            self.sync_schema_roots_inner()?;
+            if conc_owner_txn.is_some() {
+                self.sync_schema_roots_from(&ctx.shared)?;
+            } else {
+                self.sync_schema_roots_inner()?;
+            }
+        }
+        // CONCURRENT OWNER attach-back (after the roots sync consumed
+        // ctx.shared above): the statement's bookkeeping merges into the
+        // transaction's overlay.
+        if conc_owner_txn.is_some() {
+            let conn = conn_identity();
+            if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+                entry.maps = ctx.shared;
+            }
         }
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
         if result.is_ok() && is_ddl {
@@ -5473,6 +5732,7 @@ impl Database {
     /// identity decision (see `committed_read_active`).
     pub fn committed_reads_available(&self) -> bool {
         self.in_transaction.load(Ordering::Acquire)
+            && !self.concurrent_active.load(Ordering::Acquire)
             && self.txn_owner_tid.load(Ordering::Acquire) != 0
             && !self.txn_has_ddl.load(Ordering::Acquire)
             && self.txn_begin_epoch.load(Ordering::Acquire)
@@ -5503,6 +5763,12 @@ impl Database {
     /// PAGER's armed scope (not the preference) so a decision never
     /// diverges from what `get_page` actually serves.
     pub(crate) fn read_maps(&self) -> Arc<crate::executor::StmtMaps> {
+        if self.pager.armed_writer_scope().is_some() {
+            let conn = conn_identity();
+            if let Some(e) = self.concurrent_txns.lock().get(&conn) {
+                return e.maps.clone();
+            }
+        }
         if self.pager.committed_reads_armed() {
             if let Some(m) = self.txn_maps_snap.read().clone() {
                 return m;
@@ -5566,6 +5832,23 @@ impl Database {
                 return Ok(pr.rows);
             }
         }
+        // DML through the `&self` query path cannot run inside a BEGIN
+        // CONCURRENT transaction: its merge-backs target the SHARED maps
+        // (uncommitted roots would leak), and the read lock does not
+        // exclude concurrent readers the way the write lock does for
+        // Database::execute. The sqlx driver never routes owner DML here
+        // (its DML arm takes the write lock and the statement-step path);
+        // direct engine-API users get a clear error.
+        if self.concurrent_txn_for_caller().is_some()
+            && matches!(
+                cached.stmt.as_ref(),
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            )
+        {
+            return Err(Error::Unsupported(
+                "DML inside a BEGIN CONCURRENT transaction must run through Database::execute",
+            ));
+        }
         // EXPLAIN [QUERY PLAN | ANALYZE]: ANALYZE executes the inner SELECT
         // with instrumentation; QUERY PLAN / plain EXPLAIN plan the inner
         // statement and render rows — never executes it.
@@ -5580,6 +5863,15 @@ impl Database {
                 None => Vec::new(),
             });
         }
+        // CONCURRENT OWNER: arm the page-shadow scope for this whole
+        // query — a transaction must see its own writes. get_page then
+        // serves the transaction's shadows, and read_maps() (below)
+        // resolves roots from the transaction's overlay. Plain readers
+        // never arm: the live cache IS the committed state in the
+        // concurrent regime.
+        let _wsg = self
+            .concurrent_txn_for_caller()
+            .map(|txn| self.pager.arm_writer_scope(txn));
         // Committed-view decision for THIS statement: SELECT-shaped reads
         // only (DML through the `&self` query path must never touch the
         // BEGIN-time state). One arming covers every arm below — the RAII
@@ -5788,6 +6080,17 @@ impl Database {
                 return Ok((pr.columns, pr.rows));
             }
         }
+        // DML inside a concurrent transaction: see query()'s rejection.
+        if self.concurrent_txn_for_caller().is_some()
+            && matches!(
+                cached.stmt.as_ref(),
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            )
+        {
+            return Err(Error::Unsupported(
+                "DML inside a BEGIN CONCURRENT transaction must run through Database::execute",
+            ));
+        }
         if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
             if *analyze {
                 return self.explain_analyze_select(inner, params);
@@ -5807,6 +6110,10 @@ impl Database {
                 rows,
             ));
         }
+        // CONCURRENT OWNER: arm the page-shadow scope (see query()).
+        let _wsg = self
+            .concurrent_txn_for_caller()
+            .map(|txn| self.pager.arm_writer_scope(txn));
         // Committed-view decision (see query()): SELECT-shaped reads only.
         let _cvg = self.committed_view_guard(matches!(cached.stmt.as_ref(), Statement::Select(_)));
         if let Statement::Select(sel) = cached.stmt.as_ref() {
@@ -6310,11 +6617,208 @@ impl Database {
     }
 
     // ====================================================================
-    // CTE (WITH clause) materialization
+    // BEGIN CONCURRENT — optimistic multi-writer regime
+    // (page shadows + conflict stamps live in storage/concurrent.rs)
     // ====================================================================
 
-    /// Execute a SELECT statement with a set of pre-materialized CTEs in
-    /// scope. Returns the ExecResult (columns + rows).
+    /// Arm the calling-connection identity for the CURRENT thread's
+    /// engine calls. The sqlx driver sets this around every statement
+    /// (its connections map 1:1 to transaction ownership); direct
+    /// engine-API users leave it at the default 0 — the engine then runs
+    /// at most one anonymous concurrent transaction at a time.
+    ///
+    /// The identity scopes `BEGIN CONCURRENT` transaction ownership: each
+    /// driver connection can hold exactly one open concurrent
+    /// transaction, and its statements (execute AND query) route to that
+    /// transaction's page shadows and bookkeeping overlay.
+    pub fn set_conn_identity(id: u64) {
+        CONN_ID.with(|c| c.set(id));
+    }
+
+    /// The pager-side transaction id open for the calling identity, if
+    /// any. Fast path: one relaxed atomic load when the regime is off.
+    pub(crate) fn concurrent_txn_for_caller(&self) -> Option<u64> {
+        if !self.concurrent_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let conn = conn_identity();
+        self.concurrent_txns.lock().get(&conn).map(|e| e.txn_id)
+    }
+
+    /// The concurrent transaction's bookkeeping overlay for the CURRENT
+    /// caller, cloned out for in-place merging (see
+    /// [`Self::store_concurrent_overlay`]). Step-path DML merges its map
+    /// deltas there instead of the shared maps — the overlay publishes at
+    /// COMMIT.
+    pub(crate) fn concurrent_overlay_for_caller(
+        &self,
+    ) -> Option<std::sync::Arc<crate::executor::StmtMaps>> {
+        if !self.concurrent_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let conn = conn_identity();
+        self.concurrent_txns
+            .lock()
+            .get(&conn)
+            .map(|e| e.maps.clone())
+    }
+
+    /// Write a merged overlay back into the caller's registry entry.
+    pub(crate) fn store_concurrent_overlay(&self, maps: std::sync::Arc<crate::executor::StmtMaps>) {
+        let conn = conn_identity();
+        if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+            entry.maps = maps;
+        }
+    }
+
+    /// `BEGIN CONCURRENT`: open this connection's optimistic multi-writer
+    /// transaction. Intercepts before the plain BEGIN machinery — no
+    /// savepoint undo log, no pager snapshot, no flush-before-snapshot:
+    /// the live page cache stays the committed store for the whole
+    /// regime, and this transaction's state accumulates in private page
+    /// shadows instead.
+    fn begin_concurrent_txn(&mut self) -> Result<()> {
+        let conn = conn_identity();
+        {
+            let txns = self.concurrent_txns.lock();
+            if txns.contains_key(&conn) {
+                return Err(Error::semantic(
+                    "cannot start a transaction within a transaction",
+                ));
+            }
+        }
+        // A plain (single-writer) transaction is open: the regimes are
+        // mutually exclusive — its uncommitted mutations live in the LIVE
+        // page cache, which the concurrent regime requires to hold only
+        // committed bytes. (An open concurrent transaction does NOT block
+        // another BEGIN CONCURRENT — that is the multi-writer regime; the
+        // global in_transaction flag is set by it, so gate on
+        // concurrent_active to tell the regimes apart.)
+        if self.in_transaction.load(Ordering::Acquire)
+            && !self.concurrent_active.load(Ordering::Acquire)
+        {
+            return Err(Error::semantic(
+                "cannot start a concurrent transaction while a write transaction is open",
+            ));
+        }
+        let txn_id = self.pager.begin_concurrent()?;
+        let entry = ConcurrentTxnEntry {
+            txn_id,
+            maps: self.maps.read().clone(),
+        };
+        self.concurrent_txns.lock().insert(conn, entry);
+        self.concurrent_active.store(true, Ordering::Release);
+        self.in_transaction.store(true, Ordering::Release);
+        self.txn_owner_tid.store(current_tid(), Ordering::Release);
+        self.txn_has_ddl.store(false, Ordering::Release);
+        self.txn_begin_epoch
+            .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
+        // The statement cache may hold plans built against maps that this
+        // transaction's overlay will diverge from; roots resolve from the
+        // CALLER's ctx.shared at execution time, so cached plans stay
+        // correct — but the read-side fast paths (point-lookup caching)
+        // key off the shared maps; invalidate once at regime start.
+        self.break_insert_chain();
+        Ok(())
+    }
+
+    /// COMMIT of this connection's concurrent transaction: validate the
+    /// write-set stamps (first-committer-wins), install the shadows
+    /// into the live cache, splice deferred frees, and run the standard
+    /// WAL commit. On conflict the transaction is fully rolled back
+    /// before the error surfaces (retry by re-running the transaction).
+    fn commit_concurrent_txn(&mut self) -> Result<()> {
+        let conn = conn_identity();
+        let entry = self.concurrent_txns.lock().remove(&conn);
+        let Some(entry) = entry else {
+            return Err(Error::semantic("no transaction is active"));
+        };
+        let r = self.pager.commit_concurrent(entry.txn_id);
+        if let Err(e) = r {
+            // The pager already rolled the shadows back; finish the
+            // engine-side teardown so the connection is not stuck in a
+            // half-open transaction.
+            self.finish_concurrent_txn();
+            return Err(e);
+        }
+        // Publish the transaction's bookkeeping overlay (root overrides,
+        // rowid caches) as the shared maps.
+        *self.maps.get_mut() = entry.maps;
+        self.refresh_maps_flag();
+        self.finish_concurrent_txn();
+        Ok(())
+    }
+
+    /// ROLLBACK of this connection's concurrent transaction: drop the
+    /// shadows (the live cache was never touched), recycle this
+    /// transaction's fresh page allocations into the freelist, and
+    /// persist that splice with one small WAL commit.
+    fn rollback_concurrent_txn(&mut self) -> Result<()> {
+        let conn = conn_identity();
+        let entry = self.concurrent_txns.lock().remove(&conn);
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let r = self.pager.rollback_concurrent(entry.txn_id);
+        // The overlay is dropped — the shared maps were never touched.
+        self.finish_concurrent_txn();
+        // Cached plans may embed tables observed mid-transaction; a fresh
+        // plan re-resolves from the shared (committed) maps.
+        self.invalidate_stmt_cache();
+        r
+    }
+
+    /// Shared tail of COMMIT/ROLLBACK: global transaction flags flip off
+    /// only when the LAST concurrent transaction has ended.
+    fn finish_concurrent_txn(&mut self) {
+        if !self.pager.concurrent_writers_active() {
+            self.concurrent_active.store(false, Ordering::Release);
+            self.in_transaction.store(false, Ordering::Release);
+            self.txn_owner_tid.store(0, Ordering::Release);
+        }
+        // Chains are disabled for the whole regime; a fresh one may build
+        // on the next plain statement.
+    }
+
+    /// The guard statement every non-owner write hits while the
+    /// concurrent regime is active: the two regimes are mutually
+    /// exclusive (a plain autocommit statement would mutate the LIVE
+    /// cache, which the concurrent regime requires to hold only
+    /// committed bytes). The sqlx driver maps this to SQLITE_BUSY and
+    /// retries until its busy timeout — plain workloads interleave
+    /// between concurrent transactions.
+    fn concurrent_regime_busy() -> Error {
+        Error::Transaction(
+            "database is locked (SQLITE_BUSY): a concurrent transaction is open; \
+             use BEGIN CONCURRENT, or retry after it commits"
+                .to_string(),
+        )
+    }
+
+    /// True when the statement is a WRITE shape (needs the engine write
+    /// lock): used by the regime guard — plain writers wait/fail while
+    /// concurrent transactions are open; readers always pass.
+    fn stmt_is_write_shaped(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Create(_)
+                | Statement::Drop(_)
+                | Statement::Alter(_)
+                | Statement::Vacuum(_)
+                | Statement::Analyze { .. }
+                | Statement::Reindex { .. }
+                | Statement::Attach(_)
+                | Statement::Detach(_)
+                | Statement::Begin(_)
+                | Statement::Pragma(_)
+                | Statement::Savepoint(_)
+                | Statement::Release(_)
+        )
+    }
+
     /// SAVEPOINT <name> — start (or nest) a savepoint. Outside a
     /// transaction, the savepoint OPENS one (releasing the outermost
     /// savepoint then commits, per SQLite semantics).
@@ -6404,6 +6908,12 @@ impl Database {
         }
     }
 
+    // ====================================================================
+    // CTE (WITH clause) materialization
+    // ====================================================================
+
+    /// Execute a SELECT statement with a set of pre-materialized CTEs in
+    /// scope. Returns the ExecResult (columns + rows).
     /// CTE SELECT execution bridge for the statement layer (pub(crate)).
     pub(crate) fn exec_select_with_ctes_stmt(
         &self,
@@ -6835,6 +7345,9 @@ impl Database {
                 shared.index_roots.remove(&k);
             }
         }
+        // (Concurrent owners' statements run per-part through
+        // `execute`, which handles the overlay; this is the plain
+        // script-split attach.)
         *self.maps.get_mut() = ctx.shared;
         self.refresh_maps_flag();
         if ctx.roots_changed {
@@ -7638,7 +8151,29 @@ impl Database {
         // lets point-lookup readers under an open write transaction
         // keep the ~0.35 us fast path instead of the ~1.2 us general
         // pipeline (ExecContext + plan dispatch + EvalContext).
-        let (table_root, index_root) = if self.pager.committed_reads_armed() {
+        // BEGIN CONCURRENT owner (an armed WRITER scope): resolve from the
+        // TRANSACTION's overlay — the same reasoning as the committed-view
+        // branch, mirrored: a mid-transaction split moves the root IN THE
+        // SHADOWS, and the owner's descent must start where ITS tree now
+        // begins. (The shared maps still carry the committed root.)
+        let (table_root, index_root) = if self.pager.armed_writer_scope().is_some() {
+            let m = self.read_maps();
+            let name = fp.table_name();
+            let t = m
+                .roots
+                .get(name)
+                .copied()
+                .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
+            let i = match fp {
+                FastPath::IndexPoint { index, .. } => m
+                    .index_roots
+                    .get(&index.name)
+                    .copied()
+                    .or_else(|| m.index_roots.get(&index.name.to_ascii_lowercase()).copied()),
+                _ => None,
+            };
+            (t, i)
+        } else if self.pager.committed_reads_armed() {
             let m = self.read_maps();
             let name = fp.table_name();
             let t = m
@@ -7738,7 +8273,11 @@ impl Database {
                 // Committed-view readers: a cached entry may describe the
                 // WRITER's uncommitted state (the writer's own reads
                 // populate it mid-transaction) — bypass both directions.
-                let committed = self.pager.committed_reads_armed();
+                // The CONCURRENT regime has the same mixing hazard in both
+                // directions (an owner's shadow-walk count must not serve a
+                // plain reader, and vice versa) — bypass while it is active.
+                let committed =
+                    self.pager.committed_reads_armed() || self.pager.concurrent_writers_active();
                 let epoch = self.write_epoch.load(Ordering::Acquire);
                 let key = table.name.to_ascii_lowercase();
                 if !committed {

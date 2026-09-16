@@ -1534,6 +1534,11 @@ impl Parser {
         } else if self.peek().is_keyword("EXCLUSIVE") {
             self.advance();
             BeginMode::Exclusive
+        } else if self.peek().is_keyword("CONCURRENT") {
+            // BEGIN CONCURRENT [TRANSACTION] — the multi-writer branch
+            // keyword (SQLite's begin_concurrent precedent).
+            self.advance();
+            BeginMode::Concurrent
         } else {
             BeginMode::Deferred
         };

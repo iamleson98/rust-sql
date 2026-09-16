@@ -210,6 +210,14 @@ struct SharedDb {
     /// can never observe uncommitted rows — SQLite isolation semantics.
     /// A read-only foreign transaction does not block readers.
     tx_dirty: AtomicBool,
+    /// Connections with an open `BEGIN CONCURRENT` transaction (the
+    /// optimistic multi-writer regime). While non-empty, plain
+    /// (non-concurrent) write statements wait — the engine's live page
+    /// cache must hold only committed bytes for the regime — but
+    /// concurrent owners never wait for each other, and readers never
+    /// wait at all (the live cache IS the committed state in the regime:
+    /// writers mutate private page shadows).
+    concurrent: parking_lot::Mutex<std::collections::HashSet<usize>>,
     /// Gate + condvar for connections waiting on the open transaction.
     /// Notified whenever the transaction state changes (BEGIN/COMMIT/
     /// ROLLBACK/close). Never held while the RwLock is held, so there is
@@ -223,6 +231,46 @@ impl SharedDb {
     fn foreign_tx(&self, me: usize) -> bool {
         let owner = self.tx_owner.load(Ordering::Acquire);
         owner != 0 && owner != me
+    }
+
+    /// True when a `BEGIN CONCURRENT` transaction owned by a DIFFERENT
+    /// connection is open (the optimistic multi-writer regime).
+    fn foreign_concurrent(&self, me: usize) -> bool {
+        self.concurrent.lock().iter().any(|&id| id != me)
+    }
+
+    /// Register/unregister this connection's concurrent transaction.
+    /// Wakes plain writers (they may now proceed) / makes them wait.
+    fn concurrent_begin(&self, me: usize) {
+        self.concurrent.lock().insert(me);
+        self.notify_tx_change();
+    }
+
+    fn concurrent_end(&self, me: usize) {
+        self.concurrent.lock().remove(&me);
+        self.notify_tx_change();
+    }
+
+    /// Wait until no transaction blocks a PLAIN write from `me`: no
+    /// foreign plain transaction and no concurrent transaction from any
+    /// other connection. Concurrent owners never call this.
+    fn wait_plain_write_clear(&self, me: usize, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !self.foreign_tx(me) && !self.foreign_concurrent(me) {
+                return true;
+            }
+            let mut guard = self.tx_gate.lock();
+            if !self.foreign_tx(me) && !self.foreign_concurrent(me) {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            self.tx_cv.wait_for(&mut guard, deadline - now);
+            drop(guard);
+        }
     }
 
     /// Wait until no transaction owned by another connection is open.
@@ -288,6 +336,7 @@ fn new_shared(db: Engine) -> Arc<SharedDb> {
         db: parking_lot::RwLock::new(db),
         tx_owner: AtomicUsize::new(0),
         tx_dirty: AtomicBool::new(false),
+        concurrent: parking_lot::Mutex::new(std::collections::HashSet::new()),
         tx_gate: parking_lot::Mutex::new(()),
         tx_cv: parking_lot::Condvar::new(),
     })
@@ -319,6 +368,9 @@ pub struct RustqliteConnection {
     /// A sqlx-managed DEFERRED transaction is open (the engine-level
     /// transaction may not have started yet — see [`Self::run_control`]).
     tx_active: bool,
+    /// True while THIS connection holds an open `BEGIN CONCURRENT`
+    /// transaction (engine-side, keyed by our connection identity).
+    concurrent_tx: bool,
     /// A rollback was queued by `Transaction` drop and will be applied on
     /// the next interaction or at close.
     pending_rollback: bool,
@@ -495,11 +547,14 @@ fn gate_mode_for(sql: &str) -> Option<bool> {
 
 /// Engine read guard with the thread's read-view preference armed by
 /// `acquire_read` (`Committed` for foreign-transaction committed-view
-/// reads, `Live` otherwise) and restored to `Auto` on drop. All driver
-/// engine calls run synchronously inside the guard's scope, so the
-/// thread-local preference never leaks across an await point.
+/// reads, `Live` otherwise) and restored to `Auto` on drop, plus the
+/// CALLING CONNECTION identity armed for the engine's `BEGIN CONCURRENT`
+/// transaction routing (statement shadow scoping + overlay maps). All
+/// driver engine calls run synchronously inside the guard's scope, so
+/// the thread-local state never leaks across an await point.
 struct ReadGuardView<'a> {
     guard: parking_lot::RwLockReadGuard<'a, Engine>,
+    prev_conn: u64,
 }
 
 impl std::ops::Deref for ReadGuardView<'_> {
@@ -514,6 +569,39 @@ impl Drop for ReadGuardView<'_> {
     #[inline]
     fn drop(&mut self) {
         Engine::set_read_view_public(crate::api::ReadView::Auto);
+        crate::api::Database::set_conn_identity(self.prev_conn);
+    }
+}
+
+/// Engine WRITE guard with the calling connection's identity armed
+/// (restored on drop) — the engine routes `BEGIN CONCURRENT` statement
+/// interception, shadow scoping, and COMMIT/ROLLBACK to the armed
+/// connection's transaction. DerefMut because write statements take
+/// `&mut Engine`.
+struct WriteGuardView<'a> {
+    guard: parking_lot::RwLockWriteGuard<'a, Engine>,
+    prev_conn: u64,
+}
+
+impl std::ops::Deref for WriteGuardView<'_> {
+    type Target = Engine;
+    #[inline]
+    fn deref(&self) -> &Engine {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriteGuardView<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Engine {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriteGuardView<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        crate::api::Database::set_conn_identity(self.prev_conn);
     }
 }
 
@@ -527,6 +615,7 @@ impl RustqliteConnection {
             id: next_conn_id(),
             tx_depth: 0,
             tx_active: false,
+            concurrent_tx: false,
             pending_rollback: false,
             busy_timeout: options.busy_timeout,
             gate_cache: StdHashMap::new(),
@@ -591,7 +680,14 @@ impl RustqliteConnection {
                     // migrated owner-task the BEGIN-time state.
                     Engine::set_read_view_public(crate::api::ReadView::Live);
                 }
-                return Ok(ReadGuardView { guard: db });
+                // Arm the calling identity for concurrent-txn statement
+                // routing (a concurrent owner's reads see its own
+                // shadows); harmless for everyone else.
+                let prev_conn = crate::api::conn_tls::swap(self.id as u64);
+                return Ok(ReadGuardView {
+                    guard: db,
+                    prev_conn,
+                });
             }
             drop(db);
             let remain = deadline.saturating_duration_since(std::time::Instant::now());
@@ -606,11 +702,55 @@ impl RustqliteConnection {
     /// busy handler: the write proceeds as soon as the other connection
     /// commits or rolls back; only on timeout does it fail with
     /// SQLITE_BUSY.
-    fn acquire_write(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Engine>, SqlxError> {
+    fn acquire_write(&self) -> Result<WriteGuardView<'_>, SqlxError> {
         let deadline = std::time::Instant::now() + self.busy_timeout;
         loop {
             // Pre-wait outside the lock: the gate condvar parks us instead
             // of spinning on the RwLock.
+            //
+            // A `BEGIN CONCURRENT` owner never waits for its sibling
+            // concurrent transactions (they are the point of the regime);
+            // a plain writer waits for BOTH foreign plain transactions
+            // and the whole concurrent regime.
+            if !self.concurrent_tx {
+                if self.shared.foreign_tx(self.id) || self.shared.foreign_concurrent(self.id) {
+                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                    if !self.shared.wait_plain_write_clear(self.id, remain) {
+                        return Err(crate::sqlx_driver::error::busy());
+                    }
+                }
+            } else if self.shared.foreign_tx(self.id) {
+                // A concurrent owner still excludes plain transactions
+                // (the regimes cannot mix).
+                let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                if !self.shared.wait_tx_clear(self.id, false, remain) {
+                    return Err(crate::sqlx_driver::error::busy());
+                }
+            }
+            let db = self.shared.db.write();
+            if self.gate_write(&db).is_ok() {
+                let prev_conn = crate::api::conn_tls::swap(self.id as u64);
+                return Ok(WriteGuardView {
+                    guard: db,
+                    prev_conn,
+                });
+            }
+            // A foreign transaction opened between the wait and the lock;
+            // drop the guard and wait again (the next round times out if
+            // the deadline has passed).
+            drop(db);
+        }
+    }
+
+    /// [`Self::acquire_write`] specialized for a `BEGIN CONCURRENT`
+    /// statement: the caller is BECOMING a concurrent owner, so sibling
+    /// concurrent transactions must not block it (this statement JOINS
+    /// the regime); only a foreign PLAIN transaction does (the regimes
+    /// cannot mix — the engine rejects the begin with a clear error if
+    /// one slips through).
+    fn acquire_write_concurrent_begin(&self) -> Result<WriteGuardView<'_>, SqlxError> {
+        let deadline = std::time::Instant::now() + self.busy_timeout;
+        loop {
             if self.shared.foreign_tx(self.id) {
                 let remain = deadline.saturating_duration_since(std::time::Instant::now());
                 if !self.shared.wait_tx_clear(self.id, false, remain) {
@@ -619,11 +759,12 @@ impl RustqliteConnection {
             }
             let db = self.shared.db.write();
             if self.gate_write(&db).is_ok() {
-                return Ok(db);
+                let prev_conn = crate::api::conn_tls::swap(self.id as u64);
+                return Ok(WriteGuardView {
+                    guard: db,
+                    prev_conn,
+                });
             }
-            // A foreign transaction opened between the wait and the lock;
-            // drop the guard and wait again (the next round times out if
-            // the deadline has passed).
             drop(db);
         }
     }
@@ -872,12 +1013,25 @@ impl RustqliteConnection {
                         parser::parse(stmt_sql).map_err(crate::sqlx_driver::error::engine_err)?
                     }
                 };
-                let mut db = self.acquire_write()?;
                 // A DEFERRED (sqlx) transaction that issues DDL or another
                 // once-class statement starts its engine-level transaction
                 // here (keeps DDL inside the deferred tx transactional, like
                 // SQLite). A raw `BEGIN` statement starts it directly.
                 let is_begin = matches!(&ast, Ast::Begin(_));
+                // BEGIN CONCURRENT acquires WITHOUT waiting on sibling
+                // concurrent transactions (this statement JOINS the
+                // regime; it only excludes plain transactions).
+                let is_concurrent_begin = matches!(
+                    &ast,
+                    Ast::Begin(crate::sql::ast::BeginStatement {
+                        mode: crate::sql::ast::BeginMode::Concurrent,
+                    })
+                );
+                let mut db = if is_concurrent_begin {
+                    self.acquire_write_concurrent_begin()?
+                } else {
+                    self.acquire_write()?
+                };
                 if !is_begin && self.tx_active && !db.in_transaction.load(Ordering::Acquire) {
                     db.execute("BEGIN", &[] as &[EngineValue])
                         .map_err(crate::sqlx_driver::error::engine_err)?;
@@ -886,31 +1040,74 @@ impl RustqliteConnection {
                 // Writes/DDL inside a transaction make it dirty (readers must
                 // wait); harmless in autocommit.
                 self.shared.tx_dirty.store(true, Ordering::Release);
-                db.execute(stmt_sql, values)
-                    .map_err(crate::sqlx_driver::error::engine_err)?;
-                // Transaction bookkeeping for raw SQL control statements.
+                let exec_result = db
+                    .execute(stmt_sql, values)
+                    .map_err(crate::sqlx_driver::error::engine_err);
+                // Transaction bookkeeping for raw SQL control statements —
+                // runs BEFORE the error propagates: a failed concurrent
+                // COMMIT (SQLITE_BUSY_SNAPSHOT conflict) still ENDED the
+                // engine-side transaction (the engine rolled it back), so
+                // the connection must not keep claiming one. The flags
+                // apply AFTER the engine guard drops (it borrows self).
+                let mut conc_begin = false;
+                let mut conc_end = false;
+                let mut plain_reset = false;
                 match &ast {
-                    Ast::Begin(_) => {
-                        // A fresh transaction starts clean.
-                        self.shared.tx_owner.store(self.id, Ordering::Release);
-                        self.shared.tx_dirty.store(false, Ordering::Release);
-                        self.shared.notify_tx_change();
+                    Ast::Begin(begin) => {
+                        if matches!(begin.mode, crate::sql::ast::BeginMode::Concurrent) {
+                            // BEGIN CONCURRENT: registered in the shared
+                            // concurrent set (NOT tx_owner — many may be
+                            // open at once); the engine created the
+                            // transaction keyed by our armed identity.
+                            conc_begin = true;
+                        } else {
+                            // A fresh transaction starts clean.
+                            self.shared.tx_owner.store(self.id, Ordering::Release);
+                            self.shared.tx_dirty.store(false, Ordering::Release);
+                            self.shared.notify_tx_change();
+                        }
                     }
                     Ast::Commit => {
-                        if self.i_own_engine_tx() {
-                            self.shared.tx_reset();
+                        if self.concurrent_tx {
+                            // The engine's COMMIT intercepted by identity
+                            // and ended the transaction (committed, or
+                            // rolled back on conflict with
+                            // SQLITE_BUSY_SNAPSHOT surfacing as the
+                            // statement's error above).
+                            conc_end = true;
+                        } else if self.i_own_engine_tx() {
+                            plain_reset = true;
                         }
                     }
                     // Only a FULL rollback ends the transaction;
                     // `ROLLBACK TO SAVEPOINT` keeps it open.
-                    Ast::Rollback(r) if r.savepoint.is_none() && self.i_own_engine_tx() => {
-                        self.shared.tx_reset();
+                    Ast::Rollback(r) if r.savepoint.is_none() => {
+                        if self.concurrent_tx {
+                            conc_end = true;
+                        } else if self.i_own_engine_tx() {
+                            plain_reset = true;
+                        }
                     }
                     Ast::Rollback(_) => {}
                     _ => {}
                 }
+                // Propagate the statement's error AFTER the bookkeeping
+                // decisions (see the comment above the match).
+                exec_result?;
                 rows_affected = db.changes().max(0) as u64;
                 last_rowid = db.last_insert_rowid();
+                drop(db);
+                if conc_begin {
+                    self.concurrent_tx = true;
+                    self.shared.concurrent_begin(self.id);
+                }
+                if conc_end {
+                    self.concurrent_tx = false;
+                    self.shared.concurrent_end(self.id);
+                }
+                if plain_reset {
+                    self.shared.tx_reset();
+                }
             }
         }
 
@@ -1044,6 +1241,19 @@ impl RustqliteConnection {
     fn finalize(&mut self) {
         let _ = self.apply_pending_rollback();
         self.tx_active = false;
+        // BEGIN CONCURRENT transaction still open on this connection:
+        // roll it back (the engine keys it by our identity; arming the
+        // identity around the ROLLBACK routes it). The regime must never
+        // outlive the connection that opened it — a leaked concurrent
+        // transaction would wedge every plain writer forever.
+        if self.concurrent_tx {
+            if let Ok(mut db) = self.try_write_now() {
+                let _ = db.execute("ROLLBACK", &[] as &[EngineValue]);
+                drop(db);
+            }
+            self.concurrent_tx = false;
+            self.shared.concurrent_end(self.id);
+        }
         // Roll back ANY engine-level transaction this connection left
         // open — including raw-script BEGINs that sqlx's tx_depth knows
         // nothing about — so a dropped connection can never leak a
@@ -1073,10 +1283,16 @@ impl RustqliteConnection {
 
     /// Acquire the write lock with ZERO busy wait (for close/drop paths
     /// where failing fast is better than parking a dropping task).
-    fn try_write_now(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Engine>, SqlxError> {
+    /// Arms the connection identity (concurrent-txn routing for the
+    /// teardown ROLLBACK).
+    fn try_write_now(&self) -> Result<WriteGuardView<'_>, SqlxError> {
         let db = self.shared.db.write();
         if self.gate_write(&db).is_ok() {
-            return Ok(db);
+            let prev_conn = crate::api::conn_tls::swap(self.id as u64);
+            return Ok(WriteGuardView {
+                guard: db,
+                prev_conn,
+            });
         }
         drop(db);
         // Someone else owns the tx; their commit/rollback will restore

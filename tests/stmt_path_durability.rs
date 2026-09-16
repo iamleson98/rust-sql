@@ -52,7 +52,11 @@ fn update_changes_counter_all_paths() {
     .unwrap();
 
     // Baseline: INSERT counts (this already worked).
-    step_all(&mut db, "INSERT INTO t (v) VALUES (?)", &[Value::Text("a".into())]);
+    step_all(
+        &mut db,
+        "INSERT INTO t (v) VALUES (?)",
+        &[Value::Text("a".into())],
+    );
     assert_eq!(db.changes(), 1, "INSERT via statement must count");
 
     // The bug: single-row UPDATE fast path returned without counting.
@@ -61,7 +65,11 @@ fn update_changes_counter_all_paths() {
         "UPDATE t SET v = ? WHERE id = ?",
         &[Value::Text("b".into()), Value::Integer(1)],
     );
-    assert_eq!(db.changes(), 1, "UPDATE via statement must count (fast path)");
+    assert_eq!(
+        db.changes(),
+        1,
+        "UPDATE via statement must count (fast path)"
+    );
     let total_after_one = db.total_changes();
 
     // Literal form (same fast path, no binds).
@@ -69,14 +77,23 @@ fn update_changes_counter_all_paths() {
     assert_eq!(db.changes(), 1, "UPDATE via execute must count");
 
     // Zero-row UPDATE reports 0, not the previous statement's count.
-    db.execute("UPDATE t SET v = 'x' WHERE id = 999", []).unwrap();
+    db.execute("UPDATE t SET v = 'x' WHERE id = 999", [])
+        .unwrap();
     assert_eq!(db.changes(), 0, "zero-row UPDATE must report 0");
 
     // Multi-row range UPDATE through the statement path.
     for v in ["a", "b", "c"] {
-        step_all(&mut db, "INSERT INTO t (v) VALUES (?)", &[Value::Text(v.into())]);
+        step_all(
+            &mut db,
+            "INSERT INTO t (v) VALUES (?)",
+            &[Value::Text(v.into())],
+        );
     }
-    step_all(&mut db, "UPDATE t SET v = 'z' WHERE id >= ?", &[Value::Integer(2)]);
+    step_all(
+        &mut db,
+        "UPDATE t SET v = 'z' WHERE id >= ?",
+        &[Value::Integer(2)],
+    );
     assert_eq!(db.changes(), 3, "range UPDATE must count every row");
     assert_eq!(
         db.total_changes() - total_after_one,
@@ -108,7 +125,11 @@ fn sqlite_format_stmt_path_durable() {
         // …then EVERY write through prepare/step ONLY — the exact shape
         // that lost data before the fix (sqlx's prepared DML).
         for v in ["a", "b", "c"] {
-            step_all(&mut db, "INSERT INTO t (v) VALUES (?)", &[Value::Text(v.into())]);
+            step_all(
+                &mut db,
+                "INSERT INTO t (v) VALUES (?)",
+                &[Value::Text(v.into())],
+            );
         }
         step_all(
             &mut db,
@@ -122,9 +143,7 @@ fn sqlite_format_stmt_path_durable() {
     {
         let db = Database::open(&path).unwrap();
         assert_eq!(db.disk_format(), "sqlite");
-        let rows = db
-            .query("SELECT id, v FROM t ORDER BY id", [])
-            .unwrap();
+        let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -169,7 +188,11 @@ fn sqlite_format_stmt_path_tx_commit_durable() {
         .unwrap();
         db.execute("BEGIN", []).unwrap();
         for v in ["x", "y"] {
-            step_all(&mut db, "INSERT INTO t (v) VALUES (?)", &[Value::Text(v.into())]);
+            step_all(
+                &mut db,
+                "INSERT INTO t (v) VALUES (?)",
+                &[Value::Text(v.into())],
+            );
         }
         // Rows inside the open transaction are NOT autocommit-dumped…
         db.execute("COMMIT", []).unwrap();

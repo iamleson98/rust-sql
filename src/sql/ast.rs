@@ -562,6 +562,12 @@ pub enum BeginMode {
     Deferred,
     Immediate,
     Exclusive,
+    /// `BEGIN CONCURRENT` — optimistic multi-writer transaction (the
+    /// SQLite `begin_concurrent` branch's semantics): several
+    /// connections may hold open write transactions at once; conflicts
+    /// are detected page-wise at first use and at COMMIT
+    /// (first-committer-wins, surfaced as SQLITE_BUSY_SNAPSHOT).
+    Concurrent,
 }
 
 #[derive(Clone, Debug)]

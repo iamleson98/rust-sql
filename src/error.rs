@@ -60,6 +60,13 @@ pub enum Error {
     AlreadyExists(String),
     /// Invalid argument from the user.
     InvalidArgument(String),
+    /// Optimistic-concurrency conflict in a `BEGIN CONCURRENT`
+    /// transaction: another connection committed a write to a page this
+    /// transaction read or wrote since it began (SQLite's BEGIN CONCURRENT
+    /// branch surfaces this as SQLITE_BUSY_SNAPSHOT / SQLITE_SNAPSHOT).
+    /// Retriable by re-running the whole transaction; the transaction is
+    /// rolled back before the error surfaces.
+    SnapshotConflict(String),
 }
 
 impl Error {
@@ -115,6 +122,9 @@ impl fmt::Display for Error {
             Error::NotFound(m) => write!(f, "{}", m),
             Error::AlreadyExists(m) => write!(f, "already exists: {}", m),
             Error::InvalidArgument(m) => write!(f, "invalid argument: {}", m),
+            Error::SnapshotConflict(m) => {
+                write!(f, "database is locked (SQLITE_BUSY_SNAPSHOT): {}", m)
+            }
         }
     }
 }

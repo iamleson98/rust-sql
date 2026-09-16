@@ -854,6 +854,15 @@ impl<'a> Statement<'a> {
     /// capturing map deltas for merge-back.
     fn exec_with_ctx<R>(&mut self, f: impl FnOnce(&mut ExecContext<'_>) -> Result<R>) -> Result<R> {
         let db = self.db;
+        // BEGIN CONCURRENT owner: arm the page-shadow scope for this
+        // whole step — get_page serves the transaction's shadows,
+        // read_maps resolves the transaction's overlay roots, and the
+        // transactional schema-root sync below writes through the
+        // shadows too. The identity is whatever the caller armed (the
+        // sqlx driver arms its connection id around the write lock).
+        let _wsg = db
+            .concurrent_txn_for_caller()
+            .map(|txn| db.pager.arm_writer_scope(txn));
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
         let shared = db.read_maps();
         let in_txn = db.in_transaction.load(std::sync::atomic::Ordering::Acquire);
@@ -880,6 +889,13 @@ impl<'a> Statement<'a> {
         // an outer scope on this thread already covers this Database.
         let _preupdate_guard = db.preupdate_scope();
         let out = f(&mut ctx);
+        // CONCURRENT owner with root moves: the schema-row rewrites must
+        // land in the transaction's page shadows (the scope is still
+        // armed HERE) — they install at COMMIT. Sourced from ctx.shared
+        // (the overlay this step resolved).
+        if _wsg.is_some() && ctx.roots_changed {
+            let _ = db.sync_schema_roots_from(&ctx.shared);
+        }
         // sqlite3_last_insert_rowid / sqlite3_changes bookkeeping: DML
         // through the streaming-statement path must update the Database
         // and the change counters the same way Database::execute does.
@@ -913,8 +929,27 @@ impl<'a> Statement<'a> {
         {
             return;
         }
+        // BEGIN CONCURRENT owner: the deltas merge into the TRANSACTION's
+        // overlay (cloned out, merged in place, stored back) — the shared
+        // maps stay at committed state until COMMIT publishes them.
+        if let Some(mut overlay) = self.db.concurrent_overlay_for_caller() {
+            let bk = Arc::make_mut(&mut overlay);
+            self.apply_deltas(bk);
+            self.db.store_concurrent_overlay(overlay);
+            return;
+        }
         let mut m = self.db.maps.write();
         let bk = Arc::make_mut(&mut *m);
+        self.apply_deltas(bk);
+        let nonempty = !bk.roots.is_empty() || !bk.index_roots.is_empty();
+        self.db
+            .maps_populated
+            .store(nonempty, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Merge this statement's captured map deltas into a bookkeeping maps
+    /// value (shared or transaction overlay).
+    fn apply_deltas(&mut self, bk: &mut crate::executor::StmtMaps) {
         if self.deltas.roots_changed {
             bk.roots.extend(self.deltas.root_overrides.drain());
             for k in self.deltas.roots_invalidated.drain(..) {
@@ -933,10 +968,6 @@ impl<'a> Statement<'a> {
                 bk.max_rowids.remove(&k);
             }
         }
-        let nonempty = !bk.roots.is_empty() || !bk.index_roots.is_empty();
-        self.db
-            .maps_populated
-            .store(nonempty, std::sync::atomic::Ordering::Release);
     }
 
     fn merge_max_rowids(&mut self) {
