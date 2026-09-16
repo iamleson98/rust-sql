@@ -707,4 +707,343 @@ mod driver {
         r.close().await.unwrap();
         cleanup("reader");
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_group_commit_amortizes_fsync() {
+        let opts = file_opts("group");
+        let mut setup = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        setup.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
+        // High-durability bursts: synchronous=FULL makes every COMMIT's
+        // durability point an fsync. Four connections open concurrent
+        // transactions on parallel threads, and their COMMITs are
+        // barrier-aligned so they arrive together — the group-commit
+        // leader must coalesce them into fewer fsyncs than commits.
+        setup.execute("PRAGMA synchronous = FULL").await.unwrap();
+        setup.close().await.unwrap();
+        // Open all four connections up front (the pooled production
+        // pattern: connections live before the burst), then run each
+        // transaction on its own thread.
+        let mut conns: Vec<_> = (0..4)
+            .map(|_| rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap())
+            .collect();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut joins = Vec::new();
+        for (i, c) in conns.drain(..).enumerate() {
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let mut c = c;
+                    c.execute("BEGIN CONCURRENT").await.unwrap();
+                    sqlx::query("INSERT INTO t (id, v) VALUES (?, 'x')")
+                        .bind(i as i64)
+                        .execute(&mut c)
+                        .await
+                        .unwrap();
+                    barrier.wait();
+                    c.execute("COMMIT").await.unwrap();
+                    c.close().await.unwrap();
+                });
+            }));
+        }
+        for j in joins {
+            j.join().expect("worker thread panicked");
+        }
+        // All four committed...
+        let mut c = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut c)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 4);
+        // ...and the fsyncs were AMORTIZED: fewer group syncs than group
+        // commits (the leader covers every sibling that appended in its
+        // coalescing window / during its in-flight fsync).
+        let (syncs, commits) = c.pager_handle().group_commit_stats();
+        assert!(commits >= 4, "stats: {}", commits);
+        assert!(
+            syncs < commits,
+            "expected amortized fsyncs, got syncs={} commits={}",
+            syncs,
+            commits
+        );
+        c.close().await.unwrap();
+        // Durable: a fresh engine replays the WAL and sees all four rows.
+        let path = std::env::temp_dir().join("cwdrv-group.db");
+        let db = rustqlite::Database::open(&path).unwrap();
+        let n = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+        assert_eq!(n, 4);
+        drop(db);
+        cleanup("group");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ROW-LEVEL conflict granularity (v2): two writers on DIFFERENT rows of
+// the SAME hot leaf page both commit — the second MERGES (replays its row
+// journal onto the current committed trees) instead of retrying.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_hot_page_disjoint_rows_merge() {
+    let (mut db, path) = waldb("cw_row_merge_insert");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    // Two transactions inserting DIFFERENT rowids of one hot leaf page.
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", [])
+        .unwrap();
+    Database::set_conn_identity(2);
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'b')", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    // Page-granularity would abort here (both dirtied the same leaf);
+    // row-granularity MERGES the second writer's journal.
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 2);
+    let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
+    assert_eq!(rows[0][1].as_text(), "a");
+    assert_eq!(rows[1][1].as_text(), "b");
+    // Durable + tree-consistent after WAL recovery.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 2);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_hot_page_disjoint_row_updates_merge() {
+    let (mut db, path) = waldb("cw_row_merge_update");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'x'), (2, 'y')", [])
+        .unwrap();
+    // Both writers UPDATE different rows (same single-leaf table).
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'A' WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'B' WHERE id = 2", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap(); // MERGE path
+    Database::set_conn_identity(0);
+    let rows = db.query("SELECT v FROM t ORDER BY id", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "A");
+    assert_eq!(rows[1][0].as_text(), "B");
+    assert_eq!(count(&db, "t"), 2);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    let rows = db2.query("SELECT v FROM t ORDER BY id", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "A");
+    assert_eq!(rows[1][0].as_text(), "B");
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_hot_page_same_row_update_conflicts() {
+    let (mut db, _path) = waldb("cw_row_conflict_update");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'x'), (2, 'y')", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'A' WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'B' WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    // SAME row: first-committer-wins at row granularity — retryable
+    // SQLITE_BUSY_SNAPSHOT.
+    Database::set_conn_identity(2);
+    let r = db.execute("COMMIT", []);
+    assert!(r.is_err(), "same-row update must conflict");
+    assert!(r
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("SQLITE_BUSY_SNAPSHOT"));
+    Database::set_conn_identity(0);
+    let rows = db.query("SELECT v FROM t ORDER BY id", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "A");
+    assert_eq!(rows[1][0].as_text(), "y");
+}
+
+#[test]
+fn concurrent_disjoint_deletes_merge() {
+    let (mut db, path) = waldb("cw_row_merge_delete");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'x'), (2, 'y')", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("DELETE FROM t WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("DELETE FROM t WHERE id = 2", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap(); // MERGE path (delete journal)
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 0);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 0);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_merge_with_index_maintenance() {
+    let (mut db, path) = waldb("cw_row_merge_index");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INT)", [])
+        .unwrap();
+    db.execute("CREATE INDEX ik ON t(k)", []).unwrap();
+    db.execute(
+        "INSERT INTO t (id, k) VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+        [],
+    )
+    .unwrap();
+    // Both writers update DIFFERENT rows' indexed column: table-leaf ops
+    // AND index-leaf ops merge.
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET k = 11 WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET k = 22 WHERE id = 2", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap(); // MERGE: table + index journals
+    Database::set_conn_identity(0);
+    // Index-driven lookups must reflect BOTH merges.
+    for (k, id) in [(11i64, 1i64), (22, 2), (30, 3), (40, 4)] {
+        let rows = db
+            .query("SELECT id FROM t WHERE k = ?", [Value::Integer(k)])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "k={} must find exactly one row", k);
+        assert_eq!(rows[0][0].as_integer(), id);
+    }
+    // The stale keys must be gone from the index.
+    assert_eq!(
+        db.query("SELECT count(*) FROM t WHERE k = 10", []).unwrap()[0][0].as_integer(),
+        0
+    );
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    let rows = db2
+        .query("SELECT id FROM t WHERE k IN (11, 22) ORDER BY id", [])
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_merge_with_root_split_rebuilds_tree() {
+    let (mut db, path) = waldb("cw_row_merge_split");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'seed')", [])
+        .unwrap();
+    // Writer 2 bulk-inserts enough rows to SPLIT the (single-leaf) tree
+    // and move its root; writer 1 touches the same original leaf first
+    // and commits — writer 2 must MERGE: discard its split shadows,
+    // replay the journal (re-splitting naturally), and land a correct
+    // catalog rootpage.
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'touched' WHERE id = 1", [])
+        .unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    for i in 2..400i64 {
+        db.execute(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [Value::Integer(i), Value::Text(format!("r{}", i).into())],
+        )
+        .unwrap();
+    }
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap(); // MERGE with re-rooting
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 399);
+    let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "touched");
+    // Integrity: every row reachable in key order (a broken root or a
+    // stale catalog rootpage would misplace or lose rows).
+    let rows = db.query("SELECT id FROM t ORDER BY id", []).unwrap();
+    let mut expect = 1i64;
+    for r in &rows {
+        assert_eq!(r[0].as_integer(), expect);
+        expect += 1;
+    }
+    assert_eq!(expect, 400);
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 399);
+    let rows = db2.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "touched");
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_merge_conflict_still_first_committer_wins_on_row() {
+    let (mut db, _path) = waldb("cw_row_merge_vs_conflict");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'x'), (2, 'y')", [])
+        .unwrap();
+    // MIXED: writer 2 updates row 2 (mergeable) AND row 1 (conflicting
+    // with writer 1's committed update) — the row-level validation must
+    // abort the whole transaction, never a partial merge.
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'A' WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'B' WHERE id = 2", []).unwrap();
+    db.execute("UPDATE t SET v = 'B2' WHERE id = 1", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    let r = db.execute("COMMIT", []);
+    assert!(r.is_err(), "same-row component must abort the merge");
+    assert!(r
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("SQLITE_BUSY_SNAPSHOT"));
+    Database::set_conn_identity(0);
+    let rows = db.query("SELECT v FROM t ORDER BY id", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "A");
+    assert_eq!(rows[1][0].as_text(), "y");
 }

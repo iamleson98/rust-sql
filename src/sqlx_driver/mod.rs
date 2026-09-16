@@ -201,6 +201,11 @@ impl SqlxDatabase for Rustqlite {
 /// One engine instance per database, shared across pool connections.
 struct SharedDb {
     db: parking_lot::RwLock<Engine>,
+    /// Shared handle to the engine's pager: the group-commit durability
+    /// wait (`group_sync`) runs OUTSIDE the engine write lock — sibling
+    /// committers append their WAL frames while the group's leader fsyncs
+    /// once for all of them (high-durability write-burst amortization).
+    pager: std::sync::Arc<crate::storage::pager::Pager>,
     /// Connection id that currently owns the engine-level transaction
     /// (0 = none). Serializes cross-connection transactions with
     /// SQLite-style BUSY semantics.
@@ -332,8 +337,10 @@ impl SharedDb {
 }
 
 fn new_shared(db: Engine) -> Arc<SharedDb> {
+    let pager = db.pager_handle();
     Arc::new(SharedDb {
         db: parking_lot::RwLock::new(db),
+        pager,
         tx_owner: AtomicUsize::new(0),
         tx_dirty: AtomicBool::new(false),
         concurrent: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -637,6 +644,12 @@ impl RustqliteConnection {
     /// The current transaction depth (0 = autocommit).
     pub fn transaction_depth(&self) -> usize {
         self.tx_depth
+    }
+
+    /// Shared pager handle (diagnostics: group-commit statistics, WAL
+    /// frame counts, cache stats).
+    pub fn pager_handle(&self) -> std::sync::Arc<crate::storage::pager::Pager> {
+        std::sync::Arc::clone(&self.shared.pager)
     }
 
     /// Set the busy timeout: how long a statement blocked by another
@@ -1040,9 +1053,25 @@ impl RustqliteConnection {
                 // Writes/DDL inside a transaction make it dirty (readers must
                 // wait); harmless in autocommit.
                 self.shared.tx_dirty.store(true, Ordering::Release);
-                let exec_result = db
-                    .execute(stmt_sql, values)
-                    .map_err(crate::sqlx_driver::error::engine_err);
+                // GROUP COMMIT: a concurrent owner's COMMIT takes the
+                // DEFERRED path — validate + install/merge + WAL append
+                // happen under this write lock (microseconds), then the
+                // lock drops and the DURABILITY wait (fsync) happens in
+                // `group_sync` OUTSIDE it. Sibling committers append their
+                // frames while the group's leader performs ONE fsync for
+                // the whole group (synchronous=FULL bursts amortize).
+                let is_concurrent_commit = matches!(&ast, Ast::Commit) && self.concurrent_tx;
+                let mut durability_ticket: Option<u64> = None;
+                let exec_result = if is_concurrent_commit {
+                    db.commit_concurrent_deferred()
+                        .map_err(crate::sqlx_driver::error::engine_err)
+                        .map(|t| {
+                            durability_ticket = Some(t);
+                        })
+                } else {
+                    db.execute(stmt_sql, values)
+                        .map_err(crate::sqlx_driver::error::engine_err)
+                };
                 // Transaction bookkeeping for raw SQL control statements —
                 // runs BEFORE the error propagates: a failed concurrent
                 // COMMIT (SQLITE_BUSY_SNAPSHOT conflict) still ENDED the
@@ -1107,6 +1136,15 @@ impl RustqliteConnection {
                 }
                 if plain_reset {
                     self.shared.tx_reset();
+                }
+                if let Some(ticket) = durability_ticket {
+                    // Durability point, OUTSIDE the engine write lock (the
+                    // group-sync leader coalesces this fsync with every
+                    // sibling committer that appended in the window).
+                    self.shared
+                        .pager
+                        .group_sync(ticket)
+                        .map_err(crate::sqlx_driver::error::engine_err)?;
                 }
             }
         }

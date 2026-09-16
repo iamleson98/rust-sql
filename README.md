@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: production-ready core. **1200+ tests** (1234 in the default matrix
+> **Status**: production-ready core. **1200+ tests** (1241 in the default matrix
 > + 65 C ABI suites; crash / power-loss simulation, OOM + I/O fault injection,
 > corruption + SQL fuzzing, differential verification
 > against real SQLite, SQL Logic Tests, intra-statement parallelism equality checks (scan,
@@ -321,7 +321,7 @@ The API is rusqlite-shaped: `execute` for statements without rows, `query` for t
 - **B+tree correctness** — randomized insert/lookup/scan/delete testing; the split logic is the trickiest part and is well-tested.
 - **WAL integrity** — CRC32 + salt + running checksum makes torn-write recovery robust; verified by crash tests that abort at every statement boundary.
 - **Concurrency model** — `&self` reads + per-page locks + scoped worker threads give three distinct concurrency tiers with zero unsafe code in the engine.
-- **Multi-writer transactions** — `BEGIN CONCURRENT` lifts SQLite's one-writer limit with optimistic, page-level conflict tracking (`storage/concurrent.rs`): N write transactions open at once over private page shadows, first-committer-wins on the write set (`SQLITE_BUSY_SNAPSHOT`, retriable), readers never block and never see uncommitted bytes. Disjoint write sets — different tables, different hot regions — commit in parallel; the commit critical section is just validate + install + WAL append.
+- **Multi-writer transactions** — `BEGIN CONCURRENT` lifts SQLite's one-writer limit with optimistic concurrency (`storage/concurrent.rs`): N write transactions open at once over private page shadows, first-committer-wins with ROW-level conflict granularity (`SQLITE_BUSY_SNAPSHOT`, retriable — two writers on different rows of the same hot leaf page both commit; the second MERGES its row journal onto the current trees instead of retrying), readers never block and never see uncommitted bytes, and group commit amortizes one fsync across concurrent committers under `PRAGMA synchronous=FULL`. The commit critical section is just validate + install/merge + WAL append — the fsync waits outside it.
 - **Parallel determinism** — workers run the serial path's own machinery and merge in range order, so answers are identical by construction (the one documented latitude: the last ULP of a REAL SUM, below).
 
 **What we cut (deliberate omissions)**
@@ -1053,13 +1053,21 @@ COMMIT;                      -- validate + install + WAL append
   committed version stamp — a page committed by another connection after
   BEGIN fails fast (`SQLITE_BUSY_SNAPSHOT`, code 517); everything the
   transaction reads is its BEGIN-time state.
-- **First-committer-wins on the write set**: at COMMIT the dirty shadow
-  pages are validated against the version stamps; any page another
-  connection committed to since means a write-write overlap — the
-  transaction rolls back and the error surfaces as `SQLITE_BUSY_SNAPSHOT`
-  (retry the whole transaction; the same contract as SQLite's branch).
-  Disjoint write sets never conflict: two writers on different tables,
-  or different hot regions of one big table, commit in parallel.
+- **First-committer-wins with ROW-level granularity**: every row-level
+  write (table insert/update/delete, index entry insert/delete) is also
+  recorded in a transaction-private ROW JOURNAL keyed by the tree's
+  canonical root + rowid. At COMMIT, a dirty-page conflict is only a
+  REAL conflict when one of those (tree, rowid) pairs was written by a
+  concurrent commit — two writers updating different rows of the SAME
+  hot leaf page both commit. The second writer MERGES: it discards its
+  page shadows and replays its row journal onto the current committed
+  trees inside a fresh shadow transaction (atomic — a replay divergence
+  rolls back cleanly and surfaces as `SQLITE_BUSY_SNAPSHOT`), re-doing
+  splits naturally and patching the catalog's rootpage so reopens see
+  the merged trees. Same-row overlaps abort and retry (the same
+  contract as SQLite's branch). Disjoint write sets never conflict:
+  two writers on different tables, or different rows of one hot page,
+  commit in parallel.
 - **Readers never block and never wait**: in the concurrent regime the
   live page cache IS the committed state (writers mutate shadows), so
   plain SELECTs take the ordinary read path — no committed-view
@@ -1068,8 +1076,16 @@ COMMIT;                      -- validate + install + WAL append
   dropping the shadows is the whole undo; the transaction's fresh page
   allocations are recycled into the freelist and one small WAL commit
   persists that.
-- **Durability**: the commit reuses the standard WAL path — frames +
-  commit marker + fsync per `PRAGMA synchronous`, CRC-checked, recovered
+- **Durability with GROUP COMMIT**: the commit appends frames + commit
+  marker under a microseconds-long critical section (validate +
+  install/merge + WAL append) and defers the fsync to a leader/follower
+  coordinator: the first committer with unsatisfied durability opens a
+  short coalescing window (~100 µs), then ONE fsync covers every frame
+  appended so far — sibling committers that appended meanwhile all
+  return together (PostgreSQL/InnoDB-style amortization). Under
+  `PRAGMA synchronous=FULL` bursts, N concurrent commits cost ~1 fsync
+  instead of N; `NORMAL/OFF` skip the wait exactly as before (the
+  durability point stays the checkpoint). CRC-checked frames, recovered
   by the crash-recovery matrix on reopen.
 
 Restrictions inside a concurrent transaction (v1): DDL, PRAGMA, and
@@ -1077,19 +1093,26 @@ SAVEPOINT statements are rejected (the in-memory catalog, savepoint undo
 logs, and journal-mode switches are single-writer structures); plain
 (non-`CONCURRENT`) write statements from other connections wait for the
 regime to drain (readers pass). Schema changes belong between
-transactions. Conflicts are page-granularity — two writers hammering the
-same hot leaf page will serialize through retries (the documented cost of
-the model SQLite's branch chose too; fine-grained row tracking is the
-future HCTREE-style step).
+transactions. The merge covers standard rowid-table and index DML (the
+statement shapes allowed inside the regime); structural-only conflicts
+(root splits colliding on the same interior pages, an unjournaled write
+path) fall back to page-granularity abort — retry, never corruption.
 
-Testing: `tests/concurrent_writes.rs` — 15 engine-level suites (two
+Testing: `tests/concurrent_writes.rs` — 22 engine-level suites (two
 writers over disjoint tables, snapshot isolation both directions,
 first-committer-wins conflicts, fail-fast on moved pages, regime gating
 of plain writers, unblocked readers, 2k-row bulk insert/rollback with
 allocation recycling, UPDATE/DELETE, mixed-workload integrity, WAL
-recovery after concurrent commits, parallel writer threads) + 3
-sqlx-driver suites (two real connections with interleaved statements,
-conflict → error code 517, reader unblocked mid-transaction).
+recovery after concurrent commits, parallel writer threads; row-level
+granularity: disjoint-row inserts/updates/deletes on one hot page MERGE,
+same-row updates conflict, index-maintained merges stay consistent, a
+merge that re-splits the tree lands a correct catalog rootpage and
+reopens clean, and a mixed mergeable+conflicting transaction still
+aborts atomically) + 4 sqlx-driver suites (two real connections with
+interleaved statements, conflict → error code 517, reader unblocked
+mid-transaction, and barrier-aligned four-connection commits under
+`synchronous=FULL` amortizing to fewer fsyncs than commits with every
+row durable on reopen).
 
 ### Missing parts (feature & compat surface)
 
@@ -1546,9 +1569,10 @@ cargo run --example batch
 ## Testing
 
 The test matrix is modeled on SQLite's own methodology
-([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1234 tests in
-the default matrix (265 unit + 969 integration across 77 files), plus 65 C ABI
-suites in `compat/` and the sqlx feature suite — all passing:
+([sqlite.org/testing.html](https://www.sqlite.org/testing.html)); 1241 tests in
+the default matrix (265 unit + 976 integration across 77 files), plus 65 C ABI
+suites in `compat/` and the sqlx feature suite (1280 tests with `--features
+sqlx`) — all passing:
 
 | SQLite technique (testing.html §) | rustqlite harness | What it verifies |
 |---|---|---|
@@ -1570,7 +1594,7 @@ suites in `compat/` and the sqlx feature suite — all passing:
 | `integrity_check` | `tests/integrity_check.rs` | full structural walk: freelist chains, every b-tree, bidirectional index↔table cross-verification |
 | Soak / long-run | `concurrency_stress.rs`, `RUSTQLITE_FUZZ_ITERS` | 32-thread mixed workloads; long fuzz iterations |
 | Concurrency (§5) | `concurrent_throughput.rs`, `committed_view.rs`, `wal.rs` | no deadlocks, no lost writes, no torn reads, snapshot consistency |
-| Multi-writer (BEGIN CONCURRENT) | `concurrent_writes.rs` | N write txns at once, snapshot isolation, first-committer-wins (SQLITE_BUSY_SNAPSHOT 517), regime gating, allocation recycling, WAL recovery, driver-level 2-conn interleaving |
+| Multi-writer (BEGIN CONCURRENT) | `concurrent_writes.rs` | N write txns at once, snapshot isolation, row-level conflict granularity + MERGE (disjoint rows of one hot page both commit; same-row conflicts 517), group-commit fsync amortization, regime gating, allocation recycling, WAL recovery, driver-level 2-conn interleaving + 4-conn group commit |
 | Intra-statement parallelism | `tests/parallel_scan.rs` | parallel-vs-serial result equality for every parallel shape (incl. GROUP BY row order, top-N order, unbounded ORDER BY with projections/ordinals/hidden-rowid, parameter-filtered fused aggregates), 300k-row SQLite cross-check, transaction-decline + PRAGMA-gate contracts |
 | Rowid in joins | `tests/rowid_join.rs` | rowid pseudo-column refs in join conditions/projections/filters differential-pinned vs bundled SQLite (rowid↔rowid, rowid↔column, outer-join NULL semantics, 3-table chains, self-joins, INTEGER-PK alias tables, `COLLATE BINARY` as the default collation, `:memory:` purity) |
 | Non-equi joins | `tests/nested_join.rs` | compiled nested-loop conditions differential-pinned vs bundled SQLite (every join flavor × comparison/arithmetic/collate/AND-OR-NOT/NULL shapes, implicit-join fusion), 150k-row parallel==serial equality for INNER/LEFT/RIGHT/FULL, transaction-decline + PRAGMA gates, SQLite cross-checks at scale, and SQLite-exact boolean truthiness (`'abc'`/`'1x'` prefix coercion, blob rules, `NOT NULL` three-valued logic) |

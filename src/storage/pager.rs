@@ -36,7 +36,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A shared mutable reference to a page.
@@ -290,6 +290,52 @@ pub struct WalState {
 /// `wal_autocheckpoint` is 1000 pages at 4 KiB; ours is the same frame
 /// count).
 const WAL_AUTOCHECKPOINT_FRAMES: u32 = 1000;
+
+/// Leader/follower fsync coordinator for GROUP COMMIT.
+///
+/// Under `PRAGMA synchronous=FULL`, every COMMIT's durability point is an
+/// fsync of the WAL (~0.1-10 ms depending on storage). N concurrent
+/// committers each paying that serially caps write throughput at
+/// 1/fsync — the classic single-fsync bottleneck. This coordinator
+/// amortizes it the way every mature WAL engine does (PostgreSQL's
+/// commit_delay/leader-followers, InnoDB's group commit): committers
+/// append their WAL frames under the (short) commit critical section,
+/// release it, and THEN wait for durability here. The first arrival
+/// becomes the LEADER: it opens a small coalescing window for sibling
+/// committers to finish appending, then performs ONE fsync covering every
+/// frame appended so far — followers parked on the condvar observe the
+/// durable frame count pass their ticket and return. Committers that
+/// arrive while a leader is in flight simply wait; the next arrival
+/// after it becomes the next leader.
+///
+/// `synchronous=NORMAL/OFF` skips the wait entirely (the durability
+/// point moves to the checkpoint, per WAL semantics) — the coordinator
+/// then only carries the auto-checkpoint duty for the deferred path.
+pub(crate) struct GroupSync {
+    state: Mutex<GroupSyncState>,
+    cv: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+pub(crate) struct GroupSyncState {
+    /// Cumulative WAL frame count known durable (fsynced or
+    /// checkpointed into the main file).
+    durable: u64,
+    /// A leader is in flight (holds the sync duty).
+    syncing: bool,
+    /// Sticky-ish sync error observed by waiters of the failed batch
+    /// (cleared when the next leader starts).
+    err: Option<String>,
+}
+
+impl GroupSync {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GroupSyncState::default()),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+}
 
 /// Backing store for the pager: either a real file (positioned I/O) or a
 /// pure in-memory byte image (`:memory:` databases).
@@ -569,6 +615,21 @@ pub struct Pager {
     /// write() syscalls are pure overhead. This is what makes autocommit
     /// INSERTs in `:memory:` mode competitive with SQLite's.
     pub(crate) lazy_writeback: AtomicBool,
+    /// Group-commit coordinator state (see [`Pager::group_sync`]):
+    /// leader/follower fsync coalescing across concurrent committers.
+    pub(crate) group_sync: GroupSync,
+    /// Cumulative WAL frame count across ALL WAL generations (survives
+    /// checkpoint resets) — the monotonically increasing durability
+    /// order committers wait on via `group_sync(ticket)`.
+    pub(crate) wal_frames_total: AtomicU64,
+    /// Group-commit coalescing window in microseconds (the leader's
+    /// pre-fsync wait for sibling committers to append their frames).
+    /// 0 = sync immediately. Default 100 µs — noise next to an fsync.
+    group_commit_delay_us: AtomicU64,
+    /// Group-commit statistics: (fsyncs performed, commits that passed
+    /// through group_sync). Diagnostics + tests.
+    group_sync_count: AtomicU64,
+    group_commit_count: AtomicU64,
     /// Last page id inserted into `dirty_pages` (see note_dirty's fast
     /// path). u32::MAX = none. Reset by flush().
     last_noted_dirty: std::sync::atomic::AtomicU32,
@@ -1532,6 +1593,11 @@ impl Pager {
             locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),
+            group_sync: GroupSync::new(),
+            wal_frames_total: AtomicU64::new(0),
+            group_commit_delay_us: AtomicU64::new(100),
+            group_sync_count: AtomicU64::new(0),
+            group_commit_count: AtomicU64::new(0),
             last_noted_dirty: std::sync::atomic::AtomicU32::new(u32::MAX),
             pending_truncate: std::sync::atomic::AtomicU32::new(0),
             legacy_migrated: AtomicBool::new(false),
@@ -2225,6 +2291,13 @@ impl Pager {
         header[16..20].copy_from_slice(&n_pages_val.to_le_bytes());
         self.write_file_at(0, &header)?;
         Ok(())
+    }
+
+    /// Durable backing-store length in bytes (file or in-memory image).
+    /// NOT the logical page count — the WAL may hold pages past this
+    /// length, and `n_pages` may run ahead of it mid-transaction.
+    pub(crate) fn store_len(&self) -> u64 {
+        self.store.len().unwrap_or(0)
     }
 
     /// Get a page by ID, reading from disk if not cached.
@@ -3683,6 +3756,20 @@ impl Pager {
     /// frame as the commit frame, sync per `PRAGMA synchronous`, and
     /// auto-checkpoint when the WAL grows past the threshold.
     pub(crate) fn flush_wal(&self) -> Result<()> {
+        self.flush_wal_opts(true, true).map(|_| ())
+    }
+
+    /// [`Self::flush_wal`] with the tail phases selectable — the
+    /// GROUP-COMMIT deferred path appends frames + commit marker (the
+    /// logical commit, published to readers immediately) but defers the
+    /// fsync AND the auto-checkpoint to the group-sync leader
+    /// ([`Self::group_sync`]). Returns the durability ticket: the
+    /// cumulative WAL frame count this commit covers.
+    ///
+    /// `checkpoint=false` callers MUST eventually route through
+    /// `group_sync` (the leader carries the auto-checkpoint duty) or the
+    /// WAL would grow unboundedly under `synchronous=NORMAL` bursts.
+    pub(crate) fn flush_wal_opts(&self, sync: bool, checkpoint: bool) -> Result<u64> {
         let psz = self.page_size();
 
         // --- header page: refresh in-cache page 0 and mark it dirty ---
@@ -3719,7 +3806,7 @@ impl Pager {
             // commit. (Cannot normally happen: dirty_count > 0 implies
             // dirty pages.)
             self.dirty_count_approx.store(0, Ordering::Release);
-            return Ok(());
+            return Ok(self.wal_frames_total.load(Ordering::Acquire));
         }
         // Page-ordered frames: a sorted append makes consecutive pages
         // land at consecutive WAL offsets, which lets `checkpoint_wal`
@@ -3731,13 +3818,19 @@ impl Pager {
         // --- append frames under the WAL write lock ---
         let mut frame_offsets: Vec<(PageId, u64)> = Vec::with_capacity(dirty_ids.len());
         let sync_needed;
+        // Durability ticket: the cumulative WAL frame count this commit
+        // covers, captured under the WAL write lock (the monotonically
+        // increasing durability order — see `group_sync`).
+        let ticket_out: u64;
         {
             let mut guard = self.wal.write();
             let Some(state) = guard.as_mut() else {
                 // Mode flipped to DELETE between the dispatch check and
                 // here (single writer, but be safe): fall back.
                 drop(guard);
-                return self.flush_inner_delete();
+                return self
+                    .flush_inner_delete()
+                    .map(|_| self.wal_frames_total.load(Ordering::Acquire));
             };
             let mut scratch = vec![0u8; psz as usize];
             for (i, id) in dirty_ids.iter().enumerate() {
@@ -3759,12 +3852,22 @@ impl Pager {
             // setting) skips this fsync: commits survive process crashes
             // (the OS page cache holds them) but not power loss; the next
             // checkpoint makes them fully durable — SQLite's documented
-            // trade-off.
+            // trade-off. The DEFERRED concurrent path (sync=false) moves
+            // this fsync to the group-sync leader, which coalesces it
+            // across sibling committers.
             let sync_mode = self.synchronous.load(Ordering::Acquire);
-            sync_needed = sync_mode >= 2 && !self.skip_fsync.load(Ordering::Acquire);
+            sync_needed = sync && sync_mode >= 2 && !self.skip_fsync.load(Ordering::Acquire);
             if sync_needed {
                 state.wal.sync()?;
             }
+            // Cumulative frame accounting (across WAL generations — the
+            // counter survives checkpoint resets): this is the
+            // monotonically increasing durability order that
+            // `group_sync` tickets compare against.
+            ticket_out = self
+                .wal_frames_total
+                .fetch_add(frame_offsets.len() as u64, Ordering::AcqRel)
+                + frame_offsets.len() as u64;
             for (id, off) in &frame_offsets {
                 state.map.insert(*id, *off);
             }
@@ -3807,7 +3910,7 @@ impl Pager {
         // on mass delete either (its file keeps the high-water length
         // until a later checkpoint; the committed page-0 frame carries
         // the smaller n_pages).
-        if frames >= WAL_AUTOCHECKPOINT_FRAMES {
+        if checkpoint && frames >= WAL_AUTOCHECKPOINT_FRAMES {
             self.checkpoint_wal()?;
             // The checkpoint's transient allocations (up to 512
             // page-cache probe clones, the id Vec) are freed HERE, after
@@ -3825,7 +3928,138 @@ impl Pager {
         // and the header's n_pages) is now committed.
         self.committed_n_pages
             .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
-        Ok(())
+        Ok(ticket_out)
+    }
+
+    // -----------------------------------------------------------------
+    // group commit: leader/follower fsync coalescing
+    // -----------------------------------------------------------------
+
+    /// Wait for the durability of WAL frames up to `ticket` (the value a
+    /// deferred commit returned from [`Self::flush_wal_opts`]).
+    ///
+    /// The FIRST waiter with unsatisfied durability becomes the LEADER:
+    /// it opens a short coalescing window (see `group_commit_delay_us`),
+    /// then ONE fsync covers every frame appended so far — sibling
+    /// committers that appended meanwhile and are parked here as
+    /// followers all return together. `PRAGMA synchronous=NORMAL/OFF`
+    /// skips the wait (their durability point is the checkpoint) — the
+    /// leader duty that always remains is the auto-checkpoint.
+    ///
+    /// Safe to call with locks held EXCEPT the WAL write lock: the leader
+    /// path takes it for the fsync. It never takes the concurrent commit
+    /// lock, so a committer holding it can wait here as a follower while
+    /// an outside leader progresses.
+    pub fn group_sync(&self, ticket: u64) -> Result<()> {
+        self.group_commit_count.fetch_add(1, Ordering::Acquire);
+        let sync_mode = self.synchronous.load(Ordering::Acquire);
+        let need_sync = sync_mode >= 2 && !self.skip_fsync.load(Ordering::Acquire);
+        if !need_sync {
+            // NORMAL/OFF: no durability wait; carry the checkpoint duty.
+            let advanced = self.group_checkpoint_if_due()?;
+            if let Some(advanced) = advanced {
+                let mut st = self.group_sync.state.lock();
+                st.durable = st.durable.max(advanced);
+                self.group_sync.cv.notify_all();
+            }
+            return Ok(());
+        }
+        let mut st = self.group_sync.state.lock();
+        loop {
+            if st.durable >= ticket {
+                return Ok(());
+            }
+            if !st.syncing {
+                // ---- become the leader ----
+                st.syncing = true;
+                st.err = None;
+                drop(st);
+                // Coalescing window: let sibling committers finish their
+                // (short) append critical sections so one fsync covers
+                // them. Bounded and tiny next to the fsync itself.
+                let delay = self.group_commit_delay_us.load(Ordering::Acquire);
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(delay));
+                }
+                let target = self.wal_frames_total.load(Ordering::Acquire);
+                let sync_res = {
+                    let mut guard = self.wal.write();
+                    match guard.as_mut() {
+                        Some(state) => state.wal.sync().map_err(|e| e.to_string()),
+                        None => Ok(()), // WAL gone (mode flip): nothing to sync
+                    }
+                };
+                self.group_sync_count.fetch_add(1, Ordering::Acquire);
+                // Auto-checkpoint AFTER the fsync: a WAL reset must never
+                // discard frames that no one has made durable yet.
+                let mut durable_now = target;
+                let mut failure: Option<String> = match &sync_res {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("WAL fsync failed: {e}")),
+                };
+                if failure.is_none() {
+                    match self.group_checkpoint_if_due() {
+                        Ok(Some(advanced)) => durable_now = durable_now.max(advanced),
+                        Ok(None) => {}
+                        Err(e) => failure = Some(format!("checkpoint failed: {e}")),
+                    }
+                }
+                st = self.group_sync.state.lock();
+                st.syncing = false;
+                match failure {
+                    None => st.durable = st.durable.max(durable_now),
+                    Some(e) => st.err = Some(e),
+                }
+                self.group_sync.cv.notify_all();
+                continue; // re-check as a satisfied waiter
+            }
+            // ---- follower: wait for the in-flight leader ----
+            if let Some(e) = st.err.clone() {
+                return Err(Error::Io(std::io::Error::other(e)));
+            }
+            self.group_sync.cv.wait(&mut st);
+        }
+    }
+
+    /// The leader's auto-checkpoint duty. Returns `Some(cumulative_frames)`
+    /// when a checkpoint ran (every frame below that count is now durable
+    /// in the main file), `None` when the WAL is under the threshold.
+    fn group_checkpoint_if_due(&self) -> Result<Option<u64>> {
+        let frames = {
+            let guard = self.wal.read();
+            guard.as_ref().map(|s| s.wal.n_frames()).unwrap_or(0)
+        };
+        if frames < WAL_AUTOCHECKPOINT_FRAMES {
+            return Ok(None);
+        }
+        // cumulative captured BEFORE the checkpoint: a committer appending
+        // after this snapshot simply waits for the next leader (its frames
+        // may also ride this checkpoint — under-crediting is safe).
+        let cumulative = self.wal_frames_total.load(Ordering::Acquire);
+        self.checkpoint_wal()?;
+        crate::api::drain_mimalloc_wake();
+        Ok(Some(cumulative))
+    }
+
+    /// Cumulative WAL frame count (the durability order). Diagnostics.
+    pub fn wal_frames_total(&self) -> u64 {
+        self.wal_frames_total.load(Ordering::Acquire)
+    }
+
+    /// Group-commit statistics: `(fsyncs performed, commits that waited)`.
+    /// Under `synchronous=FULL`, `syncs < commits` means fsyncs were
+    /// amortized across a group.
+    pub fn group_commit_stats(&self) -> (u64, u64) {
+        (
+            self.group_sync_count.load(Ordering::Acquire),
+            self.group_commit_count.load(Ordering::Acquire),
+        )
+    }
+
+    /// Group-commit coalescing window (microseconds). Tests set 0 for
+    /// immediate syncs.
+    pub fn set_group_commit_delay_us(&self, us: u64) {
+        self.group_commit_delay_us.store(us, Ordering::Release);
     }
 
     /// Re-read the file header through the committed page map (WAL) and

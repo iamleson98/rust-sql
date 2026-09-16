@@ -257,7 +257,7 @@ pub(crate) mod conn_tls {
 /// `&mut Database`, which serializes them — but reads proceed without
 /// blocking on the outer lock.
 pub struct Database {
-    pub(crate) pager: Pager,
+    pub(crate) pager: Arc<Pager>,
     pub(crate) catalog: Catalog,
     path: PathBuf,
     /// Inside an explicit BEGIN..COMMIT/ROLLBACK transaction. Only mutated
@@ -2186,7 +2186,7 @@ impl Database {
         if !memory && path.as_os_str() == ":memory:" && codec.is_none() {
             return Self::open_memory_inner();
         }
-        let pager = Pager::open_opts(&path, DEFAULT_CACHE_PAGES, memory)?;
+        let pager: Arc<Pager> = Arc::new(Pager::open_opts(&path, DEFAULT_CACHE_PAGES, memory)?);
         if let Some(c) = &codec {
             pager.set_codec(Some(c.clone()))?;
         } else if let Some(required) = pager.required_codec() {
@@ -2290,7 +2290,7 @@ impl Database {
     /// (the pager already names itself `:memory:`).
     fn open_memory_inner() -> Result<Self> {
         crate::engine_init();
-        let pager = Pager::open_memory(DEFAULT_CACHE_PAGES)?;
+        let pager: Arc<Pager> = Arc::new(Pager::open_memory(DEFAULT_CACHE_PAGES)?);
         let mut catalog = Catalog::new();
         catalog.schema_cookie = pager.schema_cookie();
         load_schema(&pager, &mut catalog)?;
@@ -2318,7 +2318,8 @@ impl Database {
     /// databases and for snapshot restore flows.
     pub fn open_in_memory_with_image(image: Vec<u8>) -> Result<Self> {
         crate::engine_init();
-        let pager = Pager::open_memory_from_image(image, DEFAULT_CACHE_PAGES)?;
+        let pager: Arc<Pager> =
+            Arc::new(Pager::open_memory_from_image(image, DEFAULT_CACHE_PAGES)?);
         let mut catalog = Catalog::new();
         catalog.schema_cookie = pager.schema_cookie();
         load_schema(&pager, &mut catalog)?;
@@ -2332,7 +2333,7 @@ impl Database {
     /// Shared `Database` assembly from a live pager + loaded catalog.
     /// `open_inner` (codec paths) and the memory constructors all end
     /// here; VACUUM re-seeding reuses it for the replacement instance.
-    fn from_pager_and_catalog(pager: Pager, catalog: Catalog, path: PathBuf) -> Self {
+    fn from_pager_and_catalog(pager: Arc<Pager>, catalog: Catalog, path: PathBuf) -> Self {
         let mut schema_root_pages = HashMap::new();
         for (name, t) in catalog.all_tables() {
             schema_root_pages.insert(format!("table:{}", name), t.root_page);
@@ -3502,7 +3503,8 @@ impl Database {
             // Reopen through the normal constructors (codec-aware).
             let mut new = match codec {
                 Some(c) => {
-                    let pager = Pager::open_opts(&path, DEFAULT_CACHE_PAGES, false)?;
+                    let pager: Arc<Pager> =
+                        Arc::new(Pager::open_opts(&path, DEFAULT_CACHE_PAGES, false)?);
                     pager.set_codec(Some(c))?;
                     let mut catalog = Catalog::new();
                     catalog.schema_cookie = pager.schema_cookie();
@@ -6361,14 +6363,17 @@ impl Database {
         &self.catalog
     }
 
-    /// Get a mutable pointer to the pager (for debugging/testing).
-    pub fn pager_mut(&mut self) -> *mut Pager {
-        &mut self.pager as *mut Pager
-    }
-
     /// Read-only pager access (diagnostics: cache stats, page count).
+    /// The pager is `Arc`-shared (the sqlx driver group-commits through a
+    /// clone of this handle outside the engine write lock).
     pub fn pager(&self) -> &Pager {
         &self.pager
+    }
+
+    /// A shared handle to the pager (group-commit durability waits happen
+    /// OUTSIDE the engine write lock — see the sqlx driver's COMMIT arm).
+    pub fn pager_handle(&self) -> Arc<Pager> {
+        Arc::clone(&self.pager)
     }
 
     /// Live B+tree root page of a table or index (diagnostics/probes):
@@ -6723,9 +6728,10 @@ impl Database {
     }
 
     /// COMMIT of this connection's concurrent transaction: validate the
-    /// write-set stamps (first-committer-wins), install the shadows
-    /// into the live cache, splice deferred frees, and run the standard
-    /// WAL commit. On conflict the transaction is fully rolled back
+    /// write-set stamps (first-committer-wins), install the shadows (or
+    /// MERGE at row granularity when only disjoint rows of a hot page
+    /// collided), splice deferred frees, and run the WAL append + inline
+    /// durability wait. On conflict the transaction is fully rolled back
     /// before the error surfaces (retry by re-running the transaction).
     fn commit_concurrent_txn(&mut self) -> Result<()> {
         let conn = conn_identity();
@@ -6742,11 +6748,74 @@ impl Database {
             return Err(e);
         }
         // Publish the transaction's bookkeeping overlay (root overrides,
-        // rowid caches) as the shared maps.
-        *self.maps.get_mut() = entry.maps;
-        self.refresh_maps_flag();
+        // rowid caches) as the shared maps — with the MERGE fixups applied
+        // (the merged trees may be rooted at different pages than the
+        // transaction's private view).
+        self.publish_concurrent_maps(entry.maps, &r.unwrap());
         self.finish_concurrent_txn();
         Ok(())
+    }
+
+    /// The DEFERRED-durability variant used by the sqlx driver's COMMIT
+    /// arm: validate + install/merge + WAL append happen now (under the
+    /// engine write lock), but the fsync wait is NOT performed here — the
+    /// caller gets the durability ticket and calls
+    /// `pager_handle().group_sync(ticket)` AFTER dropping the engine write
+    /// lock, so sibling committers can append their frames while the
+    /// group's leader fsyncs once for all of them.
+    pub fn commit_concurrent_deferred(&mut self) -> Result<u64> {
+        let conn = conn_identity();
+        let entry = self.concurrent_txns.lock().remove(&conn);
+        let Some(entry) = entry else {
+            return Err(Error::semantic("no transaction is active"));
+        };
+        let r = self.pager.commit_concurrent_deferred(entry.txn_id);
+        match r {
+            Ok((outcome, ticket)) => {
+                self.publish_concurrent_maps(entry.maps, &outcome);
+                self.finish_concurrent_txn();
+                Ok(ticket)
+            }
+            Err(e) => {
+                self.finish_concurrent_txn();
+                Err(e)
+            }
+        }
+    }
+
+    /// Publish a committed concurrent transaction's overlay as the shared
+    /// maps, applying the merge's root fixups first: every root value the
+    /// overlay holds for a tree the MERGE re-rooted is replaced with the
+    /// tree's current committed root (cached plans and fast paths resolve
+    /// roots through these maps — a stale private root would descend a
+    /// subtree as if it were the whole tree).
+    fn publish_concurrent_maps(
+        &mut self,
+        maps: std::sync::Arc<crate::executor::StmtMaps>,
+        outcome: &crate::storage::concurrent::ConcurrentCommitOutcome,
+    ) {
+        let mut maps = maps;
+        if !outcome.root_fixups.is_empty() {
+            let mut fixed = (*maps).clone();
+            let fix = |m: &mut std::collections::HashMap<String, u32>| {
+                for v in m.values_mut() {
+                    for (old, new) in &outcome.root_fixups {
+                        if *v == *old {
+                            *v = *new;
+                        }
+                    }
+                }
+            };
+            fix(&mut fixed.roots);
+            fix(&mut fixed.index_roots);
+            maps = std::sync::Arc::new(fixed);
+            // Cached plans embed table/index Arcs whose root_page may be
+            // the pre-merge view; a fresh plan re-resolves from the fixed
+            // maps. Cheap and rare (merges only).
+            self.invalidate_stmt_cache();
+        }
+        *self.maps.get_mut() = maps;
+        self.refresh_maps_flag();
     }
 
     /// ROLLBACK of this connection's concurrent transaction: drop the

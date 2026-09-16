@@ -1660,7 +1660,6 @@ mod chrono_types {
 #[cfg(feature = "sqlx-uuid")]
 mod uuid_types {
     use super::mem_pool;
-    use sqlx::Row;
     use uuid::Uuid;
 
     #[tokio::test]

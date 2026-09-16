@@ -11,6 +11,7 @@
 //! varint-encoded to keep small payloads compact.
 
 use crate::error::{Error, Result};
+use crate::storage::concurrent::JournalKind;
 use crate::storage::page::{Page, PageId, PageType, PAGE_HEADER_SIZE};
 use crate::storage::pager::Pager;
 use crate::types::Value;
@@ -1587,6 +1588,12 @@ pub struct Btree<'a> {
     pub pager: &'a Pager,
     pub root: PageId,
     pub is_index: bool,
+    /// Row-journal suppression for the APPEND family: the append entry
+    /// points journal the whole op at THEIR boundary (after success) and
+    /// must not double-record when their slow paths fall back to
+    /// `insert_table` / `insert_index` (which journal on their own
+    /// success). See `insert_table_append`.
+    journal_suppress: bool,
     /// Pinned root page for the read path: avoids a page-cache read-lock +
     /// Arc refcount round-trip on EVERY descent (a 10-row join seeks the
     /// tree 10 times; each seek re-fetched the root). Validated against
@@ -1654,6 +1661,7 @@ impl<'a> Btree<'a> {
             pager,
             root,
             is_index,
+            journal_suppress: false,
             pinned_root: None,
             pinned_epoch: 0,
             table_leaf: None,
@@ -1972,6 +1980,7 @@ impl<'a> Btree<'a> {
             pager,
             root,
             is_index,
+            journal_suppress: false,
             pinned_root: None,
             pinned_epoch: 0,
             table_leaf: None,
@@ -2630,6 +2639,31 @@ impl<'a> Btree<'a> {
     }
 
     pub fn insert_table(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
+        // Concurrent-writer row journal: record the op AFTER success so
+        // the journal never contains phantom effects of failed statements
+        // (a statement-level abort would otherwise leave journal/pages
+        // drift). Any error invalidates the whole journal — the commit then
+        // falls back to page-granularity conflict semantics (abort on
+        // conflict), never a bogus merge.
+        let r = self.insert_table_inner(rowid, payload);
+        if r.is_ok() {
+            if !self.journal_suppress {
+                self.pager.note_row_write(
+                    self.root,
+                    false,
+                    JournalKind::Insert,
+                    rowid,
+                    &[],
+                    payload,
+                );
+            }
+        } else {
+            self.pager.note_journal_invalidated();
+        }
+        r
+    }
+
+    fn insert_table_inner(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
         // Notify the pager that a write is about to happen. This maintains
         // the O(1) dirty-page counter used by `flush()`'s fast path
         // (see `Pager::note_write`).
@@ -2661,6 +2695,7 @@ impl<'a> Btree<'a> {
                     key: split_key - 1,
                 };
                 self.insert_cell_into_page(new_root, &cell)?;
+                self.pager.note_root_split(old_root, new_root);
                 self.root = new_root;
                 Ok(())
             }
@@ -2684,8 +2719,13 @@ impl<'a> Btree<'a> {
     /// Precondition: `rowid > current_max_rowid` (caller's responsibility).
     /// If the precondition is violated, this falls back to the normal path.
     pub fn insert_table_append(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
-        self.insert_table_append_inner(rowid, payload, None)
-            .map(|_| ())
+        let root = self.root;
+        self.journal_suppress = true;
+        let r = self
+            .insert_table_append_inner(rowid, payload, None)
+            .map(|_| ());
+        self.journal_suppress = false;
+        self.journal_typed_result(root, JournalKind::Insert, rowid, &[], payload, r)
     }
 
     /// Append with a LEAF HINT from a previous append in the SAME statement:
@@ -2704,7 +2744,40 @@ impl<'a> Btree<'a> {
         payload: &[u8],
         hint: Option<PageId>,
     ) -> Result<Option<PageId>> {
-        self.insert_table_append_inner(rowid, payload, hint)
+        let root = self.root;
+        self.journal_suppress = true;
+        let r = self.insert_table_append_inner(rowid, payload, hint);
+        self.journal_suppress = false;
+        self.journal_typed_result(root, JournalKind::Insert, rowid, &[], payload, r)
+    }
+
+    /// Shared journal tail for the hooked TABLE entry points: records the
+    /// op after success (respecting suppression — the append family
+    /// suppresses the nested `insert_table` fallback journal), invalidates
+    /// the journal on failure (journal/pages drift would otherwise make a
+    /// merge replay unsound), and passes `r` through unchanged.
+    fn journal_typed_result<T>(
+        &mut self,
+        root: PageId,
+        kind: JournalKind,
+        rowid: i64,
+        key: &[u8],
+        payload: &[u8],
+        r: Result<T>,
+    ) -> Result<T> {
+        match r {
+            Ok(v) => {
+                if !self.journal_suppress {
+                    self.pager
+                        .note_row_write(root, false, kind, rowid, key, payload);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
     }
 
     /// DIRECT-WRITE spilled append: like `insert_table_append_hinted`
@@ -2721,6 +2794,38 @@ impl<'a> Btree<'a> {
     /// full payload and falls back to `insert_table_append_hinted` /
     /// `insert_table`. No bytes were written in that case.
     pub fn insert_table_append_spilled(
+        &mut self,
+        rowid: i64,
+        prefix: &[u8],
+        body: &[u8],
+        hint: Option<PageId>,
+    ) -> Result<Option<PageId>> {
+        let root = self.root;
+        self.journal_suppress = true;
+        let r = self.insert_table_append_spilled_inner(rowid, prefix, body, hint);
+        self.journal_suppress = false;
+        match r {
+            Ok(v) => {
+                if v.is_some() && !self.journal_suppress {
+                    // The journal needs the FULL payload; materialize it
+                    // only on the success path of a concurrent writer (the
+                    // plain path never concatenates).
+                    let mut full = Vec::with_capacity(prefix.len() + body.len());
+                    full.extend_from_slice(prefix);
+                    full.extend_from_slice(body);
+                    self.pager
+                        .note_row_write(root, false, JournalKind::Insert, rowid, &[], &full);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn insert_table_append_spilled_inner(
         &mut self,
         rowid: i64,
         prefix: &[u8],
@@ -3097,6 +3202,31 @@ impl<'a> Btree<'a> {
         rowid: i64,
         hint: Option<PageId>,
     ) -> Result<Option<PageId>> {
+        let root = self.root;
+        self.journal_suppress = true;
+        let r = self.insert_index_append_hinted_inner(key, rowid, hint);
+        self.journal_suppress = false;
+        match r {
+            Ok(v) => {
+                if !self.journal_suppress {
+                    self.pager
+                        .note_row_write(root, true, JournalKind::Insert, rowid, key, &[]);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn insert_index_append_hinted_inner(
+        &mut self,
+        key: &[u8],
+        rowid: i64,
+        hint: Option<PageId>,
+    ) -> Result<Option<PageId>> {
         self.pager.note_write();
 
         // Fast path: validate the hinted leaf and append directly into it.
@@ -3288,6 +3418,42 @@ impl<'a> Btree<'a> {
         updates: &[(i64, &[u8])],
         deferred: &mut Vec<usize>,
     ) -> Result<()> {
+        let root = self.root;
+        let r = self.update_table_bulk_inner(updates, deferred);
+        match r {
+            Ok(()) => {
+                if !self.journal_suppress {
+                    // Deferred (size-changed) rows are re-applied by the
+                    // caller as delete+insert — journaled there. Their
+                    // Replace entries here are net-idempotent with that
+                    // sequence on replay, so journaling all updates keeps
+                    // validation sound without splitting the batch.
+                    for (rid, payload) in updates {
+                        self.pager.note_row_write(
+                            root,
+                            false,
+                            JournalKind::Replace,
+                            *rid,
+                            &[],
+                            payload,
+                        );
+                        self.pager.note_row_outcome(true);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn update_table_bulk_inner(
+        &mut self,
+        updates: &[(i64, &[u8])],
+        deferred: &mut Vec<usize>,
+    ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -3457,6 +3623,31 @@ impl<'a> Btree<'a> {
     }
 
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
+        let root = self.root;
+        let r = self.update_table_inner(rowid, new_payload);
+        match r {
+            Ok(did) => {
+                if !self.journal_suppress {
+                    self.pager.note_row_write(
+                        root,
+                        false,
+                        JournalKind::Replace,
+                        rowid,
+                        &[],
+                        new_payload,
+                    );
+                    self.pager.note_row_outcome(did);
+                }
+                Ok(did)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn update_table_inner(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
         // Notify the pager that a write is about to happen (in-place UPDATE).
         // Same-size payload patches and in-slot shrinks never move an
         // offset — the non-invalidating variant keeps advisory leaf hints
@@ -5537,6 +5728,25 @@ impl<'a> Btree<'a> {
     /// Delete a (rowid) from a table B+tree. Does not rebalance (we leave
     /// pages underfull rather than risk concurrent-merge bugs).
     pub fn delete_table(&mut self, rowid: i64) -> Result<bool> {
+        let root = self.root;
+        let r = self.delete_table_inner(rowid);
+        match r {
+            Ok(did) => {
+                if !self.journal_suppress {
+                    self.pager
+                        .note_row_write(root, false, JournalKind::Delete, rowid, &[], &[]);
+                    self.pager.note_row_outcome(did);
+                }
+                Ok(did)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn delete_table_inner(&mut self, rowid: i64) -> Result<bool> {
         // Notify the pager that a write is about to happen.
         self.pager.note_write();
         self.delete_from_page(self.root, rowid)
@@ -5548,6 +5758,25 @@ impl<'a> Btree<'a> {
     /// separate `lookup_table` descent. Returns `Ok(None)` when the rowid
     /// doesn't exist.
     pub fn delete_table_get_payload(&mut self, rowid: i64) -> Result<Option<Vec<u8>>> {
+        let root = self.root;
+        let r = self.delete_table_get_payload_inner(rowid);
+        match r {
+            Ok(payload) => {
+                if !self.journal_suppress {
+                    self.pager
+                        .note_row_write(root, false, JournalKind::Delete, rowid, &[], &[]);
+                    self.pager.note_row_outcome(payload.is_some());
+                }
+                Ok(payload)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn delete_table_get_payload_inner(&mut self, rowid: i64) -> Result<Option<Vec<u8>>> {
         self.pager.note_write();
         // Payload of the doomed cell: inline bytes, or a spilled prefix +
         // chain head that must be assembled (and whose chain is freed by
@@ -5701,6 +5930,42 @@ impl<'a> Btree<'a> {
     /// ns/row. Callers that need the deleted payloads (index maintenance,
     /// RETURNING, triggers) keep the per-row path.
     pub fn delete_rowids_inorder(&mut self, rowids: &[i64]) -> Result<u64> {
+        let root = self.root;
+        let r = self.delete_rowids_inorder_inner(rowids);
+        match r {
+            Ok(deleted) => {
+                if !self.journal_suppress {
+                    if deleted as usize == rowids.len() {
+                        // Every requested rowid actually removed — the
+                        // journal exactly describes the bulk effect.
+                        for &rid in rowids {
+                            self.pager.note_row_write(
+                                root,
+                                false,
+                                JournalKind::Delete,
+                                rid,
+                                &[],
+                                &[],
+                            );
+                            self.pager.note_row_outcome(true);
+                        }
+                    } else {
+                        // Some rowids were absent: WHICH ones failed is
+                        // unknown at this boundary — invalidate rather
+                        // than journal guesses (page-granularity fallback).
+                        self.pager.note_journal_invalidated();
+                    }
+                }
+                Ok(deleted)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn delete_rowids_inorder_inner(&mut self, rowids: &[i64]) -> Result<u64> {
         self.pager.note_write();
         let mut deleted: u64 = 0;
         let mut sticky: Option<PageId> = None;
@@ -8061,6 +8326,20 @@ impl<'a> Btree<'a> {
     /// Insert a (key, rowid) pair into an index B+tree.
     /// The key is the encoded form of the indexed column value(s).
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
+        let root = self.root;
+        let r = self.insert_index_inner(key, rowid);
+        if r.is_ok() {
+            if !self.journal_suppress {
+                self.pager
+                    .note_row_write(root, true, JournalKind::Insert, rowid, key, &[]);
+            }
+        } else {
+            self.pager.note_journal_invalidated();
+        }
+        r
+    }
+
+    fn insert_index_inner(&mut self, key: &[u8], rowid: i64) -> Result<()> {
         // Notify the pager that a write is about to happen.
         self.pager.note_write();
         // Index entries are sorted by (key, rowid): the cell's btree order
@@ -8109,6 +8388,7 @@ impl<'a> Btree<'a> {
                     split_key,
                 )?;
                 self.insert_cell_into_page(new_root, &cell)?;
+                self.pager.note_root_split(old_root, new_root);
                 self.root = new_root;
                 Ok(())
             }
@@ -8118,7 +8398,25 @@ impl<'a> Btree<'a> {
     /// Delete a (key, rowid) pair from an index B+tree.
     /// The key is required because index pages are sorted by (key, rowid).
     pub fn delete_index(&mut self, key: &[u8], rowid: i64) -> Result<bool> {
-        // Notify the pager that a write is about to happen.
+        let root = self.root;
+        let r = self.delete_index_inner(key, rowid);
+        match r {
+            Ok(did) => {
+                if !self.journal_suppress {
+                    self.pager
+                        .note_row_write(root, true, JournalKind::Delete, rowid, key, &[]);
+                    self.pager.note_row_outcome(did);
+                }
+                Ok(did)
+            }
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
+    fn delete_index_inner(&mut self, key: &[u8], rowid: i64) -> Result<bool> {
         self.pager.note_write();
         self.delete_index_from_page(self.root, key, rowid)
     }

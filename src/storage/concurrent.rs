@@ -66,6 +66,52 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// One journaled row-level write, recorded at the B-tree entry-function
+/// boundary (the last point where the full semantic row — rowid + payload
+/// or index key — is in hand).
+///
+/// The journal is what upgrades conflict detection from PAGE granularity
+/// to ROW granularity: two transactions writing DIFFERENT rows of the same
+/// hot leaf page both commit — the second one MERGES (replays its journal
+/// onto the current committed trees) instead of retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalKind {
+    Insert,
+    /// Payload-level replace of an existing rowid (UPDATE).
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JournalOp {
+    /// Canonical tree identity: the tree's root page as THIS transaction
+    /// first saw it (root splits inside the transaction are folded back to
+    /// the origin via `root_lineage`). Two overlapping transactions on the
+    /// same tree share the same canonical root, so row-stamp keys match.
+    /// Root 0 = the schema/catalog tree (its rows are schema rows).
+    pub root: PageId,
+    pub is_index: bool,
+    pub kind: JournalKind,
+    pub rowid: i64,
+    /// Index ops: the encoded index key (empty for table ops).
+    pub key: Vec<u8>,
+    /// Table ops: the full row payload (empty for index ops / deletes).
+    pub payload: Vec<u8>,
+}
+
+/// What `COMMIT` reports back to the engine so it can fix up its
+/// bookkeeping maps after a MERGE (the merged trees may have different
+/// roots than the transaction's private view).
+#[derive(Debug, Default)]
+pub struct ConcurrentCommitOutcome {
+    /// True when the transaction MERGED (replayed its row journal onto the
+    /// current committed trees) instead of installing its page shadows.
+    pub merged: bool,
+    /// `(old_root_viewed_by_engine_maps, current_committed_root)` pairs —
+    /// the engine replaces these values in its table/index root maps.
+    pub root_fixups: Vec<(PageId, PageId)>,
+}
+
 /// One open `BEGIN CONCURRENT` transaction's pager-side state.
 ///
 /// Lives in the [`ConcurrentManager`] keyed by the engine-issued
@@ -103,6 +149,23 @@ pub struct ConcurrentTxn {
     /// Shadow ids dirtied (mirrors the shadow pages' own `dirty` flags;
     /// kept for O(1) install-path iteration and diagnostics).
     dirtied: HashSet<PageId>,
+    /// Row-level write journal, in execution order. Populated by
+    /// [`Pager::note_row_write`] at the B-tree entry-function boundary
+    /// while a writer scope is armed. Pages whose changes are fully
+    /// described by journal ops can be MERGED at commit (see
+    /// [`Pager::commit_concurrent`]).
+    pub(crate) row_journal: Vec<JournalOp>,
+    /// Parallel to `row_journal`: the ORIGINAL outcome of update/delete
+    /// class ops (did the row exist / was it applied). The merge's replay
+    /// must reproduce these outcomes — a divergence means the current
+    /// state drifted in a way row validation did not model, and the merge
+    /// aborts (retry) instead of guessing.
+    pub(crate) op_ok: Vec<bool>,
+    /// Root moves performed by THIS transaction: new root -> old root.
+    /// Used to canonicalize journal keys (every op keys back to the tree's
+    /// origin root as seen at first touch) and, at install time, to update
+    /// the manager's origin -> current-root map.
+    pub(crate) root_lineage: HashMap<PageId, PageId>,
 }
 
 impl ConcurrentTxn {
@@ -116,7 +179,25 @@ impl ConcurrentTxn {
             allocated: Vec::new(),
             freed: Vec::new(),
             dirtied: HashSet::new(),
+            row_journal: Vec::new(),
+            op_ok: Vec::new(),
+            root_lineage: HashMap::new(),
         }
+    }
+
+    /// Canonical (origin) root for a CURRENT root page id: chases this
+    /// transaction's own root-split lineage backwards to the fixed point.
+    /// A root that never moved canonicalizes to itself.
+    fn canonical_root(&self, root: PageId) -> PageId {
+        let mut cur = root;
+        // Lineage chains are short (splits are rare); guard the loop total.
+        for _ in 0..64 {
+            match self.root_lineage.get(&cur) {
+                Some(&old) if old != cur => cur = old,
+                _ => break,
+            }
+        }
+        cur
     }
 }
 
@@ -130,6 +211,19 @@ pub struct ConcurrentManager {
     /// Absent = never written by a concurrent commit (stamp 0 semantics:
     /// the pre-concurrent committed state).
     stamps: RwLock<HashMap<PageId, u64>>,
+    /// Row-level write stamps: (canonical tree root, rowid) → epoch of the
+    /// commit that last wrote that row. The ROW-granularity refinement of
+    /// `stamps`: a dirty-page conflict is only a REAL conflict when the
+    /// same (tree, rowid) was written by a concurrent commit — different
+    /// rows on the same hot page MERGE instead of retrying. Index writes
+    /// key by (index root, rowid): entries of one row collide (any key),
+    /// entries of different rows do not.
+    row_stamps: RwLock<HashMap<(PageId, i64), u64>>,
+    /// Origin root → CURRENT committed root for that tree. Updated at
+    /// every concurrent commit that moved a root (splits fold into the
+    /// origin's entry). Absent = the origin root is still current. The
+    /// merge's replay resolves each journal op's tree through this map.
+    live_roots: RwLock<HashMap<PageId, PageId>>,
     /// Monotonic install epoch. Bumped once per concurrent COMMIT; pages
     /// installed by that commit carry the new value.
     commit_epoch: AtomicU64,
@@ -156,6 +250,8 @@ impl ConcurrentManager {
         Self {
             txns: Mutex::new(HashMap::new()),
             stamps: RwLock::new(HashMap::new()),
+            row_stamps: RwLock::new(HashMap::new()),
+            live_roots: RwLock::new(HashMap::new()),
             commit_epoch: AtomicU64::new(1),
             next_txn: AtomicU64::new(1),
             commit_lock: Mutex::new(()),
@@ -227,6 +323,58 @@ impl ConcurrentManager {
             stamps.insert(id, epoch);
         }
         epoch
+    }
+
+    /// Stamp the rows a committing transaction's journal wrote (row-level
+    /// first-committer-wins bookkeeping). Index and table ops both key by
+    /// (root, rowid).
+    fn stamp_rows(&self, ops: impl Iterator<Item = (PageId, i64)>, epoch: u64) {
+        let mut rows = self.row_stamps.write();
+        for key in ops {
+            rows.insert(key, epoch);
+        }
+    }
+
+    /// Committed row stamp of (canonical root, rowid). 0 = never written
+    /// by a concurrent commit.
+    pub(crate) fn row_stamp(&self, root: PageId, rowid: i64) -> u64 {
+        self.row_stamps
+            .read()
+            .get(&(root, rowid))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The CURRENT committed root for the tree whose ORIGIN root is
+    /// `origin` (folds root splits across commits).
+    pub(crate) fn current_root_of(&self, origin: PageId) -> PageId {
+        self.live_roots
+            .read()
+            .get(&origin)
+            .copied()
+            .unwrap_or(origin)
+    }
+
+    /// Record a committed root move (origin -> new current), folding any
+    /// intermediate chain: each lineage entry (new -> old) resolves old's
+    /// origin and points it at `new`.
+    fn install_lineage(&self, lineage: &HashMap<PageId, PageId>) {
+        if lineage.is_empty() {
+            return;
+        }
+        let mut live = self.live_roots.write();
+        for (&new_root, &old_root) in lineage.iter() {
+            // Chase the old root's origin through the SAME lineage batch
+            // (entries are in split order, so the chain resolves).
+            let mut origin = old_root;
+            for _ in 0..64 {
+                match lineage.get(&origin) {
+                    Some(&older) if older != origin => origin = older,
+                    _ => break,
+                }
+            }
+            live.insert(origin, new_root);
+        }
     }
 
     pub(crate) fn note_scope_armed(&self) {
@@ -312,6 +460,16 @@ impl Pager {
     pub fn arm_writer_scope(&self, txn_id: u64) -> WriterScopeGuard<'_> {
         let prev = WRITER_SCOPE.with(|c| c.replace(Some((self.instance_id, txn_id))));
         self.concurrent.note_scope_armed();
+        // Kill this thread's table-leaf hints: a hint recorded by a
+        // PREVIOUS statement (or another connection sharing this thread —
+        // the identity-switching harness) pins a PageRef that predates
+        // this statement's shadow routing. update_table's hint path
+        // patches the hinted page DIRECTLY (no get_page), so a stale hint
+        // would write the LIVE page (or another txn's shadow) inside the
+        // concurrent regime — an isolation breach. The epoch bump makes
+        // every stored hint fail its `s.epoch == epoch` check; within THIS
+        // statement the hints re-establish normally (same txn's shadows).
+        self.write_version.fetch_add(1, Ordering::Relaxed);
         self.refresh_concurrent_gate();
         WriterScopeGuard { prev, pager: self }
     }
@@ -356,12 +514,36 @@ impl Pager {
         self.concurrent_gate.load(Ordering::Acquire) & 0x1 != 0
     }
 
-    /// COMMIT a concurrent transaction: validate the write-set stamps,
-    /// install shadows into the live cache, splice deferred frees, and
-    /// run the standard WAL commit. On conflict the transaction is fully
-    /// rolled back (shadows dropped, allocations recycled) before the
-    /// error surfaces — the caller never needs a separate ROLLBACK.
-    pub fn commit_concurrent(&self, txn_id: u64) -> Result<()> {
+    /// COMMIT a concurrent transaction: validate, then either install the
+    /// page shadows (fast path — no conflicts) or MERGE (row-level
+    /// refinement: replay the transaction's row journal onto the current
+    /// committed trees), and append the WAL frames. The WAL append happens
+    /// inside the commit critical section; the DURABILITY wait (fsync under
+    /// `PRAGMA synchronous=FULL`) is deferred to [`Pager::group_sync`] so
+    /// consecutive committers amortize one fsync across the group. On
+    /// conflict the transaction is fully rolled back (shadows dropped,
+    /// allocations recycled) before the error surfaces — the caller never
+    /// needs a separate ROLLBACK.
+    pub fn commit_concurrent(&self, txn_id: u64) -> Result<ConcurrentCommitOutcome> {
+        let (outcome, ticket) = self.commit_concurrent_inner(txn_id)?;
+        self.group_sync(ticket)?;
+        Ok(outcome)
+    }
+
+    /// [`Self::commit_concurrent`] split for the driver's group-commit
+    /// pipelining: runs validate + install/merge + WAL append under the
+    /// commit critical section and returns the durability ticket WITHOUT
+    /// waiting for the fsync. The caller (holding no engine locks) then
+    /// calls [`Pager::group_sync`] with the ticket — meanwhile the next
+    /// committer's append can already overlap the fsync.
+    pub fn commit_concurrent_deferred(
+        &self,
+        txn_id: u64,
+    ) -> Result<(ConcurrentCommitOutcome, u64)> {
+        self.commit_concurrent_inner(txn_id)
+    }
+
+    fn commit_concurrent_inner(&self, txn_id: u64) -> Result<(ConcurrentCommitOutcome, u64)> {
         let _commit = self.concurrent.commit_lock.lock();
         let Some(txn) = self.concurrent.take(txn_id) else {
             return Err(Error::Transaction(format!(
@@ -384,7 +566,12 @@ impl Pager {
         // aborted), so only WRITE-WRITE overlaps need commit-time
         // validation. A dirty shadow page whose committed stamp moved
         // since it was fetched means another connection committed a write
-        // to the same page: installing would clobber it — abort.
+        // to the same page. That is the END of the story at PAGE
+        // granularity — but ROW granularity refines it: if the row
+        // journal fully describes this transaction's writes and none of
+        // those (tree, rowid) pairs were re-stamped by the concurrent
+        // commit, the transaction MERGES (replays its journal onto the
+        // current trees) instead of retrying.
         //
         // PAGE 0 (dirty): the header region is rewritten by every commit
         // and only stamped when a schema-row rewrite installed, so a
@@ -405,59 +592,23 @@ impl Pager {
             }
         }
         if !conflicts.is_empty() {
-            // Full rollback before surfacing: recycle allocations so the
-            // ids are not leaked, drop shadows (the live cache was never
-            // touched — nothing else to undo).
+            // Any resolution of a page conflict (merge or abort) discards
+            // the page shadows, so this transaction's fresh allocations
+            // are garbage either way — recycle them up front.
             self.splice_txn_freed(&txn.allocated)?;
-            return Err(Error::SnapshotConflict(format!(
-                "page{} {} changed by a concurrent commit since this transaction began; \
-                 the transaction was rolled back — retry it",
-                if conflicts.len() == 1 { "" } else { "s" },
-                conflicts
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            return self.resolve_page_conflict(
+                txn.row_journal.clone(),
+                txn.op_ok.clone(),
+                txn.root_lineage.clone(),
+                txn.begin_epoch,
+                &conflicts,
+            );
         }
 
-        // ---- install: shadows → live cache (content-replace under the
-        // page mutex, so any Arc clones held elsewhere stay valid).
-        //
-        // Read-only shadow copies (never dirtied) install nothing: the
-        // live bytes are identical by construction.
-        let psz = self.page_size() as usize;
-        let mut installed: Vec<PageId> = Vec::with_capacity(txn.shadows.len());
-        {
-            let mut cache = self.cache.write();
-            for (id, shadow) in txn.shadows.iter() {
-                let dirty = shadow.lock().dirty;
-                if !dirty {
-                    continue; // clean copy — live bytes already match
-                }
-                installed.push(*id);
-                match cache.get(*id).cloned() {
-                    Some(live) => {
-                        let mut dst = live.lock();
-                        let src = shadow.lock();
-                        dst.data.copy_from_slice(&src.data);
-                        dst.dirty = true;
-                    }
-                    None => {
-                        let src = shadow.lock();
-                        let mut page = crate::storage::page::Page::new(*id, psz as u32);
-                        page.data.copy_from_slice(&src.data);
-                        page.dirty = true;
-                        drop(src);
-                        let pr: PageRef = Arc::new(Mutex::new(page));
-                        self.maybe_evict_locked(&mut cache);
-                        cache.insert(*id, pr);
-                        self.lru.lock().push_back(*id);
-                    }
-                }
-                self.note_dirty(*id);
-            }
-        }
+        // ---- fast path: install shadows → live cache (content-replace
+        // under the page mutex, so any Arc clones held elsewhere stay
+        // valid).
+        let installed = self.install_txn_shadows(&txn);
         // Page-0 header refresh rides the flush (n_pages high-water,
         // freelist, cookie) — the standard flush_wal path does it.
 
@@ -465,11 +616,15 @@ impl Pager {
         self.splice_txn_freed(&txn.freed)?;
 
         // ---- WAL commit: frames for every installed page + splice
-        // writes + header, one commit marker, fsync per synchronous.
-        self.flush_wal_concurrent()?;
+        // writes + header, one commit marker. The fsync is deferred to
+        // group_sync (ticket).
+        let ticket = self.flush_wal_deferred_concurrent()?;
 
-        // ---- publish version stamps for the installed pages.
-        self.concurrent.stamp_installed(installed.into_iter());
+        // ---- publish version stamps for the installed pages + rows.
+        let epoch = self.concurrent.stamp_installed(installed.into_iter());
+        self.concurrent
+            .stamp_rows(txn.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
+        self.concurrent.install_lineage(&txn.root_lineage);
 
         // Advisory caches (leaf hints, memos, chains) must re-derive
         // against the new committed state — one epoch bump covers all.
@@ -478,7 +633,361 @@ impl Pager {
 
         self.note_tx_committed();
         self.refresh_concurrent_gate();
+        Ok((ConcurrentCommitOutcome::default(), ticket))
+    }
+
+    /// Install a transaction's dirty shadow pages into the live cache.
+    /// Read-only shadow copies (never dirtied) install nothing: the live
+    /// bytes are identical by construction. Returns the installed page
+    /// ids (for stamp publication).
+    fn install_txn_shadows(&self, txn: &ConcurrentTxn) -> Vec<PageId> {
+        let psz = self.page_size() as usize;
+        let mut installed: Vec<PageId> = Vec::with_capacity(txn.shadows.len());
+        let mut cache = self.cache.write();
+        for (id, shadow) in txn.shadows.iter() {
+            let dirty = shadow.lock().dirty;
+            if !dirty {
+                continue; // clean copy — live bytes already match
+            }
+            installed.push(*id);
+            match cache.get(*id).cloned() {
+                Some(live) => {
+                    let mut dst = live.lock();
+                    let src = shadow.lock();
+                    dst.data.copy_from_slice(&src.data);
+                    dst.dirty = true;
+                }
+                None => {
+                    let src = shadow.lock();
+                    let mut page = crate::storage::page::Page::new(*id, psz as u32);
+                    page.data.copy_from_slice(&src.data);
+                    page.dirty = true;
+                    drop(src);
+                    let pr: PageRef = Arc::new(Mutex::new(page));
+                    self.maybe_evict_locked(&mut cache);
+                    cache.insert(*id, pr);
+                    self.lru.lock().push_back(*id);
+                }
+            }
+            self.note_dirty(*id);
+        }
+        installed
+    }
+
+    /// Resolve a dirty-page conflict with ROW granularity: validate the
+    /// journal's (tree, rowid) keys against the committed row stamps and,
+    /// when none moved, MERGE — discard the shadows and replay the journal
+    /// into a FRESH shadow transaction armed at the current epoch (so a
+    /// mid-replay failure rolls back by dropping the fresh shadows, the
+    /// live cache is never touched non-atomically), then install that
+    /// fresh transaction through the standard path.
+    ///
+    /// Caller contract: the original transaction's shadows are already
+    /// discarded and its allocations recycled; `journal` / `op_ok` /
+    /// `lineage` were cloned out of it.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_page_conflict(
+        &self,
+        journal: Vec<JournalOp>,
+        op_ok: Vec<bool>,
+        lineage: HashMap<PageId, PageId>,
+        begin_epoch: u64,
+        conflicts: &[PageId],
+    ) -> Result<(ConcurrentCommitOutcome, u64)> {
+        let page_conflict = || {
+            Error::SnapshotConflict(format!(
+                "page{} {} changed by a concurrent commit since this transaction began; \
+                 the transaction was rolled back — retry it",
+                if conflicts.len() == 1 { "" } else { "s" },
+                conflicts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        };
+        // Row effects must be journaled for a merge to be possible at
+        // all (empty journal + page conflict = structural-only writes —
+        // today's page-granularity semantics).
+        if journal.is_empty() {
+            return Err(page_conflict());
+        }
+        // ---- row validation: first-committer-wins at (tree, rowid).
+        for op in &journal {
+            if self.concurrent.row_stamp(op.root, op.rowid) > begin_epoch {
+                return Err(Error::SnapshotConflict(format!(
+                    "row {} of tree {} was changed by a concurrent commit since this \
+                     transaction began; the transaction was rolled back — retry it",
+                    op.rowid, op.root
+                )));
+            }
+        }
+
+        // ---- MERGE: replay the journal onto the current committed trees
+        // inside a fresh shadow transaction.
+        let fresh_epoch = self.concurrent.current_epoch();
+        let fresh_pages = self.committed_n_pages.load(Ordering::Acquire);
+        let fresh_id = self.concurrent.begin(fresh_epoch, fresh_pages);
+        self.refresh_concurrent_gate();
+        let replay = {
+            let _guard = self.arm_writer_scope(fresh_id);
+            self.replay_journal(&journal, &op_ok, &lineage)
+        };
+        let fresh = match self.concurrent.take(fresh_id) {
+            Some(t) => t,
+            None => {
+                // Unreachable (we just created it), but be total.
+                return Err(page_conflict());
+            }
+        };
+        self.refresh_concurrent_gate();
+        match replay {
+            Ok(()) => {}
+            Err(e) => {
+                // Atomic undo of the partial replay: the fresh shadows
+                // drop here (live cache untouched); recycle the replay's
+                // own fresh allocations.
+                self.splice_txn_freed(&fresh.allocated)?;
+                // Surface as a retriable snapshot conflict — the merge's
+                // replay diverged from the original outcomes (state moved
+                // in a way the row journal did not model).
+                return Err(Error::SnapshotConflict(format!(
+                    "merge replay diverged ({}); the transaction was rolled back — retry it",
+                    e
+                )));
+            }
+        }
+
+        // ---- install the replayed state through the standard path.
+        let installed = self.install_txn_shadows(&fresh);
+        self.splice_txn_freed(&fresh.freed)?;
+        let ticket = self.flush_wal_deferred_concurrent()?;
+        let epoch = self.concurrent.stamp_installed(installed.into_iter());
+        // The fresh transaction's journal re-recorded the replayed ops
+        // (with keys canonicalized against ITS lineage) — stamping those
+        // keys publishes exactly the rows the merged commit wrote.
+        self.concurrent
+            .stamp_rows(fresh.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
+        self.concurrent.install_lineage(&fresh.root_lineage);
+
+        // ---- engine bookkeeping fixups: the merged trees may be rooted
+        // elsewhere than the transaction's private view (replayed splits).
+        // For every canonical tree this transaction touched, tell the
+        // engine which of its cached root values to replace.
+        let mut outcome = ConcurrentCommitOutcome {
+            merged: true,
+            root_fixups: Vec::new(),
+        };
+        {
+            let mut canonicals: HashSet<PageId> = journal.iter().map(|o| o.root).collect();
+            for &new_root in lineage.keys() {
+                // Fold my private split roots back to their origins.
+                let mut cur = new_root;
+                for _ in 0..64 {
+                    match lineage.get(&cur) {
+                        Some(&old) if old != cur => cur = old,
+                        _ => break,
+                    }
+                }
+                canonicals.insert(cur);
+            }
+            for c in canonicals {
+                if c == 0 {
+                    continue; // the catalog root is fixed at page 0
+                }
+                let current = self.concurrent.current_root_of(c);
+                if current != c {
+                    outcome.root_fixups.push((c, current));
+                }
+                // The engine's overlay may hold MY private root for this
+                // tree (if I split it); map it to the merged root too.
+                let mut my_view = c;
+                for (&new_root, &old_root) in lineage.iter() {
+                    let _ = old_root;
+                    // newest key whose canonical == c
+                    let mut cur = new_root;
+                    for _ in 0..64 {
+                        match lineage.get(&cur) {
+                            Some(&old) if old != cur => cur = old,
+                            _ => break,
+                        }
+                    }
+                    if cur == c && new_root > my_view {
+                        my_view = new_root;
+                    }
+                }
+                if my_view != c && my_view != current {
+                    outcome.root_fixups.push((my_view, current));
+                }
+            }
+        }
+
+        // Advisory caches must re-derive against the new committed state.
+        self.write_version.fetch_add(1, Ordering::Relaxed);
+        self.clear_committed_view();
+        self.note_tx_committed();
+        self.refresh_concurrent_gate();
+        Ok((outcome, ticket))
+    }
+
+    /// Replay the row journal (inside a freshly armed writer scope —
+    /// every page fetch/materialize/allocate/free routes into the fresh
+    /// transaction's shadows, so a failure drops atomically). Catalog
+    // rows (root 0) replay LAST, with their rootpage column patched to
+    /// the merged trees' current roots (the private view's roots were
+    /// discarded with the shadows).
+    fn replay_journal(
+        &self,
+        journal: &[JournalOp],
+        op_ok: &[bool],
+        lineage: &HashMap<PageId, PageId>,
+    ) -> Result<()> {
+        // Canonical origin -> the fresh transaction's CURRENT view root.
+        // The replay's own splits move roots mid-flight; descending from
+        // the frozen origin root would insert later rows into a stale
+        // subtree (ordering violation + unreachable rows). Updated after
+        // every op from the Btree's post-op root.
+        let mut view_roots: HashMap<PageId, PageId> = HashMap::new();
+        // Phase 1: data trees.
+        for (i, op) in journal.iter().enumerate() {
+            if op.root == 0 {
+                continue;
+            }
+            self.replay_one(op, op_ok.get(i).copied().unwrap_or(true), &mut view_roots)?;
+        }
+        // Phase 2: catalog rows (schema-row rewrites from mid-transaction
+        // root syncs), rootpage patched to the post-replay current roots.
+        for (i, op) in journal.iter().enumerate() {
+            if op.root != 0 {
+                continue;
+            }
+            let patched = self.patch_schema_row_rootpage(op, lineage, &view_roots)?;
+            self.replay_one(
+                &patched,
+                op_ok.get(i).copied().unwrap_or(true),
+                &mut view_roots,
+            )?;
+        }
         Ok(())
+    }
+
+    fn replay_one(
+        &self,
+        op: &JournalOp,
+        expected_ok: bool,
+        view_roots: &mut HashMap<PageId, PageId>,
+    ) -> Result<()> {
+        use crate::storage::btree::Btree;
+        let root = if op.root == 0 {
+            0
+        } else {
+            view_roots
+                .get(&op.root)
+                .copied()
+                .unwrap_or_else(|| self.concurrent.current_root_of(op.root))
+        };
+        let post_root = if op.is_index {
+            let mut bt = Btree::new(self, root, true);
+            match op.kind {
+                JournalKind::Insert => bt.insert_index(&op.key, op.rowid)?,
+                JournalKind::Delete => {
+                    let ok = bt.delete_index(&op.key, op.rowid)?;
+                    if ok != expected_ok {
+                        return Err(Error::Transaction(format!(
+                            "index entry ({}, {}) existence diverged during replay",
+                            op.rowid, op.root
+                        )));
+                    }
+                }
+                JournalKind::Replace => {
+                    return Err(Error::Transaction("index ops have no Replace".into()))
+                }
+            }
+            bt.root
+        } else {
+            let mut bt = Btree::new(self, root, false);
+            match op.kind {
+                JournalKind::Insert => bt.insert_table(op.rowid, &op.payload)?,
+                JournalKind::Replace => {
+                    // No parity check: the in-place "fits" decision depends
+                    // on the CURRENT page layout (a concurrent delete may
+                    // have freed room), so false->true is a legal drift —
+                    // the effect (row bytes) is identical either way.
+                    bt.update_table(op.rowid, &op.payload)?;
+                }
+                JournalKind::Delete => {
+                    let ok = bt.delete_table(op.rowid)?;
+                    if ok != expected_ok {
+                        return Err(Error::Transaction(format!(
+                            "row {} existence diverged during replay",
+                            op.rowid
+                        )));
+                    }
+                }
+            }
+            bt.root
+        };
+        if op.root != 0 {
+            view_roots.insert(op.root, post_root);
+        }
+        Ok(())
+    }
+
+    /// Patch a catalog (schema) row's rootpage column to the merged tree's
+    /// current root. The stale value is this transaction's private view
+    /// root; its canonical origin is resolved through the ORIGINAL
+    /// transaction's lineage, and the origin's current root through the
+    /// manager's committed root map.
+    fn patch_schema_row_rootpage(
+        &self,
+        op: &JournalOp,
+        lineage: &HashMap<PageId, PageId>,
+        view_roots: &HashMap<PageId, PageId>,
+    ) -> Result<JournalOp> {
+        // Only Insert/Replace ops carry a payload worth patching.
+        if op.kind == JournalKind::Delete || (!op.is_index && op.payload.is_empty()) {
+            return Ok(op.clone());
+        }
+        let mut row = crate::storage::row_codec::decode_row(&op.payload, 5, op.rowid, None)
+            .map_err(|e| {
+                Error::Transaction(format!(
+                    "merge: catalog row {} does not decode as a schema row: {}",
+                    op.rowid, e
+                ))
+            })?;
+        let Some(crate::Value::Integer(stale_page)) = row.get(3) else {
+            return Ok(op.clone()); // not a schema-shaped row — replay as-is
+        };
+        // The schema row carries SQLite's 1-BASED rootpage (internal root
+        // + 1 — see `rewrite_schema_row_root` / `encode_schema_row_opt`).
+        // Canonicalize the INTERNAL root, patch back in the same
+        // convention.
+        let Some(stale_page) = u32::try_from(*stale_page).ok() else {
+            return Ok(op.clone());
+        };
+        if stale_page == 0 {
+            return Ok(op.clone()); // root 0 = the schema tree itself
+        }
+        let stale_root = stale_page - 1;
+        // Canonicalize the stale root through the ORIGINAL txn's lineage.
+        let mut cur = stale_root;
+        for _ in 0..64 {
+            match lineage.get(&cur) {
+                Some(&old) if old != cur => cur = old,
+                _ => break,
+            }
+        }
+        let current = view_roots
+            .get(&cur)
+            .copied()
+            .unwrap_or_else(|| self.concurrent.current_root_of(cur));
+        if current != stale_root {
+            row[3] = crate::Value::Integer(current as i64 + 1);
+            let mut patched = op.clone();
+            patched.payload = crate::storage::row_codec::encode_row_aliased(&row, None);
+            return Ok(patched);
+        }
+        Ok(op.clone())
     }
 
     /// ROLLBACK a concurrent transaction: the live cache was never
@@ -522,6 +1031,12 @@ impl Pager {
         if ids.is_empty() {
             return Ok(());
         }
+        // Disk-backed page count (the DURABLE length — deliberately NOT
+        // `committed_n_pages`/`n_pages`, which a mid-regime sibling commit
+        // inflates with OTHER transactions' still-uncommitted allocations:
+        // the flush publishes the live high-water as the committed bound).
+        let psz = self.page_size();
+        let disk_pages = (self.store_len() / psz as u64) as u32;
         for &id in ids {
             if id == 0 {
                 continue;
@@ -530,10 +1045,16 @@ impl Pager {
             // allocation rolled back or conflicted): it has no live
             // presence yet. Publish a zeroed live page through the normal
             // freelist path so the trunk entry + on-disk image exist.
-            if !self.cache.read().contains_key(id)
-                && id >= self.committed_n_pages.load(Ordering::Acquire)
-            {
-                let psz = self.page_size();
+            // Servable = cached, in the committed WAL map, or below the
+            // durable file length; anything else would make free_page's
+            // get_page short-read the file.
+            let wal_has = {
+                let wal = self.wal.read();
+                wal.as_ref()
+                    .map(|s| s.map.contains_key(&id))
+                    .unwrap_or(false)
+            };
+            if !self.cache.read().contains_key(id) && !wal_has && id >= disk_pages {
                 let mut page = crate::storage::page::Page::new(id, psz);
                 page.dirty = true;
                 let pr: PageRef = Arc::new(Mutex::new(page));
@@ -566,6 +1087,26 @@ impl Pager {
         self.committed_n_pages
             .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
         r
+    }
+
+    /// The DEFERRED WAL commit for the concurrent critical section:
+    /// appends the frames + commit marker and publishes the committed
+    /// page count, but does NOT fsync and does NOT auto-checkpoint —
+    /// both are the group-sync leader's job (see [`Pager::group_sync`]).
+    /// Returns the durability ticket (the cumulative WAL frame count
+    /// this commit covers; `group_sync(ticket)` waits for the fsync).
+    fn flush_wal_deferred_concurrent(&self) -> Result<u64> {
+        if self.wal.read().is_none() {
+            // Journal mode cannot flip while a concurrent txn is open
+            // (PRAGMA is rejected), but be total anyway: the DELETE-journal
+            // path has no deferral point — run it inline.
+            self.flush_inner_delete()?;
+            return Ok(self.wal_frames_total());
+        }
+        let ticket = self.flush_wal_opts(false, false)?;
+        self.committed_n_pages
+            .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
+        Ok(ticket)
     }
 
     // -----------------------------------------------------------------
@@ -762,6 +1303,100 @@ impl Pager {
         if let Some(mut guard) = self.concurrent.get(txn_id) {
             if let Some(txn) = guard.get_mut(&txn_id) {
                 txn.dirtied.insert(id);
+            }
+        }
+    }
+
+    /// Record a row-level write for the armed transaction's journal —
+    /// the ROW-granularity refinement of the page-shadow scheme. Called
+    /// from the B-tree entry functions (the boundary where the full
+    /// semantic row is in hand); a no-op unless a concurrent writer
+    /// scope is armed on this pager (one atomic gate load otherwise).
+    ///
+    /// `root` is the tree root AS THE CALLER SEES IT (the transaction's
+    /// current view — its own splits have moved it); it is canonicalized
+    /// back to the origin root here so keys match across transactions.
+    pub(crate) fn note_row_write(
+        &self,
+        root: PageId,
+        is_index: bool,
+        kind: JournalKind,
+        rowid: i64,
+        key: &[u8],
+        payload: &[u8],
+    ) {
+        let Some(txn_id) = self.armed_writer_scope() else {
+            return; // plain-write path: no journal, zero overhead
+        };
+        if let Some(mut guard) = self.concurrent.get(txn_id) {
+            if let Some(txn) = guard.get_mut(&txn_id) {
+                let canonical = txn.canonical_root(root);
+                txn.row_journal.push(JournalOp {
+                    root: canonical,
+                    is_index,
+                    kind,
+                    rowid,
+                    key: if is_index { key.to_vec() } else { Vec::new() },
+                    payload: if is_index {
+                        Vec::new()
+                    } else {
+                        payload.to_vec()
+                    },
+                });
+                txn.op_ok.push(true);
+            }
+        }
+    }
+
+    /// Record the OUTCOME of the just-executed update/delete class op
+    /// (parallel to the journal entry pushed by the matching
+    /// `note_row_write` call): did the row exist / was the op applied.
+    /// The merge's replay must reproduce these outcomes exactly — a
+    /// divergence aborts the merge (retry) rather than guessing.
+    pub(crate) fn note_row_outcome(&self, ok: bool) {
+        let Some(txn_id) = self.armed_writer_scope() else {
+            return;
+        };
+        if let Some(mut guard) = self.concurrent.get(txn_id) {
+            if let Some(txn) = guard.get_mut(&txn_id) {
+                if let Some(last) = txn.op_ok.last_mut() {
+                    *last = ok;
+                }
+            }
+        }
+    }
+
+    /// Invalidate the armed transaction's row journal: an entry function
+    /// failed mid-operation (or produced an outcome this boundary cannot
+    /// attribute), so the journal may no longer describe the page shadows
+    /// exactly. The commit falls back to PAGE-granularity conflict
+    /// semantics (any conflicting dirty page aborts) — never a merge
+    /// replayed from a possibly-divergent journal.
+    pub(crate) fn note_journal_invalidated(&self) {
+        let Some(txn_id) = self.armed_writer_scope() else {
+            return;
+        };
+        if let Some(mut guard) = self.concurrent.get(txn_id) {
+            if let Some(txn) = guard.get_mut(&txn_id) {
+                txn.row_journal.clear();
+                txn.op_ok.clear();
+            }
+        }
+    }
+
+    /// Record a root split performed by the armed transaction
+    /// (`new_root` now sits above `old_root`). Page 0 is the permanent
+    /// catalog root and never moves — its lineage entry is skipped.
+    pub(crate) fn note_root_split(&self, old_root: PageId, new_root: PageId) {
+        if old_root == 0 || new_root == 0 {
+            return;
+        }
+        let Some(txn_id) = self.armed_writer_scope() else {
+            return; // plain-mode splits need no lineage (no journal)
+        };
+        if let Some(mut guard) = self.concurrent.get(txn_id) {
+            if let Some(txn) = guard.get_mut(&txn_id) {
+                txn.root_lineage.insert(new_root, old_root);
             }
         }
     }
