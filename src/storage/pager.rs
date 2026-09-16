@@ -770,6 +770,15 @@ pub struct Pager {
     /// live scope gated off. RMW operations on the counter serialize, so
     /// count > 0 holds whenever any scope exists — no ordering hazard.
     committed_scope_count: std::sync::atomic::AtomicUsize,
+    /// Combined fast-path gate for the BEGIN CONCURRENT regime, packed
+    /// next to `committed_scope_count` so the hot read paths stay on one
+    /// cache line: bit 0 = any concurrent transaction open, bit 1 = any
+    /// writer scope armed. Maintained at regime boundaries from the
+    /// authoritative manager counters (statement-granular; transient
+    /// staleness is harmless — see `refresh_concurrent_gate`). A single
+    /// load-and-branch replaces reaching into the embedded manager's
+    /// colder atomics on every `get_page` / `note_dirty` / `note_write`.
+    pub(crate) concurrent_gate: std::sync::atomic::AtomicUsize,
     /// Snapshot of `write_epoch()` at BEGIN: while a committed-view scope
     /// is armed on this pager, `write_epoch` returns THIS value so hints
     /// built against BEGIN-time pages stay valid for the whole
@@ -1555,6 +1564,7 @@ impl Pager {
             committed_view_used: std::sync::atomic::AtomicBool::new(false),
             committed_bound_cache: std::sync::atomic::AtomicU32::new(0),
             committed_scope_count: std::sync::atomic::AtomicUsize::new(0),
+            concurrent_gate: std::sync::atomic::AtomicUsize::new(0),
             committed_view_epoch: std::sync::atomic::AtomicU64::new(0),
             concurrent: crate::storage::concurrent::ConcurrentManager::new(),
             committed_n_pages: std::sync::atomic::AtomicU32::new(0),
@@ -1973,7 +1983,9 @@ impl Pager {
         // state the transaction is building) but NOT the live dirty
         // counter — the live cache was never touched, and flush() for
         // this work happens at the concurrent COMMIT.
-        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0
+            && self.armed_writer_scope().is_some()
+        {
             self.write_version.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -2064,7 +2076,9 @@ impl Pager {
     /// valid across bulk in-place UPDATEs. Any op that can move keys,
     /// split pages, or recycle pages must use the full `note_write`.
     pub fn note_write_in_place(&self) {
-        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0
+            && self.armed_writer_scope().is_some()
+        {
             return; // shadow in-place patch: no live dirty counter
         }
         self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
@@ -2150,7 +2164,7 @@ impl Pager {
         // Concurrent regime: route the dirty note into the armed
         // transaction (shadow pages are WAL-emitted by the concurrent
         // COMMIT install, never by the plain flush paths).
-        if self.concurrent.scope_armed_any() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0 {
             if let Some(txn) = self.armed_writer_scope() {
                 self.writer_shadow_note_dirty(txn, id);
                 return;
@@ -2234,35 +2248,32 @@ impl Pager {
                 }
             }
         }
-        // Writer-shadow scope (armed for every statement of an open
-        // BEGIN CONCURRENT transaction on this thread): serve the
-        // transaction's PRIVATE pages — materializing a copy of the
-        // committed bytes on first touch. Same atomic-gate shape as the
-        // committed-view branch above: zero cost when no concurrent
-        // transaction is executing anywhere.
-        if self.concurrent.scope_armed_any() {
+        // BEGIN CONCURRENT regime — one combined gate load covers both
+        // decisions: bit 1 = a writer scope is armed somewhere (this
+        // thread's TLS decides whether it is OURS — same-thread
+        // store/load coherence guarantees owners see their own arm);
+        // bit 0 = the regime is active at all (plain fetches are then
+        // READERS, bounded by the COMMITTED page count — other writers'
+        // uncommitted allocations must be invisible). Zero = the
+        // overwhelming common case: one load, one branch, live path.
+        let cw_gate = self.concurrent_gate.load(Ordering::Acquire);
+        if cw_gate & 0x2 != 0 {
             if let Some(txn) = self.armed_writer_scope() {
                 return self.writer_shadow_fetch(txn, id);
             }
         }
-        let n_pages_val = if self.concurrent.any_active() {
-            // Concurrent regime: a plain (unscoped) fetch is a READER —
-            // bound it by the COMMITTED page count. Other concurrent
-            // writers' fresh allocations (n_pages high-water) must be
-            // invisible: the live cache does not contain them, and the
-            // main file does not either.
+        let n_pages_val = if cw_gate & 0x1 != 0 {
             self.committed_n_pages.load(Ordering::Acquire)
         } else {
             self.n_pages.load(Ordering::Acquire)
         };
-        if id >= n_pages_val && id != 0 {
-            return Err(Error::corruption(format!(
-                "page {} out of range (n_pages={})",
-                id, n_pages_val
-            )));
-        }
 
-        // Fast path: read lock, check cache.
+        // Fast path: read lock, check cache. A live-cache HIT is always
+        // servable WITHOUT the bounds check: entries beyond the
+        // committed bound exist only as the commit/rollback splice's
+        // deliberately published pages (see `splice_txn_freed`) — the
+        // bound guards the MISS path's disk/WAL reads, where an
+        // uncommitted allocation must be unfetchable.
         {
             let cache = self.cache.read();
             if let Some(page_ref) = cache.get(id).cloned() {
@@ -2277,6 +2288,12 @@ impl Pager {
                 }
                 return Ok(page_ref);
             }
+        }
+        if id >= n_pages_val && id != 0 {
+            return Err(Error::corruption(format!(
+                "page {} out of range (n_pages={})",
+                id, n_pages_val
+            )));
         }
 
         // Slow path: cache miss — take write lock, double-check, then read from disk.
@@ -2772,7 +2789,7 @@ impl Pager {
         // popping it would mutate shared state (trunk pages + atomics)
         // that other concurrent writers' snapshots still depend on.
         // Deferred frees splice back at COMMIT/ROLLBACK.
-        if self.concurrent.scope_armed_any() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0 {
             if let Some(txn) = self.armed_writer_scope() {
                 return self.writer_shadow_alloc(txn);
             }
@@ -2896,7 +2913,7 @@ impl Pager {
         // the ids disjoint across concurrent writers). `zeroed: false`
         // (overflow chains) is honored identically: the caller fills
         // every byte before the shadow can be observed.
-        if self.concurrent.scope_armed_any() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0 {
             if let Some(txn) = self.armed_writer_scope() {
                 let first_id = self.n_pages.fetch_add(n as u32, Ordering::AcqRel);
                 let psz = self.page_size();
@@ -3067,7 +3084,7 @@ impl Pager {
         // stay untouched mid-transaction (another writer's snapshot
         // still sees this page as a live tree member); COMMIT/ROLLBACK
         // splices the deferred ids under the commit mutex.
-        if self.concurrent.scope_armed_any() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0 {
             if let Some(txn) = self.armed_writer_scope() {
                 return self.writer_shadow_free(txn, id);
             }
@@ -3162,7 +3179,7 @@ impl Pager {
         // sits above any bound we could pick. Convert the truncation
         // into deferred frees (the commit splice recycles them) and
         // report zero pages truncated.
-        if self.concurrent.scope_armed_any() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0 {
             if let Some(txn) = self.armed_writer_scope() {
                 for &id in freed {
                     self.writer_shadow_free(txn, id)?;
@@ -4158,7 +4175,9 @@ impl Pager {
         // Concurrent regime: a statement of an open BEGIN CONCURRENT
         // transaction must NEVER flush — its pages are private shadows;
         // the WAL commit is the concurrent COMMIT path's exclusive job.
-        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+        if self.concurrent_gate.load(Ordering::Relaxed) & 0x2 != 0
+            && self.armed_writer_scope().is_some()
+        {
             return Ok(());
         }
         // LAZY WRITE-BACK MODE (in-memory databases): pure no-op. Do NOT

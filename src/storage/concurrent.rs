@@ -270,6 +270,7 @@ impl Drop for WriterScopeGuard<'_> {
     fn drop(&mut self) {
         WRITER_SCOPE.with(|c| c.set(self.prev.take()));
         self.pager.concurrent.note_scope_dropped();
+        self.pager.refresh_concurrent_gate();
     }
 }
 
@@ -300,7 +301,9 @@ impl Pager {
         let begin_n_pages = self.committed_n_pages.load(Ordering::Acquire);
         let begin_epoch = self.concurrent.current_epoch();
         self.note_tx_begun();
-        Ok(self.concurrent.begin(begin_epoch, begin_n_pages))
+        let id = self.concurrent.begin(begin_epoch, begin_n_pages);
+        self.refresh_concurrent_gate();
+        Ok(id)
     }
 
     /// Arm this thread's writer scope for `txn_id` on THIS pager.
@@ -309,6 +312,7 @@ impl Pager {
     pub fn arm_writer_scope(&self, txn_id: u64) -> WriterScopeGuard<'_> {
         let prev = WRITER_SCOPE.with(|c| c.replace(Some((self.instance_id, txn_id))));
         self.concurrent.note_scope_armed();
+        self.refresh_concurrent_gate();
         WriterScopeGuard { prev, pager: self }
     }
 
@@ -323,12 +327,33 @@ impl Pager {
         }
     }
 
+    /// Recompute the combined fast-path gate from the manager's
+    /// authoritative counters (bit 0 = regime active, bit 1 = scope
+    /// armed). Called at regime boundaries — statement granularity at
+    /// most. Transient staleness is harmless in BOTH directions:
+    /// - a stale-zero regime bit serves readers `n_pages`, which equals
+    ///   `committed_n_pages` until the first scoped allocation (a regime
+    ///   that just began has allocated nothing);
+    /// - a stale-one regime bit serves readers `committed_n_pages`,
+    ///   which equals `n_pages` after the ending commit's flush (the
+    ///   refresh runs after it);
+    /// - the scope bit is stored by the SAME thread that arms (owners
+    ///   always observe their own arm via same-thread coherence), and
+    ///   every refresh recomputes it from the authoritative count, so
+    ///   one owner's boundary can never drop another's bit.
+    fn refresh_concurrent_gate(&self) {
+        let active = self.concurrent.any_active();
+        let armed = self.concurrent.scope_armed_any();
+        let gate = (active as usize) | ((armed as usize) << 1);
+        self.concurrent_gate.store(gate, Ordering::Release);
+    }
+
     /// True while the concurrent regime is active (any open concurrent
     /// transaction). Readers use the plain live path (the live cache IS
     /// the committed store in this regime) but must bound page ids by
     /// the COMMITTED page count, not the live allocation high-water.
     pub fn concurrent_writers_active(&self) -> bool {
-        self.concurrent.any_active()
+        self.concurrent_gate.load(Ordering::Acquire) & 0x1 != 0
     }
 
     /// COMMIT a concurrent transaction: validate the write-set stamps,
@@ -344,6 +369,12 @@ impl Pager {
                 txn_id
             )));
         };
+        // Refresh the combined gate IMMEDIATELY after the take: every
+        // early return below (the conflict abort in particular) must
+        // leave a gate consistent with the registry, or the engine's
+        // `concurrent_writers_active` check wedges every plain writer on
+        // BUSY forever.
+        self.refresh_concurrent_gate();
 
         // ---- validation: first-committer-wins on the WRITE set.
         //
@@ -446,6 +477,7 @@ impl Pager {
         self.clear_committed_view();
 
         self.note_tx_committed();
+        self.refresh_concurrent_gate();
         Ok(())
     }
 
@@ -459,6 +491,8 @@ impl Pager {
         let Some(txn) = self.concurrent.take(txn_id) else {
             return Ok(()); // already ended
         };
+        // See commit_concurrent: refresh immediately after the take.
+        self.refresh_concurrent_gate();
         // Recycle THIS transaction's fresh allocations: every id in
         // `allocated` is unreferenced by the committed trees (the tree
         // surgery that linked them lived only in shadows), so freelist
@@ -475,6 +509,7 @@ impl Pager {
         }
 
         self.note_tx_rolled_back();
+        self.refresh_concurrent_gate();
         Ok(())
     }
 
