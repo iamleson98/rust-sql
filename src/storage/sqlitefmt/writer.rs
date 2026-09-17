@@ -21,6 +21,7 @@
 //! removed so a subsequent SQLite open reads the fresh image.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::header::build_header_enc;
 use super::record::{encode_record_aliased_enc, encode_record_enc, TextEnc};
@@ -286,6 +287,102 @@ fn clear_sidecar(path: &std::path::Path) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Atomic-write staging files
+// ---------------------------------------------------------------------------
+
+/// Temp-file marker: a full-image write stages its bytes in
+/// `{stem}.rsqltmp{pid}x{seq}` next to the database file and renames
+/// them over it on success. The marker + digit suffix is exactly what
+/// the open-time sweep ([`sweep_stale_temps`]) recognizes as
+/// engine-owned debris.
+const TMP_MARKER: &str = "rsqltmp";
+
+/// Monotonic per-write counter. The PID alone is not unique enough:
+/// two connections dumping concurrently inside one process would
+/// share one staging file and interleave their bytes — the seq makes
+/// every write's staging path distinct.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// This write's staging path: `{stem}.rsqltmp{pid}x{seq}`.
+fn temp_path_for(path: &Path) -> std::path::PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{}{}x{}", TMP_MARKER, std::process::id(), seq))
+}
+
+/// Remove a file, retrying briefly. Windows AV scanners, the search
+/// indexer and sync clients (OneDrive/Dropbox) routinely hold a
+/// just-closed handle for a few milliseconds; without the retry a
+/// transient lock leaks the staging file for good.
+fn remove_with_retry(path: &Path) {
+    for attempt in 0..6u32 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return,
+            Err(_) if !path.exists() => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5 << attempt)),
+        }
+    }
+}
+
+/// Rename with a short retry — the same transient Windows sharing
+/// violations that block removal also block
+/// `MoveFileExW(REPLACE_EXISTING)`.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..4u32 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+/// Best-effort removal of orphaned staging files (`{stem}.rsqltmp*`)
+/// left behind by crashed or killed writes. Called when a database
+/// file is OPENED: by then anything matching the pattern is garbage —
+/// a live write holds its staging file only for the microseconds
+/// between create and rename, and a write whose rename is denied
+/// falls back to an in-place rewrite (see [`write_image_atomic`]), so
+/// removing its staging file cannot corrupt the database. This
+/// process's own staging files are skipped out of caution for
+/// same-process reentrant opens.
+pub fn sweep_stale_temps(path: &Path) {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return;
+    };
+    let prefix = format!("{}.{}", stem.to_string_lossy(), TMP_MARKER);
+    // `rest` has the `{stem}.rsqltmp` prefix stripped already, so the
+    // own-process check compares bare pid digits (`{pid}` /
+    // `{pid}x{seq}`); the `x` delimiter keeps one pid from matching a
+    // longer one (9 vs 99).
+    let own = std::process::id().to_string();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        // Engine-generated names continue with digits (a pid, or
+        // `pid x seq`); anything else (a user's `db.rsqltmp-notes`)
+        // is not ours — leave it alone.
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        // Never touch this process's own staging files.
+        if rest == own || rest.starts_with(&format!("{own}x")) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 /// Write atomically (temp file + fsync + rename), with an in-place
 /// fallback when Windows denies the rename over a live cross-process
 /// handle.
@@ -298,22 +395,42 @@ pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
 /// rename with Windows in-place fallbacks, then stale sidecar removal
 /// so a subsequent SQLite open (or the engine's own reader) never
 /// replays pre-checkpoint frames.
+///
+/// Staging-file hygiene: the staging path is unique per write
+/// ([`temp_path_for`]); on the in-place fallback path it is removed
+/// with a retry; and on ANY error the wrapper below removes it — a
+/// failed write must never leak `db.rsqltmp*` debris into the
+/// database's directory. Staging files orphaned by a killed process
+/// are reclaimed at the next open ([`sweep_stale_temps`]).
 pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension(format!("rsqltmp{}", std::process::id()));
+    let tmp = temp_path_for(path);
+    let result = write_image_staged(&tmp, path, bytes);
+    if result.is_err() {
+        // The leak this used to cause: a rename denied by a transient
+        // Windows lock (AV/indexer/sync) or an IO error aborted the
+        // write with the staging file still on disk — and the drop-path
+        // caller swallows errors, so the debris appeared silently.
+        remove_with_retry(&tmp);
+    }
+    result
+}
+
+/// Staged write core: `tmp` is this write's unique staging path.
+fn write_image_staged(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
     {
         use std::io::Write;
         let mut f =
-            std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+            std::fs::File::create(tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
         f.write_all(bytes)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path)
+    rename_with_retry(tmp, path)
         .or_else(|e| {
             // Windows/EXDEV: fall back to remove + rename.
             let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp, path).map_err(|e2| format!("rename: {e} / {e2}"))
+            rename_with_retry(tmp, path).map_err(|e2| format!("rename: {e} / {e2}"))
         })
         .or_else(|e| {
             // Windows with a live cross-process SQLite connection: the
@@ -333,7 +450,7 @@ pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
                 .map_err(|e| format!("in-place write {}: {e}", path.display()))?;
             f.sync_all()
                 .map_err(|e| format!("in-place fsync {}: {e}", path.display()))?;
-            let _ = std::fs::remove_file(&tmp);
+            remove_with_retry(tmp);
             Ok::<(), String>(())
         })?;
     // Stale sidecars would resurrect pre-dump frames. On Windows a live
@@ -1257,4 +1374,45 @@ fn build_schema_tree(
         table_cells.push(make_table_leaf_cell(usable, c.rowid, &payload));
     }
     pack_table_tree(alloc, usable, table_cells, Some(1))
+}
+
+#[cfg(test)]
+mod tempfile_tests {
+    use super::*;
+
+    /// Every staging path must be distinct within a process — the PID
+    /// alone would make two concurrent dumpers share (and interleave
+    /// bytes through) one staging file.
+    #[test]
+    fn staging_paths_are_unique_per_write() {
+        let p = std::path::Path::new("dir/db.sqlite");
+        let a = temp_path_for(p);
+        let b = temp_path_for(p);
+        let c = temp_path_for(p);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        // Same directory, same stem, engine marker + pid + seq.
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("db.rsqltmp"), "name: {name}");
+        assert!(a.parent() == Some(std::path::Path::new("dir")));
+    }
+
+    /// The staging path keeps the stem and swaps the extension, for
+    /// both plain and extensioned database names.
+    #[test]
+    fn staging_path_shape() {
+        let with_ext = temp_path_for(std::path::Path::new("db.sqlite"));
+        assert!(with_ext
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("db.rsqltmp"));
+        let plain = temp_path_for(std::path::Path::new("db"));
+        assert!(plain
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("db.rsqltmp"));
+    }
 }

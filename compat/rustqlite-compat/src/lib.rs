@@ -1837,8 +1837,7 @@ fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> 
                 if let Some(w) = &u.target_where {
                     walk_expr(w, &mut c);
                 }
-                if let rustqlite::sql::ast::UpsertAction::DoUpdate { set, where_clause } =
-                    &u.action
+                if let rustqlite::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &u.action
                 {
                     for (_, e) in set {
                         walk_expr(e, &mut c);

@@ -30,7 +30,7 @@ pub mod wal;
 pub mod writer;
 
 pub use reader::{read_sqlite_file, RawRow, SchemaRow, SqliteDbImage};
-pub use writer::{build_bytes, write_sqlite_file, Collation, OutDb, OutObject};
+pub use writer::{build_bytes, sweep_stale_temps, write_sqlite_file, Collation, OutDb, OutObject};
 
 /// Cheap file-type sniff: does this path hold a SQLite-format database?
 pub fn is_sqlite_file(path: &std::path::Path) -> bool {

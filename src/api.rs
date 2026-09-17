@@ -2403,6 +2403,11 @@ impl Database {
     /// this constructor is the explicit form (handy for `CREATE` intent,
     /// which is `Database::open_sqlite_format`).
     fn from_sqlite_file(path: &Path) -> Result<Self> {
+        // Reclaim staging files orphaned by crashed or killed writes
+        // BEFORE reading the image. The sweep only fires on OPEN, where
+        // nothing matching the engine's `rsqltmp` staging pattern can
+        // belong to a healthy in-flight write of THIS connection.
+        crate::storage::sqlitefmt::sweep_stale_temps(path);
         let image = crate::storage::sqlitefmt::read_sqlite_file(path)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let mut db = Self::open_memory_inner()?;
@@ -2448,6 +2453,9 @@ impl Database {
                 )));
             }
         }
+        // Same hygiene on the create path: a fresh file must not
+        // inherit `rsqltmp` debris from whatever crashed before it.
+        crate::storage::sqlitefmt::sweep_stale_temps(path);
         let mut db = Self::open_memory_inner()?;
         db.path = path.to_path_buf();
         db.foreign = Some(ForeignSqlite {
