@@ -1828,9 +1828,23 @@ fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> 
                 _ => {}
             }
             if let Some(u) = &i.upsert {
-                if let rustqlite::sql::ast::UpsertAction::DoUpdate { set, .. } = &u.action {
+                // UPSERT parameters bind on THIS statement (SQLite
+                // semantics): the conflict-target WHERE, the DO UPDATE
+                // SET expressions, and the DO UPDATE WHERE guard all
+                // carry bindable `?` slots. Missing them under-counts
+                // `sqlite3_bind_parameter_count`, so the trailing binds
+                // fail with "parameter index out of range".
+                if let Some(w) = &u.target_where {
+                    walk_expr(w, &mut c);
+                }
+                if let rustqlite::sql::ast::UpsertAction::DoUpdate { set, where_clause } =
+                    &u.action
+                {
                     for (_, e) in set {
                         walk_expr(e, &mut c);
+                    }
+                    if let Some(w) = where_clause {
+                        walk_expr(w, &mut c);
                     }
                 }
             }

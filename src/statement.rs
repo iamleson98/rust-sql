@@ -1228,6 +1228,38 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
             } else if let crate::sql::ast::InsertSource::Select(s) = &i.source {
                 walk_select(s, &mut max_pos, &mut saw_numeric, named, &mut counter);
             }
+            // UPSERT parameters bind on THIS statement (SQLite semantics):
+            // the DO UPDATE SET expressions, the optional conflict-target
+            // WHERE, the DO UPDATE WHERE guard, and RETURNING all carry
+            // bindable `?` slots. Missing them under-counts
+            // `parameter_count`, so `bind_all` rejects the trailing values
+            // with "parameter index N out of range".
+            if let Some(u) = &i.upsert {
+                if let Some(w) = &u.target_where {
+                    walk_expr(w, &mut max_pos, &mut saw_numeric, named, &mut counter);
+                }
+                if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &u.action
+                {
+                    for (_, e) in set {
+                        walk_expr(e, &mut max_pos, &mut saw_numeric, named, &mut counter);
+                    }
+                    if let Some(w) = where_clause {
+                        walk_expr(w, &mut max_pos, &mut saw_numeric, named, &mut counter);
+                    }
+                }
+            }
+            if let Some(w) = &i.with {
+                for cte in &w.ctes {
+                    walk_select(&cte.select, &mut max_pos, &mut saw_numeric, named, &mut counter);
+                }
+            }
+            if let Some(rcs) = &i.returning {
+                for rc in rcs {
+                    if let crate::sql::ast::ResultColumn::Expr { expr, .. } = rc {
+                        walk_expr(expr, &mut max_pos, &mut saw_numeric, named, &mut counter);
+                    }
+                }
+            }
         }
         AstStatement::Update(u) => {
             for (_, e) in &u.set {
