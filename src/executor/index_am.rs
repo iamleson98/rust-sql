@@ -208,17 +208,17 @@ fn decode_spatial_key(key: &[u8]) -> Option<(i64, i64, i64)> {
     let mut vals = [0i64; 3];
     let mut pos = 0usize;
     for slot in vals.iter_mut() {
-        if pos >= key.len() || key[pos] != 0x01 {
-            return None;
-        }
-        // INTEGER order key: [0x01] + 8-byte big-endian order key
-        // (double_order_key's sign-flip trick, inverted here). Our
-        // levels/cells are small integers, so the double round-trip is
-        // exact.
-        if pos + 9 > key.len() {
+        // INTEGER order key, uniform 11-byte body: [0x01] + 8-byte
+        // big-endian order key (double_order_key's sign-flip trick,
+        // inverted here) + 2-byte delta past the double bucket floor.
+        // (Spatial levels/cells are small integers — the delta is always
+        // zero there — but the decoder honors it anyway so the round-trip
+        // is exact for any i64 triple.)
+        if pos + 11 > key.len() || key[pos] != 0x01 {
             return None;
         }
         let bytes: [u8; 8] = key[pos + 1..pos + 9].try_into().ok()?;
+        let delta: [u8; 2] = key[pos + 9..pos + 11].try_into().ok()?;
         let ok = u64::from_be_bytes(bytes);
         let fbits = if ok >> 63 == 1 {
             ok & 0x7FFF_FFFF_FFFF_FFFF
@@ -229,8 +229,13 @@ fn decode_spatial_key(key: &[u8]) -> Option<(i64, i64, i64)> {
         if !f.is_finite() || f < i64::MIN as f64 || f >= i64::MAX as f64 {
             return None;
         }
-        *slot = f as i64;
-        pos += 9;
+        let lo = f as i64;
+        *slot = lo.wrapping_add(i64::from(u16::from_be_bytes(delta)));
+        pos += 11;
+    }
+    // Exactly three integers — anything longer is not a spatial key.
+    if pos != key.len() {
+        return None;
     }
     Some((vals[0], vals[1], vals[2]))
 }

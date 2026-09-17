@@ -1763,7 +1763,10 @@ fn abi_serialize_deserialize_round_trip() {
     assert!(size > 0, "serialize size = {size}");
     // The image must carry our native magic.
     unsafe {
-        assert_eq!(&std::slice::from_raw_parts(buf, 8), b"RSQLDB04");
+        assert_eq!(
+            std::slice::from_raw_parts(buf, 8),
+            rustqlite::storage::page::DB_MAGIC.as_slice()
+        );
     }
 
     // Deserialize into a brand-new connection.

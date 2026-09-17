@@ -2201,6 +2201,38 @@ impl Database {
                 required
             )));
         }
+        // Legacy index-key format (`RSQLDB03`/`RSQLDB04`): the file's
+        // index trees hold the pre-prefix-free order-key encoding, so a
+        // plain open would silently misread them (false prefix matches:
+        // `''` vs NUL-leading text, 2^53 vs 2^53 + k). Rebuild the whole
+        // file logically — table trees are rowid-keyed and
+        // format-independent, and every index (explicit, implicit
+        // PK/UNIQUE, WITHOUT ROWID, expression, partial, FTS, spatial) is
+        // derived data that the replay reconstructs under the CURRENT
+        // encoding — then re-open. Codec-coded legacy files are rejected
+        // instead: the rebuild path is plain-page only.
+        if pager.needs_index_format_upgrade() {
+            if codec.is_some() || pager.required_codec().is_some() {
+                return Err(Error::semantic(
+                    "legacy (RSQLDB03/04) codec-coded databases are not auto-upgraded; \
+                     re-create the database with this version",
+                ));
+            }
+            let p = path.clone();
+            // Release the source handle BEFORE the upgrade's atomic
+            // rename (Windows: rename over an open file fails).
+            drop(pager);
+            Self::upgrade_legacy_index_format(&p)?;
+            let check = Pager::open_opts(&p, DEFAULT_CACHE_PAGES, false)?;
+            let ok = !check.needs_index_format_upgrade();
+            drop(check);
+            if !ok {
+                return Err(Error::corruption(
+                    "legacy format upgrade did not take effect (is the file writable?)",
+                ));
+            }
+            return Self::open_inner(p, None, false);
+        }
         let mut catalog = Catalog::new();
         catalog.schema_cookie = pager.schema_cookie();
         // Load the schema from page 0 (the schema table root).
@@ -2312,6 +2344,243 @@ impl Database {
             catalog,
             PathBuf::from(":memory:"),
         ))
+    }
+
+    /// Upgrade a legacy-index-format file (`RSQLDB03`/`RSQLDB04`) to the
+    /// current format IN PLACE: a full logical rebuild into a fresh
+    /// database, atomically swapped over the original path.
+    ///
+    /// Correctness hinges on NEVER reading a legacy index tree: the
+    /// source is walked with raw TABLE B-tree scans (rowid-keyed trees
+    /// are format-independent), the schema replays through DDL, and the
+    /// target's indexes are rebuilt from the copied rows under the
+    /// current prefix-free key encoding. Table B-trees, the schema
+    /// table, and the compact row codec are untouched by the format
+    /// change, so a mid-upgrade crash is safe by construction: the
+    /// original file stays intact until the final rename, and the next
+    /// open simply re-runs the migration.
+    ///
+    /// Fidelity notes (mirrors VACUUM semantics): rowids are preserved
+    /// exactly (alias-carried or explicit `rowid` inserts); the
+    /// AUTOINCREMENT high-water replays from the source's
+    /// `sqlite_sequence` (explicit-rowid inserts only bump it to the max
+    /// landed rowid — the deleted-tail case needs the replay); triggers
+    /// replay AFTER data so they never fire during the copy; foreign-key
+    /// enforcement stays off for the copy (SQLite does the same during
+    /// VACUUM). The rebuilt file uses the default page size.
+    fn upgrade_legacy_index_format(path: &Path) -> Result<()> {
+        let pager: Arc<Pager> = Arc::new(Pager::open_opts(path, DEFAULT_CACHE_PAGES, false)?);
+        let mut catalog = Catalog::new();
+        catalog.schema_cookie = pager.schema_cookie();
+        load_schema(&pager, &mut catalog)?;
+        let mut tgt = Self::open_memory_inner()?;
+        tgt.execute("BEGIN", ())?;
+        let work = Self::replay_legacy_into(&pager, &catalog, &mut tgt);
+        let out = match work {
+            Ok(()) => tgt.execute("COMMIT", ()),
+            Err(e) => {
+                let _ = tgt.execute("ROLLBACK", ());
+                Err(e)
+            }
+        };
+        out?;
+        let bytes = tgt.image()?;
+        drop(tgt);
+        drop(pager);
+        // Atomic replace: fsync'd temp file + rename, so a crash at any
+        // point leaves either the untouched legacy file or the fully
+        // written current-format one.
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(".rsql05.tmp");
+        let tmp_path = PathBuf::from(tmp_os);
+        let write = (|| -> Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp_path)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("upgrade create: {e}"))))?;
+            f.write_all(&bytes)?;
+            f.sync_all()
+                .map_err(|e| Error::Io(std::io::Error::other(format!("upgrade fsync: {e}"))))?;
+            Ok(())
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(Error::Io(std::io::Error::other(format!(
+                "upgrade rename: {e}"
+            ))));
+        }
+        // Retire stale sidecars: a leftover WAL would hold legacy-format
+        // frames (and the spill sidecar mid-transaction pages) that no
+        // longer match the replaced main file. The rebuild already folded
+        // every committed WAL frame into the new image through the pager's
+        // committed view.
+        let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(path));
+        let _ = std::fs::remove_file(crate::storage::pager::spill_path_for(path));
+        Ok(())
+    }
+
+    /// Replay a legacy-format source (raw scans only) into a fresh
+    /// database. See [`Self::upgrade_legacy_index_format`].
+    fn replay_legacy_into(pager: &Arc<Pager>, catalog: &Catalog, tgt: &mut Database) -> Result<()> {
+        // 1. Tables first (name order for a stable replay). Internal
+        //    sqlite_* objects are rebuilt by the engine itself.
+        let mut tables = catalog.all_tables();
+        tables.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, table) in &tables {
+            if name.eq_ignore_ascii_case("sqlite_master")
+                || name.eq_ignore_ascii_case("sqlite_schema")
+                || name.starts_with("sqlite_")
+                || table.create_sql.is_empty()
+            {
+                continue;
+            }
+            tgt.execute(table.create_sql.as_str(), ())?;
+        }
+        // 2. Rows: raw table-tree scans (the planner is bypassed — a
+        //    legacy secondary index must never serve a read here).
+        for (name, table) in &tables {
+            if name.eq_ignore_ascii_case("sqlite_master")
+                || name.eq_ignore_ascii_case("sqlite_schema")
+                || name.starts_with("sqlite_")
+                || table.create_sql.is_empty()
+                || table.vtab.is_some()
+            {
+                continue;
+            }
+            Self::copy_legacy_table_rows(pager, tgt, table)?;
+        }
+        // 3. AUTOINCREMENT high-water fidelity: the source's
+        //    sqlite_sequence rows win over the copy-derived floors
+        //    (same contract as the image loader).
+        if let Some(seq) = catalog.get_table("sqlite_sequence") {
+            let rows = Self::raw_scan_rows(pager, &seq, 2, None)?;
+            if !rows.is_empty() && tgt.catalog.get_table("sqlite_sequence").is_some() {
+                tgt.execute("DELETE FROM sqlite_sequence", ())?;
+                for row in rows {
+                    tgt.execute("INSERT INTO sqlite_sequence VALUES (?, ?)", row.1.clone())?;
+                }
+            }
+        }
+        // 4. Explicit indexes (implicit PK/UNIQUE ones ride the CREATE
+        //    TABLE replay; both backfill from the copied rows under the
+        //    CURRENT key encoding).
+        let mut indexes = catalog.all_indexes();
+        indexes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, ix) in &indexes {
+            if name.starts_with("sqlite_autoindex_") || ix.create_sql.is_empty() {
+                continue;
+            }
+            tgt.execute(ix.create_sql.as_str(), ())?;
+        }
+        // 5. Views + triggers (DDL only; AFTER data so triggers never
+        //    fire during the copy).
+        for (_, view) in catalog.all_views() {
+            if !view.create_sql.is_empty() {
+                tgt.execute(view.create_sql.as_str(), ())?;
+            }
+        }
+        for (_, trg) in catalog.all_triggers() {
+            if !trg.create_sql.is_empty() {
+                tgt.execute(trg.create_sql.as_str(), ())?;
+            }
+        }
+        // 6. Header fields.
+        if pager.user_version() != 0 {
+            tgt.execute(
+                &format!("PRAGMA user_version = {}", pager.user_version()),
+                (),
+            )?;
+        }
+        if pager.application_id() != 0 {
+            tgt.execute(
+                &format!("PRAGMA application_id = {}", pager.application_id()),
+                (),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Raw-scan one table's rows: `(rowid, decoded values)` pairs. The
+    /// scan is the storage-level `scan_table` walk — no planner, no
+    /// indexes, no residuals. A row that fails to decode aborts the
+    /// migration loudly (silent skips would lose data).
+    fn raw_scan_rows(
+        pager: &Arc<Pager>,
+        table: &Arc<Table>,
+        n_cols: usize,
+        rowid_alias: Option<usize>,
+    ) -> Result<Vec<(i64, Vec<crate::types::Value>)>> {
+        let mut out: Vec<(i64, Vec<crate::types::Value>)> = Vec::new();
+        let mut bad: Option<String> = None;
+        let mut bt = Btree::new(pager, table.root_page, false);
+        bt.scan_table(|rowid, payload| {
+            match decode_row(payload, n_cols, rowid, rowid_alias) {
+                Ok(row) => out.push((rowid, row)),
+                Err(e) => {
+                    bad.get_or_insert_with(|| e.to_string());
+                    return false; // stop the walk; the error surfaces after.
+                }
+            }
+            true
+        })?;
+        if let Some(e) = bad {
+            return Err(Error::corruption(format!(
+                "legacy upgrade: table '{}': row decode failed: {e}",
+                table.name
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Copy one table's rows into the rebuild target with rowids
+    /// preserved. INSERT shapes mirror the VACUUM copier: a rowid-alias
+    /// column carries the rowid; a plain rowid table binds the explicit
+    /// `rowid` target; WITHOUT ROWID tables key by their logical PK.
+    /// Generated columns are excluded from the column list (the target
+    /// recomputes them — deterministic expressions).
+    fn copy_legacy_table_rows(
+        pager: &Arc<Pager>,
+        tgt: &mut Database,
+        table: &Arc<Table>,
+    ) -> Result<()> {
+        let stored: Vec<usize> = (0..table.columns.len())
+            .filter(|&i| table.columns[i].generated.is_none())
+            .collect();
+        if stored.is_empty() {
+            return Ok(());
+        }
+        let rows = Self::raw_scan_rows(pager, table, table.n_columns(), table.rowid_alias)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let q = |s: &str| -> String { format!("\"{}\"", s.replace('"', "\"\"")) };
+        let col_list = stored
+            .iter()
+            .map(|&i| q(&table.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target = q(&table.name);
+        let placeholders = stored.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let insert_sql = if table.without_rowid || table.rowid_alias.is_some() {
+            format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})")
+        } else {
+            format!("INSERT INTO {target} (rowid, {col_list}) VALUES (?, {placeholders})")
+        };
+        let with_rowid = !table.without_rowid && table.rowid_alias.is_none();
+        for (rowid, row) in rows {
+            let mut vals: Vec<crate::types::Value> = Vec::with_capacity(stored.len() + 1);
+            if with_rowid {
+                vals.push(crate::types::Value::Integer(rowid));
+            }
+            for &i in &stored {
+                vals.push(row.get(i).cloned().unwrap_or(crate::types::Value::Null));
+            }
+            tgt.execute(insert_sql.as_str(), vals)?;
+        }
+        Ok(())
     }
 
     /// Open an in-memory database seeded from a complete database image
@@ -4422,6 +4691,17 @@ impl Database {
                     inserted
                 });
 
+        // ── Statement journal (row-granularity statement atomicity — see
+        // the general path's hook): a FAILED fast-path INSERT leaves no
+        // partial rows. Must run BEFORE the map-merge epilogue so the
+        // undo's root moves flow into the same write-back. ──
+        if result.is_err() && !ctx.stmt_undo.is_empty() {
+            let entries = std::mem::take(&mut ctx.stmt_undo);
+            if let Err(undo_err) = crate::executor::replay_stmt_undo(&mut ctx, entries) {
+                eprintln!("stmt-undo replay failed after fast-insert error: {undo_err}");
+            }
+        }
+
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
         self.in_transaction
@@ -5513,6 +5793,24 @@ impl Database {
             )
         };
         profile::span(t_exec, &profile::EXEC_NS);
+        // ── Statement journal (SQLite's statement-journal contract, row
+        // granularity) ──
+        // A FAILED statement must leave no partial writes: rows it landed
+        // — its own inserts/deletes AND rows written by triggers fired
+        // from it (they share this ExecContext) — are undone in reverse
+        // before the error surfaces. UPDATE paths pre-validate their
+        // failure modes before any row lands, so they stay journal-free;
+        // in-place upsert mutations and vtab xUpdate effects are the
+        // documented corners (see StmtUndoEntry). Best-effort: the
+        // ORIGINAL statement error is what the caller must see.
+        if result.is_err() && !ctx.stmt_undo.is_empty() {
+            let entries = std::mem::take(&mut ctx.stmt_undo);
+            if let Err(undo_err) = crate::executor::replay_stmt_undo(&mut ctx, entries) {
+                // Exceptional by construction (a healthy b-tree always
+                // undoes) — loud on purpose.
+                eprintln!("stmt-undo replay failed after statement error: {undo_err}");
+            }
+        }
         self.in_transaction
             .store(ctx.in_transaction, Ordering::Release);
         self.set_last_insert_rowid(ctx.last_insert_rowid);
@@ -7443,6 +7741,7 @@ impl Database {
             foreign_keys: Vec::new(),
             col_names: view_cols.to_vec().into(),
             qualified_col_names: view_cols.to_vec().into(),
+            col_affinities: std::sync::Arc::from(Vec::new()),
             vtab: None,
         };
         for (new_row, old_row) in &rows {
@@ -8415,7 +8714,13 @@ impl Database {
                 project,
                 columns: _,
             } => {
-                let rid = rowid.resolve(params).as_integer();
+                // STRICT seek semantics (SQLite affinity for the rowid
+                // comparison): numeric text still matches ('5' == rowid 5),
+                // but ''/'abc'/BLOB match NOTHING — the old lenient
+                // as_integer() mapped '' to rowid 0 and phantom-matched.
+                let Some(rid) = crate::executor::rowid_seek_value(rowid.resolve(params)) else {
+                    return Ok(Vec::new());
+                };
                 let root = table_root.unwrap_or(table.root_page);
                 let mut bt = Btree::new(&self.pager, root, false);
                 // Decode the projected row directly under the page lock —
@@ -8608,8 +8913,16 @@ impl Database {
                 project,
                 columns: _,
             } => {
-                let lo = start.resolve(params).as_integer();
-                let hi = end.resolve(params).as_integer();
+                // Cross-type bound semantics (see executor::rowid_range_bound):
+                // NULL never matches; non-numeric TEXT/BLOB makes the comparison
+                // constant (INTEGER < TEXT/BLOB); fractional REALs round away
+                // from the range interior. An EMPTY resolution returns zero rows.
+                let lo_v = start.resolve(params);
+                let hi_v = end.resolve(params);
+                let Some((lo, hi)) = crate::executor::rowid_range_bounds(Some(lo_v), Some(hi_v))
+                else {
+                    return Ok(Vec::new());
+                };
                 let root = table_root.unwrap_or(table.root_page);
                 let mut bt = Btree::new(&self.pager, root, false);
                 // Pre-size the result from the range width: a growing Vec
@@ -10234,6 +10547,17 @@ impl Database {
                     .into_iter()
                     .map(|ix| (*ix).clone())
                     .collect();
+                // Same survival contract for TRIGGERS: drop_table unlinks
+                // the table's trigger registrations too, and nothing
+                // re-added them — a trigger created BEFORE an ADD COLUMN
+                // stayed in sqlite_master but silently never fired again
+                // (stateful-fuzz divergence: AFTER DELETE ON t0 lost its
+                // audit-writing trigger across a later column add).
+                let live_triggers: Vec<crate::schema::Trigger> = catalog
+                    .triggers_on_table(&a.table)
+                    .into_iter()
+                    .map(|t| (*t).clone())
+                    .collect();
                 // drop_table clears the temp mark — carry it across the
                 // drop/re-add dance (TEMP scope survives ADD COLUMN).
                 let was_temp = catalog.is_temp(&a.table);
@@ -10241,6 +10565,9 @@ impl Database {
                 catalog.add_table(rebuilt);
                 for ix in live_indexes {
                     catalog.add_index(ix);
+                }
+                for trg in live_triggers {
+                    catalog.add_trigger(trg);
                 }
                 if was_temp {
                     catalog.mark_temp(&table_name);
@@ -12065,7 +12392,24 @@ pub(crate) fn expr_to_sql(e: &Expr) -> String {
         E::Literal(v) => match v {
             Value::Null => "NULL".into(),
             Value::Integer(i) => i.to_string(),
-            Value::Real(r) => r.to_string(),
+            // Rust's Display prints -4.0 as "-4" — round-tripping the
+            // rewritten SQL through the parser would turn the REAL into
+            // an INTEGER (ALTER TABLE ADD COLUMN c REAL DEFAULT -4.0
+            // produced Integer(-4) on fresh inserts while ALTER-backfilled
+            // rows kept Real(-4.0); stateful-fuzz divergence). Debug
+            // formatting always keeps the ".0" or exponent so the value
+            // re-parses as a REAL.
+            Value::Real(r) => {
+                if r.is_finite() {
+                    format!("{:?}", r)
+                } else if *r == f64::INFINITY {
+                    "9e999".into()
+                } else if *r == f64::NEG_INFINITY {
+                    "-9e999".into()
+                } else {
+                    "NULL".into() // NaN never survives storage as REAL
+                }
+            }
             Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
             Value::Blob(b) => {
                 let hex: String = b.iter().map(|x| format!("{:02X}", x)).collect();

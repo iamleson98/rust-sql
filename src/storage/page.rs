@@ -38,23 +38,36 @@ pub const MIN_PAGE_SIZE: u32 = 512;
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// Magic header for the database file.
-/// On-disk format version. `RSQLDB04`: the freelist switched from a
-/// per-page linked list (freeing a page wrote its 4 KB body: zero + next
-/// pointer) to SQLite's TRUNK format — freed pages are just 4-byte
-/// entries in a trunk page's array, so a mass delete reclaims thousands
-/// of pages with ~1 write per 1022 frees. `RSQLDB03` files are accepted
-/// read-only-compat: the legacy linked freelist is migrated to trunk
-/// format at open. `RSQLDB03`: index order keys for TEXT/BLOB
-/// switched from (length-prefix, bytes) to true lexicographic
-/// (bytes + NUL terminator) — index range scans and ORDER BY on text of
-/// differing lengths were wrong. Bumped to `RSQLDB02` with the compact row
-/// codec (size-classed integers, varint lengths, rowid-alias elision) —
-/// files written by v1 are rejected with a clear "unsupported format"
-/// error instead of silently decoding garbage.
-pub const DB_MAGIC: [u8; 8] = *b"RSQLDB04";
-/// Previous format version, accepted at open and migrated in-place
-/// (legacy linked-list freelist → trunk freelist; magic rewritten on the
-/// next flush).
+/// On-disk format version. `RSQLDB05`: index order keys became
+/// PREFIX-FREE — numerics encode as a uniform [tag][double 8][delta 2]
+/// body (a small-int key used to be a strict prefix of a big-int/real
+/// key, so an equality probe for 2^53 could prefix-match 2^53 + k), and
+/// TEXT/BLOB payloads escape every 0x00 byte as (00 01) before the
+/// (00 00) terminator (the single-terminator form made '' a strict
+/// prefix of NUL-leading strings — false UNIQUE conflicts, phantom
+/// rows). `RSQLDB04`/`RSQLDB03` files are accepted and MIGRATED at
+/// open: a full logical rebuild (raw table scans — table trees are
+/// rowid-keyed and format-independent — replayed into a fresh database
+/// whose indexes rebuild under the new encoding; see
+/// `Database::open`'s legacy-format upgrade). `RSQLDB04`: the freelist
+/// switched from a per-page linked list (freeing a page wrote its 4 KB
+/// body: zero + next pointer) to SQLite's TRUNK format — freed pages
+/// are just 4-byte entries in a trunk page's array, so a mass delete
+/// reclaims thousands of pages with ~1 write per 1022 frees.
+/// `RSQLDB03`: index order keys for TEXT/BLOB switched from
+/// (length-prefix, bytes) to true lexicographic (bytes + NUL
+/// terminator) — index range scans and ORDER BY on text of differing
+/// lengths were wrong. Bumped to `RSQLDB02` with the compact row codec
+/// (size-classed integers, varint lengths, rowid-alias elision) — files
+/// written by v1 are rejected with a clear "unsupported format" error
+/// instead of silently decoding garbage.
+pub const DB_MAGIC: [u8; 8] = *b"RSQLDB05";
+/// Pre-05 format versions, accepted at open and migrated by a full
+/// logical rebuild (fresh indexes under the current key encoding). The
+/// legacy freelist migration is subsumed: the rebuilt file is written
+/// from scratch.
+pub const DB_MAGIC_V4: [u8; 8] = *b"RSQLDB04";
+/// Oldest accepted version (same migration path as V4).
 pub const DB_MAGIC_V3: [u8; 8] = *b"RSQLDB03";
 
 /// Page 0 is special: it holds the database header (100 bytes) followed by

@@ -2381,11 +2381,24 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 // and adding it would be a wider change. This is planning-only,
                 // not per-row, so the format!() cost is negligible.
                 if format!("{:?}", s) == format!("{:?}", e) {
-                    return Plan::RowidLookup {
+                    let lookup = Plan::RowidLookup {
                         table: table.clone(),
                         alias: alias.clone(),
                         rowid: s.clone(),
                     };
+                    // The equality shortcut must NOT swallow the residual
+                    // conjuncts: `WHERE id = ? AND note IS NULL` planned as a
+                    // bare RowidLookup updated/deleted/returned row `id`
+                    // regardless of `note` (wrongful writes — pinned by
+                    // tests/statement_atomicity.rs). Keep them as a Filter
+                    // over the seek, exactly like the IN-list paths.
+                    if let Some(res) = residual {
+                        return Plan::Filter {
+                            input: Box::new(lookup),
+                            predicate: res,
+                        };
+                    }
+                    return lookup;
                 }
             }
             return Plan::RowidRange {

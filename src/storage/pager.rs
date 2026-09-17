@@ -468,7 +468,7 @@ impl Store {
 }
 
 /// Path of the DELETE-mode mid-transaction page-spill sidecar.
-fn spill_path_for<P: AsRef<Path>>(db_path: P) -> PathBuf {
+pub(crate) fn spill_path_for<P: AsRef<Path>>(db_path: P) -> PathBuf {
     let mut p = db_path.as_ref().as_os_str().to_os_string();
     p.push("-spill");
     PathBuf::from(p)
@@ -889,6 +889,13 @@ pub struct Pager {
     /// The aggregate grouper's temp-store freeze honors it — see
     /// `executor::HashGrouper::armed_grouper`.
     temp_store: std::sync::atomic::AtomicI64,
+    /// The opened file carries a PRE-`RSQLDB05` magic (03/04): its index
+    /// trees hold the legacy order-key encoding. `Database::open` reacts
+    /// by rebuilding the file logically (see
+    /// `Database::upgrade_legacy_index_format`); the pager itself keeps
+    /// serving pages normally — table trees are rowid-keyed and
+    /// format-independent.
+    legacy_index_format: std::sync::atomic::AtomicBool,
     /// Sequential-access tracker for read-ahead: the last page id
     /// touched (any path) and the length of the current +1 run.
     prefetch_last: std::sync::atomic::AtomicU32,
@@ -1643,6 +1650,7 @@ impl Pager {
                 crate::storage::pager::DEFAULT_PARALLEL_SCAN_MIN_ROWS,
             ),
             temp_store: std::sync::atomic::AtomicI64::new(0),
+            legacy_index_format: std::sync::atomic::AtomicBool::new(false),
             prefetch_last: std::sync::atomic::AtomicU32::new(u32::MAX),
             prefetch_run: std::sync::atomic::AtomicU8::new(0),
         };
@@ -1686,12 +1694,26 @@ impl Pager {
         Ok(pager)
     }
 
+    /// True when the opened file predates the `RSQLDB05` prefix-free
+    /// index order-key encoding (magic 03/04) and needs the logical
+    /// rebuild at `Database::open`.
+    pub fn needs_index_format_upgrade(&self) -> bool {
+        self.legacy_index_format.load(Ordering::Acquire)
+    }
+
     /// One-time upgrade of a `RSQLDB03` file: convert the legacy
     /// linked-list freelist (each freed page's first 4 bytes = next) into
     /// the v4 trunk format, and rewrite the magic so the next flush
     /// persists v4. Files with an empty freelist (the common case) only
     /// pay the magic rewrite. Idempotent for v4 files (no-op).
+    ///
+    /// SUPERSEDED for 03/04 files by the logical rebuild (the flag makes
+    /// this a no-op for them): rewriting the magic alone would leave
+    /// legacy-encoded index trees under a current-version banner.
     fn migrate_legacy_freelist(&self) -> Result<()> {
+        if self.needs_index_format_upgrade() {
+            return Ok(()); // the logical rebuild replaces the whole file.
+        }
         // Read the magic from the RAW file bytes — NEVER via get_page:
         // for codec-coded files the codec is not armed yet during `open`,
         // and caching an undecoded page 0 would poison every later read
@@ -1844,11 +1866,16 @@ impl Pager {
             )));
         }
         let magic = FileHeader::magic(&header).copied();
-        // v3 (legacy linked-list freelist): accepted and migrated — the
-        // freelist rebuild happens in `migrate_legacy_freelist` (called
-        // from `open`); the magic itself upgrades on the next flush.
+        // Pre-05 magics (03/04): ACCEPTED — the index order keys predate
+        // the prefix-free encoding. The pager serves table pages normally
+        // (rowid-keyed trees are format-independent); the flag tells
+        // `Database::open` to run the full logical rebuild. The legacy
+        // freelist migration is SUBSUMED: the rebuild writes a fresh file.
+        let is_v4 = magic == Some(crate::storage::page::DB_MAGIC_V4);
         let is_v3 = magic == Some(crate::storage::page::DB_MAGIC_V3);
-        if magic != Some(crate::storage::page::DB_MAGIC) && !is_v3 {
+        if is_v4 || is_v3 {
+            self.legacy_index_format.store(true, Ordering::Release);
+        } else if magic != Some(crate::storage::page::DB_MAGIC) {
             // Distinguish "not a rustqlite file" from "old format version"
             // so users get an actionable message.
             let m = FileHeader::magic(&header)

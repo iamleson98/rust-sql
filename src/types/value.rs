@@ -236,6 +236,16 @@ impl Value {
         if self.is_null() || other.is_null() {
             return Value::Null;
         }
+        // SQLite's || result type: BLOB only when BOTH operands are
+        // blobs (byte concatenation); any other pairing is TEXT with the
+        // operands text-coerced. `SELECT typeof(x'41' || x'42')` is
+        // "blob" — the old text-always form returned "text".
+        if let (Value::Blob(a), Value::Blob(b)) = (self, other) {
+            let mut bytes = Vec::with_capacity(a.len() + b.len());
+            bytes.extend_from_slice(a);
+            bytes.extend_from_slice(b);
+            return Value::Blob(bytes);
+        }
         Value::Text(format!("{}{}", self.as_text(), other.as_text()).into())
     }
 
@@ -402,49 +412,67 @@ impl Value {
         match self {
             Value::Null => out.push(0x00),
             Value::Integer(i) => {
+                // UNIFORM 11-byte body: [01][double-order 8][delta 2].
+                // The delta is zero for |i| <= 2^53 (the double is exact)
+                // and the i128 remainder beyond it. Fixed width keeps the
+                // numeric family PREFIX-FREE — a 9-byte small-int key used
+                // to be a strict prefix of big-int/real keys, so an
+                // equality probe for 2^53 could prefix-match a cell for
+                // 2^53 + k (the same false-match class the Text/Blob
+                // terminator had). (lo, delta) pairs still order exactly
+                // like the integers they encode.
                 out.push(0x01);
-                if i.unsigned_abs() <= (1u64 << 53) {
-                    out.extend_from_slice(&double_order_key(*i as f64).to_be_bytes());
-                } else {
-                    // Find the largest double <= i (the bucket floor).
-                    let mut lo = *i as f64; // round-to-nearest
-                    if (lo as i128) > (*i as i128) {
-                        // Rounded up — step down one ULP.
-                        let b = lo.to_bits();
-                        lo = if lo > 0.0 {
-                            f64::from_bits(b - 1)
-                        } else {
-                            f64::from_bits(b + 1)
-                        };
-                    }
-                    let delta = (*i as i128 - lo as i128) as u16;
-                    out.extend_from_slice(&double_order_key(lo).to_be_bytes());
-                    out.extend_from_slice(&delta.to_be_bytes());
+                let mut lo = *i as f64; // round-to-nearest
+                if (lo as i128) > (*i as i128) {
+                    // Rounded up — step down one ULP to the bucket floor.
+                    let b = lo.to_bits();
+                    lo = if lo > 0.0 {
+                        f64::from_bits(b - 1)
+                    } else {
+                        f64::from_bits(b + 1)
+                    };
                 }
+                let delta = (*i as i128 - lo as i128) as u16;
+                out.extend_from_slice(&double_order_key(lo).to_be_bytes());
+                out.extend_from_slice(&delta.to_be_bytes());
             }
             Value::Real(f) => {
+                // Same uniform body (delta = 0): a REAL and the INTEGER
+                // it equals encode IDENTICALLY (SQLite indexes 2 and 2.0
+                // as one key), and no real key prefixes another.
                 out.push(0x01);
                 out.extend_from_slice(&double_order_key(*f).to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes());
             }
             Value::Text(s) => {
                 // TRUE lexicographic order (SQL text comparison: memcmp,
-                // then shorter-prefix-first). Raw bytes + a 0x00 terminator
-                // — the terminator makes 'a' < 'a\0' < 'ab' and never
-                // reorders non-equal strings, matching memcmp semantics
-                // for embedded NULs. (The previous form — 4-byte length
-                // prefix before the bytes — ordered by LENGTH first, so
-                // `WHERE tag > 'beta'` via an index returned 'alpha'
-                // (len 5) as greater: index ranges and ORDER BY on text
-                // of differing lengths were wrong.)
+                // then shorter-prefix-first) in a PREFIX-FREE encoding:
+                // [02] escape(bytes) [00 00], where escape rewrites every
+                // 0x00 payload byte to the pair (00 01). The old raw-
+                // bytes-plus-single-terminator form ordered correctly but
+                // was prefix-AMBIGUOUS: encode('') = [02 00] is a strict
+                // prefix of encode('\0a') = [02 00 61 00], so an equality
+                // probe for '' prefix-matched cells of NUL-leading
+                // strings (false UNIQUE conflicts, phantom rows). The
+                // escape pairs keep the terminator [00 00] un-reachable
+                // from inside the payload, so no key is a prefix of
+                // another — while byte-wise comparison still orders
+                // exactly like memcmp + shorter-prefix-first (a 00 inside
+                // the payload always continues as 01, which is less than
+                // any terminator-adjacent continuation... verified by the
+                // order-key property tests).
                 out.push(0x02);
-                out.extend_from_slice(s.as_bytes());
+                escape_order_bytes_into(s.as_bytes(), out);
+                out.push(0x00);
                 out.push(0x00);
             }
             Value::Blob(b) => {
-                // Same terminator scheme (SQL blob order is memcmp,
-                // shorter-prefix-first).
+                // Same escape scheme (SQL blob order is memcmp,
+                // shorter-prefix-first). x'' = [03 00 00] is now
+                // distinguishable from x'00..' = [03 00 01 .. 00 00].
                 out.push(0x03);
-                out.extend_from_slice(b);
+                escape_order_bytes_into(b, out);
+                out.push(0x00);
                 out.push(0x00);
             }
         }
@@ -473,36 +501,37 @@ impl Value {
             }
             Value::Integer(i) => {
                 o[0] = 0x01;
-                if i.unsigned_abs() <= (1u64 << 53) {
-                    o[1..9].copy_from_slice(&double_order_key(*i as f64).to_be_bytes());
-                } else {
-                    let mut lo = *i as f64;
-                    if (lo as i128) > (*i as i128) {
-                        let b = lo.to_bits();
-                        lo = if lo > 0.0 {
-                            f64::from_bits(b - 1)
-                        } else {
-                            f64::from_bits(b + 1)
-                        };
-                    }
-                    let delta = (*i as i128 - lo as i128) as u16;
-                    o[1..9].copy_from_slice(&double_order_key(lo).to_be_bytes());
-                    o[9..11].copy_from_slice(&delta.to_be_bytes());
+                let mut lo = *i as f64;
+                if (lo as i128) > (*i as i128) {
+                    let b = lo.to_bits();
+                    lo = if lo > 0.0 {
+                        f64::from_bits(b - 1)
+                    } else {
+                        f64::from_bits(b + 1)
+                    };
                 }
+                let delta = (*i as i128 - lo as i128) as u16;
+                o[1..9].copy_from_slice(&double_order_key(lo).to_be_bytes());
+                o[9..11].copy_from_slice(&delta.to_be_bytes());
             }
             Value::Real(f) => {
                 o[0] = 0x01;
                 o[1..9].copy_from_slice(&double_order_key(*f).to_be_bytes());
+                o[9..11].copy_from_slice(&0u16.to_be_bytes());
             }
             Value::Text(s) => {
                 o[0] = 0x02;
-                o[1..1 + s.len()].copy_from_slice(s.as_bytes());
-                o[1 + s.len()] = 0x00;
+                let n = escape_order_bytes_into_slice(s.as_bytes(), &mut o[1..need - 2]);
+                debug_assert_eq!(n, need - 3);
+                o[need - 2] = 0x00;
+                o[need - 1] = 0x00;
             }
             Value::Blob(b) => {
                 o[0] = 0x03;
-                o[1..1 + b.len()].copy_from_slice(b);
-                o[1 + b.len()] = 0x00;
+                let n = escape_order_bytes_into_slice(b, &mut o[1..need - 2]);
+                debug_assert_eq!(n, need - 3);
+                o[need - 2] = 0x00;
+                o[need - 1] = 0x00;
             }
         }
         Some(need)
@@ -513,17 +542,13 @@ impl Value {
     pub fn order_key_len(&self) -> usize {
         match self {
             Value::Null => 1,
-            Value::Integer(i) => {
-                if i.unsigned_abs() <= (1u64 << 53) {
-                    9
-                } else {
-                    11
-                }
-            }
-            Value::Real(_) => 9,
-            // 1 type tag + bytes + 1 terminator.
-            Value::Text(s) => 2 + s.len(),
-            Value::Blob(b) => 2 + b.len(),
+            // Uniform [tag][double 8][delta 2].
+            Value::Integer(_) => 11,
+            Value::Real(_) => 11,
+            // 1 type tag + escaped bytes + 2-byte terminator; each 0x00
+            // payload byte escapes to two bytes.
+            Value::Text(s) => 3 + s.len() + s.as_bytes().iter().filter(|&&b| b == 0).count(),
+            Value::Blob(b) => 3 + b.len() + b.iter().filter(|&&b| b == 0).count(),
         }
     }
 
@@ -687,6 +712,21 @@ pub enum Affinity {
     None,
 }
 
+/// SQLite REAL-affinity storage semantics for negative zero: `-0.0` is
+/// normalized to `+0.0` when stored in (or read back from) a REAL column —
+/// SQLite's record layer treats integral REALs as integers on disk, which
+/// drops the zero's sign bit. Empirically pinned against real SQLite:
+/// `INSERT INTO t(f REAL) VALUES(-0.0)` reads back `0.0`, while
+/// BLOB/none-affinity columns preserve `-0.0` bit-for-bit and expression
+/// results (`SELECT -0.0`, `CAST(-0.0 AS REAL)`) keep the sign.
+pub(crate) fn real_stored(f: f64) -> f64 {
+    if f == 0.0 {
+        0.0
+    } else {
+        f
+    }
+}
+
 impl Affinity {
     /// SQLite's affinity rules (datatype3.html §3.1): a column declared
     /// INT* gets INTEGER affinity, CHAR/CLOB/TEXT → TEXT, BLOB or no type →
@@ -736,13 +776,13 @@ impl Affinity {
             (Affinity::Integer, Value::Null) => Value::Null,
 
             (Affinity::Real, Value::Integer(i)) => Value::Real(i as f64),
-            (Affinity::Real, Value::Real(f)) => Value::Real(f),
+            (Affinity::Real, Value::Real(f)) => Value::Real(real_stored(f)),
             (Affinity::Real, Value::Text(s)) => {
                 // SQLite affinity: REAL column with TEXT input — convert if
                 // the text looks like a number; otherwise keep as Text.
                 let trimmed = s.trim();
                 if let Ok(f) = trimmed.parse::<f64>() {
-                    Value::Real(f)
+                    Value::Real(real_stored(f))
                 } else {
                     Value::Text(s)
                 }
@@ -805,6 +845,40 @@ pub(crate) fn double_order_key(f: f64) -> u64 {
     } else {
         bits | 0x8000_0000_0000_0000
     }
+}
+
+/// Escape payload bytes for the Text/Blob ORDER-KEY encoding: every 0x00
+/// becomes the pair (00 01). Together with the [00 00] terminator this
+/// makes the encoded key PREFIX-FREE (no key is a strict prefix of
+/// another) while preserving memcmp order + shorter-prefix-first — see
+/// `Value::encode_order_key_into`.
+fn escape_order_bytes_into(bytes: &[u8], out: &mut Vec<u8>) {
+    for &b in bytes {
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(0x01);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+/// Slice form of `escape_order_bytes_into`: writes into `out`, returning
+/// the number of bytes written (`out` must be large enough — callers size
+/// it via `Value::order_key_len`).
+fn escape_order_bytes_into_slice(bytes: &[u8], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for &b in bytes {
+        if b == 0x00 {
+            out[n] = 0x00;
+            out[n + 1] = 0x01;
+            n += 2;
+        } else {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// SQL ordering semantics: NULL sorts first.

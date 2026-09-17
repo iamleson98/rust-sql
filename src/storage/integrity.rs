@@ -36,6 +36,10 @@ use crate::storage::row_codec::decode_row;
 use crate::types::Value;
 use std::collections::HashSet;
 
+/// Decoded rows of one table (rowid, values) — partial-index predicate
+/// evaluation during index cross-verification.
+type RowidRows = Vec<(i64, Vec<Value>)>;
+
 /// Default maximum number of reported problems (SQLite uses 100).
 const MAX_REPORTED_PROBLEMS: usize = 100;
 
@@ -120,15 +124,30 @@ pub fn integrity_check(
     check_schema_tree(pager, &mut p);
 
     // ---- 4. Table b-trees -------------------------------------------------
+    // Tables that own PARTIAL indexes get their rows decoded and captured
+    // during the walk: index cross-verification must evaluate each row
+    // against the partial index's WHERE predicate (predicate-excluded rows
+    // are legitimately absent from the index).
+    let partial_owners: HashSet<String> = catalog
+        .all_indexes()
+        .iter()
+        .filter(|(_, idx)| idx.partial_expr.is_some())
+        .map(|(_, idx)| idx.table.to_ascii_lowercase())
+        .collect();
     let tables = catalog.all_tables();
     let mut table_rowids: Vec<(String, HashSet<i64>)> = Vec::with_capacity(tables.len());
+    let mut table_rows: Vec<(String, RowidRows)> = Vec::new();
     for (name, table) in &tables {
         let root = roots
             .get(&name.to_ascii_lowercase())
             .copied()
             .unwrap_or(table.root_page);
-        let rowids = check_table_tree(pager, table, root, &mut p);
+        let capture = partial_owners.contains(&name.to_ascii_lowercase());
+        let (rowids, rows) = check_table_tree(pager, table, root, &mut p, capture);
         table_rowids.push((name.clone(), rowids));
+        if let Some(rows) = rows {
+            table_rows.push((name.clone(), rows));
+        }
     }
 
     // ---- 5. Index b-trees (the part quick_check skips) -------------------
@@ -140,11 +159,32 @@ pub fn integrity_check(
                 .copied()
                 .unwrap_or(idx.root_page);
             // Find the owning table's rowid set for cross-verification.
-            let owner = table_rowids
+            let owner_entry = table_rowids
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(&idx.table));
+            let owner = owner_entry.map(|(_, set)| set.clone());
+            // Decoded rows + Table descriptor for partial-predicate eval.
+            let rows_entry = table_rows
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(&idx.table));
+            let partial_rows = if idx.partial_expr.is_some() {
+                rows_entry.map(|(_, rows)| rows.as_slice())
+            } else {
+                None
+            };
+            let table_desc = tables
                 .iter()
                 .find(|(t, _)| t.eq_ignore_ascii_case(&idx.table))
-                .map(|(_, set)| set.clone());
-            check_index_tree(pager, idx, root, owner.as_ref(), &mut p);
+                .map(|(_, tbl)| tbl.as_ref());
+            check_index_tree(
+                pager,
+                idx,
+                root,
+                owner.as_ref(),
+                partial_rows,
+                table_desc,
+                &mut p,
+            );
         }
     }
 
@@ -265,10 +305,20 @@ fn check_schema_tree(pager: &Pager, p: &mut Problems) {
 }
 
 /// Full check of one table b-tree. Returns the set of rowids it contains
-/// (for index cross-verification). Never fails hard: structural errors
-/// become messages and yield whatever rowids were walkable.
-fn check_table_tree(pager: &Pager, table: &Table, root: u32, p: &mut Problems) -> HashSet<i64> {
+/// (for index cross-verification), and — when `capture_rows` is set — the
+/// decoded rows themselves (needed to evaluate partial-index WHERE
+/// predicates during index cross-verification). Never fails hard:
+/// structural errors become messages and yield whatever rowids were
+/// walkable.
+fn check_table_tree(
+    pager: &Pager,
+    table: &Table,
+    root: u32,
+    p: &mut Problems,
+    capture_rows: bool,
+) -> (HashSet<i64>, Option<RowidRows>) {
     let mut rowids = HashSet::new();
+    let mut rows: Option<RowidRows> = capture_rows.then(Vec::new);
     let mut prev: Option<i64> = None;
     let n_cols = table.n_columns();
     let alias = table.rowid_alias;
@@ -284,13 +334,18 @@ fn check_table_tree(pager: &Pager, table: &Table, root: u32, p: &mut Problems) -
             }
         }
         prev = Some(rowid);
-        if decode_row(payload, n_cols, rowid, alias).is_err() {
-            p.push(format!(
+        match decode_row(payload, n_cols, rowid, alias) {
+            Ok(vals) => {
+                if let Some(out) = rows.as_mut() {
+                    out.push((rowid, vals));
+                }
+            }
+            Err(_) => p.push(format!(
                 "row {} of table {} fails to decode (payload {} bytes)",
                 rowid,
                 table.name,
                 payload.len()
-            ));
+            )),
         }
         rowids.insert(rowid);
         true
@@ -298,16 +353,22 @@ fn check_table_tree(pager: &Pager, table: &Table, root: u32, p: &mut Problems) -
     if let Err(e) = scan {
         p.push(format!("table {} tree is corrupt: {}", table.name, e));
     }
-    rowids
+    (rowids, rows)
 }
 
 /// Full check of one index b-tree plus cross-verification against the
-/// owning table's rowid set (when known).
+/// owning table's rowid set (when known). For a partial index, only rows
+/// satisfying the index's WHERE predicate are required to be present
+/// (SQLite semantics: predicate-excluded rows are legitimately absent).
+/// `partial_rows` carries the owning table's decoded rows for predicate
+/// evaluation (present only when the index is partial).
 fn check_index_tree(
     pager: &Pager,
     idx: &Index,
     root: u32,
     owner_rowids: Option<&HashSet<i64>>,
+    partial_rows: Option<&[(i64, Vec<Value>)]>,
+    table: Option<&Table>,
     p: &mut Problems,
 ) {
     let mut prev: Option<(Vec<u8>, i64)> = None;
@@ -346,8 +407,26 @@ fn check_index_tree(
             ));
         }
     }
-    // Table -> index: every live row must have an index entry.
-    let missing: Vec<&i64> = owner.difference(&index_rowids).collect();
+    // Table -> index: every live row must have an index entry — except
+    // rows a partial index's WHERE predicate excludes (those are
+    // legitimately absent; SQLite reports the same data as ok).
+    let required: HashSet<i64> = match (&idx.partial_expr, partial_rows, table) {
+        (Some(_), Some(rows), Some(t)) => rows
+            .iter()
+            .filter(|(_, vals)| {
+                crate::executor::index_row_matches_partial(
+                    idx,
+                    t,
+                    vals,
+                    &[],
+                    &std::collections::HashMap::new(),
+                )
+            })
+            .map(|(rid, _)| *rid)
+            .collect(),
+        _ => owner.iter().cloned().collect(),
+    };
+    let missing: Vec<&i64> = required.difference(&index_rowids).collect();
     if !missing.is_empty() {
         // Report count-style (SQLite reports each missing row; we cap
         // through the collector, so report a bounded list).

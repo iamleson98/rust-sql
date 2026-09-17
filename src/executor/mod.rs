@@ -797,6 +797,94 @@ fn rewrite_outer_refs_in_expr(
     }
 }
 
+/// One row-level statement-journal entry (SQLite's statement-journal
+/// contract, row granularity): a FAILED statement must leave no partial
+/// writes. Rows this statement landed are recorded here; the api layer
+/// replays the journal IN REVERSE when the statement returns Err —
+/// trigger-written rows land in the same ExecContext, so they are
+/// journaled (and undone) with the statement that fired them, matching
+/// SQLite's whole-statement undo unit.
+///
+/// Not journaled (documented corners): in-place UPDATE mutation paths
+/// (UPDATE pre-validates its failure modes before any row lands) and
+/// virtual-table xUpdate effects. The sqlite_sequence high-water IS
+/// journaled (see `bump_sqlite_sequence`): SQLite rolls a failed
+/// statement's sequence bump back, so ids from failed inserts are
+/// reused, not burned.
+pub(crate) enum StmtUndoEntry {
+    /// A row this statement inserted (directly or via a trigger body):
+    /// undo = fetch → delete from table + indexes.
+    Inserted { table: Arc<Table>, rowid: i64 },
+    /// A row this statement deleted (payload captured at delete time):
+    /// undo = re-insert into table + indexes.
+    Deleted {
+        table: Arc<Table>,
+        rowid: i64,
+        payload: Vec<u8>,
+    },
+}
+
+/// Replay a statement journal in reverse, best-effort. Called by the
+/// api layer only on statement failure; the ORIGINAL error is what the
+/// user sees, so secondary failures here are swallowed after being
+/// recorded in the profile log (a failing undo means deeper structural
+/// trouble than the statement's own error).
+pub(crate) fn replay_stmt_undo(
+    ctx: &mut ExecContext<'_>,
+    mut entries: Vec<StmtUndoEntry>,
+) -> Result<()> {
+    while let Some(entry) = entries.pop() {
+        match entry {
+            StmtUndoEntry::Inserted { table, rowid } => {
+                let indexes = ctx.catalog().indexes_on_table(&table.name);
+                let root = ctx.table_root(&table);
+                let mut bt = Btree::new(ctx.pager, root, false);
+                let payload = match bt.lookup_table(rowid)? {
+                    LookupResult::Found(p) => p,
+                    LookupResult::NotFound => continue, // already gone
+                };
+                bt.delete_table(rowid)?;
+                if bt.root != root {
+                    ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+                }
+                if !indexes.is_empty() {
+                    if let Ok(row) =
+                        decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)
+                    {
+                        for idx in &indexes {
+                            let _ = delete_index_entry(ctx, idx, &table, &row, rowid);
+                        }
+                    }
+                }
+                ctx.invalidate_max_rowid_if_deleted(&table.name.to_ascii_lowercase(), rowid);
+            }
+            StmtUndoEntry::Deleted {
+                table,
+                rowid,
+                payload,
+            } => {
+                let indexes = ctx.catalog().indexes_on_table(&table.name);
+                let root = ctx.table_root(&table);
+                let mut bt = Btree::new(ctx.pager, root, false);
+                bt.insert_table(rowid, &payload)?;
+                if bt.root != root {
+                    ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+                }
+                if !indexes.is_empty() {
+                    if let Ok(row) =
+                        decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)
+                    {
+                        for idx in &indexes {
+                            let _ = insert_index_entry(ctx, idx, &table, &row, rowid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct ExecContext<'a> {
     pub pager: &'a Pager,
     /// Positional bound parameters (`?` placeholders), indexed 0..N.
@@ -845,6 +933,11 @@ pub struct ExecContext<'a> {
     pub index_roots: HashMap<String, u32>,
     /// LOCAL max-rowid cache entries written by this statement.
     pub max_rowids: HashMap<String, i64>,
+    /// Row-level statement journal: rows this statement has LANDed so
+    /// far (inserts + deletes incl. trigger-written rows). Replayed in
+    /// reverse by the api layer when the statement fails — SQLite's
+    /// statement-journal atomicity at row granularity.
+    pub(crate) stmt_undo: Vec<StmtUndoEntry>,
     /// Set when a table/index root actually MOVED this statement (B+tree
     /// split). Gates `sync_schema_roots` in api.rs — previously that call
     /// ran after EVERY statement, taking two read locks and collecting
@@ -943,6 +1036,7 @@ impl<'a> ExecContext<'a> {
             shared: crate::executor::StmtMaps::empty_arc(),
             index_roots: HashMap::new(),
             max_rowids: HashMap::new(),
+            stmt_undo: Vec::new(),
             roots_changed: false,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
@@ -987,6 +1081,7 @@ impl<'a> ExecContext<'a> {
             shared,
             index_roots: HashMap::new(),
             max_rowids: HashMap::new(),
+            stmt_undo: Vec::new(),
             roots_changed: false,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
@@ -1108,31 +1203,61 @@ impl<'a> ExecContext<'a> {
     /// names in practice are already lowercase, so try the exact name
     /// first (borrowed lookup, zero allocation).
     pub fn get_or_scan_max_rowid(&mut self, table: &Table) -> Result<i64> {
+        // Effective max for allocation: 0 for an empty table (SQLite: the
+        // first auto rowid is 1).
+        Ok(self.get_or_scan_max_rowid_opt(table)?.unwrap_or(0))
+    }
+
+    /// The TRUE maximum rowid, `None` when the table is empty. This is
+    /// SQLite's allocation basis (OP_NewRowid: tree-max + 1): a table
+    /// holding only negative rowids allocates `neg_max + 1`, NOT 1 — so
+    /// emptiness must stay distinguishable from a max of 0. Empty tables
+    /// are deliberately NOT cached: the rescan of an empty root is O(1),
+    /// and caching a 0 would poison subsequent negative-rowid inserts
+    /// (the raise-only cache could never reach the true negative max).
+    pub fn get_or_scan_max_rowid_opt(&mut self, table: &Table) -> Result<Option<i64>> {
         // Fast path 1: table name is already lowercase (the common case).
         if let Some(&max) = self.max_rowids.get(&table.name) {
-            return Ok(max);
+            return Ok(Some(max));
         }
-        if let Some(&max) = self.shared.max_rowids.get(&table.name) {
-            // NOTE: no eager local-overlay seed — the seed allocated a
-            // key String clone on EVERY statement (the overlay is
-            // per-statement, the shared map is not). `set_max_rowid_lc`
-            // handles the shared-hit case directly below.
-            return Ok(max);
+        // Mid-statement invalidations must SHADOW the shared snapshot: the
+        // key is only removed from the shared map at the statement-end
+        // merge, so a trigger fired later in the SAME statement (e.g. the
+        // cached max rowid was just moved away by a rowid-alias UPDATE)
+        // would otherwise read the stale pre-invalidation value and
+        // allocate above a rowid that no longer exists.
+        let invalidated = |k: &str| self.max_rowids_invalidated.iter().any(|x| x == k);
+        if !invalidated(&table.name) {
+            if let Some(&max) = self.shared.max_rowids.get(&table.name) {
+                // NOTE: no eager local-overlay seed — the seed allocated a
+                // key String clone on EVERY statement (the overlay is
+                // per-statement, the shared map is not). `set_max_rowid_lc`
+                // handles the shared-hit case directly below.
+                return Ok(Some(max));
+            }
         }
         // Fast path 2: mixed-case name with a cached lowercase key.
         let key = table.name.to_ascii_lowercase();
         if let Some(&max) = self.max_rowids.get(&key) {
-            return Ok(max);
+            return Ok(Some(max));
         }
-        if let Some(&max) = self.shared.max_rowids.get(&key) {
-            self.max_rowids.insert(key, max);
-            self.max_rowids_changed = true;
-            return Ok(max);
+        if !invalidated(&key) {
+            if let Some(&max) = self.shared.max_rowids.get(&key) {
+                self.max_rowids.insert(key, max);
+                self.max_rowids_changed = true;
+                return Ok(Some(max));
+            }
         }
         let root = self.table_root(table);
-        let max = find_max_rowid(self.pager, root)?;
-        self.max_rowids.insert(key, max);
-        self.max_rowids_changed = true;
+        let max = find_max_rowid_opt(self.pager, root)?;
+        if let Some(m) = max {
+            // Cache only non-empty scans: an empty table's allocation base
+            // is 0, but a cached 0 cannot be told apart from a REAL row with
+            // rowid 0 once rows land — keep the cache authoritative for the
+            // true max and let empty tables rescan (O(1) on an empty root).
+            self.max_rowids.insert(key, m);
+            self.max_rowids_changed = true;
+        }
         Ok(max)
     }
 
@@ -1190,6 +1315,9 @@ impl<'a> ExecContext<'a> {
     /// in place when the key already exists instead of re-allocating the key
     /// String on every inserted row.
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
+        if std::env::var_os("DBG_ROWID").is_some() {
+            eprintln!("DBG set_max {table_name_lc}={rowid}");
+        }
         // Monotonic: the max-rowid cache may only ever be RAISED. It feeds
         // `next_auto_rowid` (max + 1), which is only collision-free when it
         // is an upper bound of the rowids actually in the table. Lowering
@@ -1760,6 +1888,24 @@ pub(crate) fn eval_row(
     evaluate(expr, &ctx)
 }
 
+/// `eval_row` with the table's column-affinity map attached — the
+/// comparison-affinity rules (`text_col > 0` compares TEXT-to-TEXT,
+/// `num_col > '5'` converts) need it. `col_names` must be the table's
+/// own (qualified or bare) list, parallel to `affinities`; callers with
+/// combined/join rows keep plain `eval_row`.
+pub(crate) fn eval_row_aff(
+    expr: &Expr,
+    row: &[Value],
+    col_names: &[String],
+    affinities: &[crate::types::Affinity],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<Value> {
+    let ctx =
+        EvalContext::new(row, col_names, params, named_params).with_affinities(Some(affinities));
+    evaluate(expr, &ctx)
+}
+
 /// Crate-public wrapper around `eval_row` — used by api.rs for index
 /// backfill (partial-index WHERE clause evaluation against existing rows).
 pub(crate) fn eval_row_public(
@@ -1781,12 +1927,22 @@ pub(crate) fn eval_row_public(
 fn enforce_row_constraints(
     table: &Table,
     row: &[Value],
-    col_names: &[String],
+    _col_names: &[String],
     params: &[Value],
     named_params: &HashMap<String, Value>,
 ) -> Result<()> {
     for (i, col) in table.columns.iter().enumerate() {
-        if !col.nullable && row.get(i).map(|v| v.is_null()).unwrap_or(true) {
+        // SQLite's documented legacy quirk: PRIMARY KEY columns of
+        // ORDINARY rowid tables may hold NULL (only WITHOUT ROWID tables
+        // and explicit NOT NULL enforce it) — "a bug in SQLite that is
+        // retained for backwards compatibility". Enforcing PK-implied
+        // NOT NULL here made `UPDATE t SET pk = NULL` fail while INSERT
+        // allowed the same NULL (stateful-fuzz divergence).
+        let pk_legacy_null = col.primary_key
+            && !table.without_rowid
+            && !col.explicit_not_null
+            && table.rowid_alias != Some(i);
+        if !col.nullable && !pk_legacy_null && row.get(i).map(|v| v.is_null()).unwrap_or(true) {
             return Err(Error::constraint(format!(
                 "NOT NULL constraint failed: {}.{}",
                 table.name, col.name
@@ -1794,8 +1950,28 @@ fn enforce_row_constraints(
         }
     }
     for expr in &table.check_exprs {
-        let v = eval_row(expr, row, col_names, params, named_params)?;
-        if !v.is_truthy() {
+        // CHECK expressions evaluate against the table's OWN column layout
+        // with comparison affinities attached: a TEXT-affinity column in a
+        // numeric comparison (`f2 TEXT CHECK (f2 >= -1000000)` with f2='')
+        // applies TEXT affinity to the numeric operand — SQLite compares
+        // '' >= '-1000000' TEXT-to-TEXT (FALSE) and rejects the row, while
+        // a plain affinity-less evaluation would class-order TEXT above
+        // INTEGER and wrongly PASS it.
+        let v = eval_row_aff(
+            expr,
+            row,
+            &table.col_names,
+            &table.col_affinities,
+            params,
+            named_params,
+        )?;
+        // SQLite CHECK semantics: the constraint fails ONLY on a FALSE
+        // (numeric-zero) result — NULL and every other value PASS
+        // ("satisfied if it evaluates to anything other than FALSE").
+        // The old `!is_truthy()` also failed NULL results, wrongly
+        // rejecting NULL-bearing rows (stateful-fuzz divergence).
+        let fails = matches!(v, Value::Integer(0)) || matches!(v, Value::Real(f) if f == 0.0);
+        if fails {
             return Err(Error::constraint(format!(
                 "CHECK constraint failed: {}",
                 table.name
@@ -1914,7 +2090,11 @@ fn fk_parent_exists(
 
     // Fast path: single referenced column == parent rowid alias → point probe.
     if parent_cols.len() == 1 && parent_cols[0] != usize::MAX && alias == Some(parent_cols[0]) {
-        let rowid = key_values[0].as_integer();
+        // Strict seek semantics: a non-integer key ('' , 'abc', a BLOB)
+        // can never equal a rowid — no match, not a lenient 0.
+        let Some(rowid) = rowid_seek_value(&key_values[0]) else {
+            return Ok(false);
+        };
         let mut bt = Btree::new(ctx.pager, root, false);
         return Ok(matches!(bt.lookup_table(rowid)?, LookupResult::Found(_)));
     }
@@ -4517,7 +4697,15 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
             let cond = Some(predicate.clone());
             let left_res = execute(left, ctx)?;
             let right_res = execute(right, ctx)?;
-            return exec_join_rows(ctx, left_res, right_res, *join_type, &cond);
+            let affs: Option<Vec<crate::types::Affinity>> =
+                match (plan_output_affinities(left), plan_output_affinities(right)) {
+                    (Some(mut l), Some(r)) => {
+                        l.extend(r);
+                        Some(l)
+                    }
+                    _ => None,
+                };
+            return exec_join_rows(ctx, left_res, right_res, *join_type, &cond, affs.as_deref());
         }
     }
     // FUSED PATH: Filter over a bare table Scan with a compilable predicate.
@@ -4554,14 +4742,30 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         }
     }
     let mut rows = Vec::new();
+    // Affinity-aware fallback (Filter over Scan): the scan's columns are
+    // the table's (qualified) list, parallel to col_affinities.
+    let scan_affinities: Option<&[crate::types::Affinity]> = match input {
+        Plan::Scan { table, .. } => Some(&table.col_affinities),
+        _ => None,
+    };
     for row in inner.rows {
-        let v = eval_row(
-            predicate,
-            &row,
-            &inner.columns,
-            &ctx.params,
-            &ctx.named_params,
-        )?;
+        let v = match scan_affinities {
+            Some(aff) => eval_row_aff(
+                predicate,
+                &row,
+                &inner.columns,
+                aff,
+                &ctx.params,
+                &ctx.named_params,
+            )?,
+            None => eval_row(
+                predicate,
+                &row,
+                &inner.columns,
+                &ctx.params,
+                &ctx.named_params,
+            )?,
+        };
         if v.is_truthy() {
             rows.push(row);
         }
@@ -6312,6 +6516,13 @@ pub(crate) struct AggState {
     /// allocation per group only when a cold aggregate actually fires.
     cold: Option<Box<AggCold>>,
     seen_value: bool,
+    /// An INTEGER-mode accumulation overflowed i64 (SQLite's sumStep):
+    /// the state folded to double with the last-good partial + the
+    /// overflowing value, and SUM() raises "integer overflow" at finalize
+    /// — UNLESS a REAL input arrives (ever), which clears the flag
+    /// (SQLite's approx mode: the error only fires for all-integer
+    /// inputs). TOTAL/AVG never raise (they are real-valued).
+    int_overflow: bool,
 }
 
 /// The rarely-used half of [`AggState`] — see `cold`.
@@ -7186,12 +7397,12 @@ fn encode_agg_state_into(buf: &mut Vec<u8>, s: &AggState) {
     // KBN compensation term (spill-safe: REAL group sums reload with
     // the same bits they spilled with).
     buf.extend_from_slice(&s.comp.to_bits().to_le_bytes());
-    let mut flags = 0u8;
-    flags |= u8::from(s.sum_is_int);
-    flags |= u8::from(s.seen_value) << 1;
     let cold = s.cold();
-    flags |= u8::from(cold.is_some()) << 2;
-    buf.push(flags);
+    let flags: u16 = u16::from(s.sum_is_int)
+        | (u16::from(s.seen_value) << 1)
+        | (u16::from(cold.is_some()) << 2)
+        | (u16::from(s.int_overflow) << 8);
+    buf.extend_from_slice(&flags.to_le_bytes());
     if let Some(c) = cold {
         let mut bits = 0u16;
         if c.min.is_some() {
@@ -7285,11 +7496,11 @@ fn decode_agg_state(cur: &mut &[u8]) -> Option<AggState> {
     let sum = f64::from_bits(take_u64(cur)?);
     let int_sum = take_u64(cur)? as i64;
     let comp = f64::from_bits(take_u64(cur)?);
-    if cur.is_empty() {
+    if cur.len() < 2 {
         return None;
     }
-    let flags = cur[0];
-    *cur = &cur[1..];
+    let flags = u16::from_le_bytes([cur[0], cur[1]]);
+    *cur = &cur[2..];
     let mut s = AggState {
         count,
         sum,
@@ -7299,6 +7510,7 @@ fn decode_agg_state(cur: &mut &[u8]) -> Option<AggState> {
     };
     s.sum_is_int = flags & 0b1 != 0;
     s.seen_value = flags & 0b10 != 0;
+    s.int_overflow = flags & 0b1_0000_0000 != 0;
     if flags & 0b100 != 0 {
         let bits = u16::from_le_bytes(take_bytes(cur, 2)?.try_into().unwrap());
         let mut cold = AggCold::default();
@@ -7684,6 +7896,7 @@ impl Default for AggState {
             int_sum: 0,
             cold: None,
             seen_value: false,
+            int_overflow: false,
         }
     }
 }
@@ -8411,7 +8624,7 @@ fn finish_group_result(
                     row.push(keys.get(s).cloned().unwrap_or(Value::Null));
                 } else {
                     let i = s - n_group;
-                    row.push(finalize_agg(&states[i], &aggregates[i].func));
+                    row.push(finalize_agg(&states[i], &aggregates[i].func)?);
                 }
             }
             out_rows.push(row);
@@ -8431,7 +8644,7 @@ fn finish_group_result(
         let mut row: Vec<Value> = Vec::with_capacity(n_out.max(1));
         row.extend(keys.iter().cloned());
         for (i, agg) in aggregates.iter().enumerate() {
-            row.push(finalize_agg(&states[i], &agg.func));
+            row.push(finalize_agg(&states[i], &agg.func)?);
         }
         out_rows.push(row);
     }
@@ -8578,6 +8791,10 @@ struct FusedAcc {
     /// SQLite's `rSum + rErr`. Zero while `sum_is_int`.
     comp: f64,
     seen: bool,
+    /// Sticky i64-accumulation overflow (see AggState::int_overflow):
+    /// SUM raises "integer overflow" at finalize unless a REAL input
+    /// arrived (which clears it).
+    int_overflow: bool,
     min: Option<NumVal>,
     max: Option<NumVal>,
 }
@@ -8591,6 +8808,7 @@ impl FusedAcc {
             sum_is_int: true,
             comp: 0.0,
             seen: false,
+            int_overflow: false,
             min: None,
             max: None,
         }
@@ -8648,8 +8866,19 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
             // the compensated f64 merge on any float side.
             dst.count = dst.count.saturating_add(src.count);
             if dst.sum_is_int && src.sum_is_int {
-                dst.i_sum = dst.i_sum.saturating_add(src.i_sum);
+                match dst.i_sum.checked_add(src.i_sum) {
+                    Some(n) => dst.i_sum = n,
+                    None => {
+                        dst.int_overflow = true;
+                        let b = src.i_sum as f64;
+                        dst.sum = dst.i_sum as f64;
+                        dst.sum_is_int = false;
+                        dst.comp = 0.0;
+                        kbn_step(&mut dst.sum, &mut dst.comp, b);
+                    }
+                }
             } else {
+                let src_saw_real = !src.sum_is_int && !src.int_overflow;
                 let b = src.sum_f64();
                 if dst.sum_is_int {
                     dst.sum = dst.i_sum as f64;
@@ -8658,6 +8887,11 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
                 }
                 kbn_step(&mut dst.sum, &mut dst.comp, b);
                 dst.comp += src.comp;
+                if src_saw_real {
+                    dst.int_overflow = false;
+                } else if src.int_overflow {
+                    dst.int_overflow = true;
+                }
             }
         }
         FusedOp::CountStar | FusedOp::CountCol => {
@@ -8670,8 +8904,19 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
             // the KBN-compensated f64 merge (step the running sums,
             // absorb both error terms).
             if dst.sum_is_int && src.sum_is_int {
-                dst.i_sum = dst.i_sum.saturating_add(src.i_sum);
+                match dst.i_sum.checked_add(src.i_sum) {
+                    Some(n) => dst.i_sum = n,
+                    None => {
+                        dst.int_overflow = true;
+                        let b = src.i_sum as f64;
+                        dst.sum = dst.i_sum as f64;
+                        dst.sum_is_int = false;
+                        dst.comp = 0.0;
+                        kbn_step(&mut dst.sum, &mut dst.comp, b);
+                    }
+                }
             } else {
+                let src_saw_real = !src.sum_is_int && !src.int_overflow;
                 let b = src.sum_f64();
                 if dst.sum_is_int {
                     dst.sum = dst.i_sum as f64;
@@ -8680,6 +8925,11 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
                 }
                 kbn_step(&mut dst.sum, &mut dst.comp, b);
                 dst.comp += src.comp;
+                if src_saw_real {
+                    dst.int_overflow = false;
+                } else if src.int_overflow {
+                    dst.int_overflow = true;
+                }
             }
             // MIN/MAX: cross-type compares as f64 (numval_lt — Value::Ord's
             // numeric path; NaN never reaches a fused accumulator).
@@ -8875,11 +9125,22 @@ impl FusedWalk {
                                     acc.sum_is_int = false;
                                     acc.comp = 0.0;
                                 }
+                                acc.int_overflow = false;
                                 kbn_step(&mut acc.sum, &mut acc.comp, f);
                             }
                             NumVal::I(i) => {
                                 if acc.sum_is_int {
-                                    acc.i_sum = acc.i_sum.saturating_add(i);
+                                    match acc.i_sum.checked_add(i) {
+                                        Some(n) => acc.i_sum = n,
+                                        None => {
+                                            eprintln!("DBG: FusedAcc overflow fold");
+                                            acc.int_overflow = true;
+                                            acc.sum = acc.i_sum as f64;
+                                            acc.sum_is_int = false;
+                                            acc.comp = 0.0;
+                                            kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                        }
+                                    }
                                 } else {
                                     kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
                                 }
@@ -8905,11 +9166,22 @@ impl FusedWalk {
                                     acc.sum_is_int = false;
                                     acc.comp = 0.0;
                                 }
+                                acc.int_overflow = false;
                                 kbn_step(&mut acc.sum, &mut acc.comp, f);
                             }
                             NumVal::I(i) => {
                                 if acc.sum_is_int {
-                                    acc.i_sum = acc.i_sum.saturating_add(i);
+                                    match acc.i_sum.checked_add(i) {
+                                        Some(n) => acc.i_sum = n,
+                                        None => {
+                                            eprintln!("DBG: FusedAcc overflow fold");
+                                            acc.int_overflow = true;
+                                            acc.sum = acc.i_sum as f64;
+                                            acc.sum_is_int = false;
+                                            acc.comp = 0.0;
+                                            kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                        }
+                                    }
                                 } else {
                                     kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
                                 }
@@ -9455,13 +9727,13 @@ fn try_fused_aggregate(
         return Ok(None);
     }
 
-    Ok(Some(fused_finalize(aggregates, &walk.accs)))
+    Ok(Some(fused_finalize(aggregates, &walk.accs)?))
 }
 
 /// Finalize a fused walk's accumulators into the single-row `ExecResult`
 /// (mirrors finalize_agg). Shared by the serial fused path and the
 /// parallel driver's merged accumulators.
-fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> ExecResult {
+fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> Result<ExecResult> {
     let mut out_row: Vec<Value> = Vec::with_capacity(aggregates.len());
     for (agg, acc) in aggregates.iter().zip(accs.iter()) {
         let v = match AggFunc::from_name(&agg.func) {
@@ -9469,6 +9741,9 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> ExecResult {
             AggFunc::Sum => {
                 if !acc.seen {
                     Value::Null
+                } else if acc.int_overflow {
+                    eprintln!("DBG: fused_finalize overflow arm");
+                    return Err(Error::semantic("integer overflow"));
                 } else if acc.sum_is_int {
                     Value::Integer(acc.i_sum)
                 } else {
@@ -9517,10 +9792,10 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> ExecResult {
         .enumerate()
         .map(|(i, _)| format!("__agg_{}", i))
         .collect();
-    ExecResult {
+    Ok(ExecResult {
         columns: out_cols.into(),
         rows: vec![out_row],
-    }
+    })
 }
 
 /// Numeric ordering for Min/Max accumulation. Cross-type compares as f64
@@ -9979,7 +10254,7 @@ fn finish_no_group_by(
 ) -> Result<ExecResult> {
     let mut out_row: Vec<Value> = Vec::with_capacity(aggregates.len());
     for (i, agg) in aggregates.iter().enumerate() {
-        out_row.push(finalize_agg(&states[i], &agg.func));
+        out_row.push(finalize_agg(&states[i], &agg.func)?);
     }
     let out_cols: Vec<String> = aggregates
         .iter()
@@ -10286,25 +10561,23 @@ fn exec_aggregate(
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx =
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-            // NULL bound: comparison is NULL (SQL 3VL) — zero rows.
-            let null_bound = match (start, end) {
-                (Some(e), _) | (_, Some(e)) => evaluate(e, &eval_ctx)?.is_null(),
-                (None, None) => false,
+            // Cross-type rowid bound semantics (see exec_rowid_range);
+            // the NULL short-circuit is subsumed by Never.
+            let start_val = match start {
+                Some(e) => Some(evaluate(e, &eval_ctx)?),
+                None => None,
             };
-            if null_bound {
+            let end_val = match end {
+                Some(e) => Some(evaluate(e, &eval_ctx)?),
+                None => None,
+            };
+            let Some((start_v, end_v)) = rowid_range_bounds(start_val.as_ref(), end_val.as_ref())
+            else {
                 let row: Vec<Value> = vec![Value::Integer(0)];
                 return Ok(ExecResult {
                     columns: Arc::from(vec!["__agg_0".to_string()]),
                     rows: vec![row],
                 });
-            }
-            let start_v = match start {
-                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-                None => i64::MIN,
-            };
-            let end_v = match end {
-                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-                None => i64::MAX,
             };
             let root = ctx.table_root(table);
             let mut bt = Btree::new(ctx.pager, root, false);
@@ -10797,7 +11070,12 @@ fn exec_aggregate(
             row.extend(grouper.keys_multi[gi].iter().cloned());
         }
         for (i, agg) in aggregates.iter().enumerate() {
-            row.push(finalize_agg(grouper.states.get(gi * n_aggs + i), &agg.func));
+            row.push(
+                finalize_agg(grouper.states.get(gi * n_aggs + i), &agg.func).map_err(|e| {
+                    eprintln!("DBG: HashGrouper finalize error {e}");
+                    e
+                })?,
+            );
         }
         out_rows.push(row);
     }
@@ -11028,7 +11306,10 @@ fn exec_plugin_aggregate(
         let mut row = key;
         for (i, slot) in states.into_iter().enumerate() {
             row.push(match slot {
-                Slot::Builtin(st) => finalize_agg(&st, &aggregates[i].func),
+                Slot::Builtin(st) => finalize_agg(&st, &aggregates[i].func).map_err(|e| {
+                    eprintln!("DBG: SlotGrouper finalize error {e}");
+                    e
+                })?,
                 Slot::Plugin { state, .. } => match state {
                     Some(st) => st.value()?,
                     // No rows reached this group's step (e.g. aggregate over
@@ -11116,6 +11397,27 @@ fn update_agg_state(
         }
         AggFunc::Sum | AggFunc::Total => {
             if !v.is_null() {
+                // SQLite's sumStep classification (sqlite3_value_numeric_type):
+                // TEXT converts with INTEGER preference (a fully-integer
+                // text contributes exactly); any other TEXT/BLOB
+                // contributes its NUMERIC PREFIX as REAL (0.0 when
+                // non-numeric) — always REAL mode. BLOBs take the prefix
+                // path only (value_numeric_type applies affinity to TEXT
+                // alone, so a blob's bytes go through value_double).
+                let v: Value = match v {
+                    Value::Text(t) => {
+                        let trimmed = t.as_str().trim();
+                        if let Ok(i) = trimmed.parse::<i64>() {
+                            Value::Integer(i)
+                        } else {
+                            Value::Real(crate::types::value::parse_real_prefix(t.as_str()))
+                        }
+                    }
+                    Value::Blob(b) => Value::Real(crate::types::value::parse_real_prefix(
+                        &String::from_utf8_lossy(b),
+                    )),
+                    other => (*other).clone(),
+                };
                 // sumStep discipline: integers accumulate exactly in
                 // int_sum; the first REAL folds the integer partial into
                 // `sum` once and flips; every f64 add thereafter is a
@@ -11126,9 +11428,22 @@ fn update_agg_state(
                         state.sum_is_int = false;
                         state.comp = 0.0;
                     }
+                    // A REAL input launders any earlier integer-mode
+                    // overflow (SQLite's approx mode — sum() only raises
+                    // for all-integer input).
+                    state.int_overflow = false;
                     kbn_step(&mut state.sum, &mut state.comp, v.as_real());
                 } else if state.sum_is_int {
-                    state.int_sum = state.int_sum.saturating_add(v.as_integer());
+                    match state.int_sum.checked_add(v.as_integer()) {
+                        Some(n) => state.int_sum = n,
+                        None => {
+                            state.int_overflow = true;
+                            state.sum = state.int_sum as f64;
+                            state.sum_is_int = false;
+                            state.comp = 0.0;
+                            kbn_step(&mut state.sum, &mut state.comp, v.as_integer() as f64);
+                        }
+                    }
                 } else {
                     kbn_step(&mut state.sum, &mut state.comp, v.as_real());
                 }
@@ -11140,6 +11455,22 @@ fn update_agg_state(
             // partial into `sum` once and flips; finalize is the raw
             // r/cnt double — no rounding, matching SQLite bit-for-bit.
             if !v.is_null() {
+                // Same argument classification as Sum (TEXT with integer
+                // preference; BLOB bytes as a REAL numeric prefix).
+                let v: Value = match v {
+                    Value::Text(t) => {
+                        let trimmed = t.as_str().trim();
+                        if let Ok(i) = trimmed.parse::<i64>() {
+                            Value::Integer(i)
+                        } else {
+                            Value::Real(crate::types::value::parse_real_prefix(t.as_str()))
+                        }
+                    }
+                    Value::Blob(b) => Value::Real(crate::types::value::parse_real_prefix(
+                        &String::from_utf8_lossy(b),
+                    )),
+                    other => (*other).clone(),
+                };
                 state.count += 1;
                 if matches!(v, Value::Real(_)) {
                     if state.sum_is_int {
@@ -11147,9 +11478,19 @@ fn update_agg_state(
                         state.sum_is_int = false;
                         state.comp = 0.0;
                     }
+                    state.int_overflow = false;
                     kbn_step(&mut state.sum, &mut state.comp, v.as_real());
                 } else if state.sum_is_int {
-                    state.int_sum = state.int_sum.saturating_add(v.as_integer());
+                    match state.int_sum.checked_add(v.as_integer()) {
+                        Some(n) => state.int_sum = n,
+                        None => {
+                            state.int_overflow = true;
+                            state.sum = state.int_sum as f64;
+                            state.sum_is_int = false;
+                            state.comp = 0.0;
+                            kbn_step(&mut state.sum, &mut state.comp, v.as_integer() as f64);
+                        }
+                    }
                 } else {
                     kbn_step(&mut state.sum, &mut state.comp, v.as_real());
                 }
@@ -11294,27 +11635,39 @@ fn stddev_of(nums: &[f64], sample: bool) -> Option<f64> {
     Some(var.sqrt())
 }
 
-pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
+pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
+    if func == "sum" && !state.sum_is_int && state.int_sum == 0 && state.sum != 0.0 {
+        eprintln!(
+            "DBG BAD STATE: ovf={} isum={} sum={} st={:p}",
+            state.int_overflow, state.int_sum, state.sum, state as *const AggState
+        );
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
     match func {
-        "count" => Value::Integer(state.count),
+        "count" => Ok(Value::Integer(state.count)),
         "sum" => {
             if !state.seen_value {
-                Value::Null
+                Ok(Value::Null)
+            } else if state.int_overflow {
+                // SQLite: all-integer input whose i64 accumulation
+                // overflowed raises (mixed real input clears the flag).
+                eprintln!("DBG: finalize_agg overflow arm");
+                Err(Error::semantic("integer overflow"))
             } else if state.sum_is_int {
-                Value::Integer(state.int_sum)
+                Ok(Value::Integer(state.int_sum))
             } else {
                 // sumFinalize's approx arm: rSum + rErr.
-                Value::Real(state.sum + state.comp)
+                Ok(Value::Real(state.sum + state.comp))
             }
         }
-        "total" => Value::Real(if state.sum_is_int {
+        "total" => Ok(Value::Real(if state.sum_is_int {
             state.int_sum as f64
         } else {
             state.sum + state.comp
-        }),
+        })),
         "avg" => {
             if state.count == 0 {
-                Value::Null
+                Ok(Value::Null)
             } else {
                 // SQLite avgFinalize: (approx ? rSum + rErr :
                 // (double)iSum)/cnt — raw double, no rounding.
@@ -11323,25 +11676,25 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                 } else {
                     state.sum + state.comp
                 };
-                Value::Real(r / state.count as f64)
+                Ok(Value::Real(r / state.count as f64))
             }
         }
-        "min" => state
+        "min" => Ok(state
             .cold()
             .and_then(|c| c.min.clone())
-            .unwrap_or(Value::Null),
-        "max" => state
+            .unwrap_or(Value::Null)),
+        "max" => Ok(state
             .cold()
             .and_then(|c| c.max.clone())
-            .unwrap_or(Value::Null),
-        "group_concat" | "string_agg" => Value::Text(
+            .unwrap_or(Value::Null)),
+        "group_concat" | "string_agg" => Ok(Value::Text(
             state
                 .cold()
                 .and_then(|c| c.concat.clone())
                 .unwrap_or_default()
                 .into(),
-        ),
-        "json_group_array" => Value::Text(
+        )),
+        "json_group_array" => Ok(Value::Text(
             format!(
                 "[{}]",
                 state
@@ -11350,7 +11703,7 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                     .unwrap_or_default()
             )
             .into(),
-        ),
+        )),
         "jsonb_group_array" => {
             let payload = state
                 .cold()
@@ -11362,7 +11715,7 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                 crate::executor::jsonb::T_ARRAY,
                 &payload,
             );
-            Value::Blob(out)
+            Ok(Value::Blob(out))
         }
         "jsonb_group_object" => {
             let payload = state
@@ -11375,9 +11728,9 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                 crate::executor::jsonb::T_OBJECT,
                 &payload,
             );
-            Value::Blob(out)
+            Ok(Value::Blob(out))
         }
-        "json_group_object" => Value::Text(
+        "json_group_object" => Ok(Value::Text(
             format!(
                 "{{{}}}",
                 state
@@ -11386,27 +11739,27 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                     .unwrap_or_default()
             )
             .into(),
-        ),
+        )),
         "stddev" | "stddev_samp" => {
             let nums = state
                 .cold()
                 .and_then(|c| c.nums.clone())
                 .unwrap_or_default();
-            stddev_of(&nums, true).map_or(Value::Null, Value::Real)
+            Ok(stddev_of(&nums, true).map_or(Value::Null, Value::Real))
         }
         "stddev_pop" => {
             let nums = state
                 .cold()
                 .and_then(|c| c.nums.clone())
                 .unwrap_or_default();
-            stddev_of(&nums, false).map_or(Value::Null, Value::Real)
+            Ok(stddev_of(&nums, false).map_or(Value::Null, Value::Real))
         }
         "median" => {
             let mut nums = state
                 .cold()
                 .and_then(|c| c.nums.clone())
                 .unwrap_or_default();
-            percentile_of(&mut nums, 50.0, true).map_or(Value::Null, Value::Real)
+            Ok(percentile_of(&mut nums, 50.0, true).map_or(Value::Null, Value::Real))
         }
         "percentile_cont" => {
             let mut nums = state
@@ -11414,7 +11767,7 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                 .and_then(|c| c.nums.clone())
                 .unwrap_or_default();
             let pct = state.cold().and_then(|c| c.pct).unwrap_or(f64::NAN);
-            percentile_of(&mut nums, pct, true).map_or(Value::Null, Value::Real)
+            Ok(percentile_of(&mut nums, pct, true).map_or(Value::Null, Value::Real))
         }
         "percentile_disc" => {
             let mut nums = state
@@ -11422,18 +11775,18 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Value {
                 .and_then(|c| c.nums.clone())
                 .unwrap_or_default();
             let pct = state.cold().and_then(|c| c.pct).unwrap_or(f64::NAN);
-            percentile_of(&mut nums, pct, false).map_or(Value::Null, Value::Real)
+            Ok(percentile_of(&mut nums, pct, false).map_or(Value::Null, Value::Real))
         }
         // Bare-column representative (AggFunc::Bare): the tracked value,
         // NULL when the group never saw one (impossible for a non-empty
         // group; the implicit empty group of an aggregate-without-GROUP-BY
         // emits NULL, matching SQLite's single-row aggregate over an
         // empty input).
-        "bare" => state
+        "bare" => Ok(state
             .cold()
             .and_then(|c| c.bare.clone())
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
+            .unwrap_or(Value::Null)),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -12381,16 +12734,25 @@ fn compile_join_term(
     combined: &[String],
     n_left: usize,
     params_len: usize,
+    affinities: Option<&[crate::types::Affinity]>,
 ) -> Option<JTerm> {
     match e {
         Expr::Binary { op, left, right } => match op {
             crate::sql::ast::BinaryOp::And => Some(JTerm::And(
-                Box::new(compile_join_term(left, combined, n_left, params_len)?),
-                Box::new(compile_join_term(right, combined, n_left, params_len)?),
+                Box::new(compile_join_term(
+                    left, combined, n_left, params_len, affinities,
+                )?),
+                Box::new(compile_join_term(
+                    right, combined, n_left, params_len, affinities,
+                )?),
             )),
             crate::sql::ast::BinaryOp::Or => Some(JTerm::Or(
-                Box::new(compile_join_term(left, combined, n_left, params_len)?),
-                Box::new(compile_join_term(right, combined, n_left, params_len)?),
+                Box::new(compile_join_term(
+                    left, combined, n_left, params_len, affinities,
+                )?),
+                Box::new(compile_join_term(
+                    right, combined, n_left, params_len, affinities,
+                )?),
             )),
             op if crate::executor::predicate::is_cmp_op(*op) => {
                 // COLLATE on either comparison operand (mirrors the
@@ -12407,6 +12769,26 @@ fn compile_join_term(
                 };
                 let l = compile_join_jexpr(left, combined, n_left, params_len)?;
                 let r = compile_join_jexpr(right, combined, n_left, params_len)?;
+                // Column-vs-column comparisons that need SQLite's
+                // cross-affinity NUMERIC fold (datatype3 §4.2: INTEGER
+                // column = TEXT column compares numerically) must run
+                // through the serial evaluator — the compiled comparison
+                // is class-ordered and would never match across storage
+                // classes. DECLINE so the generic path folds. NOTE: RCol
+                // indices are RIGHT-side-relative — offset by n_left when
+                // indexing the combined affinity array.
+                let mixed = |l: &JExpr, r: &JExpr| match (l, r) {
+                    (JExpr::LCol(li), JExpr::RCol(ri)) => {
+                        join_key_pair_mixed(affinities, affinities, *li, n_left + *ri)
+                    }
+                    (JExpr::RCol(ri), JExpr::LCol(li)) => {
+                        join_key_pair_mixed(affinities, affinities, *li, n_left + *ri)
+                    }
+                    _ => false,
+                };
+                if mixed(&l, &r) {
+                    return None;
+                }
                 Some(JTerm::Cmp(*op, l, r, coll))
             }
             _ => Some(JTerm::Truth(compile_join_jexpr(
@@ -12417,7 +12799,7 @@ fn compile_join_term(
             op: crate::sql::ast::UnaryOp::Not,
             expr,
         } => Some(JTerm::Not(Box::new(compile_join_term(
-            expr, combined, n_left, params_len,
+            expr, combined, n_left, params_len, affinities,
         )?))),
         _ => Some(JTerm::Truth(compile_join_jexpr(
             e, combined, n_left, params_len,
@@ -12484,6 +12866,54 @@ fn compile_join_jexpr(
     }
 }
 
+/// Output-row affinities for a plan whose columns parallel base-table
+/// scans: `Scan` (table columns + optional hidden rowid slot),
+/// `Filter`-over-such (pass-through rows), and `Join`s of such sides
+/// (left columns then right, slots interleaved as emitted). `None` for
+/// anything else (projections, aggregates, subqueries) — callers then
+/// skip affinity folding rather than guess.
+fn plan_output_affinities(plan: &Plan) -> Option<Vec<crate::types::Affinity>> {
+    use crate::types::Affinity;
+    match plan {
+        Plan::Scan { table, .. } => {
+            let mut v: Vec<Affinity> = table.col_affinities.iter().copied().collect();
+            if crate::planner::wants_rowid_slot(table) {
+                v.push(Affinity::Integer);
+            }
+            Some(v)
+        }
+        Plan::Filter { input, .. } => plan_output_affinities(input),
+        Plan::Join { left, right, .. } => {
+            let mut l = plan_output_affinities(left)?;
+            let r = plan_output_affinities(right)?;
+            l.extend(r);
+            Some(l)
+        }
+        _ => None,
+    }
+}
+
+/// True when a join-key pair (left position `li`, right position `ri`)
+/// needs SQLite's cross-affinity NUMERIC fold (one side
+/// INTEGER/REAL/NUMERIC, the other TEXT/BLOB): the fast paths compare
+/// class-ordered encodings and must decline so the serial evaluator can
+/// fold (datatype3 §4.2).
+fn join_key_pair_mixed(
+    l_affs: Option<&[crate::types::Affinity]>,
+    r_affs: Option<&[crate::types::Affinity]>,
+    li: usize,
+    ri: usize,
+) -> bool {
+    use crate::types::Affinity::*;
+    let (Some(la), Some(ra)) = (l_affs, r_affs) else {
+        return false; // unknown affinities: keep the fast path
+    };
+    let la = la.get(li).copied().unwrap_or(Integer);
+    let ra = ra.get(ri).copied().unwrap_or(Integer);
+    matches!(la, Integer | Real | Numeric) && matches!(ra, Text | Blob | None)
+        || matches!(ra, Integer | Real | Numeric) && matches!(la, Text | Blob | None)
+}
+
 fn exec_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -12493,7 +12923,22 @@ fn exec_join(
 ) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
     let right_res = execute(right, ctx)?;
-    exec_join_rows(ctx, left_res, right_res, join_type, condition)
+    let affs: Option<Vec<crate::types::Affinity>> =
+        match (plan_output_affinities(left), plan_output_affinities(right)) {
+            (Some(mut l), Some(r)) => {
+                l.extend(r);
+                Some(l)
+            }
+            _ => None,
+        };
+    exec_join_rows(
+        ctx,
+        left_res,
+        right_res,
+        join_type,
+        condition,
+        affs.as_deref(),
+    )
 }
 
 /// The nested-loop join over ALREADY-MATERIALIZED side results (the
@@ -12506,6 +12951,7 @@ fn exec_join_rows(
     right_res: ExecResult,
     join_type: crate::sql::ast::JoinType,
     condition: &Option<Expr>,
+    affinities: Option<&[crate::types::Affinity]>,
 ) -> Result<ExecResult> {
     let mut combined_cols: Vec<String> = left_res.columns.to_vec();
     combined_cols.extend(right_res.columns.iter().cloned());
@@ -12524,7 +12970,7 @@ fn exec_join_rows(
     // parallel split below takes this exact same `JTerm`.
     let compiled = condition
         .as_ref()
-        .and_then(|c| compile_join_term(c, &combined_cols, n_left, params.len()));
+        .and_then(|c| compile_join_term(c, &combined_cols, n_left, params.len(), affinities));
     if let Some(jt) = compiled {
         // ---- Intra-statement parallel split: the LEFT (outer) side's
         // row range splits across workers; each worker runs the
@@ -12597,7 +13043,17 @@ fn exec_join_rows(
             let mut combined = left_row.clone();
             combined.extend(right_row.clone());
             let ok = if let Some(cond) = condition {
-                let v = eval_row(cond, &combined, &combined_cols, &params, &named_params)?;
+                let v = match affinities {
+                    Some(affs) => eval_row_aff(
+                        cond,
+                        &combined,
+                        &combined_cols,
+                        affs,
+                        &params,
+                        &named_params,
+                    )?,
+                    None => eval_row(cond, &combined, &combined_cols, &params, &named_params)?,
+                };
                 v.is_truthy()
             } else {
                 true
@@ -12822,6 +13278,20 @@ fn try_fused_scan_hash_join(
     let l_keys: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
     let r_keys: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
     let n_keys = eq_pairs.len();
+    // Cross-affinity equi keys (INTEGER col = TEXT col — needs the
+    // NUMERIC fold) must NOT hash: the encoded order keys are
+    // class-ordered and would never collide. DECLINE to the nested-loop
+    // path, whose serial evaluator folds (datatype3 §4.2).
+    {
+        let l_affs = plan_output_affinities(left);
+        let r_affs = plan_output_affinities(right);
+        if eq_pairs
+            .iter()
+            .any(|&(li, ri)| join_key_pair_mixed(l_affs.as_deref(), r_affs.as_deref(), li, ri))
+        {
+            return Ok(None);
+        }
+    }
 
     // ---- Projection resolution (bare columns only) --------------------
     // Combined column list as BORROWED strings (left then right — exactly
@@ -13524,13 +13994,44 @@ fn exec_hash_join(
     // Extract the equi-join keys from the condition.
     // We expect `left.col = right.col` (a single equality or an AND of equalities).
     let eq_pairs = extract_equi_join_keys(condition, &left_res.columns, &right_res.columns);
+    // Combined output affinities (scan-shaped sides): the serial
+    // fallback evaluates the ON condition with affinity folding.
+    let affs: Option<Vec<crate::types::Affinity>> =
+        match (plan_output_affinities(left), plan_output_affinities(right)) {
+            (Some(mut l), Some(r)) => {
+                l.extend(r);
+                Some(l)
+            }
+            _ => None,
+        };
+    // Cross-affinity equi keys must not hash (see the fused path's
+    // gate) — treat as no-equi and take the nested loop, which folds.
+    let eq_pairs = if eq_pairs.iter().any(|&(li, ri)| {
+        join_key_pair_mixed(
+            plan_output_affinities(left).as_deref(),
+            plan_output_affinities(right).as_deref(),
+            li,
+            ri,
+        )
+    }) {
+        Vec::new()
+    } else {
+        eq_pairs
+    };
 
     if eq_pairs.is_empty() {
         // No equi-join keys — fall back to nested-loop (+ optional
         // projection). The sides are ALREADY materialized above: run the
         // nested loop over them directly (exec_join_rows) — the old
         // call re-executed BOTH sides a second time.
-        let res = exec_join_rows(ctx, left_res, right_res, join_type, condition)?;
+        let res = exec_join_rows(
+            ctx,
+            left_res,
+            right_res,
+            join_type,
+            condition,
+            affs.as_deref(),
+        )?;
         return match projection {
             Some(cols) => apply_projection(res, cols, ctx),
             None => Ok(res),
@@ -14547,7 +15048,14 @@ fn exec_rowid_lookup(
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-    let rowid = evaluate(rowid_expr, &eval_ctx)?.as_integer();
+    // STRICT seek: a non-integer key ('' / 'abc' / BLOB) matches NOTHING
+    // (the old lenient as_integer() mapped '' to rowid 0).
+    let Some(rowid) = rowid_seek_value(&evaluate(rowid_expr, &eval_ctx)?) else {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
+    };
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
     let row = match bt.lookup_table(rowid)? {
@@ -14738,7 +15246,14 @@ fn fetch_candidate_rows(
             .lookup_table_with(*rowid, |payload| decode_row(payload, n_cols, *rowid, alias))?
         {
             if let Some(pred) = residual {
-                let pv = eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                let pv = eval_row_aff(
+                    pred,
+                    &row,
+                    &table.col_names,
+                    &table.col_affinities,
+                    &ctx.params,
+                    &ctx.named_params,
+                )?;
                 if !pv.is_truthy() {
                     continue;
                 }
@@ -14800,9 +15315,14 @@ fn exec_inverted_index_scan(
             table_bt.scan_table_borrowed(|rowid, payload| {
                 if let Ok(mut row) = decode_row(payload, n_cols, rowid, ralias) {
                     if let Some(pred) = residual {
-                        if let Ok(pv) =
-                            eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)
-                        {
+                        if let Ok(pv) = eval_row_aff(
+                            pred,
+                            &row,
+                            &table.col_names,
+                            &table.col_affinities,
+                            &ctx.params,
+                            &ctx.named_params,
+                        ) {
                             if !pv.is_truthy() {
                                 return true;
                             }
@@ -14939,9 +15459,14 @@ fn exec_spatial_knn(
             }
             if let Ok(mut row) = decode_row(payload, n_cols, rowid, ralias) {
                 if let Some(pred) = residual {
-                    if let Ok(pv) =
-                        eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)
-                    {
+                    if let Ok(pv) = eval_row_aff(
+                        pred,
+                        &row,
+                        &table.col_names,
+                        &table.col_affinities,
+                        &ctx.params,
+                        &ctx.named_params,
+                    ) {
                         if !pv.is_truthy() {
                             return true;
                         }
@@ -15011,8 +15536,14 @@ fn exec_spatial_knn(
                     decode_row(payload, n_cols, rowid, ralias)
                 })? {
                     if let Some(pred) = residual {
-                        let passed =
-                            eval_row(pred, &row, &table.col_names, &ctx.params, &ctx.named_params)?;
+                        let passed = eval_row_aff(
+                            pred,
+                            &row,
+                            &table.col_names,
+                            &table.col_affinities,
+                            &ctx.params,
+                            &ctx.named_params,
+                        )?;
                         if !passed.is_truthy() {
                             continue;
                         }
@@ -15136,32 +15667,27 @@ fn exec_rowid_range(
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
 
-    // Evaluate the bounds. None means unbounded (-∞ or +∞). A NULL
-    // bound makes the comparison NULL (SQL 3VL) — the range is EMPTY,
-    // never "NULL coerces to 0" (which turned `id >= NULL` into
-    // "everything from rowid 0" — found by examples/probe_null_key3.rs,
-    // differential vs SQLite).
-    let start_null = match start_expr {
-        Some(e) => evaluate(e, &eval_ctx)?.is_null(),
-        None => false,
+    // Evaluate the bounds. None means unbounded (-∞ or +∞). Bounds go
+    // through SQLite's cross-type semantics (rowid_range_bounds): NULL
+    // never matches, non-numeric TEXT/BLOB operands make the comparison
+    // constant (INTEGER < TEXT/BLOB — `pk > 'abc'` is empty, `pk < 'abc'`
+    // is every row), fractional REALs round away from the interior
+    // (`pk >= 2.5` starts at 3). The old lenient as_integer() coerced
+    // 'abc' to 0 and 2.5 to 2 — the stateful fuzzer caught the wrong
+    // DELETEs.
+    let start_v = match start_expr {
+        Some(e) => Some(evaluate(e, &eval_ctx)?),
+        None => None,
     };
-    let end_null = match end_expr {
-        Some(e) => evaluate(e, &eval_ctx)?.is_null(),
-        None => false,
+    let end_v = match end_expr {
+        Some(e) => Some(evaluate(e, &eval_ctx)?),
+        None => None,
     };
-    if start_null || end_null {
+    let Some((start, end)) = rowid_range_bounds(start_v.as_ref(), end_v.as_ref()) else {
         return Ok(ExecResult {
             columns: out_cols,
             rows: Vec::new(),
         });
-    }
-    let start: i64 = match start_expr {
-        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-        None => i64::MIN,
-    };
-    let end: i64 = match end_expr {
-        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-        None => i64::MAX,
     };
 
     let root = ctx.table_root(&table);
@@ -15359,13 +15885,20 @@ fn exec_rowid_range_projected_impl(
             rows: Vec::new(),
         });
     }
-    let start: i64 = match start_expr {
-        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-        None => i64::MIN,
+    // Cross-type bound semantics (see exec_rowid_range).
+    let start_v = match start_expr {
+        Some(e) => Some(evaluate(e, &eval_ctx)?),
+        None => None,
     };
-    let end: i64 = match end_expr {
-        Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-        None => i64::MAX,
+    let end_v = match end_expr {
+        Some(e) => Some(evaluate(e, &eval_ctx)?),
+        None => None,
+    };
+    let Some((start, end)) = rowid_range_bounds(start_v.as_ref(), end_v.as_ref()) else {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
     };
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
@@ -15463,7 +15996,13 @@ fn exec_rowid_lookup_projected(
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-    let rowid = evaluate(rowid_expr, &eval_ctx)?.as_integer();
+    // STRICT seek (see exec_rowid_lookup): non-integer keys match nothing.
+    let Some(rowid) = rowid_seek_value(&evaluate(rowid_expr, &eval_ctx)?) else {
+        return Ok(ExecResult {
+            columns: out_cols,
+            rows: Vec::new(),
+        });
+    };
     let root = ctx.table_root(&table);
     let mut bt = Btree::new(ctx.pager, root, false);
     let n_cols = table.n_columns();
@@ -16371,9 +16910,64 @@ impl IndexMaintState {
 /// INTEGER PRIMARY KEY alias). Never a valid real column index.
 pub(crate) const ROWID_COLUMN_SENTINEL: usize = usize::MAX;
 
+/// Which columns an INSERT's target list EXPLICITLY provides (the
+/// rowid sentinel is not a column). DEFAULT fills only the others.
+#[inline]
+fn provided_columns(table: &Table, target_indices: &[usize]) -> Vec<bool> {
+    let mut provided = vec![false; table.columns.len()];
+    for &ti in target_indices {
+        if ti != ROWID_COLUMN_SENTINEL && ti < provided.len() {
+            provided[ti] = true;
+        }
+    }
+    provided
+}
+
 /// Extract an explicit rowid from a supplied value: integers pass through,
 /// integral REALs convert exactly (2^63 is representable), NULL means
 /// auto-assign, anything else is an error.
+/// STRICT rowid seek value for `rowid_alias = operand` equality (SQLite's
+/// comparison semantics for the rowid fast path — the operand goes through
+/// INTEGER-column affinity before the equality):
+///   Integer            -> Some(i)
+///   integral Real      -> Some(i)          (2^63 wraps to i64::MIN)
+///   numeric Text       -> Some(i)          (SQLite affinity: '5' == rowid 5,
+///                                           leading/trailing spaces trimmed)
+///   non-numeric Text   -> None             ('' / 'abc' match NOTHING — the
+///                                           old lenient `as_integer()`
+///                                           mapped '' to rowid 0 and
+///                                           phantom-matched that row)
+///   Blob / Null / etc. -> None             (a BLOB never converts)
+/// `None` means the comparison can never hold: the seek yields zero rows.
+pub(crate) fn rowid_seek_value(v: &Value) -> Option<i64> {
+    match v {
+        Value::Integer(i) => Some(*i),
+        Value::Null => None,
+        Value::Real(_) => rowid_from_value(v).ok().flatten(),
+        Value::Text(t) => {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Some(i);
+            }
+            if let Ok(f) = trimmed.parse::<f64>() {
+                if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                    return Some(f as i64);
+                }
+                if f == 9_223_372_036_854_775_808.0 {
+                    return Some(i64::MIN);
+                }
+                None
+            } else {
+                None
+            }
+        }
+        Value::Blob(_) => None,
+    }
+}
+
 fn rowid_from_value(v: &Value) -> Result<Option<i64>> {
     match v {
         Value::Integer(r) => Ok(Some(*r)),
@@ -16383,6 +16977,124 @@ fn rowid_from_value(v: &Value) -> Result<Option<i64>> {
         }
         Value::Real(f) if *f == 9_223_372_036_854_775_808.0 => Ok(Some(i64::MIN)), // 2^63 wraps to MIN in SQLite's conversion
         _ => Err(Error::semantic("rowid must be an integer")),
+    }
+}
+
+/// A resolved rowid RANGE bound under SQLite's cross-type comparison
+/// semantics — the range analog of [`rowid_seek_value`]. The rowid column
+/// carries INTEGER affinity, so the operand converts when numeric; when
+/// it is TEXT/BLOB the comparison is CONSTANT (SQLite's type order:
+/// INTEGER is always less than TEXT and BLOB), and NULL never matches.
+pub(crate) enum RowidRangeBound {
+    /// Inclusive rowid bound. Fractional REALs round AWAY from the
+    /// range's interior (ceil on the lower side, floor on the upper), so
+    /// `pk >= 2.5` starts at rowid 3 with no residual needed.
+    Val(i64),
+    /// The comparison direction is constant-TRUE for every row: a
+    /// non-numeric operand opens the UPPER side (`pk < 'abc'` is every
+    /// row); ±inf opens the far side.
+    Unbounded,
+    /// The comparison can never hold: a non-numeric operand on the LOWER
+    /// side (`pk > 'abc'` — INTEGER < TEXT), NaN, or ±inf on the near
+    /// side.
+    Never,
+}
+
+fn unbounded_side(lower: bool) -> RowidRangeBound {
+    if lower {
+        RowidRangeBound::Never
+    } else {
+        RowidRangeBound::Unbounded
+    }
+}
+
+/// Resolve one bound value. `lower` = the `pk > />= v` side;
+/// `!lower` = the `pk < /<= v` side.
+pub(crate) fn rowid_range_bound(v: &Value, lower: bool) -> RowidRangeBound {
+    match v {
+        Value::Integer(i) => RowidRangeBound::Val(*i),
+        Value::Null => RowidRangeBound::Never, // 3VL: NULL comparisons never hold
+        Value::Real(f) => {
+            if f.is_nan() {
+                RowidRangeBound::Never
+            } else if *f == f64::NEG_INFINITY {
+                unbounded_side(!lower)
+            } else if *f == f64::INFINITY {
+                unbounded_side(lower)
+            } else if f.fract() == 0.0 {
+                // Integral real: exact (2^63 wraps like rowid_seek_value).
+                match rowid_from_value(v) {
+                    Ok(Some(i)) => RowidRangeBound::Val(i),
+                    // Out of i64 range entirely (beyond ±2^63).
+                    _ => unbounded_side(if *f > 0.0 { lower } else { !lower }),
+                }
+            } else if *f > i64::MAX as f64 || *f < i64::MIN as f64 {
+                // Fractional but past the integer domain: same side rule.
+                unbounded_side(if *f > 0.0 { lower } else { !lower })
+            } else if lower {
+                RowidRangeBound::Val(f.ceil() as i64)
+            } else {
+                RowidRangeBound::Val(f.floor() as i64)
+            }
+        }
+        Value::Text(t) => {
+            // INTEGER affinity applied to a TEXT operand: numeric text
+            // converts ('5' == rowid 5, leading/trailing spaces trimmed);
+            // anything else stays TEXT, and INTEGER < TEXT is constant.
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                return unbounded_side(lower);
+            }
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return RowidRangeBound::Val(i);
+            }
+            if let Ok(f) = trimmed.parse::<f64>() {
+                return rowid_range_bound(&Value::Real(f), lower);
+            }
+            unbounded_side(lower)
+        }
+        Value::Blob(_) => unbounded_side(lower),
+    }
+}
+
+/// Resolve a (start, end) rowid-range pair — the operands are ALREADY
+/// evaluated (constants / parameters) — to inclusive rowid bounds.
+/// `None` = the range is provably EMPTY (a Never bound, or an inverted
+/// pair): callers return zero rows without touching the B-tree.
+pub(crate) fn rowid_range_bounds(start: Option<&Value>, end: Option<&Value>) -> Option<(i64, i64)> {
+    let lo = match start {
+        Some(v) => match rowid_range_bound(v, true) {
+            RowidRangeBound::Val(i) => i,
+            RowidRangeBound::Unbounded => i64::MIN,
+            RowidRangeBound::Never => return None,
+        },
+        None => i64::MIN,
+    };
+    let hi = match end {
+        Some(v) => match rowid_range_bound(v, false) {
+            RowidRangeBound::Val(i) => i,
+            RowidRangeBound::Unbounded => i64::MAX,
+            RowidRangeBound::Never => return None,
+        },
+        None => i64::MAX,
+    };
+    if lo > hi {
+        return None;
+    }
+    Some((lo, hi))
+}
+
+/// The rowid a strict `pk > v` / `pk < v` boundary EXCLUDES, when the
+/// fast "skip exactly the boundary rowid" check is sound: only when `v`
+/// is integral (for a fractional `v` nothing sits ON the boundary — the
+/// ceil/floor range already moved past it — so the caller must fall back
+/// to the general residual evaluation).
+pub(crate) fn rowid_strict_boundary(v: &Value) -> Option<i64> {
+    match v {
+        Value::Integer(i) => Some(*i),
+        Value::Real(f) if f.is_finite() && f.fract() == 0.0 => rowid_from_value(v).ok().flatten(),
+        Value::Text(t) => t.trim().parse::<i64>().ok(),
+        _ => None,
     }
 }
 
@@ -16574,7 +17286,10 @@ fn exec_insert_inner(
     }
     // Track the current root page — it may change if the B+tree splits.
     let mut current_root = ctx.table_root(&table);
-    let mut max_rowid = ctx.get_or_scan_max_rowid(&table)?;
+    // Statement-local TRUE max rowid (None = table currently empty):
+    // SQLite allocates tree-max+1 per row, so an explicit negative first
+    // row on an empty table must lower the effective max below 0.
+    let mut max_rowid = ctx.get_or_scan_max_rowid_opt(&table)?;
     let mut inserted = 0i64;
 
     // AUTOINCREMENT: the high-water floor comes from sqlite_sequence
@@ -16685,9 +17400,20 @@ fn exec_insert_inner(
                     full_row[col_idx] = table.columns[col_idx].coerce(val);
                 }
             }
-            // Apply column defaults.
+            // Apply column defaults — ONLY to columns the INSERT's
+            // column list OMITTED. SQLite keeps an explicit NULL (DEFAULT
+            // never overwrites one); the old is_null() check conflated
+            // "absent" with "explicitly NULL" (stateful-fuzz divergence:
+            // `INSERT (c3) VALUES (NULL)` stored the DEFAULT x'00').
+            // An EMPTY expr list is the DEFAULT VALUES row shape: nothing
+            // is provided, so every column takes its default.
+            let provided = if exprs.is_empty() {
+                vec![false; table.columns.len()]
+            } else {
+                provided_columns(&table, &target_indices)
+            };
             for (i, col) in table.columns.iter().enumerate() {
-                if full_row[i].is_null() && col.default.is_some() {
+                if !provided[i] && col.default.is_some() {
                     if let Some(default_expr) = &col.default {
                         let eval_ctx = EvalContext::new(
                             &empty_row,
@@ -16716,10 +17442,15 @@ fn exec_insert_inner(
             let mut rowid_autogen = false;
             if let Some(idx) = table.rowid_alias {
                 if full_row[idx].is_null() {
-                    let r = next_auto_rowid(ctx.pager, current_root, max_rowid.max(seq_floor))?;
-                    if r > max_rowid {
-                        max_rowid = r;
-                    }
+                    // Overlay-aware allocation (triggers fired by earlier
+                    // rows of THIS statement may have landed rows on the
+                    // same table — the statement-local max_rowid is stale
+                    // by exactly those rows; see exec_insert_one_row).
+                    let live = ctx.get_or_scan_max_rowid_opt(&table)?;
+                    let eff = max_rowid.max(live);
+                    let r =
+                        next_auto_rowid(ctx.pager, current_root, eff.unwrap_or(0).max(seq_floor))?;
+                    max_rowid = Some(r);
                     full_row[idx] = Value::Integer(r);
                     rowid_autogen = true;
                 }
@@ -16785,6 +17516,9 @@ fn exec_insert_inner(
             match outcome {
                 InsertOutcome::Inserted => {
                     inserted += 1;
+                    // (The statement-journal Inserted entry is pushed inside
+                    // exec_insert_one_row, covering both this generic loop
+                    // and the literal fast path.)
                     // AUTOINCREMENT: raise the sequence high-water to the
                     // landed rowid (SQLite bumps on every insert that
                     // exceeds it — auto-allocated or explicit).
@@ -16927,9 +17661,17 @@ fn exec_insert_inner(
             }
         }
 
-        // Apply column defaults.
+        // Apply column defaults — ONLY to omitted columns (see the
+        // fast path's comment: an explicit NULL stays NULL). An EMPTY
+        // source row (DEFAULT VALUES / zero-width source) provides
+        // nothing: every column takes its default.
+        let provided = if row.is_empty() {
+            vec![false; table.columns.len()]
+        } else {
+            provided_columns(&table, &target_indices)
+        };
         for (i, col) in table.columns.iter().enumerate() {
-            if full_row[i].is_null() && col.default.is_some() {
+            if !provided[i] && col.default.is_some() {
                 let eval_ctx =
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 if let Some(default_expr) = &col.default {
@@ -16950,10 +17692,8 @@ fn exec_insert_inner(
         let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
-                let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
-                if r > max_rowid {
-                    max_rowid = r;
-                }
+                let r = next_auto_rowid(ctx.pager, current_root, max_rowid.unwrap_or(0))?;
+                max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
             }
@@ -17118,7 +17858,10 @@ pub fn fast_insert_literal_rows(
     rows: Vec<Vec<Value>>,
 ) -> Result<(i64, u32, i64)> {
     let mut current_root = ctx.table_root(table);
-    let mut max_rowid = ctx.get_or_scan_max_rowid(table)?;
+    // Statement-local TRUE max rowid (None = table currently empty): a
+    // first explicit negative row must lower the effective max below 0
+    // (SQLite allocates tree-max+1 per row, per OP_NewRowid).
+    let mut max_rowid = ctx.get_or_scan_max_rowid_opt(table)?;
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let mut index_states = make_index_states(ctx, &indexes, table);
     let table_name_lc = table.name.to_ascii_lowercase();
@@ -17181,14 +17924,17 @@ pub fn fast_insert_literal_rows(
         )?;
 
         // Rowid pre-assignment so a NULL rowid-alias doesn't trip NOT NULL
-        // (mirrors exec_insert).
+        // (mirrors exec_insert). Overlay-aware: a trigger fired by an
+        // earlier row of this statement may have landed rows on the same
+        // table — the statement-local max_rowid does not see them, and a
+        // stale allocation duplicates a live rowid.
         let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
-                let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
-                if r > max_rowid {
-                    max_rowid = r;
-                }
+                let live = ctx.get_or_scan_max_rowid_opt(table)?;
+                let eff = max_rowid.max(live);
+                let r = next_auto_rowid(ctx.pager, current_root, eff.unwrap_or(0))?;
+                max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
             }
@@ -17275,7 +18021,7 @@ pub fn fast_insert_literal_rows(
     // (rows inserted, final live root, final max rowid) — the caller's
     // INSERT-chain setup consumes the live root / max-rowid so the next
     // same-shape statement can skip the derivation entirely.
-    Ok((inserted, current_root, max_rowid))
+    Ok((inserted, current_root, max_rowid.unwrap_or(0)))
 }
 
 pub fn fast_insert_single_row(
@@ -17289,7 +18035,10 @@ pub fn fast_insert_single_row(
 
     let table_name_lc = table.name.to_ascii_lowercase();
     let mut current_root = ctx.table_root(table);
-    let mut max_rowid = ctx.get_or_scan_max_rowid(table)?;
+    // Statement-local TRUE max rowid (None = table currently empty): a
+    // first explicit negative row must lower the effective max below 0
+    // (SQLite allocates tree-max+1 per row, per OP_NewRowid).
+    let mut max_rowid = ctx.get_or_scan_max_rowid_opt(table)?;
 
     let n_cols = table.n_columns();
     let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
@@ -17304,10 +18053,8 @@ pub fn fast_insert_single_row(
     let mut rowid_autogen = false;
     if let Some(idx) = table.rowid_alias {
         if full_row[idx].is_null() {
-            let r = next_auto_rowid(ctx.pager, current_root, max_rowid)?;
-            if r > max_rowid {
-                max_rowid = r;
-            }
+            let r = next_auto_rowid(ctx.pager, current_root, max_rowid.unwrap_or(0))?;
+            max_rowid = Some(r);
             full_row[idx] = Value::Integer(r);
             rowid_autogen = true;
         }
@@ -17403,7 +18150,7 @@ fn exec_insert_one_row(
     table: &Arc<Table>,
     table_name_lc: &str,
     current_root: &mut u32,
-    max_rowid: &mut i64,
+    max_rowid: &mut Option<i64>,
     full_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
     index_states: &mut [IndexMaintState],
@@ -17435,34 +18182,46 @@ fn exec_insert_one_row(
     // explicit ids (the S12 multi-index shape) were paying TWO full
     // descents per row for the table part alone.
     let mut rowid_is_fresh_beyond_max = false;
+    // The statement-local `max_rowid` is Option-valued (None = the table
+    // was EMPTY when the statement started): it tracks the TRUE max so an
+    // explicit negative first row on an empty table lowers the effective
+    // max below 0, matching SQLite's per-row tree-max+1 allocation. It
+    // does NOT see rows a trigger fired from THIS statement landed on the
+    // same table (those update the ctx's max-rowid overlay only). Every
+    // freshness verdict and every auto allocation therefore folds in the
+    // LIVE overlay value — a stale "fresh" verdict skipped the conflict
+    // probe and APPENDED a duplicate rowid into the b-tree
+    // (self-recursive-trigger repro: the trigger's row took max+1, then
+    // the outer statement's next explicit row with the same id corrupted
+    // the tree instead of failing with SQLite's UNIQUE error).
+    let live = ctx.get_or_scan_max_rowid_opt(table)?;
+    let true_max: Option<i64> = (*max_rowid).max(live);
     let rowid = if let Some(r) = explicit_rowid {
         // `INSERT INTO t (rowid, ...)` on a table without an INTEGER
         // PRIMARY KEY alias: the rowid is supplied positionally.
         rowid_was_autogenerated = false;
-        if r > *max_rowid {
-            *max_rowid = r;
+        if true_max.map_or(true, |m| r > m) {
             rowid_is_fresh_beyond_max = true;
         }
+        *max_rowid = Some(true_max.map_or(r, |m| m.max(r)));
         r
     } else if let Some(idx) = table.rowid_alias {
         match &full_row[idx] {
             Value::Integer(i) => {
                 rowid_was_autogenerated = rowid_autogen_hint;
-                // Explicit id beyond the current max: fresh by the same
-                // argument as the positional-rowid case (see the comment
-                // above) — and keep the caller's max_rowid current for
-                // the remaining rows of a multi-row VALUES batch.
-                if *i > *max_rowid {
-                    *max_rowid = *i;
+                // Explicit id beyond the current true max: fresh by the
+                // same argument as the positional-rowid case (see the
+                // comment above) — and keep the caller's max_rowid current
+                // for the remaining rows of a multi-row VALUES batch.
+                if true_max.map_or(true, |m| *i > m) {
                     rowid_is_fresh_beyond_max = true;
                 }
+                *max_rowid = Some(true_max.map_or(*i, |m| m.max(*i)));
                 *i
             }
             Value::Null => {
-                let r = next_auto_rowid(ctx.pager, *current_root, *max_rowid)?;
-                if r > *max_rowid {
-                    *max_rowid = r;
-                }
+                let r = next_auto_rowid(ctx.pager, *current_root, true_max.unwrap_or(0))?;
+                *max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
                 rowid_was_autogenerated = true;
                 r
@@ -17474,10 +18233,8 @@ fn exec_insert_one_row(
             }
         }
     } else {
-        let r = next_auto_rowid(ctx.pager, *current_root, *max_rowid)?;
-        if r > *max_rowid {
-            *max_rowid = r;
-        }
+        let r = next_auto_rowid(ctx.pager, *current_root, true_max.unwrap_or(0))?;
+        *max_rowid = Some(r);
         rowid_was_autogenerated = true;
         r
     };
@@ -17645,9 +18402,22 @@ fn exec_insert_one_row(
                             for old_key in &old_keys {
                                 ibt.delete_index(old_key, existing_rowid)?;
                             }
+                            if st.root != ibt.root {
+                                ctx.set_index_root(&st.idx.name, ibt.root);
+                            }
                             st.root = ibt.root;
                         }
                     }
+                    // Statement journal: the replaced holder's payload, so
+                    // a LATER failure in this statement re-inserts it (the
+                    // matching Inserted entry for the new row deletes the
+                    // replacement first — reverse replay order guarantees
+                    // the pairing).
+                    ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                        table: std::sync::Arc::clone(table),
+                        rowid: existing_rowid,
+                        payload: old_payload,
+                    });
                 }
             }
             _ => {
@@ -17872,6 +18642,9 @@ fn exec_insert_one_row(
                     for old_key in &old_keys {
                         ibt.delete_index(old_key, rowid)?;
                     }
+                    if st.root != ibt.root {
+                        ctx.set_index_root(&st.idx.name, ibt.root);
+                    }
                     st.root = ibt.root;
                 }
             }
@@ -17900,6 +18673,9 @@ fn exec_insert_one_row(
             for key_bytes in &keys {
                 ibt.insert_index(key_bytes, rowid)?;
             }
+            if root != ibt.root {
+                ctx.set_index_root(&st.idx.name, ibt.root);
+            }
             st.root = ibt.root;
             continue;
         }
@@ -17911,11 +18687,26 @@ fn exec_insert_one_row(
         let mut ibt = Btree::new(ctx.pager, root, true);
         let new_hint = ibt.insert_index_append_hinted(key_bytes, rowid, hint)?;
         st.hint = new_hint;
+        if root != ibt.root {
+            // Immediate ctx write-back on split (rare): a LATER row of
+            // this statement may fail, and the statement-journal undo +
+            // the maps must resolve the CURRENT index root, not the
+            // batch-tail one (which failure paths skip).
+            ctx.set_index_root(&st.idx.name, ibt.root);
+        }
         st.root = ibt.root;
     }
     ctx.last_insert_rowid = rowid;
     ctx.changes += 1;
     ctx.set_max_rowid_lc(table_name_lc, rowid);
+    // Statement journal (here rather than in the callers so the GENERIC
+    // loop and the literal fast path both journal): this row has LANDED.
+    // If a later row of the owning statement fails, the api layer's
+    // reverse replay deletes it — SQLite's statement-journal atomicity.
+    ctx.stmt_undo.push(StmtUndoEntry::Inserted {
+        table: std::sync::Arc::clone(table),
+        rowid,
+    });
     Ok((InsertOutcome::Inserted, rowid))
 }
 
@@ -18032,6 +18823,27 @@ fn exec_upsert_row(
                 new_row[idx] = Value::Integer(existing_rowid);
             }
 
+            // BEFORE UPDATE triggers: an upserted row IS an update —
+            // SQLite fires the UPDATE event per DO-UPDATE row with
+            // OLD = stored row, NEW = merged row. `UPDATE OF` matching
+            // uses the upsert's SET columns.
+            if crate::executor::triggers::has_triggers_for(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Update(vec![]),
+            ) {
+                let changed_cols: Vec<String> = set.iter().map(|(c, _)| c.clone()).collect();
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    table,
+                    &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                    crate::sql::ast::TriggerWhen::Before,
+                    Some(&new_row),
+                    Some(&old_row),
+                    &table.col_names,
+                )?;
+            }
+
             // Rewrite the row: in-place when the payload size is unchanged,
             // otherwise delete + insert.
             payload_buf.clear();
@@ -18080,7 +18892,30 @@ fn exec_upsert_row(
                 for new_key in &new_keys {
                     ibt.insert_index(new_key, existing_rowid)?;
                 }
+                if st.root != ibt.root {
+                    ctx.set_index_root(&st.idx.name, ibt.root);
+                }
                 st.root = ibt.root;
+            }
+
+            // AFTER UPDATE triggers (NEW = post-change, OLD = pre-change):
+            // same event contract as a plain UPDATE — the upserted row
+            // counts as an update (SQLite fires one UPDATE event).
+            if crate::executor::triggers::has_triggers_for(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Update(vec![]),
+            ) {
+                let changed_cols: Vec<String> = set.iter().map(|(c, _)| c.clone()).collect();
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    table,
+                    &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                    crate::sql::ast::TriggerWhen::After,
+                    Some(&new_row),
+                    Some(&old_row),
+                    &table.col_names,
+                )?;
             }
 
             // Replace full_row with the merged row for RETURNING.
@@ -18139,7 +18974,7 @@ pub(crate) struct UpdateConflictPlan {
 /// holds). Rows failing the predicate are never indexed (SQLite:
 /// partial indexes only contain matching rows), so they are exempt
 /// from that index's uniqueness enforcement.
-fn index_row_matches_partial(
+pub(crate) fn index_row_matches_partial(
     index: &crate::schema::Index,
     table: &Table,
     row: &[Value],
@@ -18391,6 +19226,11 @@ pub(crate) fn delete_rows_by_rowid_inner(
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let table_name_lc = table.name.to_ascii_lowercase();
     let n_cols = table.n_columns();
+    // Statement-journal Arc for this table (one catalog lookup for the
+    // whole batch; per-row pushes are refcount bumps). None only if the
+    // catalog entry vanished mid-statement (impossible for DML) — journal
+    // stays empty then, which is simply no undo.
+    let journal_arc = ctx.catalog().get_table(&table_name_lc);
     for &rowid in rowids {
         let root = ctx.table_root(table);
         // Preupdate: fire this row's DELETE before the FK actions
@@ -18436,6 +19276,16 @@ pub(crate) fn delete_rows_by_rowid_inner(
                         delete_index_entry(ctx, idx, table, &row, rowid)?;
                     }
                 }
+            }
+            // Statement journal: payload moves in (zero-copy — it was
+            // about to drop). A later failure in the owning statement
+            // re-inserts the row + its index entries.
+            if let Some(t) = journal_arc.as_ref() {
+                ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                    table: std::sync::Arc::clone(t),
+                    rowid,
+                    payload,
+                });
             }
             ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid);
         }
@@ -18509,6 +19359,12 @@ fn apply_rowid_alias_move(
     // move); the caller runs ON UPDATE enforcement after the move.
     // delete_rows_by_rowid_inner always enforces DELETE FKs, so inline
     // the delete here without that call.
+    //
+    // Statement journal: the move is delete(old) + insert(new) — journal
+    // both halves in operation order (Deleted(old) then Inserted(new));
+    // the reverse replay deletes the new row first, then re-inserts the
+    // old one, restoring the pre-move state of a FAILED statement.
+    let journal_arc = ctx.catalog().get_table(&table.name.to_ascii_lowercase());
     {
         let root = ctx.table_root(table);
         let (new_root, old_payload) = {
@@ -18525,6 +19381,13 @@ fn apply_rowid_alias_move(
                     }
                 }
             }
+            if let Some(t) = journal_arc.as_ref() {
+                ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                    table: std::sync::Arc::clone(t),
+                    rowid,
+                    payload,
+                });
+            }
             ctx.invalidate_max_rowid_if_deleted(&table.name.to_ascii_lowercase(), rowid);
         }
     }
@@ -18538,6 +19401,12 @@ fn apply_rowid_alias_move(
     }
     for idx in &indexes {
         insert_index_entry(ctx, idx, table, new_row, target)?;
+    }
+    if let Some(t) = journal_arc.as_ref() {
+        ctx.stmt_undo.push(StmtUndoEntry::Inserted {
+            table: std::sync::Arc::clone(t),
+            rowid: target,
+        });
     }
     Ok(true)
 }
@@ -18735,8 +19604,25 @@ pub(crate) fn bump_sqlite_sequence(
             crate::types::Value::Integer(new_seq),
         ];
         let payload = crate::storage::row_codec::encode_row(&row);
+        // Statement journal (SQLite's AUTOINCREMENT atomicity: a FAILED
+        // statement rolls its sequence bump back — a multi-tuple INSERT
+        // whose later tuple hits a UNIQUE error left the earlier tuples'
+        // bumps behind, so ids burned gaps that real SQLite reuses).
+        // Journal the old row (restore on undo) and the new row (remove
+        // on undo), in operation order — the replay pops in reverse.
+        if let Ok(LookupResult::Found(p)) = bt.lookup_table(rowid) {
+            ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                table: std::sync::Arc::clone(&seq_table),
+                rowid,
+                payload: p,
+            });
+        }
         bt.delete_table(rowid)?;
         bt.insert_table(rowid, &payload)?;
+        ctx.stmt_undo.push(StmtUndoEntry::Inserted {
+            table: std::sync::Arc::clone(&seq_table),
+            rowid,
+        });
     } else {
         let rowid = bt.max_rowid_hint().unwrap_or(0) + 1;
         let row = vec![
@@ -18745,6 +19631,10 @@ pub(crate) fn bump_sqlite_sequence(
         ];
         let payload = crate::storage::row_codec::encode_row(&row);
         bt.insert_table(rowid, &payload)?;
+        ctx.stmt_undo.push(StmtUndoEntry::Inserted {
+            table: std::sync::Arc::clone(&seq_table),
+            rowid,
+        });
     }
     // Root tracking: the sequence table's root can split while growing;
     // record the live root so later statements in this transaction see it.
@@ -18802,6 +19692,12 @@ pub(crate) fn delete_sqlite_sequence_row(ctx: &mut ExecContext, table_name: &str
 pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> {
     // Fast path: there is still room above the current maximum.
     if max_rowid < i64::MAX {
+        if std::env::var_os("DBG_ROWID").is_some() {
+            eprintln!(
+                "DBG next_auto_rowid root={root} max={max_rowid} -> {}",
+                max_rowid + 1
+            );
+        }
         return Ok(max_rowid + 1);
     }
     // Overflow lottery: random positive candidates, checked against the
@@ -18841,13 +19737,20 @@ pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> 
     free.ok_or_else(|| Error::Runtime("table is full: every possible rowid is in use".into()))
 }
 
-fn find_max_rowid(pager: &Pager, root: u32) -> Result<i64> {
+/// The TRUE maximum rowid in the tree, `None` when the tree is empty.
+/// Negative rowids included: a table holding only negative rowids (e.g.
+/// after explicit `INSERT (id) VALUES (-6)`) must allocate max+1 = -5
+/// next — NOT 1. Seeding an accumulator with 0 would clamp every
+/// all-negative table to the empty-table behavior; SQLite reads the
+/// tree's true max for every OP_NewRowid and so must we.
+fn find_max_rowid_opt(pager: &Pager, root: u32) -> Result<Option<i64>> {
     let mut bt = Btree::new(pager, root, false);
-    let mut max = 0i64;
+    let mut max: Option<i64> = None;
     bt.scan_table(|rowid, _| {
-        if rowid > max {
-            max = rowid;
-        }
+        max = Some(match max {
+            Some(m) if m >= rowid => m,
+            _ => rowid,
+        });
         true
     })?;
     Ok(max)
@@ -19785,15 +20688,22 @@ fn try_streaming_update(
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
-            let s = match start {
-                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-                None => i64::MIN,
+            // Cross-type bound semantics (see exec_rowid_range). An
+            // EMPTY resolution falls back to the full-range walk: the
+            // per-row residual (kept by the planner for strict bounds)
+            // then filters everything out — correct, just not free.
+            let sv = match start {
+                Some(e) => Some(evaluate(e, &eval_ctx)?),
+                None => None,
             };
-            let e = match end {
-                Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-                None => i64::MAX,
+            let ev = match end {
+                Some(e) => Some(evaluate(e, &eval_ctx)?),
+                None => None,
             };
-            (s, e)
+            match rowid_range_bounds(sv.as_ref(), ev.as_ref()) {
+                Some((s, e)) => (s, e),
+                None => (i64::MAX, i64::MIN), // inverted: the walk sees zero rows
+            }
         }
         _ => (i64::MIN, i64::MAX),
     };
@@ -19812,16 +20722,30 @@ fn try_streaming_update(
     let compiled_residual: Option<crate::executor::predicate::CompiledPredicate> = residual_pred
         .and_then(|p| crate::executor::predicate::compile_predicate(p, table, &table.name));
 
-    // For RowidLookup, evaluate the rowid expression now.
+    // For RowidLookup, evaluate the rowid expression now (STRICT seek
+    // semantics — non-integer keys match zero rows, never a lenient 0).
     let lookup_rowid: Option<i64> = match &src {
         StreamingSource::RowidLookup { rowid, .. } => {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
-            Some(evaluate(rowid, &eval_ctx)?.as_integer())
+            rowid_seek_value(&evaluate(rowid, &eval_ctx)?)
         }
         _ => None,
     };
+    // Strict-seek zero-match: a RowidLookup source whose key did not
+    // convert to an integer (TEXT 'zeta', BLOB, NaN, non-integral REAL)
+    // matches ZERO rows under SQLite's semantics (`id = 'zeta'` —
+    // INTEGER affinity leaves the literal TEXT, and INTEGER = TEXT is
+    // constant-false). Falling through to the general full-scan below
+    // would wrongly apply the UPDATE to EVERY row, because the
+    // RowidLookup plan carries no residual predicate for the equality.
+    if matches!(src, StreamingSource::RowidLookup { .. }) && lookup_rowid.is_none() {
+        return Ok(Some(ExecResult {
+            columns: returning_column_names(returning.unwrap_or(&[]), &table.col_names).into(),
+            rows: Vec::new(),
+        }));
+    }
 
     // Reusable buffers — allocated once, reused per row.
     let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
@@ -21390,7 +22314,14 @@ fn process_update_row(
             cp.eval(row_buf, positions, params)
         } else {
             {
-                let v = eval_row(pred, row_buf, col_names, params, named_params)?;
+                let v = eval_row_aff(
+                    pred,
+                    row_buf,
+                    col_names,
+                    table.col_affinities.as_ref(),
+                    params,
+                    named_params,
+                )?;
                 v.is_truthy()
             }
         };
@@ -21837,7 +22768,14 @@ fn try_streaming_delete(
                             continue;
                         }
                         if let Some(pred) = residual_pred {
-                            match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                            match eval_row_aff(
+                                pred,
+                                &row_buf,
+                                &col_names,
+                                table.col_affinities.as_ref(),
+                                &params,
+                                &named_params,
+                            ) {
                                 Ok(v) if v.is_truthy() => {}
                                 Ok(_) => continue,
                                 Err(e) => {
@@ -21889,7 +22827,14 @@ fn try_streaming_delete(
                             continue;
                         }
                         if let Some(pred) = residual_pred {
-                            match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                            match eval_row_aff(
+                                pred,
+                                &row_buf,
+                                &col_names,
+                                table.col_affinities.as_ref(),
+                                &params,
+                                &named_params,
+                            ) {
                                 Ok(v) if v.is_truthy() => {}
                                 Ok(_) => continue,
                                 Err(e) => {
@@ -21916,13 +22861,19 @@ fn try_streaming_delete(
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
-        let lo = match start_expr {
-            Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-            None => i64::MIN,
+        // Cross-type bound semantics (see exec_rowid_range). An EMPTY
+        // resolution (Never bound / inverted) walks nothing.
+        let sv = match start_expr {
+            Some(e) => Some(evaluate(e, &eval_ctx)?),
+            None => None,
         };
-        let hi = match end_expr {
-            Some(e) => evaluate(e, &eval_ctx)?.as_integer(),
-            None => i64::MAX,
+        let ev = match end_expr {
+            Some(e) => Some(evaluate(e, &eval_ctx)?),
+            None => None,
+        };
+        let (lo, hi) = match rowid_range_bounds(sv.as_ref(), ev.as_ref()) {
+            Some((lo, hi)) => (lo, hi),
+            None => (i64::MAX, i64::MIN), // inverted: the walk sees zero rows
         };
         // Strict-bound fast check: `id > v` excludes exactly rowid == v
         // (the scan is inclusive; the residual only trims the boundary).
@@ -21940,7 +22891,16 @@ fn try_streaming_delete(
                             || bare.eq_ignore_ascii_case("rowid")
                     })
                 };
-                let bound_of = |e: &Expr| evaluate(e, &eval_ctx).ok().map(|v| v.as_integer());
+                let bound_of = |e: &Expr| {
+                    evaluate(e, &eval_ctx)
+                        .ok()
+                        // Only INTEGRAL bounds make the skip-rowid check
+                        // sound: a fractional `pk > 2.5` excludes no
+                        // boundary rowid (the ceil already moved the range
+                        // past 2), and non-numeric operands must fall to
+                        // the real residual evaluation.
+                        .and_then(|v| rowid_strict_boundary(&v))
+                };
                 if is_id(left) {
                     bound_of(right)
                 } else if is_id(right) {
@@ -21967,7 +22927,14 @@ fn try_streaming_delete(
                     {
                         return true; // skip undecodable rows, keep walking
                     }
-                    match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                    match eval_row_aff(
+                        pred,
+                        &row_buf,
+                        &col_names,
+                        table.col_affinities.as_ref(),
+                        &params,
+                        &named_params,
+                    ) {
                         Ok(v) if v.is_truthy() => {}
                         Ok(_) => return true,
                         Err(e) => {
@@ -21992,7 +22959,14 @@ fn try_streaming_delete(
                     {
                         return true;
                     }
-                    match eval_row(pred, &row_buf, &col_names, &params, &named_params) {
+                    match eval_row_aff(
+                        pred,
+                        &row_buf,
+                        &col_names,
+                        table.col_affinities.as_ref(),
+                        &params,
+                        &named_params,
+                    ) {
                         Ok(v) if v.is_truthy() => {}
                         Ok(_) => return true,
                         Err(e) => {
@@ -22136,6 +23110,14 @@ fn try_streaming_delete(
                 )?;
             }
         }
+        // Statement journal: the deleted payload moves in (zero-copy —
+        // it was about to drop). A later failure in this statement
+        // re-inserts the row + its index entries (reverse order).
+        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+            table: std::sync::Arc::clone(table),
+            rowid: rid,
+            payload,
+        });
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
@@ -22206,7 +23188,14 @@ fn exec_delete(
             let empty_cols: Vec<String> = Vec::new();
             let eval_ctx =
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-            let rowid_val = evaluate(rowid, &eval_ctx)?.as_integer();
+            // STRICT seek: non-integer keys delete nothing (zero matched
+            // rows — still a well-formed statement).
+            let Some(rowid_val) = rowid_seek_value(&evaluate(rowid, &eval_ctx)?) else {
+                return Ok(ExecResult {
+                    columns: Arc::from(vec!["deleted".to_string()]),
+                    rows: vec![vec![Value::Integer(0)]],
+                });
+            };
             let root = ctx.table_root(&table);
             // Preupdate: fire BEFORE the FK actions (SQLite's order: the
             // parent's DELETE event first, then cascaded children at
@@ -22386,15 +23375,25 @@ fn exec_delete(
         enforce_parent_delete_fks(ctx, &table, row, rowid, 0)?;
         let root = ctx.table_root(&table);
         let new_root;
+        let deleted_payload;
         {
             let mut bt = Btree::new(ctx.pager, root, false);
-            bt.delete_table(rowid)?;
+            deleted_payload = bt.delete_table_get_payload(rowid)?;
             new_root = bt.root;
         }
         ctx.set_table_root_lc(&table_name_lc, new_root);
         // Maintain indexes: delete the entry for this row.
         for idx in &indexes {
             delete_index_entry(ctx, idx, &table, row, rowid)?;
+        }
+        // Statement journal: the deleted payload moves in (zero-copy) so a
+        // later failure in this statement re-inserts the row + indexes.
+        if let Some(payload) = deleted_payload {
+            ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                table: std::sync::Arc::clone(&table),
+                rowid,
+                payload,
+            });
         }
         ctx.changes += 1;
         deleted += 1;

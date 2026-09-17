@@ -35,6 +35,16 @@ pub(crate) enum PredValue {
     Param(usize),
     /// A literal constant.
     Literal(Value),
+    /// A runtime operand with a comparison affinity applied before the
+    /// comparison (SQLite's exprAffinity: a column operand lends its
+    /// affinity to a parameter operand — `WHERE text_col > ?` renders the
+    /// bound number as text; `WHERE num_col > ?` converts numeric-looking
+    /// text). Static literals fold at compile time; parameters coerce per
+    /// evaluation through this wrapper.
+    Coerce {
+        inner: Box<PredValue>,
+        affinity: crate::types::Affinity,
+    },
     /// A compiled ARITHMETIC operand (`a % 10`, `b + 1` — any BinaryOp
     /// chain over columns/literals/params). Needed so predicates like
     /// `WHERE a % 10 = 0` compile: the leaf-only compiler bails on them
@@ -160,6 +170,10 @@ impl PredValue {
             PredValue::Param(i) => Cow::Borrowed(params.get(*i).unwrap_or(null_ref())),
             PredValue::Literal(v) => Cow::Borrowed(v),
             PredValue::Expr(pe) => Cow::Owned(pe.eval(row, positions, params)),
+            PredValue::Coerce { inner, affinity } => {
+                let v = inner.eval(row, positions, params);
+                Cow::Owned(crate::executor::expr::apply_operand_affinity(*affinity, &v))
+            }
         }
     }
 }
@@ -360,6 +374,7 @@ fn operand_columns(pv: &PredValue, out: &mut Vec<usize>) {
     match pv {
         PredValue::Col(i) => out.push(*i),
         PredValue::Expr(pe) => pe.collect_columns(out),
+        PredValue::Coerce { inner, .. } => operand_columns(inner, out),
         _ => {}
     }
 }
@@ -621,6 +636,66 @@ fn needle_text(b: &[u8]) -> crate::types::text::Text {
 /// predicates to the general AST-walk path — and, worse, to bail out of
 /// the fused scan+filter entirely (full row materialization before the
 /// filter). Falls back to None only for genuinely unsupported shapes.
+/// The affinity a bound comparison operand carries (a table column), or
+/// None (literals / params / expressions — SQLite's "no affinity").
+fn operand_affinity(
+    pv: &PredValue,
+    table: &crate::schema::Table,
+) -> Option<crate::types::Affinity> {
+    match pv {
+        PredValue::Col(i) => table.columns.get(*i).map(|c| c.affinity),
+        _ => None,
+    }
+}
+
+/// Apply a comparison affinity to one bound operand: static literals fold
+/// in place; runtime operands (parameters / expressions) gain a `Coerce`
+/// wrapper; the column side itself is untouched.
+fn coerce_operand(pv: PredValue, aff: crate::types::Affinity) -> PredValue {
+    match pv {
+        PredValue::Literal(v) => {
+            PredValue::Literal(crate::executor::expr::apply_operand_affinity(aff, &v))
+        }
+        PredValue::Coerce { .. } => pv,
+        PredValue::Col(_) => pv,
+        other => PredValue::Coerce {
+            inner: Box::new(other),
+            affinity: aff,
+        },
+    }
+}
+
+/// SQLite's comparison-affinity contract for a bound operator pair: when
+/// exactly one side is a column, its affinity applies to the other side.
+/// When BOTH sides are columns, a NUMERIC-family affinity on one side
+/// applies NUMERIC to a TEXT/BLOB-affinity other side (datatype3 §4.2 —
+/// `int_col = text_col` compares numerically).
+fn fold_cmp_operands(
+    lhs: PredValue,
+    rhs: PredValue,
+    table: &crate::schema::Table,
+) -> (PredValue, PredValue) {
+    let la = operand_affinity(&lhs, table);
+    let ra = operand_affinity(&rhs, table);
+    match (la, ra) {
+        (Some(a), None) => (lhs, coerce_operand(rhs, a)),
+        (None, Some(a)) => (coerce_operand(lhs, a), rhs),
+        (Some(a), Some(b)) => {
+            use crate::types::Affinity::*;
+            let numeric = |x: crate::types::Affinity| matches!(x, Integer | Real | Numeric);
+            let texty = |x: crate::types::Affinity| matches!(x, Text | Blob | None);
+            if numeric(a) && texty(b) {
+                (lhs, coerce_operand(rhs, Numeric))
+            } else if numeric(b) && texty(a) {
+                (coerce_operand(lhs, Numeric), rhs)
+            } else {
+                (lhs, rhs)
+            }
+        }
+        _ => (lhs, rhs),
+    }
+}
+
 fn bind_operand(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<PredValue> {
     if let Some(leaf) = bind_leaf(e, table, prefix) {
         return Some(leaf);
@@ -927,6 +1002,10 @@ pub(crate) fn compile_predicate(
             op if is_cmp_op(*op) => {
                 let lhs = bind_operand(left, table, prefix)?;
                 let rhs = bind_operand(right, table, prefix)?;
+                // Comparison affinity (SQLite's exprAffinity): the column
+                // operand's affinity applies to a plain operand — static
+                // literals fold here, parameters gain a Coerce wrapper.
+                let (lhs, rhs) = fold_cmp_operands(lhs, rhs, table);
                 // TEXT `=` fast path: `col = 'literal'` (either side)
                 // with a TEXT literal compiles to byte equality — no
                 // per-row Value construction, NaN probes, or collation
@@ -1016,6 +1095,13 @@ pub(crate) fn compile_predicate(
                     if let Some(col) = table.find_column(name) {
                         let lo = bind_leaf(low, table, prefix)?;
                         let hi = bind_leaf(high, table, prefix)?;
+                        // Both bounds take the column's affinity
+                        // (SQLite: BETWEEN desugars to two comparisons).
+                        let aff = table.columns.get(col).map(|c| c.affinity);
+                        let (lo, hi) = match aff {
+                            Some(a) => (coerce_operand(lo, a), coerce_operand(hi, a)),
+                            None => (lo, hi),
+                        };
                         return Some(CompiledPredicate::Between {
                             col,
                             lo,
@@ -1063,6 +1149,13 @@ pub(crate) fn compile_predicate(
             let mut bound = Vec::with_capacity(vals.len());
             for v in vals.iter() {
                 bound.push(bind_leaf(v, table, prefix)?);
+            }
+            // Every member takes the column's affinity (SQLite: the left
+            // operand's affinity applies to literal list members).
+            if let Some(a) = table.columns.get(col).map(|c| c.affinity) {
+                for b in bound.iter_mut() {
+                    *b = coerce_operand(b.clone(), a);
+                }
             }
             // All-integer-literal members: prebuilt membership set (the
             // big-IN fast path — see the variant docs). Everything else

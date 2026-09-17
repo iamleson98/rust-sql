@@ -398,6 +398,7 @@ pub(crate) fn vtab_columns_to_schema(
         check_exprs: Vec::new(),
         foreign_keys: Vec::new(),
         col_names: std::sync::Arc::from(Vec::new()),
+        col_affinities: std::sync::Arc::from(Vec::new()),
         qualified_col_names: std::sync::Arc::from(Vec::new()),
         vtab: None,
     };

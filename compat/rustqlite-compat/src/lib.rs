@@ -4267,8 +4267,28 @@ pub unsafe extern "C" fn sqlite3_deserialize(
 /// in-memory store directly; SQLite-format images stage through a
 /// unique temp file (the interop bridge sniffs them on open).
 fn load_image_as_database(bytes: &[u8]) -> Result<rustqlite::Database, ()> {
-    if bytes.len() >= 8 && &bytes[..8] == b"RSQLDB04" {
+    // Native image of the CURRENT format: seed the in-memory store
+    // directly (no temp file, no fs).
+    if bytes.len() >= 8 && &bytes[..8] == &rustqlite::storage::page::DB_MAGIC {
         rustqlite::Database::open_in_memory_with_image(bytes.to_vec()).map_err(|_| ())
+    } else if bytes.len() >= 8 && is_native_image(bytes) {
+        // LEGACY native image (RSQLDB03/04 order keys): stage through a
+        // temp file so `Database::open` runs the full logical-rebuild
+        // upgrade — seeding the memory store directly would serve
+        // legacy-encoded index trees with no migration.
+        let path = std::env::temp_dir().join(format!(
+            "rustqlite-deserialize-{}-{}.db",
+            std::process::id(),
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                N.fetch_add(1, Ordering::Relaxed)
+            }
+        ));
+        std::fs::write(&path, bytes).map_err(|_| ())?;
+        // The staging file's lifetime is the engine's (the OS temp
+        // cleaner reclaims any stragglers after process exit).
+        rustqlite::Database::open(&path).map_err(|_| ())
     } else if bytes.len() >= 16 && &bytes[..16] == b"SQLite format 3\0" {
         let path = std::env::temp_dir().join(format!(
             "rustqlite-deserialize-{}-{}.db",
@@ -4286,6 +4306,12 @@ fn load_image_as_database(bytes: &[u8]) -> Result<rustqlite::Database, ()> {
     } else {
         Err(())
     }
+}
+
+/// True when the buffer starts with any `RSQLDB` magic (any format
+/// version — the staging path decides upgrade vs. reject).
+fn is_native_image(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[..6] == b"RSQLDB"
 }
 
 // ---------------------------------------------------------------------------

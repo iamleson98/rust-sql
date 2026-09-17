@@ -1610,7 +1610,7 @@ impl Driver for GroupByDriver {
                     row.push(crate::executor::finalize_agg(
                         &states[i],
                         &self.aggregates[i].func,
-                    ));
+                    )?);
                 }
             }
             out.push(row);

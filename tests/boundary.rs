@@ -265,9 +265,17 @@ fn real_extremes_round_trip() {
                     got.to_bits() == v.to_bits() || got == v
                 };
                 assert!(same, "REAL {} round-tripped as {}", v, got);
-                // -0.0 must preserve its sign bit.
+                // REAL-affinity storage normalizes -0.0 to +0.0 (SQLite's
+                // record layer treats integral REALs as integers on disk,
+                // dropping the zero's sign: INSERT -0.0 reads back 0.0 —
+                // pinned against real SQLite; BLOB/none-affinity columns
+                // are the ones that must preserve the sign bit).
                 if *v == 0.0 && v.is_sign_negative() {
-                    assert!(got.is_sign_negative(), "-0.0 lost its sign, became {}", got);
+                    assert_eq!(
+                        got.to_bits(),
+                        0.0f64.to_bits(),
+                        "-0.0 must read back as +0.0 (SQLite REAL-column semantics)"
+                    );
                 }
             }
             other => panic!("REAL {} came back as {:?}", v, other),

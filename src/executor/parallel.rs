@@ -359,7 +359,7 @@ pub(crate) fn try_parallel_fused_aggregate(
             fused_merge_acc(dst, src, spec.op);
         }
     }
-    Ok(Some(fused_finalize(aggregates, &accs)))
+    Ok(Some(fused_finalize(aggregates, &accs)?))
 }
 
 /// Parallel no-GROUP-BY DISTINCT aggregates (`SELECT COUNT(DISTINCT x),
@@ -803,6 +803,48 @@ pub(crate) fn try_parallel_groupby_selective(
 
 /// Fold a partial range's `AggState` into the destination. OP-AWARE:
 /// `AggState` overloads its fields per function (SUM/Total use
+/// Merge src's numeric-sum accumulator into dst's (parallel partials):
+/// int+int exact via checked add — an overflow folds to double with the
+/// overflowing value and sets the sticky int_overflow flag (SUM raises at
+/// finalize for all-integer input); merging with a double-side that saw
+/// REAL input clears the flag (SQLite's approx mode).
+fn merge_sums(dst: &mut super::AggState, src: &super::AggState) {
+    if dst.sum_is_int && src.sum_is_int {
+        match dst.int_sum.checked_add(src.int_sum) {
+            Some(n) => dst.int_sum = n,
+            None => {
+                dst.int_overflow = true;
+                let b = src.int_sum as f64;
+                dst.sum = dst.int_sum as f64;
+                dst.sum_is_int = false;
+                dst.comp = 0.0;
+                super::kbn_step(&mut dst.sum, &mut dst.comp, b);
+            }
+        }
+    } else {
+        let src_saw_real = !src.sum_is_int && !src.int_overflow;
+        let b = if src.sum_is_int {
+            src.int_sum as f64
+        } else {
+            src.sum
+        };
+        if dst.sum_is_int {
+            dst.sum = dst.int_sum as f64;
+            dst.sum_is_int = false;
+            dst.comp = 0.0;
+        }
+        super::kbn_step(&mut dst.sum, &mut dst.comp, b);
+        dst.comp += src.comp;
+        // Propagate the sticky overflow unless a REAL input was seen on
+        // the src side (SQLite's approx-mode laundering).
+        if src_saw_real {
+            dst.int_overflow = false;
+        } else if src.int_overflow {
+            dst.int_overflow = true;
+        }
+    }
+}
+
 /// (int_sum, sum, sum_is_int); AVG uses (count, sum) with `sum` always
 /// f64 and the int fields inert; COUNT uses only `count`). Non-DISTINCT
 /// states merge field-wise (integer sums exactly; REAL sums in range
@@ -841,22 +883,7 @@ pub(crate) fn merge_agg_state(
             // exactly and flips to the compensated merge on any float
             // side.
             dst.count = dst.count.saturating_add(src.count);
-            if dst.sum_is_int && src.sum_is_int {
-                dst.int_sum = dst.int_sum.saturating_add(src.int_sum);
-            } else {
-                let b = if src.sum_is_int {
-                    src.int_sum as f64
-                } else {
-                    src.sum
-                };
-                if dst.sum_is_int {
-                    dst.sum = dst.int_sum as f64;
-                    dst.sum_is_int = false;
-                    dst.comp = 0.0;
-                }
-                super::kbn_step(&mut dst.sum, &mut dst.comp, b);
-                dst.comp += src.comp;
-            }
+            merge_sums(dst, src);
         }
         AggFunc::Count => {
             dst.count = dst.count.saturating_add(src.count);
@@ -935,22 +962,7 @@ pub(crate) fn merge_agg_state(
             // SUM/Total: int+int exact; any float side flips to the
             // KBN-compensated merge (step dst's running sum with src's,
             // absorb both error terms).
-            if dst.sum_is_int && src.sum_is_int {
-                dst.int_sum = dst.int_sum.saturating_add(src.int_sum);
-            } else {
-                let b = if src.sum_is_int {
-                    src.int_sum as f64
-                } else {
-                    src.sum
-                };
-                if dst.sum_is_int {
-                    dst.sum = dst.int_sum as f64;
-                    dst.sum_is_int = false;
-                    dst.comp = 0.0;
-                }
-                super::kbn_step(&mut dst.sum, &mut dst.comp, b);
-                dst.comp += src.comp;
-            }
+            merge_sums(dst, src);
             // MIN/MAX under SQL value ordering (update_agg_state's
             // comparator).
             if let Some(m) = src.cold().and_then(|c| c.min.as_ref()) {

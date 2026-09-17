@@ -710,7 +710,7 @@ pub fn row_column_regions_into(
     pos == payload.len()
 }
 
-fn affinity_apply_opt(aff: Affinity, v: Value) -> Option<Value> {
+pub(crate) fn affinity_apply_opt(aff: Affinity, v: Value) -> Option<Value> {
     match (aff, v) {
         (Affinity::None, v) => Some(v),
         (aff, v) => Some(aff.coerce(v)),

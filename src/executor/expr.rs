@@ -301,6 +301,16 @@ pub struct EvalContext<'a> {
     /// Named parameters (:name, @col, $var). Allocated lazily — empty for
     /// the 99% case of purely positional `?` placeholders.
     pub named_params: &'a HashMap<String, Value>,
+    /// Column affinities parallel to `column_names`, when the row is a
+    /// single table's row (scan filters, residuals, projections). None
+    /// for combined/join rows and legacy contexts — comparisons then keep
+    /// the engine's raw total order (no affinity coercion). This drives
+    /// SQLite's comparison-affinity rules: a column operand lends its
+    /// affinity to a literal/parameter operand before comparing
+    /// (`text_col > 0` compares TEXT-to-TEXT; `num_col > '5'` converts
+    /// '5' to 5; `num_col > 'abc'` stays a cross-type comparison because
+    /// NUMERIC affinity only converts numeric-LOOKING text).
+    pub column_affinities: Option<&'a [crate::types::Affinity]>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -316,7 +326,74 @@ impl<'a> EvalContext<'a> {
             column_names,
             params,
             named_params,
+            column_affinities: None,
         }
+    }
+
+    /// Attach the column-affinity map (single-table row contexts).
+    pub fn with_affinities(mut self, affinities: Option<&'a [crate::types::Affinity]>) -> Self {
+        self.column_affinities = affinities;
+        self
+    }
+
+    /// The affinity a column-reference expression resolves to in this
+    /// context: `Some(aff)` for a real column (or the rowid pseudo-column
+    /// — INTEGER), `None` when the context has no affinity map or the
+    /// name resolves outside this row (conservative: the comparison then
+    /// keeps raw semantics). Mirrors `lookup`'s local resolution order.
+    pub fn column_expr_affinity(&self, e: &Expr) -> Option<crate::types::Affinity> {
+        let Expr::Column { table, name } = e else {
+            return None;
+        };
+        if table.is_some() {
+            // Qualified refs in single-table contexts match the
+            // "t.c"-qualified column list; the hidden rowid slot carries
+            // INTEGER affinity.
+            let t = table.as_deref().unwrap();
+            let qual = format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
+            for (i, n) in self.column_names.iter().enumerate() {
+                if n.to_ascii_lowercase() == qual {
+                    return self.affinity_at(i);
+                }
+            }
+            if crate::planner::is_rowid_spelling(name) {
+                for n in self.column_names.iter() {
+                    if crate::planner::is_hidden_rowid(n)
+                        && n[..n.rfind('.')?].eq_ignore_ascii_case(t)
+                    {
+                        return Some(crate::types::Affinity::Integer);
+                    }
+                }
+            }
+            return None;
+        }
+        // Bare name: exact, then qualified-suffix ("t.c" for "c"), then
+        // the rowid spellings (real column first — `position` order).
+        for (i, n) in self.column_names.iter().enumerate() {
+            if n.eq_ignore_ascii_case(name) {
+                return self.affinity_at(i);
+            }
+        }
+        for (i, n) in self.column_names.iter().enumerate() {
+            if let Some(pos) = n.rfind('.') {
+                if n[pos + 1..].eq_ignore_ascii_case(name) {
+                    return self.affinity_at(i);
+                }
+            }
+        }
+        if crate::planner::is_rowid_spelling(name)
+            && self
+                .column_names
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("rowid") || crate::planner::is_hidden_rowid(c))
+        {
+            return Some(crate::types::Affinity::Integer);
+        }
+        None
+    }
+
+    fn affinity_at(&self, i: usize) -> Option<crate::types::Affinity> {
+        self.column_affinities?.get(i).copied()
     }
 
     pub fn add_table(&mut self, alias: &str, row: &'a [Value]) {
@@ -411,6 +488,87 @@ impl<'a> EvalContext<'a> {
     }
 }
 
+/// An operand with NO affinity of its own: a literal, a bound parameter,
+/// or a COLLATE wrapper around one (SQLite: anything that is not a
+/// column reference or a CAST). Comparisons against an affinity-carrying
+/// column coerce these BEFORE comparing.
+fn plain_operand(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Collate { expr, .. } => plain_operand(expr),
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Neg,
+            expr,
+        } => plain_operand(expr),
+        _ => false,
+    }
+}
+
+/// Apply a comparison affinity to an operand's VALUE (SQLite's
+/// sqlite3VdbeMemApplyAffinity for comparisons): TEXT affinity renders
+/// numbers as text; the numeric affinities convert numeric-LOOKING text
+/// only (numbers pass through, other text keeps its storage class so the
+/// comparison stays cross-type — SQLite's documented behavior); BLOB and
+/// no-affinity never convert.
+pub(crate) fn apply_operand_affinity(a: crate::types::Affinity, v: &Value) -> Value {
+    use crate::types::Affinity::*;
+    match a {
+        Text => match v {
+            Value::Integer(_) | Value::Real(_) => Value::Text(v.as_text().into()),
+            _ => v.clone(),
+        },
+        // Comparison affinity (datatype3 §4.2): an INTEGER, REAL or
+        // NUMERIC column lends NUMERIC affinity to the other operand —
+        // NOT its own storage affinity. The storage INTEGER coerce
+        // truncates REALs (`Real(5e-324)` -> `Integer(0)`), which flipped
+        // `a <> 5e-324` on a=0 from TRUE to FALSE (stateful-fuzz
+        // divergence). NUMERIC keeps non-integral REALs as REALs and
+        // only converts numeric-looking TEXT.
+        Integer | Real | Numeric => {
+            crate::storage::row_codec::affinity_apply_opt(Numeric, v.clone())
+                .unwrap_or_else(|| v.clone())
+        }
+        _ => v.clone(),
+    }
+}
+
+/// SQLite's comparison-affinity contract for one operator application
+/// (datatype3 §4.2): when exactly one side is an affinity-carrying column
+/// reference and the other is a plain operand (literal / parameter), the
+/// column's affinity is applied to the plain operand's value. When BOTH
+/// sides are columns, a NUMERIC-family affinity (INTEGER/REAL/NUMERIC)
+/// on one side applies NUMERIC affinity to a TEXT/BLOB-affinity other
+/// side (`a.e = b.note` with e INTEGER and note TEXT compares numerically
+/// — SQLite matches 5 against '5'). Returns the (possibly coerced)
+/// operand pair.
+fn coerce_comparison_operands(
+    ctx: &EvalContext<'_>,
+    le: &Expr,
+    l: Value,
+    re: &Expr,
+    r: Value,
+) -> (Value, Value) {
+    let la = ctx.column_expr_affinity(le);
+    let ra = ctx.column_expr_affinity(re);
+    match (la, ra) {
+        (Some(a), None) if plain_operand(re) => (l, apply_operand_affinity(a, &r)),
+        (None, Some(a)) if plain_operand(le) => (apply_operand_affinity(a, &l), r),
+        (Some(a), Some(b)) => {
+            use crate::types::Affinity::*;
+            let numeric = |x: crate::types::Affinity| matches!(x, Integer | Real | Numeric);
+            let texty = |x: crate::types::Affinity| matches!(x, Text | Blob | None);
+            if numeric(a) && texty(b) {
+                (l, apply_operand_affinity(Numeric, &r))
+            } else if numeric(b) && texty(a) {
+                (apply_operand_affinity(Numeric, &l), r)
+            } else {
+                (l, r)
+            }
+        }
+        _ => (l, r),
+    }
+}
+
 /// Evaluate an expression in the given context.
 pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
     match expr {
@@ -430,6 +588,23 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         Expr::Binary { op, left, right } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
+            // Comparison-affinity coercion (SQLite's exprAffinity rules):
+            // applied BEFORE the collation dispatch — `text_col > 0` must
+            // compare TEXT-to-TEXT even under a COLLATE, and
+            // `num_col COLLATE X > '5'` must still convert '5' first.
+            let (l, r) = if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) {
+                coerce_comparison_operands(ctx, left, l, right, r)
+            } else {
+                (l, r)
+            };
             // JSON path operators: `x -> path` (JSON text) / `x ->> path`
             // (SQL value). They bind tighter than every other binary
             // operator and can RAISE (malformed JSON / bad path).
@@ -481,6 +656,18 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             let v = evaluate(expr, ctx)?;
             let lo = evaluate(low, ctx)?;
             let hi = evaluate(high, ctx)?;
+            // Comparison affinity (SQLite: BETWEEN desugars to two
+            // comparisons, each applying the column's affinity to the
+            // plain operand).
+            let (lo, hi) = match ctx.column_expr_affinity(expr) {
+                Some(a) if plain_operand(low) && plain_operand(high) => (
+                    apply_operand_affinity(a, &lo),
+                    apply_operand_affinity(a, &hi),
+                ),
+                Some(a) if plain_operand(low) => (apply_operand_affinity(a, &lo), hi),
+                Some(a) if plain_operand(high) => (lo, apply_operand_affinity(a, &hi)),
+                _ => (lo, hi),
+            };
             // SQL three-valued logic: BETWEEN is sugar for `expr >= low AND
             // expr <= high`. If any operand is NULL, the AND result is NULL
             // (UNKNOWN), which WHERE filters out. So a NULL val yields NULL
@@ -666,12 +853,23 @@ fn evaluate_in(
         return Ok(Value::Null);
     }
     let coll_ref = coll.as_deref();
+    // Comparison affinity (SQLite: the left operand's affinity applies to
+    // every literal list member — `note IN ('x', -17.857)` compares
+    // text-wise against '-17.857').
+    let lhs_aff = ctx.column_expr_affinity(expr).filter(|_| {
+        // Only when the left operand is the affinity carrier and the list
+        // is literal-shaped (subquery members carry their own values).
+        matches!(source, InSource::List(_))
+    });
     let (found, list_has_null) = match source {
         InSource::List(list) => {
             let mut found = false;
             let mut list_has_null = false;
             for e in list.iter() {
-                let candidate = evaluate(e, ctx)?;
+                let candidate = match (lhs_aff, plain_operand(e)) {
+                    (Some(a), true) => apply_operand_affinity(a, &evaluate(e, ctx)?),
+                    _ => evaluate(e, ctx)?,
+                };
                 if candidate.is_null() {
                     list_has_null = true;
                     continue;

@@ -1498,9 +1498,14 @@ fn native_vacuum_into_exports_real_sqlite_file() {
         db.execute(format!("VACUUM INTO '{}'", dst.display()).as_str(), ())
             .unwrap();
 
-        // Source untouched: native magic, still queryable.
+        // Source untouched: native magic (current format version), still
+        // queryable.
         let head = std::fs::read(&src).unwrap();
-        assert_eq!(&head[0..8], b"RSQLDB04", "source stays native format");
+        assert_eq!(
+            &head[0..8],
+            &rustqlite::storage::page::DB_MAGIC,
+            "source stays native format"
+        );
         let n = rows_of(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(n[0][0], Value::Integer(49));
     }

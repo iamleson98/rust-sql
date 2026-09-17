@@ -148,6 +148,11 @@ pub struct Table {
     /// Cached `"table.column"`-qualified names, matching what `exec_scan`
     /// reports for an un-aliased scan. Built once in `build_table`.
     pub qualified_col_names: std::sync::Arc<[String]>,
+    /// Cached column affinities, parallel to `col_names` — the comparison
+    /// affinity rules (a column operand lends its affinity to a
+    /// literal/param operand: `text_col > 0` compares TEXT-to-TEXT, and
+    /// `num_col > '5'` converts '5' to 5) resolve through this.
+    pub col_affinities: std::sync::Arc<[crate::types::Affinity]>,
     /// Virtual-table instance when this is a `CREATE VIRTUAL TABLE` entry
     /// (root_page is 0 — there is no B+tree; all access goes through the
     /// module callbacks).
@@ -155,8 +160,8 @@ pub struct Table {
 }
 
 impl Table {
-    /// Rebuild the `col_names` / `qualified_col_names` caches after a
-    /// structural change (used by the vtab schema bridge).
+    /// Rebuild the `col_names` / `qualified_col_names` / `col_affinities`
+    /// caches after a structural change (used by the vtab schema bridge).
     pub fn rebuild_name_caches(&mut self) {
         self.col_names = self
             .columns
@@ -169,6 +174,12 @@ impl Table {
             .iter()
             .map(|c| format!("{}.{}", self.name, c.name))
             .collect::<Vec<String>>()
+            .into();
+        self.col_affinities = self
+            .columns
+            .iter()
+            .map(|c| c.affinity)
+            .collect::<Vec<crate::types::Affinity>>()
             .into();
     }
 
@@ -1190,6 +1201,8 @@ pub fn build_table(
     }
 
     let plain: Vec<String> = table_columns.iter().map(|c| c.name.clone()).collect();
+    let table_columns_affinities: Vec<crate::types::Affinity> =
+        table_columns.iter().map(|c| c.affinity).collect();
     let qualified: Vec<String> = table_columns
         .iter()
         .map(|c| format!("{}.{}", name, c.name))
@@ -1207,6 +1220,7 @@ pub fn build_table(
         foreign_keys,
         col_names: plain.into(),
         qualified_col_names: qualified.into(),
+        col_affinities: table_columns_affinities.into(),
         vtab: None,
     })
 }
@@ -1359,6 +1373,13 @@ pub fn sqlite_master_table() -> Table {
                 .map(|c| format!("sqlite_master.{}", c))
                 .collect::<Vec<String>>(),
         ),
+        col_affinities: std::sync::Arc::from(vec![
+            crate::types::Affinity::Text,
+            crate::types::Affinity::Text,
+            crate::types::Affinity::Text,
+            crate::types::Affinity::Integer,
+            crate::types::Affinity::Text,
+        ]),
         vtab: None,
     }
 }
