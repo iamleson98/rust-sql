@@ -2403,6 +2403,13 @@ impl Database {
     /// this constructor is the explicit form (handy for `CREATE` intent,
     /// which is `Database::open_sqlite_format`).
     fn from_sqlite_file(path: &Path) -> Result<Self> {
+        // Orphaned atomic-write staging files (`{stem}.rsqltmp{pid}`
+        // from a previous process that died between staging and
+        // rename — the "random temp file" dev checkouts used to
+        // accumulate) are swept here, at the single choke point every
+        // SQLite-format open flows through (Database::open sniffing +
+        // open_sqlite_format).
+        crate::storage::sqlitefmt::writer::sweep_stale_tmps(path);
         let image = crate::storage::sqlitefmt::read_sqlite_file(path)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let mut db = Self::open_memory_inner()?;
@@ -2436,6 +2443,11 @@ impl Database {
     /// file with SQLite magic is opened through the interop path.
     pub fn open_sqlite_format<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
+        // Fresh-create path: the main file may not exist yet, but a
+        // crashed earlier attempt can still have left its staging file
+        // behind — sweep those too (from_sqlite_file sweeps again for
+        // existing files; both are idempotent best-effort).
+        crate::storage::sqlitefmt::writer::sweep_stale_tmps(path);
         if path.exists() && crate::storage::sqlitefmt::is_sqlite_file(path) {
             return Self::from_sqlite_file(path);
         }

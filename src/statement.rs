@@ -1238,8 +1238,7 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                 if let Some(w) = &u.target_where {
                     walk_expr(w, &mut max_pos, &mut saw_numeric, named, &mut counter);
                 }
-                if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &u.action
-                {
+                if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &u.action {
                     for (_, e) in set {
                         walk_expr(e, &mut max_pos, &mut saw_numeric, named, &mut counter);
                     }
@@ -1250,7 +1249,13 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
             }
             if let Some(w) = &i.with {
                 for cte in &w.ctes {
-                    walk_select(&cte.select, &mut max_pos, &mut saw_numeric, named, &mut counter);
+                    walk_select(
+                        &cte.select,
+                        &mut max_pos,
+                        &mut saw_numeric,
+                        named,
+                        &mut counter,
+                    );
                 }
             }
             if let Some(rcs) = &i.returning {

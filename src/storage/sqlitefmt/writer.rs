@@ -18,7 +18,11 @@
 //!
 //! Durability: temp file + fsync + atomic rename — a crash leaves either
 //! the old or the new file, never a mix. Stale `-wal`/`-shm` sidecars are
-//! removed so a subsequent SQLite open reads the fresh image.
+//! removed so a subsequent SQLite open reads the fresh image, and the
+//! staging file itself is guarded: every error path removes it, and any
+//! orphan left by a hard kill (`{stem}.rsqltmp{pid}`) is swept away on
+//! the next open — a dev checkout never accumulates "random" temp
+//! files next to the database.
 
 use std::path::Path;
 
@@ -286,6 +290,38 @@ fn clear_sidecar(path: &std::path::Path) {
     }
 }
 
+/// Removes the staging file on drop unless dismissed. Every error path
+/// out of [`write_image_atomic`] — failed write, failed fsync, failed
+/// rename with failed fallbacks, even a panic mid-write — then leaves no
+/// `rsqltmp*` orphan behind. (The success path dismisses the guard after
+/// the rename: the staging name no longer exists, and skipping the
+/// remove avoids a tiny window where another same-PID thread could have
+/// re-created the name in the meantime.)
+struct TmpGuard {
+    path: std::path::PathBuf,
+    live: bool,
+}
+
+impl TmpGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        TmpGuard { path, live: true }
+    }
+    /// The rename succeeded: the staging name no longer exists.
+    fn consumed(mut self) {
+        self.live = false;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if self.live {
+            // Best-effort: a file locked by an AV scanner (Windows) is
+            // retried by sweep_stale_tmps on the next open.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Write atomically (temp file + fsync + rename), with an in-place
 /// fallback when Windows denies the rename over a live cross-process
 /// handle.
@@ -294,12 +330,48 @@ pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
     write_image_atomic(path, &bytes)
 }
 
+/// Best-effort removal of orphaned atomic-write staging files for
+/// `path` — `{stem}.rsqltmp{pid}` leftovers from processes that died
+/// between staging and rename (power loss, `kill -9`, a crashed CLI
+/// run). Called on every SQLite-format open so the litter is cleared by
+/// the next `make migrate-*` run or server start instead of piling up.
+///
+/// The numeric-PID suffix is what distinguishes a true orphan from an
+/// unrelated file that happens to start with the same prefix, and the
+/// staging file only ever held a mid-flight image of THIS database, so
+/// removing it is always safe: the main file keeps the last committed
+/// state (the staged transaction never returned success to its client —
+/// the same crash semantics as SQLite discarding a hot journal).
+pub fn sweep_stale_tmps(path: &Path) {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let Some(stem) = path.file_stem() else { return };
+    let prefix = format!("{}.rsqltmp", stem.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Atomic full-image write (checkpoint semantics): temp + fsync +
 /// rename with Windows in-place fallbacks, then stale sidecar removal
 /// so a subsequent SQLite open (or the engine's own reader) never
-/// replays pre-checkpoint frames.
+/// replays pre-checkpoint frames. The staging file is removed on every
+/// failure path (see [`TmpGuard`]).
 pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("rsqltmp{}", std::process::id()));
+    let guard = TmpGuard::new(tmp.clone());
     {
         use std::io::Write;
         let mut f =
@@ -309,13 +381,14 @@ pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path)
-        .or_else(|e| {
-            // Windows/EXDEV: fall back to remove + rename.
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp, path).map_err(|e2| format!("rename: {e} / {e2}"))
-        })
-        .or_else(|e| {
+    let renamed = std::fs::rename(&tmp, path).or_else(|e| {
+        // Windows/EXDEV: fall back to remove + rename.
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path).map_err(|e2| format!("rename: {e} / {e2}"))
+    });
+    match renamed {
+        Ok(()) => guard.consumed(),
+        Err(e) => {
             // Windows with a live cross-process SQLite connection: the
             // other handle has share read+write but no share-delete, so
             // both rename and remove are denied ("os error 5"). SQLite
@@ -333,9 +406,9 @@ pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
                 .map_err(|e| format!("in-place write {}: {e}", path.display()))?;
             f.sync_all()
                 .map_err(|e| format!("in-place fsync {}: {e}", path.display()))?;
-            let _ = std::fs::remove_file(&tmp);
-            Ok::<(), String>(())
-        })?;
+            // The staging file is removed by the guard on scope exit.
+        }
+    }
     // Stale sidecars would resurrect pre-dump frames. On Windows a live
     // cross-process connection may hold them open (no share-delete), so
     // when removal fails, TRUNCATE in place: a zero-length WAL is an

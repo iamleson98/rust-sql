@@ -2258,3 +2258,145 @@ fn temp_table_stays_temp_across_alter() {
     drop(db);
     cleanup(&path);
 }
+
+// ===========================================================================
+// Atomic-write staging files (`rsqltmp`) — the single-file-at-rest contract
+// ===========================================================================
+
+/// Helper: every `{stem}.rsqltmp*` file in the database's directory,
+/// whatever its suffix (used to assert both "none remain" and "only the
+/// numeric orphans were swept").
+fn staging_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+    let prefix = format!("{}.rsqltmp", stem);
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let starts = entry
+                .file_name()
+                .to_str()
+                .map(|n| n.starts_with(prefix.as_str()))
+                .unwrap_or(false);
+            if starts {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+/// A clean commit cycle must leave ONLY the database file: the atomic
+/// writer stages each full-image write as `{stem}.rsqltmp{pid}` and the
+/// name is renamed away (POSIX) or removed (the Windows in-place
+/// fallback) — it must never be left behind. Regression: dev `make`
+/// runs littered `db.rsqltmp19508`-style files next to the database.
+#[test]
+fn atomic_write_leaves_no_staging_file() {
+    let path = tmpdb("staging_clean");
+    {
+        let mut db = Database::open_sqlite_format(&path).expect("open sqlite format");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .expect("ddl");
+        db.execute("INSERT INTO t (v) VALUES ('a')", [])
+            .expect("insert");
+        db.flush().expect("flush");
+        drop(db);
+    }
+    assert!(path.exists(), "the database file exists after close");
+    let stray = staging_files(&path);
+    assert!(
+        stray.is_empty(),
+        "no rsqltmp staging files may remain after a clean close: {stray:?}"
+    );
+
+    // The committed data survived the cycle.
+    let mut db = Database::open(&path).expect("reopen");
+    assert_eq!(one_i64(&db, "SELECT COUNT(*) FROM t"), 1);
+    db.flush().unwrap();
+    drop(db);
+    cleanup(&path);
+}
+
+/// Opening a database sweeps away orphaned staging files from processes
+/// that died between staging and rename (power loss, kill -9, a crashed
+/// CLI run) — the "random `db.rsqltmp19508` file" complaint. Only
+/// numeric-suffix orphans of THIS database's stem are swept: a file that
+/// merely starts with the same prefix (non-numeric suffix, or another
+/// database named `stem.rsqltmp…`) must survive untouched.
+#[test]
+fn open_sweeps_orphaned_staging_files() {
+    let path = tmpdb("staging_sweep");
+    {
+        let mut db = Database::open_sqlite_format(&path).expect("create");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .expect("ddl");
+        db.execute("INSERT INTO t (v) VALUES ('keep')", [])
+            .expect("insert");
+        db.flush().expect("flush");
+        drop(db);
+    }
+
+    let dir = path.parent().unwrap().to_path_buf();
+    let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+    // Orphans a dead process could have left behind (numeric PIDs).
+    let orphan_a = dir.join(format!("{}.rsqltmp19508", stem));
+    let orphan_b = dir.join(format!("{}.rsqltmp7", stem));
+    // Look-alikes that must NOT be swept: non-numeric suffix, and a
+    // foreign database whose name merely starts with the prefix.
+    let lookalike = dir.join(format!("{}.rsqltmpNOTANUM", stem));
+    let foreign_db = dir.join(format!("{}.rsqltmp42.sqlite", stem));
+    std::fs::write(&orphan_a, b"partial garbage from a killed writer").unwrap();
+    std::fs::write(&orphan_b, b"").unwrap();
+    std::fs::write(&lookalike, b"unrelated file").unwrap();
+    // A real SQLite database file with a prefix-shaped name — opening
+    // it as its own database must keep working (and keep its data).
+    {
+        let mut other = Database::open_sqlite_format(&foreign_db).expect("foreign open");
+        other
+            .execute("CREATE TABLE f (x)", [])
+            .expect("foreign ddl");
+        other
+            .execute("INSERT INTO f VALUES (7)", [])
+            .expect("foreign insert");
+        other.flush().expect("foreign flush");
+        drop(other);
+    }
+
+    // The reopen that must clean the orphans.
+    let mut db = Database::open(&path).expect("reopen");
+    assert!(
+        !orphan_a.exists() && !orphan_b.exists(),
+        "numeric-suffix rsqltmp orphans must be swept on open"
+    );
+    assert!(
+        lookalike.exists(),
+        "a non-numeric suffix file sharing the prefix must survive"
+    );
+    assert!(
+        foreign_db.exists(),
+        "a foreign database with a prefix-shaped name must survive"
+    );
+    // The sweep must not have touched the data.
+    assert_eq!(
+        one_text(&db, "SELECT v FROM t WHERE id = 1"),
+        "keep",
+        "sweeping must leave committed data intact"
+    );
+    db.flush().unwrap();
+    drop(db);
+
+    // The foreign database still opens with its own data (its own sweep
+    // keys on stem "stem.rsqltmp42", not on our stem).
+    let mut other = Database::open(&foreign_db).expect("foreign reopen");
+    assert_eq!(one_i64(&other, "SELECT COUNT(*) FROM f"), 1);
+    other.flush().unwrap();
+    drop(other);
+
+    let _ = std::fs::remove_file(&lookalike);
+    let _ = std::fs::remove_file(&foreign_db);
+    cleanup(&path);
+}
