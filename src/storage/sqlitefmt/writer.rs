@@ -342,6 +342,18 @@ pub fn write_sqlite_file(path: &Path, db: &OutDb) -> Result<(), String> {
 /// removing it is always safe: the main file keeps the last committed
 /// state (the staged transaction never returned success to its client —
 /// the same crash semantics as SQLite discarding a hot journal).
+///
+/// The CURRENT process's suffix is deliberately skipped: the engine is
+/// linked into the process, so an in-flight
+/// [`write_image_atomic`](fn.write_image_atomic.html) stages under
+/// exactly this pid while OTHER connections in the same process may be
+/// opening (and sweeping) concurrently. Sweeping a live staging file
+/// deletes the rename source mid-write — the rename fails, the
+/// Windows/EXDEV fallback then removes the main database, and the write
+/// dies with "in-place open … No such file or directory" (the
+/// `rsqltmp_orphans_swept_on_open` flake). A staging file carrying the
+/// live pid can only be a leftover from a pid-reused predecessor; the
+/// next open under a different pid sweeps it.
 pub fn sweep_stale_tmps(path: &Path) {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
@@ -349,6 +361,7 @@ pub fn sweep_stale_tmps(path: &Path) {
     };
     let Some(stem) = path.file_stem() else { return };
     let prefix = format!("{}.rsqltmp", stem.to_string_lossy());
+    let live_suffix = std::process::id().to_string();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -359,6 +372,9 @@ pub fn sweep_stale_tmps(path: &Path) {
             continue;
         };
         if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            if suffix == live_suffix {
+                continue; // possibly a live staging file of THIS process
+            }
             let _ = std::fs::remove_file(entry.path());
         }
     }
