@@ -8319,8 +8319,24 @@ pub(crate) fn scan_groupby_grouper(
                     crate::executor::predicate::compiled_expr_columns(c, &mut wanted);
                 }
             }
-            wanted.sort_unstable();
-            wanted.dedup();
+            // THE FILTER'S COLUMNS MUST BE IN `wanted` TOO. The compiled
+            // predicate evaluates POSITIONALLY against the `wide` buffer
+            // and the AST fallback reads by name from the SAME buffer; a
+            // filter column missing from `wanted` decodes as NULL and
+            // drops EVERY row (`SELECT b, count(*) FROM s WHERE a > 0
+            // GROUP BY b` returned [] while SQLite returned the rows —
+            // index_stress cross-validation caught it at 4k-row scale).
+            // A filter that did NOT compile walks the AST per row, so
+            // its WHOLE row must decode (no column-set analysis).
+            if let Some(cf) = &compiled_filter {
+                crate::executor::predicate::compiled_columns(cf, &mut wanted);
+            }
+            if filter_predicate.is_some() && compiled_filter.is_none() {
+                wanted = (0..n_cols).collect();
+            } else {
+                wanted.sort_unstable();
+                wanted.dedup();
+            }
 
             // Intra-statement parallel split (see the selective-branch
             // note above): the compiled loop replicated per rowid range,
@@ -10658,7 +10674,9 @@ fn exec_aggregate(
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 let key_values: Vec<Value> = key_exprs
                     .iter()
-                    .map(|e| evaluate(e, &eval_ctx))
+                    .map(|e| {
+                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(table, index, e, &v))
+                    })
                     .collect::<Result<_>>()?;
                 // NULL equality probes match nothing (SQL 3VL).
                 let n: i64 = if key_values.iter().any(|v| v.is_null()) {
@@ -10761,15 +10779,7 @@ fn exec_aggregate(
                     rows: vec![row],
                 });
             }
-            let fold_bound = |e: &Expr| -> Result<Value> {
-                let v = evaluate(e, &eval_ctx)?;
-                Ok(match index.columns.first() {
-                    Some(ic) => {
-                        crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned()
-                    }
-                    None => v,
-                })
-            };
+            let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, &_table, &index);
             let start_key: Option<(Vec<u8>, bool)> = match start {
                 Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
                 None => None,
@@ -15177,7 +15187,7 @@ fn exec_index_in(
     // same way. Deduping on the encoded key is type-exact.
     let mut encoded_keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
     for e in key_exprs {
-        let v = evaluate(e, &eval_ctx)?;
+        let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(&table, &index, e, &v))?;
         // NULL keys never match an index entry (SQLite semantics); other
         // types are encoded order-preservingly and simply miss.
         if v.is_null() {
@@ -16093,7 +16103,7 @@ fn exec_index_lookup_impl(
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     let key_values: Vec<Value> = key_exprs
         .iter()
-        .map(|e| evaluate(e, &eval_ctx))
+        .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(&table, &index, e, &v)))
         .collect::<Result<_>>()?;
 
     // NULL equality probes match NOTHING (SQL 3VL: `v = NULL` is never
@@ -16239,6 +16249,56 @@ fn index_key_prefix_cmp(cell_key: &[u8], bound: &[u8]) -> std::cmp::Ordering {
     }
 }
 
+/// SQLite's comparison affinity for index probes (datatype3 §4.2): when
+/// exactly one side of the comparison is a column, that column's
+/// affinity applies to the other operand. For an index seek, the
+/// indexed column's TABLE affinity applies to the probe operand —
+/// `WHERE int_col = '7'` must seek with the INTEGER 7, not the TEXT
+/// '7' (raw text encodes BELOW every integer key, so the probe finds
+/// nothing while SQLite finds the row). Skipped when the operand is
+/// itself a column (the two-column rules are the residual predicate's
+/// job) and for expression index entries (expression keys carry no
+/// affinity).
+fn probe_affinity_value(table: &Table, index: &crate::schema::Index, e: &Expr, v: &Value) -> Value {
+    let ic = match index.columns.first() {
+        Some(ic) => ic,
+        None => return v.clone(),
+    };
+    if ic.expr.is_some() || matches!(e, Expr::Column { .. }) {
+        return v.clone();
+    }
+    let aff = match table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&ic.name))
+    {
+        Some(c) => c.affinity,
+        None => return v.clone(),
+    };
+    if matches!(aff, crate::types::Affinity::None) {
+        return v.clone();
+    }
+    crate::executor::expr::apply_operand_affinity(aff, v)
+}
+
+/// Evaluate an IndexRange bound expression into a seek-key VALUE: the
+/// probe affinity (above) applies first, then the first index column's
+/// collation folds the key so it matches the folded stored keys
+/// (NOCASE / RTRIM).
+fn eval_index_bound(
+    e: &Expr,
+    eval_ctx: &EvalContext<'_>,
+    table: &Table,
+    index: &crate::schema::Index,
+) -> Result<Value> {
+    let v = evaluate(e, eval_ctx)?;
+    let v = probe_affinity_value(table, index, e, &v);
+    Ok(match index.columns.first() {
+        Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
+        None => v,
+    })
+}
+
 /// Execute an IndexRange: scan the index B+tree between the (encoded) bounds,
 /// collect the matching rowids, fetch the rows by rowid, and apply any
 /// residual predicate. Rows come back in index order (ascending by the
@@ -16259,13 +16319,7 @@ fn exec_index_range(
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     // Collated index: the bounds fold through the first index column's
     // collation so the scan bounds match the folded stored keys.
-    let fold_bound = |e: &Expr| -> Result<Value> {
-        let v = evaluate(e, &eval_ctx)?;
-        Ok(match index.columns.first() {
-            Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
-            None => v,
-        })
-    };
+    let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, &table, &index);
     // NULL bound: the comparison is NULL (SQL 3VL) — the range is
     // EMPTY. The NULL order-key would otherwise EXACTLY match the
     // stored NULL entries (`v >= NULL AND v <= NULL` / `v = NULL`
@@ -16559,13 +16613,7 @@ fn exec_index_range_projected(
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-    let fold_bound = |e: &Expr| -> Result<Value> {
-        let v = evaluate(e, &eval_ctx)?;
-        Ok(match index.columns.first() {
-            Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
-            None => v,
-        })
-    };
+    let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, &table, &index);
     // NULL bound: the comparison is NULL (SQL 3VL) — empty range (see
     // exec_index_range's guard).
     if let Some((e, _)) = start {
@@ -17317,6 +17365,17 @@ fn exec_insert_inner(
             Some(mut sc) => {
                 for st in sc.index_states.iter_mut() {
                     st.root = ctx.index_root(&st.idx);
+                    // The append hint is a leaf PageId pinned during a
+                    // PREVIOUS statement: that statement may have FAILED
+                    // (the statement-atomicity restore frees pages the
+                    // hint points at — a later append then read "invalid
+                    // page type byte: 0x0"), or an interleaved statement
+                    // may have freed/reused the page. A hint crossing
+                    // statement boundaries can even land in ANOTHER
+                    // index's leaf after freelist reuse (both type
+                    // LeafIndex) and silently corrupt it. Reset here;
+                    // the first row re-pins.
+                    st.hint = None;
                 }
                 (
                     sc.index_states,
@@ -20591,7 +20650,7 @@ fn try_streaming_update(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let key_values: Vec<Value> = key_exprs
                 .iter()
-                .map(|e| evaluate(e, &eval_ctx))
+                .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v)))
                 .collect::<Result<_>>()?;
             // NULL equality probe: matches nothing (SQL 3VL — see
             // exec_index_lookup_impl's guard).
@@ -20633,7 +20692,7 @@ fn try_streaming_update(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
             for e in key_exprs.iter() {
-                let v = evaluate(e, &eval_ctx)?;
+                let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v))?;
                 if v.is_null() {
                     continue;
                 }
@@ -21193,7 +21252,11 @@ fn try_streaming_update(
             })
         }
     } else if let StreamingSource::IndexRange {
-        index, start, end, ..
+        table: t,
+        index,
+        start,
+        end,
+        ..
     } = &src
     {
         // IndexRange source: `UPDATE ... WHERE indexed_col > ?` (and
@@ -21207,13 +21270,7 @@ fn try_streaming_update(
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
         // Collated index: fold bounds through the first column's collation.
-        let fold_bound = |e: &Expr| -> Result<Value> {
-            let v = evaluate(e, &eval_ctx)?;
-            Ok(match index.columns.first() {
-                Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
-                None => v,
-            })
-        };
+        let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, t, index);
         let start_key: Option<(Vec<u8>, bool)> = match start {
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
@@ -22531,7 +22588,7 @@ fn try_streaming_delete(
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 let key_values: Vec<Value> = key_exprs
                     .iter()
-                    .map(|e| evaluate(e, &eval_ctx))
+                    .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v)))
                     .collect::<Result<_>>()?;
                 let probe_keys = if key_values.iter().any(|v| v.is_null()) {
                     Vec::new()
@@ -22566,7 +22623,8 @@ fn try_streaming_delete(
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
                 for e in key_exprs.iter() {
-                    let v = evaluate(e, &eval_ctx)?;
+                    let v =
+                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v))?;
                     if v.is_null() {
                         continue;
                     }
@@ -22667,7 +22725,7 @@ fn try_streaming_delete(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
             for e in key_exprs.iter() {
-                let v = evaluate(e, &eval_ctx)?;
+                let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v))?;
                 if v.is_null() {
                     continue;
                 }
@@ -22703,7 +22761,7 @@ fn try_streaming_delete(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let key_values: Vec<Value> = key_exprs
                 .iter()
-                .map(|e| evaluate(e, &eval_ctx))
+                .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v)))
                 .collect::<Result<_>>()?;
             // NULL equality probe: matches nothing (SQL 3VL — see
             // exec_index_lookup_impl's guard).
@@ -22778,13 +22836,7 @@ fn try_streaming_delete(
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
-        let fold_bound = |e: &Expr| -> Result<Value> {
-            let v = evaluate(e, &eval_ctx)?;
-            Ok(match index.columns.first() {
-                Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
-                None => v,
-            })
-        };
+        let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, table, index);
         let start_key: Option<(Vec<u8>, bool)> = match start {
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,

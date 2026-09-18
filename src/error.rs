@@ -120,7 +120,9 @@ impl fmt::Display for Error {
             // Prefix-free: byte-identical to SQLite's errmsg (see the
             // NotFound doc below).
             Error::NotFound(m) => write!(f, "{}", m),
-            Error::AlreadyExists(m) => write!(f, "already exists: {}", m),
+            // SQLite shape: "table t already exists" / "index i already
+            // exists" — the message itself carries the object type.
+            Error::AlreadyExists(m) => write!(f, "{}", m),
             Error::InvalidArgument(m) => write!(f, "invalid argument: {}", m),
             Error::SnapshotConflict(m) => {
                 write!(f, "database is locked (SQLITE_BUSY_SNAPSHOT): {}", m)

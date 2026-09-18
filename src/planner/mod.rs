@@ -6459,9 +6459,11 @@ impl<'a> DpCtx<'a> {
                 .is_some_and(|c| c.name.eq_ignore_ascii_case(col))
             {
                 if let Some(s) = self.catalog.index_stats(&idx.name) {
-                    if let Some(&d) = s.distinct_prefix.first() {
-                        if d > 0 {
-                            return Some(d);
+                    // D1 is the average eq-class size; the DISTINCT count
+                    // it came from is ~rows/D1 (ceil).
+                    if let Some(&d1) = s.distinct_prefix.first() {
+                        if d1 > 0 && s.rows > 0 {
+                            return Some(((s.rows + d1 - 1) / d1).max(1));
                         }
                     }
                 }

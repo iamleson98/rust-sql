@@ -3353,8 +3353,13 @@ impl<'a> Btree<'a> {
         let cell_size = cell.len() as u32;
 
         let mut borrowed = page.lock();
-        if borrowed.page_type()? != PageType::LeafIndex {
-            return Ok(None); // stale hint pointing at a non-index page
+        match borrowed.page_type() {
+            Ok(PageType::LeafIndex) => {}
+            // Stale hint: wrong page kind, or the page was freed /
+            // zeroed by a rollback since the hint was pinned (an error
+            // here used to surface as "invalid page type byte: 0x0"
+            // instead of falling back to the full insert path).
+            Ok(_) | Err(_) => return Ok(None),
         }
         let n = borrowed.n_cells();
         if n == 0 {

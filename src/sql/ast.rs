@@ -127,6 +127,8 @@ pub struct CreateTrigger {
     pub name: String,
     /// `CREATE TEMP TRIGGER` — connection-scoped, never persisted.
     pub temp: bool,
+    /// `CREATE TRIGGER IF NOT EXISTS` — silently skips a duplicate name.
+    pub if_not_exists: bool,
     pub table: String,
     pub when: TriggerWhen,
     pub events: Vec<TriggerEvent>,

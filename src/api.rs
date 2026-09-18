@@ -931,7 +931,7 @@ impl FastPath {
 /// Pre-encode the index key for an IndexPoint fast path when every bound
 /// key is a literal (constants in the SQL text). Returns None when any
 /// key is a parameter (re-encoded per call against the param values).
-fn pre_encode_literal_keys(keys: &[FastBound], index: &Index) -> Option<Arc<[u8]>> {
+fn pre_encode_literal_keys(keys: &[FastBound], index: &Index, table: &Table) -> Option<Arc<[u8]>> {
     if !keys.iter().all(|k| matches!(k, FastBound::Literal(_))) {
         return None;
     }
@@ -947,12 +947,15 @@ fn pre_encode_literal_keys(keys: &[FastBound], index: &Index) -> Option<Arc<[u8]
     let mut buf = Vec::with_capacity(keys.len() * 8);
     for (i, k) in keys.iter().enumerate() {
         if let FastBound::Literal(v) = k {
-            // The index b-tree stores COLLATED keys (NOCASE / RTRIM fold
+            // Probe affinity first (SQLite's comparison rule, datatype3
+            // §4.2 — `WHERE int_col = '7'` seeks INTEGER 7), then the
+            // index b-tree stores COLLATED keys (NOCASE / RTRIM fold
             // TEXT at maintenance time); the probe key must fold the
             // same way or uppercase / trailing-space probes miss.
+            let v = fast_probe_affinity(table, index, i, v);
             match index.columns.get(i) {
                 Some(c) => {
-                    crate::plugin::collation_fold_key_ref(&c.collation, v)
+                    crate::plugin::collation_fold_key_ref(&c.collation, &v)
                         .encode_order_key_into(&mut buf);
                 }
                 None => v.encode_order_key_into(&mut buf),
@@ -960,6 +963,43 @@ fn pre_encode_literal_keys(keys: &[FastBound], index: &Index) -> Option<Arc<[u8]
         }
     }
     Some(buf.into())
+}
+
+/// The comparison affinity a fast-path probe value carries (SQLite's
+/// rule, datatype3 §4.2): the indexed column's TABLE affinity applies
+/// to the operand — `WHERE int_col = '7'` must seek with INTEGER 7, not
+/// TEXT '7' (raw text encodes BELOW every integer key, so the probe
+/// finds nothing while SQLite finds the row). Fast-path bounds are
+/// literals / parameters only (`bind_expr` declines everything else),
+/// so they never carry an affinity of their own. Expression index
+/// entries and no-affinity columns never convert. Borrowed when no
+/// conversion applies — zero cost on the common BINARY/none shape.
+#[inline]
+fn fast_probe_affinity<'a>(
+    table: &Table,
+    index: &Index,
+    i: usize,
+    v: &'a Value,
+) -> std::borrow::Cow<'a, Value> {
+    let ic = match index.columns.get(i) {
+        Some(ic) => ic,
+        None => return std::borrow::Cow::Borrowed(v),
+    };
+    if ic.expr.is_some() {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    let aff = match table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&ic.name))
+    {
+        Some(c) => c.affinity,
+        None => return std::borrow::Cow::Borrowed(v),
+    };
+    if matches!(aff, crate::types::Affinity::None) {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    std::borrow::Cow::Owned(crate::executor::expr::apply_operand_affinity(aff, v))
 }
 
 /// Does any index column use a non-BINARY collation (probe keys must be
@@ -8617,7 +8657,7 @@ impl Database {
                         .iter()
                         .map(bind_expr)
                         .collect::<Option<Vec<_>>>()?;
-                    let pre_encoded = pre_encode_literal_keys(&keys, index);
+                    let pre_encoded = pre_encode_literal_keys(&keys, index, table);
                     // Output name: an explicit AS alias wins (SQLite's
                     // short-column-name rule — name-based consumers like
                     // sqlx resolve by the alias), else the display form.
@@ -8743,7 +8783,7 @@ impl Database {
                         .map(bind_expr)
                         .collect::<Option<Vec<_>>>()?;
                     let (project, cols) = resolve_projection(columns, table)?;
-                    let pre_encoded = pre_encode_literal_keys(&keys, index);
+                    let pre_encoded = pre_encode_literal_keys(&keys, index, table);
                     Some(FastPath::IndexPoint {
                         table: table.clone(),
                         index: index.clone(),
@@ -8807,7 +8847,7 @@ impl Database {
                                 .iter()
                                 .map(bind_expr)
                                 .collect::<Option<Vec<_>>>()?;
-                            let pre_encoded = pre_encode_literal_keys(&keys, index);
+                            let pre_encoded = pre_encode_literal_keys(&keys, index, table);
                             // The Project's column may carry the alias
                             // (the `__agg_N` rewrite keeps it); fall back
                             // to the aggregate's own alias, then display.
@@ -8968,6 +9008,7 @@ impl Database {
                 }
             }
             FastPath::IndexCount {
+                table,
                 index,
                 keys,
                 pre_encoded,
@@ -8985,10 +9026,14 @@ impl Database {
                         key_scratch = Vec::with_capacity(keys.len() * 8);
                         for (i, k) in keys.iter().enumerate() {
                             let v = k.resolve(params);
+                            // Probe affinity first (datatype3 §4.2 — same
+                            // rule as the pre-encoded literals), then the
+                            // collated fold.
+                            let v = fast_probe_affinity(table, index, i, v);
                             match index.columns.get(i) {
                                 // Collated index: fold the probe key the
                                 // way maintenance folds stored keys.
-                                Some(c) => crate::plugin::collation_fold_key_ref(&c.collation, v)
+                                Some(c) => crate::plugin::collation_fold_key_ref(&c.collation, &v)
                                     .encode_order_key_into(&mut key_scratch),
                                 None => v.encode_order_key_into(&mut key_scratch),
                             }
@@ -9063,12 +9108,14 @@ impl Database {
                         // folds stored keys — an unfolded 'APPLE' probe
                         // misses the folded 'apple' entries. Folded values
                         // may change length, so this path always uses the
-                        // heap buffer.
+                        // heap buffer. The probe affinity applies first
+                        // (same rule as the pre-encoded literals).
                         key_heap = Vec::with_capacity(keys.len() * 8);
                         for (i, k) in keys.iter().enumerate() {
                             let v = k.resolve(params);
+                            let v = fast_probe_affinity(table, index, i, v);
                             match index.columns.get(i) {
-                                Some(c) => crate::plugin::collation_fold_key_ref(&c.collation, v)
+                                Some(c) => crate::plugin::collation_fold_key_ref(&c.collation, &v)
                                     .encode_order_key_into(&mut key_heap),
                                 None => v.encode_order_key_into(&mut key_heap),
                             }
@@ -9077,13 +9124,15 @@ impl Database {
                     }
                     None => {
                         // Resolve + encode each bound into the stack slice;
-                        // spill to a heap Vec if any key doesn't fit.
+                        // spill to a heap Vec if any key doesn't fit. The
+                        // probe affinity applies per key (BINARY/none —
+                        // the overwhelmingly common shape — borrows with
+                        // zero cost).
                         let mut spilled = false;
                         'outer: {
-                            for k in keys {
-                                match k
-                                    .resolve(params)
-                                    .encode_order_key_into_slice(&mut key_stack[key_stack_len..])
+                            for (i, k) in keys.iter().enumerate() {
+                                let v = fast_probe_affinity(table, index, i, k.resolve(params));
+                                match v.encode_order_key_into_slice(&mut key_stack[key_stack_len..])
                                 {
                                     Some(n) => key_stack_len += n,
                                     None => {
@@ -9097,8 +9146,9 @@ impl Database {
                             &key_stack[..key_stack_len]
                         } else {
                             key_heap = Vec::with_capacity(keys.len() * 8);
-                            for k in keys {
-                                k.resolve(params).encode_order_key_into(&mut key_heap);
+                            for (i, k) in keys.iter().enumerate() {
+                                fast_probe_affinity(table, index, i, k.resolve(params))
+                                    .encode_order_key_into(&mut key_heap);
                             }
                             &key_heap
                         }
@@ -9514,14 +9564,16 @@ impl Database {
             let root = ctx.table_root(table);
             let n = Btree::new(ctx.pager, root, false).count_rows().unwrap_or(0) as i64;
             let indexes = catalog.indexes_on_table(&table.name);
-            if indexes.is_empty() {
-                // SQLite writes an idx = NULL row for index-less tables.
+            // SQLite's needTableCnt: the (tbl, NULL, n) row is written
+            // only when the table has NO full (non-partial) index — and
+            // never for a zero-row table (analyze.c's jZeroRows).
+            let has_full_index = indexes.iter().any(|i| i.partial_expr.is_none());
+            if !has_full_index && n > 0 {
                 insert_sqls.push(format!(
                     "INSERT INTO sqlite_stat1 VALUES ('{}', NULL, '{}')",
                     table.name.replace('\'', "''"),
                     n
                 ));
-                continue;
             }
             for index in indexes {
                 // Per-prefix distinct counts: one GROUP BY per prefix k,
@@ -9544,9 +9596,30 @@ impl Database {
                     let cnt = Self::analyze_scalar_query(&sql, ctx, catalog)?;
                     distinct.push(cnt.max(0));
                 }
+                // SQLite's stat numbers (statGet in analyze.c):
+                // D_i = ceil(n / d_i) — the average eq-class size — with
+                // the refinement D==2 && n*10 <= d*11 -> 1. An empty
+                // table's FULL index is omitted from stat1 entirely
+                // ("an empty table is omitted from sqlite_stat1"); a
+                // PARTIAL index keeps its zero row.
+                let is_partial = index.partial_expr.is_some();
+                if n == 0 && !is_partial {
+                    continue;
+                }
+                let dvals: Vec<i64> = distinct
+                    .iter()
+                    .map(|&d| {
+                        let v = if d > 0 { (n + d - 1) / d } else { 0 };
+                        if v == 2 && n * 10 <= d * 11 {
+                            1
+                        } else {
+                            v
+                        }
+                    })
+                    .collect();
                 let stats = crate::schema::IndexStats {
                     rows: n,
-                    distinct_prefix: distinct,
+                    distinct_prefix: dvals,
                 };
                 insert_sqls.push(format!(
                     "INSERT INTO sqlite_stat1 VALUES ('{}', '{}', '{}')",
@@ -9744,7 +9817,17 @@ impl Database {
                     if if_not_exists {
                         return Ok(());
                     }
-                    return Err(Error::AlreadyExists(format!("table: {}", name.name)));
+                    // SQLite names the EXISTING object's type: creating a
+                    // table over a view says "view v already exists".
+                    let what = if catalog.get_table(&name.name).is_some() {
+                        "table"
+                    } else {
+                        "view"
+                    };
+                    return Err(Error::AlreadyExists(format!(
+                        "{} {} already exists",
+                        what, name.name
+                    )));
                 }
                 // (The reserved-`sqlite_%`-name guard lives at the
                 // USER-FACING entry in `execute` — ANALYZE's internal
@@ -10201,7 +10284,10 @@ impl Database {
                     if if_not_exists {
                         return Ok(());
                     }
-                    return Err(Error::AlreadyExists(format!("index: {}", name)));
+                    return Err(Error::AlreadyExists(format!(
+                        "index {} already exists",
+                        name
+                    )));
                 }
                 // Specialized access methods (PostgreSQL's USING clause,
                 // borrowed): validate shape and derive the IndexKind.
@@ -10394,7 +10480,17 @@ impl Database {
                     if if_not_exists {
                         return Ok(());
                     }
-                    return Err(Error::AlreadyExists(format!("table: {}", name.name)));
+                    // SQLite names the EXISTING object's type: a view over
+                    // a TABLE errors "table t already exists".
+                    let what = if catalog.get_view(&name.name).is_some() {
+                        "view"
+                    } else {
+                        "table"
+                    };
+                    return Err(Error::AlreadyExists(format!(
+                        "{} {} already exists",
+                        what, name.name
+                    )));
                 }
                 let view = crate::schema::View {
                     name: name.name.clone(),
@@ -10430,7 +10526,15 @@ impl Database {
                     if if_not_exists {
                         return Ok(());
                     }
-                    return Err(Error::AlreadyExists(format!("table: {}", name.name)));
+                    let what = if catalog.get_table(&name.name).is_some() {
+                        "table"
+                    } else {
+                        "view"
+                    };
+                    return Err(Error::AlreadyExists(format!(
+                        "{} {} already exists",
+                        what, name.name
+                    )));
                 }
                 // Module lookup through the thread-local plugin scope —
                 // the CREATE statement runs inside `execute()`'s
@@ -10466,6 +10570,17 @@ impl Database {
                 Ok(())
             }
             CreateStatement::Trigger(t) => {
+                // SQLite: a duplicate trigger name errors; IF NOT EXISTS
+                // skips silently.
+                if catalog.get_trigger(&t.name).is_some() {
+                    if t.if_not_exists {
+                        return Ok(());
+                    }
+                    return Err(Error::AlreadyExists(format!(
+                        "trigger {} already exists",
+                        t.name
+                    )));
+                }
                 let trig = crate::schema::Trigger {
                     name: t.name.clone(),
                     table: t.table.clone(),
@@ -10629,7 +10744,10 @@ impl Database {
                     .get_table(&a.table)
                     .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
                 if catalog.get_table(&new_name).is_some() {
-                    return Err(Error::AlreadyExists(format!("table: {}", new_name)));
+                    return Err(Error::AlreadyExists(format!(
+                        "there is already another table or index with this name: {}",
+                        new_name
+                    )));
                 }
                 let old_name = table.name.clone();
                 let root = table.root_page;
@@ -10649,9 +10767,12 @@ impl Database {
                     .into();
 
                 // Move the catalog entry (indexes + triggers follow).
-                catalog
-                    .rename_table(&old_name, &new_name)
-                    .ok_or_else(|| Error::AlreadyExists(format!("table: {}", new_name)))?;
+                catalog.rename_table(&old_name, &new_name).ok_or_else(|| {
+                    Error::AlreadyExists(format!(
+                        "there is already another table or index with this name: {}",
+                        new_name
+                    ))
+                })?;
                 // Replace the moved entry's Arc with the rebuilt table.
                 catalog.replace_table(&new_name, rebuilt);
                 // The OLD name's cached root must be retired from the
@@ -10688,6 +10809,19 @@ impl Database {
                 let table = catalog
                     .get_table(&a.table)
                     .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
+                // SQLite: adding a name that already exists (case-
+                // insensitive) errors; the engine used to append a
+                // DUPLICATE column silently.
+                if table
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+                {
+                    return Err(Error::AlreadyExists(format!(
+                        "duplicate column name: {}",
+                        column.name
+                    )));
+                }
                 let root = table.root_page;
                 // SQLite restrictions: the new column may not be PRIMARY
                 // KEY or UNIQUE, and must either be nullable or carry a
@@ -10882,7 +11016,10 @@ impl Database {
                     .iter()
                     .any(|c| c.name.eq_ignore_ascii_case(&new))
                 {
-                    return Err(Error::AlreadyExists(format!("column: {}", new)));
+                    return Err(Error::AlreadyExists(format!(
+                        "duplicate column name: {}",
+                        new
+                    )));
                 }
                 if new.is_empty()
                     || new

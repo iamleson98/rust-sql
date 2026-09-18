@@ -71,10 +71,12 @@ fn analyze_writes_sqlite_stat1_rows() {
             String::from("idx_a"),
             String::from("100 10"),
         ),
+        // SQLite writes avg eq-class sizes: 100 rows / 20 distinct
+        // (a,b) pairs = 5 ("100 10 5" — verified vs real SQLite).
         (
             String::from("t"),
             String::from("idx_ab"),
-            String::from("100 10 20"),
+            String::from("100 10 5"),
         ),
     ];
     assert_eq!(
@@ -112,8 +114,10 @@ fn analyze_target_table_only() {
     // u's row survives untouched; t's row was re-collected.
     assert_eq!(rows.len(), 2);
     let u_row = rows.iter().find(|r| r[0].as_text() == "u").unwrap();
-    assert_eq!(u_row[2].as_text(), "4 4");
+    // SQLite: 4 distinct values over 4 rows -> D1 = ceil(4/4) = 1.
+    assert_eq!(u_row[2].as_text(), "4 1");
     let t_row = rows.iter().find(|r| r[0].as_text() == "t").unwrap();
+    // SQLite: 3 rows / 2 distinct -> ceil(3/2) = 2.
     assert_eq!(t_row[2].as_text(), "3 2");
 
     // Unknown target errors like SQLite.
@@ -124,7 +128,7 @@ fn analyze_target_table_only() {
     let rows = db
         .query("SELECT tbl, stat FROM sqlite_stat1 WHERE idx = 'idx_b'", ())
         .unwrap();
-    assert_eq!(rows[0][1].as_text(), "4 4");
+    assert_eq!(rows[0][1].as_text(), "4 1");
 }
 
 /// The planner actually uses the statistics: after ANALYZE, a query on
@@ -257,14 +261,15 @@ fn analyze_stats_survive_reopen() {
         let rows = db
             .query("SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_v'", ())
             .unwrap();
-        assert_eq!(rows[0][0].as_text(), "100 7");
+        // SQLite: 100 rows / 7 distinct -> ceil(100/7) = 15.
+        assert_eq!(rows[0][0].as_text(), "100 15");
     }
     // Reopen: stats load from disk (load_schema's stat-table walk).
     let db2 = Database::open(&path).unwrap();
     let rows = db2
         .query("SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_v'", ())
         .unwrap();
-    assert_eq!(rows[0][0].as_text(), "100 7");
+    assert_eq!(rows[0][0].as_text(), "100 15");
     // Answers still correct with the loaded stats.
     let c = db2.query("SELECT COUNT(*) FROM t WHERE v = 3", ()).unwrap();
     assert_eq!(c[0][0], Value::Integer(14));
@@ -330,6 +335,7 @@ fn analyze_expression_index() {
     let rows = db
         .query("SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_vx'", ())
         .unwrap();
-    // v*2 over 1..50: 50 distinct.
-    assert_eq!(rows[0][0].as_text(), "50 50");
+    // v*2 over 1..50: 50 distinct -> SQLite's D1 = ceil(50/50) = 1
+    // (the avg eq-class size, not the distinct count).
+    assert_eq!(rows[0][0].as_text(), "50 1");
 }

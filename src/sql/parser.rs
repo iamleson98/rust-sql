@@ -1079,6 +1079,14 @@ impl Parser {
 
     fn parse_create_trigger(&mut self, temp: bool) -> Result<Statement> {
         self.expect_keyword("TRIGGER")?;
+        let if_not_exists = if self.peek().is_keyword("IF") {
+            self.advance();
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
         let name = self.parse_ident()?;
         let when = if self.peek().is_keyword("BEFORE") {
             self.advance();
@@ -1147,6 +1155,7 @@ impl Parser {
         Ok(Statement::Create(CreateStatement::Trigger(CreateTrigger {
             name,
             temp,
+            if_not_exists,
             table,
             when,
             events,

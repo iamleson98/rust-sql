@@ -480,8 +480,13 @@ pub struct Catalog {
 pub struct IndexStats {
     /// Owning table's row count at ANALYZE time.
     pub rows: i64,
-    /// `D1..Dk` — distinct counts for the index's column prefixes.
-    /// Empty when the stat row carried only the table row count.
+    /// SQLite's `D1..Dk` — the stat column's numbers after the first:
+    /// for each prefix i, the (ceil'd) average number of rows sharing
+    /// the first i values — analyze.c's `I = (K+D-1)/D` with the
+    /// `I==2 && K*10<=D*11 -> 1` refinement. D_k IS the equality
+    /// selectivity estimate for k bound columns (`WHERE a=? AND b=?`
+    /// matches D_k rows), NOT a distinct count. Empty when the stat row
+    /// carried only the table row count.
     pub distinct_prefix: Vec<i64>,
 }
 
@@ -498,20 +503,25 @@ impl IndexStats {
     }
 
     /// SQLite's row-estimate model for an equality lookup over the first
-    /// `k` bound columns: `rows / (D1 × … × Dk)`, floored at 1. Missing
-    /// stats degrade to 0 (caller treats unknown as "no estimate").
+    /// `k` bound columns: `D_k` — the stat column's k-th number is
+    /// itself "an estimate of the number of rows matched by an equality
+    /// query ... with the corresponding number of fields" (statGet in
+    /// analyze.c). Missing stats degrade to 0 (caller treats unknown as
+    /// "no estimate"); a non-positive D (empty-index "0 0" row) is no
+    /// estimate either.
     pub fn estimate_eq(&self, k: usize) -> i64 {
         if self.rows <= 0 {
             return 0;
         }
-        let mut est = self.rows as f64;
-        for d in self.distinct_prefix.iter().take(k) {
-            if *d <= 0 {
-                return 1;
-            }
-            est /= *d as f64;
+        match self.distinct_prefix.get(k.wrapping_sub(1)) {
+            Some(&d) if d > 0 => d,
+            // D==0 on a non-empty table: no usable estimate.
+            Some(_) => 0,
+            // k==0 (no bound columns): every row matches.
+            None if k == 0 => self.rows,
+            // Beyond the stat prefixes: unknown.
+            None => 0,
         }
-        est.max(1.0) as i64
     }
 
     /// Render back to the `stat` column text.
