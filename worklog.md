@@ -719,3 +719,29 @@ Work Log:
 
 Stage Summary:
 - SQLite-format persistence now follows SQLite's actual commit protocols in both journal modes: page-granular I/O, crash atomicity via hot journals (byte-compatible with the sqlite3 CLI's own recovery), incremental WAL checkpoints. The remaining documented cost is the O(db) CPU image rebuild per commit boundary — batching in explicit transactions (SQLite's own advice for bulk loads) is the standing guidance for write-heavy interchange files.
+
+Task ID: 21
+Agent: main (Super Z)
+Task: Fix the fuzz-campaign commit's CI failures (tests, clippy, oom-injection, bench gates) — crash-consistency hardening found by the OOM sweep
+
+Work Log:
+- CI run 35202569229 on 151a2c7 (fuzz campaign 1) failed: test jobs (3 OSes), oom-injection, clippy, and all bench gates. Reproduced each locally (fresh sandbox: re-cloned, rustup 1.98.1 reinstalled).
+- tests: fused_range_scan::real_and_text_bounds_decline_fused expected 1 for `a BETWEEN '5' AND 'z'` — real SQLite (verified with python sqlite3) returns 8 under NUMERIC affinity ('5' folds to 5, numbers < TEXT): the fuzz commit's affinity fix was CORRECT, the old expectation pinned the buggy behavior. Updated to 8 with the datatype3 §4.2 rationale.
+- clippy: compat crate had `&bytes[..8] == &DB_MAGIC` (op_ref, -D warnings) — fixed.
+- BENCH GATES: the entire Gate-1..4 failure was ONE leftover debug print in finalize_agg — `DBG BAD STATE` eprintln + `Backtrace::force_capture()` fired per GROUP per query (GROUP BY agg 20ms -> 351ms, 17x). Removed it + 5 other cold-path DBG eprintlns (kept the env-gated ones). All 4 gates pass again (Gate1 18/18, Gate2 20/20, Gate3 8/8, Gate4 11W/1T/0L).
+- OOM-INJECTION (the deep one — 5 distinct engine bugs, all found by a custom 2-process fault-sweep harness, ~4000 crash/recovery cycles):
+  1. flush_inner_delete wrote dirty pages in hash order: a parent interior page could land before the new child it references -> "page N out of range (n_pages=N)" after any mid-flush abort. Now a THREE-PHASE schedule: new page bodies (>= committed bound) -> page-0 header -> old pages, all descending within phases; the DELETE-mode spill drain merged into the same pass.
+  2. allocate_page/allocate_pages popped the freelist with the count decrement AFTER fallible mutations: an OOM error between `head.store(next=0)` and the count fix left count>0/head==0, and the exit flush persisted it ("corrupt freelist"). Count now decrements FIRST (every torn exit under-reports = benign page leak).
+  3. truncate_tail subtracted `removed` from a possibly-drifted count; when the chain emptied this froze the drift as (count>0, head=0) poison. The walk now RECOMPUTES the surviving count from the chain itself (Σ kept entries + kept trunks).
+  4. free_page on the current head-trunk page appended the trunk to its OWN entry array (count over-report by one). Double-free guard added.
+  5. read_header now reconciles freelist_count against the actual chain walk (raw 8-byte reads, cycle-guarded, clean-termination-gated) — heals drifted files at every open; allocate paths self-heal (count>0 && head==0 -> count=0, extend the file) instead of erroring.
+  PLUS: rollback_autocommit_stmt — a FAILED autocommit write statement now restores the pager from the durable committed image (cache clear + WAL spilled/spill-sidecar drop + header restore from a stack buffer + file-tail trim). This is the statement-journal contract: mid-split OOM aborts used to leave half-built trees that the exit flush published as commits. Gated off for explicit transactions, deferred-flush mode, and lazy write-back (:memory: / sqlite-format bridge, where the backing image is not the committed state). The api epilogue clears the failed statement's overlay maps but KEEPS the undo's invalidation lists (set_max_rowid_lc writes THROUGH to the shared maps in autocommit — clearing the invalidations burned AUTOINCREMENT ids: [1,4,5] regression caught by fuzz_regressions).
+  wal.rs: read_frame_prefix_at — allocation-free header-prefix frame read for the rollback (the restore runs under the rigged allocator).
+- Parallel_join SIGKILLs are the 3.9GB sandbox OOM-killer (reproduced identically at CI-green 0a4917c) — not a regression; CI runners have the headroom.
+- Verified locally: default/sqlx/no-default/oom-injection matrices green; oom_fault 519 fault points baseline-intact; custom sweep 1..=2000 fault points with a control workload after every crash: zero corruptions; crash_recovery/durability/integrity/db_corrupt_fuzz green; clippy (default/sqlx/no-default/workspace) -D warnings clean; fmt clean; doc 5/5; compat 55/55; torture 0.25 scale 0 gate failures; bench gates 1-4 all PASS.
+
+Stage Summary:
+- The OOM fault-injection suite is the harness that found everything: 5 freelist/flush crash-consistency bugs + the missing statement-atomicity restore, each one a "torn write the next open cannot survive" class.
+- DELETE-mode flush ordering contract is now 3-phase (new pages -> header -> old pages) + open-time freelist reconciliation + torn-state self-heal.
+- The bench-gate "regression" of the fuzz commit was entirely a debug print; the campaign's semantic fixes are performance-neutral.
+- Ready to commit + push; watch CI to green.

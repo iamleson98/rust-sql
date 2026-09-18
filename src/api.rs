@@ -4677,6 +4677,27 @@ impl Database {
         self.insert_chain_hot.store(true, Ordering::Relaxed);
     }
 
+    /// Failed-fast-insert recovery: the fast INSERT paths return their
+    /// errors BEFORE the general epilogue, so the autocommit
+    /// statement-atomicity restore (see the epilogue's
+    /// `rollback_autocommit_stmt` block for the full rationale) must run
+    /// here too. The maps are not detached on this path (the fast paths
+    /// consult `self.maps` in place), so the restore additionally breaks
+    /// the insert chain and invalidates the statement cache — the
+    /// statement's root moves never landed durably.
+    fn recover_failed_autocommit_fastpath(&mut self) {
+        if !self.in_transaction.load(Ordering::Acquire)
+            && !self.deferred_flush.load(Ordering::Acquire)
+            && self.pager.dirty_page_count() > 0
+        {
+            if let Err(rb_err) = self.pager.rollback_autocommit_stmt() {
+                eprintln!("autocommit-statement rollback failed after fast-path error: {rb_err}");
+            }
+        }
+        self.invalidate_stmt_cache();
+        self.break_insert_chain();
+    }
+
     /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
     ///
     /// Returns `Ok(true)` when executed, `Ok(false)` when the fast path
@@ -5431,12 +5452,20 @@ impl Database {
                     return Err(Self::concurrent_regime_busy());
                 }
                 if !conc_owner {
-                    if self.exec_chained_insert(sql)? {
+                    let chained = self.exec_chained_insert(sql);
+                    if chained.is_err() {
+                        self.recover_failed_autocommit_fastpath();
+                    }
+                    if chained? {
                         self.note_foreign_write()?;
                         return Ok(());
                     }
                     if let Some(fi) = try_fast_insert_parse(sql) {
-                        if self.exec_fast_insert(fi)? {
+                        let fast = self.exec_fast_insert(fi);
+                        if fast.is_err() {
+                            self.recover_failed_autocommit_fastpath();
+                        }
+                        if fast? {
                             self.note_foreign_write()?;
                             return Ok(());
                         }
@@ -5912,6 +5941,59 @@ impl Database {
                 // Exceptional by construction (a healthy b-tree always
                 // undoes) — loud on purpose.
                 eprintln!("stmt-undo replay failed after statement error: {undo_err}");
+            }
+        }
+        // ── Autocommit statement-atomicity (page level) ──
+        // A FAILED autocommit write statement is a rolled-back implicit
+        // transaction: its page-level work (half-finished splits,
+        // freelist pops, file growth) must not survive to the next
+        // flush — the pre-statement durable image is the committed
+        // state, and nothing mid-statement ever writes the main file
+        // (WAL frames / DELETE sidecar only). The row-level stmt_undo
+        // above is logical and best-effort; this restore is physical
+        // and total. Without it, an allocation failure mid-split left
+        // the cache holding an interior cell pointing at a page that
+        // was never materialized, which the exit flush then published
+        // as if it were a commit (found by the OOM fault-injection
+        // sweep: "page N out of range", "freelist trunk X claims
+        // 3943629056 entries").
+        //
+        // Gates: (a) no explicit transaction (its ROLLBACK owns
+        // recovery), (b) flush-per-statement mode (in deferred mode
+        // dirty pages span earlier COMMITTED-but-unflushed statements
+        // and this restore would drop them), (c) the statement actually
+        // dirtied pages (read-only failures have nothing to undo).
+        if result.is_err()
+            && !ctx.in_transaction
+            && !ctx.deferred_flush
+            && self.pager.dirty_page_count() > 0
+        {
+            if let Err(rb_err) = self.pager.rollback_autocommit_stmt() {
+                // Loud: the engine is now in an unspecified dirty state.
+                eprintln!("autocommit-statement rollback failed after statement error: {rb_err}");
+            } else {
+                // The overlay maps below hold the failed statement's root
+                // moves / rowid caches / index roots — they point at
+                // pages the restore just discarded. Clearing them makes
+                // the epilogue's `extend` merges no-ops, so `ctx.shared`
+                // (the detached pre-statement maps) re-attaches without
+                // them. The INVALIDATED lists are deliberately KEPT and
+                // replayed: `set_max_rowid_lc`'s autocommit fast path
+                // writes max-rowid bumps THROUGH to `ctx.shared` in
+                // place (zero-alloc hot path), so the shared maps are
+                // NOT pristine after a failed statement — the undo's
+                // invalidation entries are exactly what removes those
+                // poisoned keys (clearing them left a stale raised max
+                // behind and burned AUTOINCREMENT ids).
+                ctx.root_overrides.clear();
+                ctx.max_rowids.clear();
+                ctx.index_roots.clear();
+                // Statement-embedded plans may carry the failed
+                // statement's roots; the next execute re-plans.
+                self.invalidate_stmt_cache();
+                // The chained-insert fast path's hints (leaf, max
+                // rowid) were built over the discarded pages.
+                self.break_insert_chain();
             }
         }
         self.in_transaction

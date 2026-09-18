@@ -63,16 +63,14 @@ fn child_workload(db_path: &std::path::Path) -> i32 {
         return 5;
     }
     for i in 1..=50i64 {
-        if db
-            .execute(
-                "INSERT INTO oom_t (v, r) VALUES (?, ?)",
-                [
-                    Value::Text(format!("child-{}", i).into()),
-                    Value::Real(i as f64 / 4.0),
-                ],
-            )
-            .is_err()
-        {
+        if let Err(e) = db.execute(
+            "INSERT INTO oom_t (v, r) VALUES (?, ?)",
+            [
+                Value::Text(format!("child-{}", i).into()),
+                Value::Real(i as f64 / 4.0),
+            ],
+        ) {
+            eprintln!("oom_fault child: INSERT {} failed: {}", i, e);
             return 6;
         }
     }

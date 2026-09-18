@@ -378,6 +378,27 @@ impl Wal {
         Ok(())
     }
 
+    /// Read the FIRST `buf.len()` bytes of a frame's page body — a
+    /// prefix read for recovery paths that only need the file header
+    /// (first 100 bytes of page 0) and must not allocate a full page
+    /// buffer (the autocommit-failure restore runs under a rigged
+    /// allocator). Same salt validation as [`Self::read_frame_at`].
+    pub fn read_frame_prefix_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if buf.len() > self.page_size as usize {
+            return Err(Error::InvalidArgument(
+                "read_frame_prefix_at: buffer larger than a page".to_string(),
+            ));
+        }
+        let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
+        read_exact_at(&self.file, &mut fh_buf, offset)?;
+        let fh = FrameHeader::decode(&fh_buf)?;
+        if fh.salt1 != self.header.salt1 || fh.salt2 != self.header.salt2 {
+            return Err(Error::corruption("WAL frame salt mismatch"));
+        }
+        read_exact_at(&self.file, buf, offset + FRAME_HEADER_SIZE as u64)?;
+        Ok(())
+    }
+
     /// Current salts (diagnostics).
     pub fn salts(&self) -> (u32, u32) {
         (self.header.salt1, self.header.salt2)

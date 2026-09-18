@@ -231,6 +231,13 @@ path = "tests/oom_fault.rs"
 harness = false
 required-features = ["oom-injection"]
 
+# Exhaustive local OOM sweep driver (the CI test samples; campaigns run
+# the full range). See examples/oom_sweep.rs for usage.
+[[example]]
+name = "oom_sweep"
+path = "examples/oom_sweep.rs"
+required-features = ["oom-injection"]
+
 [[bench]]
 name = "point_lookup"
 harness = false

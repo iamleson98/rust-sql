@@ -1934,6 +1934,48 @@ impl Pager {
                 actual_size, expected_size, n_pages, page_size
             )));
         }
+
+        // FREELIST RECONCILIATION: the header's count field can drift
+        // above the chain's real size after a torn (mid-flush aborted)
+        // commit — page writes land before the header write, so a crash
+        // between them leaves e.g. a trunk whose K was decremented while
+        // the header still claims the old count (found by the OOM
+        // fault-injection sweep: the drift later surfaces as
+        // "freelist count > 0 but freelist head is 0" once a mass-delete
+        // truncates the chain away). The trunk chain IS the freelist;
+        // the count is derived bookkeeping. Walk it (raw reads, no
+        // cache) and store the walked truth when the walk terminates
+        // cleanly. A walk that exhausts its step budget (a cycle in a
+        // corrupt file) keeps the header's value for integrity_check
+        // to diagnose. Entries are capped at the trunk capacity, so a
+        // torn trunk body cannot inflate the recount arbitrarily.
+        {
+            let mut cur = freelist_head;
+            let mut walked: u32 = 0;
+            let mut steps = n_pages.saturating_add(4);
+            let mut clean = cur == 0;
+            while cur != 0 && cur < n_pages && steps > 0 {
+                steps -= 1;
+                let mut trunk8 = [0u8; 8];
+                if self
+                    .read_file_at(cur as u64 * page_size as u64, &mut trunk8)
+                    .is_err()
+                {
+                    break;
+                }
+                let next = u32::from_le_bytes(trunk8[0..4].try_into().unwrap_or([0; 4]));
+                let k = u32::from_le_bytes(trunk8[4..8].try_into().unwrap_or([0; 4]));
+                let cap = (page_size / 4).saturating_sub(2);
+                walked = walked.saturating_add(1 + k.min(cap));
+                cur = next;
+                if cur == 0 {
+                    clean = true;
+                }
+            }
+            if clean && walked != freelist_count {
+                self.freelist_count.store(walked, Ordering::Release);
+            }
+        }
         Ok(())
     }
 
@@ -2926,6 +2968,18 @@ impl Pager {
     /// (K == 0), the trunk page itself is handed out and the head moves
     /// to `next_trunk` — O(1), no re-linking writes.
     pub fn allocate_page(&self) -> Result<PageId> {
+        // SELF-HEAL (torn-commit tolerance): a mid-flush abort can leave
+        // the durable header's count above the (empty) chain — the
+        // reconciliation at open fixes it for fresh opens, this covers
+        // the in-process window. Extending the file matches SQLite's
+        // empty-freelist behavior; the leaked pages are reclaimed by a
+        // later free. The old hard error ("corrupt freelist") turned a
+        // survivable tear into a permanent failure.
+        if self.freelist_count.load(Ordering::Acquire) > 0
+            && self.freelist_head.load(Ordering::Acquire) == 0
+        {
+            self.freelist_count.store(0, Ordering::Release);
+        }
         // Concurrent regime: fresh pages only, parked in the armed
         // transaction's shadows. The freelist is deliberately bypassed —
         // popping it would mutate shared state (trunk pages + atomics)
@@ -2960,6 +3014,27 @@ impl Pager {
                 )
             };
             let freed: PageId;
+            // Decrement the count FIRST, before any fallible mutation
+            // (get_page allocates — under OOM injection it can Err).
+            // ERROR-ATOMICITY INVARIANT: every torn exit of this pop must
+            // leave `freelist_count` LESS THAN OR EQUAL TO the entries
+            // actually reachable from `freelist_head`. An over-reporting
+            // tear (count > 0 while the head already advanced — e.g.
+            // head=0) survives a clean process exit and lands in the
+            // flushed header, permanently poisoning every later open
+            // ("freelist count > 0 but freelist head is 0" — found by
+            // the OOM fault-injection sweep). Under-reporting tears only
+            // leak a page: allocate_page extends the file instead, and
+            // the next free_page re-links the chain — always benign.
+            self.freelist_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                    if x > 0 {
+                        Some(x - 1)
+                    } else {
+                        None
+                    }
+                })
+                .map_err(|_| Error::corruption("freelist underflow"))?;
             if k_entries > 0 {
                 // Pop the LAST leaf entry: one 4-byte write to the trunk.
                 let last = 8 + (k_entries as usize - 1) * 4;
@@ -2990,16 +3065,6 @@ impl Pager {
                 drop(borrowed);
                 self.note_dirty(head);
             }
-            // Use fetch_sub to safely decrement without overflow.
-            self.freelist_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
-                    if x > 0 {
-                        Some(x - 1)
-                    } else {
-                        None
-                    }
-                })
-                .map_err(|_| Error::corruption("freelist underflow"))?;
 
             // Clear the handed-out page before reuse (the recycled body
             // may still hold the old tree's bytes in the cache or file).
@@ -3087,6 +3152,13 @@ impl Pager {
             }
         }
         let mut out: Vec<(PageId, PageRef)> = Vec::with_capacity(n);
+        // SELF-HEAL: see allocate_page — an empty chain with a drifted
+        // count extends the file instead of erroring.
+        if self.freelist_count.load(Ordering::Acquire) > 0
+            && self.freelist_head.load(Ordering::Acquire) == 0
+        {
+            self.freelist_count.store(0, Ordering::Release);
+        }
         // Phase 1: freelist pops (exact single-page semantics, batched).
         for _ in 0..n {
             let current_free_count = self.freelist_count.load(Ordering::Acquire);
@@ -3113,6 +3185,19 @@ impl Pager {
                 )
             };
             let freed: PageId;
+            // Same error-atomicity invariant as the single-page pop:
+            // count decrements FIRST, so every torn exit under-reports
+            // (benign page leak) instead of over-reporting (head=0 with
+            // count>0 — a persistent poison).
+            self.freelist_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                    if x > 0 {
+                        Some(x - 1)
+                    } else {
+                        None
+                    }
+                })
+                .map_err(|_| Error::corruption("freelist underflow"))?;
             if k_entries > 0 {
                 let last = 8 + (k_entries as usize - 1) * 4;
                 let page = self.get_page(head)?;
@@ -3138,15 +3223,6 @@ impl Pager {
                 drop(borrowed);
                 self.note_dirty(head);
             }
-            self.freelist_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
-                    if x > 0 {
-                        Some(x - 1)
-                    } else {
-                        None
-                    }
-                })
-                .map_err(|_| Error::corruption("freelist underflow"))?;
             let page_ref = self.get_page(freed)?;
             // Clear the handed-out page before reuse (the recycled body
             // may still hold the old tree's bytes in the cache or file) —
@@ -3236,6 +3312,14 @@ impl Pager {
         // though the durable copy is never touched).
         let page_ref = self.get_page(id)?;
         let head = self.freelist_head.load(Ordering::Acquire);
+        // Double-free guard: `id` is already the head trunk — freeing it
+        // again would append the page to its OWN entry array (the count
+        // then claims one more free page than exists; every later
+        // truncate/mass-delete that empties the chain leaves
+        // "count > 0 with head == 0" behind). The page is already free.
+        if id == head && id != 0 {
+            return Ok(());
+        }
         let psz = self.page_size() as usize;
         let trunk_cap = (psz.saturating_sub(8)) / 4;
         let mut became_trunk = false;
@@ -3363,9 +3447,17 @@ impl Pager {
         // entries < k (compacted in place); the chain is re-linked.
         {
             let mut cur = self.freelist_head.load(Ordering::Acquire);
-            let mut removed: u32 = 0;
             let mut new_head: PageId = 0;
             let mut prev_kept: PageId = 0;
+            // Recompute the surviving count from the walk itself instead
+            // of subtracting `removed` from the (possibly drifted) atomic
+            // count: every KEPT trunk contributes itself (a free page)
+            // plus its surviving entries. The old subtraction kept any
+            // pre-existing over-report alive — a drifted count with an
+            // emptied chain left "count > 0 but head == 0", permanently
+            // poisoning the file after the next flush (found by the OOM
+            // fault-injection sweep).
+            let mut kept_pages: u32 = 0;
             // Cycle guard: the trunk chain can't be longer than the old
             // page count; a corrupt file stops the walk.
             let mut steps = (self.freelist_count.load(Ordering::Acquire) + n).max(1);
@@ -3391,12 +3483,12 @@ impl Pager {
                     (next, kn, entries)
                 };
                 if cur >= k {
-                    // The whole trunk page is gone: it + its entries all
-                    // count as removed freelist pages.
-                    removed += 1 + k_entries as u32;
+                    // The whole trunk page is gone: it + its entries are
+                    // all removed from the freelist.
                 } else {
                     let kept: Vec<u32> = entries.into_iter().filter(|&e| e < k).collect();
-                    removed += (k_entries - kept.len()) as u32;
+                    // The kept trunk itself stays a free page.
+                    kept_pages += 1 + kept.len() as u32;
                     if kept.len() != k_entries {
                         // Rewrite the compacted entry array + K.
                         let page = self.get_page(cur)?;
@@ -3425,9 +3517,7 @@ impl Pager {
                 cur = next;
             }
             self.freelist_head.store(new_head, Ordering::Release);
-            if removed > 0 {
-                self.freelist_count.fetch_sub(removed, Ordering::AcqRel);
-            }
+            self.freelist_count.store(kept_pages, Ordering::Release);
         }
 
         // --- drop [k, n) from the cache, LRU, dirty set, WAL map ---
@@ -4455,6 +4545,119 @@ impl Pager {
         }
     }
 
+    /// Roll the pager back to the last DURABLE COMMITTED state — the
+    /// recovery point for a FAILED AUTOCOMMIT write statement.
+    ///
+    /// Soundness: mid-statement evictions never write the main file
+    /// (dirty pages go to WAL frames or the DELETE-mode sidecar, both
+    /// uncommitted), so the main file plus the WAL committed map hold
+    /// exactly the pre-statement image. Restoring from them discards
+    /// every page-level effect of the failed statement — half-finished
+    /// B+tree splits (an interior cell pointing at a page that was
+    /// never materialized), freelist pops/pushes, and file growth —
+    /// instead of letting the next flush (or the process-exit flush)
+    /// publish them as if they were a commit.
+    ///
+    /// This is the autocommit counterpart of the `__begin__` savepoint
+    /// ROLLBACK: an autocommit statement IS its own transaction, so its
+    /// failure must leave NOTHING behind (SQLite's statement-journal
+    /// contract). The savepoint machinery is deliberately NOT used
+    /// here — pushing a savepoint per statement would pre-image every
+    /// page the statement touches (~2-6 x 4 KB copies on the hot INSERT
+    /// path); restoring from the durable image costs nothing on the
+    /// success path and only runs on failure.
+    ///
+    /// Preconditions (caller-checked): no explicit transaction is open
+    /// (`in_transaction == false`) and flush-per-statement is active
+    /// (not deferred-flush mode — there, dirty pages span several
+    /// committed-but-unflushed statements and this restore would drop
+    /// them).
+    pub fn rollback_autocommit_stmt(&self) -> Result<()> {
+        // LAZY WRITE-BACK (in-memory / sqlite-format-bridge databases):
+        // the backing image is NOT the committed state (it lags many
+        // statements behind), so "restore from disk" would discard
+        // committed-but-unwritten work. These pagers keep their committed
+        // state ONLY in the cache — the restore is impossible; the
+        // caller's row-level stmt_undo remains the recovery mechanism.
+        if self.lazy_writeback.load(Ordering::Acquire) || self.store.is_memory() {
+            return Ok(());
+        }
+        // 1. The failed statement's sidecar spills are dead work (the
+        //    main file was never touched mid-statement).
+        self.drop_delete_spill();
+        // 2. Drop the whole cache — every cached mutation of the failed
+        //    statement (and any page it fetched) is untrusted; the
+        //    committed bytes are re-read on demand from the WAL map or
+        //    the file.
+        {
+            let mut cache = self.cache.write();
+            cache.clear();
+        }
+        self.lru.lock().clear();
+        self.dirty_pages.lock().clear();
+        self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+        // 3. Uncommitted WAL spill frames of the failed statement: dead.
+        if let Some(state) = self.wal.write().as_mut() {
+            state.spilled.clear();
+        }
+        // 4. Advisory caches (btree leaf hints, root-children routing)
+        //    were built over the failed statement's live bytes.
+        self.write_version.fetch_add(1, Ordering::Relaxed);
+        // 5. An armed tail truncation belonged to the failed work.
+        self.pending_truncate.store(0, Ordering::Release);
+        // 6. Mutable metadata from the durable committed header (WAL
+        //    committed page 0 frame, else the main file): n_pages,
+        //    freelist head/count, schema cookie, committed bound.
+        //    DELIBERATELY ALLOCATION-FREE on the main-file path (a
+        //    100-byte stack buffer): this restore runs while the
+        //    allocator is still rigged to fail (the very failure that
+        //    triggered it), so a Vec here would abort the rollback
+        //    itself.
+        {
+            let mut hdr = [0u8; 100];
+            let mut restored = false;
+            {
+                let wal_guard = self.wal.read();
+                if let Some(state) = wal_guard.as_ref() {
+                    if let Some(&offset) = state.map.get(&0) {
+                        if state.wal.read_frame_prefix_at(offset, &mut hdr).is_ok() {
+                            restored = true;
+                        }
+                    }
+                }
+            }
+            if !restored {
+                self.read_file_at(0, &mut hdr)?;
+            }
+            let n_pages = u32::from_le_bytes(hdr[16..20].try_into().unwrap_or([0; 4]));
+            let freelist_head = u32::from_le_bytes(hdr[20..24].try_into().unwrap_or([0; 4]));
+            let freelist_count = u32::from_le_bytes(hdr[24..28].try_into().unwrap_or([0; 4]));
+            let schema_cookie = u32::from_le_bytes(hdr[28..32].try_into().unwrap_or([0; 4]));
+            self.n_pages.store(n_pages, Ordering::Release);
+            self.freelist_head.store(freelist_head, Ordering::Release);
+            self.freelist_count.store(freelist_count, Ordering::Release);
+            self.schema_cookie.store(schema_cookie, Ordering::Release);
+            self.committed_n_pages.store(n_pages, Ordering::Release);
+        }
+        // 7. In DELETE mode the failed statement's page allocations may
+        //    have grown the main file (a flush wrote pages but died
+        //    before the header). Trim the physical tail back to the
+        //    committed count so a later open never sees "extra" pages.
+        //    In WAL mode the main-file tail is advisory (reads go
+        //    through the committed map), so the trim is harmless.
+        let committed = self.committed_n_pages.load(Ordering::Acquire);
+        let target_size = committed as u64 * self.page_size.load(Ordering::Acquire) as u64;
+        if let Ok(len) = self.store.len() {
+            if len > target_size {
+                let _ = self.store.set_len(target_size);
+            }
+        }
+        self.n_pages.store(committed, Ordering::Release);
+        // 8. Nothing is dirty anymore.
+        self.dirty_count_approx.store(0, Ordering::Release);
+        Ok(())
+    }
+
     /// True when no page is currently spilled to the DELETE-mode
     /// sidecar (quiescent-state check for journal-mode switches and
     /// integrity probes).
@@ -4514,14 +4717,16 @@ impl Pager {
     /// DELETE-mode flush body: scattered page writes + header refresh +
     /// fsync.
     ///
-    /// ORDERING CONTRACT (crash safety): the header — the only place the
-    /// committed `n_pages` lives — is written LAST, after every other
-    /// page and before the truncating `set_len`. A crash at ANY point
-    /// then leaves the file at least as long as the header claims
-    /// (extra tail bytes are ignored at open), never shorter; the
-    /// "file size < n_pages * page_size" corruption is unreachable. The
-    /// previous header-first order left a window (header written, new
-    /// pages not yet) that the OOM fault-injection suite hits.
+    /// ORDERING CONTRACT (crash safety): the durable committed page count
+    /// bounds what the header exposes; the write schedule is three-phase
+    /// — new page bodies, then the header (page 0), then the old pages'
+    /// new bytes (see the schedule note below). A crash at ANY point
+    /// leaves the file at least as long as the header claims (extra tail
+    /// bytes are ignored at open), never shorter, and every tree pointer
+    /// the old header can reach resolves to a written page. The
+    /// historical header-first order left a length window; the
+    /// intermediate pages-then-header order left a dangling-child window
+    /// (both were found by the OOM fault-injection suite).
     pub(crate) fn flush_inner_delete(&self) -> Result<()> {
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
@@ -4584,9 +4789,94 @@ impl Pager {
             ids
         };
 
-        for id in dirty_ids {
-            // Use a single cache read lock to look up the page; clone the Arc
-            // and release the lock before doing I/O.
+        // DELETE-MODE SPILL DRAIN: mid-transaction cache-pressure evictions
+        // wrote the newest uncommitted versions to the sidecar (never the
+        // main file). This is the COMMIT moment — copy every spilled record
+        // into the main file, still BEFORE the header write (the crash
+        // ordering contract: data pages first, header last). A partially
+        // failed drain behaves exactly like a failed dirty-page write above
+        // (the error propagates; ROLLBACK discards the rest).
+        //
+        // The spill drain is hoisted BEFORE the dirty-page loop and merged
+        // into ONE descending-id write pass with it — see the ordering note
+        // below (an in-cache dirty page may reference a spilled page and
+        // vice versa; a single total order is the only sound schedule).
+        // The sidecar bytes are copied out under the spill lock ONLY (the
+        // eviction path takes the spill lock while holding the cache write
+        // lock — holding it across the loop's cache reads would be an ABBA
+        // deadlock).
+        let spilled_bodies: std::collections::HashMap<PageId, Vec<u8>, PageIdHashBuild> = {
+            let mut spill_guard = self.delete_spill.lock();
+            match spill_guard.as_mut() {
+                Some(spill) if !spill.pages.is_empty() => {
+                    let psz = self.page_size() as usize;
+                    let mut out = std::collections::HashMap::default();
+                    let drained: Vec<(PageId, u64)> = spill.pages.drain().collect();
+                    for (id, off) in drained {
+                        let mut buf = vec![0u8; psz];
+                        match spill.read_page_at(off, &mut buf) {
+                            Ok(()) => {
+                                out.insert(id, buf);
+                            }
+                            Err(e) => {
+                                // Restore the entry so the page is not
+                                // silently lost — the error propagates below
+                                // via the same "failed drain" contract as a
+                                // failed dirty-page write.
+                                spill.pages.insert(id, off);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    out
+                }
+                _ => std::collections::HashMap::default(),
+            }
+        };
+
+        // WRITE ORDER (crash safety, part 2 of the ordering contract):
+        // DESCENDING page id — newly allocated page bodies (the HIGHEST
+        // ids: fresh splits, overflow chains, reused-freelist leaves) land
+        // on disk BEFORE the older, lower-id pages whose new bytes point at
+        // them. The old order (arbitrary hash order) could write a parent
+        // interior page whose new cell references the not-yet-written new
+        // child: a crash in that window left the committed tree pointing
+        // at a page that does not exist ("page N out of range", found by
+        // the OOM fault-injection sweep — the torn write is walkable by
+        // nothing). With the new/changed referent written first, every
+        // crash prefix leaves each already-written page referencing only
+        // pages that are themselves already written (or, for pages beyond
+        // the not-yet-updated header count, unreachable — extra tail bytes
+        // the open path ignores by design). Page 0 (schema + header)
+        // remains LAST, as before.
+        let mut write_order: Vec<PageId> = dirty_ids
+            .into_iter()
+            .chain(spilled_bodies.keys().copied())
+            .collect();
+        write_order.sort_unstable_by(|a, b| b.cmp(a));
+        write_order.dedup();
+
+        // THREE-PHASE WRITE SCHEDULE (crash safety, part 3):
+        //   phase 1 — NEW pages (id >= the durable committed count)
+        //   phase 2 — page 0 (the header: n_pages, freelist, cookie)
+        //   phase 3 — OLD pages (id < the committed count)
+        // A crash anywhere leaves a consistent tree: before phase 2 the
+        // old header bounds every reachable page (new bodies are
+        // unreachable tail bytes, ignored by design); after phase 2 the
+        // new count covers the new pages, and the only unwritten pages
+        // are OLD ones whose new bytes nothing reachable depends on
+        // yet — their old bytes still stand. (The previous two-phase
+        // "pages-then-header" schedule tore the OTHER way: an aborted
+        // flush left an old interior page's new bytes on disk with a
+        // child pointer to a page the not-yet-written header did not
+        // count — "page N out of range" for every later open.)
+        let committed_bound = self.committed_n_pages.load(Ordering::Acquire);
+        let write_page = |id: PageId| -> Result<()> {
+            if let Some(bytes) = spilled_bodies.get(&id) {
+                return self.codec_write_page(id, bytes);
+            }
+            // Use a single cache read lock to look up the page; clone the
+            // Arc and release the lock before doing I/O.
             let page_ref = self.cache.read().get(id).cloned();
             if let Some(page_ref) = page_ref {
                 let mut borrowed = page_ref.lock();
@@ -4595,38 +4885,12 @@ impl Pager {
                     borrowed.dirty = false;
                 }
             }
+            Ok(())
+        };
+        for &id in write_order.iter().filter(|&&id| id >= committed_bound) {
+            write_page(id)?;
         }
-
-        // DELETE-MODE SPILL DRAIN: mid-transaction cache-pressure evictions
-        // wrote the newest uncommitted versions to the sidecar (never the
-        // main file). This is the COMMIT moment — copy every spilled record
-        // into the main file, still BEFORE the header write (the crash
-        // ordering contract: data pages first, header last). A partially
-        // failed drain behaves exactly like a failed dirty-page write above
-        // (the error propagates; ROLLBACK discards the rest).
-        {
-            let mut spill_guard = self.delete_spill.lock();
-            if let Some(spill) = spill_guard.as_mut() {
-                if !spill.pages.is_empty() {
-                    let psz = self.page_size() as usize;
-                    let mut buf = vec![0u8; psz];
-                    let entries: Vec<(PageId, u64)> = spill.pages.drain().collect();
-                    for (id, off) in entries {
-                        spill.read_page_at(off, &mut buf)?;
-                        self.codec_write_page(id, &buf)?;
-                    }
-                    // Reset the sidecar for the next transaction (truncate
-                    // in place — cheaper than delete + recreate).
-                    use std::io::Write;
-                    let _ = spill.file.set_len(0);
-                    let _ = spill.file.flush();
-                }
-            }
-        }
-
-        // ---- header LAST: every other page is durable; NOW commit the
-        // new page count. A crash before this point leaves the old
-        // (smaller or equal) n_pages with a file that covers it. ----
+        // ---- header: commit the new page count NOW (phase 2) ----
         if let Some(header) = &header_direct {
             self.codec_write_page(0, header)?;
         } else {
@@ -4639,6 +4903,20 @@ impl Pager {
                 }
             }
         }
+        for &id in write_order.iter().filter(|&&id| id < committed_bound) {
+            write_page(id)?;
+        }
+        // Reset the sidecar for the next transaction (truncate in place —
+        // cheaper than delete + recreate).
+        if !spilled_bodies.is_empty() {
+            let mut spill_guard = self.delete_spill.lock();
+            if let Some(spill) = spill_guard.as_mut() {
+                use std::io::Write;
+                let _ = spill.file.set_len(0);
+                let _ = spill.file.flush();
+            }
+        }
+
         // If skip_fsync is set (in-memory mode), sync_all is a no-op on
         // tmpfs anyway, but the syscall round-trip still costs ~5-50 µs.
         // Skip the entire call to make in-memory mode match SQLite's `:memory:`
