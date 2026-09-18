@@ -188,6 +188,104 @@ pub fn crc32(prev1: u32, prev2: u32, data: &[u8]) -> (u32, u32) {
     (c1, c2)
 }
 
+/// Process-wide WAL/engine lifecycle guard.
+///
+/// Serializes the close-time teardown of a retiring engine (`Pager::drop`:
+/// checkpoint into the main file + sidecar removal, and
+/// `Pager::disable_wal`) against the birth of the NEXT engine generation
+/// for the same path (`Database::open`: main-file read + catalog load +
+/// legacy-format upgrade; `Pager::enable_wal`: WAL file creation).
+///
+/// Why this exists — the 2026-09-18 datxevui.com outage: the shared
+/// engine's refcount hit zero (sqlx's pool retiring its whole startup
+/// cohort together at `max_lifetime`, default 30 min) while a request
+/// thread's pool-acquire was already creating the next generation.
+/// `Engine::drop` → `Pager::drop` ran `checkpoint + remove_file(<db>-wal)`
+/// with no coordination: the removal deleted the WAL file the NEW engine
+/// had just created at that path, stranding it on a deleted inode — every
+/// subsequent commit landed in the unlinked file (invisible, nothing
+/// durable on disk), and the layout eventually degraded into
+/// `(code 10) failed to fill whole buffer` and
+/// `(code 11) WAL frame salt mismatch` (SQLITE_CORRUPT) on every write.
+///
+/// Reentrant (same-thread): `Database::open` holds the guard across the
+/// legacy-format upgrade, whose temporary pager drops — and therefore
+/// checkpoints — on the same thread.
+pub fn lifecycle_guard() -> &'static parking_lot::ReentrantMutex<()> {
+    static GUARD: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+    &GUARD
+}
+
+/// Stable on-disk file identity: (device, inode) on Unix, (volume serial,
+/// file index) on Windows. `None` where the platform or the metadata read
+/// cannot provide it — callers must treat `None` as "do NOT remove".
+#[cfg(unix)]
+pub fn file_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(windows)]
+pub fn file_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    file.metadata()
+        .ok()
+        .map(|m| match (m.volume_serial_number(), m.file_index()) {
+            (Some(v), Some(i)) => Some((v as u64, i)),
+            _ => None,
+        })
+        .flatten()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn file_identity(file: &File) -> Option<(u64, u64)> {
+    let _ = file;
+    None
+}
+
+/// Identity of whatever file currently sits at `path` (`None` if the
+/// path is vacant or unreadable).
+#[cfg(unix)]
+pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(windows)]
+pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| match (m.volume_serial_number(), m.file_index()) {
+            (Some(v), Some(i)) => Some((v as u64, i)),
+            _ => None,
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    let _ = path;
+    None
+}
+
+/// Remove the file at `path` ONLY when it is still the same on-disk file
+/// as `owned` (the identity of a handle this side owns). A mismatch means
+/// a newer engine generation created its own file at this path while the
+/// owner was retiring — deleting it would strand that generation on a
+/// deleted inode (see [`lifecycle_guard`]). No file / no identity → no
+/// removal (fail-safe).
+pub fn remove_file_if_owned(path: &Path, owned: Option<(u64, u64)>) {
+    let Some(owned) = owned else { return };
+    match path_identity(path) {
+        Some(current) if current == owned => {
+            let _ = std::fs::remove_file(path);
+        }
+        _ => {
+            // Not our file anymore (or already gone) — leave it alone.
+        }
+    }
+}
+
 fn rand_u32() -> u32 {
     // Use system time as a cheap entropy source.
     let nanos = std::time::SystemTime::now()
@@ -209,6 +307,13 @@ pub struct Wal {
 }
 
 impl Wal {
+    /// The (dev, ino) identity of this handle's WAL file — used by the
+    /// close-time sidecar removal to delete only a file this handle still
+    /// owns (see [`lifecycle_guard`] / [`remove_file_if_owned`]).
+    pub fn identity(&self) -> Option<(u64, u64)> {
+        file_identity(&self.file)
+    }
+
     /// Open or create the WAL file alongside the main database file.
     pub fn open<P: AsRef<Path>>(db_path: P, page_size: u32) -> Result<Self> {
         let path = wal_path_for(db_path);

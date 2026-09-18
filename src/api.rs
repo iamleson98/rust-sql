@@ -2237,6 +2237,17 @@ impl Database {
         if !memory && path.as_os_str() == ":memory:" && codec.is_none() {
             return Self::open_memory_inner();
         }
+        // File-backed open serialized against a RETIRING engine
+        // generation's close-time teardown (checkpoint into this same
+        // file + sidecar removal — see storage::wal::lifecycle_guard).
+        // Without this, the pool-driven regeneration race reads a
+        // half-checkpointed main file and/or creates a WAL the dying
+        // generation then deletes (the 2026-09-18 datxevui.com outage:
+        // engine ran on a deleted inode, commits non-durable, then
+        // `WAL frame salt mismatch`). Reentrant: the legacy-format
+        // upgrade below drops temporary pagers (→ their close-time
+        // checkpoint) on this same thread, and re-enters open_inner.
+        let _lifecycle = crate::storage::wal::lifecycle_guard().lock();
         let pager: Arc<Pager> = Arc::new(Pager::open_opts(&path, DEFAULT_CACHE_PAGES, memory)?);
         if let Some(c) = &codec {
             pager.set_codec(Some(c.clone()))?;

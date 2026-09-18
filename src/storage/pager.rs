@@ -1412,14 +1412,41 @@ impl Drop for Pager {
             return;
         }
         if self.wal.read().is_some() {
+            // Serialized against the next engine generation's open /
+            // enable_wal (see storage::wal::lifecycle_guard): the
+            // close-time checkpoint writes the MAIN file, and the
+            // sidecar removal must never interleave with a fresh engine
+            // reading the main file or creating its own WAL at this
+            // path. Without this, a pool-driven engine regeneration
+            // (sqlx retiring its whole startup cohort at max_lifetime)
+            // races exactly like the 2026-09-18 datxevui.com outage:
+            // the removal deletes the NEW generation's just-created WAL
+            // and strands it on a deleted inode.
+            let _guard = crate::storage::wal::lifecycle_guard().lock();
             let _ = self.checkpoint_wal();
-            let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(&self.path));
+            // Ownership-checked removal: delete the sidecar only when
+            // the path still holds OUR file (same inode). A newer
+            // generation's WAL must survive our retirement.
+            let mine = {
+                let g = self.wal.read();
+                g.as_ref().and_then(|s| s.wal.identity())
+            };
+            crate::storage::wal::remove_file_if_owned(
+                &crate::storage::wal::wal_path_for(&self.path),
+                mine,
+            );
         }
         // DELETE-mode spill sidecar: uncommitted cache-pressure records.
         // A clean close either already drained them (COMMIT ran flush) or
-        // the transaction was abandoned — both leave garbage. Best-effort.
-        if self.delete_spill.lock().is_some() {
-            let _ = std::fs::remove_file(spill_path_for(&self.path));
+        // the transaction was abandoned — both leave garbage. Best-effort,
+        // ownership-checked the same way as the WAL above.
+        {
+            let guard = self.delete_spill.lock();
+            if let Some(spill) = guard.as_ref() {
+                let mine = crate::storage::wal::file_identity(&spill.file);
+                drop(guard);
+                crate::storage::wal::remove_file_if_owned(&spill_path_for(&self.path), mine);
+            }
         }
     }
 }
@@ -3700,6 +3727,12 @@ impl Pager {
             self.memory_wal.store(true, Ordering::Release);
             return Ok(());
         }
+        // WAL creation is serialized against a retiring engine
+        // generation's close-time sidecar removal (see
+        // storage::wal::lifecycle_guard) — the race that deleted this
+        // freshly created WAL out from under the live engine in the
+        // 2026-09-18 datxevui.com outage.
+        let _guard = crate::storage::wal::lifecycle_guard().lock();
         // Flush pending dirty pages in DELETE mode first.
         self.flush()?;
         let mut wal = crate::storage::wal::Wal::open(&self.path, self.page_size())?;
@@ -3742,12 +3775,24 @@ impl Pager {
         if self.wal.read().is_none() {
             return Ok(());
         }
+        // Serialized against the next generation's open/enable_wal —
+        // see storage::wal::lifecycle_guard (the datxevui WAL-deletion
+        // race: this removal must never delete a freshly created WAL
+        // belonging to a new engine generation).
+        let _guard = crate::storage::wal::lifecycle_guard().lock();
         self.checkpoint_wal()?;
+        let mine = {
+            let guard = self.wal.read();
+            guard.as_ref().and_then(|s| s.wal.identity())
+        };
         {
             let mut guard = self.wal.write();
             *guard = None;
         }
-        let _ = std::fs::remove_file(crate::storage::wal::wal_path_for(&self.path));
+        crate::storage::wal::remove_file_if_owned(
+            &crate::storage::wal::wal_path_for(&self.path),
+            mine,
+        );
         Ok(())
     }
 
