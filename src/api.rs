@@ -2867,6 +2867,31 @@ impl Database {
                 *next_rowid = (*next_rowid).max(row.rowid);
             }
         }
+        // ONE explicit transaction around the whole load: without it,
+        // every 256-row insert chunk commits through `dump_foreign`'s
+        // O(db) image rebuild — opening a 300k-row file paid ~1170 full
+        // rebuilds (75 s, where SQLite's own integrity check of the same
+        // file runs in 0.44 s). SQLite's bulk-load advice (batch work in
+        // BEGIN..COMMIT) applied to our own load path. A load failure
+        // rolls back and the failed `from_sqlite_file` open is dropped.
+        self.execute("BEGIN", ())?;
+        let load = self.load_foreign_image_inner(image);
+        match load {
+            Ok(()) => self.execute("COMMIT", ())?,
+            Err(e) => {
+                let _ = self.execute("ROLLBACK", ());
+                return Err(e);
+            }
+        }
+        // A loaded WAL sidecar is now folded into the in-memory state;
+        // the next dump removes the stale sidecars.
+        Ok(())
+    }
+
+    fn load_foreign_image_inner(
+        &mut self,
+        image: crate::storage::sqlitefmt::SqliteDbImage,
+    ) -> Result<()> {
         // 1. Tables. `sqlite_sequence` loads like any other table: the
         // catalog copy becomes the live high-water store (bump helper)
         // and the user-visible surface SQLite exposes (dumps DELETE/INSERT
@@ -2953,8 +2978,6 @@ impl Database {
                 (),
             )?;
         }
-        // A loaded WAL sidecar is now folded into the in-memory state;
-        // the next dump removes the stale sidecars.
         Ok(())
     }
 
