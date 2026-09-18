@@ -943,6 +943,16 @@ pub struct ExecContext<'a> {
     /// ran after EVERY statement, taking two read locks and collecting
     /// `Vec<(String, u32)>`s (with String clones) even when nothing moved.
     pub roots_changed: bool,
+    /// Monotonic count of trigger firings on this context. The insert
+    /// loops snapshot it at statement start and use it as a cheap gate:
+    /// while it is unchanged, the max-rowid overlay CANNOT have moved
+    /// except by this statement's own monotonic appends (already folded
+    /// into the statement-local max), so the per-row `live` consult in
+    /// `get_or_scan_max_rowid_opt` — a String-keyed hash lookup on the
+    /// hottest insert path — is skipped entirely. Any trigger (on any
+    /// table) can write this table mid-statement, so the bump is global,
+    /// not per-table.
+    pub(crate) triggers_fired_epoch: u64,
     /// Set when `max_rowids` gained local entries this statement (gates the
     /// write-back merge — root moves are rare, but the max-rowid scan cache
     /// populates on first INSERT and on first index-range heuristic use).
@@ -1038,6 +1048,7 @@ impl<'a> ExecContext<'a> {
             max_rowids: HashMap::new(),
             stmt_undo: Vec::new(),
             roots_changed: false,
+            triggers_fired_epoch: 0,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
             roots_invalidated: Vec::new(),
@@ -1083,6 +1094,7 @@ impl<'a> ExecContext<'a> {
             max_rowids: HashMap::new(),
             stmt_undo: Vec::new(),
             roots_changed: false,
+            triggers_fired_epoch: 0,
             max_rowids_changed: false,
             max_rowids_invalidated: Vec::new(),
             roots_invalidated: Vec::new(),
@@ -1315,7 +1327,7 @@ impl<'a> ExecContext<'a> {
     /// in place when the key already exists instead of re-allocating the key
     /// String on every inserted row.
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
-        if std::env::var_os("DBG_ROWID").is_some() {
+        if dbg_rowid() {
             eprintln!("DBG set_max {table_name_lc}={rowid}");
         }
         // Monotonic: the max-rowid cache may only ever be RAISED. It feeds
@@ -17359,6 +17371,15 @@ fn exec_insert_inner(
     // RETURNING output buffer.
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
+    // Provided-column maps are per-STATEMENT constants (the INSERT's
+    // column list is fixed): hoisted out of the row loops so a
+    // multi-VALUES batch pays ONE Vec<bool> instead of one per row
+    // (the stateful-fuzz "defaults on omitted columns only" fix had
+    // briefly put this allocation on the per-row hot path). Both the
+    // literal fast path and the generic source path borrow them.
+    let provided_by_list = provided_columns(&table, &target_indices);
+    let provided_default = vec![false; table.columns.len()];
+
     // Fast path: source is a Plan::Values. Skip exec_values' column-name
     // String allocations (which INSERT doesn't need) and the intermediate
     // Vec<Vec<Value>> allocation. For a 1k-statement INSERT batch (1 row
@@ -17407,10 +17428,10 @@ fn exec_insert_inner(
             // `INSERT (c3) VALUES (NULL)` stored the DEFAULT x'00').
             // An EMPTY expr list is the DEFAULT VALUES row shape: nothing
             // is provided, so every column takes its default.
-            let provided = if exprs.is_empty() {
-                vec![false; table.columns.len()]
+            let provided: &[bool] = if exprs.is_empty() {
+                &provided_default
             } else {
-                provided_columns(&table, &target_indices)
+                &provided_by_list
             };
             for (i, col) in table.columns.iter().enumerate() {
                 if !provided[i] && col.default.is_some() {
@@ -17446,8 +17467,15 @@ fn exec_insert_inner(
                     // rows of THIS statement may have landed rows on the
                     // same table — the statement-local max_rowid is stale
                     // by exactly those rows; see exec_insert_one_row).
-                    let live = ctx.get_or_scan_max_rowid_opt(&table)?;
-                    let eff = max_rowid.max(live);
+                    // The epoch gate skips the consult entirely while no
+                    // trigger has fired in this statement: the overlay
+                    // cannot have moved except by this loop's own
+                    // monotonic appends.
+                    let eff = if ctx.triggers_fired_epoch > 0 {
+                        max_rowid.max(ctx.get_or_scan_max_rowid_opt(&table)?)
+                    } else {
+                        max_rowid
+                    };
                     let r =
                         next_auto_rowid(ctx.pager, current_root, eff.unwrap_or(0).max(seq_floor))?;
                     max_rowid = Some(r);
@@ -17664,11 +17692,12 @@ fn exec_insert_inner(
         // Apply column defaults — ONLY to omitted columns (see the
         // fast path's comment: an explicit NULL stays NULL). An EMPTY
         // source row (DEFAULT VALUES / zero-width source) provides
-        // nothing: every column takes its default.
-        let provided = if row.is_empty() {
-            vec![false; table.columns.len()]
+        // nothing: every column takes its default. Hoisted per-statement
+        // (the source row shape is fixed by the plan).
+        let provided: &[bool] = if row.is_empty() {
+            &provided_default
         } else {
-            provided_columns(&table, &target_indices)
+            &provided_by_list
         };
         for (i, col) in table.columns.iter().enumerate() {
             if !provided[i] && col.default.is_some() {
@@ -17931,8 +17960,13 @@ pub fn fast_insert_literal_rows(
         let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
-                let live = ctx.get_or_scan_max_rowid_opt(table)?;
-                let eff = max_rowid.max(live);
+                // Epoch-gated overlay consult (see the fast path's comment):
+                // zero cost while no trigger has fired this statement.
+                let eff = if ctx.triggers_fired_epoch > 0 {
+                    max_rowid.max(ctx.get_or_scan_max_rowid_opt(table)?)
+                } else {
+                    max_rowid
+                };
                 let r = next_auto_rowid(ctx.pager, current_root, eff.unwrap_or(0))?;
                 max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
@@ -18193,9 +18227,15 @@ fn exec_insert_one_row(
     // probe and APPENDED a duplicate rowid into the b-tree
     // (self-recursive-trigger repro: the trigger's row took max+1, then
     // the outer statement's next explicit row with the same id corrupted
-    // the tree instead of failing with SQLite's UNIQUE error).
-    let live = ctx.get_or_scan_max_rowid_opt(table)?;
-    let true_max: Option<i64> = (*max_rowid).max(live);
+    // the tree instead of failing with SQLite's UNIQUE error). While no
+    // trigger has fired in this statement (epoch == 0) the overlay can
+    // only hold this loop's own monotonic appends — already folded into
+    // the statement-local max — so the consult is skipped entirely.
+    let true_max: Option<i64> = if ctx.triggers_fired_epoch > 0 {
+        (*max_rowid).max(ctx.get_or_scan_max_rowid_opt(table)?)
+    } else {
+        *max_rowid
+    };
     let rowid = if let Some(r) = explicit_rowid {
         // `INSERT INTO t (rowid, ...)` on a table without an INTEGER
         // PRIMARY KEY alias: the rowid is supplied positionally.
@@ -19683,16 +19723,27 @@ pub(crate) fn delete_sqlite_sequence_row(ctx: &mut ExecContext, table_name: &str
     Ok(())
 }
 
-/// Rowid to assign for an auto-allocated insert (NULL INTEGER PRIMARY KEY,
-/// or a rowid table with no alias). Normally `max_rowid + 1`; but when the
-/// table already holds the largest possible integer rowid, mirror SQLite:
-/// pick random positive candidates until one is unused (100 attempts),
-/// then linearly scan for the first gap in the rowid space, and finally
-/// fail gracefully instead of overflowing.
+/// One-shot debug flag for the rowid allocation path: `DBG_ROWID=1`.
+/// Cached in a `OnceLock` because `std::env::var_os` takes a process-wide
+/// lock and scans the environment — the campaign briefly called it per
+/// ROW in `next_auto_rowid`/`set_max_rowid_lc`, costing ~100ns/row on the
+/// multi-VALUES INSERT path (a 30% regression vs SQLite on the bench
+/// gate). First-use evaluation only.
+fn dbg_rowid() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("DBG_ROWID").is_some())
+}
+
+/// Allocate the next automatic rowid for the table rooted at `root` whose
+/// current maximum rowid is `max_rowid` (SQLite's OP_NewRowid). Normally
+/// `max_rowid + 1`; but when the table already holds the largest possible
+/// integer rowid, mirror SQLite: pick random positive candidates until one
+/// is unused (100 attempts), then linearly scan for the first gap in the
+/// rowid space, and finally fail gracefully instead of overflowing.
 pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> {
     // Fast path: there is still room above the current maximum.
     if max_rowid < i64::MAX {
-        if std::env::var_os("DBG_ROWID").is_some() {
+        if dbg_rowid() {
             eprintln!(
                 "DBG next_auto_rowid root={root} max={max_rowid} -> {}",
                 max_rowid + 1

@@ -71,6 +71,11 @@ pub(crate) fn fire_triggers(
             MAX_TRIGGER_DEPTH, table.name
         )));
     }
+    // Any trigger body can execute arbitrary DML (including against
+    // tables the OUTER statement is inserting into), so the insert
+    // loops' per-row max-rowid overlay consults must become LIVE from
+    // this point on (see ExecContext::triggers_fired_epoch).
+    ctx.triggers_fired_epoch += 1;
     // SQLite's default (PRAGMA recursive_triggers = OFF): a trigger does
     // not fire ITSELF, directly or indirectly — but DIFFERENT triggers
     // chained at depth 2+ still run (SQLite's name-on-stack semantics;

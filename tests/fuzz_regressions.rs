@@ -361,3 +361,48 @@ fn insert_default_values_applies_column_defaults() {
     assert!(v[0][0].is_null());
     assert_eq!(v[0][1].as_integer(), 0);
 }
+
+#[test]
+fn multi_values_trigger_same_table_rowid_sequence() {
+    // Pins the epoch-gated max-rowid overlay consult in the INSERT fast
+    // path: while no trigger has fired this statement the consult is
+    // SKIPPED (it can only reflect this loop's own monotonic appends),
+    // but the moment a trigger lands rows on the SAME table mid-batch,
+    // subsequent rows must allocate above them. Verified against real
+    // SQLite: outer rows take 1,3,5,7 and each trigger row takes the
+    // even slot immediately after its firing row.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.v NOT LIKE 'trig-%' \
+         BEGIN INSERT INTO t (v) VALUES ('trig-' || NEW.id); END",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c'), ('d')", [])
+        .unwrap();
+    let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
+    let got: Vec<(i64, String)> = rows
+        .iter()
+        .map(|r| (r[0].as_integer(), r[1].as_text()))
+        .collect();
+    let expect: Vec<(i64, &str)> = vec![
+        (1, "a"),
+        (2, "trig-1"),
+        (3, "b"),
+        (4, "trig-3"),
+        (5, "c"),
+        (6, "trig-5"),
+        (7, "d"),
+        (8, "trig-7"),
+    ];
+    assert_eq!(
+        got,
+        expect
+            .into_iter()
+            .map(|(i, s)| (i, s.to_string()))
+            .collect::<Vec<_>>(),
+        "rowid allocation must track same-table trigger rows mid-batch"
+    );
+}

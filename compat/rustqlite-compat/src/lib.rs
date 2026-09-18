@@ -4269,7 +4269,7 @@ pub unsafe extern "C" fn sqlite3_deserialize(
 fn load_image_as_database(bytes: &[u8]) -> Result<rustqlite::Database, ()> {
     // Native image of the CURRENT format: seed the in-memory store
     // directly (no temp file, no fs).
-    if bytes.len() >= 8 && &bytes[..8] == &rustqlite::storage::page::DB_MAGIC {
+    if bytes.len() >= 8 && bytes[..8] == rustqlite::storage::page::DB_MAGIC {
         rustqlite::Database::open_in_memory_with_image(bytes.to_vec()).map_err(|_| ())
     } else if bytes.len() >= 8 && is_native_image(bytes) {
         // LEGACY native image (RSQLDB03/04 order keys): stage through a

@@ -201,24 +201,27 @@ fn real_and_text_bounds_decline_fused() {
         ),
         3
     );
-    // TEXT bounds: numbers < TEXT, so only TEXT rows can match;
-    // 'text-low' ∈ ['5', 'z'] and 'zzz' > 'z'.
+    // TEXT bounds: SQLite applies NUMERIC affinity to the TEXT operand
+    // ('5' coerces to 5; 'z' stays text), then storage-class ordering
+    // puts every non-NULL value below 'z' — 5,10,15,20,12.5,99.5,
+    // 5,'text-low' all match; 'zzz' > 'z' and -3 < 5 don't. Ground
+    // truth verified against real SQLite (8 rows).
     assert_eq!(
         count(
             &db,
             "SELECT COUNT(*) FROM t WHERE a BETWEEN '5' AND 'z'",
             []
         ),
-        1
+        8
     );
-    // TEXT param bounds decline as well.
+    // TEXT param bounds decline as well — same answer as literals.
     assert_eq!(
         count(
             &db,
             "SELECT COUNT(*) FROM t WHERE a >= ? AND a <= ?",
             [Value::Text("5".into()), Value::Text("z".into())]
         ),
-        1
+        8
     );
     // NULL bound: NULL comparisons never match — fused must decline, not
     // treat NULL as 0.
