@@ -9145,7 +9145,6 @@ impl FusedWalk {
                                     match acc.i_sum.checked_add(i) {
                                         Some(n) => acc.i_sum = n,
                                         None => {
-                                            eprintln!("DBG: FusedAcc overflow fold");
                                             acc.int_overflow = true;
                                             acc.sum = acc.i_sum as f64;
                                             acc.sum_is_int = false;
@@ -9186,7 +9185,6 @@ impl FusedWalk {
                                     match acc.i_sum.checked_add(i) {
                                         Some(n) => acc.i_sum = n,
                                         None => {
-                                            eprintln!("DBG: FusedAcc overflow fold");
                                             acc.int_overflow = true;
                                             acc.sum = acc.i_sum as f64;
                                             acc.sum_is_int = false;
@@ -9754,7 +9752,6 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> Result<ExecResul
                 if !acc.seen {
                     Value::Null
                 } else if acc.int_overflow {
-                    eprintln!("DBG: fused_finalize overflow arm");
                     return Err(Error::semantic("integer overflow"));
                 } else if acc.sum_is_int {
                     Value::Integer(acc.i_sum)
@@ -11082,12 +11079,10 @@ fn exec_aggregate(
             row.extend(grouper.keys_multi[gi].iter().cloned());
         }
         for (i, agg) in aggregates.iter().enumerate() {
-            row.push(
-                finalize_agg(grouper.states.get(gi * n_aggs + i), &agg.func).map_err(|e| {
-                    eprintln!("DBG: HashGrouper finalize error {e}");
-                    e
-                })?,
-            );
+            row.push(finalize_agg(
+                grouper.states.get(gi * n_aggs + i),
+                &agg.func,
+            )?);
         }
         out_rows.push(row);
     }
@@ -11318,10 +11313,7 @@ fn exec_plugin_aggregate(
         let mut row = key;
         for (i, slot) in states.into_iter().enumerate() {
             row.push(match slot {
-                Slot::Builtin(st) => finalize_agg(&st, &aggregates[i].func).map_err(|e| {
-                    eprintln!("DBG: SlotGrouper finalize error {e}");
-                    e
-                })?,
+                Slot::Builtin(st) => finalize_agg(&st, &aggregates[i].func)?,
                 Slot::Plugin { state, .. } => match state {
                     Some(st) => st.value()?,
                     // No rows reached this group's step (e.g. aggregate over
@@ -11648,13 +11640,6 @@ fn stddev_of(nums: &[f64], sample: bool) -> Option<f64> {
 }
 
 pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
-    if func == "sum" && !state.sum_is_int && state.int_sum == 0 && state.sum != 0.0 {
-        eprintln!(
-            "DBG BAD STATE: ovf={} isum={} sum={} st={:p}",
-            state.int_overflow, state.int_sum, state.sum, state as *const AggState
-        );
-        eprintln!("{}", std::backtrace::Backtrace::force_capture());
-    }
     match func {
         "count" => Ok(Value::Integer(state.count)),
         "sum" => {
@@ -11663,7 +11648,6 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
             } else if state.int_overflow {
                 // SQLite: all-integer input whose i64 accumulation
                 // overflowed raises (mixed real input clears the flag).
-                eprintln!("DBG: finalize_agg overflow arm");
                 Err(Error::semantic("integer overflow"))
             } else if state.sum_is_int {
                 Ok(Value::Integer(state.int_sum))
