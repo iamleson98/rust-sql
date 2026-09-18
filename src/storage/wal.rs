@@ -227,14 +227,44 @@ pub fn file_identity(file: &File) -> Option<(u64, u64)> {
 
 #[cfg(windows)]
 pub fn file_identity(file: &File) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    file.metadata()
-        .ok()
-        .map(|m| match (m.volume_serial_number(), m.file_index()) {
-            (Some(v), Some(i)) => Some((v as u64, i)),
-            _ => None,
-        })
-        .flatten()
+    // GetFileInformationByHandle via raw FFI: std's
+    // `MetadataExt::file_index`/`volume_serial_number` are unstable
+    // (`windows_by_handle`), which broke the Windows build. The volume
+    // serial + 64-bit file index is a solid on-disk identity (ReFS's
+    // 128-bit indices are truncated — collision risk is negligible for
+    // close-time ownership checks, and the lifecycle guard makes even a
+    // collision harmless).
+    use std::os::raw::c_void;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ByHandleFileInformation {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    #[allow(non_snake_case)]
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            hFile: *mut c_void,
+            lpFileInformation: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let mut info = std::mem::zeroed::<ByHandleFileInformation>();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut c_void, &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    let index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+    Some((info.dwVolumeSerialNumber as u64, index))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -253,13 +283,11 @@ pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
 
 #[cfg(windows)]
 pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| match (m.volume_serial_number(), m.file_index()) {
-            (Some(v), Some(i)) => Some((v as u64, i)),
-            _ => None,
-        })
+    // Open the file read-only and identify the handle (std metadata has
+    // no stable file-index access on Windows). Failure to open → None →
+    // the caller does not remove — fail-safe.
+    let file = File::open(path).ok()?;
+    file_identity(&file)
 }
 
 #[cfg(not(any(unix, windows)))]
