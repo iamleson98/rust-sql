@@ -122,6 +122,7 @@ for row in &rows {
 - **Page recycling**: DELETE unlinks empty leaves onto the pager freelist; new allocations reuse freelist pages before growing the file; VACUUM reclaims the file tail at page granularity
 - **Pager**: LRU page cache with bucket-keyed leaf fast path, freelist, page allocation, dirty page tracking, WAL-aware reads
 - **WAL**: write-ahead log with CRC32 checksums, salt-based recovery, frame-level integrity — torn writes truncate recovery at the first bad frame
+- **SQLite-format commit protocol (incremental, SQLite's own)**: databases opened/created in SQLite's file format no longer rewrite the whole image per COMMIT. DELETE journal mode implements SQLite's documented atomic-commit protocol (`atomiccommit.html` + `fileformat2.html` §3): a rollback journal (`<db>-journal`, byte-exact with real SQLite's — magic, nonce, sparse page checksums, pre-transaction page count) takes pre-images of the pages a commit changes, the changed pages are written in place into the main file, both are fsynced in that order, and the journal's deletion is the commit point; a crash at any earlier moment leaves a hot journal that the next open replays (the `sqlite3` CLI recovers the same file identically). WAL mode appends only changed-page frames to the `<db>-wal` sidecar and checkpoints INCREMENTALLY at SQLite's 1000-frame autocheckpoint pressure (page copies back, never a full-image rewrite; the clean-close fold too). One full atomic write remains per open's first commit / journal-mode switch / shrinking re-layout. Measured on the reported production shape (5 autocommit statements per page): a 400-page workload wrote **912.7 MB → 20.7 MB** (44x, at real SQLite's own 28.2 MB), per-commit I/O now O(changed pages) and independent of database size (`tests/foreign_journal_durability.rs`, incl. hot-journal rollback and real-SQLite `integrity_check` validation)
 - **MVCC**: snapshot isolation via WAL frame indexing (page-level version tracking)
 - **Row codec v2** (`RSQLDB02`): size-classed integers (1–9 bytes), LEB128 text/blob lengths, and rowid-alias elision — `id INTEGER PRIMARY KEY` is stored as a 1-byte marker materialized from the B+tree key, like SQLite's record format
 - **Committed-view read concurrency**: lock-free per-thread memo of the committed WAL view — readers resolve the latest committed page versions without touching shared atomics on the hot path
@@ -709,9 +710,13 @@ SQLite and must pass `PRAGMA integrity_check`. A dedicated CI job
 ### Interop limitations
 
 - SQLite-format databases are single-connection (the whole image is
-  loaded on open; the file is rewritten per commit — O(file) per commit
-  boundary, not O(dirty pages)). Use the native format for hot
-  write-heavy workloads; SQLite-format mode targets interchange.
+  loaded on open). Commit I/O is now page-granular — O(changed pages)
+  per commit boundary in both journal modes, one full write per
+  open/mode-switch — but each commit boundary still rebuilds the image
+  in memory (O(database) CPU), so batching bulk loads inside explicit
+  `BEGIN … COMMIT` transactions remains the documented best practice
+  (SQLite's own advice for the same shape). Use the native format for
+  hot write-heavy workloads; SQLite-format mode targets interchange.
 - Index keys larger than one page (huge TEXT/`WITHOUT ROWID` PK values)
   load and query — the index b-tree spills them to overflow chains, and
   the SQLite-format writer emits the cells byte-exactly (verified by

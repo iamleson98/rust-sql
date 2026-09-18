@@ -185,6 +185,105 @@ impl WalWriter {
     }
 }
 
+/// Incremental checkpoint (wal.html §4.3): copy every COMMITTED frame's
+/// page back into the main database file, extend/truncate the main file
+/// to the last commit frame's database size, fsync, then retire the
+/// sidecar. Only frames up to the last commit marker are applied —
+/// trailing uncommitted frames are discarded, exactly like SQLite's
+/// `walCheckpoint`. Returns (pages written, resulting db size in pages).
+///
+/// This replaces the old "checkpoint = full atomic image rewrite": the
+/// sidecar already holds exactly the changed pages, so folding it back
+/// costs O(frames), never O(database).
+pub fn checkpoint(path: &Path, page_size: u32) -> Result<(usize, u32), String> {
+    let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(path);
+    let wal = std::fs::read(&wal_path).map_err(|e| format!("read {}: {e}", wal_path.display()))?;
+    if wal.len() < 32 {
+        // No header: nothing committed. Remove the husk so a later open
+        // never mistakes it for state.
+        let _ = std::fs::remove_file(&wal_path);
+        return Ok((0, 0));
+    }
+    let magic = u32::from_be_bytes([wal[0], wal[1], wal[2], wal[3]]);
+    if magic != 0x377f_0682 && magic != 0x377f_0683 {
+        return Err(format!("wal sidecar {}: bad magic", wal_path.display()));
+    }
+    let wal_ps = u32::from_be_bytes([wal[8], wal[9], wal[10], wal[11]]);
+    if wal_ps != page_size {
+        return Err(format!(
+            "wal sidecar {}: page size {wal_ps} != {page_size}",
+            wal_path.display()
+        ));
+    }
+    let file_salt1 = u32::from_be_bytes([wal[16], wal[17], wal[18], wal[19]]);
+    let frame_size = 24 + page_size as usize;
+    let mut off = 32usize;
+    // Pages to copy back, in order (later occurrences of a page win by
+    // overwriting earlier ones). Only the prefix ending at the LAST commit
+    // frame is durable.
+    let mut pending: Vec<(u32, &[u8])> = Vec::new();
+    let mut committed: Vec<(u32, &[u8])> = Vec::new();
+    let mut commit_db_size: u32 = 0;
+    while off + frame_size <= wal.len() {
+        let hdr = &wal[off..off + 24];
+        let page_no = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let db_size = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let salt1 = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+        if salt1 != file_salt1 {
+            break; // frames from a previous WAL generation
+        }
+        if page_no == 0 {
+            break; // corrupt
+        }
+        let frame = &wal[off + 24..off + frame_size];
+        pending.push((page_no, frame));
+        if db_size != 0 {
+            // Commit frame: the pending pages become durable.
+            committed.append(&mut pending);
+            commit_db_size = db_size;
+        }
+        off += frame_size;
+    }
+    // Drop any uncommitted trailing frames (pending holds them).
+    drop(pending);
+    if committed.is_empty() {
+        let _ = std::fs::remove_file(&wal_path);
+        return Ok((0, 0));
+    }
+    // Copy the committed pages back into the main file. Positioned
+    // writes (seek + write): the caller holds the session lock, so the
+    // file offset is uncontended.
+    use std::io::{Seek, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let ps = page_size as usize;
+    let mut written = 0usize;
+    for (pgno, page) in &committed {
+        let off = (*pgno as u64 - 1) * ps as u64;
+        f.seek(std::io::SeekFrom::Start(off))
+            .map_err(|e| format!("seek {}: {e}", path.display()))?;
+        f.write_all(page)
+            .map_err(|e| format!("write page {pgno}: {e}"))?;
+        written += 1;
+    }
+    if commit_db_size > 0 {
+        let want = commit_db_size as u64 * ps as u64;
+        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if cur != want {
+            f.set_len(want)
+                .map_err(|e| format!("set_len {}: {e}", path.display()))?;
+        }
+    }
+    f.sync_all()
+        .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    // Retire the sidecar: a zero-length WAL is an empty WAL to every
+    // reader; removal keeps the at-rest file set minimal.
+    let _ = std::fs::remove_file(&wal_path);
+    Ok((written, commit_db_size))
+}
+
 /// The pages of `image` that differ from `base` (or lie beyond it),
 /// in page order — the frame set for one commit. Page size equality
 /// is the caller's contract (both images come from the same writer).

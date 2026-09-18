@@ -276,3 +276,22 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 1
+
+# Write-amplification probe: replicates the reported production shape
+# (5 autocommit statements per app-page) against SQLite-format (foreign)
+# databases and real SQLite (rusqlite bundled) as the standard oracle.
+# Driver: scripts/write_amp_driver.sh (LD_PRELOAD syscall counting).
+[[example]]
+name = "probe_write_amp"
+path = "examples/probe_write_amp.rs"
+
+# Trace the SQLite-format (foreign) persistence path per statement.
+[[example]]
+name = "probe_foreign_trace"
+path = "examples/probe_foreign_trace.rs"
+
+# Post-fix verification: open an engine-written DELETE-mode file with
+# real SQLite (integrity_check + row counts + journal mode).
+[[example]]
+name = "verify_engine_file"
+path = "examples/verify_engine_file.rs"

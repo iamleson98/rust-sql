@@ -12,3 +12,4 @@ sqlx-interop/target/
 compat/libsqlite3-sys/target
 __pycache__/
 target-nodflt/
+probe-tmp/

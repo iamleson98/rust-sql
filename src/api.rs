@@ -697,17 +697,22 @@ impl Drop for Database {
             // SQLite's clean-close semantics: the LAST connection
             // checkpoints the WAL and removes the sidecar, leaving a
             // self-contained .db (plain file copies stay valid). Mirror
-            // it — fold any live sidecar into the main file.
+            // it — fold the live sidecar into the main file
+            // INCREMENTALLY (page copies, wal.html §4.3), never a
+            // full-image rewrite; the atomic full write remains only as
+            // the fallback when the incremental fold fails.
             let mut session = f.wal.lock();
             if let Some(sess) = session.as_mut() {
                 if sess.writer.has_frames() {
                     let path = f.path.clone();
-                    let _ = crate::storage::sqlitefmt::writer::write_image_atomic(
-                        &path,
-                        &sess.last_image,
-                    );
-                    let ckpt = sess.writer.ckpt_seq() + 1;
                     let ps = sess.writer.page_size();
+                    if crate::storage::sqlitefmt::wal::checkpoint(&path, ps).is_err() {
+                        let _ = crate::storage::sqlitefmt::writer::write_image_atomic(
+                            &path,
+                            &sess.last_image,
+                        );
+                    }
+                    let ckpt = sess.writer.ckpt_seq() + 1;
                     sess.writer = crate::storage::sqlitefmt::wal::WalWriter::new(ps, ckpt);
                 }
             }
@@ -2679,6 +2684,16 @@ impl Database {
         // SQLite-format open flows through (Database::open sniffing +
         // open_sqlite_format).
         crate::storage::sqlitefmt::writer::sweep_stale_tmps(path);
+        // Hot rollback journal (fileformat2.html §1.1): a crashed engine
+        // commit — or a crashed REAL SQLite writer on this same file —
+        // left pre-images that restore the pre-transaction state. This
+        // is SQLite's own open-time `pager_playback`, applied before
+        // the file is parsed. A journal that turns out to be a commit
+        // marker (truncated/invalidated header) is removed, not
+        // replayed. Failure to replay fails the OPEN (fail-closed):
+        // reading a half-rolled-back image is corruption.
+        crate::storage::sqlitefmt::rj::replay_if_hot(path)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let image = crate::storage::sqlitefmt::read_sqlite_file(path)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let mut db = Self::open_memory_inner()?;
@@ -3082,74 +3097,165 @@ impl Database {
         let bytes = crate::storage::sqlitefmt::build_bytes(&out)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
 
-        // WAL-append attempt: only with an established session and no
-        // source sidecar left to fold (had_wal implies the first dump
-        // must fully rewrite the file anyway).
+        // Incremental commit attempt — needs an established session (the
+        // committed image under OUR page layout). `had_wal` (a source
+        // sidecar left to fold) forces the full write instead.
         let mut session = foreign.wal.lock();
         if foreign.had_wal.load(Ordering::Acquire) {
             session.take();
         }
         let mut wal_err: Option<String> = None;
+        let mut incremental_done = false;
         if let Some(sess) = session.as_mut() {
             let ps = sess.writer.page_size();
             if ps as usize != 0 && bytes.len() % ps as usize == 0 {
-                let changed =
-                    crate::storage::sqlitefmt::wal::diff_pages(&sess.last_image, &bytes, ps);
-                if changed.is_empty() {
-                    // Byte-identical rebuild: nothing to commit — the
-                    // file already holds this state.
-                    foreign.dirty.store(false, Ordering::Release);
-                    foreign.had_wal.store(false, Ordering::Release);
-                    return Ok(());
-                }
-                let db_size = (bytes.len() / ps as usize) as u32;
-                // Capture the PRE-commit sidecar length before the
-                // encoder counts its own pending frames.
-                let pre_len = sess.writer.wal_len();
-                let frames = sess.writer.encode_commit(&changed, db_size);
-                let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(&path);
-                match crate::storage::sqlitefmt::wal::append_wal(
-                    &wal_path,
-                    &sess.writer,
-                    pre_len,
-                    &frames,
-                ) {
-                    Ok(()) => {
-                        sess.last_image = bytes;
-                        if sess.writer.should_checkpoint() {
-                            // Fold the sidecar into the main file (full
-                            // atomic write clears it) and reset the
-                            // salts; the diff base is now the main file.
-                            crate::storage::sqlitefmt::writer::write_image_atomic(
-                                &path,
-                                &sess.last_image,
-                            )
-                            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-                            let ckpt = sess.writer.ckpt_seq() + 1;
-                            sess.writer = crate::storage::sqlitefmt::wal::WalWriter::new(ps, ckpt);
-                        }
+                if foreign.journal_wal.load(Ordering::Acquire) {
+                    // ---- WAL mode: append only the changed pages as
+                    // frames to the sidecar (wal.html). ----
+                    let changed =
+                        crate::storage::sqlitefmt::wal::diff_pages(&sess.last_image, &bytes, ps);
+                    if changed.is_empty() {
+                        // Byte-identical rebuild: nothing to commit — the
+                        // file already holds this state.
                         foreign.dirty.store(false, Ordering::Release);
                         foreign.had_wal.store(false, Ordering::Release);
                         return Ok(());
                     }
-                    Err(e) => wal_err = Some(e),
+                    let db_size = (bytes.len() / ps as usize) as u32;
+                    // Capture the PRE-commit sidecar length before the
+                    // encoder counts its own pending frames.
+                    let pre_len = sess.writer.wal_len();
+                    let frames = sess.writer.encode_commit(&changed, db_size);
+                    let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(&path);
+                    match crate::storage::sqlitefmt::wal::append_wal(
+                        &wal_path,
+                        &sess.writer,
+                        pre_len,
+                        &frames,
+                    ) {
+                        Ok(()) => {
+                            sess.last_image = bytes.clone();
+                            if sess.writer.should_checkpoint() {
+                                // SQLite's 1000-page autocheckpoint: fold the
+                                // committed frames back into the main file
+                                // INCREMENTALLY (page copies), then reset
+                                // the sidecar — never a full-image write.
+                                match crate::storage::sqlitefmt::wal::checkpoint(&path, ps) {
+                                    Ok(_) => {
+                                        let ckpt = sess.writer.ckpt_seq() + 1;
+                                        sess.writer =
+                                            crate::storage::sqlitefmt::wal::WalWriter::new(
+                                                ps, ckpt,
+                                            );
+                                    }
+                                    Err(e) => {
+                                        // Frames are durable but the fold
+                                        // failed (replaced/tampered sidecar):
+                                        // the full write below republishes
+                                        // and clears it.
+                                        wal_err = Some(e);
+                                    }
+                                }
+                            }
+                            if wal_err.is_none() {
+                                foreign.dirty.store(false, Ordering::Release);
+                                foreign.had_wal.store(false, Ordering::Release);
+                                incremental_done = true;
+                            }
+                        }
+                        Err(e) => wal_err = Some(e),
+                    }
+                } else {
+                    // ---- Rollback (DELETE) journal mode — SQLite's own
+                    // atomic-commit protocol (atomiccommit.html): the
+                    // journal takes PRE-images of every page this commit
+                    // changes, the changed pages are written IN PLACE
+                    // into the main database file, both are fsynced in
+                    // that order, and the journal's DELETION is the commit
+                    // point. A crash at any earlier moment leaves a hot
+                    // journal that `from_sqlite_file` replays (and the
+                    // sqlite3 CLI replays identically — byte-exact format).
+                    // Single file at rest: no sidecar survives a commit. ----
+                    let changed =
+                        crate::storage::sqlitefmt::wal::diff_pages(&sess.last_image, &bytes, ps);
+                    if changed.is_empty() {
+                        foreign.dirty.store(false, Ordering::Release);
+                        foreign.had_wal.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                    let psu = ps as usize;
+                    let n_old = (sess.last_image.len() / psu) as u32;
+                    let n_new = (bytes.len() / psu) as u32;
+                    // Pre-images: only pages that existed before this
+                    // commit — pages beyond n_old are new, and rollback
+                    // discards them by truncating to n_old.
+                    let old_pages: Vec<(u32, Vec<u8>)> = changed
+                        .iter()
+                        .filter(|(pgno, _)| *pgno <= n_old)
+                        .map(|(pgno, _)| {
+                            let s = (*pgno as usize - 1) * psu;
+                            (*pgno, sess.last_image[s..s + psu].to_vec())
+                        })
+                        .collect();
+                    // Dense-rebuild shrink guard: our image builder never
+                    // leaves holes, so a SHRINKING database (mass DELETE)
+                    // re-flows every page after the cut and the page diff
+                    // no longer maps onto the file — one atomic image
+                    // swap is the only correct publication for that
+                    // shape (SQLite itself never re-flows: its freelist
+                    // keeps page identities stable). Everything else —
+                    // growth and in-place updates, however many pages —
+                    // takes the journal protocol exactly as SQLite does,
+                    // even when the journal momentarily outweighs a tiny
+                    // database (SQLite's own tradeoff).
+                    if n_new >= n_old {
+                        match crate::storage::sqlitefmt::rj::write_journal(
+                            &path, &old_pages, ps, n_old,
+                        ) {
+                            Ok(()) => {
+                                match crate::storage::sqlitefmt::rj::write_pages(
+                                    &path, ps, &changed,
+                                ) {
+                                    Ok(()) => {
+                                        // COMMIT POINT (SQLite's "delete the
+                                        // journal" form).
+                                        if let Err(e) = std::fs::remove_file(
+                                            crate::storage::sqlitefmt::rj::journal_path_of(&path),
+                                        ) {
+                                            wal_err = Some(format!("remove journal: {e}"));
+                                        } else {
+                                            sess.last_image = bytes.clone();
+                                            foreign.dirty.store(false, Ordering::Release);
+                                            foreign.had_wal.store(false, Ordering::Release);
+                                            incremental_done = true;
+                                        }
+                                    }
+                                    Err(e) => wal_err = Some(e),
+                                }
+                            }
+                            Err(e) => wal_err = Some(e),
+                        }
+                    }
+                    // A failed incremental attempt falls through to the
+                    // full atomic write below: the main file receives the
+                    // complete new image and every sidecar is retired —
+                    // always a correct state, just the slow path. A
+                    // mid-commit failure leaves a hot journal on disk;
+                    // the full write's journal retirement covers it.
                 }
             }
         }
-        if let Some(e) = wal_err {
-            // A replaced/tampered sidecar: fall back to the full write
-            // (which removes it) — the error is only diagnostic.
-            let _ = e;
-        }
         drop(session);
 
-        // Full atomic write + establish the WAL session (WAL-mode files
-        // only — a rollback-mode file set via `PRAGMA journal_mode =
-        // delete` keeps full-rewrite commits, SQLite's mode semantics).
-        // A loaded rollback-mode source converts here: the engine's
-        // commits are WAL frames from this point on, so the file's
-        // persistent marker (header 18/19) becomes 2/2.
-        if foreign.journal_wal.load(Ordering::Acquire) {
+        // Full atomic write: the FIRST dump after open (the source's
+        // layout becomes ours), a journal-mode switch, a wholesale
+        // re-layout, or the incremental fallback. Both journal modes
+        // then establish a session so every LATER commit writes only
+        // the changed pages — WAL frames in wal mode, rollback-journal
+        // page writes in delete mode. A rollback-mode source stays 1/1
+        // in its header (SQLite's file-format semantics for the mode).
+        if !incremental_done {
+            let _ = wal_err; // the incremental error is only diagnostic
             let ps = if out.page_size == 0 {
                 4096
             } else {
@@ -3161,9 +3267,6 @@ impl Database {
                 writer: crate::storage::sqlitefmt::wal::WalWriter::new(ps, 0),
                 last_image: bytes,
             });
-        } else {
-            crate::storage::sqlitefmt::writer::write_image_atomic(&path, &bytes)
-                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         }
         foreign.dirty.store(false, Ordering::Release);
         // had_wal referred to the SOURCE's sidecar, removed by the write.
@@ -12205,10 +12308,15 @@ fn apply_journal_mode_foreign(f: Option<&ForeignSqlite>, mode: &str) -> Result<(
     Ok(())
 }
 
-/// Foreign journal-mode switch: `wal` arms the sidecar commit path (or
-/// keeps it); the rollback family drops any live session — the next
-/// commit is a full atomic write with a 1/1 header (SQLite's
-/// WAL -> delete checkpoint + downgrade).
+/// Foreign journal-mode switch, mirroring SQLite's persistent FILE
+/// conversion semantics: `wal` converts the file (header 18/19 = 2/2 in
+/// the MAIN file — a 1/1 main file ignores the sidecar on every
+/// real-SQLite open, so the marker may never ride a WAL frame); the
+/// rollback family converts back (checkpoint + 1/1 header). Both
+/// directions drop any live session: the next dump re-publishes the
+/// file wholesale under the new mode, then re-establishes incremental
+/// commits (WAL frames / rollback-journal pages). One full write per
+/// mode switch, never per commit.
 fn apply_foreign_journal_mode(f: &ForeignSqlite, mode: &str) {
     // A live session's sidecar is superseded by the next full write
     // (write_image_atomic clears sidecars).
@@ -12217,7 +12325,16 @@ fn apply_foreign_journal_mode(f: &ForeignSqlite, mode: &str) {
         f.wal.lock().take();
         f.dirty.store(true, Ordering::Release);
     } else if mode == "wal" {
-        f.journal_wal.store(true, Ordering::Release);
+        let was = f.journal_wal.swap(true, Ordering::AcqRel);
+        if !was {
+            // First switch to WAL: the conversion must reach the MAIN
+            // file's header now, not a sidecar frame. Drop the live
+            // rollback session so the next dump (the pragma itself
+            // triggers one) rewrites the file with 18/19 = 2/2 and
+            // establishes the WAL session.
+            f.wal.lock().take();
+            f.dirty.store(true, Ordering::Release);
+        }
     }
 }
 

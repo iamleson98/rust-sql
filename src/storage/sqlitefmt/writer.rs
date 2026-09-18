@@ -418,6 +418,11 @@ pub fn write_image_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut shm = path.as_os_str().to_os_string();
     shm.push("-shm");
     clear_sidecar(std::path::Path::new(&shm));
+    // A fresh full image also retires any rollback journal: real SQLite
+    // would treat a leftover hot journal as pre-image state of THIS file
+    // and roll our image back on the next open. (The full write IS the
+    // commit — nothing to roll back to.)
+    clear_sidecar(&super::rj::journal_path_of(path));
     Ok(())
 }
 

@@ -25,6 +25,7 @@
 pub mod header;
 pub mod reader;
 pub mod record;
+pub mod rj;
 pub mod varint;
 pub mod wal;
 pub mod writer;

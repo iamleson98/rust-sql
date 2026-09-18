@@ -699,3 +699,23 @@ Work Log:
 
 Stage Summary:
 - The third and final SQL blocker for the pdf-tts rustqlite integration is closed; DELETE works on composite-PK tables through every supported source shape.
+
+---
+Task ID: 20
+Agent: main (Super Z)
+Task: Fix the SQLite-format (foreign) full-image-rewrite-per-COMMIT write amplification (reported: 2.32 TB written for a 40k-page bulk parse) using SQLite's own documented commit protocols
+
+Work Log:
+- Verified: dump_foreign's non-WAL branch rewrote the whole file (temp+fsync+rename) on EVERY autocommit statement/COMMIT for delete-journal-mode sources. Measured (LD_PRELOAD syscall counter, production shape = rusqlite-seeded DELETE-mode file, 5 autocommit stmts/page): 912.7 MB written for 400 pages/2000 stmts (1,603 renames) vs real SQLite's 28.2 MB; extrapolates to the reported 2.32 TB.
+- Fix, per atomiccommit.html / fileformat2.html §3 / wal.html:
+  * NEW src/storage/sqlitefmt/rj.rs — SQLite rollback journal writer (magic/nonce/sparse checksums/pre-transaction page count), in-place changed-page writer, open-time hot-journal replay (torn-record stop, commit-marker removal, truncate-to-initial-pages, fail-closed).
+  * dump_foreign DELETE branch: journal pre-images -> fsync -> pwrite changed pages -> fsync -> journal deletion (the commit point); session diff-base established after the first full write per open; only a shrinking re-layout (dense builder, no freelist) falls back to one atomic full write.
+  * WAL autocheckpoint (1000 frames) + Drop clean-close fold: incremental checkpoint (frame pages copied back, set_len from commit db_size, sidecar retired) — never a full-image write.
+  * from_sqlite_file: hot-journal replay before parse (also recovers crashed REAL SQLite writers on the same file).
+  * write_image_atomic retires a stale -journal; delete->WAL mode switch converts the file header immediately (18/19 = 2/2 must live in the MAIN file, not a sidecar frame).
+- Measured after: 20.7 MB on the identical workload (42x; SQLite itself: 28.2 MB), 1 rename total, per-commit I/O 12-18 KB size-independent (100/400/1000-page scaling linear, was quadratic); real SQLite re-opens the file: journal_mode=delete, integrity_check=ok.
+- tests/foreign_journal_durability.rs (6 suites, incl. unix inode-stability regression + a spec-independent hand-crafted hot journal) + 4 rj.rs unit tests; examples/probe_write_amp.rs kept as the measurement harness; README storage/interop sections updated.
+- Full suite + fmt + clippy green locally before push.
+
+Stage Summary:
+- SQLite-format persistence now follows SQLite's actual commit protocols in both journal modes: page-granular I/O, crash atomicity via hot journals (byte-compatible with the sqlite3 CLI's own recovery), incremental WAL checkpoints. The remaining documented cost is the O(db) CPU image rebuild per commit boundary — batching in explicit transactions (SQLite's own advice for bulk loads) is the standing guidance for write-heavy interchange files.
