@@ -1106,8 +1106,21 @@ pub fn build_table(
                 table_columns[idx].primary_key_order = ic.order;
                 table_columns[idx].nullable = false;
                 table_columns[idx].pk_seq = (seq + 1) as u8;
-                // If single INTEGER PRIMARY KEY at table level, it's also a rowid alias.
-                if table_pk.len() == 1 && table_columns[idx].affinity == Affinity::Integer {
+                // If a single-column table-level PRIMARY KEY names a column
+                // declared exactly "INTEGER" (case-insensitive, trimmed),
+                // it is also a rowid alias — SQLite build.c
+                // sqlite3AddPrimaryKey. NOTE: the type must be exactly
+                // "INTEGER" ("INT", "TINYINT", "UNSIGNED INTEGER" are NOT
+                // aliases — affinity alone is not enough), and unlike the
+                // column-level form, a DESC member does NOT block the
+                // alias here (`PRIMARY KEY(x DESC)` still aliases x).
+                // Pinned against real SQLite.
+                if table_pk.len() == 1
+                    && table_columns[idx]
+                        .declared_type
+                        .trim()
+                        .eq_ignore_ascii_case("INTEGER")
+                {
                     rowid_alias = Some(idx);
                 }
             }

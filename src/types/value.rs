@@ -727,6 +727,21 @@ pub(crate) fn real_stored(f: f64) -> f64 {
     }
 }
 
+/// INTEGER/NUMERIC affinity's REAL→INTEGER squeeze (SQLite
+/// `sqlite3RealSameAsInt` + `applyNumericAffinity`, bTryForInt=1):
+/// convert iff the value round-trips through i64 EXACTLY, is strictly
+/// inside ±2^63, and is not i64::MIN. Empirical pins vs real SQLite:
+/// 2^62 → integer, 2^63 (any spelling) → real, i64::MIN → real,
+/// -0.0 → integer 0, 1e30/1e19 → real, 8.0/'8e0'/'8.0' → integer 8.
+fn numeric_real_affinity(f: f64) -> Value {
+    let i = f as i64; // saturating cast
+    if f.is_finite() && i != i64::MIN && f == (i as f64) && f.abs() < 9_223_372_036_854_775_808.0 {
+        Value::Integer(i)
+    } else {
+        Value::Real(f)
+    }
+}
+
 impl Affinity {
     /// SQLite's affinity rules (datatype3.html §3.1): a column declared
     /// INT* gets INTEGER affinity, CHAR/CLOB/TEXT → TEXT, BLOB or no type →
@@ -752,8 +767,17 @@ impl Affinity {
     /// Apply affinity to a value, coercing if necessary.
     pub fn coerce(&self, v: Value) -> Value {
         match (*self, v) {
+            // SQLite (datatype3 §3.1 + vdbe.c applyNumericAffinity): a
+            // column with INTEGER affinity stores values EXACTLY like
+            // NUMERIC affinity — real text parses to INTEGER (preferred)
+            // or REAL, and an integral REAL squeezes to INTEGER iff it
+            // round-trips (`f == (f as i64) as f64`) strictly inside
+            // ±2^63 and not i64::MIN (sqlite3RealSameAsInt). Verified
+            // against real SQLite: 5.5 stays REAL (never truncated!),
+            // 8.0/'8e0'/'8.0' → 8, 2^62 → integer, ±2^63 stay REAL,
+            // -0.0 → 0, 1e30 stays REAL.
             (Affinity::Integer, Value::Integer(i)) => Value::Integer(i),
-            (Affinity::Integer, Value::Real(f)) => Value::Integer(f as i64),
+            (Affinity::Integer, Value::Real(f)) => numeric_real_affinity(f),
             (Affinity::Integer, Value::Text(s)) => {
                 // SQLite affinity rules: try to parse the (trimmed) text as
                 // an integer; if that fails, try as a real; if BOTH fail,
@@ -763,9 +787,7 @@ impl Affinity {
                 if let Ok(i) = trimmed.parse::<i64>() {
                     Value::Integer(i)
                 } else if let Ok(f) = trimmed.parse::<f64>() {
-                    // Real-looking value in an integer column: SQLite stores
-                    // it as REAL (NOT as a truncated integer).
-                    Value::Real(f)
+                    numeric_real_affinity(f)
                 } else {
                     Value::Text(s)
                 }
@@ -806,22 +828,21 @@ impl Affinity {
             // examples/probe_numeric_affinity.rs): numeric-looking text
             // coerces to INTEGER (preferred) or REAL; lossless-integral
             // REALs squeeze to INTEGER (inserting 5.0 yields typeof
-            // 'integer' 5); non-numeric text keeps its TEXT storage class;
-            // BLOBs are never converted by any affinity.
+            // 'integer' 5) — the squeeze bound is the round-trip rule
+            // (sqlite3RealSameAsInt: 2^62 squeezes, ±2^63 never do, -0.0
+            // becomes 0), NOT a 2^53 cap; non-numeric text keeps its TEXT
+            // storage class; BLOBs are never converted by any affinity.
             (Affinity::Numeric, Value::Integer(i)) => Value::Integer(i),
-            (Affinity::Numeric, Value::Real(f)) => {
-                if f.is_finite() && f.trunc() == f && f.abs() <= 9.007_199_254_740_992e15 {
-                    Value::Integer(f as i64)
-                } else {
-                    Value::Real(f)
-                }
-            }
+            (Affinity::Numeric, Value::Real(f)) => numeric_real_affinity(f),
             (Affinity::Numeric, Value::Text(s)) => {
                 let trimmed = s.trim();
                 if let Ok(i) = trimmed.parse::<i64>() {
                     Value::Integer(i)
                 } else if let Ok(f) = trimmed.parse::<f64>() {
-                    Value::Real(f)
+                    // '8.0'/'8e0': SQLite's applyNumericAffinity parses the
+                    // text as REAL then squeezes the integral result to
+                    // INTEGER (bTryForInt = 1).
+                    numeric_real_affinity(f)
                 } else {
                     Value::Text(s)
                 }

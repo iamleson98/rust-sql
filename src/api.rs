@@ -4685,10 +4685,10 @@ impl Database {
     /// consult `self.maps` in place), so the restore additionally breaks
     /// the insert chain and invalidates the statement cache — the
     /// statement's root moves never landed durably.
-    fn recover_failed_autocommit_fastpath(&mut self) {
+    fn recover_failed_autocommit_fastpath(&mut self, dirty_at_start: usize) {
         if !self.in_transaction.load(Ordering::Acquire)
             && !self.deferred_flush.load(Ordering::Acquire)
-            && self.pager.dirty_page_count() > 0
+            && self.pager.dirty_set_marked() != dirty_at_start
         {
             if let Err(rb_err) = self.pager.rollback_autocommit_stmt() {
                 eprintln!("autocommit-statement rollback failed after fast-path error: {rb_err}");
@@ -4696,6 +4696,25 @@ impl Database {
         }
         self.invalidate_stmt_cache();
         self.break_insert_chain();
+    }
+
+    /// Autocommit statement-atomicity restore (page level) — the cold
+    /// companion of the epilogue gate. Factored out and #[inline(never)]:
+    /// the 53-line inline block bloated the hot execute() epilogue and
+    /// cost mixed-RW autocommit 3.5x (bench-gate ubuntu; local A/B 1.14ms
+    /// -> 4.5ms).
+    #[inline(never)]
+    fn restore_failed_autocommit_stmt_pages(&self) -> Result<()> {
+        let r = self.pager.rollback_autocommit_stmt();
+        if r.is_ok() {
+            // Statement-embedded plans may carry the failed statement's
+            // roots; the next execute re-plans. The chained-insert fast
+            // path's hints (leaf, max rowid) were built over the discarded
+            // pages.
+            self.invalidate_stmt_cache();
+            self.break_insert_chain();
+        }
+        r
     }
 
     /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
@@ -5417,6 +5436,18 @@ impl Database {
         // and can never observe a torn epoch.
         self.write_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Statement-start dirty-page count for the autocommit
+        // statement-atomicity gate below: the restore must fire only when
+        // THIS statement mutated pager state, not when earlier
+        // COMMITTED-but-unflushed pages (lazy write-back accumulates
+        // them forever) merely leave the count positive. A delta check
+        // answers exactly "did this statement dirty anything" — the
+        // plain `> 0` check fired on EVERY failed insert of the
+        // mixed-RW bench (200/iteration: stale lazy pages + fixed-id
+        // UNIQUE failures), making each failure pay a full restore +
+        // statement-cache invalidation and re-parse (4x; found by the
+        // CI bench gate after the crash-consistency commit).
+        let dirty_at_start = self.pager.dirty_set_marked();
         // (View-DML intercept: the cached-statement `view_target` field
         // carries the resolution — INSERT into a view is caught after
         // `get_or_cache_stmt`, BEFORE any write path can act on it. The
@@ -5454,7 +5485,7 @@ impl Database {
                 if !conc_owner {
                     let chained = self.exec_chained_insert(sql);
                     if chained.is_err() {
-                        self.recover_failed_autocommit_fastpath();
+                        self.recover_failed_autocommit_fastpath(dirty_at_start);
                     }
                     if chained? {
                         self.note_foreign_write()?;
@@ -5463,7 +5494,7 @@ impl Database {
                     if let Some(fi) = try_fast_insert_parse(sql) {
                         let fast = self.exec_fast_insert(fi);
                         if fast.is_err() {
-                            self.recover_failed_autocommit_fastpath();
+                            self.recover_failed_autocommit_fastpath(dirty_at_start);
                         }
                         if fast? {
                             self.note_foreign_write()?;
@@ -5966,9 +5997,16 @@ impl Database {
         if result.is_err()
             && !ctx.in_transaction
             && !ctx.deferred_flush
-            && self.pager.dirty_page_count() > 0
+            // DELTA gate (dirty_at_start, captured at statement entry):
+            // only statements that actually MUTATED a page pay the
+            // restore — the optimistic dirty_page_count() over-reports
+            // (note_write fires before constraint checks), and the old
+            // plain `> 0` check made every failed insert of the mixed-RW
+            // bench pay a full restore + statement-cache invalidation
+            // (200/iteration, 4x total; found by the CI bench gate).
+            && self.pager.dirty_set_marked() != dirty_at_start
         {
-            if let Err(rb_err) = self.pager.rollback_autocommit_stmt() {
+            if let Err(rb_err) = self.restore_failed_autocommit_stmt_pages() {
                 // Loud: the engine is now in an unspecified dirty state.
                 eprintln!("autocommit-statement rollback failed after statement error: {rb_err}");
             } else {
@@ -5988,12 +6026,6 @@ impl Database {
                 ctx.root_overrides.clear();
                 ctx.max_rowids.clear();
                 ctx.index_roots.clear();
-                // Statement-embedded plans may carry the failed
-                // statement's roots; the next execute re-plans.
-                self.invalidate_stmt_cache();
-                // The chained-insert fast path's hints (leaf, max
-                // rowid) were built over the discarded pages.
-                self.break_insert_chain();
             }
         }
         self.in_transaction
@@ -8847,7 +8879,13 @@ impl Database {
                 .copied()
                 .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
             let i = match fp {
-                FastPath::IndexPoint { index, .. } => m
+                // IndexCount shares the live-root requirement: a split
+                // moves the index root, and the Arc snapshot's root_page
+                // goes stale — a count resolved from it silently misses
+                // every leaf the split added (found by the PK stress
+                // suite: count(*) WHERE k = <literal> = 0 while the row
+                // exists, exactly past the first split).
+                FastPath::IndexPoint { index, .. } | FastPath::IndexCount { index, .. } => m
                     .index_roots
                     .get(&index.name)
                     .copied()
@@ -8864,7 +8902,13 @@ impl Database {
                 .copied()
                 .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
             let i = match fp {
-                FastPath::IndexPoint { index, .. } => m
+                // IndexCount shares the live-root requirement: a split
+                // moves the index root, and the Arc snapshot's root_page
+                // goes stale — a count resolved from it silently misses
+                // every leaf the split added (found by the PK stress
+                // suite: count(*) WHERE k = <literal> = 0 while the row
+                // exists, exactly past the first split).
+                FastPath::IndexPoint { index, .. } | FastPath::IndexCount { index, .. } => m
                     .index_roots
                     .get(&index.name)
                     .copied()
@@ -8881,7 +8925,13 @@ impl Database {
                 .copied()
                 .or_else(|| m.roots.get(&name.to_ascii_lowercase()).copied());
             let i = match fp {
-                FastPath::IndexPoint { index, .. } => m
+                // IndexCount shares the live-root requirement: a split
+                // moves the index root, and the Arc snapshot's root_page
+                // goes stale — a count resolved from it silently misses
+                // every leaf the split added (found by the PK stress
+                // suite: count(*) WHERE k = <literal> = 0 while the row
+                // exists, exactly past the first split).
+                FastPath::IndexPoint { index, .. } | FastPath::IndexCount { index, .. } => m
                     .index_roots
                     .get(&index.name)
                     .copied()
@@ -11612,7 +11662,10 @@ fn default_value_text(e: &Expr) -> String {
 /// 'pk' = PRIMARY KEY auto-index (compound / non-integer / WITHOUT
 /// ROWID). SQLite lists indexes in REVERSE creation order — root-page
 /// allocation order is the creation proxy, so sort descending.
-fn pragma_index_list(
+/// Shared by the PRAGMA path and the `pragma_index_list()` table-valued
+/// function (the TVF must report identical metadata — a stale divergent
+/// copy once reported origin 'c' for PK autoindexes).
+pub(crate) fn pragma_index_list(
     t: &Arc<crate::schema::Table>,
     catalog: &crate::schema::Catalog,
 ) -> PragmaRows {
@@ -11672,7 +11725,9 @@ fn pragma_index_list(
 /// `PRAGMA index_info(idx)` / `index_xinfo(idx)` —
 /// (seqno, cid, name[, desc, coll, key]). `index_xinfo` additionally
 /// appends the auxiliary rowid column (cid=-1, name NULL, key=0).
-fn pragma_index_info(
+/// Shared by the PRAGMA path and the `pragma_index_info` /
+/// `pragma_index_xinfo` table-valued functions.
+pub(crate) fn pragma_index_info(
     idx: &Arc<crate::schema::Index>,
     t: &Arc<crate::schema::Table>,
     xinfo: bool,
@@ -13739,10 +13794,21 @@ fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
         } else {
             match text.parse::<i64>() {
                 Ok(v) => Some((Value::Integer(if neg { -v } else { v }), ne)),
-                // Out-of-i64-range integer literal: SQLite treats it as REAL.
+                // Out-of-i64-range integer literal: SQLite treats it as
+                // REAL — EXCEPT the negated fold: `-9223372036854775808`
+                // is the INTEGER i64::MIN (the parser folds the negative
+                // literal; only the POSITIVE literal is REAL). Mirrors
+                // the lexer's Token::HugeInteger rule (see parse_unary).
+                Err(_) if neg => match text.parse::<u64>() {
+                    Ok(9_223_372_036_854_775_808u64) => Some((Value::Integer(i64::MIN), ne)),
+                    _ => {
+                        let v: f64 = text.parse().ok()?;
+                        Some((Value::Real(-v), ne))
+                    }
+                },
                 Err(_) => {
                     let v: f64 = text.parse().ok()?;
-                    Some((Value::Real(if neg { -v } else { v }), ne))
+                    Some((Value::Real(v), ne))
                 }
             }
         }

@@ -17705,7 +17705,15 @@ fn exec_insert_inner(
         let mut rowid_autogen = false;
         if let Some(idx) = table.rowid_alias {
             if full_row[idx].is_null() {
-                let r = next_auto_rowid(ctx.pager, current_root, max_rowid.unwrap_or(0))?;
+                // AUTOINCREMENT: the sequence floor applies here exactly as
+                // in the VALUES loop — a deleted top rowid must never be
+                // reused (INSERT..SELECT previously allocated plain
+                // max+1, violating the AUTOINCREMENT contract).
+                let r = next_auto_rowid(
+                    ctx.pager,
+                    current_root,
+                    max_rowid.unwrap_or(0).max(seq_floor),
+                )?;
                 max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
@@ -17739,6 +17747,21 @@ fn exec_insert_inner(
         match outcome {
             InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
                 inserted += 1;
+                // AUTOINCREMENT: raise the sequence high-water to the
+                // landed rowid (identical to the VALUES loop's bump —
+                // INSERT..SELECT previously never bumped sqlite_sequence,
+                // so the next auto id could REUSE ids the SELECT rows had
+                // just landed; found by the PK stress suite).
+                if is_autoinc {
+                    if let Some(alias) = table.rowid_alias {
+                        if let Some(crate::types::Value::Integer(r)) = full_row.get(alias) {
+                            if *r > seq_floor {
+                                seq_floor = *r;
+                                bump_sqlite_sequence(ctx, &table.name, *r)?;
+                            }
+                        }
+                    }
+                }
                 if let Some(ret) = returning {
                     returning_rows.push(project_returning_row(
                         ret,
@@ -18251,9 +18274,14 @@ fn exec_insert_one_row(
                 r
             }
             _ => {
-                return Err(Error::semantic(
-                    "rowid alias column must be an integer or NULL",
-                ))
+                // SQLite OP_MustBeInt (vdbe.c): the rowid alias column
+                // must hold an INTEGER after NUMERIC-affinity coercion —
+                // a REAL that is not an exact integer (5.5, 1e30, ±2^63),
+                // non-integer TEXT ('7.5', '0x10'), or a BLOB all fail
+                // with SQLite's exact message: "datatype mismatch"
+                // (SQLITE_MISMATCH, a constraint-class error). Verified
+                // against real SQLite.
+                return Err(Error::constraint("datatype mismatch"));
             }
         }
     } else {

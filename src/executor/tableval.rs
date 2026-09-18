@@ -52,7 +52,8 @@ pub(crate) fn exec_table_function(
         "json_tree" => json_each(&vals, true)?,
         "pragma_table_info" => pragma_table_info(ctx, &vals)?,
         "pragma_index_list" => pragma_index_list(ctx, &vals),
-        "pragma_index_info" | "pragma_index_xinfo" => pragma_index_info(ctx, &vals),
+        "pragma_index_info" => pragma_index_info(ctx, &vals, false),
+        "pragma_index_xinfo" => pragma_index_info(ctx, &vals, true),
         "pragma_foreign_key_list" => pragma_foreign_key_list(ctx, &vals)?,
         "pragma_collation_list" => pragma_collation_list(),
         "pragma_database_list" => pragma_database_list(),
@@ -261,47 +262,56 @@ fn pragma_index_list(
         Some(Value::Text(t)) => t.to_string(),
         _ => return (COLS.to_vec(), Vec::new()),
     };
-    let idxs = ctx.catalog().indexes_on_table(&name);
-    let mut rows = Vec::with_capacity(idxs.len());
-    for (i, ix) in idxs.iter().enumerate() {
-        rows.push(vec![
-            Value::Integer(i as i64),
-            Value::Text(ix.name.as_str().into()),
-            Value::Integer(if ix.unique { 1 } else { 0 }),
-            Value::Text("c".into()),
-            Value::Integer(0),
-        ]);
-    }
-    (COLS.to_vec(), rows)
+    let Some(t) = ctx.catalog().get_table(&name) else {
+        return (COLS.to_vec(), Vec::new());
+    };
+    // Delegate to the PRAGMA-path implementation: origin 'pk'/'u'/'c',
+    // partial flag, and SQLite's reverse-creation-order seq — the TVF
+    // must report metadata identical to `PRAGMA index_list` (a stale
+    // divergent copy here once reported origin 'c' for PK autoindexes).
+    let pr = crate::api::pragma_index_list(&t, ctx.catalog());
+    (COLS.to_vec(), pr.rows)
 }
 
 fn pragma_index_info(
     ctx: &ExecContext<'_>,
     args: &[Value],
+    xinfo: bool,
 ) -> (Vec<&'static str>, Vec<Vec<Value>>) {
     const COLS: [&str; 3] = ["seqno", "cid", "name"];
+    const XCOLS: [&str; 6] = ["seqno", "cid", "name", "desc", "coll", "key"];
     let name = match args.first() {
         Some(Value::Text(t)) => t.to_string(),
-        _ => return (COLS.to_vec(), Vec::new()),
+        _ => {
+            return if xinfo {
+                (XCOLS.to_vec(), Vec::new())
+            } else {
+                (COLS.to_vec(), Vec::new())
+            }
+        }
     };
-    let idx = match ctx.catalog().get_index(&name) {
-        Some(i) => i,
-        None => return (COLS.to_vec(), Vec::new()),
+    let Some(idx) = ctx.catalog().get_index(&name) else {
+        return if xinfo {
+            (XCOLS.to_vec(), Vec::new())
+        } else {
+            (COLS.to_vec(), Vec::new())
+        };
     };
-    let table = match ctx.catalog().get_table(&idx.table) {
-        Some(t) => t,
-        None => return (COLS.to_vec(), Vec::new()),
+    let Some(table) = ctx.catalog().get_table(&idx.table) else {
+        return if xinfo {
+            (XCOLS.to_vec(), Vec::new())
+        } else {
+            (COLS.to_vec(), Vec::new())
+        };
     };
-    let mut rows = Vec::with_capacity(idx.columns.len());
-    for (i, c) in idx.columns.iter().enumerate() {
-        let cid = table.find_column(&c.name).map(|i| i as i64).unwrap_or(-1);
-        rows.push(vec![
-            Value::Integer(i as i64),
-            Value::Integer(cid),
-            Value::Text(c.name.as_str().into()),
-        ]);
+    // Delegate to the PRAGMA-path implementation (xinfo carries the
+    // desc/coll/key columns and the auxiliary rowid entry).
+    let pr = crate::api::pragma_index_info(&idx, &table, xinfo);
+    if xinfo {
+        (XCOLS.to_vec(), pr.rows)
+    } else {
+        (COLS.to_vec(), pr.rows)
     }
-    (COLS.to_vec(), rows)
 }
 
 fn pragma_foreign_key_list(

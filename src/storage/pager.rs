@@ -2363,6 +2363,19 @@ impl Pager {
         self.dirty_count_approx.load(Ordering::Acquire)
     }
 
+    /// EXACT count of pages currently marked dirty (the `dirty_pages`
+    /// set's live length — unlike [`Self::dirty_page_count`], which
+    /// counts optimistic `note_write` calls and over-reports). The
+    /// autocommit statement-atomicity gate snapshots this at statement
+    /// start and compares at the epilogue: a failed statement that
+    /// never mutated a page (constraint checks fire before any b-tree
+    /// write) must NOT pay the physical restore — the optimistic
+    /// counter made every failed insert of the mixed-RW bench pay it
+    /// (200/iteration, 4x; found by the CI bench gate).
+    pub fn dirty_set_marked(&self) -> usize {
+        self.dirty_pages.lock().len()
+    }
+
     /// Advance the schema cookie in memory only (DDL bookkeeping). The
     /// next `flush` writes it into page 0's header — the WAL-aware path
     /// (unlike the direct-file-write `bump_schema_cookie`).
