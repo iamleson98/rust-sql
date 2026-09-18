@@ -258,7 +258,7 @@ pub fn file_identity(file: &File) -> Option<(u64, u64)> {
             lpFileInformation: *mut ByHandleFileInformation,
         ) -> i32;
     }
-    let mut info = std::mem::zeroed::<ByHandleFileInformation>();
+    let mut info = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
     let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut c_void, &mut info) };
     if ok == 0 {
         return None;
