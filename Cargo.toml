@@ -302,3 +302,29 @@ path = "examples/probe_foreign_trace.rs"
 [[example]]
 name = "verify_engine_file"
 path = "examples/verify_engine_file.rs"
+
+# Cold-start verification on super-large files: 5M-row (~1.3 GiB) sources
+# built with rusqlite (SQLite format) and the engine (native format),
+# then fresh-process open + first-query + RSS measurements with the page
+# cache dropped between rounds. Driver: scripts/cold_large.sh (external).
+[[example]]
+name = "probe_cold_large"
+path = "examples/probe_cold_large.rs"
+
+# Multi-writer hammer: N concurrent-transaction writer connections
+# (payment shape: debit + audit + index), M reader connections checking
+# snapshot invariants, then integrity_check reconciliation + VACUUM INTO
+# export verified by real SQLite. Also found the live-engine partial-view
+# divergence pinned in tests/concurrent_reader_visibility.rs.
+[[example]]
+name = "probe_mw_hammer"
+path = "examples/probe_mw_hammer.rs"
+required-features = ["sqlx"]
+
+# Diagnostic companion to probe_mw_hammer: isolates the reader-visibility
+# divergence under an N-writer concurrent burst (root-resolution tracing
+# hooks: RSQL_DBG_CW=1).
+[[example]]
+name = "probe_mw_diag"
+path = "examples/probe_mw_diag.rs"
+required-features = ["sqlx"]
