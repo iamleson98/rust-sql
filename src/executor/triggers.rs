@@ -85,7 +85,13 @@ pub(crate) fn fire_triggers(
     if triggers.is_empty() {
         return Ok(());
     }
-    for trig in triggers {
+    // SQLite fires same-event triggers in REVERSE creation order: its
+    // trigger chain PREPENDS each new trigger and firing walks the chain
+    // head-first (verified: two AFTER DELETE triggers A then B insert
+    // rows B-first; three triggers C,B,A). Our list is creation-ordered,
+    // so walk it backwards (deep-sweep: the delete-all with two
+    // self-inserting audit triggers produced phase-shifted rows).
+    for trig in triggers.iter().rev() {
         if trig.when != phase {
             continue;
         }
@@ -113,7 +119,7 @@ pub(crate) fn fire_triggers(
         // runs. Validated once per Trigger registration (the Arc is
         // replaced by DDL, so the flag can never go stale).
         if !trig.validated.load(std::sync::atomic::Ordering::Acquire) {
-            validate_trigger_first_fire(ctx.catalog(), &trig, table)?;
+            validate_trigger_first_fire(ctx.catalog(), trig, table)?;
             trig.validated
                 .store(true, std::sync::atomic::Ordering::Release);
         }

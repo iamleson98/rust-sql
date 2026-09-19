@@ -2805,6 +2805,11 @@ pub(crate) fn try_parallel_join_probe(
     n_out: usize,
     left_outer: bool,
     build_unmatched_tail: bool,
+    // Rowid-alias SEEK gate (the serial fused path's `rowid_seek_join`):
+    // Some(gated_is_probe) — the gated side's key values convert through
+    // `rowid_seek_value` and a slot hit must convert EXACTLY to the
+    // alias side's rowid (mirrors the serial path bit for bit).
+    seek_gate: Option<bool>,
 ) -> Result<Option<Vec<crate::Row>>> {
     let pager = ctx.pager;
     // Committed-view scope: workers are foreign to the TLS arming.
@@ -2871,18 +2876,35 @@ pub(crate) fn try_parallel_join_probe(
                     }
                     let mut key_ok = true;
                     for (j, &kp) in probe_key_pos.iter().enumerate() {
-                        let k = match pbuf.get(kp) {
-                            Some(crate::types::Value::Integer(i)) => {
-                                crate::types::value::double_order_key(*i as f64)
+                        let k = if seek_gate == Some(true) {
+                            // Gated probe key: the value CONVERTS through
+                            // the rowid seek gate — None matches nothing
+                            // (SQLite's SeekRowid no-row jump).
+                            match super::rowid_seek_value(
+                                pbuf.get(kp).unwrap_or(&crate::types::Value::Null),
+                            ) {
+                                Some(i) => crate::types::value::double_order_key(i as f64),
+                                None => {
+                                    key_ok = false;
+                                    break;
+                                }
                             }
-                            Some(crate::types::Value::Real(f)) => {
-                                crate::types::value::double_order_key(*f)
-                            }
-                            // NULL/TEXT/BLOB: no match (LEFT still emits
-                            // the NULL-extended probe row).
-                            _ => {
-                                key_ok = false;
-                                break;
+                        } else {
+                            match pbuf.get(kp) {
+                                Some(crate::types::Value::Integer(i)) => {
+                                    crate::types::value::double_order_key(*i as f64)
+                                }
+                                Some(crate::types::Value::Real(f)) => {
+                                    // -0.0 normalizes to +0.0 (SQL: 0 = -0.0).
+                                    let f = if *f == 0.0 { 0.0 } else { *f };
+                                    crate::types::value::double_order_key(f)
+                                }
+                                // NULL/TEXT/BLOB: no match (LEFT still emits
+                                // the NULL-extended probe row).
+                                _ => {
+                                    key_ok = false;
+                                    break;
+                                }
                             }
                         };
                         pks[j] = k;
@@ -2901,17 +2923,41 @@ pub(crate) fn try_parallel_join_probe(
                                 if existing == u64::MAX {
                                     break u32::MAX;
                                 }
-                                if existing == k
-                                    && (n_keys == 1
-                                        || super::join_keys_match(
+                                // ALWAYS verify a key hit against the
+                                // stored values (the serial fused path's
+                                // contract): an INTEGER probe key beyond
+                                // 2^53 is its rounded double —
+                                // Integer(i64::MAX) hashes onto
+                                // Real(2^63)'s exact key. values_sql_equal
+                                // (the EXACT int/float compare) decides —
+                                // EXCEPT for a SEEK-gated pair, where the
+                                // gated value must convert exactly to the
+                                // alias rowid (see the serial path).
+                                let hit = existing == k
+                                    && (if let Some(gated_is_probe) = seek_gate {
+                                        let bpos = slots[slot].head as usize * built.stride
+                                            + built_key_slots[0];
+                                        let (gated, alias) = if gated_is_probe {
+                                            (&pbuf[probe_key_pos[0]], &built.build_vals[bpos])
+                                        } else {
+                                            (&built.build_vals[bpos], &pbuf[probe_key_pos[0]])
+                                        };
+                                        matches!(
+                                            alias,
+                                            crate::types::Value::Integer(r)
+                                                if super::rowid_seek_value(gated) == Some(*r)
+                                        )
+                                    } else {
+                                        super::join_keys_match(
                                             &built.build_vals,
                                             slots[slot].head as usize,
                                             built.stride,
                                             &built_key_slots,
                                             &pbuf,
                                             &probe_key_pos,
-                                        ))
-                                {
+                                        )
+                                    });
+                                if hit {
                                     break slots[slot].head;
                                 }
                                 slot = (slot + 1) & table_mask;

@@ -77,7 +77,12 @@ fn values_match(a: &Value, b: &Sv) -> bool {
         (Value::Integer(x), Sv::Real(y)) => (*x as f64 - y).abs() <= 1e-9 * y.abs().max(1.0),
         (Value::Real(x), Sv::Integer(y)) => (*x - *y as f64).abs() <= 1e-9 * x.abs().max(1.0),
         (Value::Real(x), Sv::Real(y)) => {
-            (x.is_nan() && y.is_nan()) || (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+            // `x == y` first: ±inf pairs must match (inf - inf = NaN made
+            // the epsilon test reject them — a FALSE divergence on
+            // overflow-to-inf sums), and exact equality is free.
+            (x.is_nan() && y.is_nan())
+                || x == y
+                || (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
         }
         (Value::Text(x), Sv::Text(y)) => x.as_str() == y,
         (Value::Blob(x), Sv::Blob(y)) => x == y,
@@ -292,7 +297,13 @@ fn gen_schema(rng: &mut Rng, _audit: bool) -> Schema {
                 .join(", ");
             let _ = name;
         } else if shape < 6 {
-            // WITHOUT ROWID: single- or double-column PK.
+            // WITHOUT ROWID: single- or double-column PK. The keywords are
+            // REQUIRED: `CREATE TABLE t (... PRIMARY KEY (f))` without them
+            // is a ROWID table whose INTEGER pk column is the rowid ALIAS
+            // (SQLite quirk) — NULL-pk inserts then auto-allocate rowids,
+            // and once the max hits i64::MAX both engines go RANDOM,
+            // which the harness model (worowid_pk = skip rowid checks)
+            // can never verify. Three deep-sweep seeds died on this.
             let k = 1 + rng.below(2);
             let mut pk = Vec::new();
             for _ in 0..k {
@@ -306,7 +317,26 @@ fn gen_schema(rng: &mut Rng, _audit: bool) -> Schema {
                 .map(|&i| cols[i].name.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
-            ddl_tail = format!(", PRIMARY KEY ({})", pk_list);
+            ddl_tail = format!(", PRIMARY KEY ({}) WITHOUT ROWID", pk_list);
+        } else if shape == 6 {
+            // Rowid alias via the SEPARATE-clause form: `f INTEGER, ...,
+            // PRIMARY KEY (f)` — SQLite treats the INTEGER pk column as
+            // the rowid alias (lang_createtable: "the column is an alias
+            // for the rowid"). Same model as the column-level alias
+            // shape: rowid dumps, arming checks, the i64::MAX guard.
+            let idx = cols
+                .iter()
+                .position(|c| c.ty == "INTEGER")
+                .unwrap_or_else(|| {
+                    cols.push(Col {
+                        name: "pk".to_string(),
+                        ty: "INTEGER",
+                    });
+                    cols.len() - 1
+                });
+            alias_pk = Some(idx);
+            let name = cols[idx].name.clone();
+            ddl_tail = format!(", PRIMARY KEY ({})", name);
         }
         let name = format!("t{t}");
         let ddl = format!("CREATE TABLE {} ({}{})", name, ddl_cols, ddl_tail);

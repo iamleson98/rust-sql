@@ -188,6 +188,7 @@ fn in_list_probe(
     v: &Value,
     vals: &[PredValue],
     int_set: &Option<std::collections::HashSet<i64>>,
+    rowid_seek: bool,
     row: &[Value],
     positions: &[usize],
     params: &[Value],
@@ -196,14 +197,16 @@ fn in_list_probe(
         // All-integer-literal fast path: one probe. Reals match
         // numerically when exactly representable (1.0 in (1,2)); a real
         // outside the exact range falls to the linear path for full
-        // cross-type semantics.
+        // cross-type semantics. Rowid-SEEK membership is IDENTICAL here:
+        // the value is the rowid Integer and every member is an Integer
+        // (an Integer seeks to itself).
         match v {
             Value::Integer(i) => (set.contains(i), false),
             Value::Real(x) => {
                 if x.is_finite() && x.fract() == 0.0 && x.abs() < 9.007_199_254_740_992e15 {
                     (set.contains(&(*x as i64)), false)
                 } else {
-                    in_linear(v, vals, row, positions, params)
+                    in_linear(v, vals, rowid_seek, row, positions, params)
                 }
             }
             // NULL value: never a member; NOT IN yields NULL (filtered) —
@@ -213,7 +216,7 @@ fn in_list_probe(
             _ => (false, false),
         }
     } else {
-        in_linear(v, vals, row, positions, params)
+        in_linear(v, vals, rowid_seek, row, positions, params)
     }
 }
 
@@ -224,16 +227,34 @@ fn in_list_probe(
 fn in_linear(
     v: &Value,
     vals: &[PredValue],
+    rowid_seek: bool,
     row: &[Value],
     positions: &[usize],
     params: &[Value],
 ) -> (bool, bool) {
     let mut found = false;
     let mut saw_null = matches!(v, Value::Null);
+    let v_rowid = if rowid_seek {
+        match v {
+            Value::Integer(r) => Some(*r),
+            _ => None,
+        }
+    } else {
+        None
+    };
     for cand in vals {
         let c = cand.eval(row, positions, params);
         if matches!(&*c, Value::Null) {
             saw_null = true;
+        } else if let Some(r) = v_rowid {
+            // Rowid-SEEK membership (SQLite's IN-loop plan drives rowid
+            // seeks with the members): OP_SeekRowid's conversion per
+            // member — `id IN (-2^63.0, '5')` matches only rowid 5 (the
+            // boundary REAL seeks nothing, the numeric text seeks 5).
+            if super::rowid_seek_value(&c) == Some(r) {
+                found = true;
+                break;
+            }
         } else if apply_binary(BinaryOp::Eq, v, &c).is_truthy() {
             found = true;
             break;
@@ -324,6 +345,14 @@ pub(crate) enum CompiledPredicate {
         /// path. `saw_null` is folded in (a literal NULL member can never
         /// match under SQL IN semantics but poisons NOT IN).
         int_set: Option<std::collections::HashSet<i64>>,
+        /// The LHS column is the table's rowid ALIAS: membership runs
+        /// under SQLite's rowid-SEEK semantics (OP_SeekRowid's conversion
+        /// per member — ticket #3922 + the Atoi64 text parse), not the
+        /// general numeric comparison. `id IN (-2^63.0, '5')` matches
+        /// ONLY the rowid 5 row (the boundary REAL seeks nothing; the
+        /// numeric text seeks 5) — exactly what SQLite's IN-loop plan
+        /// (the subquery/list driving rowid seeks) produces.
+        rowid_seek: bool,
     },
     /// `col LIKE/GLOB pattern` / `NOT LIKE|GLOB ...` (literal or param
     /// pattern). `glob` selects the matcher: GLOB is case-sensitive with
@@ -443,10 +472,15 @@ impl CompiledPredicate {
                 matches!(&*h, Value::Null)
             }
             CompiledPredicate::InList {
-                col, vals, int_set, ..
+                col,
+                vals,
+                int_set,
+                rowid_seek,
+                ..
             } => {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
-                let (found, saw_null) = in_list_probe(v, vals, int_set, row, positions, params);
+                let (found, saw_null) =
+                    in_list_probe(v, vals, int_set, *rowid_seek, row, positions, params);
                 !found && saw_null
             }
             CompiledPredicate::Like { col, pattern, .. } => {
@@ -559,11 +593,13 @@ impl CompiledPredicate {
                 vals,
                 negated,
                 int_set,
+                rowid_seek,
             } => {
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 // Membership probe shared with eval_null (NOT's
                 // three-valued logic): (found, saw_null).
-                let (found, saw_null) = in_list_probe(v, vals, int_set, row, positions, params);
+                let (found, saw_null) =
+                    in_list_probe(v, vals, int_set, *rowid_seek, row, positions, params);
                 // SQL IN semantics: NULL never matches; NOT IN with any
                 // NULL member yields NULL (not true) — filtered out.
                 if *negated {
@@ -1184,6 +1220,7 @@ pub(crate) fn compile_predicate(
                 vals: bound,
                 negated: *negated,
                 int_set,
+                rowid_seek: table.rowid_alias == Some(col),
             })
         }
         Expr::Like {

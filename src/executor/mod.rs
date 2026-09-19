@@ -822,6 +822,23 @@ pub(crate) enum StmtUndoEntry {
         rowid: i64,
         payload: Vec<u8>,
     },
+    /// A row this statement updated IN PLACE (the pre-update payload,
+    /// captured before the rewrite — `UPDATE t SET ...` rows that keep
+    /// their rowid, and upsert DO-UPDATE rewrites): undo = restore the
+    /// old payload at the same rowid and swap the index entries back
+    /// (delete the post-update row's keys, re-insert the old row's
+    /// keys). The rowid-alias MOVE path journals itself as a
+    /// Deleted(old) + Inserted(new) pair instead (see
+    /// `apply_rowid_alias_move`) — this entry is for same-rowid
+    /// rewrites, which neither half covers. Found by the deep-sweep:
+    /// a multi-row UPDATE whose SECOND row hit an intra-statement
+    /// UNIQUE conflict left the first row's rewrite behind (SQLite
+    /// rolls the whole statement back).
+    Updated {
+        table: Arc<Table>,
+        rowid: i64,
+        old_payload: Vec<u8>,
+    },
 }
 
 /// Replay a statement journal in reverse, best-effort. Called by the
@@ -880,9 +897,109 @@ pub(crate) fn replay_stmt_undo(
                     }
                 }
             }
+            StmtUndoEntry::Updated {
+                table,
+                rowid,
+                old_payload,
+            } => {
+                // 1. Remove the row's CURRENT (post-update) index entries —
+                //    computed from the payload currently stored at rowid.
+                //    Reverse-order replay guarantees that payload is exactly
+                //    what THIS entry's statement wrote (any later write has
+                //    its own, later-replayed entry).
+                let indexes = ctx.catalog().indexes_on_table(&table.name);
+                let root = ctx.table_root(&table);
+                let mut current: Option<Vec<u8>> = None;
+                {
+                    let mut bt = Btree::new(ctx.pager, root, false);
+                    if let LookupResult::Found(p) = bt.lookup_table(rowid)? {
+                        current = Some(p);
+                    }
+                }
+                if let Some(cur) = current.as_ref() {
+                    if !indexes.is_empty() {
+                        if let Ok(new_row) =
+                            decode_row(cur, table.n_columns(), rowid, table.rowid_alias)
+                        {
+                            for idx in &indexes {
+                                let _ = delete_index_entry(ctx, idx, &table, &new_row, rowid);
+                            }
+                        }
+                    }
+                    // 2. Restore the pre-update payload (in-place when the
+                    //    size matches — the common undo shape — else
+                    //    delete + insert).
+                    let root = ctx.table_root(&table);
+                    let mut bt = Btree::new(ctx.pager, root, false);
+                    let did_in_place = bt.update_table(rowid, &old_payload).unwrap_or(false);
+                    if !did_in_place {
+                        bt.delete_table(rowid)?;
+                        bt.insert_table(rowid, &old_payload)?;
+                    }
+                    if bt.root != root {
+                        ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+                    }
+                    // 3. Re-insert the old row's index entries.
+                    if !indexes.is_empty() {
+                        if let Ok(old_row) =
+                            decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)
+                        {
+                            for idx in &indexes {
+                                let _ = insert_index_entry(ctx, idx, &table, &old_row, rowid);
+                            }
+                        }
+                    }
+                } else {
+                    // The row vanished after this entry was journaled (a
+                    // later delete — replayed first — removed it, or a
+                    // later entry moved it): nothing to restore HERE for
+                    // the payload; the old row's reinsertion belongs to
+                    // that entry's own replay.
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Journal an in-place row rewrite for statement-atomicity undo: capture
+/// the row's PRE-update payload (re-encoded from the decoded old row —
+/// the record codec roundtrips byte-identically) so a later failure in
+/// the same statement can restore it (see `StmtUndoEntry::Updated`).
+/// Over-journaling is a harmless no-op on replay (the entry's old
+/// payload equals the stored payload → delete/restore/index swap all
+/// no-op), so pushing before a rewrite that might not land is safe.
+pub(crate) fn journal_row_rewrite(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowid: i64,
+    old_row: &Row,
+) {
+    if let Some(t) = ctx.catalog().get_table(&table.name.to_ascii_lowercase()) {
+        ctx.stmt_undo.push(StmtUndoEntry::Updated {
+            table: t,
+            rowid,
+            old_payload: encode_row_aliased(old_row, table.rowid_alias),
+        });
+    }
+}
+
+/// Same as [`journal_row_rewrite`] but from an already-encoded pre-update
+/// payload (the streaming path stashes it during the scan phase — no
+/// re-encode). Byte-for-byte the same contract.
+pub(crate) fn journal_row_rewrite_payload(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowid: i64,
+    old_payload: &[u8],
+) {
+    if let Some(t) = ctx.catalog().get_table(&table.name.to_ascii_lowercase()) {
+        ctx.stmt_undo.push(StmtUndoEntry::Updated {
+            table: t,
+            rowid,
+            old_payload: old_payload.to_vec(),
+        });
+    }
 }
 
 pub struct ExecContext<'a> {
@@ -1174,6 +1291,10 @@ impl<'a> ExecContext<'a> {
 
     /// Update the index root override (called after an index B+tree split).
     pub fn set_index_root(&mut self, index_name: &str, root: u32) {
+        if crate::executor::dbg_index_trace() {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("[set-index-root] {} -> {}\n{}", index_name, root, bt);
+        }
         if self.index_roots.get(index_name) == Some(&root)
             || self.shared.index_roots.get(index_name) == Some(&root)
         {
@@ -1198,6 +1319,9 @@ impl<'a> ExecContext<'a> {
     /// roots only move on B+tree splits. Previously this allocated a fresh
     /// key String + inserted into the map on EVERY inserted row.
     pub fn set_table_root_lc(&mut self, table_name_lc: &str, root: u32) {
+        if crate::executor::dbg_index_trace() {
+            eprintln!("[set-table-root] {} -> {}", table_name_lc, root);
+        }
         // Skip when the value already matches either the local overlay or
         // the shared snapshot (roots only move on B+tree splits).
         if self.root_overrides.get(table_name_lc) == Some(&root)
@@ -2261,6 +2385,9 @@ fn fk_write_child_row(
     if let Some(target) = move_target {
         if target == rowid {
             // Key value unchanged numerically — plain in-place write.
+            // Statement journal: FK-action child rewrites are part of the
+            // OWNING statement — its failure must roll them back too.
+            journal_row_rewrite(ctx, child, rowid, old_crow);
             let root = ctx.table_root(child);
             let new_root = {
                 let mut bt = Btree::new(ctx.pager, root, false);
@@ -2290,6 +2417,11 @@ fn fk_write_child_row(
             }
         }
         // Delete the old cell + its index entries (OLD row values).
+        // Statement journal: FK-action child MOVES are part of the owning
+        // statement — journal as Deleted(old) + Inserted(new), the same
+        // pair `apply_rowid_alias_move` uses (reverse replay deletes the
+        // new cell first, then re-inserts the old one).
+        let journal_arc = ctx.catalog().get_table(&child.name.to_ascii_lowercase());
         {
             let root = ctx.table_root(child);
             let (new_root, old_payload) = {
@@ -2306,6 +2438,13 @@ fn fk_write_child_row(
                         }
                     }
                 }
+                if let Some(t) = journal_arc.as_ref() {
+                    ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                        table: std::sync::Arc::clone(t),
+                        rowid,
+                        payload: op,
+                    });
+                }
                 ctx.invalidate_max_rowid_if_deleted(&child.name.to_ascii_lowercase(), rowid);
             }
         }
@@ -2318,12 +2457,26 @@ fn fk_write_child_row(
                 ctx.set_table_root(&child.name, bt.root);
             }
         }
+        // The moved-in rowid RAISES the max-rowid cache (monotonic): a
+        // later auto-allocated INSERT in this transaction would otherwise
+        // reuse target and duplicate the row (found by the deep-sweep: an
+        // UPDATE moved a row to 26 past a stale cache of 22, the next
+        // trigger-fired INSERT allocated 23..27 and duplicated 26).
+        ctx.set_max_rowid_lc(&child.name.to_ascii_lowercase(), target);
         for idx in &indexes {
             insert_index_entry(ctx, idx, child, new_crow, target)?;
+        }
+        if let Some(t) = journal_arc.as_ref() {
+            ctx.stmt_undo.push(StmtUndoEntry::Inserted {
+                table: std::sync::Arc::clone(t),
+                rowid: target,
+            });
         }
         Ok(target)
     } else {
         // Plain in-place payload write (no alias move).
+        // Statement journal (see the move branch above).
+        journal_row_rewrite(ctx, child, rowid, old_crow);
         let root = ctx.table_root(child);
         let new_root = {
             let mut bt = Btree::new(ctx.pager, root, false);
@@ -2678,9 +2831,13 @@ fn enforce_parent_delete_fks(
                 ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
                     // Rewrite each child row's FK columns to NULL / defaults.
                     for (rowid, mut crow) in children {
-                        // Preupdate: keep the pre-rewrite row for the event.
+                        // Pre-rewrite snapshot: feeds BOTH the preupdate
+                        // event and the statement-atomicity journal (the
+                        // SET NULL / SET DEFAULT mutation below consumes
+                        // `crow` in place).
+                        let old_crow_snapshot = crow.clone();
                         let pre_row = if crate::preupdate::hook_installed() {
-                            Some(crow.clone())
+                            Some(old_crow_snapshot.clone())
                         } else {
                             None
                         };
@@ -2701,6 +2858,10 @@ fn enforce_parent_delete_fks(
                         let root = ctx.table_root(&child);
                         let new_root;
                         {
+                            // Statement journal: ON DELETE SET NULL / SET
+                            // DEFAULT child rewrites roll back with the
+                            // owning statement (SQLite statement atomicity).
+                            journal_row_rewrite(ctx, child.as_ref(), rowid, &old_crow_snapshot);
                             // Preupdate: the child row is about to be
                             // rewritten (SET NULL / SET DEFAULT).
                             crate::preupdate::fire(
@@ -6653,7 +6814,11 @@ fn hash_sql_value<H: std::hash::Hasher>(v: &Value, state: &mut H) {
             state.write_i64(*i);
         }
         Value::Real(f) => {
-            if f.is_finite() && *f == f.trunc() && f.abs() <= 9.007_199_254_740_992e15 {
+            // Same normalization as types::value::hash_value_sql: EXACT
+            // integral doubles (up to 2^63, not 2^53) collide with their
+            // Integer form — they are one value under values_sql_equal's
+            // exact comparison, so they MUST share a hash.
+            if f.is_finite() && *f == f.trunc() && f.abs() < 9223372036854775808.0 {
                 state.write_u8(1);
                 state.write_i64(*f as i64);
             } else {
@@ -8874,6 +9039,24 @@ pub(crate) fn kbn_step(sum: &mut f64, comp: &mut f64, x: f64) {
     *sum = t;
 }
 
+/// Fold the KBN compensation in ONCE at finalize — SQLite's
+/// `kbnFinalize` guard, verbatim: the error term is folded only while
+/// the running sum is finite AND nonzero. When the sum has gone ±inf
+/// (input overflow), `comp` holds NaN/±inf noise from the overflowed
+/// steps (`(±inf - ±inf)` pairs); folding it yields NaN where SQLite
+/// returns the ±inf itself. The `comp != 0` check also keeps a -0.0
+/// sum from being normalized to +0.0 by a zero fold. Pinned by
+/// `sum_real_overflow_is_inf_not_nan` (deep-sweep seed 8:
+/// `sum(-1e308 × 4)` returned NaN; SQLite returns -inf).
+#[inline]
+pub(crate) fn kbn_finalize_sum(sum: f64, comp: f64) -> f64 {
+    if comp != 0.0 && sum.is_finite() {
+        sum + comp
+    } else {
+        sum
+    }
+}
+
 /// Fold `src` (a partial range's accumulator) into `dst`. The merge is
 /// OP-AWARE because `FusedAcc` overloads its fields per aggregate:
 /// Sum/Total use (i_sum, sum, sum_is_int, comp); Avg uses (count, sum,
@@ -9100,14 +9283,32 @@ impl FusedWalk {
                     false
                 }
                 (a, b) => {
-                    let (x, y) = (a.as_f64(), b.as_f64());
+                    // Mixed INTEGER×REAL (or REAL×REAL) pairs: the EXACT
+                    // int/float comparison (SQLite's sqlite3IntFloatCompare
+                    // — see types::value::int_float_compare). The old
+                    // as_f64/as_f64 cast collapsed i64::MAX and 2^63 onto
+                    // the same double, so `WHERE int_col = 9.2233720368547758e18`
+                    // WRONGLY matched an i64::MAX row (deep-sweep).
+                    use std::cmp::Ordering;
+                    let ord = match (a, b) {
+                        (NumVal::I(x), NumVal::F(y)) => {
+                            crate::types::value::int_float_compare(x, y)
+                        }
+                        (NumVal::F(x), NumVal::I(y)) => {
+                            crate::types::value::int_float_compare(y, x).reverse()
+                        }
+                        _ => match a.as_f64().partial_cmp(&b.as_f64()) {
+                            Some(o) => o,
+                            None => Ordering::Equal, // NaN literal: bail-ish
+                        },
+                    };
                     match f.cmp {
-                        FusedCmp::Eq => x == y,
-                        FusedCmp::Neq => x != y,
-                        FusedCmp::Lt => x < y,
-                        FusedCmp::LtEq => x <= y,
-                        FusedCmp::Gt => x > y,
-                        FusedCmp::GtEq => x >= y,
+                        FusedCmp::Eq => ord == Ordering::Equal,
+                        FusedCmp::Neq => ord != Ordering::Equal,
+                        FusedCmp::Lt => ord == Ordering::Less,
+                        FusedCmp::LtEq => ord != Ordering::Greater,
+                        FusedCmp::Gt => ord == Ordering::Greater,
+                        FusedCmp::GtEq => ord != Ordering::Less,
                     }
                 }
             };
@@ -9491,6 +9692,10 @@ fn fused_filter_lit(
     match e {
         Expr::Literal(v) => match v {
             Value::Integer(i) => Some(NumVal::I(*i)),
+            // NaN literal/param: SQL comparisons with NaN are NULL
+            // (never a match, never a clean <>) — bail to the general
+            // predicate rather than f64-compare it.
+            Value::Real(f) if f.is_nan() => None,
             Value::Real(f) => Some(NumVal::F(*f)),
             _ => None,
         },
@@ -9502,6 +9707,7 @@ fn fused_filter_lit(
             }?;
             match v {
                 Value::Integer(i) => Some(NumVal::I(*i)),
+                Value::Real(f) if f.is_nan() => None,
                 Value::Real(f) => Some(NumVal::F(*f)),
                 _ => None,
             }
@@ -9772,14 +9978,14 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> Result<ExecResul
                 } else if acc.sum_is_int {
                     Value::Integer(acc.i_sum)
                 } else {
-                    // sumFinalize's approx arm: rSum + rErr.
-                    Value::Real(acc.sum + acc.comp)
+                    // sumFinalize's approx arm: rSum + rErr (guarded).
+                    Value::Real(kbn_finalize_sum(acc.sum, acc.comp))
                 }
             }
             AggFunc::Total => Value::Real(if acc.sum_is_int {
                 acc.i_sum as f64
             } else {
-                acc.sum + acc.comp
+                kbn_finalize_sum(acc.sum, acc.comp)
             }),
             AggFunc::Avg => {
                 if acc.count == 0 {
@@ -9793,7 +9999,7 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> Result<ExecResul
                     let r = if acc.sum_is_int {
                         acc.i_sum as f64
                     } else {
-                        acc.sum + acc.comp
+                        kbn_finalize_sum(acc.sum, acc.comp)
                     };
                     Value::Real(r / acc.count as f64)
                 }
@@ -11662,14 +11868,15 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
             } else if state.sum_is_int {
                 Ok(Value::Integer(state.int_sum))
             } else {
-                // sumFinalize's approx arm: rSum + rErr.
-                Ok(Value::Real(state.sum + state.comp))
+                // sumFinalize's approx arm: rSum + rErr, with kbnFinalize's
+                // finite guard (±inf sums stay ±inf, never NaN).
+                Ok(Value::Real(kbn_finalize_sum(state.sum, state.comp)))
             }
         }
         "total" => Ok(Value::Real(if state.sum_is_int {
             state.int_sum as f64
         } else {
-            state.sum + state.comp
+            kbn_finalize_sum(state.sum, state.comp)
         })),
         "avg" => {
             if state.count == 0 {
@@ -11680,7 +11887,7 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
                 let r = if state.sum_is_int {
                     state.int_sum as f64
                 } else {
-                    state.sum + state.comp
+                    kbn_finalize_sum(state.sum, state.comp)
                 };
                 Ok(Value::Real(r / state.count as f64))
             }
@@ -12532,14 +12739,14 @@ fn compute_window_at(
                     } else if int_exact {
                         Ok(Value::Integer(isum))
                     } else {
-                        // sumFinalize's approx arm: rSum + rErr.
-                        Ok(Value::Real(sum + comp))
+                        // sumFinalize's approx arm: rSum + rErr (guarded).
+                        Ok(Value::Real(kbn_finalize_sum(sum, comp)))
                     }
                 }
                 "total" => Ok(Value::Real(if int_exact {
                     isum as f64
                 } else {
-                    sum + comp
+                    kbn_finalize_sum(sum, comp)
                 })),
                 "avg" => {
                     if count == 0 {
@@ -12548,7 +12755,11 @@ fn compute_window_at(
                         // SQLite avgFinalize over the frame: the
                         // int-exact partial converts once, else the
                         // compensated f64 sum; raw r/cnt, no rounding.
-                        let r = if int_exact { isum as f64 } else { sum + comp };
+                        let r = if int_exact {
+                            isum as f64
+                        } else {
+                            kbn_finalize_sum(sum, comp)
+                        };
                         Ok(Value::Real(r / count as f64))
                     }
                 }
@@ -13284,16 +13495,42 @@ fn try_fused_scan_hash_join(
     let l_keys: Vec<usize> = eq_pairs.iter().map(|(l, _)| *l).collect();
     let r_keys: Vec<usize> = eq_pairs.iter().map(|(_, r)| *r).collect();
     let n_keys = eq_pairs.len();
+    // ---- Rowid-alias SEEK join (SQLite's "SEARCH <side> USING INTEGER
+    // PRIMARY KEY (rowid=?)") -----------------------------------------
+    // A single equi-key whose column is the rowid-ALIAS column of its
+    // side's table turns the OTHER side's key values into SEEK keys:
+    // SQLite plans `A JOIN B ON A.x = B.id` as SCAN A + per-row
+    // SeekRowid(B, A.x) — OP_SeekRowid's conversion (ticket #3922 +
+    // the Atoi64 text parse), NOT the general numeric comparison.
+    // `Real(-2^63) = i64::MIN` is TRUE as a scalar but the SEEK finds
+    // nothing; TEXT '5' seeks rowid 5. The gate applies when the alias
+    // side is the side SQLite would seek: INNER/CROSS — either side
+    // (SQLite reorders to make the alias side inner); LEFT — the RIGHT
+    // (inner) side; RIGHT — the LEFT (inner) side; FULL — never.
+    let l_key_is_alias = l_table.rowid_alias == Some(l_keys[0]);
+    let r_key_is_alias = r_table.rowid_alias == Some(r_keys[0]);
+    let rowid_seek_join = n_keys == 1
+        && match join_type {
+            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross => {
+                l_key_is_alias ^ r_key_is_alias
+            }
+            crate::sql::ast::JoinType::Left => r_key_is_alias && !l_key_is_alias,
+            crate::sql::ast::JoinType::Right => l_key_is_alias && !r_key_is_alias,
+            crate::sql::ast::JoinType::Full => false,
+        };
     // Cross-affinity equi keys (INTEGER col = TEXT col — needs the
     // NUMERIC fold) must NOT hash: the encoded order keys are
     // class-ordered and would never collide. DECLINE to the nested-loop
-    // path, whose serial evaluator folds (datatype3 §4.2).
+    // path, whose serial evaluator folds (datatype3 §4.2) — EXCEPT for
+    // a seek-gated pair: the gate converts both sides to rowid-integers
+    // (numeric TEXT '5' → 5), so the fold is already applied.
     {
         let l_affs = plan_output_affinities(left);
         let r_affs = plan_output_affinities(right);
-        if eq_pairs
-            .iter()
-            .any(|&(li, ri)| join_key_pair_mixed(l_affs.as_deref(), r_affs.as_deref(), li, ri))
+        if !rowid_seek_join
+            && eq_pairs
+                .iter()
+                .any(|&(li, ri)| join_key_pair_mixed(l_affs.as_deref(), r_affs.as_deref(), li, ri))
         {
             return Ok(None);
         }
@@ -13383,6 +13620,23 @@ fn try_fused_scan_hash_join(
     } else {
         (r_side, l_side, false)
     };
+    // The SEEK gate's direction: the alias side is the side SQLite seeks;
+    // the OTHER side's values convert through rowid_seek_value. The alias
+    // side is the BUILD side iff `gated_is_probe` — i.e. the PROBE values
+    // convert when the build holds the alias, and the BUILD values
+    // convert when the probe holds it. (For LEFT the build is the right/
+    // inner side by construction; for RIGHT the probe is the left/inner
+    // side — both match the eligibility rules above.)
+    let gated_is_probe: bool = rowid_seek_join
+        && (if build_is_left {
+            l_key_is_alias
+        } else {
+            r_key_is_alias
+        });
+    // Cache-key marker: a gated build stores CONVERTED keys (or un-aborted
+    // large-rowid keys) — it must never be reused for an ungated join on
+    // the same (root, wanted, key columns).
+    let gated_cache_marker = rowid_seek_join;
 
     // ---- Decode plans ---------------------------------------------------
     // Per output column: (is_build_side, position in that side's decode
@@ -13507,8 +13761,14 @@ fn try_fused_scan_hash_join(
     let committed_read = pager.committed_reads_armed();
     // The cache key includes the KEY COLUMNS: the same wanted set with
     // different key columns builds a different table (folded-hash slots
-    // + verification columns).
-    let cache_key = (build.root, build_wanted.clone(), build_key_pos.clone());
+    // + verification columns). A seek-gated build stores different keys
+    // (converted seek values / un-aborted rowid keys) — the marker keeps
+    // it apart from an ungated build of the same shape.
+    let mut cache_key_pos = build_key_pos.clone();
+    if gated_cache_marker {
+        cache_key_pos.push(usize::MAX); // sentinel: never a real position
+    }
+    let cache_key = (build.root, build_wanted.clone(), cache_key_pos);
     let cached: Option<std::sync::Arc<JoinBuildState>> = if committed_read {
         None
     } else {
@@ -13550,6 +13810,12 @@ fn try_fused_scan_hash_join(
         // Per-key order keys + the folded composite hash (n_keys > 1) or
         // the exact single order key (n_keys == 1).
         let mut ks: Vec<u64> = vec![0u64; n_keys];
+        // SEEK-gate roles for THIS side: the build values convert
+        // (gated build), or the build values are the alias ROWIDS (no
+        // 2^53 abort — SQLite seeks rowids of any magnitude; the
+        // insert verification splits double-key collisions exactly).
+        let build_side_gated = rowid_seek_join && !gated_is_probe;
+        let build_side_is_alias = rowid_seek_join && gated_is_probe;
         {
             let mut bt = Btree::new(pager, build.root, false);
             bt.scan_table_borrowed(|rowid, payload| {
@@ -13567,31 +13833,53 @@ fn try_fused_scan_hash_join(
                 }
                 let mut null_key = false;
                 for (j, &kp) in build_key_pos.iter().enumerate() {
-                    let k = match buf.get(kp) {
-                        Some(Value::Integer(i)) => {
-                            // Same 2^53 gate as the materialized path's
-                            // u64_mode: beyond it, i as f64 rounds and keys
-                            // could collide.
-                            if i.unsigned_abs() > (1u64 << 53) {
+                    let k = if build_side_gated {
+                        // Gated build key: the value CONVERTS through the
+                        // rowid seek gate — None (boundary REAL, numeric
+                        // TEXT that isn't, NULL, BLOB) never matches: the
+                        // row is stored slotless for the RIGHT/FULL tail.
+                        match rowid_seek_value(buf.get(kp).unwrap_or(&Value::Null)) {
+                            Some(i) => crate::types::value::double_order_key(i as f64),
+                            None => {
+                                null_key = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        match buf.get(kp) {
+                            Some(Value::Integer(i)) => {
+                                // Same 2^53 gate as the materialized path's
+                                // u64_mode: beyond it, i as f64 rounds and keys
+                                // could collide — EXCEPT on the alias side of
+                                // a seek-gated join (the values ARE rowids;
+                                // collisions split via exact verification).
+                                if !build_side_is_alias && i.unsigned_abs() > (1u64 << 53) {
+                                    aborted = true;
+                                    return false;
+                                }
+                                crate::types::value::double_order_key(*i as f64)
+                            }
+                            Some(Value::Real(f)) => {
+                                // -0.0 normalizes to +0.0 in the key: they are
+                                // ONE value under SQL equality (0 = -0.0), and
+                                // double_order_key would split them.
+                                let f = if *f == 0.0 { 0.0 } else { *f };
+                                crate::types::value::double_order_key(f)
+                            }
+                            // NULL build keys never match anything — but they
+                            // are still STORED (slotless): RIGHT/FULL must emit
+                            // them in the unmatched tail, and a flavor-blind
+                            // build keeps the cross-statement cache correct
+                            // (an INNER/LEFT probe never sees them: no slot).
+                            // TEXT/BLOB build keys need the byte-key path.
+                            Some(Value::Null) => {
+                                null_key = true;
+                                break;
+                            }
+                            _ => {
                                 aborted = true;
                                 return false;
                             }
-                            crate::types::value::double_order_key(*i as f64)
-                        }
-                        Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                        // NULL build keys never match anything — but they
-                        // are still STORED (slotless): RIGHT/FULL must emit
-                        // them in the unmatched tail, and a flavor-blind
-                        // build keeps the cross-statement cache correct
-                        // (an INNER/LEFT probe never sees them: no slot).
-                        // TEXT/BLOB build keys need the byte-key path.
-                        Some(Value::Null) => {
-                            null_key = true;
-                            break;
-                        }
-                        _ => {
-                            aborted = true;
-                            return false;
                         }
                     };
                     ks[j] = k;
@@ -13633,17 +13921,35 @@ fn try_fused_scan_hash_join(
                         slots[slot] = JoinSlot { key: k, head: ord };
                         break;
                     }
-                    if existing == k
-                        && (n_keys == 1
-                            || join_keys_match(
+                    let ok = if existing == k {
+                        if rowid_seek_join {
+                            // SEEK-gated insert verification: chain rows
+                            // must have the SAME converted value at the
+                            // i64 level (a shared double key from distinct
+                            // large i64s splits into separate slots — the
+                            // probe's per-slot verification stays exact).
+                            let head_val =
+                                &build_vals[slots[slot].head as usize * stride + build_key_pos[0]];
+                            let new_val = &buf[build_key_pos[0]];
+                            rowid_seek_value(new_val) == rowid_seek_value(head_val)
+                        } else if n_keys == 1 {
+                            // Single-key EXACT-order-key slots: chain-only
+                            // (the probe-side mirror verifies).
+                            true
+                        } else {
+                            join_keys_match(
                                 &build_vals,
                                 slots[slot].head as usize,
                                 stride,
                                 &build_key_pos,
                                 &buf,
                                 &build_key_pos,
-                            ))
-                    {
+                            )
+                        }
+                    } else {
+                        false
+                    };
+                    if ok {
                         chain[ord as usize] = slots[slot].head;
                         slots[slot].head = ord;
                         break;
@@ -13708,6 +14014,7 @@ fn try_fused_scan_hash_join(
             out_combined.len(),
             left_outer,
             build_unmatched_tail,
+            rowid_seek_join.then_some(gated_is_probe),
         )? {
             let columns_out: std::sync::Arc<[String]> = out_names.into();
             return Ok(Some(ExecResult {
@@ -13718,7 +14025,6 @@ fn try_fused_scan_hash_join(
     }
     // ---- PROBE: stream scan + selective decode + emit -------------------
     let n_out = out_combined.len();
-    let built_n_keys = built.n_keys;
     let built_key_slots: &[usize] = &built.key_slots;
     let mut out_rows: Vec<Row> = Vec::with_capacity(probe.count.max(1));
     let mut pbuf: Vec<Value> = Vec::new();
@@ -13758,17 +14064,37 @@ fn try_fused_scan_hash_join(
             // emits the NULL-extended probe row.
             let mut key_ok = true;
             for (j, &kp) in probe_key_pos.iter().enumerate() {
-                let k = match pbuf.get(kp) {
-                    Some(Value::Integer(i)) => {
-                        // Mirrors the materialized path exactly (no 2^53
-                        // gate on probe keys): identical match semantics.
-                        crate::types::value::double_order_key(*i as f64)
+                let k = if rowid_seek_join && gated_is_probe {
+                    // Gated probe key: the value CONVERTS through the rowid
+                    // seek gate — None (boundary REAL, non-numeric TEXT,
+                    // NULL, BLOB) matches nothing (SQLite's SeekRowid
+                    // jumps to no-row); numeric TEXT '5' seeks rowid 5.
+                    match rowid_seek_value(pbuf.get(kp).unwrap_or(&Value::Null)) {
+                        Some(i) => crate::types::value::double_order_key(i as f64),
+                        None => {
+                            key_ok = false;
+                            break;
+                        }
                     }
-                    Some(Value::Real(f)) => crate::types::value::double_order_key(*f),
-                    // NULL / TEXT / BLOB: no match possible.
-                    _ => {
-                        key_ok = false;
-                        break;
+                } else {
+                    match pbuf.get(kp) {
+                        Some(Value::Integer(i)) => {
+                            // Mirrors the materialized path exactly (no 2^53
+                            // gate on probe keys): identical match semantics.
+                            // The ALIAS side of a seek-gated join lands here
+                            // with the rowid — any magnitude, exactly keyed.
+                            crate::types::value::double_order_key(*i as f64)
+                        }
+                        Some(Value::Real(f)) => {
+                            // -0.0 normalizes to +0.0 (SQL: 0 = -0.0 — one key).
+                            let f = if *f == 0.0 { 0.0 } else { *f };
+                            crate::types::value::double_order_key(f)
+                        }
+                        // NULL / TEXT / BLOB: no match possible.
+                        _ => {
+                            key_ok = false;
+                            break;
+                        }
                     }
                 };
                 pks[j] = k;
@@ -13782,27 +14108,49 @@ fn try_fused_scan_hash_join(
                 };
                 next = {
                     // Open-addressing lookup: probe until an empty slot
-                    // (no match) or a key hit. Single-key slots hold EXACT
-                    // order keys (a hit IS a match); multi-key slots hold
-                    // folded hashes (a hit is verified against the stored
-                    // values — a hash collision keeps probing).
+                    // (no match) or a VERIFIED key hit. Single-key slots
+                    // hold exact order keys but a hit is STILL verified
+                    // against the stored value: the PROBE key of an
+                    // INTEGER beyond 2^53 is its rounded double (the build
+                    // side aborts there; the probe side has no gate) —
+                    // Integer(i64::MAX) hashes onto Real(2^63)'s exact
+                    // key. Only values_sql_equal (the EXACT int/float
+                    // comparison) decides the match; a failed verification
+                    // keeps probing (deep-sweep seed 3: the join matched
+                    // 2^63 against i64::MAX).
                     let mut slot = key_slot(k, hash_shift, table_mask);
                     loop {
                         let existing = slots[slot].key;
                         if existing == u64::MAX {
                             break u32::MAX;
                         }
-                        if existing == k
-                            && (built_n_keys == 1
-                                || join_keys_match(
+                        let hit = existing == k
+                            && (if rowid_seek_join {
+                                // SEEK-gated pair: the gated side's value
+                                // must convert EXACTLY to the alias side's
+                                // rowid — the key hit alone is not enough
+                                // (distinct large i64s can share a double
+                                // key; the build's insert verification
+                                // splits them, this re-checks the head).
+                                let bpos =
+                                    slots[slot].head as usize * stride + built_key_slots[0];
+                                let (gated, alias) = if gated_is_probe {
+                                    (&pbuf[probe_key_pos[0]], &build_vals[bpos])
+                                } else {
+                                    (&build_vals[bpos], &pbuf[probe_key_pos[0]])
+                                };
+                                matches!(alias, Value::Integer(r) if rowid_seek_value(gated) == Some(*r))
+                            } else {
+                                join_keys_match(
                                     build_vals,
                                     slots[slot].head as usize,
                                     stride,
                                     built_key_slots,
                                     &pbuf,
                                     &probe_key_pos,
-                                ))
-                        {
+                                )
+                            });
+                        if hit {
                             break slots[slot].head;
                         }
                         slot = (slot + 1) & table_mask;
@@ -15089,9 +15437,11 @@ fn exec_rowid_lookup(
 /// rowids, then seek each row with ONE shared B+tree handle. Rows are
 /// emitted in rowid order (ascending), like SQLite's rowid IN seek order.
 ///
-/// Non-integer list members are skipped (SQLite's `id IN (1, 'x')` never
-/// matches a row for 'x'); NULLs contribute no rows. If a rowid is absent
-/// from the table it is simply skipped — IN semantics need no error.
+/// List members fold through the ROWID-ALIAS affinity (rowid_seek_value:
+/// integral REALs and numeric TEXT match, exactly SQLite's `rowid IN (...)`
+/// seek semantics); NULL / non-numeric / blob members contribute no rows.
+/// If a rowid is absent from the table it is simply skipped — IN semantics
+/// need no error.
 fn exec_rowid_in(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -15111,10 +15461,14 @@ fn exec_rowid_in(
     let mut rowids: Vec<i64> = Vec::with_capacity(values.len());
     for e in values {
         let v = evaluate(e, &eval_ctx)?;
-        // Text/blob/real members can never equal an integer rowid; skip
-        // them rather than erroring (SQLite IN semantics: type-mismatched
-        // members just don't match).
-        if let Value::Integer(i) = v {
+        // Members fold through the ROWID-ALIAS affinity (SQLite's
+        // `rowid IN (...)` semantics — same conversion as the equality
+        // seek): integral REALs ('1.000' → 1.0 → 1) and numeric TEXT
+        // ('0' → 0) match, non-numeric text / blobs / fractional reals /
+        // NULL contribute no rows (deep-sweep seed 12: `id IN (1.000, '0',
+        // 1e308)` deleted nothing here; SQLite folds '0'→0 and 1.000→1
+        // and deletes two rows).
+        if let Some(i) = rowid_seek_value(&v) {
             rowids.push(i);
         }
     }
@@ -15750,6 +16104,19 @@ fn exec_rowid_range(
     } else {
         Vec::new()
     };
+    // Affinity-aware residual evaluation (SQLite datatype3 §4.2): the
+    // residual's column refs carry the table's column affinities, and the
+    // appended rowid slot INTEGER. Without this the residual compared
+    // class-ordered (INTEGER < TEXT) — `WHERE pk > '0'` matched NOTHING
+    // where SQLite folds '0' numerically and matches every pk > 0
+    // (stateful-fuzz deep-sweep).
+    let eval_affs: Vec<crate::types::Affinity> = if residual.is_some() {
+        let mut a: Vec<crate::types::Affinity> = table.col_affinities.iter().copied().collect();
+        a.push(crate::types::Affinity::Integer);
+        a
+    } else {
+        Vec::new()
+    };
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
     let residual_expr = residual;
@@ -15761,9 +16128,10 @@ fn exec_rowid_range(
             if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
                 if let Some(res) = residual_expr {
                     row.push(Value::Integer(rowid));
-                    let keep = eval_row(res, &row, &eval_cols, params, named_params)
-                        .map(|v| v.is_truthy())
-                        .unwrap_or(false);
+                    let keep =
+                        eval_row_aff(res, &row, &eval_cols, &eval_affs, params, named_params)
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
                     if !keep {
                         return true;
                     }
@@ -15926,6 +16294,19 @@ fn exec_rowid_range_projected_impl(
     } else {
         Vec::new()
     };
+    // Affinity-aware residual evaluation (SQLite datatype3 §4.2): the
+    // residual's column refs carry the table's column affinities, and the
+    // appended rowid slot INTEGER. Without this the residual compared
+    // class-ordered (INTEGER < TEXT) — `WHERE pk > '0'` matched NOTHING
+    // where SQLite folds '0' numerically and matches every pk > 0
+    // (stateful-fuzz deep-sweep).
+    let eval_affs: Vec<crate::types::Affinity> = if residual.is_some() {
+        let mut a: Vec<crate::types::Affinity> = table.col_affinities.iter().copied().collect();
+        a.push(crate::types::Affinity::Integer);
+        a
+    } else {
+        Vec::new()
+    };
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
     let pred_may_reenter = residual.is_some_and(expr_has_subquery);
@@ -15947,9 +16328,10 @@ fn exec_rowid_range_projected_impl(
                     // columns), evaluate, then project positionally.
                     if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
                         full.push(Value::Integer(rowid));
-                        let keep = eval_row(res, &full, &eval_cols, params, named_params)
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
+                        let keep =
+                            eval_row_aff(res, &full, &eval_cols, &eval_affs, params, named_params)
+                                .map(|v| v.is_truthy())
+                                .unwrap_or(false);
                         if keep {
                             full.pop();
                             let mut row = Vec::with_capacity(idxs.len());
@@ -15968,9 +16350,16 @@ fn exec_rowid_range_projected_impl(
                     if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
                         if let Some(res) = residual {
                             row.push(Value::Integer(rowid));
-                            let keep = eval_row(res, &row, &eval_cols, params, named_params)
-                                .map(|v| v.is_truthy())
-                                .unwrap_or(false);
+                            let keep = eval_row_aff(
+                                res,
+                                &row,
+                                &eval_cols,
+                                &eval_affs,
+                                params,
+                                named_params,
+                            )
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
                             if !keep {
                                 return true;
                             }
@@ -16710,6 +17099,19 @@ fn exec_index_range_projected(
     } else {
         Vec::new()
     };
+    // Affinity-aware residual evaluation (SQLite datatype3 §4.2): the
+    // residual's column refs carry the table's column affinities, and the
+    // appended rowid slot INTEGER. Without this the residual compared
+    // class-ordered (INTEGER < TEXT) — `WHERE pk > '0'` matched NOTHING
+    // where SQLite folds '0' numerically and matches every pk > 0
+    // (stateful-fuzz deep-sweep).
+    let eval_affs: Vec<crate::types::Affinity> = if residual.is_some() {
+        let mut a: Vec<crate::types::Affinity> = table.col_affinities.iter().copied().collect();
+        a.push(crate::types::Affinity::Integer);
+        a
+    } else {
+        Vec::new()
+    };
     let params = ctx.params.clone();
     let named_params = ctx.named_params.clone();
     let residual_pred = residual;
@@ -16756,9 +17158,16 @@ fn exec_index_range_projected(
                 Some(res) => {
                     if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
                         full.push(Value::Integer(rowid));
-                        let k = eval_row(res, &full, &eval_cols, &params, &named_params)
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
+                        let k = eval_row_aff(
+                            res,
+                            &full,
+                            &eval_cols,
+                            &eval_affs,
+                            &params,
+                            &named_params,
+                        )
+                        .map(|v| v.is_truthy())
+                        .unwrap_or(false);
                         full.pop();
                         if k {
                             placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] =
@@ -16811,9 +17220,16 @@ fn exec_index_range_projected(
                     if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
                         if let Ok(mut full) = decode_row(&payload, n_cols, rowid, rowid_alias) {
                             full.push(Value::Integer(rowid));
-                            let keep = eval_row(res, &full, &eval_cols, &params, &named_params)
-                                .map(|v| v.is_truthy())
-                                .unwrap_or(false);
+                            let keep = eval_row_aff(
+                                res,
+                                &full,
+                                &eval_cols,
+                                &eval_affs,
+                                &params,
+                                &named_params,
+                            )
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
                             full.pop();
                             if keep {
                                 rows.push(project_row_from_full(Some(idxs), &full, rowid));
@@ -16826,9 +17242,16 @@ fn exec_index_range_projected(
                         if let Ok(mut row) = decode_row(&payload, n_cols, rowid, rowid_alias) {
                             if let Some(res) = res {
                                 row.push(Value::Integer(rowid));
-                                let keep = eval_row(res, &row, &eval_cols, &params, &named_params)
-                                    .map(|v| v.is_truthy())
-                                    .unwrap_or(false);
+                                let keep = eval_row_aff(
+                                    res,
+                                    &row,
+                                    &eval_cols,
+                                    &eval_affs,
+                                    &params,
+                                    &named_params,
+                                )
+                                .map(|v| v.is_truthy())
+                                .unwrap_or(false);
                                 if !keep {
                                     continue;
                                 }
@@ -16967,60 +17390,100 @@ fn provided_columns(table: &Table, target_indices: &[usize]) -> Vec<bool> {
     provided
 }
 
-/// Extract an explicit rowid from a supplied value: integers pass through,
-/// integral REALs convert exactly (2^63 is representable), NULL means
-/// auto-assign, anything else is an error.
 /// STRICT rowid seek value for `rowid_alias = operand` equality (SQLite's
 /// comparison semantics for the rowid fast path — the operand goes through
 /// INTEGER-column affinity before the equality):
 ///   Integer            -> Some(i)
-///   integral Real      -> Some(i)          (2^63 wraps to i64::MIN)
-///   numeric Text       -> Some(i)          (SQLite affinity: '5' == rowid 5,
-///                                           leading/trailing spaces trimmed)
-///   non-numeric Text   -> None             ('' / 'abc' match NOTHING — the
-///                                           old lenient `as_integer()`
-///                                           mapped '' to rowid 0 and
-///                                           phantom-matched that row)
+///   integral Real      -> Some(i)          (#3922 gate: strictly inside
+///                                           the i64 domain — ±2^63 NEVER
+///                                           match a rowid)
+///   numeric Text       -> Some(i)          (Atoi64 full-parse first —
+///                                           '-9223372036854775808'
+///                                           DOES match — else the
+///                                           RealSameAsInt/#3922 gates)
+///   non-numeric Text   -> None             ('' / 'abc' match NOTHING)
 ///   Blob / Null / etc. -> None             (a BLOB never converts)
 /// `None` means the comparison can never hold: the seek yields zero rows.
 pub(crate) fn rowid_seek_value(v: &Value) -> Option<i64> {
     match v {
         Value::Integer(i) => Some(*i),
         Value::Null => None,
-        Value::Real(_) => rowid_from_value(v).ok().flatten(),
-        Value::Text(t) => {
-            let trimmed = t.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            if let Ok(i) = trimmed.parse::<i64>() {
-                return Some(i);
-            }
-            if let Ok(f) = trimmed.parse::<f64>() {
-                if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                    return Some(f as i64);
-                }
-                if f == 9_223_372_036_854_775_808.0 {
-                    return Some(i64::MIN);
-                }
-                None
-            } else {
-                None
-            }
-        }
+        Value::Real(f) => real_int_key(*f),
+        Value::Text(t) => text_int_key(t.trim()),
         Value::Blob(_) => None,
     }
 }
 
+/// sqlite3RealToI64 (util.c), verbatim: the CLAMPING REAL→i64 conversion
+/// the rowid-range seek opcodes use (OP_SeekGE/LT/LE/GT). Below
+/// -(2^63-1024) clamps to i64::MIN; above +(2^63-1024) clamps to
+/// i64::MAX; inside the band the cast is exact and in-bounds.
+pub(crate) fn real_to_i64(r: f64) -> i64 {
+    if r < -9223372036854774784.0 {
+        i64::MIN
+    } else if r > 9223372036854774784.0 {
+        i64::MAX
+    } else {
+        r as i64
+    }
+}
+
+/// sqlite3VdbeIntegerAffinity's conversion gate (ticket #3922, vdbe.c):
+/// a REAL becomes an INTEGER key only when the RealToI64 round-trip is
+/// exact AND the result is STRICTLY inside the i64 domain — the two
+/// extreme rowids (i64::MIN / i64::MAX) never come from a REAL operand.
+/// This gates OP_SeekRowid (rowid equality/IN/join seeks) AND
+/// OP_MustBeInt (rowid INSERT assignment): `WHERE rowid = -2^63.0`
+/// matches NOTHING in SQLite even though the scalar compare says equal.
+pub(crate) fn real_int_key(r: f64) -> Option<i64> {
+    let ix = real_to_i64(r);
+    if ix as f64 == r && ix > i64::MIN && ix < i64::MAX {
+        Some(ix)
+    } else {
+        None
+    }
+}
+
+/// sqlite3RealSameAsInt (util.c): the tighter 2^51 bit-identical check
+/// from applyNumericAffinity's alsoAnInt arm (used for TEXT operands —
+/// the ±0.0 special case covers the sign of zero).
+fn real_same_as_int(r: f64, i: i64) -> bool {
+    r == 0.0 || (r == i as f64 && (-(1i64 << 51)..(1i64 << 51)).contains(&i))
+}
+
+/// TEXT → rowid key under applyNumericAffinity(bTryForInt = 1) — the
+/// conversion for rowid EQUALITY seeks and rowid INSERT assignment:
+/// a full integer parse (Atoi64 == 0) first, else a full numeric parse
+/// with the RealSameAsInt squeeze, else the IntegerAffinity #3922 gate.
+fn text_int_key(trimmed: &str) -> Option<i64> {
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Some(i);
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        if f.is_finite() {
+            let ix = real_to_i64(f);
+            if real_same_as_int(f, ix) {
+                return Some(ix);
+            }
+            return real_int_key(f);
+        }
+    }
+    None
+}
+
+/// OP_MustBeInt semantics (vdbe.c) for an explicitly assigned rowid
+/// (`INSERT INTO t (rowid) ...`): INTEGER passes, a REAL converts only
+/// through the #3922 gate, numeric TEXT through text_int_key — anything
+/// else fails with SQLite's exact message, "datatype mismatch"
+/// (SQLITE_MISMATCH).
 fn rowid_from_value(v: &Value) -> Result<Option<i64>> {
+    let mismatch = || Error::constraint("datatype mismatch");
     match v {
         Value::Integer(r) => Ok(Some(*r)),
         Value::Null => Ok(None),
-        Value::Real(f) if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 => {
-            Ok(Some(*f as i64))
-        }
-        Value::Real(f) if *f == 9_223_372_036_854_775_808.0 => Ok(Some(i64::MIN)), // 2^63 wraps to MIN in SQLite's conversion
-        _ => Err(Error::semantic("rowid must be an integer")),
+        Value::Real(f) => real_int_key(*f).map(Some).ok_or_else(mismatch),
+        Value::Text(t) => text_int_key(t.trim()).map(Some).ok_or_else(mismatch),
+        Value::Blob(_) => Err(mismatch()),
     }
 }
 
@@ -17030,9 +17493,11 @@ fn rowid_from_value(v: &Value) -> Result<Option<i64>> {
 /// it is TEXT/BLOB the comparison is CONSTANT (SQLite's type order:
 /// INTEGER is always less than TEXT and BLOB), and NULL never matches.
 pub(crate) enum RowidRangeBound {
-    /// Inclusive rowid bound. Fractional REALs round AWAY from the
-    /// range's interior (ceil on the lower side, floor on the upper), so
-    /// `pk >= 2.5` starts at rowid 3 with no residual needed.
+    /// Inclusive rowid bound. A fractional REAL pre-rounds AWAY from the
+    /// range's interior (the OP_SeekGE/LT direction adjustment: `pk >= 2.5`
+    /// starts at rowid 3, `pk < 2.5` ends at rowid 2), so no residual is
+    /// needed; an exact-roundtrip REAL lands ON its integer (the strict
+    /// side's exclusion is `rowid_strict_boundary`).
     Val(i64),
     /// The comparison direction is constant-TRUE for every row: a
     /// non-numeric operand opens the UPPER side (`pk < 'abc'` is every
@@ -17061,24 +17526,46 @@ pub(crate) fn rowid_range_bound(v: &Value, lower: bool) -> RowidRangeBound {
         Value::Real(f) => {
             if f.is_nan() {
                 RowidRangeBound::Never
-            } else if *f == f64::NEG_INFINITY {
-                unbounded_side(!lower)
-            } else if *f == f64::INFINITY {
-                unbounded_side(lower)
-            } else if f.fract() == 0.0 {
-                // Integral real: exact (2^63 wraps like rowid_seek_value).
-                match rowid_from_value(v) {
-                    Ok(Some(i)) => RowidRangeBound::Val(i),
-                    // Out of i64 range entirely (beyond ±2^63).
-                    _ => unbounded_side(if *f > 0.0 { lower } else { !lower }),
-                }
-            } else if *f > i64::MAX as f64 || *f < i64::MIN as f64 {
-                // Fractional but past the integer domain: same side rule.
-                unbounded_side(if *f > 0.0 { lower } else { !lower })
-            } else if lower {
-                RowidRangeBound::Val(f.ceil() as i64)
             } else {
-                RowidRangeBound::Val(f.floor() as i64)
+                // OP_SeekGE/LT/LE/GT's table branch (vdbe.c), verbatim:
+                // iKey = sqlite3RealToI64(r) (the CLAMPING cast), then the
+                // direction adjustment from c = sqlite3IntFloatCompare(iKey, r):
+                //   c > 0 (iKey above r):  `>` behaves as `>= iKey`, `<=` as `< iKey`
+                //   c < 0 (iKey below r):  `>=` behaves as `> iKey`, `<` as `<= iKey`
+                //   c == 0:               the bound is exactly iKey
+                // Since rowids are integers, `> iKey` ≡ `>= iKey + 1` and
+                // `< iKey` ≡ `<= iKey - 1` — the ±1 encodings below are
+                // exact. The c < 0 lower side at iKey = i64::MAX is EMPTY
+                // (nothing is above MAX) — pinned by
+                // `rowid_boundary_seeks` (`id >= 9.2233720368547758e18`
+                // returns 0 rows in SQLite while `id <= …` returns the
+                // i64::MAX row).
+                use std::cmp::Ordering;
+                let i_key = real_to_i64(*f);
+                let c = crate::types::value::int_float_compare(i_key, *f);
+                if lower {
+                    match c {
+                        Ordering::Greater | Ordering::Equal => RowidRangeBound::Val(i_key),
+                        Ordering::Less => {
+                            if i_key == i64::MAX {
+                                RowidRangeBound::Never
+                            } else {
+                                RowidRangeBound::Val(i_key + 1)
+                            }
+                        }
+                    }
+                } else {
+                    match c {
+                        Ordering::Less | Ordering::Equal => RowidRangeBound::Val(i_key),
+                        Ordering::Greater => {
+                            if i_key == i64::MIN {
+                                RowidRangeBound::Never
+                            } else {
+                                RowidRangeBound::Val(i_key - 1)
+                            }
+                        }
+                    }
+                }
             }
         }
         Value::Text(t) => {
@@ -17134,10 +17621,39 @@ pub(crate) fn rowid_range_bounds(start: Option<&Value>, end: Option<&Value>) -> 
 /// ceil/floor range already moved past it — so the caller must fall back
 /// to the general residual evaluation).
 pub(crate) fn rowid_strict_boundary(v: &Value) -> Option<i64> {
+    use std::cmp::Ordering;
     match v {
         Value::Integer(i) => Some(*i),
-        Value::Real(f) if f.is_finite() && f.fract() == 0.0 => rowid_from_value(v).ok().flatten(),
-        Value::Text(t) => t.trim().parse::<i64>().ok(),
+        Value::Real(f) if f.is_finite() => {
+            // The c == 0 case ONLY (an exact round-trip to iKey): the seek
+            // opcode runs unadjusted, so a strict `>`/`<` excludes exactly
+            // rowid == iKey. A fractional bound (c ≠ 0) never lands a
+            // rowid ON the boundary — the ±1 range encoding already moved
+            // past it — and a clamp-zone bound (±2^63) has its boundary
+            // rowid INCLUDED by the direction adjustment (`rowid < 2^63.0`
+            // keeps i64::MAX!), so no skip in either case.
+            let i_key = real_to_i64(*f);
+            if crate::types::value::int_float_compare(i_key, *f) == Ordering::Equal {
+                Some(i_key)
+            } else {
+                None
+            }
+        }
+        Value::Text(t) => {
+            let trimmed = t.trim();
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Some(i);
+            }
+            if let Ok(f) = trimmed.parse::<f64>() {
+                if f.is_finite() {
+                    let i_key = real_to_i64(f);
+                    if crate::types::value::int_float_compare(i_key, f) == Ordering::Equal {
+                        return Some(i_key);
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -17341,8 +17857,14 @@ fn exec_insert_inner(
     // once per statement; `bump` keeps the table row current as rows
     // land. Plain tables skip all of this (no sequence table lookup).
     let is_autoinc = table.columns.iter().any(|c| c.autoincrement);
+    // The AUTOINCREMENT allocation floor starts at 0 (SQLite's next id
+    // on a fresh table is 1): a missing sqlite_sequence row means "no
+    // rowid has ever raised it" — NEGATIVE explicit rowids never raise
+    // the sequence (`INSERT INTO t(c) VALUES (-8)` then an auto row
+    // lands at 1, not -7 — pinned by the stateful fuzz). i64::MIN here
+    // made the first auto id negative on negative-only tables.
     let mut seq_floor: i64 = if is_autoinc {
-        read_sqlite_sequence(ctx, &table.name)?.unwrap_or(i64::MIN)
+        read_sqlite_sequence(ctx, &table.name)?.unwrap_or(0).max(0)
     } else {
         i64::MIN
     };
@@ -17477,6 +17999,17 @@ fn exec_insert_inner(
                 &provided_by_list
             };
             for (i, col) in table.columns.iter().enumerate() {
+                // The rowid-ALIAS column NEVER takes its DEFAULT when
+                // omitted: SQLite allocates a rowid instead (verified:
+                // `f2 INTEGER DEFAULT 5, ..., PRIMARY KEY (f2)` +
+                // `INSERT INTO t1 (d) VALUES (NULL)` lands rowids 1, 2 —
+                // the DEFAULT is dead on the alias). Applying it made
+                // multi-row inserts collide on the default value
+                // (deep-sweep: "UNIQUE constraint failed: t1.f2" where
+                // SQLite succeeds).
+                if table.rowid_alias == Some(i) {
+                    continue;
+                }
                 if !provided[i] && col.default.is_some() {
                     if let Some(default_expr) = &col.default {
                         let eval_ctx = EvalContext::new(
@@ -17519,8 +18052,12 @@ fn exec_insert_inner(
                     } else {
                         max_rowid
                     };
-                    let r =
-                        next_auto_rowid(ctx.pager, current_root, eff.unwrap_or(0).max(seq_floor))?;
+                    let r = next_auto_rowid(
+                        ctx.pager,
+                        current_root,
+                        eff.unwrap_or(0).max(seq_floor),
+                        is_autoinc,
+                    )?;
                     max_rowid = Some(r);
                     full_row[idx] = Value::Integer(r);
                     rowid_autogen = true;
@@ -17530,13 +18067,24 @@ fn exec_insert_inner(
             // NOT NULL + CHECK constraints. Always enforced: the NOT NULL
             // loop is purely positional (no names needed); col_names is
             // only consulted for CHECK expressions (empty when absent).
-            enforce_row_constraints(
+            // INSERT OR IGNORE: SQLite's IGNORE conflict resolution also
+            // covers NOT NULL and CHECK — a violating row is SKIPPED
+            // silently (pinned: `INSERT OR IGNORE INTO t0 (f, c) VALUES
+            // (9, NULL)` on a `c BLOB NOT NULL` table succeeds as a
+            // no-op in SQLite; stateful-fuzz case 31). OR REPLACE/ABORT
+            // still error (a NULL cannot be replaced into existence).
+            if let Err(e) = enforce_row_constraints(
                 &table,
                 &full_row,
                 &col_names,
                 &ctx.params,
                 &ctx.named_params,
-            )?;
+            ) {
+                if on_conflict == crate::sql::ast::ConflictResolution::Ignore {
+                    continue; // skip the row — SQLite's OR IGNORE
+                }
+                return Err(e);
+            }
             // FOREIGN KEY (child side) — enforced only when the pragma is on.
             enforce_child_fks(ctx, &table, &full_row)?;
 
@@ -17565,6 +18113,18 @@ fn exec_insert_inner(
                     st.hint = None;
                 }
                 ctx.table_append_hint = None;
+                // The trigger body's writes run through the GENERIC path:
+                // a nested insert may have SPLIT this table's root (and
+                // every index's root). Our statement-local current_root /
+                // index-state roots are now STALE — re-read them from the
+                // ctx overrides, or the next row of this statement splits
+                // the OLD root page again and orphans the first split's
+                // pages (the stateful-fuzz "one row missing after a
+                // trigger-cascade page split" class).
+                current_root = ctx.table_root(&table);
+                for st in index_states.iter_mut() {
+                    st.root = ctx.index_root(&st.idx);
+                }
             }
             let (outcome, landed_rowid) = exec_insert_one_row(
                 ctx,
@@ -17580,10 +18140,15 @@ fn exec_insert_inner(
                 rowid_autogen,
                 explicit_rowid,
             )?;
-            let trigger_fired = matches!(
-                outcome,
-                InsertOutcome::Inserted | InsertOutcome::UpdatedExisting
-            );
+            // AFTER INSERT triggers fire ONLY on the Inserted outcome: an
+            // upsert that took the DO UPDATE path already fired the UPDATE
+            // event (BEFORE + AFTER, inside the conflict branch below) —
+            // SQLite's upsert-update path fires [bi, bu, au] with NO ai
+            // (verified against real SQLite: the insert ATTEMPT fires
+            // BEFORE INSERT, the conflict resolution fires the UPDATE
+            // pair; AFTER INSERT never fires). Firing it here too
+            // double-counted every upserted row in AFTER INSERT triggers.
+            let trigger_fired = matches!(outcome, InsertOutcome::Inserted);
             match outcome {
                 InsertOutcome::Inserted => {
                     inserted += 1;
@@ -17654,16 +18219,32 @@ fn exec_insert_inner(
                     st.hint = None;
                 }
                 ctx.table_append_hint = None;
+                // The trigger body's writes run through the GENERIC path:
+                // a nested insert may have SPLIT this table's root (and
+                // every index's root). Our statement-local current_root /
+                // index-state roots are now STALE — re-read them from the
+                // ctx overrides, or the next row of this statement splits
+                // the OLD root page again and orphans the first split's
+                // pages (the stateful-fuzz "one row missing after a
+                // trigger-cascade page split" class).
+                current_root = ctx.table_root(&table);
+                for st in index_states.iter_mut() {
+                    st.root = ctx.index_root(&st.idx);
+                }
             }
         }
-        // Write back any index-root moves (splits) to the context so the
-        // NEXT statement descends from the current root — the catalog's
-        // Arc<Index> still holds the CREATE-time root.
-        for st in index_states.iter() {
-            if ctx.index_root(&st.idx) != st.root {
-                ctx.set_index_root(&st.idx.name, st.root);
-            }
-        }
+        // NOTE: this epilogue deliberately writes NOTHING back. Every split
+        // site (`exec_insert_one_row` and the other st.root movers) calls
+        // `ctx.set_index_root` at the MOMENT of the move, so a re-assert
+        // here is redundant — and actively harmful in the trigger-cascade
+        // case: a nested AFTER-INSERT trigger body may have split the
+        // index AFTER this statement's states were captured (st.root is
+        // stale), and re-asserting it CLOBBERS the newer root, orphaning
+        // the split's pages (every entry under them becomes unreachable —
+        // "row N missing from index"). Pinned by the stateful-fuzz
+        // replay: trg10 (AFTER DELETE) inserting a row that fires trg4
+        // (AFTER INSERT) whose insert split ix3's root; the outer
+        // statement's write-back reverted the root and lost 106 entries.
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
@@ -17743,6 +18324,17 @@ fn exec_insert_inner(
             &provided_by_list
         };
         for (i, col) in table.columns.iter().enumerate() {
+            // The rowid-ALIAS column NEVER takes its DEFAULT when
+            // omitted: SQLite allocates a rowid instead (verified:
+            // `f2 INTEGER DEFAULT 5, ..., PRIMARY KEY (f2)` +
+            // `INSERT INTO t1 (d) VALUES (NULL)` lands rowids 1, 2 —
+            // the DEFAULT is dead on the alias). Applying it made
+            // multi-row inserts collide on the default value
+            // (deep-sweep: "UNIQUE constraint failed: t1.f2" where
+            // SQLite succeeds).
+            if table.rowid_alias == Some(i) {
+                continue;
+            }
             if !provided[i] && col.default.is_some() {
                 let eval_ctx =
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -17772,6 +18364,7 @@ fn exec_insert_inner(
                     ctx.pager,
                     current_root,
                     max_rowid.unwrap_or(0).max(seq_floor),
+                    is_autoinc,
                 )?;
                 max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
@@ -17836,14 +18429,18 @@ fn exec_insert_inner(
             InsertOutcome::Skipped => {}
         }
     }
-    // Write back any index-root moves (splits) to the context so the
-    // NEXT statement descends from the current root — the catalog's
-    // Arc<Index> still holds the CREATE-time root.
-    for st in index_states.iter() {
-        if ctx.index_root(&st.idx) != st.root {
-            ctx.set_index_root(&st.idx.name, st.root);
-        }
-    }
+    // NOTE: this epilogue deliberately writes NOTHING back. Every split
+    // site (`exec_insert_one_row` and the other st.root movers) calls
+    // `ctx.set_index_root` at the MOMENT of the move, so a re-assert
+    // here is redundant — and actively harmful in the trigger-cascade
+    // case: a nested AFTER-INSERT trigger body may have split the
+    // index AFTER this statement's states were captured (st.root is
+    // stale), and re-asserting it CLOBBERS the newer root, orphaning
+    // the split's pages (every entry under them becomes unreachable —
+    // "row N missing from index"). Pinned by the stateful-fuzz replay:
+    // trg10 (AFTER DELETE) inserting a row that fires trg4 (AFTER
+    // INSERT) whose insert split ix3's root; the outer statement's
+    // write-back reverted the root and lost 106 entries.
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
@@ -18033,7 +18630,12 @@ pub fn fast_insert_literal_rows(
                 } else {
                     max_rowid
                 };
-                let r = next_auto_rowid(ctx.pager, current_root, eff.unwrap_or(0))?;
+                let r = next_auto_rowid(
+                    ctx.pager,
+                    current_root,
+                    eff.unwrap_or(0),
+                    table.columns.iter().any(|c| c.autoincrement),
+                )?;
                 max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
@@ -18064,6 +18666,16 @@ pub fn fast_insert_literal_rows(
                 st.hint = None;
             }
             ctx.table_append_hint = None;
+            // The trigger body's writes run through the GENERIC path: a
+            // nested insert may have SPLIT this table's root (and every
+            // index's root). Our statement-local current_root /
+            // index-state roots are now STALE — re-read them from the ctx
+            // overrides, or the next row of this statement splits the OLD
+            // root page again and orphans the first split's pages.
+            current_root = ctx.table_root(table);
+            for st in index_states.iter_mut() {
+                st.root = ctx.index_root(&st.idx);
+            }
         }
 
         let (outcome, _landed_rowid) = exec_insert_one_row(
@@ -18109,15 +18721,24 @@ pub fn fast_insert_literal_rows(
                 st.hint = None;
             }
             ctx.table_append_hint = None;
+            // The trigger body's writes run through the GENERIC path: a
+            // nested insert may have SPLIT this table's root (and every
+            // index's root). Our statement-local current_root /
+            // index-state roots are now STALE — re-read them from the ctx
+            // overrides, or the next row of this statement splits the OLD
+            // root page again and orphans the first split's pages.
+            current_root = ctx.table_root(table);
+            for st in index_states.iter_mut() {
+                st.root = ctx.index_root(&st.idx);
+            }
         }
     }
 
-    // Write back any index-root moves (splits).
-    for st in index_states.iter() {
-        if ctx.index_root(&st.idx) != st.root {
-            ctx.set_index_root(&st.idx.name, st.root);
-        }
-    }
+    // NOTE: no index-root write-back here. Every split site already calls
+    // `ctx.set_index_root` at the moment of the move; re-asserting a
+    // possibly-stale st.root would CLOBBER a root that a nested
+    // AFTER-INSERT trigger body's split moved after these states were
+    // captured (orphaned split pages — "row N missing from index").
     // (rows inserted, final live root, final max rowid) — the caller's
     // INSERT-chain setup consumes the live root / max-rowid so the next
     // same-shape statement can skip the derivation entirely.
@@ -18153,7 +18774,12 @@ pub fn fast_insert_single_row(
     let mut rowid_autogen = false;
     if let Some(idx) = table.rowid_alias {
         if full_row[idx].is_null() {
-            let r = next_auto_rowid(ctx.pager, current_root, max_rowid.unwrap_or(0))?;
+            let r = next_auto_rowid(
+                ctx.pager,
+                current_root,
+                max_rowid.unwrap_or(0),
+                table.columns.iter().any(|c| c.autoincrement),
+            )?;
             max_rowid = Some(r);
             full_row[idx] = Value::Integer(r);
             rowid_autogen = true;
@@ -18184,12 +18810,11 @@ pub fn fast_insert_single_row(
         rowid_autogen,
         None,
     )?;
-    // Write back index roots that moved (splits).
-    for st in index_states.iter() {
-        if ctx.index_root(&st.idx) != st.root {
-            ctx.set_index_root(&st.idx.name, st.root);
-        }
-    }
+    // NOTE: no index-root write-back here. Every split site already calls
+    // `ctx.set_index_root` at the moment of the move; re-asserting a
+    // possibly-stale st.root would CLOBBER a root that a nested
+    // AFTER-INSERT trigger body's split moved after these states were
+    // captured (orphaned split pages — "row N missing from index").
     match outcome {
         InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => Ok(1),
         InsertOutcome::Skipped => Ok(0),
@@ -18326,7 +18951,12 @@ fn exec_insert_one_row(
                 *i
             }
             Value::Null => {
-                let r = next_auto_rowid(ctx.pager, *current_root, true_max.unwrap_or(0))?;
+                let r = next_auto_rowid(
+                    ctx.pager,
+                    *current_root,
+                    true_max.unwrap_or(0),
+                    table.columns.iter().any(|c| c.autoincrement),
+                )?;
                 *max_rowid = Some(r);
                 full_row[idx] = Value::Integer(r);
                 rowid_was_autogenerated = true;
@@ -18344,7 +18974,12 @@ fn exec_insert_one_row(
             }
         }
     } else {
-        let r = next_auto_rowid(ctx.pager, *current_root, true_max.unwrap_or(0))?;
+        let r = next_auto_rowid(
+            ctx.pager,
+            *current_root,
+            true_max.unwrap_or(0),
+            table.columns.iter().any(|c| c.autoincrement),
+        )?;
         *max_rowid = Some(r);
         rowid_was_autogenerated = true;
         r
@@ -18400,6 +19035,38 @@ fn exec_insert_one_row(
         }
         None => UpsertTarget::Any,
     };
+
+    // UPSERT target = the rowid PK (or the empty any-target): SQLite
+    // checks the ROWID constraint FIRST — its table b-tree insert lands
+    // before any index maintenance, so a rowid conflict takes the upsert
+    // action and the unique-index checks NEVER RUN. `INSERT ... VALUES
+    // (39, 'alpha') ON CONFLICT(id) DO NOTHING` with BOTH id=39 and
+    // note='alpha' taken: SQLite's DO NOTHING succeeds because the note
+    // conflict is never reached (stateful-fuzz case 21 pinned it; the
+    // index-first order raised "UNIQUE constraint failed: audit.note").
+    // Autogenerated and beyond-max rowids can never conflict — skip the
+    // probe on those shapes (zero cost on the bulk-load fast path).
+    if let Some(u) = upsert {
+        if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk)
+            && !rowid_was_autogenerated
+            && !rowid_is_fresh_beyond_max
+        {
+            let mut bt = Btree::new(ctx.pager, *current_root, false);
+            if let LookupResult::Found(_) = bt.lookup_table(rowid)? {
+                return exec_upsert_row(
+                    ctx,
+                    table,
+                    table_name_lc,
+                    current_root,
+                    full_row,
+                    payload_buf,
+                    index_states,
+                    rowid,
+                    u,
+                );
+            }
+        }
+    }
 
     // UNIQUE-index constraint check: before touching the table btree, look
     // up the new row's key in every UNIQUE index on this table. If any
@@ -18768,6 +19435,12 @@ fn exec_insert_one_row(
     // search on ascending bulk loads (validated per use; falls back to
     // the full insert path automatically).
     for st in index_states.iter_mut() {
+        if crate::executor::dbg_index_trace() {
+            eprintln!(
+                "[idx1+] {} rowid={} root={} hint={:?}",
+                st.idx.name, rowid, st.root, st.hint
+            );
+        }
         if st.idx.partial_expr.is_some()
             && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)
         {
@@ -18959,6 +19632,10 @@ fn exec_upsert_row(
             // otherwise delete + insert.
             payload_buf.clear();
             encode_row_aliased_into(&new_row, table.rowid_alias, payload_buf);
+            // Statement journal: a multi-VALUES insert whose LATER row
+            // fails must roll this upsert-rewrite back too (SQLite's
+            // statement atomicity covers the whole INSERT statement).
+            journal_row_rewrite(ctx, table, existing_rowid, &old_row);
             // Preupdate: UPSERT's DO UPDATE is a row UPDATE (old = the
             // stored row, new = the merged row — SQLite fires exactly one
             // UPDATE event per upserted row).
@@ -19381,22 +20058,24 @@ pub(crate) fn delete_rows_by_rowid_inner(
         };
         ctx.set_table_root_lc(&table_name_lc, new_root);
         if let Some(payload) = old_payload {
+            // Statement journal: a later failure in the owning statement
+            // re-inserts the row + its index entries. Pushed BEFORE the
+            // index maintenance below — the cell is already gone; a `?`
+            // failure after this point must still see the undo entry (the
+            // payload CLONES here — the decode below still needs it).
+            if let Some(t) = journal_arc.as_ref() {
+                ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                    table: std::sync::Arc::clone(t),
+                    rowid,
+                    payload: payload.clone(),
+                });
+            }
             if !indexes.is_empty() {
                 if let Ok(row) = decode_row(&payload, n_cols, rowid, table.rowid_alias) {
                     for idx in &indexes {
                         delete_index_entry(ctx, idx, table, &row, rowid)?;
                     }
                 }
-            }
-            // Statement journal: payload moves in (zero-copy — it was
-            // about to drop). A later failure in the owning statement
-            // re-inserts the row + its index entries.
-            if let Some(t) = journal_arc.as_ref() {
-                ctx.stmt_undo.push(StmtUndoEntry::Deleted {
-                    table: std::sync::Arc::clone(t),
-                    rowid,
-                    payload,
-                });
             }
             ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid);
         }
@@ -19431,10 +20110,11 @@ fn apply_rowid_alias_move(
     let target = match new_alias {
         Value::Integer(i) => *i,
         Value::Null => {
-            // NULL on the rowid alias auto-assigns (INSERT semantics).
-            let root = ctx.table_root(table);
-            let max_rowid = ctx.get_or_scan_max_rowid(table)?;
-            next_auto_rowid(ctx.pager, root, max_rowid)?
+            // SQLite: assigning NULL to the INTEGER PRIMARY KEY alias in
+            // an UPDATE is "datatype mismatch" — auto-assign is INSERT
+            // semantics only (verified: `UPDATE t SET id = NULL` errors).
+            // The old auto-assign here silently invented a fresh rowid.
+            return Err(Error::constraint("datatype mismatch"));
         }
         _ => return Err(Error::constraint("datatype mismatch")),
     };
@@ -19510,6 +20190,12 @@ fn apply_rowid_alias_move(
             ctx.set_table_root(&table.name, bt.root);
         }
     }
+    // The moved-in rowid RAISES the max-rowid cache (monotonic — see the
+    // mirror comment in fk_write_child_row): without this, a later
+    // auto-allocated INSERT reuses `target` and DUPLICATES the row
+    // (deep-sweep: row moved 8→26 past a stale cache of 22; the next
+    // trigger-fired INSERTs took 23..27 and duplicated 26).
+    ctx.set_max_rowid_lc(&table.name.to_ascii_lowercase(), target);
     for idx in &indexes {
         insert_index_entry(ctx, idx, table, new_row, target)?;
     }
@@ -19526,6 +20212,18 @@ fn apply_rowid_alias_move(
 /// methods (GIN inverted / GiST spatial) contribute MULTIPLE keys per
 /// row — one per tsvector lexeme / covered grid cell — inserted in one
 /// B+tree handle so a root split between keys is still tracked.
+/// Env-gated index-op trace (RUSTQLITE_DBG_IDX=1): every entry insert
+/// and delete on every index, with the live root at the time — used to
+/// diagnose cross-statement index-consistency divergences.
+pub(crate) fn dbg_index_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RUSTQLITE_DBG_IDX")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn insert_index_entry(
     ctx: &mut ExecContext<'_>,
     index: &crate::schema::Index,
@@ -19542,6 +20240,12 @@ fn insert_index_entry(
     let root = ctx.index_root(index);
     let mut bt = Btree::new(ctx.pager, root, true);
     for key_bytes in &keys {
+        if crate::executor::dbg_index_trace() {
+            eprintln!(
+                "[idx+] {} rowid={} key={:02X?} root={}",
+                index.name, rowid, key_bytes, root
+            );
+        }
         bt.insert_index(key_bytes, rowid)?;
     }
     if bt.root != root {
@@ -19568,6 +20272,12 @@ fn delete_index_entry(
     let root = ctx.index_root(index);
     let mut bt = Btree::new(ctx.pager, root, true);
     for key_bytes in &keys {
+        if crate::executor::dbg_index_trace() {
+            eprintln!(
+                "[idx-] {} rowid={} key={:02X?} root={}",
+                index.name, rowid, key_bytes, root
+            );
+        }
         bt.delete_index(key_bytes, rowid)?;
     }
     if bt.root != root {
@@ -19811,7 +20521,7 @@ fn dbg_rowid() -> bool {
 /// integer rowid, mirror SQLite: pick random positive candidates until one
 /// is unused (100 attempts), then linearly scan for the first gap in the
 /// rowid space, and finally fail gracefully instead of overflowing.
-pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> {
+pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64, autoinc: bool) -> Result<i64> {
     // Fast path: there is still room above the current maximum.
     if max_rowid < i64::MAX {
         if dbg_rowid() {
@@ -19821,6 +20531,15 @@ pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> 
             );
         }
         return Ok(max_rowid + 1);
+    }
+    // AUTOINCREMENT: the counter is monotonic — it never wraps and never
+    // goes random. With the high-water mark at i64::MAX the next id
+    // cannot exist: SQLite raises SQLITE_FULL, whose message is verbatim
+    // "database or disk is full" (pinned: `INSERT INTO t(id INTEGER
+    // PRIMARY KEY AUTOINCREMENT ...) VALUES` past a MAX-sequence fails
+    // with exactly this; deep-sweep seeds 7/9).
+    if autoinc {
+        return Err(Error::constraint("database or disk is full"));
     }
     // Overflow lottery: random positive candidates, checked against the
     // live tree (rows inserted earlier in this statement/transaction are
@@ -19833,30 +20552,12 @@ pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64) -> Result<i64> 
             return Ok(candidate);
         }
     }
-    // Linear fallback: a table scan walks rowids in ascending order, so
-    // the first hole between consecutive rowids — or the slot below the
-    // smallest key — is provably unused.
-    let mut prev: Option<i64> = None;
-    let mut free: Option<i64> = None;
-    bt.scan_table(|rowid, _| {
-        match prev {
-            None => {
-                if rowid > i64::MIN {
-                    free = Some(rowid - 1);
-                    return false;
-                }
-            }
-            Some(p) => {
-                if rowid > p.wrapping_add(1) {
-                    free = Some(p + 1);
-                    return false;
-                }
-            }
-        }
-        prev = Some(rowid);
-        true
-    })?;
-    free.ok_or_else(|| Error::Runtime("table is full: every possible rowid is in use".into()))
+    // SQLite gives up after 100 random attempts: SQLITE_FULL ("database
+    // or disk is full") — OP_NewRowid never linearly scans for holes, and
+    // neither may we (the old linear fallback invented hole reuse SQLite
+    // refuses; parity pinned by the stateful differential fuzzer).
+    let _ = bt;
+    Err(Error::constraint("database or disk is full"))
 }
 
 /// The TRUE maximum rowid in the tree, `None` when the tree is empty.
@@ -20151,6 +20852,12 @@ fn exec_update(
             }
         }
         let payload = encode_row_aliased(&new_row, table.rowid_alias);
+        // Statement journal: the pre-rewrite payload (codec roundtrip of
+        // the decoded old row) — a LATER row's failure in this same
+        // statement replays it back (SQLite's statement-journal
+        // contract; found by the deep-sweep: intra-statement UNIQUE
+        // conflicts left earlier rows' rewrites behind).
+        journal_row_rewrite(ctx, &table, rowid, &row);
         let root = ctx.table_root(&table);
         let new_root;
         {
@@ -20451,6 +21158,8 @@ fn exec_update_from(
             }
         }
         let payload = encode_row_aliased(&new_row, table.rowid_alias);
+        // Statement journal (see the exec_update site).
+        journal_row_rewrite(ctx, table, rowid, &row);
         let root = ctx.table_root(table);
         let new_root;
         {
@@ -20958,7 +21667,11 @@ fn try_streaming_update(
         table,
         &crate::sql::ast::TriggerEvent::Update(vec![]),
     );
-    let needs_old_payload = !touched_indexes.is_empty() || has_update_triggers;
+    // Statement-atomicity: the pre-update payload is ALWAYS stashed now —
+    // the undo journal (StmtUndoEntry::Updated) needs it whether or not
+    // indexes/triggers do. A failed statement replays every applied row
+    // back (SQLite's statement-journal contract).
+    let needs_old_payload = true;
 
     // Collect (rowid, new_payload_bytes, old_payload_bytes) tuples for the
     // update phase. We can't update inside the scan callback because the
@@ -21030,6 +21743,11 @@ fn try_streaming_update(
                 // rebalance) before falling back to delete + insert.
                 // Patch / in-leaf replace (leaf-hinted); a grow that
                 // cannot fit the leaf falls back to delete + insert.
+                // Statement journal: same contract as the bulk/loop
+                // sites — the pre-rewrite payload (row_buf still holds
+                // the decoded OLD row) replays back if anything later in
+                // this statement fails.
+                journal_row_rewrite(ctx, table, rowid, &row_buf);
                 // Preupdate: this path bypasses process_update_row —
                 // fire here (row_buf/new_row still hold the row's
                 // values from the fetch closure above).
@@ -21866,6 +22584,17 @@ fn try_streaming_update(
     // bulk-applied rows skip the per-row index maintenance, so any
     // touched index forces the per-row path (defer everything).
     if touched_indexes.is_empty() && !has_update_triggers {
+        // Statement journal FIRST: every row this bulk pass may apply gets
+        // its pre-update payload captured (over-journaling is a no-op on
+        // replay — see journal_row_rewrite_payload). A failure after some
+        // rows landed (an error in the per-row phase that follows, an
+        // io fault mid-bulk) replays them all back.
+        for &i in order.iter() {
+            let (rowid, _, old_stash) = &updates[i];
+            if let Some(old) = old_stash.as_deref() {
+                journal_row_rewrite_payload(ctx, table, *rowid, old);
+            }
+        }
         let sorted_updates: Vec<(i64, &[u8])> = order
             .iter()
             .map(|&i| {
@@ -21931,6 +22660,12 @@ fn try_streaming_update(
         }
         let new_root;
         {
+            // Statement journal: this row's pre-update payload, captured
+            // before the rewrite (rows from the bulk branch were already
+            // journaled pre-bulk — the entry replay is a no-op then).
+            if let Some(old) = old_payload_opt {
+                journal_row_rewrite_payload(ctx, table, *rowid, old);
+            }
             let mut bt = Btree::new(ctx.pager, root, false);
             let did_in_place = bt.update_table(*rowid, new_payload).unwrap_or(false);
             if !did_in_place {
@@ -23197,6 +23932,23 @@ fn try_streaming_delete(
         let Some(payload) = payload else { continue };
         deleted += 1;
         ctx.changes += 1;
+        // Statement journal: the deleted payload moves in (zero-copy —
+        // it was about to drop). A later failure in this statement
+        // re-inserts the row + its index entries (reverse order).
+        // PUSHED IMMEDIATELY after the cell removal — BEFORE the index
+        // maintenance, RETURNING projection, and AFTER-DELETE triggers
+        // below, any of which can fail (`?` propagation) and abort the
+        // statement: the row is ALREADY gone from the tree, so a missing
+        // journal entry here loses it permanently (stateful-fuzz case
+        // 21: the delete-all's SECOND trg2-fired audit insert hit the
+        // unique partial index ix0; row b=39 was deleted but never
+        // journaled, and the rollback restored the other 8 rows only —
+        // SQLite's statement atomicity restores all 9).
+        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+            table: std::sync::Arc::clone(table),
+            rowid: rid,
+            payload: payload.clone(),
+        });
         if need_row {
             let row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
             if let Some(ret) = returning {
@@ -23225,14 +23977,6 @@ fn try_streaming_delete(
                 )?;
             }
         }
-        // Statement journal: the deleted payload moves in (zero-copy —
-        // it was about to drop). A later failure in this statement
-        // re-inserts the row + its index entries (reverse order).
-        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
-            table: std::sync::Arc::clone(table),
-            rowid: rid,
-            payload,
-        });
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
@@ -23497,18 +24241,21 @@ fn exec_delete(
             new_root = bt.root;
         }
         ctx.set_table_root_lc(&table_name_lc, new_root);
-        // Maintain indexes: delete the entry for this row.
-        for idx in &indexes {
-            delete_index_entry(ctx, idx, &table, row, rowid)?;
-        }
         // Statement journal: the deleted payload moves in (zero-copy) so a
         // later failure in this statement re-inserts the row + indexes.
+        // Pushed BEFORE the index maintenance and AFTER-triggers below —
+        // the cell is already gone; a `?` failure after this point must
+        // still see the undo entry (same contract as the streaming loop).
         if let Some(payload) = deleted_payload {
             ctx.stmt_undo.push(StmtUndoEntry::Deleted {
                 table: std::sync::Arc::clone(&table),
                 rowid,
                 payload,
             });
+        }
+        // Maintain indexes: delete the entry for this row.
+        for idx in &indexes {
+            delete_index_entry(ctx, idx, &table, row, rowid)?;
         }
         ctx.changes += 1;
         deleted += 1;

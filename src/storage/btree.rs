@@ -2696,6 +2696,12 @@ impl<'a> Btree<'a> {
                 };
                 self.insert_cell_into_page(new_root, &cell)?;
                 self.pager.note_root_split(old_root, new_root);
+                if crate::executor::dbg_index_trace() {
+                    eprintln!(
+                        "[root-split:tab] old={} new={} split_key={}",
+                        old_root, new_root, split_key
+                    );
+                }
                 self.root = new_root;
                 Ok(())
             }
@@ -4214,6 +4220,12 @@ impl<'a> Btree<'a> {
                         }
 
                         if is_right_most {
+                            if crate::executor::dbg_index_trace() {
+                                eprintln!(
+                                    "[parent:rm] parent={} child={} new_page={} sep_rowid={}",
+                                    page_id, child_id, new_page, split_key
+                                );
+                            }
                             // Append cell1 = (child_id, separator) and make
                             // new_page the new right-most child.
                             // NOTE: `is_right_most` is only true when
@@ -4617,6 +4629,25 @@ impl<'a> Btree<'a> {
     /// Insert a cell into a leaf or interior page. Cells are kept sorted:
     /// table pages by i64 key, index pages by (key bytes, rowid).
     fn insert_cell_into_page(&mut self, page_id: PageId, cell: &Cell) -> Result<()> {
+        if crate::executor::dbg_index_trace() {
+            let pt = self
+                .pager
+                .get_page(page_id)
+                .ok()
+                .and_then(|p| p.lock().page_type().ok());
+            if matches!(pt, Some(PageType::LeafIndex | PageType::InteriorIndex)) {
+                eprintln!(
+                    "[cell+->{}] rowid={} key={:02X?}",
+                    page_id,
+                    cell.key(),
+                    cell.index_key()
+                        .iter()
+                        .take(8)
+                        .copied()
+                        .collect::<Vec<u8>>()
+                );
+            }
+        }
         let page = self.pager.get_page(page_id)?;
         let pt = page.lock().page_type()?;
         let cell_size = cell.encoded_size();
@@ -4932,6 +4963,12 @@ impl<'a> Btree<'a> {
 
         // Allocate + init the new leaf.
         let new_page_id = self.pager.allocate_page()?;
+        if crate::executor::dbg_index_trace() {
+            eprintln!(
+                "[split:mid] page={} type={:?} n={} pos={} mid={} left_cells={} right_cells={} left_bytes={} right_bytes={} new_page={}",
+                page_id, pt, n_usize, pos, mid, left_cells, right_cells, left_bytes, right_bytes, new_page_id
+            );
+        }
         {
             let np = self.pager.get_page(new_page_id)?;
             let mut npb = np.lock();
@@ -5041,6 +5078,20 @@ impl<'a> Btree<'a> {
         pt: PageType,
         new_cell: Cell,
     ) -> Result<InsertResult> {
+        if crate::executor::dbg_index_trace() {
+            eprintln!(
+                "[split:append] page={} type={:?} cell_rowid={} key={:02X?}",
+                page_id,
+                pt,
+                new_cell.key(),
+                new_cell
+                    .index_key()
+                    .iter()
+                    .take(8)
+                    .copied()
+                    .collect::<Vec<u8>>()
+            );
+        }
         let new_page_id = self.pager.allocate_page()?;
         let new_page = self.pager.get_page(new_page_id)?;
         {
@@ -8419,6 +8470,12 @@ impl<'a> Btree<'a> {
                 )?;
                 self.insert_cell_into_page(new_root, &cell)?;
                 self.pager.note_root_split(old_root, new_root);
+                if crate::executor::dbg_index_trace() {
+                    eprintln!(
+                        "[root-split:idx] old_root={} new_root={} self.root(was {})={}",
+                        old_root, new_root, self.root, new_root
+                    );
+                }
                 self.root = new_root;
                 Ok(())
             }
@@ -9031,6 +9088,83 @@ impl<'a> Btree<'a> {
     /// Scan all entries in an index B+tree, calling `f(rowid, key)` for each.
     pub fn scan_index<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
         self.scan_index_subtree(self.root, &mut f)
+    }
+
+    /// Env-gated (RUSTQLITE_DBG_IDX) topology dump: every page of the
+    /// tree (type, n_cells, right-most pointer, children) — diagnosing
+    /// orphaned-page corruption.
+    pub fn debug_dump_tree(&mut self, label: &str) {
+        if !crate::executor::dbg_index_trace() {
+            return;
+        }
+        eprintln!("[dump] {label} root={}", self.root);
+        let mut queue: Vec<(PageId, usize)> = vec![(self.root, 0)];
+        let mut seen = std::collections::HashSet::new();
+        while let Some((pid, depth)) = queue.pop() {
+            if !seen.insert(pid) {
+                eprintln!("[dump]   page {} (depth {}) REVISITED", pid, depth);
+                continue;
+            }
+            let Ok(page) = self.pager.get_page(pid) else {
+                eprintln!("[dump]   page {} (depth {}) UNREADABLE", pid, depth);
+                continue;
+            };
+            let b = page.lock();
+            let Ok(pt) = b.page_type() else {
+                eprintln!("[dump]   page {} (depth {}) BAD-TYPE", pid, depth);
+                continue;
+            };
+            let n = b.n_cells();
+            let rm = b.right_most_pointer();
+            let psz = b.page_size();
+            let first = if n > 0 {
+                let p = b.cell_pointer(0) as usize;
+                decode_index_cell(&b.data[p..], false, psz)
+                    .map(|v| {
+                        format!(
+                            "rowid={} key={:02X?}",
+                            v.rowid,
+                            v.key.iter().take(6).copied().collect::<Vec<u8>>()
+                        )
+                    })
+                    .unwrap_or_else(|| "?".into())
+            } else {
+                "-".into()
+            };
+            let last = if n > 0 {
+                let p = b.cell_pointer(n - 1) as usize;
+                decode_index_cell(&b.data[p..], false, psz)
+                    .map(|v| {
+                        format!(
+                            "rowid={} key={:02X?}",
+                            v.rowid,
+                            v.key.iter().take(6).copied().collect::<Vec<u8>>()
+                        )
+                    })
+                    .unwrap_or_else(|| "?".into())
+            } else {
+                "-".into()
+            };
+            eprintln!(
+                "[dump]   page {} (depth {}) {:?} n={} rm={} first[{}] last[{}]",
+                pid, depth, pt, n, rm, first, last
+            );
+            match pt {
+                PageType::InteriorIndex => {
+                    for i in 0..n {
+                        let p = b.cell_pointer(i) as usize;
+                        if let Some(v) = decode_index_cell(&b.data[p..], true, psz) {
+                            queue.push((v.left_child, depth + 1));
+                        }
+                    }
+                    if rm != 0 {
+                        queue.push((rm, depth + 1));
+                    }
+                }
+                PageType::LeafIndex => {}
+                _ => {}
+            }
+        }
     }
 
     fn scan_index_subtree<F: FnMut(i64, &[u8]) -> bool>(

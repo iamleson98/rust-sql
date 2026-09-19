@@ -100,15 +100,59 @@ impl Hash for GroupKey<'_> {
     }
 }
 
+/// EXACT comparison of an i64 against an f64 — SQLite's
+/// `sqlite3IntFloatCompare()` (the no-long-double path), verbatim
+/// semantics. Integers beyond 2^53 stay exact: `9223372036854775807 =
+/// 9.2233720368547758e18` is FALSE in SQLite (the double is exactly 2^63,
+/// strictly greater than i64::MAX) while a naive `(i as f64) == r` cast
+/// rounds both to 2^63 and calls them equal — found by the stateful
+/// differential fuzz deep-sweep (DELETE with a 2^63 REAL literal wrongly
+/// matching an i64::MAX row).
+///
+/// Algorithm (mirrors sqlite3IntFloatCompare): r outside [-2^63, 2^63)
+/// decides immediately; otherwise the truncated integer decides, and only
+/// when the truncation equals i does the (exact — i is representable)
+/// double form break the tie. NaN never reaches here (Value::cmp's
+/// num_class orders NaN after all numbers; values_sql_equal guards it).
+pub(crate) fn int_float_compare(i: i64, r: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if r < -9223372036854775808.0 {
+        // Any i64 is greater than every double below -2^63.
+        return Ordering::Greater;
+    }
+    if r >= 9223372036854775808.0 {
+        // Any i64 is less than every double >= 2^63 (i64::MAX < 2^63).
+        return Ordering::Less;
+    }
+    // Guarded range: the truncating cast is exact and in-bounds (Rust `as`
+    // saturates out-of-range, but the guards above make that unreachable).
+    let y = r as i64;
+    match i.cmp(&y) {
+        Ordering::Equal => {
+            let s = i as f64;
+            if s < r {
+                Ordering::Less
+            } else if s > r {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        ord => ord,
+    }
+}
+
 /// SQL equality on two values (numeric cross-type equality, NULL == NULL).
 pub fn values_sql_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
         (Value::Integer(x), Value::Integer(y)) => x == y,
-        // Numeric equality across INTEGER/REAL (SQLite semantics).
+        // Numeric equality across INTEGER/REAL (SQLite semantics) — the
+        // EXACT int/float comparison, not a double cast (see
+        // `int_float_compare`). NaN compares false to everything.
         (Value::Integer(x), Value::Real(y)) | (Value::Real(y), Value::Integer(x)) => {
-            *x as f64 == *y
+            !y.is_nan() && int_float_compare(*x, *y) == std::cmp::Ordering::Equal
         }
         (Value::Real(x), Value::Real(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
@@ -129,8 +173,12 @@ fn hash_value_sql<H: Hasher>(v: &Value, state: &mut H) {
         }
         Value::Real(f) => {
             // Normalize integral doubles to their integer hash so they
-            // collide with Integer(n); normalize -0.0 to 0.
-            if f.is_finite() && *f == f.trunc() && f.abs() <= 9.007_199_254_740_992e15 {
+            // collide with Integer(n); normalize -0.0 to 0. The bound is
+            // 2^63 (not 2^53): EXACT integral doubles up to 2^63-1 are
+            // i64-equal to their Integer form (values_sql_equal's exact
+            // compare), and equal values MUST hash equal — Real(2^62)
+            // and Integer(2^62) are one key under SQL semantics.
+            if f.is_finite() && *f == f.trunc() && f.abs() < 9223372036854775808.0 {
                 state.write_u8(1);
                 state.write_i64(*f as i64);
             } else {
@@ -942,10 +990,20 @@ impl Ord for Value {
             (Integer(_) | Real(_), Integer(_) | Real(_)) => {
                 let (ca, cb) = (num_class(self), num_class(other));
                 match ca.cmp(&cb) {
-                    Ordering::Equal => {
-                        let (a, b) = (self.as_real(), other.as_real());
-                        a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-                    }
+                    Ordering::Equal => match (self, other) {
+                        // Mixed int/real pairs use SQLite's EXACT
+                        // comparison (sqlite3IntFloatCompare): an i64 never
+                        // equals a double it merely rounds to —
+                        // 9223372036854775807 orders BELOW 2^63.0. The
+                        // old `as_real()` cast collapsed both to 2^63 and
+                        // mis-ordered every integer beyond 2^53.
+                        (Integer(a), Real(b)) => int_float_compare(*a, *b),
+                        (Real(a), Integer(b)) => int_float_compare(*b, *a).reverse(),
+                        _ => {
+                            let (a, b) = (self.as_real(), other.as_real());
+                            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+                        }
+                    },
                     ord => ord,
                 }
             }

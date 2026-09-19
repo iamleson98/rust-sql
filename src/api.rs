@@ -6033,12 +6033,12 @@ impl Database {
         // ── Statement journal (SQLite's statement-journal contract, row
         // granularity) ──
         // A FAILED statement must leave no partial writes: rows it landed
-        // — its own inserts/deletes AND rows written by triggers fired
-        // from it (they share this ExecContext) — are undone in reverse
-        // before the error surfaces. UPDATE paths pre-validate their
-        // failure modes before any row lands, so they stay journal-free;
-        // in-place upsert mutations and vtab xUpdate effects are the
-        // documented corners (see StmtUndoEntry). Best-effort: the
+        // — its own inserts/deletes AND in-place UPDATE rewrites (see
+        // StmtUndoEntry::Updated, journaled at every rewrite site) AND
+        // rows written by triggers fired from it (they share this
+        // ExecContext) — are undone in reverse before the error surfaces.
+        // In-place upsert mutations and vtab xUpdate effects are covered
+        // by the same journal. Best-effort: the
         // ORIGINAL statement error is what the caller must see.
         if result.is_err() && !ctx.stmt_undo.is_empty() {
             let entries = std::mem::take(&mut ctx.stmt_undo);
@@ -13341,7 +13341,7 @@ fn insert_schema_row(pager: &Pager, row: &[Value]) -> Result<()> {
         }
         true
     })?;
-    let rowid = crate::executor::next_auto_rowid(pager, 0, max_rowid)?;
+    let rowid = crate::executor::next_auto_rowid(pager, 0, max_rowid, false)?;
     let payload = encode_row(&row.to_vec());
     schema_tree_mutate(pager, |bt| bt.insert_table(rowid, &payload).map(|_| ()))
 }

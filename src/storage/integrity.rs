@@ -427,6 +427,16 @@ fn check_index_tree(
         _ => owner.iter().cloned().collect(),
     };
     let missing: Vec<&i64> = required.difference(&index_rowids).collect();
+    if !missing.is_empty() && crate::executor::dbg_index_trace() {
+        let all: Vec<i64> = missing.iter().copied().copied().collect();
+        eprintln!(
+            "[integrity] index {} missing {} rows: {:?}",
+            idx.name,
+            all.len(),
+            all
+        );
+        bt.debug_dump_tree(&format!("index {}", idx.name));
+    }
     if !missing.is_empty() {
         // Report count-style (SQLite reports each missing row; we cap
         // through the collector, so report a bounded list).
