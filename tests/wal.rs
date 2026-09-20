@@ -36,10 +36,13 @@ fn wal_basic_commit_and_read() {
     drop(db);
 
     // Clean close checkpointed the WAL; reopen sees everything, no -wal.
+    // SQLite semantics: WAL mode PERSISTS in the file header — the reopen
+    // comes up in WAL mode (the sidecar is recreated empty; before the
+    // persistence fix the handle silently reverted to DELETE mode).
     let db = Database::open(&path).unwrap();
     assert_eq!(
         db.query("PRAGMA journal_mode", []).unwrap()[0][0].as_text(),
-        "delete"
+        "wal"
     );
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 3);
@@ -59,10 +62,16 @@ fn wal_crash_recovery_unclean_shutdown() {
     }
     db.execute("COMMIT", []).unwrap();
 
-    // Simulate a crash: forget the Database — its Drop (checkpoint + WAL
-    // removal) never runs. The -wal file with committed frames remains.
+    // Simulate a crash: RETIRE the handle (its Drop's clean-close
+    // checkpoint + WAL removal is disabled) and drop it — the in-process
+    // WAL writer lease releases (the analogue of the OS releasing a dead
+    // process's file locks) while the -wal file with committed frames
+    // remains. (std::mem::forget would LEAK the handle: its lease would
+    // stay held and the next writer would get SQLITE_BUSY — exactly what
+    // a leaked sqlite3* connection does through its POSIX locks.)
     let rows_before = db.query("SELECT COUNT(*), SUM(v) FROM t", []).unwrap();
-    std::mem::forget(db);
+    db.pager_handle().retire();
+    drop(db);
 
     assert!(
         std::path::PathBuf::from(format!("{}-wal", path.to_str().unwrap())).exists(),
@@ -105,7 +114,8 @@ fn wal_served_reads_after_reopen_without_checkpoint() {
         .unwrap();
     db.execute("INSERT INTO t (v) VALUES ('x')", []).unwrap();
     let sum_before = db.query("SELECT COUNT(*) FROM t", []).unwrap();
-    std::mem::forget(db);
+    db.pager_handle().retire();
+    drop(db);
     assert_eq!(sum_before[0][0].as_integer(), 1);
 
     let mut db2 = Database::open(&path).unwrap();
@@ -303,7 +313,8 @@ fn wal_indexes_and_dml_roundtrip() {
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 270);
 
-    std::mem::forget(db);
+    db.pager_handle().retire();
+    drop(db);
     let db2 = Database::open(&path).unwrap();
     let rows = db2.query("SELECT COUNT(*) FROM t", []).unwrap();
     assert_eq!(rows[0][0].as_integer(), 270);

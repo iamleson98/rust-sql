@@ -323,6 +323,79 @@ fn rand_u32() -> u32 {
     nanos.wrapping_mul(2654435761).wrapping_add(0x12345678)
 }
 
+/// Process-wide WAL WRITER lease registry: WAL sidecar path -> the pager
+/// instance id that owns the right to APPEND frames / checkpoint / reset
+/// it. One process may hold MANY read pagers on the same sidecar (each
+/// `Database::open` of a WAL-mode file attaches; committed frames are
+/// plain positioned reads), but concurrent UNSERIALIZED appends from two
+/// pagers would interleave at clashing offsets with independent running
+/// checksums — silent sidecar corruption. The first appender takes the
+/// lease; other pagers' append attempts fail with a clear busy-class
+/// error instead of corrupting the log. The lease releases when the
+/// owning pager retires (Drop/`retire()`), which also serializes against
+/// open/teardown through [`lifecycle_guard`].
+///
+/// This is an in-process guard only (multi-PROCESS access to native
+/// files remains outside the engine's contract; the SQLite-format
+/// container is the cross-process interchange path).
+pub(crate) fn wal_writer_leases(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static LEASES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>> =
+        std::sync::OnceLock::new();
+    LEASES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Canonicalize a sidecar path for lease keying: two handles opening
+/// "db.sqlite" and "./db.sqlite" must map to the same lease entry.
+pub(crate) fn lease_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Lease acquisition result: `Ours` = the caller already holds it,
+/// `Acquired` = it was free and is now held, `Foreign` = another live
+/// pager in this process holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WalLease {
+    Ours,
+    Acquired,
+    Foreign(String),
+}
+
+/// Try to take (or confirm) the write lease for `owner` on `path`.
+pub(crate) fn acquire_wal_lease(path: &Path, owner: u64) -> WalLease {
+    let key = lease_key(path);
+    let mut leases = wal_writer_leases().lock().unwrap();
+    match leases.get(&key) {
+        Some(&held) if held != owner => WalLease::Foreign(key.display().to_string()),
+        Some(_) => WalLease::Ours,
+        None => {
+            leases.insert(key, owner);
+            WalLease::Acquired
+        }
+    }
+}
+
+/// The busy-class error for a foreign lease, with the actionable hint.
+pub(crate) fn wal_lease_busy(foreign: String) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "the WAL writer lease for {foreign} is held by another connection in this \
+             process; concurrent multi-handle WAL writes are unsafe — route writes \
+             through one connection (or the sqlx driver's shared engine)"
+        ),
+    )
+}
+
+/// Release the lease on `path` when `owner` holds it.
+pub(crate) fn release_wal_lease(path: &Path, owner: u64) {
+    let key = lease_key(path);
+    let mut leases = wal_writer_leases().lock().unwrap();
+    if leases.get(&key).copied() == Some(owner) {
+        leases.remove(&key);
+    }
+}
+
 /// The WAL file.
 pub struct Wal {
     file: File,

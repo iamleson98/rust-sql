@@ -473,6 +473,17 @@ impl ConcurrentManager {
         self.scope_count.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// The concurrent manager's committed origin → current-root map
+    /// (the authoritative tree-root view for the concurrent regime —
+    /// diagnostics for `RSQL_DBG_CW` root-resolution tracing).
+    pub(crate) fn dbg_live_roots(&self) -> Vec<(PageId, PageId)> {
+        self.live_roots
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    }
+
     pub(crate) fn note_scope_dropped(&self) {
         self.scope_count.fetch_sub(1, Ordering::AcqRel);
     }

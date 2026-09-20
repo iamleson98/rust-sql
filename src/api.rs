@@ -221,6 +221,13 @@ struct ConcurrentTxnEntry {
     txn_id: u64,
     /// Transaction-private bookkeeping overlay.
     maps: std::sync::Arc<crate::executor::StmtMaps>,
+    /// The shared maps as they were when this transaction opened (the
+    /// overlay's BASE). `publish_concurrent_maps` publishes the overlay's
+    /// DELTA against this base into the shared maps — a full-map swap
+    /// would regress entries other connections committed after this
+    /// transaction began (their re-rooted trees), bouncing root
+    /// resolutions between generations mid-burst.
+    base: std::sync::Arc<crate::executor::StmtMaps>,
     /// Overlay snapshots aligned with the pager-side savepoint stack
     /// (index i corresponds to concurrent savepoint i — the mirror of
     /// the plain path's `savepoint_maps`). ROLLBACK TO restores the
@@ -6186,7 +6193,19 @@ impl Database {
             // committed transaction: reads resolved a stale leaf and saw
             // only its rows.
             let restored = self.txn_maps_snap.write().take();
-            *self.maps.get_mut() = restored.unwrap_or_else(empty_maps);
+            // NO SNAPSHOT = this ROLLBACK did not end a plain
+            // BEGIN..COMMIT transaction: a failed BEGIN's cleanup, a
+            // failed CONCURRENT commit's teardown (the transaction was
+            // already deregistered, so the ROLLBACK falls through to this
+            // plain machinery), or a stray ROLLBACK. In every one of those
+            // cases the shared maps still describe COMMITTED state —
+            // restoring `empty_maps` here WIPED every live root override
+            // (the pinned reader-visibility divergence: all readers then
+            // resolved the catalog's DDL-time root, an interior node after
+            // the seed's splits, and served a consistent PARTIAL table).
+            // Keep the current maps instead.
+            let keep = self.maps.read().clone();
+            *self.maps.get_mut() = restored.unwrap_or(keep);
             self.refresh_maps_flag();
             // `schema_root_pages` mirrors "what the schema rows on disk
             // say" — after rollback that is exactly the begin-time roots.
@@ -6276,7 +6295,41 @@ impl Database {
         // install at COMMIT.
         if result.is_ok() && ctx.roots_changed {
             if conc_owner_txn.is_some() {
-                self.sync_schema_roots_from(&ctx.shared)?;
+                // Only THIS transaction's root moves (the overlay's DELTA
+                // against its BEGIN-time base) may rewrite schema rows.
+                // Entries cloned from the base can be STALE against
+                // sibling commits — a full-overlay sync would rewrite
+                // their rows backward into this transaction's shadows
+                // (the conflict machinery then has to merge them away)
+                // and dirty page 0's shadow for trees this transaction
+                // never touched, forcing spurious conflicts.
+                let base = {
+                    let conn = conn_identity();
+                    self.concurrent_txns
+                        .lock()
+                        .get(&conn)
+                        .map(|e| e.base.clone())
+                };
+                if let Some(base) = base {
+                    let mut delta = (*base).clone();
+                    delta.roots = ctx
+                        .shared
+                        .roots
+                        .iter()
+                        .filter(|(k, v)| base.roots.get(*k) != Some(*v))
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect();
+                    delta.index_roots = ctx
+                        .shared
+                        .index_roots
+                        .iter()
+                        .filter(|(k, v)| base.index_roots.get(*k) != Some(*v))
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect();
+                    self.sync_schema_roots_from(&std::sync::Arc::new(delta))?;
+                } else {
+                    self.sync_schema_roots_from(&ctx.shared)?;
+                }
             } else {
                 self.sync_schema_roots_inner()?;
             }
@@ -7000,6 +7053,42 @@ impl Database {
         Arc::clone(&self.pager)
     }
 
+    /// Diagnostic dump of every root bookkeeping source for one object
+    /// (shared maps, catalog Arc, schema-row tracker, manager live roots)
+    /// — the `RSQL_DBG_CW` root-resolution tracing hook.
+    #[doc(hidden)]
+    pub fn dbg_root_state(&self, name: &str) -> String {
+        let key = name.to_ascii_lowercase();
+        let maps = self.maps.read();
+        let map_root = maps
+            .roots
+            .get(&key)
+            .or_else(|| maps.roots.get(name))
+            .copied();
+        let map_idx = maps
+            .index_roots
+            .get(&key)
+            .or_else(|| maps.index_roots.get(name))
+            .copied();
+        let cat_root = self
+            .catalog
+            .get_table(name)
+            .map(|t| t.root_page)
+            .or_else(|| self.catalog.get_index(name).map(|i| i.root_page));
+        let tracker = {
+            let synced = self.schema_root_pages.lock();
+            synced
+                .get(&format!("table:{}", key))
+                .or_else(|| synced.get(&format!("index:{}", key)))
+                .copied()
+        };
+        let live = self.pager.dbg_live_roots();
+        format!(
+            "name={name} map_table={map_root:?} map_index={map_idx:?} catalog={cat_root:?} \
+             schema_row_tracker={tracker:?} manager_live_roots={live:?}"
+        )
+    }
+
     /// Live B+tree root page of a table or index (diagnostics/probes):
     /// the bookkeeping map tracks root moves from splits, falling back to
     /// the catalog's CREATE-time root. `None` when the object doesn't
@@ -7334,8 +7423,16 @@ impl Database {
         let entry = ConcurrentTxnEntry {
             txn_id,
             maps: self.maps.read().clone(),
+            base: self.maps.read().clone(),
             savepoint_maps: Vec::new(),
         };
+        if std::env::var_os("RSQL_DBG_CW").is_some() {
+            let m = entry.maps.clone();
+            eprintln!(
+                "[CW-BEGIN] conn={conn} overlay_tables={:?} overlay_indexes={:?}",
+                m.roots, m.index_roots
+            );
+        }
         self.concurrent_txns.lock().insert(conn, entry);
         self.concurrent_active.store(true, Ordering::Release);
         self.in_transaction.store(true, Ordering::Release);
@@ -7372,11 +7469,11 @@ impl Database {
             self.finish_concurrent_txn();
             return Err(e);
         }
-        // Publish the transaction's bookkeeping overlay (root overrides,
-        // rowid caches) as the shared maps — with the MERGE fixups applied
-        // (the merged trees may be rooted at different pages than the
-        // transaction's private view).
-        self.publish_concurrent_maps(entry.maps, &r.unwrap());
+        // Publish the transaction's bookkeeping DELTA (root overrides,
+        // rowid caches) into the shared maps — reconciled against the
+        // pager's committed-root view so values never regress to older
+        // generations (see `publish_concurrent_maps`).
+        self.publish_concurrent_maps(entry.maps, entry.base, &r.unwrap());
         self.finish_concurrent_txn();
         Ok(())
     }
@@ -7397,7 +7494,7 @@ impl Database {
         let r = self.pager.commit_concurrent_deferred(entry.txn_id);
         match r {
             Ok((outcome, ticket)) => {
-                self.publish_concurrent_maps(entry.maps, &outcome);
+                self.publish_concurrent_maps(entry.maps, entry.base, &outcome);
                 self.finish_concurrent_txn();
                 Ok(ticket)
             }
@@ -7408,41 +7505,118 @@ impl Database {
         }
     }
 
-    /// Publish a committed concurrent transaction's overlay as the shared
-    /// maps, applying the merge's root fixups first: every root value the
-    /// overlay holds for a tree the MERGE re-rooted is replaced with the
-    /// tree's current committed root (cached plans and fast paths resolve
-    /// roots through these maps — a stale private root would descend a
-    /// subtree as if it were the whole tree).
+    /// Publish a committed concurrent transaction's bookkeeping DELTA into
+    /// the shared maps.
+    ///
+    /// Two hard rules, both born from the pinned reader-visibility
+    /// divergence (tests/concurrent_reader_visibility.rs):
+    ///
+    /// 1. **Only the DELTA.** The overlay is a full BEGIN-time snapshot of
+    ///    the shared maps plus this transaction's updates. Swapping it in
+    ///    wholesale would REGRESS every entry another connection committed
+    ///    after this transaction began (its re-rooted trees) — root
+    ///    resolutions then bounce between generations and readers descend
+    ///    a demoted interior node as if it were the whole tree. Only
+    ///    entries that differ from the recorded BASE are published, and
+    ///    base entries the overlay dropped (DROP TABLE / rename
+    ///    invalidations) are removed.
+    ///
+    /// 2. **Roots reconcile against the pager's committed-root view.**
+    ///    Every published root value is folded through the concurrent
+    ///    manager's origin→current map (`Pager::committed_root_of`): a
+    ///    MERGE re-rooted tree publishes its current committed root (the
+    ///    merge fixups), a fast-path split publishes its just-installed
+    ///    root, and any value left over from an older generation resolves
+    ///    forward instead of backward. Cached plans and fast paths resolve
+    ///    roots through these maps — a stale value would serve a partial
+    ///    tree.
     fn publish_concurrent_maps(
         &mut self,
         maps: std::sync::Arc<crate::executor::StmtMaps>,
+        base: std::sync::Arc<crate::executor::StmtMaps>,
         outcome: &crate::storage::concurrent::ConcurrentCommitOutcome,
     ) {
-        let mut maps = maps;
-        if !outcome.root_fixups.is_empty() {
-            let mut fixed = (*maps).clone();
-            let fix = |m: &mut std::collections::HashMap<String, u32>| {
-                for v in m.values_mut() {
-                    for (old, new) in &outcome.root_fixups {
-                        if *v == *old {
-                            *v = *new;
-                        }
-                    }
+        if std::env::var_os("RSQL_DBG_CW").is_some() {
+            eprintln!(
+                "[CW-PUBLISH] merged={} fixups={:?} in_tables={:?} in_indexes={:?}",
+                outcome.merged, outcome.root_fixups, maps.roots, maps.index_roots
+            );
+        }
+        // The next shared maps: the CURRENT committed state plus this
+        // transaction's reconciled delta.
+        let mut next: crate::executor::StmtMaps = (**self.maps.read()).clone();
+        let mut changed = false;
+        // Merge fixups: the outcome's (old_value, current) pairs cover the
+        // PRIVATE root pages the manager never learned (a merged
+        // transaction's shadows were discarded — the fresh replay's
+        // lineage only maps its OWN roots). Apply them first, then fold
+        // through the manager's committed-root view for anything left.
+        let fixup = |mut v: u32| -> u32 {
+            for (old, new) in &outcome.root_fixups {
+                if v == *old {
+                    v = *new;
                 }
-            };
-            fix(&mut fixed.roots);
-            fix(&mut fixed.index_roots);
-            maps = std::sync::Arc::new(fixed);
-            // Cached plans embed table/index Arcs whose root_page may be
-            // the pre-merge view; a fresh plan re-resolves from the fixed
-            // maps. Cheap and rare (merges only).
+            }
+            self.pager.committed_root_of(v)
+        };
+        // Root overrides (tables).
+        for (k, v) in maps.roots.iter() {
+            if base.roots.get(k) == Some(v) {
+                continue; // unchanged since BEGIN: not this txn's delta
+            }
+            let rv = fixup(*v);
+            if next.roots.get(k) != Some(&rv) {
+                next.roots.insert(k.clone(), rv);
+                changed = true;
+            }
+        }
+        for k in base.roots.keys() {
+            if !maps.roots.contains_key(k) && next.roots.remove(k).is_some() {
+                changed = true; // invalidated mid-transaction (DROP/rename)
+            }
+        }
+        // Index roots: same discipline.
+        for (k, v) in maps.index_roots.iter() {
+            if base.index_roots.get(k) == Some(v) {
+                continue;
+            }
+            let rv = fixup(*v);
+            if next.index_roots.get(k) != Some(&rv) {
+                next.index_roots.insert(k.clone(), rv);
+                changed = true;
+            }
+        }
+        for k in base.index_roots.keys() {
+            if !maps.index_roots.contains_key(k) && next.index_roots.remove(k).is_some() {
+                changed = true;
+            }
+        }
+        // Max-rowid caches: monotonic max-merge (the cache must stay an
+        // upper bound of live rowids); invalidations replay as removals.
+        for (k, v) in maps.max_rowids.iter() {
+            if base.max_rowids.get(k) == Some(v) {
+                continue;
+            }
+            let cur = next.max_rowids.get(k).copied().unwrap_or(i64::MIN);
+            if *v > cur {
+                next.max_rowids.insert(k.clone(), *v);
+                changed = true;
+            }
+        }
+        for k in base.max_rowids.keys() {
+            if !maps.max_rowids.contains_key(k) && next.max_rowids.remove(k).is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            *self.maps.get_mut() = std::sync::Arc::new(next);
+            self.refresh_maps_flag();
+            // Cached plans embed table/index Arcs whose root_page may be a
+            // pre-commit view; a fresh plan re-resolves from the updated
+            // maps. Cheap and rare (roots only move on splits/merges).
             self.invalidate_stmt_cache();
         }
-        *self.maps.get_mut() = maps;
-        self.refresh_maps_flag();
     }
-
     /// ROLLBACK of this connection's concurrent transaction: drop the
     /// shadows (the live cache was never touched), recycle this
     /// transaction's fresh page allocations into the freelist, and
@@ -9762,6 +9936,16 @@ impl Database {
                 Ok(())
             }
             Statement::Rollback(_) => {
+                // SQLite parity: ROLLBACK without an open transaction is an
+                // error, not a silent no-op. The tolerant form ALSO fed the
+                // map-wipe path (a failed CONCURRENT commit's cleanup
+                // ROLLBACK arrived here with the transaction already gone
+                // and "succeeded", triggering the rolled_back epilogue).
+                if !ctx.in_transaction && !ctx.pager.concurrent_writers_active() {
+                    return Err(Error::semantic(
+                        "cannot rollback - no transaction is active",
+                    ));
+                }
                 // Restore the pager to the transaction base. Prefer the
                 // savepoint undo log (non-destructive: pre-images are
                 // restored into the cache and re-dirtied, so even pages a

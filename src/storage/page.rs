@@ -422,11 +422,21 @@ impl Page {
 /// 56..60  user version (u32 LE)
 /// 60..64  incremental vacuum mode (u32 LE, 0=off)
 /// 64..68  application id (u32 LE)
-/// 68..92  reserved (zeros)
+/// 68..72  reserved (zeros)
+/// 72..76  journal mode (u32 LE: 0 = delete [default], 1 = wal) — WAL
+///         PERSISTS across connections exactly like SQLite's header bytes
+///         18/19 (a reopen of a WAL-mode file comes up in WAL mode);
+///         every other journal mode reverts to delete on reopen, also
+///         like SQLite.
+/// 76..92  reserved (zeros)
 /// 92..96  version-valid-for (u32 LE)
 /// 96..100  SQLite version magic (we use our own version, e.g. 1)
 /// ```
 pub struct FileHeader;
+
+/// `journal_mode` header values (offset 72..76, LE).
+pub const JOURNAL_MODE_DELETE: u32 = 0;
+pub const JOURNAL_MODE_WAL: u32 = 1;
 
 impl FileHeader {
     pub fn write(buf: &mut [u8], page_size: u32, db_size_pages: u32, schema_cookie: u32) {
@@ -493,6 +503,21 @@ impl FileHeader {
     pub fn set_schema_cookie(buf: &mut [u8], cookie: u32) {
         buf[28..32].copy_from_slice(&cookie.to_le_bytes());
         buf[12..16].copy_from_slice(&cookie.wrapping_add(1).to_le_bytes()); // bump change counter
+    }
+
+    /// The persistent journal mode (offset 72). `JOURNAL_MODE_DELETE`
+    /// (0) for every pre-existing file — the region was reserved zeros —
+    /// so this is backward compatible by construction.
+    pub fn journal_mode(buf: &[u8]) -> u32 {
+        if buf.len() < 76 {
+            return JOURNAL_MODE_DELETE;
+        }
+        u32::from_le_bytes(buf[72..76].try_into().unwrap())
+    }
+
+    /// Set the persistent journal mode (offset 72).
+    pub fn set_journal_mode(buf: &mut [u8], mode: u32) {
+        buf[72..76].copy_from_slice(&mode.to_le_bytes());
     }
 }
 

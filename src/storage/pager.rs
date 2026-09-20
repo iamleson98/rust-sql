@@ -1402,12 +1402,23 @@ impl Drop for Pager {
         // behavior). Best-effort — an unclean exit (crash, kill) skips
         // this and recovery on next open serves the committed frames.
         //
-        // A RETIRED pager (its database file was replaced out from under
-        // it — VACUUM's rewrite path) skips all of it: the close-time
-        // bookkeeping would write its own pre-replacement view back over
-        // the new image (an empty-map checkpoint still re-asserts the
-        // old page count via set_len) and delete sidecars now owned by
-        // the fresh pager.
+        // The WRITER LEASE releases unconditionally FIRST — even for a
+        // RETIRED pager (its file was replaced out from under it —
+        // VACUUM's rewrite path, whose successor must be able to take
+        // the lease). Releasing the in-process lease is the analogue of
+        // the OS releasing a dead process's file locks; a handle dropped
+        // WITHOUT Drop (std::mem::forget / a leak) keeps the lease and
+        // later writers get SQLITE_BUSY — the same behavior a leaked
+        // sqlite3* connection exhibits through its held POSIX locks.
+        if !self.store.is_memory() {
+            let sidecar = crate::storage::wal::wal_path_for(&self.path);
+            crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+        }
+        //
+        // A RETIRED pager skips the rest: the close-time bookkeeping would
+        // write its own pre-replacement view back over the new image (an
+        // empty-map checkpoint still re-asserts the old page count via
+        // set_len) and delete sidecars now owned by the fresh pager.
         if self.retired.load(Ordering::Acquire) {
             return;
         }
@@ -1423,18 +1434,30 @@ impl Drop for Pager {
             // the removal deletes the NEW generation's just-created WAL
             // and strands it on a deleted inode.
             let _guard = crate::storage::wal::lifecycle_guard().lock();
-            let _ = self.checkpoint_wal();
-            // Ownership-checked removal: delete the sidecar only when
-            // the path still holds OUR file (same inode). A newer
-            // generation's WAL must survive our retirement.
-            let mine = {
-                let g = self.wal.read();
-                g.as_ref().and_then(|s| s.wal.identity())
-            };
-            crate::storage::wal::remove_file_if_owned(
-                &crate::storage::wal::wal_path_for(&self.path),
-                mine,
+            // WAL WRITER LEASE: only the lease owner may checkpoint +
+            // remove the sidecar. A read-only second handle closing while
+            // the live owner appends would otherwise truncate the log
+            // under it (the same datxevui class, intra-process).
+            let sidecar = crate::storage::wal::wal_path_for(&self.path);
+            let am_owner = !matches!(
+                crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id),
+                crate::storage::wal::WalLease::Foreign(_)
             );
+            if am_owner {
+                let _ = self.checkpoint_wal();
+                // Ownership-checked removal: delete the sidecar only when
+                // the path still holds OUR file (same inode). A newer
+                // generation's WAL must survive our retirement.
+                let mine = {
+                    let g = self.wal.read();
+                    g.as_ref().and_then(|s| s.wal.identity())
+                };
+                crate::storage::wal::remove_file_if_owned(
+                    &crate::storage::wal::wal_path_for(&self.path),
+                    mine,
+                );
+                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            }
         }
         // DELETE-mode spill sidecar: uncommitted cache-pressure records.
         // A clean close either already drained them (COMMIT ran flush) or
@@ -1452,6 +1475,24 @@ impl Drop for Pager {
 }
 
 impl Pager {
+    /// Diagnostics passthrough (see `ConcurrentManager::dbg_live_roots`).
+    #[doc(hidden)]
+    pub fn dbg_live_roots(&self) -> Vec<(PageId, PageId)> {
+        self.concurrent.dbg_live_roots()
+    }
+
+    /// The CURRENT committed root of the tree that `root` belongs to (fold
+    /// `root` to its origin, then resolve the origin to its live root).
+    /// Identity when the concurrent manager has no lineage for the tree —
+    /// the value is already the committed root. Engine-side root
+    /// bookkeeping reconciles every published value through here so a
+    /// stale generation resolves FORWARD (see
+    /// `Database::publish_concurrent_maps`).
+    pub fn committed_root_of(&self, root: PageId) -> PageId {
+        let origin = self.concurrent.origin_of(root);
+        self.concurrent.current_root_of(origin)
+    }
+
     /// Open or create a database file at the given path.
     pub fn open<P: AsRef<Path>>(path: P, cache_capacity: usize) -> Result<Self> {
         Self::open_opts(path, cache_capacity, false)
@@ -1700,13 +1741,27 @@ impl Pager {
             // shutdown, torn transactions are discarded at frame level.
             // Memory stores have no sidecar WAL (enable_wal is a no-op
             // there), so the probe only runs for file-backed pagers.
+            //
+            // PERSISTENT WAL (SQLite parity): the file header's journal
+            // marker (offset 72) outlives the sidecar — a clean close
+            // checkpoints + REMOVES the sidecar but the file stays marked
+            // WAL, so a reopen comes up in WAL mode and recreates it.
+            // Before this, a fresh `Database::open` of a WAL-mode file
+            // silently reverted to DELETE mode (BEGIN CONCURRENT then
+            // failed with "requires journal_mode=WAL" on every reopened
+            // handle).
             if !pager.store.is_memory() {
                 let wal_file = crate::storage::wal::wal_path_for(&pager.path);
-                if wal_file.exists()
+                let sidecar_leftover = wal_file.exists()
                     && std::fs::metadata(&wal_file)
                         .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-                {
+                        .unwrap_or(false);
+                let header_says_wal = {
+                    let mut b = [0u8; 4];
+                    let n = pager.read_file_at(72, &mut b).unwrap_or(0);
+                    n == 4 && u32::from_le_bytes(b) == crate::storage::page::JOURNAL_MODE_WAL
+                };
+                if sidecar_leftover || header_says_wal {
                     pager.enable_wal()?;
                 }
                 // Crash recovery: a leftover -spill sidecar is UNCOMMITTED
@@ -3761,6 +3816,19 @@ impl Pager {
                 state.map.retain(|&id, _| id < bound);
             }
         }
+        // Mark the mode PERSISTENT in the file header (SQLite's own
+        // WAL-mode switch rewrites header bytes 18/19 immediately). This
+        // must run AFTER the WAL map attaches: `persist_journal_mode_flag`
+        // fetches page 0 through the cache, and fetching it before the
+        // map exists would cache the (older) MAIN-FILE page 0 — shadowing
+        // the WAL's newer committed page 0 for the whole session (a
+        // mid-flight second handle then read a pre-CREATE schema: "no
+        // such table"). With the map attached, the fetch serves the
+        // newest committed page 0, flags it dirty (the next WAL commit
+        // re-emits it), and the raw header bytes are patched + fsynced so
+        // the mode is durable even if no commit follows. A reopen of this
+        // file then comes up in WAL mode (see `from_store`).
+        self.persist_journal_mode_flag(crate::storage::page::JOURNAL_MODE_WAL)?;
         Ok(())
     }
 
@@ -3780,7 +3848,31 @@ impl Pager {
         // race: this removal must never delete a freshly created WAL
         // belonging to a new engine generation).
         let _guard = crate::storage::wal::lifecycle_guard().lock();
+        // WRITER LEASE: only the lease owner may checkpoint + reset the
+        // sidecar (a read-only second handle flipping its OWN mode must
+        // not truncate the live owner's log).
+        let sidecar = crate::storage::wal::wal_path_for(&self.path);
+        if let crate::storage::wal::WalLease::Foreign(f) =
+            crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
+        {
+            return Err(crate::error::Error::Transaction(format!(
+                "database is locked (SQLITE_BUSY): {}",
+                crate::storage::wal::wal_lease_busy(f)
+            )));
+        }
+        let result = self.disable_wal_locked();
+        crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+        result
+    }
+
+    /// `disable_wal` with the lifecycle + writer leases already held.
+    fn disable_wal_locked(&self) -> Result<()> {
         self.checkpoint_wal()?;
+        // The mode flip is durable: clear the persisted WAL marker in the
+        // header (in-cache page 0, flagged dirty for the next DELETE-mode
+        // flush, AND the raw file bytes + fsync now) — a reopen of this
+        // file must come up in DELETE mode, not WAL.
+        self.persist_journal_mode_flag(crate::storage::page::JOURNAL_MODE_DELETE)?;
         let mine = {
             let guard = self.wal.read();
             guard.as_ref().and_then(|s| s.wal.identity())
@@ -3801,10 +3893,63 @@ impl Pager {
         self.wal.read().is_some() || self.memory_wal.load(Ordering::Acquire)
     }
 
+    /// Persist the journal-mode marker in the file header (offset 72):
+    /// update the in-cache page 0 (flagged dirty so the next flush
+    /// carries it) AND patch the raw file bytes + fsync so the mode is
+    /// durable immediately — a reopen of a WAL-mode file must come up in
+    /// WAL mode (SQLite's persistent WAL, header bytes 18/19).
+    fn persist_journal_mode_flag(&self, mode: u32) -> Result<()> {
+        if self.store.is_memory() {
+            return Ok(());
+        }
+        let page0 = self.get_page(0)?;
+        {
+            let mut p = page0.lock();
+            crate::storage::page::FileHeader::set_journal_mode(&mut p.data, mode);
+            p.dirty = true;
+        }
+        self.note_dirty(0);
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&mode.to_le_bytes());
+        self.write_file_at(72, &raw)?;
+        self.store.sync_all()?;
+        Ok(())
+    }
+
     /// Copy every committed WAL page back into the main database file,
     /// sync it, and reset the WAL. Readers stay correct throughout: the
     /// map is dropped only after the main file holds every page.
     pub fn checkpoint_wal(&self) -> Result<()> {
+        // WRITER LEASE: resetting/truncating the sidecar is exactly as
+        // destructive as appending when a second pager in this process
+        // holds the log. `Ours` = we are the (sticky) owner — nested call,
+        // the lease stays held; `Acquired` = the lease was free (no live
+        // writer) — transient take, released below; `Foreign` = busy.
+        if !self.store.is_memory() {
+            let sidecar = crate::storage::wal::wal_path_for(&self.path);
+            let acquired = match crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
+            {
+                crate::storage::wal::WalLease::Foreign(f) => {
+                    return Err(crate::error::Error::Transaction(format!(
+                        "database is locked (SQLITE_BUSY): {}",
+                        crate::storage::wal::wal_lease_busy(f)
+                    )))
+                }
+                crate::storage::wal::WalLease::Acquired => true,
+                crate::storage::wal::WalLease::Ours => false,
+            };
+            let r = self.checkpoint_wal_locked();
+            if acquired {
+                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            }
+            r
+        } else {
+            self.checkpoint_wal_locked()
+        }
+    }
+
+    /// [`Self::checkpoint_wal`] with the writer lease already held.
+    fn checkpoint_wal_locked(&self) -> Result<()> {
         let mut guard = self.wal.write();
         let Some(state) = guard.as_mut() else {
             return Ok(());
@@ -3989,6 +4134,33 @@ impl Pager {
     pub(crate) fn flush_wal_opts(&self, sync: bool, checkpoint: bool) -> Result<u64> {
         let psz = self.page_size();
 
+        // WRITER LEASE — STICKY: this call APPENDS to the WAL sidecar (and
+        // may checkpoint it below). Concurrent appends from a second pager
+        // on the same file would interleave at clashing offsets with
+        // independent running checksums — silent corruption — and a
+        // second handle CHECKPOINTING from a map that never saw the other
+        // handle's frames would reset the log and strand their committed
+        // pages. The first handle to write takes the process-wide lease
+        // and HOLDS it until it retires (Drop / `disable_wal` release it);
+        // every other handle's write attempt fails fast with a clean
+        // busy-class error. Read-only handles attach freely (WAL frames
+        // are plain positioned reads).
+        if !self.store.is_memory() {
+            let sidecar = crate::storage::wal::wal_path_for(&self.path);
+            if let crate::storage::wal::WalLease::Foreign(f) =
+                crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
+            {
+                return Err(crate::error::Error::Transaction(format!(
+                    "database is locked (SQLITE_BUSY): {}",
+                    crate::storage::wal::wal_lease_busy(f)
+                )));
+            }
+        }
+        self.flush_wal_opts_locked(sync, checkpoint, psz)
+    }
+
+    /// [`Self::flush_wal_opts`] with the writer lease already held.
+    fn flush_wal_opts_locked(&self, sync: bool, checkpoint: bool, psz: u32) -> Result<u64> {
         // --- header page: refresh in-cache page 0 and mark it dirty ---
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
@@ -4003,6 +4175,14 @@ impl Pager {
             FileHeader::write(&mut borrowed.data, psz, n_pages_val, schema_cookie_val);
             borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
             borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
+            // Re-assert the persisted WAL marker on EVERY commit: an image
+            // install (VACUUM / compact copy) can land a page 0 built from
+            // a zeroed reserved region — the flag would silently flip the
+            // file back to "delete" after the next checkpoint.
+            crate::storage::page::FileHeader::set_journal_mode(
+                &mut borrowed.data,
+                crate::storage::page::JOURNAL_MODE_WAL,
+            );
             borrowed.dirty = true;
         }
         self.dirty_pages.lock().insert(0);
