@@ -681,7 +681,7 @@ impl Pager {
             Some(g) => g,
             None => return true, // not open: nothing to commit
         };
-        let Some(txn) = guard.get(txn_id) else {
+        let Some(txn) = guard.get(&txn_id) else {
             return true;
         };
         let has_dirty_shadow = txn.shadows.values().any(|pr| pr.lock().dirty);

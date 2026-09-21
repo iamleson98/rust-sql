@@ -5563,7 +5563,8 @@ impl Database {
                 //   path IMPLICITLY JOINS the statement as a one-statement
                 //   concurrent transaction — see the scope arm below).
                 let conc_owner = self.concurrent_txn_for_caller().is_some();
-                let plain_during_regime = self.concurrent_active.load(Ordering::Acquire) && !conc_owner;
+                let plain_during_regime =
+                    self.concurrent_active.load(Ordering::Acquire) && !conc_owner;
                 if !conc_owner && !plain_during_regime {
                     let chained = self.exec_chained_insert(sql);
                     if chained.is_err() {
@@ -6028,7 +6029,7 @@ impl Database {
         // Valid for the duration of the statement (we hold &mut self).
         let _thread_db =
             crate::plugin::abi::ThreadDbGuard::install(self as *const Database as *mut Database);
-        let result = if let Some(plan) = plan_opt {
+        let mut result = if let Some(plan) = plan_opt {
             // Substitute uncorrelated subqueries (scalar / IN / EXISTS) with
             // their materialized results before execution — mirrors
             // SQLite's OP_Once evaluation. Skipped entirely (zero cost)
@@ -6041,7 +6042,7 @@ impl Database {
             // at the epilogue tail), and would skip the epilogue's maps
             // re-attach (ctx.shared was detached above — the shared maps
             // would stay empty for every later reader).
-            let exec = || -> Result<()> {
+            let mut exec = || -> Result<()> {
                 let plan_local;
                 let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
                     plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
@@ -6448,7 +6449,9 @@ impl Database {
         if implicit_cw_joined {
             drop(_writer_scope_guard);
             let finish = if result.is_ok()
-                && !self.pager.concurrent_txn_is_noop(conc_owner_txn.unwrap_or(u64::MAX))
+                && !self
+                    .pager
+                    .concurrent_txn_is_noop(conc_owner_txn.unwrap_or(u64::MAX))
             {
                 self.commit_concurrent_txn_shared()
             } else {

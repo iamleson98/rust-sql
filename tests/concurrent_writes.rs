@@ -334,7 +334,8 @@ fn concurrent_plain_writes_join_the_regime() {
     // a one-statement concurrent transaction (disjoint rows both commit)
     // instead of failing BUSY — the live cache stays committed-clean.
     Database::set_conn_identity(2);
-    db.execute("INSERT INTO t (v) VALUES ('plain')", []).unwrap();
+    db.execute("INSERT INTO t (v) VALUES ('plain')", [])
+        .unwrap();
     // The joiner committed durably: it is NOT part of the owner's txn.
     assert_eq!(count(&db, "t"), 1);
     // Plain READS still pass and never see the owner's uncommitted row.
@@ -350,7 +351,8 @@ fn concurrent_plain_writes_join_the_regime() {
     Database::set_conn_identity(1);
     db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(2);
-    db.execute("INSERT INTO t (v) VALUES ('after')", []).unwrap();
+    db.execute("INSERT INTO t (v) VALUES ('after')", [])
+        .unwrap();
     Database::set_conn_identity(0);
     assert_eq!(count(&db, "t"), 3);
     // Durability: reopen and re-read.
@@ -372,12 +374,14 @@ fn concurrent_plain_joiner_same_row_first_committer_wins() {
     // (uncommitted — the joiner's snapshot still reads 'base').
     Database::set_conn_identity(1);
     db.execute("BEGIN CONCURRENT", []).unwrap();
-    db.execute("UPDATE t SET v = 'owner' WHERE id = 1", []).unwrap();
+    db.execute("UPDATE t SET v = 'owner' WHERE id = 1", [])
+        .unwrap();
     // The joiner writes the SAME row and COMMITS FIRST (its transaction
     // is the single statement) — first-committer-wins means the joiner
     // installs and the OWNER's later COMMIT loses.
     Database::set_conn_identity(2);
-    db.execute("UPDATE t SET v = 'joiner' WHERE id = 1", []).unwrap();
+    db.execute("UPDATE t SET v = 'joiner' WHERE id = 1", [])
+        .unwrap();
     Database::set_conn_identity(0);
     let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "joiner");
@@ -387,10 +391,15 @@ fn concurrent_plain_joiner_same_row_first_committer_wins() {
     Database::set_conn_identity(1);
     let c = db.execute("COMMIT", []);
     assert!(c.is_err());
-    assert!(c.err().unwrap().to_string().contains("SQLITE_BUSY_SNAPSHOT"));
+    assert!(c
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("SQLITE_BUSY_SNAPSHOT"));
     // Regime drained: the owner can retry as a fresh statement.
     Database::set_conn_identity(1);
-    db.execute("UPDATE t SET v = 'owner2' WHERE id = 1", []).unwrap();
+    db.execute("UPDATE t SET v = 'owner2' WHERE id = 1", [])
+        .unwrap();
     Database::set_conn_identity(0);
     let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
     assert_eq!(rows[0][0].as_text(), "owner2");
@@ -416,7 +425,8 @@ fn concurrent_plain_joiner_streaming_statement() {
         .unwrap();
     Database::set_conn_identity(1);
     db.execute("BEGIN CONCURRENT", []).unwrap();
-    db.execute("INSERT INTO t (id, v) VALUES (1, 'owner')", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'owner')", [])
+        .unwrap();
     // A PLAIN connection (identity 2) steps an INSERT while the regime
     // is open: the statement IMPLICITLY JOINS (identity is read at step
     // time — the streaming twin of the execute-path join).
