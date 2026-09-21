@@ -61,6 +61,11 @@ static GLOBAL_OOM_ALLOC: crate::oom_alloc::OomAllocator = crate::oom_alloc::OomA
 /// is measured against — never returns small-object pages to the OS, so it
 /// never pays this tax. mimalloc's own docs recommend `-1` (never purge)
 /// for latency-sensitive services; we set it once, at engine init.
+///
+/// Deployment override: `RUSTSQL_MIMALLOC_PURGE_DELAY_MS=<ms>` opts a
+/// service into delayed purging (25 is the measured sweet spot — see
+/// the option comment). Unset / unparsable → -1, the latency-first
+/// default, so nothing changes unless an operator asks for it.
 #[cfg(feature = "mimalloc")]
 fn tune_mimalloc() {
     use std::sync::Once;
@@ -85,12 +90,32 @@ fn tune_mimalloc() {
         // by page_cross_thread_max_reclaim = 42 and minimal_purge_size).
         const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
         const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
-        // Never purge automatically: the per-allocation purge-timer checks
-        // cost ~25 ns/alloc (measured as the UPDATE-by-PK regression), and
-        // freed pages return explicitly at write-burst boundaries instead
-        // (see `drain_mimalloc_wake`'s mi_collect).
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
-        debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY), -1);
+        // Deployment-tunable, default -1 (never purge automatically):
+        // the per-allocation purge-timer checks cost ~25 ns/alloc
+        // (measured as the UPDATE-by-PK regression), and freed pages
+        // return explicitly at write-burst boundaries instead (see
+        // `drain_mimalloc_wake`'s mi_collect).
+        //
+        // WHY an override exists at all: the write-burst drains + the
+        // SERVICE-side periodic mi_collect cannot return pages stranded
+        // in OTHER live threads' mimalloc heaps — and every thread-local
+        // heap that ever served a big transient burst (argon2 verifies,
+        // tantivy searches, request JSON) holds those freed pages forever
+        // when purging is off (measured in production 2026-09-21: a
+        // login burst ratcheted +2.5 MB PER LOGIN, permanent — the
+        // "RSS only ever grows" report). Services that value RSS
+        // hygiene over last-few-percent latency set
+        // RUSTSQL_MIMALLOC_PURGE_DELAY_MS=25 and freed pages madvise back
+        // after ~25 ms of thread idleness.
+        let purge_delay_ms: i64 = std::env::var("RUSTSQL_MIMALLOC_PURGE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(-1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, purge_delay_ms);
+        debug_assert_eq!(
+            libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY),
+            purge_delay_ms
+        );
         // NOTE on the startup footprint (measured, not changed here):
         // mimalloc commits memory at 64 KiB page granularity per size
         // class — the engine's ~0.4 MiB of open-path allocations spread
