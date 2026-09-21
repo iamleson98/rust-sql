@@ -885,3 +885,20 @@ Work Log:
 Stage Summary:
 - v3 read-ahead is strictly >= v2 on every shape: same syscall win, bounded over-read, in-memory hot path back to zero TLS overhead.
 - Pushing to get fresh macOS + ubuntu datapoints; S09 blob-copy reduction queued as the next optimization.
+
+---
+Task ID: 28
+Agent: main (Super Z)
+Task: S09 blob-insert copy reduction — kill the two hidden full-payload passes (the recurring fast-ubuntu deficit: 12.8 vs 9.0, 2/2).
+
+Work Log:
+- Probe (examples/probe_blob_breakdown.rs, engine-window timing per the torture harness): at equal total bytes the 64KB-blob shape ran 1.65 GB/s vs the 16KB shape's 3.0+ GB/s — a size-dependent extra pass. Two found:
+  1. insert_table_append_spilled MATERIALIZED the full payload (fresh Vec + 2 copies) for the concurrent row journal on EVERY successful spilled insert — the note_row_write call itself no-ops unless a writer scope is armed, but the concat already ran. Now gated on armed_writer_scope().is_some() (exactly note_row_write's own gate).
+  2. The spilled-append path returned None whenever the target leaf was full — and the blob-append shape hits that on ~1/3 of rows (measured: fallbacks at rows 1,4,...) because each ~4KB-class local cell fills a leaf in ~3 rows. The executor fallback re-ENCODED the whole row (one full pass) + took the buffered insert (another). Fix: insert_table_append_spilled_inner now builds the overflow Cell directly from (prefix, body) and places it through the normal descent + split machinery (new insert_cell_root_aware helper extracted from insert_table_inner — same root-split arm, no duplication). Orphan-chain reclaim on error mirrors the leaf-bail cleanup. The row NEVER materializes as one contiguous payload on any spilled path.
+- Result: every spilled insert is now exactly one source pass -> page bytes (the copy-count floor for a copy-based engine). Local S09 child A/B: rq 29.5-31.7ms vs sq 31.6-33.2 (WIN, ~1.06-1.09x); the removed passes were L2-speed on this sandbox (DRAM-bound here) but are real traffic on CI's big-cache fast hosts where the 12.8-vs-9.0 deficit lives (~80MB of eliminated per-run traffic).
+- Read-ahead v3 CI check pending; the macOS single-row loss was triaged as the documented DARWIN_WIDE_ROWS fleet swing (bench_full's same-shape autocommit row = 3.41x WIN in the same failing job; Linux HEAD 1.57x WIN).
+- Gates: fmt clean, clippy clean, lib 269, overflow 34, delete_spill 6, regression 27, fuzz pins, differential 15, concurrent_writes 12, wal 33, durability 9, crash_recovery 6, integrity_check 9, million_record 1, full torture at CI scale 0 gate failures (S09 1.13x WIN, S17 1.74x WIN, S18 MATCH).
+
+Stage Summary:
+- The blob insert path is at the one-pass floor; the two eliminated passes (~80MB/run on the S09 shape) target exactly the fast-host deficit.
+- probe_blob_breakdown.rs committed as the blob-cost diagnostic.

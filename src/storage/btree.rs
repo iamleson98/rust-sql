@@ -2669,6 +2669,15 @@ impl<'a> Btree<'a> {
         // (see `Pager::note_write`).
         self.pager.note_write();
         let cell = self.make_leaf_cell(rowid, payload)?;
+        self.insert_cell_root_aware(cell)
+    }
+
+    /// Place an already-built cell through the normal descent + split
+    /// machinery, growing the root when the split reaches it. Extracted
+    /// from `insert_table_inner` so the spilled-append path can place a
+    /// pre-built overflow cell WITHOUT materializing a contiguous
+    /// payload first.
+    fn insert_cell_root_aware(&mut self, cell: Cell) -> Result<()> {
         match self.insert_into_page(self.root, cell)? {
             InsertResult::Done => Ok(()),
             InsertResult::Split {
@@ -2812,10 +2821,15 @@ impl<'a> Btree<'a> {
         self.journal_suppress = false;
         match r {
             Ok(v) => {
-                if v.is_some() && !self.journal_suppress {
-                    // The journal needs the FULL payload; materialize it
-                    // only on the success path of a concurrent writer (the
-                    // plain path never concatenates).
+                if v.is_some() && self.pager.armed_writer_scope().is_some() {
+                    // The journal needs the FULL payload — but ONLY when a
+                    // concurrent writer's row journal is actually armed
+                    // (note_row_write itself no-ops otherwise). The eager
+                    // materialization ran on EVERY spilled insert and was a
+                    // second full-body copy + alloc per blob row: the S09
+                    // shape measured 1.65 GB/s effective — 2x the one-pass
+                    // floor (prefix + chain are written straight from the
+                    // Value's buffer; this was the only extra pass).
                     let mut full = Vec::with_capacity(prefix.len() + body.len());
                     full.extend_from_slice(prefix);
                     full.extend_from_slice(body);
@@ -2854,7 +2868,38 @@ impl<'a> Btree<'a> {
         // 1. Resolve the target leaf (hint or right-most walk).
         let leaf_id = match self.spill_target_leaf(hint, rowid, cell_size)? {
             Some(l) => l,
-            None => return Ok(None),
+            None => {
+                // Stale hint / full leaf / non-append shape: place the
+                // PRE-BUILT overflow cell through the normal descent +
+                // split machinery — the row never materializes as one
+                // contiguous payload. The old caller-side fallback
+                // re-encoded the whole row (a FULL extra pass per
+                // spilled row); the blob-append shape hits this on
+                // nearly every row (one ~4KB local cell fills a leaf),
+                // so it was a guaranteed second pass — the S09
+                // 64KB-blob shape measured 1.65 GB/s effective vs the
+                // 16KB shape's 3.0+ GB/s on the same one-pass path.
+                let mut local = Vec::with_capacity(local_len);
+                local.extend_from_slice(prefix);
+                local.extend_from_slice(&body[..body_local]);
+                let cap = self.overflow_page_capacity();
+                let overflow = self.build_overflow_chain_rest(&body[body_local..], cap)?;
+                let cell = Cell::TableLeafOverflow {
+                    rowid,
+                    total: total as u64,
+                    local,
+                    overflow,
+                };
+                match self.insert_cell_root_aware(cell) {
+                    Ok(()) => return Ok(Some(self.right_most_leaf()?)),
+                    Err(e) => {
+                        // The cell never landed: reclaim the orphan
+                        // chain (mirrors the leaf-bail cleanup below).
+                        let _ = self.free_overflow_chain(overflow);
+                        return Err(e);
+                    }
+                }
+            }
         };
 
         // 2. Build the chain (NO leaf lock held while allocating — the
