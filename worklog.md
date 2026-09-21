@@ -902,3 +902,20 @@ Work Log:
 Stage Summary:
 - The blob insert path is at the one-pass floor; the two eliminated passes (~80MB/run on the S09 shape) target exactly the fast-host deficit.
 - probe_blob_breakdown.rs committed as the blob-cost diagnostic.
+
+---
+Task ID: 29
+Agent: main (Super Z)
+Task: Page materialization memset removal + S17 fast-host residual analysis; triage of the b3038b1 ubuntu torture failure.
+
+Work Log:
+- b3038b1 ubuntu torture failure triaged as a SLOW-RUNNER DRAW: the whole runner was ~40% slower than its own history (S02 rq 20.4ms vs 13.6-15.2 historical; even SQLite slower: S02 sq 95.8 vs 63.4) while the RATIOS stayed identical (S02 4.69x vs 4.66x, S05 3.18x vs 3.20x). S12 was a stable 1.09x WIN at a80ba79 (98.5 vs 106.9, lookup_ms 11.83x) and only flipped on that slow draw. The REAL ubuntu gaps remain S09 (blob fixes at 58aaf0a, validation pending) and S17 (a80ba79: 14.6 vs 9.5).
+- S17 residual analysis (probe_s17_phases, committed): open is 0.15 ms (trivial — the fsync work paid off), the SUM dominates. File-backed SUM = 27 ns/row warm vs 12 ns/row for the identical in-memory SUM; a warm-cache COUNT (zero-decode walk) = 10 ns/row — so the delta is per-row DECODE cost on file-backed pages, not I/O (syscr 592 = ~0.6-1.2 ms of the 8 ms). Root suspicion: the 512-page default cache vs the 880-page live tree (read thrash: SQLite sidesteps its own cache via mmap reads) + decode-path divergence. The mmap-class read path is the identified next project for S17 fast hosts; not attempted this cycle.
+- MEMSET REMOVAL: get_page's miss path, the committed-view miss, the savepoint pre-image, and the read-ahead prefetch all allocated ZEROED pages (Page::new = vec![0u8; 4KB]) that every fill branch immediately overwrote — the overflow-chain writer already had Page::new_uninit for exactly this reason. All four now use new_uninit (safety: each branch fully overwrites before cache visibility — read_exact-or-error frame/spill reads, codec copy_from_slice, plain reads with n == psz checks; allocate_page's fresh-page extension KEEPS zeroing — zero IS its initialization). Measured locally neutral (mimalloc's 4KB zeroing was cheap here) but removes 4-15 MB of dead memset per cold scan; strict improvement.
+- Gates: fmt clean, clippy --all-targets clean, lib 269, wal/durability/crash_recovery/integrity_check/io_fault/stateful_fuzz/overflow/regression all green (7/7 ok), release fuzz + differential green.
+- Note: the user merged feat/tunable-purge-delay (RUSTSQL_MIMALLOC_PURGE_DELAY_MS, default unchanged) as 9f391f6 — no interaction with engine changes; its CI run validates the combination. This commit rebases on top.
+
+Stage Summary:
+- Dead memsets gone from every page-materialization path (strict win, zero risk).
+- S17 fast-host residual fully characterized: per-row decode + cache-thrash class, mmap-read project queued.
+- b3038b1's S12/S17 ubuntu failures triaged as one slow runner draw; no code action.

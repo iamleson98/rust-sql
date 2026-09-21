@@ -2595,7 +2595,16 @@ impl Pager {
                 return Ok(page_ref);
             }
             let psz = self.page_size();
-            let mut page = Page::new(id, psz);
+            // UNINIT page bytes: every fill branch below overwrites the
+            // FULL page before it becomes cache-visible (spill/WAL frame
+            // reads are read_exact-or-error; the codec path copies a
+            // decoded page image; the plain read checks n == psz and
+            // errors otherwise — the page is never inserted on a short
+            // read). The 4 KB zeroing of `Page::new` was a dead memset on
+            // EVERY materialized page (the cold-scan S17 shape memset ~
+            // 8-15 MB of pages per open+SUM that the reads immediately
+            // overwrote).
+            let mut page = Page::new_uninit(id, psz);
             // MID-TXN SPILL hit: this page's newest (uncommitted) version
             // lives in a spill frame written when the cache dropped it
             // under pressure. Re-cache it as DIRTY (it is mid-transaction
@@ -2756,7 +2765,9 @@ impl Pager {
                             if cache.get(pid as u32).is_some() {
                                 continue;
                             }
-                            let mut p = Page::new(pid as u32, psz as u32);
+                            // UNINIT: the bulk read verified n == len,
+                            // so this copy overwrites every byte.
+                            let mut p = Page::new_uninit(pid as u32, psz as u32);
                             let src = &buf[i * psz..(i + 1) * psz];
                             p.data.copy_from_slice(src);
                             self.maybe_evict_locked(&mut cache);
@@ -2998,7 +3009,9 @@ impl Pager {
         {
             let sp = self.savepoints.lock();
             if let Some(bytes) = sp.first().and_then(|lvl| lvl.pages.get(&id)) {
-                let mut page = Page::new(id, psz);
+                // UNINIT (see the main miss path): copy_from_slice writes
+                // every byte (a size mismatch panics before visibility).
+                let mut page = Page::new_uninit(id, psz);
                 page.data.copy_from_slice(bytes);
                 let pr: PageRef = Arc::new(Mutex::new(page));
                 let entry = CommittedEntry { pr, alias: false };
@@ -3041,7 +3054,9 @@ impl Pager {
             self.memo_committed_page(id, &entry, token);
             return Ok(entry.pr);
         }
-        let mut page = Page::new(id, psz);
+        // UNINIT (see the main miss path): every branch fully fills the
+        // page or errors before it is cached.
+        let mut page = Page::new_uninit(id, psz);
         let mut served_from_wal = false;
         {
             let wal_guard = self.wal.read();
