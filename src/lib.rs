@@ -67,6 +67,10 @@ static GLOBAL_OOM_ALLOC: crate::oom_alloc::OomAllocator = crate::oom_alloc::OomA
 /// the option comment). Unset / unparsable → -1, the latency-first
 /// default, so nothing changes unless an operator asks for it.
 #[cfg(feature = "mimalloc")]
+#[allow(clippy::useless_conversion)] // c_long == i64 on unix: the
+                                     // i64::from() widenings below are
+                                     // no-ops there but REQUIRED on
+                                     // Windows (c_long == i32)
 fn tune_mimalloc() {
     use std::sync::Once;
     static TUNED: Once = Once::new();
@@ -111,9 +115,14 @@ fn tune_mimalloc() {
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(-1);
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, purge_delay_ms);
+        // PORTABILITY: the FFI takes c_long — i64 on LP64 unix, i32 on
+        // Windows (LLP64). The plain i64 argument compiled on unix and
+        // broke every Windows job; route through std::ffi::c_long so the
+        // conversion is explicit on every target. The value class here
+        // (-1 or a small ms count) fits both widths trivially.
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, purge_delay_ms as std::ffi::c_long);
         debug_assert_eq!(
-            libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY),
+            i64::from(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY)),
             purge_delay_ms
         );
         // NOTE on the startup footprint (measured, not changed here):

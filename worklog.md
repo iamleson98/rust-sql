@@ -919,3 +919,17 @@ Stage Summary:
 - Dead memsets gone from every page-materialization path (strict win, zero risk).
 - S17 fast-host residual fully characterized: per-row decode + cache-thrash class, mmap-read project queued.
 - b3038b1's S12/S17 ubuntu failures triaged as one slow runner draw; no code action.
+
+---
+Task ID: 31
+Agent: main (Super Z)
+Task: Fix the Windows-wide CI breakage from the tunable-purge-delay merge (9f391f6).
+
+Work Log:
+- The merge's purge-delay feature passed an i64 to mi_option_set, whose FFI parameter is c_long — i64 on LP64 unix, i32 on Windows (LLP64). Compiled green on linux/macos, broke COMPILATION on every Windows job of both 9f391f6 and 35d3825 (torture/stress-intensive/million-record/interop/bench-gate all E0308).
+- FIX: explicit `as std::ffi::c_long` on the set, `i64::from(...)` on the debug_assert read-back, function-level #[allow(clippy::useless_conversion)] with the platform rationale (the i64::from is a no-op on unix, required on Windows). The value class (-1 or small ms counts) fits both widths.
+- Verified: clippy --features mimalloc and default both -D warnings clean on this (LP64) host; the casts are portable by construction. fmt clean.
+- Also triaged the merge run's ubuntu bench-gate loss: INSERT (multi-VALUES 100/batch) 0.86x (13.6%, 3-attempt best) — single datapoint, historically 1.02-1.05x; watching the next run before acting.
+
+Stage Summary:
+- Windows unblocked; the purge-delay feature keeps its semantics unchanged (default -1).
