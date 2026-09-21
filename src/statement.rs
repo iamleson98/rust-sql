@@ -816,9 +816,30 @@ impl<'a> Statement<'a> {
                 plan.as_ref(),
                 Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
             );
+            // ── IMPLICIT CONCURRENT JOIN (statement-path twin of the join
+            // arm in Database::execute) ─────────────────────────────────
+            // A plain autocommit DML statement stepped while the BEGIN
+            // CONCURRENT regime is active joins as a one-statement
+            // concurrent transaction: page shadows, row-journal conflict
+            // validation, group-commit fsync. This also closes the
+            // streaming path's latent regime hole — without the join, a
+            // raw prepare+step DML during the regime wrote the LIVE cache
+            // mid-regime. DML executes atomically inside this one
+            // exec_with_ctx call (RETURNING rows materialize before it
+            // returns), so the transaction's whole lifecycle is this
+            // block: begin → execute → merge overlay → commit.
+            let implicit_cw = is_dml
+                && self.db.concurrent_regime_active()
+                && self.db.concurrent_txn_for_caller().is_none();
+            let implicit_cw_txn = if implicit_cw {
+                self.db.begin_concurrent_txn_shared()?;
+                self.db.concurrent_txn_for_caller()
+            } else {
+                None
+            };
             let has_subq = self.has_subqueries;
             let plan2 = plan.clone();
-            let res = self.exec_with_ctx(move |ctx| {
+            let exec_res = self.exec_with_ctx(move |ctx| {
                 let plan_local;
                 let plan_ref: &Plan = if has_subq {
                     plan_local = crate::executor::rewrite_plan_subqueries(&plan2, ctx)?;
@@ -827,7 +848,17 @@ impl<'a> Statement<'a> {
                     &plan2
                 };
                 execute(plan_ref, ctx)
-            })?;
+            });
+            // The joined statement's failure must never strand its
+            // one-statement transaction: roll it back before the error
+            // propagates.
+            let exec_res = if implicit_cw && exec_res.is_err() {
+                let _ = self.db.rollback_concurrent_txn_shared();
+                exec_res
+            } else {
+                exec_res
+            };
+            let res = exec_res?;
             if is_dml {
                 // DML through a prepared statement bypasses
                 // Database::execute (and its write-epoch bump), so the
@@ -837,7 +868,13 @@ impl<'a> Statement<'a> {
                     .write_epoch
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.merge_dml_maps();
-                self.db.sync_schema_roots_public()?;
+                if !implicit_cw {
+                    // The concurrent owner / implicit joiner already synced
+                    // its root moves through the armed scope inside
+                    // exec_with_ctx (transactional schema roots); this live
+                    // sync is the PLAIN statement's persistence path.
+                    self.db.sync_schema_roots_public()?;
+                }
                 // Auto-commit ledger: a DML statement stepped with no
                 // transaction open was its own implicit transaction.
                 if !self
@@ -862,6 +899,23 @@ impl<'a> Statement<'a> {
             } else if self.deltas.max_rowids_changed && !self.db.pager.committed_reads_armed() {
                 // Committed-view reads never merge (see query()).
                 self.merge_max_rowids();
+            }
+            // ── IMPLICIT CONCURRENT JOIN tail: commit (or free-rollback a
+            // no-op statement — a no-op commit would still dirty page 0 +
+            // append a WAL marker). A conflict surfaces as a retriable
+            // SQLITE_BUSY_SNAPSHOT; the pager already rolled the shadows
+            // back either way.
+            if let Some(txn) = implicit_cw_txn {
+                let finish = if self.db.pager.concurrent_txn_is_noop(txn) {
+                    self.db.rollback_concurrent_txn_shared()
+                } else {
+                    self.db.commit_concurrent_txn_shared()
+                };
+                if let Err(e) = finish {
+                    self.stream = StreamState::Exhausted;
+                    self.done = true;
+                    return Err(e);
+                }
             }
             if is_dml && !dml_has_returning {
                 self.stream = StreamState::Exhausted;

@@ -152,11 +152,13 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 | 8-conn mixed R/W 80/20 (sqlx) | 0.74x — parity guard | commit fsync sets the floor (host-dominated; reads inside stay 2.8x) |
 | Intra-statement parallel aggregates (1M) | **5.8–8.8x** | worker-split + range-ordered merge — SQLite is single-threaded by design |
 | Intra-statement parallel top-N / sorts (1M) | **2.2–2.6x / 1.4x** | per-worker keep-heaps / chunk sort + k-way merge |
-| Multi-connection writers | SQLite-equivalent | single writer + BUSY + busy timeout — or `BEGIN CONCURRENT` (below) |
+| Multi-connection writers | **≥ SQLite everywhere** | plain autocommit DML **implicitly joins** the optimistic regime (no BUSY wait, conflict = retriable 517); explicit `BEGIN CONCURRENT` for multi-statement overlap |
 
 Three tiers: **(1) inter-connection MRMW reads** — true parallel readers on shared pages, consistent committed snapshots, no dirty reads; **(2) the sqlx layer** — statements execute inline in the async task, snapshot isolation between connections; **(3) intra-statement parallelism** — `PRAGMA parallel_scan` (default ON above 131072 estimated rows; OFF is bit-identical serial; workers decline inside transactions; any bail falls back to serial).
 
 **`BEGIN CONCURRENT`** — optimistic multi-writer transactions (SQLite `begin_concurrent` branch semantics): N write transactions at once over private page shadows, snapshot isolation (`SQLITE_BUSY_SNAPSHOT` 517 on moved pages), **row-level first-committer-wins with MERGE** (disjoint rows of one hot leaf page both commit; the second writer replays its row journal onto current trees atomically), readers never block, ROLLBACK nearly free, SAVEPOINT inside, **group commit** (~1 fsync per burst under `synchronous=FULL`; ~5x single-writer OLTP throughput at 8 connections, ~0.25 fsync/txn). 28 engine suites + 7 sqlx suites + 3 stress harnesses (`tests/concurrent_writes.rs`).
+
+**Implicit join** — plain autocommit INSERT/UPDATE/DELETE arriving while the regime is open no longer waits out BUSY: the statement runs as a one-statement concurrent transaction (same shadows, row-level validation, group-commit fsync) through every path — `Database::execute`, prepare/step streaming, and the sqlx driver (which skips the regime wait for autocommit DML). Same-row writers get retriable 517 and win/lose by first-committer-wins; disjoint rows of one hot page MERGE. This also closed a latent hole: raw prepare/step DML during the regime previously wrote the live cache mid-regime.
 
 ## Cold start on large files
 
@@ -222,7 +224,7 @@ The honest ledger. Everything here is verifiable absence — `module_list`/`func
 - **High write fan-out flattens the read win** — same shape as SQLite's WAL under fsync, not a divergence.
 - **SQLite-format files are single-connection** (whole-image load; the native container carries MRMW).
 - **Native-format files are single-process** — and single-writer-handle: the MRMW pager coordinates threads in one process through ONE engine (the sqlx pool's per-path shared engine); two processes must not hold one native file concurrently, and a second independent handle's WRITES are rejected with SQLITE_BUSY by the WAL writer lease (never corruption). Cross-handle reads work while the sidecar is stable (crash recovery / post-drain verification). The SQLite-format container remains the cross-process interchange path (atomic temp+fsync+rename commits; WAL sidecar byte-compatible with real SQLite processes).
-- `BEGIN CONCURRENT` restrictions: DDL and PRAGMA rejected inside; plain writers wait for the regime to drain (readers pass); structural-only conflicts (root-split collisions, unjournaled paths) fall back to page-granularity abort — retry, never corruption.
+- `BEGIN CONCURRENT` restrictions: DDL and PRAGMA rejected inside (the shared catalog is single-writer), and plain DDL/PRAGMA/BEGIN still wait for the regime to drain — plain DML joins it instead (above); structural-only conflicts (root-split collisions, unjournaled paths) fall back to page-granularity abort — retry, never corruption.
 
 ### Missing parts (feature & compat surface) — with today's workaround
 

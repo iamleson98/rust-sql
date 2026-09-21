@@ -726,6 +726,23 @@ impl RustqliteConnection {
     /// commits or rolls back; only on timeout does it fail with
     /// SQLITE_BUSY.
     fn acquire_write(&self) -> Result<WriteGuardView<'_>, SqlxError> {
+        self.acquire_write_inner(false)
+    }
+
+    /// [`Self::acquire_write`] for an AUTOCOMMIT DML statement: a foreign
+    /// concurrent regime does NOT block it — the engine IMPLICITLY JOINS
+    /// the statement into the regime as a one-statement concurrent
+    /// transaction (page shadows, row-level first-committer-wins with
+    /// MERGE, group-commit fsync). A commit conflict surfaces
+    /// SQLITE_BUSY_SNAPSHOT (retriable) instead of the unconditional
+    /// BUSY-wait the plain path used to pay. Foreign PLAIN transactions
+    /// still wait exactly like [`Self::acquire_write`] (the regimes
+    /// cannot mix).
+    fn acquire_write_dml(&self) -> Result<WriteGuardView<'_>, SqlxError> {
+        self.acquire_write_inner(true)
+    }
+
+    fn acquire_write_inner(&self, join_concurrent: bool) -> Result<WriteGuardView<'_>, SqlxError> {
         let deadline = std::time::Instant::now() + self.busy_timeout;
         loop {
             // Pre-wait outside the lock: the gate condvar parks us instead
@@ -734,9 +751,13 @@ impl RustqliteConnection {
             // A `BEGIN CONCURRENT` owner never waits for its sibling
             // concurrent transactions (they are the point of the regime);
             // a plain writer waits for BOTH foreign plain transactions
-            // and the whole concurrent regime.
+            // and the whole concurrent regime — EXCEPT an autocommit DML
+            // statement routed through `acquire_write_dml`, which joins
+            // the regime engine-side instead of waiting for it to drain.
             if !self.concurrent_tx {
-                if self.shared.foreign_tx(self.id) || self.shared.foreign_concurrent(self.id) {
+                let blocked = self.shared.foreign_tx(self.id)
+                    || (!join_concurrent && self.shared.foreign_concurrent(self.id));
+                if blocked {
                     let remain = deadline.saturating_duration_since(std::time::Instant::now());
                     if !self.shared.wait_plain_write_clear(self.id, remain) {
                         return Err(crate::sqlx_driver::error::busy());
@@ -978,7 +999,15 @@ impl RustqliteConnection {
                 }
             }
             Kind::Dml => {
-                let mut db = self.acquire_write()?;
+                // AUTOCOMMIT DML may join a foreign BEGIN CONCURRENT regime
+                // (engine-side implicit join — no BUSY wait); a connection
+                // holding a driver-level transaction must keep waiting for
+                // the regime (its BEGIN predates the join machinery).
+                let mut db = if self.tx_active {
+                    self.acquire_write()?
+                } else {
+                    self.acquire_write_dml()?
+                };
                 // A DEFERRED (sqlx) transaction starts its engine-level
                 // transaction here, at the FIRST write statement — readers
                 // inside never-started deferred transactions stay fully

@@ -323,29 +323,127 @@ fn concurrent_fail_fast_when_page_moved_after_begin() {
 }
 
 #[test]
-fn concurrent_plain_writes_wait_for_the_regime() {
-    let (mut db, path) = waldb("cw_plain_gate");
+fn concurrent_plain_writes_join_the_regime() {
+    let (mut db, path) = waldb("cw_plain_join");
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
         .unwrap();
     Database::set_conn_identity(1);
     db.execute("BEGIN CONCURRENT", []).unwrap();
     db.execute("INSERT INTO t (v) VALUES ('c')", []).unwrap();
-    // A plain autocommit write from another identity is excluded while
-    // the regime is active (the live cache must stay committed-clean).
+    // A plain autocommit write from another identity JOINS the regime as
+    // a one-statement concurrent transaction (disjoint rows both commit)
+    // instead of failing BUSY — the live cache stays committed-clean.
     Database::set_conn_identity(2);
-    let r = db.execute("INSERT INTO t (v) VALUES ('plain')", []);
+    db.execute("INSERT INTO t (v) VALUES ('plain')", []).unwrap();
+    // The joiner committed durably: it is NOT part of the owner's txn.
+    assert_eq!(count(&db, "t"), 1);
+    // Plain READS still pass and never see the owner's uncommitted row.
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 1);
+    // Plain DDL while the regime is active still waits (the in-memory
+    // catalog is a single-writer structure).
+    Database::set_conn_identity(2);
+    let r = db.execute("CREATE TABLE u (x)", []);
     assert!(r.is_err());
     assert!(r.err().unwrap().to_string().contains("SQLITE_BUSY"));
-    // Plain READS still pass.
-    assert_eq!(count(&db, "t"), 0);
-    // After COMMIT the plain writer proceeds.
+    // After COMMIT everything proceeds.
     Database::set_conn_identity(1);
     db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(2);
-    db.execute("INSERT INTO t (v) VALUES ('plain')", [])
+    db.execute("INSERT INTO t (v) VALUES ('after')", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 3);
+    // Durability: reopen and re-read.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 3);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_plain_joiner_same_row_first_committer_wins() {
+    let (mut db, path) = waldb("cw_plain_join_conflict");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
         .unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'base')", [])
+        .unwrap();
+    // Owner holds an open concurrent txn that has written row 1
+    // (uncommitted — the joiner's snapshot still reads 'base').
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("UPDATE t SET v = 'owner' WHERE id = 1", []).unwrap();
+    // The joiner writes the SAME row and COMMITS FIRST (its transaction
+    // is the single statement) — first-committer-wins means the joiner
+    // installs and the OWNER's later COMMIT loses.
+    Database::set_conn_identity(2);
+    db.execute("UPDATE t SET v = 'joiner' WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(0);
+    let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "joiner");
+    assert_eq!(count(&db, "t"), 1);
+    // The owner's COMMIT loses: SQLITE_BUSY_SNAPSHOT (retriable), the
+    // transaction fully rolled back.
+    Database::set_conn_identity(1);
+    let c = db.execute("COMMIT", []);
+    assert!(c.is_err());
+    assert!(c.err().unwrap().to_string().contains("SQLITE_BUSY_SNAPSHOT"));
+    // Regime drained: the owner can retry as a fresh statement.
+    Database::set_conn_identity(1);
+    db.execute("UPDATE t SET v = 'owner2' WHERE id = 1", []).unwrap();
+    Database::set_conn_identity(0);
+    let rows = db.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "owner2");
+    // Durability: reopen and re-read.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    let rows = db2.query("SELECT v FROM t WHERE id = 1", []).unwrap();
+    assert_eq!(rows[0][0].as_text(), "owner2");
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_plain_joiner_streaming_statement() {
+    // Plain DML through the PREPARE/STEP path (the sqlx driver's DML arm
+    // and the C ABI's prepared statements) joins the regime too — and no
+    // longer writes the live cache mid-regime (the pre-join hole). The
+    // owner writes FIRST (its shadows materialize), then the streaming
+    // joiner commits a disjoint row of the same hot leaf — the owner's
+    // COMMIT MERGES both.
+    let (mut db, path) = waldb("cw_plain_join_step");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'owner')", []).unwrap();
+    // A PLAIN connection (identity 2) steps an INSERT while the regime
+    // is open: the statement IMPLICITLY JOINS (identity is read at step
+    // time — the streaming twin of the execute-path join).
+    Database::set_conn_identity(2);
+    {
+        let mut stmt = db
+            .prepare("INSERT INTO t (id, v) VALUES (?, 'step-join')")
+            .unwrap();
+        stmt.bind(1, Value::Integer(900)).unwrap();
+        assert!(stmt.step().is_ok());
+    }
+    // The streaming joiner committed: visible to fresh readers; the
+    // owner's uncommitted row stays invisible.
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 1);
+    // The owner's COMMIT merges its row onto the current tree (the
+    // joiner moved the shared leaf's stamp — disjoint rows both land).
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(0);
     assert_eq!(count(&db, "t"), 2);
+    // Durability + integrity after reopen.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 2);
+    db2.query("PRAGMA integrity_check", []).unwrap();
+    drop(db2);
     cleanup(&path);
 }
 
@@ -632,6 +730,56 @@ mod driver {
         c1.close().await.unwrap();
         c2.close().await.unwrap();
         cleanup("two");
+    }
+
+    #[tokio::test]
+    async fn driver_autocommit_dml_joins_concurrent_regime() {
+        let opts = file_opts("plainjoin");
+        let mut holder = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        let mut plain = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        holder.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        holder
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
+        // The regime is held OPEN by `holder`; `plain` is in autocommit
+        // mode. Pre-join behavior: the INSERT waited out the busy timeout
+        // and failed SQLITE_BUSY; now it JOINS as a one-statement
+        // concurrent transaction.
+        holder.execute("BEGIN CONCURRENT").await.unwrap();
+        holder
+            .execute("INSERT INTO t (id, v) VALUES (1, 'owner')")
+            .await
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        sqlx::query("INSERT INTO t (id, v) VALUES (2, 'plain')")
+            .execute(&mut plain)
+            .await
+            .unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(2000),
+            "autocommit DML must join the regime, not wait it out"
+        );
+        // The joiner's row is committed and visible to a third reader...
+        let mut reader = rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut reader)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 1, "reader must see the joiner's committed row only");
+        reader.close().await.unwrap();
+        // ...and the holder's transaction still owns its own row.
+        holder.execute("COMMIT").await.unwrap();
+        let n: i64 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&mut plain)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 2);
+        holder.close().await.unwrap();
+        plain.close().await.unwrap();
+        cleanup("plainjoin");
     }
 
     #[tokio::test]

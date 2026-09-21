@@ -672,6 +672,25 @@ impl Pager {
         self.concurrent.any_active()
     }
 
+    /// True when the transaction has no observable effect (no dirty
+    /// shadows, no row-journal ops, no frees): the IMPLICIT-JOIN tail
+    /// routes such statements to ROLLBACK instead of COMMIT — a no-op
+    /// commit would still dirty page 0 + append a WAL commit marker.
+    pub fn concurrent_txn_is_noop(&self, txn_id: u64) -> bool {
+        let guard = match self.concurrent.get(txn_id) {
+            Some(g) => g,
+            None => return true, // not open: nothing to commit
+        };
+        let Some(txn) = guard.get(txn_id) else {
+            return true;
+        };
+        let has_dirty_shadow = txn.shadows.values().any(|pr| pr.lock().dirty);
+        !has_dirty_shadow
+            && txn.row_journal.is_empty()
+            && txn.freed.is_empty()
+            && txn.discarded.is_empty()
+    }
+
     /// COMMIT a concurrent transaction: validate, then either install the
     /// page shadows (fast path — no conflicts) or MERGE (row-level
     /// refinement: replay the transaction's row journal onto the current

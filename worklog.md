@@ -946,3 +946,25 @@ Work Log:
 
 Stage Summary:
 - CI green at 147090c. Known open items (documented above): S17 fast-host per-row residual (mmap-read project), the perf ledger's parity rows.
+
+---
+Task ID: 33
+Agent: main (Super Z)
+Task: Implicit concurrent join — plain autocommit DML JOINS the BEGIN CONCURRENT regime instead of failing BUSY (the flagship concurrent-write improvement).
+
+Work Log:
+- Deep research pass over the write paths: storage/concurrent.rs (regime lifecycle, validation, merge), api.rs query()/execute gates (fast-insert gate + classified gate), statement.rs streaming DML (exec_with_ctx per-step scope, overlay merge), sqlx_driver acquire_write/gate_write, C ABI sqlite3_step's tx gate.
+- Found a LATENT HOLE during research: the raw prepare/step streaming path had NO regime gate — plain streaming DML during a concurrent regime wrote the LIVE cache mid-regime (the driver/C-ABI layers masked it with their own waits). Closed by construction: streaming DML now joins.
+- IMPLICIT JOIN (execute path, api.rs): at the writer-scope arm (after every interception — view DML, savepoints, txn control), a plain table-DML statement during an active regime begins a one-statement concurrent transaction (begin_concurrent_txn_shared), executes as its owner (scope armed, overlay detached, in_txn=true so the autocommit page-restore correctly defers to the txn machinery), and commits at the epilogue tail (after overlay attach-back + roots sync): validate -> install/MERGE -> WAL append -> group fsync. Commit conflict surfaces SQLITE_BUSY_SNAPSHOT (retriable) — strictly better than the old unconditional BUSY.
+- Safety restructure of query() so no early return can strand the one-statement txn: (a) rewrite_plan_subqueries' `?` converted to a closure whose error flows into `result` (also fixes a pre-existing maps leak: the old `?` skipped the epilogue's ctx.shared re-attach, leaving the shared maps EMPTY); (b) the owner roots-sync `?`s converted to result-capture.
+- No-op routing: concurrent_txn_is_noop (pager) — a statement that dirtied nothing and journaled nothing ROLLS BACK instead of committing (a no-op concurrent commit still dirties page 0 + appends a WAL marker).
+- IMPLICIT JOIN (streaming path, statement.rs): the is_dml materialized arm joins at first step (identity read at STEP time), executes atomically inside its one exec_with_ctx (RETURNING rows materialize there), merges the overlay, commits at the arm's tail. Exec failure rolls back before propagating. The redundant post-exec live sync_schema_roots_public is skipped for joiners/owners (the in-scope sync already persisted root moves into the shadows).
+- sqlx driver: acquire_write split into acquire_write_inner(join_concurrent); the Dml arm passes join_concurrent=!tx_active — autocommit DML skips the foreign_concurrent wait (foreign PLAIN tx waits unchanged); driver-level transactions keep the old regime wait. gate_write needed no change (concurrent BEGIN never sets tx_owner).
+- C ABI: unchanged by design — BEGIN CONCURRENT is TxKind::Begin so the compat tx gate keeps plain C-ABI writers waiting for the regime (correct, documented); the join covers the raw API, CLI, and sqlx native driver. Follow-up candidate: relax the compat gate for autocommit DML via a public engine accessor.
+- Tests: concurrent_plain_writes_wait_for_the_regime replaced by concurrent_plain_writes_join_the_regime (join succeeds + durable, DDL still BUSY, reopen verify). New: concurrent_plain_joiner_same_row_first_committer_wins (joiner commits first -> owner's COMMIT gets 517, retry succeeds, reopen verify), concurrent_plain_joiner_streaming_statement (owner writes first, joiner steps INSERT id=900, owner COMMIT merges the hot leaf, integrity_check), driver_autocommit_dml_joins_concurrent_regime (no BUSY wait, elapsed-time guard, third-reader visibility).
+- Audited every BUSY/SNAPSHOT assertion across concurrent_writes / concurrent_reader_visibility / sqlx_driver / concurrency_stress / stateful_fuzz (no BEGIN CONCURRENT in fuzzers) — only the intended semantics changed.
+- README: Multi-connection writers row now ">= SQLite everywhere" with the implicit join; the BEGIN CONCURRENT section gained the implicit-join paragraph; the restrictions bullet updated (plain DML joins; DDL/PRAGMA/BEGIN still wait).
+
+Stage Summary:
+- A plain autocommit write during a concurrent regime is now a first-class optimistic writer on every engine path — no BUSY, no wait, row-level conflicts only (retriable 517), group-commit fsync — and the streaming path's latent live-cache-write hole is closed.
+- Gates unchanged for everything else: DDL/PRAGMA/BEGIN still wait out the regime; owners and readers behave identically to before.
