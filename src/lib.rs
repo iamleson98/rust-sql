@@ -121,6 +121,19 @@ const _: () = assert!(
     "allow_thp position out of bounds for this mimalloc layout"
 );
 
+// The dispatch above only knows two layouts (v2: last = 38, v3: last =
+// 47). Pin that pairing at compile time as the belt to the match's
+// braces: anyone who "fixes" an unknown-layout compile error by guessing
+// a position without re-deriving it against the bundled headers has to
+// get past BOTH this and the bounds asserts above. (A plain runtime test
+// would trip clippy::assertions_on_constants here — the condition is
+// fully constant, which is precisely the point.)
+#[cfg(feature = "mimalloc")]
+const _: () = assert!(
+    libmimalloc_sys::_mi_option_last == 38 || libmimalloc_sys::_mi_option_last == 47,
+    "unknown mimalloc option layout: re-derive the option positions in mimalloc_option_positions()"
+);
+
 /// Disable mimalloc's delayed page purging.
 ///
 /// By default mimalloc madvises freed pages back to the OS after a 10 ms
@@ -389,18 +402,9 @@ mod mimalloc_tuning_tests {
         }
     }
 
-    /// The compile-time dispatch only knows two layouts. This pins the
-    /// pairing it relies on: v2 builds export `_mi_option_last == 38`
-    /// and v3 builds `== 47`. If a future sys crate lands a new layout,
-    /// [`mimalloc_option_positions`] refuses to compile — this test is
-    /// the belt to that braces for anyone who "fixes" the panic by
-    /// guessing a position.
-    #[test]
-    fn layout_is_one_of_the_known_two() {
-        assert!(
-            libmimalloc_sys::_mi_option_last == 38 || libmimalloc_sys::_mi_option_last == 47,
-            "unknown mimalloc option layout (last={}): re-derive positions",
-            libmimalloc_sys::_mi_option_last
-        );
-    }
+    // No runtime test for the layout pairing itself: the module-level
+    // `const _: () = assert!`s above are evaluated at compile time for
+    // EVERY build (debug, release, tests) — strictly stronger than any
+    // runtime check, and a constant-folded runtime assert would only
+    // trip clippy::assertions_on_constants.
 }
