@@ -53,6 +53,74 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_OOM_ALLOC: crate::oom_alloc::OomAllocator = crate::oom_alloc::OomAllocator;
 
+/// mimalloc option ids used by [`tune_mimalloc`], derived from the
+/// COMPILE-TIME layout the sys crate builds, so a feature flip
+/// (`libmimalloc-sys/v2`) or an upstream version bump cannot silently
+/// mis-target an option.
+///
+/// The sys crate deliberately does not export `mi_option_purge_delay` or
+/// `mi_option_allow_thp` ("experimental options... are not exposed as
+/// constants for stability reasons"), so their positions come from
+/// mimalloc.h — and they DIVERGE between the two trees the sys crate can
+/// build:
+///
+/// ```text
+/// option           v2 (`v2` feature)   v3 (default build)
+/// ---------------  -----------------   -----------------
+/// purge_delay      15                  15
+/// allow_thp        37                  43
+/// _mi_option_last  38                  47
+/// ```
+///
+/// `mi_option_set` silently IGNORES out-of-range ids (hard bounds guard
+/// in mimalloc's options.c: `if (option < 0 || option >=
+/// _mi_option_last) return;`), so hardcoding the v3 `allow_thp` (43) in
+/// a v2 build turned the THP disable into a SILENT NO-OP — mimalloc kept
+/// making huge-page decisions with only the kernel-side prctl still
+/// applying. `purge_delay` happens to sit at 15 in BOTH layouts
+/// (bracketed by `eager_commit_delay`/`deprecated_eager_commit_delay`
+/// = 14 and `use_numa_nodes` = 16), which is why the purge-delay knob
+/// worked either way. Deriving both positions from `_mi_option_last`
+/// (which the sys crate DOES export, one value per layout) makes the
+/// pairing explicit; an unknown future layout is a COMPILE error (const
+/// `panic!`) instead of a silently-wrong or silently-dropped write.
+#[cfg(feature = "mimalloc")]
+const fn mimalloc_option_positions() -> (libmimalloc_sys::mi_option_t, libmimalloc_sys::mi_option_t)
+{
+    match libmimalloc_sys::_mi_option_last {
+        38 => (15, 37), // mimalloc v2 (libmimalloc-sys built with `v2`)
+        47 => (15, 43), // mimalloc v3 (default build)
+        // Layout drift: upstream inserted or removed an option before
+        // these positions. Refuse to compile rather than write to a
+        // possibly-wrong slot — re-derive against the bundled
+        // c_src/mimalloc/v{N}/include/mimalloc.h of the resolved
+        // libmimalloc-sys, and update the table above.
+        _ => panic!("mimalloc option layout changed: re-derive the option positions in mimalloc_option_positions()"),
+    }
+}
+
+/// `mi_option_purge_delay` position for the layout being built.
+#[cfg(feature = "mimalloc")]
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = mimalloc_option_positions().0;
+
+/// `mi_option_allow_thp` position for the layout being built.
+#[cfg(feature = "mimalloc")]
+const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = mimalloc_option_positions().1;
+
+// In-bounds guarantees for the derived positions (mimalloc's set/get
+// silently drop out-of-range ids, so a slipped constant must fail HERE,
+// at compile time, not vanish at runtime).
+#[cfg(feature = "mimalloc")]
+const _: () = assert!(
+    MI_OPTION_PURGE_DELAY < libmimalloc_sys::_mi_option_last,
+    "purge_delay position out of bounds for this mimalloc layout"
+);
+#[cfg(feature = "mimalloc")]
+const _: () = assert!(
+    MI_OPTION_ALLOW_THP < libmimalloc_sys::_mi_option_last,
+    "allow_thp position out of bounds for this mimalloc layout"
+);
+
 /// Disable mimalloc's delayed page purging.
 ///
 /// By default mimalloc madvises freed pages back to the OS after a 10 ms
@@ -66,6 +134,10 @@ static GLOBAL_OOM_ALLOC: crate::oom_alloc::OomAllocator = crate::oom_alloc::OomA
 /// service into delayed purging (25 is the measured sweet spot — see
 /// the option comment). Unset / unparsable → -1, the latency-first
 /// default, so nothing changes unless an operator asks for it.
+///
+/// NOTE: setting this programmatically STOMPS mimalloc's own
+/// `MIMALLOC_PURGE_DELAY` env var (if anything read it first) — the
+/// engine-owned `RUSTSQL_MIMALLOC_PURGE_DELAY_MS` is the supported knob.
 #[cfg(feature = "mimalloc")]
 #[allow(clippy::useless_conversion)] // c_long == i64 on unix: the
                                      // i64::from() widenings below are
@@ -75,25 +147,22 @@ fn tune_mimalloc() {
     use std::sync::Once;
     static TUNED: Once = Once::new();
     TUNED.call_once(|| unsafe {
-        // `mi_option_purge_delay` sits at enum position 15 in mimalloc.h
-        // (eager_commit_delay = 14, use_numa_nodes = 16 bracket it); the
-        // sys crate's bindings don't name it, so use the raw value.
-        // purge_delay (enum position 15): freed pages are madvise'd back
-        // to the OS after this delay (ms). -1 = never — the old setting,
-        // bought first-query latency but retained EVERY freed page in
-        // VmHWM (peak-RSS-bound workloads measured ~3x their live set).
+        // purge_delay: freed pages are madvise'd back to the OS after
+        // this delay (ms). -1 = never — the old setting, bought
+        // first-query latency but retained EVERY freed page in VmHWM
+        // (peak-RSS-bound workloads measured ~3x their live set).
         // 25 ms = pages freed by an alloc-heavy query return to the OS
         // once the query loop goes idle, but back-to-back iterations
         // (best-of-N benchmark rounds, storm-then-read transitions well
         // under 25 ms apart) still reuse them — immediate purging (0)
         // re-faulted the entire working set on EVERY round (measured
         // +0.5 ms/round on the join+GROUP BY bench).
-        // Raw enum positions from mimalloc.h (the sys crate's bindings
-        // only name the pre-v3 subset; purge_delay = 15 is bracketed by
-        // eager_commit_delay = 14 and use_numa_nodes = 16, allow_thp = 43
-        // by page_cross_thread_max_reclaim = 42 and minimal_purge_size).
-        const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-        const MI_OPTION_ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
+        //
+        // The option POSITION is layout-derived (see
+        // [`mimalloc_option_positions`]): 15 in both v2 and v3, but the
+        // sys crate does not export the name, and hardcoding it blind
+        // is how allow_thp drifted (below).
+        //
         // Deployment-tunable, default -1 (never purge automatically):
         // the per-allocation purge-timer checks cost ~25 ns/alloc
         // (measured as the UPDATE-by-PK regression), and freed pages
@@ -142,6 +211,10 @@ fn tune_mimalloc() {
         // puts RSS back at exactly-touched-pages granularity. Applies to
         // segments committed after this point; for the initial arena too,
         // set MIMALLOC_ARENA_RESERVE=64M (the lean-startup recipe).
+        // The position is layout-derived: 43 in v3 but 37 in v2 — the
+        // previously hardcoded 43 was a SILENT NO-OP under a v2 feature
+        // build (mimalloc bounds-guards the set), leaving mimalloc's own
+        // THP decisions enabled while only the kernel prctl applied.
         libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_THP, 0);
         debug_assert_eq!(libmimalloc_sys::mi_option_get(MI_OPTION_ALLOW_THP), 0);
     });
@@ -281,3 +354,53 @@ pub use storage::sqlitefmt;
 pub use types::{Affinity, Row, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(all(test, feature = "mimalloc"))]
+mod mimalloc_tuning_tests {
+    use super::*;
+
+    /// `tune_mimalloc` must actually reach the slots it targets: after
+    /// the Once-guarded call, both options read back the engine's policy
+    /// values (the env override honored for purge delay). A feature flip
+    /// or a sys-crate bump that broke the derived positions fails HERE
+    /// at CI time — in release builds the same check exists only as the
+    /// (stripped) `debug_assert`s, and a dropped option set is otherwise
+    /// a SILENT no-op (mimalloc bounds-guards option ids).
+    #[test]
+    #[allow(clippy::useless_conversion)] // i64::from(c_long): no-op on
+                                         // unix, required on Windows
+    fn tuned_options_read_back() {
+        tune_mimalloc(); // Once-guarded: idempotent, safe from tests
+        let expected_purge: i64 = std::env::var("RUSTSQL_MIMALLOC_PURGE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(-1);
+        unsafe {
+            assert_eq!(
+                i64::from(libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY)),
+                expected_purge,
+                "purge_delay did not read back the tuned value — position mis-derived?"
+            );
+            assert_eq!(
+                i64::from(libmimalloc_sys::mi_option_get(MI_OPTION_ALLOW_THP)),
+                0,
+                "allow_thp did not read back 0 — position mis-derived for this layout?"
+            );
+        }
+    }
+
+    /// The compile-time dispatch only knows two layouts. This pins the
+    /// pairing it relies on: v2 builds export `_mi_option_last == 38`
+    /// and v3 builds `== 47`. If a future sys crate lands a new layout,
+    /// [`mimalloc_option_positions`] refuses to compile — this test is
+    /// the belt to that braces for anyone who "fixes" the panic by
+    /// guessing a position.
+    #[test]
+    fn layout_is_one_of_the_known_two() {
+        assert!(
+            libmimalloc_sys::_mi_option_last == 38 || libmimalloc_sys::_mi_option_last == 47,
+            "unknown mimalloc option layout (last={}): re-derive positions",
+            libmimalloc_sys::_mi_option_last
+        );
+    }
+}
