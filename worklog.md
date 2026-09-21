@@ -832,3 +832,23 @@ Work Log:
 Stage Summary:
 - The mac+win CI failures are a real engine bug (lease key instability across sidecar removal) — fixed + pinned cross-platform.
 - S09 is a hardware-skew ratio flip (engine absolute times IMPROVED); no code change, watching CI.
+
+---
+Task ID: 25
+Agent: main (Super Z)
+Task: Close the S17 open-first-query regression (0.60x on CI win/ubuntu, was 2.14x before f9acbbb) — read-ahead restoration for WAL-mode reopens.
+
+Work Log:
+- Diagnosis from CI logs: S17 open_first_query_ms flipped 2.14x WIN (pre-f9acbbb: rq 5.7 vs sq 12.2) to 0.60-0.77x LOSS (rq 12.5-16.1 vs sq 9.7) exactly when WAL persistence landed: fresh handles now AUTO-ATTACH WAL on reopen, and the sequential read-ahead gate was `wal.read().is_none()` — every WAL-mode reopen silently lost read-ahead. The sidecar is checkpointed+REMOVED at clean close, so the attach has an EMPTY committed map and the main file is the only version source — identical to DELETE mode.
+- FIX 1 (gate): read-ahead now allows a WAL attach whose committed map AND spill index are both empty; any live frame keeps the per-page path.
+- FIX 2 (bulk I/O): the old prefetch loop did one read_file_at PER PAGE (no batching despite the comment). Now the whole run is ONE positioned read (up to 16 pages / 64 KiB) sliced into pages.
+- FIX 3 (multi-threaded streams — found via a /proc/self/io syscr probe + offset logging): the +1 run detector was a pair of pager ATOMICS; parallel scans (2 workers on disjoint page ranges) interleave their streams through one pager and the shared detector measured length-1 runs (1907 of them; jump histogram dominated by the two workers' +-891-page separation) — read-ahead never armed while both workers ran. The detector is now THREAD-LOCAL (SEQ_RUN_TL single-entry cache keyed by pager instance id).
+- FIX 4 (over-read): 16-page prefetches on short +1 runs mostly read DEAD pages on the fragmented post-checkpoint layout (measured: 163 x 64KB bulk reads for a 3.6MB live tree, 2.8x over-read). Tiered sizing from the observed run length: run 2-3 -> 4 pages, 4-5 -> 8, 6+ -> 16.
+- Result (probe: fresh-open + SUM over 250k rows, syscr = read-syscall count via /proc/self/io): disabled 3698 / old-variance 580-2050 (eviction + worker-count luck) / fixed 493-495 across 6 runs — 7.5x syscall cut, deterministic.
+- Full local torture matrix at ubuntu CI scale (0.25): gate failures 0; S17 open_first_query 1.74x WIN (rq 8.9 vs sq 15.5), S09 1.08x WIN, S02 5.97x WIN, S18 differential MATCH; only the known (reported, not gated) mem columns lose.
+- Gates: fmt clean, clippy --all-targets -D warnings clean (default; the new probe example included), lib 269, pager suites green (wal 33, durability 9, concurrent_reader_visibility 6, crash_recovery 6, io_fault 3, page_size 6, tempstore 9, integrity_check 9... 72 total), stateful fuzz (default + fresh-seed pins) + differential + million_record_compare green.
+- S09 ubuntu CI failure triaged as hardware-skew (NOT a code regression): between the green and failed runs the ENGINE improved 14.5->12.8ms while SQLite jumped 16.1->9.1ms (faster host); windows S09 on the same commit was 1.19x WIN. No S09 code change.
+
+Stage Summary:
+- The S17 class (cold first query on WAL-mode files) is closed at the mechanism level: WAL-attach no longer disables read-ahead, prefetch is single-syscall bulk, per-thread run detection makes it work under parallel scans, and tiered sizing avoids dead-page over-read.
+- examples/probe_syscr_s17.rs committed as the read-syscall diagnostic for future prefetch work.

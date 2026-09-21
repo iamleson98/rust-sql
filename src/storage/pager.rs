@@ -896,10 +896,23 @@ pub struct Pager {
     /// serving pages normally — table trees are rowid-keyed and
     /// format-independent.
     legacy_index_format: std::sync::atomic::AtomicBool,
-    /// Sequential-access tracker for read-ahead: the last page id
-    /// touched (any path) and the length of the current +1 run.
-    prefetch_last: std::sync::atomic::AtomicU32,
-    prefetch_run: std::sync::atomic::AtomicU8,
+}
+
+thread_local! {
+    /// Per-THREAD sequential-run detector for read-ahead:
+    /// (pager instance id, last page id, current +1 run length).
+    ///
+    /// Thread-local — NOT pager fields — because parallel scans run
+    /// several independent +1 page streams through ONE pager at the
+    /// same time (worker A walks [0..mid], worker B [mid..end]). A
+    /// shared detector interleaves the streams: every other miss jumps
+    /// (measured on the S17 shape: two workers ~891 pages apart, 1907
+    /// length-1 runs, read-ahead NEVER armed, one pread per page). Each
+    /// thread tracks its own stream; a single-entry cache is enough —
+    /// a thread runs one scan of one pager at a time, and any pager or
+    /// stream switch just resets the run.
+    static SEQ_RUN_TL: std::cell::Cell<(u64, u32, u8)> =
+        const { std::cell::Cell::new((0, u32::MAX, 0)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,8 +1732,6 @@ impl Pager {
             ),
             temp_store: std::sync::atomic::AtomicI64::new(0),
             legacy_index_format: std::sync::atomic::AtomicBool::new(false),
-            prefetch_last: std::sync::atomic::AtomicU32::new(u32::MAX),
-            prefetch_run: std::sync::atomic::AtomicU8::new(0),
         };
 
         let file_size = pager.store.len()?;
@@ -2676,43 +2687,89 @@ impl Pager {
             }
             page_ref
         };
-        // Sequential read-ahead: after a +1 run of page touches, batch the
-        // next few pages into the cache in one go — cold sequential scans
-        // (bulk loads, full-table aggregates, VACUUM) cut their syscall
-        // count ~5x. Heavily gated: only the plain file-backed, non-WAL,
-        // non-codec, no-committed-scope, no-spill state (every other
-        // layout serves pages from a VERSIONED source whose bytes must
-        // not be short-circuited from the main file). Prefetched pages
-        // enter CLEAN — later fetchers take the normal path (fast-path
-        // hit, savepoint capture, WAL check all still run).
-        if self.prefetch_run.load(Ordering::Relaxed) >= 2
+        // Sequential read-ahead: after a +1 run of page touches on THIS
+        // THREAD's stream, pull the next run of pages into the cache with
+        // ONE positioned read — cold sequential scans (bulk loads,
+        // full-table aggregates, VACUUM) cut their syscall count per page
+        // from ~1 to ~1/run (a 7 MB S17-shape scan is ~1800 preads
+        // otherwise; at 1-2us each that is the whole gap to SQLite's mmap
+        // fault-around on fast hosts — the 2026-09-20 S17 2.14x->0.60x
+        // flip: WAL persistence made fresh handles attach WAL, and the
+        // old wal.is_none() gate silently disabled read-ahead for every
+        // WAL-mode reopen). Heavily gated: only the plain file-backed,
+        // non-codec, no-committed-scope, no-spill state — and a WAL
+        // attach is fine when BOTH its committed map and spill index
+        // are EMPTY (a fresh attach on a checkpointed+removed sidecar:
+        // the main file is then the only version source, exactly like
+        // DELETE mode; any live frame makes the main file potentially
+        // stale and stays on the per-page path). Prefetched pages enter
+        // CLEAN — later fetchers take the normal path (fast-path hit,
+        // savepoint capture, WAL check all still run).
+        let seq_run = SEQ_RUN_TL.with(|c| {
+            let (pid, _, run) = c.get();
+            if pid == self.instance_id {
+                run
+            } else {
+                0
+            }
+        });
+        if seq_run >= 2
             && !self.store.is_memory()
-            && self.wal.read().is_none()
+            && self
+                .wal
+                .read()
+                .as_ref()
+                .map_or(true, |s| s.map.is_empty() && s.spilled.is_empty())
             && !self.codec.read().is_active()
             && self.committed_scope_count.load(Ordering::Acquire) == 0
             && self.delete_spill.lock().is_none()
             && self.savepoint_depth.load(Ordering::Relaxed) == 0
         {
-            const PREFETCH_PAGES: u32 = 4;
-            let psz = self.page_size();
-            let mut cache = self.cache.write();
-            for pid in (id + 1)..(id + 1 + PREFETCH_PAGES) {
-                if pid >= n_pages_val {
-                    break;
+            // TIERED run length, grown from the observed run: a barely-
+            // armed stream (run 2-3) may break after a couple of pages —
+            // prefetching 16 there mostly reads dead pages (measured on
+            // the fragmented post-checkpoint S17 layout: 163 x 64 KB
+            // bulk reads for a 3.6 MB live tree, 2.8x over-read). Long
+            // proven runs get the full window. Capped at 16 pages /
+            // 64 KiB — the +1 detector re-arms per touch, so this is a
+            // rolling window over a sequential scan, and the whole run
+            // is ONE read_file_at.
+            const PREFETCH_MAX_BYTES: usize = 64 * 1024;
+            let tier_pages: usize = if seq_run >= 6 {
+                16
+            } else if seq_run >= 4 {
+                8
+            } else {
+                4
+            };
+            let psz = self.page_size() as usize;
+            let want = tier_pages.min(PREFETCH_MAX_BYTES / psz.max(1)).max(2);
+            let first = id as usize + 1;
+            let run_end = (first + want).min(n_pages_val as usize);
+            if run_end > first {
+                let len = (run_end - first) * psz;
+                let mut buf = vec![0u8; len];
+                match self.read_file_at(first as u64 * psz as u64, &mut buf) {
+                    Ok(n) if n == len => {
+                        let mut cache = self.cache.write();
+                        for (i, pid) in (first..run_end).enumerate() {
+                            if cache.get(pid as u32).is_some() {
+                                continue;
+                            }
+                            let mut p = Page::new(pid as u32, psz as u32);
+                            let src = &buf[i * psz..(i + 1) * psz];
+                            p.data.copy_from_slice(src);
+                            self.maybe_evict_locked(&mut cache);
+                            let prefetched = Arc::new(Mutex::new(p));
+                            cache.insert(pid as u32, prefetched);
+                            self.lru.lock().push_back(pid as u32);
+                        }
+                    }
+                    _ => {
+                        // short read / I/O error: leave it to the real
+                        // miss path (it will produce the proper error).
+                    }
                 }
-                if cache.get(pid).is_some() {
-                    continue;
-                }
-                let mut p = Page::new(pid, psz);
-                let offset = pid as u64 * psz as u64;
-                match self.read_file_at(offset, &mut p.data) {
-                    Ok(n) if n == psz as usize => {}
-                    _ => break, // short read / I/O error: leave it to the real miss path
-                }
-                self.maybe_evict_locked(&mut cache);
-                let prefetched = Arc::new(Mutex::new(p));
-                cache.insert(pid, prefetched);
-                self.lru.lock().push_back(pid);
             }
         }
         self.note_seq_access(id);
@@ -2722,19 +2779,23 @@ impl Pager {
         Ok(page_ref)
     }
 
-    /// Track the +1 access pattern for sequential read-ahead.
+    /// Track the +1 access pattern for sequential read-ahead — per
+    /// THREAD (see `SEQ_RUN_TL`): parallel scans run multiple +1 streams
+    /// through one pager, and a shared detector interleaves them into
+    /// length-1 runs (read-ahead never armed while both workers ran).
     #[inline]
     fn note_seq_access(&self, id: PageId) {
-        let last = self.prefetch_last.load(Ordering::Relaxed);
-        if id == last.wrapping_add(1) {
-            let r = self.prefetch_run.load(Ordering::Relaxed);
-            if r < 8 {
-                self.prefetch_run.store(r + 1, Ordering::Relaxed);
+        SEQ_RUN_TL.with(|c| {
+            let (pid, last, mut run) = c.get();
+            if pid == self.instance_id && id == last.wrapping_add(1) {
+                if run < 8 {
+                    run += 1;
+                }
+            } else {
+                run = 0;
             }
-        } else {
-            self.prefetch_run.store(0, Ordering::Relaxed);
-        }
-        self.prefetch_last.store(id, Ordering::Relaxed);
+            c.set((self.instance_id, id, run));
+        });
     }
 
     // -----------------------------------------------------------------
