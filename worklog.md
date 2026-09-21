@@ -933,3 +933,16 @@ Work Log:
 
 Stage Summary:
 - Windows unblocked; the purge-delay feature keeps its semantics unchanged (default -1).
+
+---
+Task ID: 32
+Agent: main (Super Z)
+Task: Final validation + session wrap.
+
+Work Log:
+- Run 35571642442 (147090c): COMPLETED SUCCESS — all 27 jobs green on the first full run after the Windows fix: fmt, 4 clippy configs, tests on linux/windows/macos x 3 configs, doc-tests, torture (3 OS), bench-gates (3 OS), stress-intensive, million-record compare, sqlite interop, OOM, compat, ci-ok.
+- This validates the whole session stack in one run: fresh-seed fuzz fixes + CI pins, WAL lease-key stability, read-ahead v3, zero-fsync reopens, one-pass blob inserts, uninit page materialization, and the user's purge-delay merge (with the Windows c_long fix).
+- Ubuntu torture S09/S17 and bench-gate all passed on this draw; the earlier S12/S17/multi-VALUES reds were runner-draw artifacts as triaged.
+
+Stage Summary:
+- CI green at 147090c. Known open items (documented above): S17 fast-host per-row residual (mmap-read project), the perf ledger's parity rows.
