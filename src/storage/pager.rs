@@ -3963,6 +3963,20 @@ impl Pager {
         if self.store.is_memory() {
             return Ok(());
         }
+        // IDEMPOTENCE: the durable flag already says `mode` -> nothing to
+        // do. Every reopen of a WAL-mode file routes through enable_wal
+        // (from_store's auto-attach), and rewriting the header + fsyncing
+        // on a pure READ-ONLY open bought nothing while costing a full
+        // FlushFileBuffers — a measurable slice of the Windows S17
+        // open+first-query gap (SQLite's open never writes when the
+        // header is already correct).
+        {
+            let mut cur = [0u8; 4];
+            let n = self.read_file_at(72, &mut cur)?;
+            if n == 4 && u32::from_le_bytes(cur) == mode {
+                return Ok(());
+            }
+        }
         let page0 = self.get_page(0)?;
         {
             let mut p = page0.lock();

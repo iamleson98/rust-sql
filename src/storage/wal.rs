@@ -427,6 +427,15 @@ pub struct Wal {
     checksum: (u32, u32),
     /// Number of frames written since the last checkpoint.
     n_frames: u32,
+    /// The on-disk header is not yet written: this handle was opened on
+    /// a fresh/empty sidecar and DEFERRED the 32-byte header write (+ its
+    /// fsync) to the first frame append. Read-only sessions of a
+    /// WAL-mode file (a reopen after a clean close checkpoints+removes
+    /// the sidecar, then auto-attaches) pay NEITHER the header fsync nor
+    /// any later one — SQLite creates the -wal at first write, not at
+    /// open. The first `append` writes the header before frame 0; a
+    /// 0-byte sidecar at recovery is simply a fresh WAL (0 frames).
+    header_dirty: bool,
 }
 
 impl Wal {
@@ -455,6 +464,7 @@ impl Wal {
             page_size,
             checksum: (0, 0),
             n_frames: 0,
+            header_dirty: false,
         };
 
         wal.recover()?;
@@ -465,13 +475,15 @@ impl Wal {
     fn recover(&mut self) -> Result<()> {
         let file_size = self.file.metadata()?.len();
         if file_size == 0 {
-            // Fresh WAL: write the header.
+            // Fresh WAL: header stays IN MEMORY (header_dirty) — the
+            // 32-byte write + fsync are deferred to the first append.
+            // Every read-only reopen of a WAL-mode file lands here;
+            // paying a header fsync at open measured as the bulk of the
+            // Windows S17 open+first-query gap.
             self.header = WalHeader::new(self.page_size);
             self.checksum = (self.header.checksum1, self.header.checksum2);
-            self.file.seek(SeekFrom::Start(0))?;
-            self.file.write_all(&self.header.encode())?;
-            self.file.sync_all()?;
             self.n_frames = 0;
+            self.header_dirty = true;
             return Ok(());
         }
 
@@ -575,6 +587,9 @@ impl Wal {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&self.header.encode())?;
+        // The header is physically on disk now (an active-writer path:
+        // checkpoint reset); nothing left to defer.
+        self.header_dirty = false;
         if sync {
             self.file.sync_all()?;
         }
@@ -642,6 +657,16 @@ impl Wal {
                 data.len(),
                 self.page_size
             )));
+        }
+        // Deferred fresh-WAL header: the first append materializes it
+        // (bytes 0..32 must precede frame 0 for recovery's checksum
+        // chain). No fsync here — the caller's commit-boundary sync
+        // covers header + frames together; a crash before it leaves a
+        // header with zero COMMITTED frames, which recovery discards.
+        if self.header_dirty {
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.write_all(&self.header.encode())?;
+            self.header_dirty = false;
         }
         let offset = WAL_HEADER_SIZE as u64
             + self.n_frames as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;

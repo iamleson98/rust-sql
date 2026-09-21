@@ -852,3 +852,19 @@ Work Log:
 Stage Summary:
 - The S17 class (cold first query on WAL-mode files) is closed at the mechanism level: WAL-attach no longer disables read-ahead, prefetch is single-syscall bulk, per-thread run detection makes it work under parallel scans, and tiered sizing avoids dead-page over-read.
 - examples/probe_syscr_s17.rs committed as the read-syscall diagnostic for future prefetch work.
+
+---
+Task ID: 26
+Agent: main (Super Z)
+Task: Kill the two fsyncs every READ-ONLY reopen of a WAL-mode file was paying (the residual Windows S17 0.70x).
+
+Work Log:
+- CI run 35564243165 (09e5217) results: S09 windows 1.80x WIN (read-ahead side benefit), S06 1.37x WIN, S12 windows a 16%-vs-15% marginal flake (the documented 2026-09-14 windows S12 jitter class — same section, same margin band), but S17 windows STILL 0.70x (rq 14.2 vs sq 9.9, improved from 16.1 but not closed).
+- Root cause (code read): from_store's auto-attach routes through the FULL enable_wal, which paid TWO fsyncs + a file creation on a pure read-only open: (1) Wal::open -> recover() on a fresh sidecar WROTE the 32-byte WAL header + sync_all; (2) persist_journal_mode_flag unconditionally rewrote the main-file header bytes + sync_all — even though the reopen happened precisely BECAUSE the flag already says WAL. SQLite creates the -wal at first write, never fsyncs at open.
+- FIX 1: persist_journal_mode_flag is idempotent — reads the 4 durable flag bytes first, returns when they already match (no page-0 dirtying, no write, no fsync). Mode CHANGES still take the full durable path.
+- FIX 2: Wal::open defers the fresh-sidecar header: recover() on a 0-byte file keeps the header IN MEMORY (header_dirty) — the first append materializes it (bytes 0..32 must precede frame 0 for recovery's checksum chain); the caller's commit-boundary sync covers header + frames together. A crash before any commit leaves a header with zero committed frames (recovery discards) or a 0-byte sidecar (fresh WAL) — both correct. reset_synced marks the header physically written (active-writer checkpoint path).
+- Verification: WAL battery green (wal 33, durability 9, crash_recovery 6, concurrent_reader_visibility 6, foreign_journal_durability 3, stmt_path_durability 9... ), broad battery green (stateful_fuzz incl. pins, differential, fuzz_regressions, regression, io_fault, savepoints, integrity_check, tempstore, page_size), syscr probe stable 494-496, sidecar still removed on clean close, full torture at CI scale: gate failures 0, S17 1.79x WIN, S09 primary TIE/WIN band, S18 MATCH.
+- S12 windows marginal flake: not chased this round (documented jitter class; 16% vs 15% gate on a section whose ubuntu result is 1.09x WIN); watch whether it reproduces on this run before acting.
+
+Stage Summary:
+- A read-only reopen of a WAL-mode file now costs ONE file creation + reads — zero fsyncs (was two + eager header writes). The Windows S17 gap (the only remaining S17 loss) is mechanically closed; ubuntu/linux S17 already 1.74-1.79x WIN.
