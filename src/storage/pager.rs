@@ -2555,7 +2555,7 @@ impl Pager {
             if let Some(page_ref) = cache.get(id).cloned() {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 drop(cache);
-                self.note_seq_access(id);
+                self.note_seq_access(id, false);
                 // SAVEPOINT undo capture: the bytes at fetch time are the
                 // pre-mutation state (every mutation get_page()s before it
                 // modifies). One atomic load when no savepoint is active.
@@ -2772,7 +2772,7 @@ impl Pager {
                 }
             }
         }
-        self.note_seq_access(id);
+        self.note_seq_access(id, true);
         if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
             self.capture_savepoint_undo(id, &page_ref);
         }
@@ -2780,19 +2780,35 @@ impl Pager {
     }
 
     /// Track the +1 access pattern for sequential read-ahead — per
-    /// THREAD (see `SEQ_RUN_TL`): parallel scans run multiple +1 streams
-    /// through one pager, and a shared detector interleaves them into
-    /// length-1 runs (read-ahead never armed while both workers ran).
+    /// THREAD (see `SEQ_RUN_TL`) and MISS-ONLY: `last` follows every
+    /// access, but the RUN advances only on misses that continue the
+    /// +1 sequence. Prefetched HITS used to extend the run too, so a
+    /// walk that consumed only part of each window still escalated to
+    /// 16-page reads — on the fragmented post-checkpoint S17 layout that
+    /// over-read 2.8x the live tree and COST more than the syscalls it
+    /// saved on fast hosts (ubuntu CI: 12.5ms without read-ahead,
+    /// 14.6ms with it). Miss-only counting makes the run grow once per
+    /// FULLY CONSUMED window: a genuinely sequential walk escalates
+    /// 4 -> 8 -> 16 pages, a jumping walk re-resets every window and
+    /// stays at the 4-page floor. In-memory stores never read ahead at
+    /// all and skip the TLS entirely (their hot path measured 2-4 TLS
+    /// touches per get_page for nothing).
     #[inline]
-    fn note_seq_access(&self, id: PageId) {
+    fn note_seq_access(&self, id: PageId, is_miss: bool) {
+        if self.store.is_memory() {
+            return;
+        }
         SEQ_RUN_TL.with(|c| {
             let (pid, last, mut run) = c.get();
-            if pid == self.instance_id && id == last.wrapping_add(1) {
-                if run < 8 {
-                    run += 1;
+            let continues = pid == self.instance_id && id == last.wrapping_add(1);
+            if is_miss {
+                if continues {
+                    if run < 8 {
+                        run += 1;
+                    }
+                } else {
+                    run = 0;
                 }
-            } else {
-                run = 0;
             }
             c.set((self.instance_id, id, run));
         });

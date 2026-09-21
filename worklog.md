@@ -868,3 +868,20 @@ Work Log:
 
 Stage Summary:
 - A read-only reopen of a WAL-mode file now costs ONE file creation + reads — zero fsyncs (was two + eager header writes). The Windows S17 gap (the only remaining S17 loss) is mechanically closed; ubuntu/linux S17 already 1.74-1.79x WIN.
+
+---
+Task ID: 27
+Agent: main (Super Z)
+Task: Read-ahead v3 (miss-only run counting) — undo the ubuntu S17 over-read cost; macOS single-row loss triage.
+
+Work Log:
+- CI run 35565293824 (a80ba79) partials: ubuntu torture FAILED S09 (12.8 vs 9.0 — the recurring fast-host blob-insert deficit, 2nd occurrence) AND S17 (14.6 vs 9.5 — WORSE than f9acbbb's 12.5: my v2 read-ahead over-read on the fragmented post-checkpoint layout and the extra memcpy cost more than the saved syscalls on a fast host). macOS bench-gate lost bench_compare "Single-row inserts (auto-commit)" 0.35x (4.88 vs 1.71ms; historical 0.88-0.93x TIE).
+- macOS row triage: DARWIN_WIDE_ROWS in bench_gate.py already documents THIS EXACT ROW swinging 2x on identical binaries (slow-syscall episode owning the job window; the 100% band absorbs 2x but today hit 185%). Corroboration that the engine path is healthy: bench_full_vs_sqlite's "INSERT (auto-commit, 1k rows)" = 3.41x WIN in the SAME failing job, and Linux HEAD = 1.15ms vs 1.81 (1.57x WIN). Still, v3 removes even the theoretical macOS sensitivity: in-memory stores now skip the TLS tracking entirely (2-4 TLS touches per get_page were pure overhead there).
+- READ-AHEAD v3: prefetched HITS no longer extend the +1 run — only MISS continuations advance it. v2's hits-extend-runs feedback escalated tiers to 16-page windows on walks that consumed only part of each window (the over-read source). v3's run grows once per FULLY consumed window: 4 -> 8 -> 16 escalation needs ~60 pages of PROVEN sequentiality; a jumping walk re-resets every window and stays at the 4-page floor. note_seq_access gained is_miss; the hit path passes false (updates `last` only).
+- Measured: syscr probe 590-592 stable (v2: 493-496 but over-reading; disabled: 3698) — 6.3x syscall cut with bounded over-read. bench_compare single-row autocommit Linux 1.56 vs 2.94 (1.88x WIN). Full torture at CI scale: 0 gate failures, S17 1.68x WIN, S09 1.00x TIE, S18 MATCH.
+- Suites: lib 269, wal 33, durability 9, crash_recovery 6, stateful_fuzz 2 (incl. pins), concurrent_reader_visibility 6, parallel_scan 56 — all green. fmt + clippy --all-targets clean.
+- OPEN (next cycle): ubuntu S09 blob insert 12.8 vs 9.0 (2/2 on fast hosts — real deficit: the 64KB blob path pays ~2 full copies + 16 overflow-page allocs per row where SQLite binds by reference; needs the copy-count reduction in the overflow write path). Ubuntu S17 residual ~12.5ms-class on the fully-fragmented layout (walk jumps every leaf; read-ahead can't help — needs b-tree-aware prefetch or mmap).
+
+Stage Summary:
+- v3 read-ahead is strictly >= v2 on every shape: same syscall win, bounded over-read, in-memory hot path back to zero TLS overhead.
+- Pushing to get fresh macOS + ubuntu datapoints; S09 blob-copy reduction queued as the next optimization.
