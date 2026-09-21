@@ -347,8 +347,30 @@ pub(crate) fn wal_writer_leases(
 
 /// Canonicalize a sidecar path for lease keying: two handles opening
 /// "db.sqlite" and "./db.sqlite" must map to the same lease entry.
+///
+/// The PARENT DIRECTORY is canonicalized, never the file itself: the
+/// key must be STABLE across the sidecar's own creation and removal.
+/// `Pager::drop` checkpoints and REMOVES the sidecar before its final
+/// lease release, and the first append acquires before the sidecar
+/// exists — a `canonicalize` of a missing file silently falls back to
+/// the RAW path, which on macOS (`/var` -> `/private/var`) and Windows
+/// (`\\?\` device prefix) differs from the canonical form used at
+/// acquisition. The release then missed the acquired entry and the
+/// lease LEAKED: every later handle on that path got SQLITE_BUSY
+/// forever (CI mac+win, `wal_mode_persists_across_reopen` +
+/// `concurrent_second_writer_handle_gets_busy_not_corruption`; Linux
+/// was immune — `/tmp` is a real directory, raw == canonical). The
+/// parent (the database's directory) survives both events, and
+/// canonicalize(parent) + file_name equals canonicalize(file) for
+/// every non-symlinked file name — sidecars are engine-created
+/// regular files, never symlinks.
 pub(crate) fn lease_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    match (path.parent(), path.file_name()) {
+        (Some(p), Some(n)) if !p.as_os_str().is_empty() => std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .join(n),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Lease acquisition result: `Ours` = the caller already holds it,

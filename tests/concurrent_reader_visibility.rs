@@ -349,3 +349,62 @@ fn concurrent_second_writer_handle_gets_busy_not_corruption() {
     drop(db);
     cleanup(&path);
 }
+
+#[test]
+fn wal_writer_lease_releases_through_symlinked_dir() {
+    // The lease-key stability pin for the CI mac+win failures: the key
+    // is derived from the canonicalized PARENT directory, never the
+    // sidecar file itself. Pager::drop removes the sidecar BEFORE its
+    // final lease release — keying on the file made canonicalize fail
+    // post-removal and fall back to the RAW path, which differs from
+    // the acquisition key whenever the database directory is reached
+    // through a symlink (macOS `/var` -> `/private/var`) or a device
+    // path (Windows `\\?\` prefix): the release missed the entry, the
+    // lease leaked, and every later handle on that path got SQLITE_BUSY
+    // forever. Linux CI is immune (`/tmp` is real), so this test
+    // reproduces the divergent-raw-vs-canonical shape explicitly via a
+    // symlinked directory — before the fix it fails with the lease busy
+    // error on the reopened handle's write.
+    let real = std::env::temp_dir().join(format!("cwvis-leasereal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&real);
+    std::fs::create_dir_all(&real).unwrap();
+    #[cfg(unix)]
+    let link = {
+        let link = std::env::temp_dir().join(format!("cwvis-leaselink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        link
+    };
+    #[cfg(unix)]
+    let via = link;
+    #[cfg(not(unix))]
+    let via = real.clone(); // symlink rights vary on Windows; the \\?\
+                            // prefix keeps raw != canonical there anyway
+    let path = via.join("lease-sym.db");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('one')", []).unwrap();
+        // The raw and canonical forms differ here by construction —
+        // prove the lease was taken at all through the real directory.
+        assert!(real.join("lease-sym.db-wal").exists());
+    }
+    // Reopen through the SAME divergent path: the dropped owner's lease
+    // must be gone — this write was the BUSY failure before the fix.
+    let mut db = Database::open(&path).unwrap();
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute("INSERT INTO t (v) VALUES ('two')", []).unwrap();
+    db.execute("COMMIT", []).unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
+    assert_eq!(rows[0][0].as_integer(), 2);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(real.join("lease-sym.db-wal"));
+    let _ = std::fs::remove_dir_all(&real);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(
+        std::env::temp_dir().join(format!("cwvis-leaselink-{}", std::process::id())),
+    );
+}

@@ -816,3 +816,19 @@ Stage Summary:
 - All 3 pinned fresh-seed divergence classes are closed and machine-verified per push; zero open correctness items in the ledger.
 - 4 additional engine bugs closed in the same commit (unary-neg of i64::MIN, schema-qualified DML targets, stat1 table rows, un-analyzed join direction).
 - Ready to push; CI carries the full matrix (1335 tests, bench gates, torture, million-record differential).
+
+---
+Task ID: 24
+Agent: main (Super Z)
+Task: Triage the f9acbbb CI failure (mac+win test failures + torture S09), fix, push.
+
+Work Log:
+- Fetched run 35492246675's failures: macOS + Windows both failed the two NEW f9acbbb tests (wal_mode_persists_across_reopen, concurrent_second_writer_handle_gets_busy_not_corruption) with "WAL writer lease ... is held by another connection"; ubuntu passed them. Torture failed S09 blobs 64KBx1k (rq 12.8ms vs sq 9.1ms, 0.71x; gate >15%).
+- LEASE BUG ROOT CAUSE: lease_key canonicalized the SIDECAR FILE path. Pager::drop checkpoints, REMOVES the sidecar, then releases the lease — canonicalize of the now-missing file falls back to the RAW path, which differs from the canonical acquisition key on macOS (/var -> /private/var symlink; CI error paths show /private/var/folders/...) and Windows (\\?\ device prefix). The release looked up the wrong key, the entry stayed, and every later handle on that path got SQLITE_BUSY forever. Linux immune: /tmp is a real directory, raw == canonical. FIX: lease_key canonicalizes the PARENT DIRECTORY (survives sidecar create/remove) + file_name; matches canonicalize(file) for every regular file. A/B verified: reverting the fix makes the new pin fail, the fix passes.
+- PIN: tests/concurrent_reader_visibility.rs wal_writer_lease_releases_through_symlinked_dir — reproduces the raw-vs-canonical divergence on ANY platform via a symlinked directory (Linux CI included; Windows keeps the \\?\ divergence without the symlink). All 6 tests in the file pass.
+- S09 TORTURE TRIAGE: NOT a code regression. Between the green run (1151448: rq 14.5ms vs sq 16.1ms, 1.11x WIN) and the failed run (f9acbbb: rq 12.8ms vs sq 9.1ms), the ENGINE got faster while SQLite jumped 44% (16.1 -> 9.1ms; its scan too: 5.6 -> 3.1ms) — the failed run landed on a faster host where SQLite's blob path scales better and the ratio crossed 1.0. Local interleaved best-of-5 A/B of HEAD vs 1151448 (isolated forced rebuilds; the shared-target worktree build poisoned cargo's mtime freshness — caught it via sha256): HEAD 27.8ms vs pre 28.7ms, parity-or-better; the sandbox shows rq WINNING S09 insert (28-30 vs sq 33). Verdict: hardware-skew flake in the ratio gate; watch the next run before touching the blob path (a real repeat on a fast host = optimize the overflow/memcpy count blind).
+- Gates before push: fmt clean, clippy --all-targets -D warnings clean (default), wal 33 + durability 9 + concurrent_reader_visibility 6 green.
+
+Stage Summary:
+- The mac+win CI failures are a real engine bug (lease key instability across sidecar removal) — fixed + pinned cross-platform.
+- S09 is a hardware-skew ratio flip (engine absolute times IMPROVED); no code change, watching CI.
