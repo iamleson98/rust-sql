@@ -6457,9 +6457,7 @@ impl Database {
             } else {
                 self.rollback_concurrent_txn_shared()
             };
-            if let Err(e) = finish {
-                return Err(e);
-            }
+            finish?;
         }
         result
     }

@@ -329,12 +329,16 @@ fn concurrent_plain_writes_join_the_regime() {
         .unwrap();
     Database::set_conn_identity(1);
     db.execute("BEGIN CONCURRENT", []).unwrap();
-    db.execute("INSERT INTO t (v) VALUES ('c')", []).unwrap();
+    // Explicit DISJOINT rowids: two auto-assigning inserts into an empty
+    // table both pick rowid 1 — a genuine same-row conflict (517, by
+    // design). Disjoint rows exercise the JOIN path.
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'c')", [])
+        .unwrap();
     // A plain autocommit write from another identity JOINS the regime as
     // a one-statement concurrent transaction (disjoint rows both commit)
     // instead of failing BUSY — the live cache stays committed-clean.
     Database::set_conn_identity(2);
-    db.execute("INSERT INTO t (v) VALUES ('plain')", [])
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'plain')", [])
         .unwrap();
     // The joiner committed durably: it is NOT part of the owner's txn.
     assert_eq!(count(&db, "t"), 1);
@@ -351,7 +355,7 @@ fn concurrent_plain_writes_join_the_regime() {
     Database::set_conn_identity(1);
     db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(2);
-    db.execute("INSERT INTO t (v) VALUES ('after')", [])
+    db.execute("INSERT INTO t (id, v) VALUES (3, 'after')", [])
         .unwrap();
     Database::set_conn_identity(0);
     assert_eq!(count(&db, "t"), 3);
