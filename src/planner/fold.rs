@@ -292,7 +292,14 @@ fn fold_unary(op: UnaryOp, expr: &mut Expr) -> Option<Expr> {
     if let Expr::Literal(v) = &*expr {
         match (op, v) {
             (UnaryOp::Neg, Value::Integer(i)) => {
-                return Some(Expr::Literal(Value::Integer(i.wrapping_neg())));
+                return Some(Expr::Literal(match i.checked_neg() {
+                    Some(n) => Value::Integer(n),
+                    // -i64::MIN = +2^63 has no i64 form: promote to REAL
+                    // (SQLite; `SELECT -(-9223372036854775808)` is
+                    // 9.223372036854776e18). wrapping_neg kept the
+                    // UN-negated value — the minus sign silently vanished.
+                    None => Value::Real(-(*i as f64)),
+                }));
             }
             (UnaryOp::Neg, Value::Real(f)) => {
                 return Some(Expr::Literal(Value::Real(-f)));

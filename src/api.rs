@@ -4791,11 +4791,12 @@ impl Database {
             // Statement-embedded plans may carry the failed statement's
             // roots; the next execute re-plans. The chained-insert fast
             // path's hints (leaf, max rowid) were built over the discarded
-            // pages.
+            // pages. (Runs on BOTH Ok arms: the declined arm's row-level
+            // stmt_undo also rewrote rows/roots since the plans cached.)
             self.invalidate_stmt_cache();
             self.break_insert_chain();
         }
-        r
+        r.map(|_| ())
     }
 
     /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
@@ -9782,6 +9783,20 @@ impl Database {
                     table.name.replace('\'', "''"),
                     n
                 ));
+                // The in-memory map carries the table-level row too,
+                // keyed by the TABLE's name (index and table names share
+                // one namespace, so no collision): `table_rows_hint`
+                // reads it — an indexless table's row count otherwise
+                // vanishes from the planner (the fused join's SQLite
+                // direction parity needs it: a stale 1-row stat flips
+                // SQLite's outer-side choice).
+                stat_rows.push((
+                    table.name.clone(),
+                    crate::schema::IndexStats {
+                        rows: n,
+                        distinct_prefix: Vec::new(),
+                    },
+                ));
             }
             for index in indexes {
                 // Per-prefix distinct counts: one GROUP BY per prefix k,
@@ -13770,13 +13785,30 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
             let mut stats: Vec<(String, crate::schema::IndexStats)> = Vec::new();
             let _ = bt.scan_table(|_rowid, payload| {
                 if let Ok(row) = decode_row(payload, 3, 0, None) {
-                    // (tbl, idx, stat): only INDEX rows (idx NOT NULL) feed
-                    // the planner; the idx-NULL table rows are advisory.
-                    if let (Value::Text(idx), Value::Text(stat)) = (&row[1], &row[2]) {
-                        stats.push((
-                            idx.as_str().to_string(),
-                            crate::schema::IndexStats::parse(stat.as_str()),
-                        ));
+                    // (tbl, idx, stat): idx NOT NULL rows are INDEX stats;
+                    // idx-NULL rows are the TABLE-level row count (written
+                    // when the table has no full index) — keyed by the
+                    // TABLE's name for `table_rows_hint` (same namespace,
+                    // no collision).
+                    match (&row[1], &row[2]) {
+                        (Value::Text(idx), Value::Text(stat)) => {
+                            stats.push((
+                                idx.as_str().to_string(),
+                                crate::schema::IndexStats::parse(stat.as_str()),
+                            ));
+                        }
+                        (Value::Null, Value::Text(stat)) => {
+                            if let Value::Text(tbl) = &row[0] {
+                                stats.push((
+                                    tbl.as_str().to_string(),
+                                    crate::schema::IndexStats {
+                                        rows: crate::schema::IndexStats::parse(stat.as_str()).rows,
+                                        distinct_prefix: Vec::new(),
+                                    },
+                                ));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 true

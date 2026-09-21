@@ -4810,7 +4810,12 @@ impl Pager {
     /// (not deferred-flush mode — there, dirty pages span several
     /// committed-but-unflushed statements and this restore would drop
     /// them).
-    pub fn rollback_autocommit_stmt(&self) -> Result<()> {
+    /// Ok(true) = the pager was restored from the durable committed
+    /// image; Ok(false) = DECLINED (lazy write-back / in-memory: the
+    /// backing image is not the committed state, so there is nothing to
+    /// restore — the caller's row-level stmt_undo is the recovery and its
+    /// bookkeeping must be KEPT); Err = the restore itself failed.
+    pub fn rollback_autocommit_stmt(&self) -> Result<bool> {
         // LAZY WRITE-BACK (in-memory / sqlite-format-bridge databases):
         // the backing image is NOT the committed state (it lags many
         // statements behind), so "restore from disk" would discard
@@ -4818,7 +4823,7 @@ impl Pager {
         // state ONLY in the cache — the restore is impossible; the
         // caller's row-level stmt_undo remains the recovery mechanism.
         if self.lazy_writeback.load(Ordering::Acquire) || self.store.is_memory() {
-            return Ok(());
+            return Ok(false);
         }
         // 1. The failed statement's sidecar spills are dead work (the
         //    main file was never touched mid-statement).
@@ -4893,7 +4898,7 @@ impl Pager {
         self.n_pages.store(committed, Ordering::Release);
         // 8. Nothing is dirty anymore.
         self.dirty_count_approx.store(0, Ordering::Release);
-        Ok(())
+        Ok(true)
     }
 
     /// True when no page is currently spilled to the DELETE-mode

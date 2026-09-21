@@ -1248,7 +1248,7 @@ impl Parser {
             }
         };
         self.expect_keyword("INTO")?;
-        let table = self.parse_ident()?;
+        let table = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -1411,7 +1411,7 @@ impl Parser {
         } else {
             None
         };
-        let table = self.parse_ident()?;
+        let table = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -1477,7 +1477,7 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Statement> {
         self.advance(); // DELETE
         self.expect_keyword("FROM")?;
-        let from = self.parse_ident()?;
+        let from = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -3389,6 +3389,33 @@ impl Parser {
             Ok((Some(first), second))
         } else {
             Ok((None, first))
+        }
+    }
+
+    /// Parse a schema-qualified DML target name (`main.t`, `temp.t`, or
+    /// bare `t`) for INSERT/UPDATE/DELETE. A single-file engine has
+    /// exactly the `main` and `temp` namespaces, and both live in one
+    /// catalog (a main/temp name collision is impossible by
+    /// construction), so a KNOWN qualifier is validated and dropped —
+    /// the same resolution SELECT's FROM clause already applies. An
+    /// unknown schema is SQLite's prepare-time error, message included:
+    /// `UPDATE nosuch.t ...` -> "no such table: nosuch.t" (verified
+    /// against the real engine).
+    fn parse_dml_table_name(&mut self) -> Result<String> {
+        let first = self.parse_ident()?;
+        if self.peek().is_punct('.') {
+            self.advance();
+            let second = self.parse_ident()?;
+            let schema_lc = first.to_ascii_lowercase();
+            if schema_lc != "main" && schema_lc != "temp" {
+                return Err(Error::semantic(format!(
+                    "no such table: {}.{}",
+                    first, second
+                )));
+            }
+            Ok(second)
+        } else {
+            Ok(first)
         }
     }
 

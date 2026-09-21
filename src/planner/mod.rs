@@ -2412,7 +2412,8 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
         // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
         // multi-seek instead of a full scan + per-row IN evaluation (which
         // previously cost a 10k-row table scan for 10 literal rowids).
-        if let Some((in_plan, residual_conjuncts)) = try_rowid_in(&conjuncts, table, alias) {
+        if let Some((in_plan, residual_conjuncts)) = try_rowid_in(catalog, &conjuncts, table, alias)
+        {
             if residual_conjuncts.is_empty() {
                 return in_plan;
             }
@@ -2726,6 +2727,7 @@ fn try_index_in(
 /// Filter). Only handles the positive (non-negated) form; `NOT IN` keeps
 /// the generic Filter path (it must scan everything anyway).
 fn try_rowid_in(
+    catalog: &Catalog,
     conjuncts: &[Expr],
     table: &Arc<Table>,
     alias: &Option<String>,
@@ -2746,6 +2748,29 @@ fn try_rowid_in(
                     || name.eq_ignore_ascii_case("_rowid_")
                     || name.eq_ignore_ascii_case("oid");
                 if is_rowid_alias || is_rowid_pseudo {
+                    // SQLite's rowid-IN seek applies the SeekRowid
+                    // conversion per member (a BLOB/TEXT member just
+                    // never matches; a boundary REAL -2^63 is rejected —
+                    // ticket #3922). That is the plan SQLite chooses
+                    // UNANALYZED (verified: blob/text members still
+                    // seek, boundary REALs miss). With sqlite_stat1 the
+                    // costs are real: for a small analyzed table SQLite
+                    // prefers a full scan / a serving alias-index probe
+                    // — the GENERAL numeric comparison, where the
+                    // boundary REAL MATCHES the i64::MIN rowid
+                    // (stateful-fuzz seed 777023 case 28: analyzed
+                    // 28-row audit, `id IN (blob, text, -2^63e18)`
+                    // matched the i64::MIN row). Decline the seek plan
+                    // in that shape so the IN evaluates numerically.
+                    let has_unconvertible_literal = list.iter().any(|e| match e {
+                        Expr::Literal(v) => crate::executor::rowid_seek_value(v).is_none(),
+                        _ => false,
+                    });
+                    if has_unconvertible_literal
+                        && table_rows_hint(catalog, table) <= 64 * list.len().max(1) as i64
+                    {
+                        return None;
+                    }
                     let others: Vec<Expr> = conjuncts
                         .iter()
                         .enumerate()
@@ -5559,7 +5584,15 @@ fn scan_qualified_cols(table: &Arc<Table>, alias: &Option<String>) -> Vec<String
 
 /// Table row-count hint from `sqlite_stat1` (any index of the table
 /// carries the table's row count), else SQLite's unanalyzed default.
-fn table_rows_hint(catalog: &Catalog, table: &Table) -> i64 {
+pub(crate) fn table_rows_hint(catalog: &Catalog, table: &Table) -> i64 {
+    // Table-level stat row first ((tbl, NULL, n) — written when the table
+    // has NO full index; keyed by the table name in the stat1 map), then
+    // any index's stats (index rows carry the owning table's count too).
+    if let Some(s) = catalog.index_stats(&table.name) {
+        if s.rows > 0 {
+            return s.rows;
+        }
+    }
     catalog
         .indexes_on_table(&table.name)
         .iter()

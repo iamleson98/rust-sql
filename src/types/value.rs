@@ -173,12 +173,23 @@ fn hash_value_sql<H: Hasher>(v: &Value, state: &mut H) {
         }
         Value::Real(f) => {
             // Normalize integral doubles to their integer hash so they
-            // collide with Integer(n); normalize -0.0 to 0. The bound is
-            // 2^63 (not 2^53): EXACT integral doubles up to 2^63-1 are
-            // i64-equal to their Integer form (values_sql_equal's exact
-            // compare), and equal values MUST hash equal — Real(2^62)
-            // and Integer(2^62) are one key under SQL semantics.
-            if f.is_finite() && *f == f.trunc() && f.abs() < 9223372036854775808.0 {
+            // collide with Integer(n); normalize -0.0 to 0. The range is
+            // [-2^63, 2^63) — mirroring int_float_compare's guarded span
+            // EXACTLY: a REAL in that range whose truncation is itself has
+            // an exact i64 form that compares Equal (values_sql_equal) to
+            // the Integer, so they MUST share a hash. The LOWER bound is
+            // INCLUSIVE: Real(-9223372036854775808.0) is exactly i64::MIN
+            // and compares Equal to Integer(i64::MIN) — excluding it
+            // (the old `f.abs() < 2^63` form) made two equal values hash
+            // differently, silently dropping rows in every hash-keyed
+            // path (hash joins keyed on a rowid-alias vs REAL pair at
+            // the boundary — stateful-fuzz seed 777101 case 3). The
+            // upper bound stays EXCLUSIVE: +2^63 has no i64 form.
+            if f.is_finite()
+                && *f == f.trunc()
+                && *f >= -9223372036854775808.0
+                && *f < 9223372036854775808.0
+            {
                 state.write_u8(1);
                 state.write_i64(*f as i64);
             } else {

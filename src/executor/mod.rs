@@ -1450,6 +1450,19 @@ impl<'a> ExecContext<'a> {
     /// Fast-path set_max_rowid for pre-lower-cased names. Updates the value
     /// in place when the key already exists instead of re-allocating the key
     /// String on every inserted row.
+    ///
+    /// PRECONDITION for the missing-key branch: `rowid` is KNOWN to be the
+    /// table's true max — i.e. it was auto-allocated (`true_max + 1`) or is
+    /// an explicit rowid beyond the previously scanned max. Every INSERT
+    /// entry point satisfies this via its statement-start
+    /// `get_or_scan_max_rowid_opt` consult (empty table ⇒ any first row is
+    /// the max). Callers that CANNOT prove it (rowid-MOVE paths) must use
+    /// [`raise_max_rowid_lc`] instead — populating a missing entry with a
+    /// sub-max guess poisons allocation (stateful-fuzz seed 777001: after
+    /// the delete-of-max invalidated the cache, a rowid-moving UPDATE
+    /// recorded its target 27 as the max although 39 survived; the next
+    /// auto INSERT allocated 28..30 where SQLite's rightmost+1 gives
+    /// 40..42).
     pub fn set_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
         if dbg_rowid() {
             eprintln!("DBG set_max {table_name_lc}={rowid}");
@@ -1502,6 +1515,31 @@ impl<'a> ExecContext<'a> {
         }
         self.max_rowids.insert(table_name_lc.to_string(), rowid);
         self.max_rowids_changed = true;
+    }
+
+    /// Monotonic RAISE of the cached max rowid that never populates a
+    /// MISSING entry: the caller cannot prove `rowid` is the table's true
+    /// max, so the next allocation must rescan (SQLite's OP_NewRowid reads
+    /// the tree's rightmost entry every time; a guessed cache value that is
+    /// below the true max allocates colliding or divergent rowids).
+    ///
+    /// Used by the rowid-MOVE paths (UPDATE of a rowid alias, FK child
+    /// rewrite): the moved-in rowid must still RAISE a stale-low cached
+    /// value (the deep-sweep duplicate-row class: a later auto INSERT in
+    /// the same transaction would otherwise reuse `target`), but a missing
+    /// entry must stay missing — typically it is missing precisely because
+    /// the move's own delete-of-max just invalidated it.
+    pub fn raise_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
+        if self.max_rowids.contains_key(table_name_lc)
+            || self.shared.max_rowids.contains_key(table_name_lc)
+        {
+            // An entry exists (local overlay or shared): the plain setter
+            // is a pure monotonic raise — exactly the wanted semantics.
+            self.set_max_rowid_lc(table_name_lc, rowid);
+        }
+        // No entry anywhere: leave the cache missing. The next
+        // `get_or_scan_max_rowid_opt` walks the tree and learns the TRUE
+        // max (rightmost entry), matching SQLite's per-allocation read.
     }
 
     /// Bind a positional parameter (the common `?` placeholder case).
@@ -2457,12 +2495,14 @@ fn fk_write_child_row(
                 ctx.set_table_root(&child.name, bt.root);
             }
         }
-        // The moved-in rowid RAISES the max-rowid cache (monotonic): a
-        // later auto-allocated INSERT in this transaction would otherwise
-        // reuse target and duplicate the row (found by the deep-sweep: an
-        // UPDATE moved a row to 26 past a stale cache of 22, the next
-        // trigger-fired INSERT allocated 23..27 and duplicated 26).
-        ctx.set_max_rowid_lc(&child.name.to_ascii_lowercase(), target);
+        // The moved-in rowid RAISES the max-rowid cache when one exists
+        // (monotonic — see the mirror comment in fk_write_child_row).
+        // It must NOT populate a MISSING entry: the move's own
+        // delete-of-max may have just invalidated it, and `target` can be
+        // below the surviving true max (a rowid-moving UPDATE to a lower
+        // id). SQLite allocates from the tree's rightmost entry; a
+        // guessed cache value diverges (stateful-fuzz seed 777001).
+        ctx.raise_max_rowid_lc(&child.name.to_ascii_lowercase(), target);
         for idx in &indexes {
             insert_index_entry(ctx, idx, child, new_crow, target)?;
         }
@@ -6815,10 +6855,17 @@ fn hash_sql_value<H: std::hash::Hasher>(v: &Value, state: &mut H) {
         }
         Value::Real(f) => {
             // Same normalization as types::value::hash_value_sql: EXACT
-            // integral doubles (up to 2^63, not 2^53) collide with their
+            // integral doubles in [-2^63, 2^63) collide with their
             // Integer form — they are one value under values_sql_equal's
-            // exact comparison, so they MUST share a hash.
-            if f.is_finite() && *f == f.trunc() && f.abs() < 9223372036854775808.0 {
+            // exact comparison, so they MUST share a hash. The lower
+            // bound is INCLUSIVE (Real(-2^63) == Integer(i64::MIN); the
+            // old `f.abs() < 2^63` excluded it and dropped boundary
+            // pairs from hash joins — stateful-fuzz seed 777101).
+            if f.is_finite()
+                && *f == f.trunc()
+                && *f >= -9223372036854775808.0
+                && *f < 9223372036854775808.0
+            {
                 state.write_u8(1);
                 state.write_i64(*f as i64);
             } else {
@@ -13386,6 +13433,29 @@ fn join_keys_match(
     true
 }
 
+/// Does `table` have a non-partial UNIQUE btree index whose LEADING
+/// column is the column at `col_pos`? (SQLite's "SEARCH t USING INDEX ix
+/// (col=?)" — a unique-equality probe with NUMERIC comparison semantics,
+/// which the planner prefers over a rowid seek whenever it exists.)
+fn unique_index_serves_eq_probe(ctx: &ExecContext<'_>, table: &Arc<Table>, col_pos: usize) -> bool {
+    let Some(col) = table.columns.get(col_pos) else {
+        return false;
+    };
+    for idx in ctx.catalog().indexes_on_table(&table.name) {
+        if idx.unique
+            && idx.partial_expr.is_none()
+            && idx.kind == crate::schema::IndexKind::Btree
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.expr.is_none() && c.name.eq_ignore_ascii_case(&col.name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn try_fused_scan_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -13509,7 +13579,7 @@ fn try_fused_scan_hash_join(
     // (inner) side; RIGHT — the LEFT (inner) side; FULL — never.
     let l_key_is_alias = l_table.rowid_alias == Some(l_keys[0]);
     let r_key_is_alias = r_table.rowid_alias == Some(r_keys[0]);
-    let rowid_seek_join = n_keys == 1
+    let mut rowid_seek_join = n_keys == 1
         && match join_type {
             crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross => {
                 l_key_is_alias ^ r_key_is_alias
@@ -13518,6 +13588,62 @@ fn try_fused_scan_hash_join(
             crate::sql::ast::JoinType::Right => l_key_is_alias && !r_key_is_alias,
             crate::sql::ast::JoinType::Full => false,
         };
+    // SQLite's DIRECTION rule for an INNER/CROSS join with one rowid-
+    // alias equi key — the rowid-seek direction applies ticket-#3922
+    // conversion (boundary REAL never finds the extreme rowid), the
+    // index-probe direction compares NUMERICALLY (the boundary pair
+    // Real(-2^63) = Integer(i64::MIN) MATCHES — stateful-fuzz seed
+    // 777101 case 3). Which direction SQLite plans:
+    //   1. Non-alias key UNINDEXED: the only index-backed plan seeks
+    //      the alias side (the unindexed inner full-scan is
+    //      catastrophic) — SEEK semantics, keep the gate.
+    //   2. Non-alias key covered by a non-partial UNIQUE btree index
+    //      (both directions index-backed): the OUTER side is the one
+    //      with the SMALLER row estimate (sqlite_stat1 when ANALYZE
+    //      ran, else the 2^20 unanalyzed default — verified: a stale
+    //      1-row stat1 flips SQLite to scan the alias side); an
+    //      estimate TIE keeps the SYNTACTIC LEFT as outer (verified
+    //      across unanalyzed size sweeps). Outer=alias side -> probe
+    //      the unique index (NUMERIC, DECLINE the gate); outer=
+    //      non-alias side -> SEEK the alias (keep).
+    // LEFT/RIGHT joins never reorder: the alias side is the inner side
+    // by construction and SQLite seeks it — the gate stays for those.
+    if rowid_seek_join
+        && matches!(
+            join_type,
+            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+        )
+    {
+        // Both directions index-backed? The NON-alias side's key needs
+        // the serving unique index (the alias side is seekable by
+        // definition — it's the rowid).
+        let non_alias_indexed = if l_key_is_alias {
+            unique_index_serves_eq_probe(ctx, r_table, r_keys[0])
+        } else {
+            unique_index_serves_eq_probe(ctx, l_table, l_keys[0])
+        };
+        if non_alias_indexed {
+            let outer_is_left = {
+                let l_rows = crate::planner::table_rows_hint(ctx.catalog(), l_table);
+                let r_rows = crate::planner::table_rows_hint(ctx.catalog(), r_table);
+                if l_rows == r_rows {
+                    true // tie: syntactic left is outer
+                } else {
+                    l_rows < r_rows // smaller estimate is outer
+                }
+            };
+            // Outer = the ALIAS side -> SQLite scans it and probes the
+            // non-alias side's unique index: NUMERIC semantics.
+            let outer_is_alias = if l_key_is_alias {
+                outer_is_left
+            } else {
+                !outer_is_left
+            };
+            if outer_is_alias {
+                rowid_seek_join = false;
+            }
+        }
+    }
     // Cross-affinity equi keys (INTEGER col = TEXT col — needs the
     // NUMERIC fold) must NOT hash: the encoded order keys are
     // class-ordered and would never collide. DECLINE to the nested-loop
@@ -14616,7 +14742,23 @@ fn exec_hash_join(
                 // build keys (different storage classes never compare
                 // equal), so they are non-matches, not lookups.
                 Some(Value::Integer(iv)) => {
-                    u64_probe_key = crate::types::value::double_order_key(*iv as f64)
+                    // Exact-representability gate: an INTEGER beyond f64
+                    // precision ROUNDS in `as f64`, and its key would land
+                    // on a REAL build key's slot (Integer(i64::MAX) ->
+                    // double_order_key(2^63)) — and pure-equi u64 hits
+                    // emit with NO verification (the fused path verifies;
+                    // this one does not). But such an INTEGER also equals
+                    // no REAL numerically (it has no exact f64 form) and
+                    // no small build INTEGER — it can match NOTHING in
+                    // u64_mode. No match, never a false one.
+                    let f = *iv as f64;
+                    if (-9223372036854775808.0..9223372036854775808.0).contains(&f)
+                        && (f as i64) == *iv
+                    {
+                        u64_probe_key = crate::types::value::double_order_key(f);
+                    } else {
+                        probe_null = true;
+                    }
                 }
                 Some(Value::Real(fv)) => u64_probe_key = crate::types::value::double_order_key(*fv),
                 Some(_) => probe_null = true,
@@ -19482,7 +19624,18 @@ fn exec_insert_one_row(
     }
     ctx.last_insert_rowid = rowid;
     ctx.changes += 1;
-    ctx.set_max_rowid_lc(table_name_lc, rowid);
+    // Cache maintenance: populate a MISSING entry only when `rowid` is
+    // PROVEN to be the table's true max — auto-allocated (true_max + 1 at
+    // allocation time; later conflict-deletes only lower the true max) or
+    // explicitly beyond the scanned max. An explicit rowid WITHIN the old
+    // range (OR REPLACE targets, low explicit ids) raises only: a missing
+    // entry here typically means a delete-of-max invalidated it mid-
+    // statement, and the true max is unknown without a rescan.
+    if rowid_was_autogenerated || rowid_is_fresh_beyond_max {
+        ctx.set_max_rowid_lc(table_name_lc, rowid);
+    } else {
+        ctx.raise_max_rowid_lc(table_name_lc, rowid);
+    }
     // Statement journal (here rather than in the callers so the GENERIC
     // loop and the literal fast path both journal): this row has LANDED.
     // If a later row of the owning statement fails, the api layer's
@@ -19605,6 +19758,78 @@ fn exec_upsert_row(
             // Rowid alias must stay consistent (it's the B+tree key).
             if let Some(idx) = table.rowid_alias {
                 new_row[idx] = Value::Integer(existing_rowid);
+            }
+
+            // UNIQUE-index enforcement for the MERGED row: in SQLite the
+            // DO UPDATE is a full UPDATE — every unique index on the
+            // table must accept the row's NEW key. The insert-path probe
+            // (which routed us here) only checked the PROPOSED row's
+            // keys; a SET that moves the surviving row onto ANOTHER
+            // row's unique key must abort with SQLite's exact message
+            // (stateful-fuzz seed 777023 case 1: `ON CONFLICT(id) DO
+            // UPDATE SET note=excluded.note` with note's value held by
+            // a different row — SQLite rejected, we accepted and left
+            // two rows sharing the key).
+            for st in index_states.iter() {
+                if !st.idx.unique {
+                    continue;
+                }
+                // NULL keys are exempt (SQLite: NULLs are distinct in
+                // UNIQUE indexes).
+                if index_key_has_null(&st.idx, table, &new_row) {
+                    continue;
+                }
+                // Partial index: only rows matching the WHERE predicate
+                // claim an entry. A row LEAVING the predicate drops its
+                // entry (maintenance below) and claims nothing.
+                let (old_in, new_in) = partial_membership_pair(
+                    &st.idx,
+                    table,
+                    &old_row,
+                    &new_row,
+                    &ctx.params,
+                    &ctx.named_params,
+                );
+                if !new_in {
+                    continue;
+                }
+                // Keys the merged row CLAIMS that it does not already
+                // hold (multi-entry keys: set difference).
+                let old_keys =
+                    crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
+                let new_keys =
+                    crate::executor::index_am::index_entry_keys(&st.idx, table, &new_row)?;
+                let has_claim = new_keys
+                    .iter()
+                    .any(|k| !old_in || !old_keys.iter().any(|ok| ok == k));
+                if !has_claim {
+                    continue;
+                }
+                let mut ibt = Btree::new(ctx.pager, st.root, true);
+                let mut conflict = false;
+                for key in &new_keys {
+                    if old_in && old_keys.iter().any(|ok| ok == key) {
+                        continue; // retained own entry — not a claim
+                    }
+                    let matches = ibt.lookup_index(key)?;
+                    if matches.iter().any(|&rid| rid != existing_rowid) {
+                        conflict = true;
+                        break;
+                    }
+                }
+                if conflict {
+                    let cols = st
+                        .idx
+                        .columns
+                        .iter()
+                        .map(|c| format!("{}.{}", table.name, c.name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::constraint(format!(
+                        "UNIQUE constraint failed: {}",
+                        cols
+                    )));
+                }
             }
 
             // BEFORE UPDATE triggers: an upserted row IS an update —
@@ -20190,12 +20415,16 @@ fn apply_rowid_alias_move(
             ctx.set_table_root(&table.name, bt.root);
         }
     }
-    // The moved-in rowid RAISES the max-rowid cache (monotonic — see the
-    // mirror comment in fk_write_child_row): without this, a later
-    // auto-allocated INSERT reuses `target` and DUPLICATES the row
-    // (deep-sweep: row moved 8→26 past a stale cache of 22; the next
-    // trigger-fired INSERTs took 23..27 and duplicated 26).
-    ctx.set_max_rowid_lc(&table.name.to_ascii_lowercase(), target);
+    // The moved-in rowid RAISES an existing max-rowid cache entry
+    // (monotonic — the deep-sweep duplicate-row class: without this, a
+    // later auto-allocated INSERT reuses `target` and DUPLICATES the
+    // row). A MISSING entry must stay missing: the move's own
+    // delete-of-max may have just invalidated it and `target` can be
+    // below the surviving true max — populating it would poison
+    // allocation (stateful-fuzz seed 777001: target 27 recorded as max
+    // while 39 survived; next auto INSERT took 28 where SQLite's
+    // rightmost+1 gives 40).
+    ctx.raise_max_rowid_lc(&table.name.to_ascii_lowercase(), target);
     for idx in &indexes {
         insert_index_entry(ctx, idx, table, new_row, target)?;
     }
@@ -22685,30 +22914,18 @@ fn try_streaming_update(
         // visible once a size-changing UPDATE grew the tree past a split
         // (~250+ rows on 4 KiB pages) — every journal mode.
         root = new_root;
-        // AFTER UPDATE triggers: NEW = the post-change row, OLD = the
-        // pre-change row (decoded from the stash when present; otherwise
-        // we can't reconstruct it — triggers on indexed-SET updates always
-        // have the stash since needs_old_payload is true for them).
-        if has_update_triggers {
-            let old_row_v: Option<Vec<Value>> = old_payload_opt
-                .and_then(|op| decode_row(op, n_cols, *rowid, table.rowid_alias).ok());
-            let new_row_v = decode_row(new_payload, n_cols, *rowid, table.rowid_alias).ok();
-            if let (Some(old_r), Some(new_r)) = (old_row_v, new_row_v) {
-                let changed_cols: Vec<String> = assignments
-                    .iter()
-                    .map(|(idx, _)| table.columns[*idx].name.clone())
-                    .collect();
-                crate::executor::triggers::fire_triggers(
-                    ctx,
-                    table,
-                    &crate::sql::ast::TriggerEvent::Update(changed_cols),
-                    crate::sql::ast::TriggerWhen::After,
-                    Some(&new_r),
-                    Some(&old_r),
-                    &table.col_names,
-                )?;
-            }
-        }
+        // Index maintenance — BEFORE the AFTER UPDATE triggers (SQLite's
+        // VDBE order: old keys deleted, table row rewritten, new keys
+        // inserted, THEN the trigger runs). Ordering is also a
+        // statement-atomicity contract: the undo journal's Updated
+        // replay assumes the CURRENT payload's entries are live in the
+        // indexes when a LATER failure replays — firing the trigger
+        // first left a window where a trigger-body error rolled the row
+        // back but its index entries had never been written, so the
+        // replay's re-insert of the OLD keys DUPLICATED them
+        // (stateful-fuzz seed 777101 case 36: "index ix10 entries out
+        // of order or duplicated").
+        //
         // Index maintenance — only on indexes whose key actually changed.
         // The old/new keys are computed HERE and handed straight to the
         // B+tree (the previous code called delete_index_entry /
@@ -22787,6 +23004,30 @@ fn try_streaming_update(
                         ctx.set_index_root(&idx.name, ibt.root);
                     }
                 }
+            }
+        }
+        // AFTER UPDATE triggers: NEW = the post-change row, OLD = the
+        // pre-change row (decoded from the stash when present; otherwise
+        // we can't reconstruct it — triggers on indexed-SET updates always
+        // have the stash since needs_old_payload is true for them).
+        if has_update_triggers {
+            let old_row_v: Option<Vec<Value>> = old_payload_opt
+                .and_then(|op| decode_row(op, n_cols, *rowid, table.rowid_alias).ok());
+            let new_row_v = decode_row(new_payload, n_cols, *rowid, table.rowid_alias).ok();
+            if let (Some(old_r), Some(new_r)) = (old_row_v, new_row_v) {
+                let changed_cols: Vec<String> = assignments
+                    .iter()
+                    .map(|(idx, _)| table.columns[*idx].name.clone())
+                    .collect();
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    table,
+                    &crate::sql::ast::TriggerEvent::Update(changed_cols),
+                    crate::sql::ast::TriggerWhen::After,
+                    Some(&new_r),
+                    Some(&old_r),
+                    &table.col_names,
+                )?;
             }
         }
         ctx.changes += 1;

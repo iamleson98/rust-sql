@@ -118,17 +118,26 @@ pub(crate) fn plan_range_split(ctx: &ExecContext<'_>, root: u32) -> Result<Optio
     if ctx.in_transaction {
         return Ok(None);
     }
-    // Gate 3: cheap row estimate.
-    let bt = Btree::new(ctx.pager, root, false);
-    let max_rowid = bt.max_rowid_hint()?;
-    if max_rowid < min_rows {
+    // Gate 3: cheap row estimate. The count is the ACTUAL b-tree row
+    // count (a pure n_cells walk — no payload decode); the previous
+    // max_rowid heuristic mistook a 3-row table holding huge rowids
+    // (2^62-class explicit ids) for a quintillion-row table, engaged
+    // the parallel machinery on it, and its per-worker partial sums
+    // raised false "integer overflow" errors that the serial per-prefix
+    // evaluation never hits (stateful-fuzz seed 777001 case 39).
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let n_rows = bt.count_rows()? as i64;
+    if n_rows < min_rows {
         return Ok(None);
     }
+    // Cuts need the rowid SPAN, not the count (explicit rowids may be
+    // huge or negative regardless of the row count).
+    let max_rowid = bt.max_rowid_hint()?;
     // Worker count: hardware threads, scaled to the work size.
     let hw = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let by_rows = ((max_rowid / MIN_ROWS_PER_WORKER) as usize).max(1);
+    let by_rows = ((n_rows / MIN_ROWS_PER_WORKER) as usize).max(1);
     let n_workers = hw.min(by_rows).clamp(1, MAX_WORKERS);
     if n_workers < 2 {
         return Ok(None); // a single worker is just the serial path + spawn cost
@@ -359,6 +368,19 @@ pub(crate) fn try_parallel_fused_aggregate(
             fused_merge_acc(dst, src, spec.op);
         }
     }
+    // A merged SUM whose sticky overflow flag is set cannot be answered
+    // here: SQLite's "integer overflow" fires on the SERIAL per-prefix
+    // accumulation, and a worker-local (or merge-local) overflow neither
+    // implies nor denies it (an out-of-slice row can keep every serial
+    // prefix in range). DECLINE — the serial fused machine re-runs the
+    // whole aggregate with exact prefix semantics (stateful-fuzz seed
+    // 777001 case 39: slice-local [2^62, 2^62+8] overflowed where the
+    // serial order, starting from -9e15, never did).
+    for (acc, spec) in accs.iter().zip(plan.specs.iter()) {
+        if acc.int_overflow && matches!(spec.op, FusedOp::Sum) {
+            return Ok(None);
+        }
+    }
     Ok(Some(fused_finalize(aggregates, &accs)?))
 }
 
@@ -578,6 +600,15 @@ pub(crate) fn try_parallel_distinct_aggregate(
         Some(s) => s,
         None => return Ok(None),
     };
+    // A merged SUM with its sticky overflow flag set cannot be answered
+    // here (SQLite raises on the SERIAL per-prefix accumulation; the
+    // worker partials' order differs — a false error AND a missed one
+    // are both possible). DECLINE: the serial path re-runs exactly.
+    for (i, state) in states.iter().enumerate() {
+        if agg_funcs[i] == AggFunc::Sum && state.int_overflow {
+            return Ok(None);
+        }
+    }
     Ok(Some(super::finish_no_group_by(
         aggregates,
         states,
@@ -776,6 +807,11 @@ pub(crate) fn try_parallel_groupby_selective(
     // display form); re-folding at the merge reproduces the serial
     // grouper's groups AND its representatives exactly.
     merged.set_key_collations(key_collations.to_vec());
+    // Sticky SUM-overflow detection (see try_parallel_fused_aggregate):
+    // any group's merged SUM state with int_overflow set makes the
+    // parallel answer unusable — SQLite's error decision depends on the
+    // SERIAL per-prefix accumulation. Decline to the serial grouper.
+    let mut sum_overflow = false;
     for g in groupers {
         let mut iter = g.into_group_iter();
         while let Some((keys, states)) = iter.next_group() {
@@ -791,8 +827,14 @@ pub(crate) fn try_parallel_groupby_selective(
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),
                 );
+                if agg_funcs[i] == AggFunc::Sum && merged.state(dst_gi, i).int_overflow {
+                    sum_overflow = true;
+                }
             }
         }
+    }
+    if sum_overflow {
+        return Ok(None);
     }
     // Post-merge drain: the partial groupers freed during the loop above;
     // the post-scope drain ran while they were still live. See the
@@ -1186,6 +1228,9 @@ pub(crate) fn try_parallel_groupby_compiled(
     // Collated GROUP BY: partials emit first-seen ORIGINAL keys; the
     // merge re-folds them (bit-identical groups + representatives).
     merged.set_key_collations(key_collations.to_vec());
+    // Sticky SUM-overflow decline (see try_parallel_groupby_selective's
+    // merge): a group's merged SUM overflow cannot be decided here.
+    let mut sum_overflow = false;
     for g in groupers {
         let mut iter = g.into_group_iter();
         while let Some((keys, states)) = iter.next_group() {
@@ -1198,8 +1243,14 @@ pub(crate) fn try_parallel_groupby_compiled(
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),
                 );
+                if agg_funcs[i] == AggFunc::Sum && merged.state(dst_gi, i).int_overflow {
+                    sum_overflow = true;
+                }
             }
         }
+    }
+    if sum_overflow {
+        return Ok(None);
     }
     // The partial groupers free DURING the merge loop above (each `g`
     // moves out and drops at its iteration's end) — the post-scope drain
@@ -1931,6 +1982,18 @@ pub(crate) fn try_parallel_aggregate_rows(
             _ => return Ok(None), // GROUP_CONCAT / JSON / percentile: order-dependent
         }
     }
+    // SUM declines EARLY (rows still untouched): SQLite's "integer
+    // overflow" fires on the SERIAL per-prefix accumulation, and chunk-
+    // local partials can neither reproduce nor disprove it — after the
+    // chunks are consumed a decline is impossible, so Sum never enters
+    // this path (the serial loop owns its exact semantics; the scan-
+    // based parallel sum paths decline post-merge instead).
+    if aggregates
+        .iter()
+        .any(|a| AggFunc::from_name(&a.func) == AggFunc::Sum)
+    {
+        return Ok(None);
+    }
     // Args: COUNT(*) (None) or a compiled positional expression.
     let mut compiled_args: Vec<Option<crate::executor::predicate::CompiledExpr>> =
         Vec::with_capacity(aggregates.len());
@@ -2239,6 +2302,10 @@ pub(crate) fn try_parallel_groupby_rows(
         HashGrouper::with_aggs(n_aggs)
     };
     merged.set_key_collations(key_collations.to_vec());
+    // Sticky SUM-overflow decline (see try_parallel_groupby_selective):
+    // the rows are only BORROWED here (workers read slices), so a
+    // post-merge decline leaves them intact for the serial loop.
+    let mut sum_overflow = false;
     for g in partials {
         let mut iter = g.into_group_iter();
         while let Some((keys, states)) = iter.next_group() {
@@ -2254,8 +2321,14 @@ pub(crate) fn try_parallel_groupby_rows(
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),
                 );
+                if agg_funcs[i] == AggFunc::Sum && merged.state(dst_gi, i).int_overflow {
+                    sum_overflow = true;
+                }
             }
         }
+    }
+    if sum_overflow {
+        return Ok(None);
     }
     // Post-merge drain (the compiled path's rationale).
     reclaim_worker_heaps();

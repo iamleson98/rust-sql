@@ -1222,3 +1222,32 @@ fn stateful_random_workload_matches_sqlite() {
         }
     }
 }
+
+/// Regression pins from the 2026-09 fresh-seed campaign (40 cases x 400
+/// ops per seed, far beyond the default seed's sweep). Each (seed, case)
+/// pair below once DIVERGED from real SQLite and is now fixed; a case is
+/// independently seeded (`seed ^ case * PHI`), so pinning the exact case
+/// re-verifies the whole fixed script on every push. The engine classes
+/// covered: rowid-allocation cache poisoning after rowid-moving
+/// UPDATE/DELETE (raise_max_rowid_lc), parallel fused/SELECTIVE/compiled
+/// SUM sticky-overflow decline, upsert DO UPDATE secondary-UNIQUE
+/// enforcement, rowid IN-list boundary-REAL seek-vs-numeric planning,
+/// boundary-value hash joins (Real(-2^63) vs Integer(i64::MIN)) with the
+/// unique-index-probe join direction, and AFTER UPDATE trigger vs index
+/// maintenance ordering (undo-journal duplication window).
+#[test]
+fn stateful_fuzz_fresh_seed_pins() {
+    let pins: [(u64, usize); 6] = [
+        (777001, 3),  // auto rowids 28.. vs SQLite 40.. after a rowid move
+        (777001, 39), // parallel slice-local [2^62, 2^62+8] false overflow
+        (777023, 1),  // upsert DO UPDATE left two rows sharing a UNIQUE key
+        (777023, 28), // `id IN (blob, text, -2^63e18)` boundary REAL match
+        (777101, 3),  // Real(-2^63) = Integer(i64::MIN) join pair dropped
+        (777101, 36), // "index entries out of order or duplicated" on undo
+    ];
+    for (seed, case) in pins {
+        if let Err(msg) = run_case(seed, case, 400) {
+            panic!("seed {seed} case {case}: {msg}");
+        }
+    }
+}
