@@ -352,6 +352,13 @@ pub struct sqlite3_backup {
     _private: [u8; 0],
 }
 
+/// Incremental-blob handle (`sqlite3_blob`) — see the `sqlite3_blob_*`
+/// family below.
+#[repr(C)]
+pub struct sqlite3_blob {
+    _private: [u8; 0],
+}
+
 /// Prepared-statement handle (`sqlite3_stmt`).
 #[repr(C)]
 pub struct sqlite3_stmt {
@@ -2666,40 +2673,13 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         // before (the regimes cannot mix engine-side).
         let writes = stmt.is_write;
         if writes {
-            let plain_foreign = {
-                let owner = engine.tx_owner.load(Ordering::Acquire);
-                owner != 0 && owner != conn.id
-            };
-            let regime = engine.db.read().concurrent_regime_active();
-            // THIS connection's own concurrent transaction does not
-            // block its own statements (the owner writes through the
-            // armed identity — the engine routes them to its overlay).
-            let own_concurrent = conn.state.in_tx.load(Ordering::Acquire)
-                && conn.state.tx_concurrent.load(Ordering::Acquire);
-            // `PRAGMA journal_mode = <current mode>` is a pure read-back
-            // no-op (SQLite's OP_JournalMode takes no lock when the mode
-            // is unchanged): the standard arm-WAL-on-connect pattern
-            // must not wait out a foreign regime. The ENGINE's regime
-            // gate makes the actual no-op call (a real mode switch
-            // during the regime still fails BUSY there). A foreign PLAIN
-            // transaction keeps blocking it — a mode flip inside another
-            // connection's transaction is never safe.
+            let dml = matches!(stmt.kind, StmtKind::Dml { .. });
             let mode_pragma = matches!(
                 stmt.kind,
                 StmtKind::PragmaWrite { ref name } if name == "journal_mode"
             );
-            let joins_concurrent = regime
-                && !plain_foreign
-                && !conn.state.in_tx.load(Ordering::Acquire)
-                && matches!(stmt.kind, StmtKind::Dml { .. });
-            if (plain_foreign || (regime && !own_concurrent && !mode_pragma)) && !joins_concurrent {
-                if conn.state.shared_cache {
-                    return conn.set_err(SQLITE_LOCKED, "database table is locked");
-                }
-                let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
-                if !await_tx_slot(&engine, conn.id, timeout, true) {
-                    return conn.set_err(SQLITE_BUSY, "database is locked");
-                }
+            if let Some(rc) = write_gate(&engine, &conn, dml, mode_pragma) {
+                return rc;
             }
         }
         // Identity arming: same rationale as the tx-control arm above —
@@ -2751,6 +2731,53 @@ fn release_tx_hold(engine: &Arc<Engine>, conn: &Conn) {
         engine.tx_owner.store(0, Ordering::Release);
         unsafe { fire_unlock_waiters(engine) };
     }
+}
+
+/// The cross-connection write gate shared by `run_once`, `sqlite3_step`'s
+/// write path, and `sqlite3_blob_write`: decides whether THIS
+/// connection's write may proceed now (returns `None`) or must surface
+/// an error code (returns `Some(rc)`, the conn error already set).
+///
+/// `dml` — the statement is plain TABLE DML (INSERT/UPDATE/DELETE
+/// shaped): during a foreign BEGIN CONCURRENT regime it IMPLICITLY
+/// JOINS the regime as a one-statement concurrent transaction instead
+/// of waiting out the drain (the engine-side join; conflicts surface
+/// retriable SQLITE_BUSY_SNAPSHOT). `journal_mode_pragma` — the
+/// statement is a `PRAGMA journal_mode` write form (the no-op
+/// read-back must not wait out a regime; the ENGINE's gate makes the
+/// actual no-op call). Everything else — DDL, PRAGMA, a connection's
+/// own transaction-scoped shapes, foreign PLAIN holds — keeps
+/// SQLite's discipline: SQLITE_LOCKED immediately on shared-cache
+/// connections (unlock_notify is the sanctioned wait), BUSY-wait
+/// through busy_timeout on private-cache ones.
+fn write_gate(
+    engine: &Arc<Engine>,
+    conn: &Conn,
+    dml: bool,
+    journal_mode_pragma: bool,
+) -> Option<c_int> {
+    let plain_foreign = {
+        let owner = engine.tx_owner.load(Ordering::Acquire);
+        owner != 0 && owner != conn.id
+    };
+    let regime = engine.db.read().concurrent_regime_active();
+    // THIS connection's own concurrent transaction does not block its
+    // own statements (the owner writes through the armed identity —
+    // the engine routes them to its overlay).
+    let own_concurrent = conn.state.in_tx.load(Ordering::Acquire)
+        && conn.state.tx_concurrent.load(Ordering::Acquire);
+    let joins_concurrent =
+        regime && !plain_foreign && !conn.state.in_tx.load(Ordering::Acquire) && dml;
+    if (plain_foreign || (regime && !own_concurrent && !journal_mode_pragma)) && !joins_concurrent {
+        if conn.state.shared_cache {
+            return Some(conn.set_err(SQLITE_LOCKED, "database table is locked"));
+        }
+        let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
+        if !await_tx_slot(engine, conn.id, timeout, true) {
+            return Some(conn.set_err(SQLITE_BUSY, "database is locked"));
+        }
+    }
+    None
 }
 
 fn fire_commit_hook(conn: &Arc<Conn>) {
@@ -2923,37 +2950,13 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
                 // surface retriable SQLITE_BUSY_SNAPSHOT), so it skips
                 // the wait and steps straight through. DDL/PRAGMA and
                 // foreign PLAIN holds wait exactly as before.
-                let plain_foreign = {
-                    let owner = engine.tx_owner.load(Ordering::Acquire);
-                    owner != 0 && owner != conn.id
-                };
-                let regime = engine.db.read().concurrent_regime_active();
-                // THIS connection's own concurrent transaction does not
-                // block its own stepped statements (the owner's DML
-                // writes through the armed identity — the engine routes
-                // them to its overlay).
-                let own_concurrent = conn.state.in_tx.load(Ordering::Acquire)
-                    && conn.state.tx_concurrent.load(Ordering::Acquire);
-                // journal_mode no-op read-back: see run_once's gate —
-                // the engine's regime gate decides the no-op.
+                let dml = matches!(s.kind, StmtKind::Dml { .. });
                 let mode_pragma = matches!(
                     s.kind,
                     StmtKind::PragmaWrite { ref name } if name == "journal_mode"
                 );
-                let joins_concurrent = regime
-                    && !plain_foreign
-                    && !conn.state.in_tx.load(Ordering::Acquire)
-                    && matches!(s.kind, StmtKind::Dml { .. });
-                if (plain_foreign || (regime && !own_concurrent && !mode_pragma))
-                    && !joins_concurrent
-                {
-                    if conn.state.shared_cache {
-                        return conn.set_err(SQLITE_LOCKED, "database table is locked");
-                    }
-                    let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
-                    if !await_tx_slot(&engine, conn.id, timeout, true) {
-                        return conn.set_err(SQLITE_BUSY, "database is locked");
-                    }
+                if let Some(rc) = write_gate(&engine, &conn, dml, mode_pragma) {
+                    return rc;
                 }
                 // ── DML / write statements: per-step write lock ────────
                 // (unchanged — writes serialize on the engine write lock,
@@ -3583,6 +3586,16 @@ pub unsafe extern "C" fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, i: c_int) 
         Some(Value::Blob(b)) if !b.is_empty() => {
             s.blob_buf.clear();
             s.blob_buf.extend_from_slice(&b);
+            s.blob_buf.as_ptr() as *const c_void
+        }
+        // SQLite's column_blob CONVERTS: a TEXT result yields its UTF-8
+        // bytes (the column accessors are interchangeable by design —
+        // before this, column_blob on a TEXT column returned NULL, a
+        // divergence from every SQLite binding that probes values
+        // blob-first).
+        Some(Value::Text(t)) if !t.as_bytes().is_empty() => {
+            s.blob_buf.clear();
+            s.blob_buf.extend_from_slice(t.as_bytes());
             s.blob_buf.as_ptr() as *const c_void
         }
         _ => std::ptr::null(),
@@ -4770,6 +4783,315 @@ pub unsafe extern "C" fn sqlite3_backup_finish(p: *mut sqlite3_backup) -> c_int 
     }
     let b = unsafe { Box::from_raw(p as *mut Backup) };
     b.err
+}
+
+// ---------------------------------------------------------------------------
+// Incremental blob I/O (sqlite3_blob_*)
+// ---------------------------------------------------------------------------
+//
+// SQLite's incremental-blob family, on the engine's row machinery:
+//
+// - `blob_open` snapshots the row's TEXT/BLOB value into the handle
+//   (one full read at open — the engine's overflow chains already
+//   stream without buffering whole payloads); reads serve the snapshot
+//   at O(1) per call; the handle sees its own writes (applied to the
+//   snapshot immediately).
+// - `blob_write` applies the mutated bytes to the DATABASE through the
+//   normal UPDATE statement path — the write participates in the
+//   connection's transaction (a plain BEGIN, a BEGIN CONCURRENT regime
+//   through the implicit join, or autocommit), is visible to other
+//   connections per those semantics, and honors the same cross-
+//   connection write gate as every other write (`write_gate`). The
+//   whole-blob UPDATE is the documented perf difference from SQLite's
+//   in-place overflow-page patching.
+// - `blob_bytes`, `blob_reopen` (re-snapshot at another row), and
+//   `blob_close` follow the C contract.
+//
+// Engine limitation (documented): TEXT values are UTF-8 in this engine;
+// writing non-UTF-8 bytes through a TEXT column's blob handle returns
+// SQLITE_ERROR (SQLite permits arbitrary bytes in TEXT).
+
+/// The live blob handle behind `sqlite3_blob*`.
+struct BlobHandle {
+    conn: Arc<Conn>,
+    engine: Arc<Engine>,
+    /// Quoted, injection-safe table/column for the write-back UPDATE.
+    table_q: String,
+    column_q: String,
+    /// Current row (reopen moves it).
+    rowid: i64,
+    /// True when opened with a non-zero flags word (read-write).
+    writable: bool,
+    /// The snapshot — open-time bytes with this handle's writes applied.
+    data: Vec<u8>,
+    /// Write back as TEXT (vs BLOB) — the column's value class at open.
+    is_text: bool,
+}
+
+/// Double-quoted SQL identifier with `"` escaping.
+fn qident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Read the row's column value for a blob handle: `Err(rc)` with the
+/// conn error set on every SQLite-shaped failure (missing table /
+/// column surfaces the engine's own error text; a missing row and a
+/// non-blob value are SQLITE_ERROR).
+fn blob_read_value(
+    engine: &Arc<Engine>,
+    conn: &Conn,
+    table_q: &str,
+    column_q: &str,
+    rowid: i64,
+) -> Result<(Vec<u8>, bool), c_int> {
+    let sql = format!("SELECT {column_q} FROM {table_q} WHERE rowid = ?");
+    let rows = {
+        let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
+        let rd = engine.db.read();
+        match rd.query(&sql, [rustqlite::Value::Integer(rowid)]) {
+            Ok(r) => r,
+            Err(e) => return Err(set_conn_err(conn, &e)),
+        }
+    };
+    let value = match rows.into_iter().next() {
+        Some(row) => row.into_iter().next().unwrap_or(rustqlite::Value::Null),
+        None => {
+            return Err(conn.set_err(SQLITE_ERROR, "no such row"));
+        }
+    };
+    match value {
+        rustqlite::Value::Blob(b) => Ok((b, false)),
+        rustqlite::Value::Text(t) => Ok((t.as_bytes().to_vec(), true)),
+        rustqlite::Value::Null => Err(conn.set_err(SQLITE_ERROR, "cannot open value of type NULL")),
+        rustqlite::Value::Integer(_) => {
+            Err(conn.set_err(SQLITE_ERROR, "cannot open value of type INTEGER"))
+        }
+        rustqlite::Value::Real(_) => {
+            Err(conn.set_err(SQLITE_ERROR, "cannot open value of type REAL"))
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_blob_open(
+    db: *mut sqlite3,
+    z_db: *const c_char,
+    z_table: *const c_char,
+    z_column: *const c_char,
+    i_row: i64,
+    flags: c_int,
+    pp_blob: *mut *mut sqlite3_blob,
+) -> c_int {
+    if pp_blob.is_null() {
+        return SQLITE_MISUSE;
+    }
+    *pp_blob = std::ptr::null_mut();
+    let Some(conn) = (db as *const Conn).as_ref() else {
+        return SQLITE_MISUSE;
+    };
+    if !z_db.is_null() {
+        let s = std::ffi::CStr::from_ptr(z_db).to_bytes();
+        if !s.is_empty() && !s.eq_ignore_ascii_case(b"main") {
+            return conn.set_err(
+                SQLITE_ERROR,
+                "unknown database name (only main is supported)",
+            );
+        }
+    }
+    let Some(table) = cstr_opt(z_table) else {
+        return conn.set_err(SQLITE_MISUSE, "invalid table name");
+    };
+    let Some(column) = cstr_opt(z_column) else {
+        return conn.set_err(SQLITE_MISUSE, "invalid column name");
+    };
+    let Some(engine) = &conn.engine else {
+        return conn.set_err(SQLITE_ERROR, "connection is in error state");
+    };
+    let writable = flags != 0;
+    if writable && conn.readonly {
+        return conn.set_err(SQLITE_READONLY, "attempt to write a readonly database");
+    }
+    let table_q = qident(&table);
+    let column_q = qident(&column);
+    let (data, is_text) = match blob_read_value(engine, conn, &table_q, &column_q, i_row) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let h = Box::new(BlobHandle {
+        conn: conn_arc_of(conn),
+        engine: engine.clone(),
+        table_q,
+        column_q,
+        rowid: i_row,
+        writable,
+        data,
+        is_text,
+    });
+    *pp_blob = Box::into_raw(h) as *mut sqlite3_blob;
+    SQLITE_OK
+}
+
+/// The `Arc<Conn>` behind a `sqlite3*` borrowed reference (bumps the
+/// count by exactly one, leaving the C side's own reference intact).
+fn conn_arc_of(conn: &Conn) -> Arc<Conn> {
+    let borrowed = unsafe { Arc::from_raw(conn as *const Conn) };
+    let cloned = borrowed.clone();
+    std::mem::forget(borrowed);
+    cloned
+}
+
+/// `Some(CStr text)` for a non-NULL pointer, `None` for NULL/invalid.
+fn cstr_opt(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_blob_read(
+    p: *mut sqlite3_blob,
+    z: *mut c_void,
+    n: c_int,
+    i_offset: c_int,
+) -> c_int {
+    let Some(h) = (p as *const BlobHandle).as_ref() else {
+        return SQLITE_MISUSE;
+    };
+    if n < 0 || i_offset < 0 {
+        return h
+            .conn
+            .set_err(SQLITE_ERROR, "invalid blob read offset or size");
+    }
+    let off = i_offset as usize;
+    let len = n as usize;
+    if off + len > h.data.len() {
+        return h.conn.set_err(SQLITE_ERROR, "blob read out of range");
+    }
+    if len > 0 {
+        if z.is_null() {
+            return h.conn.set_err(SQLITE_MISUSE, "invalid blob read buffer");
+        }
+        std::ptr::copy_nonoverlapping(h.data.as_ptr().add(off), z as *mut u8, len);
+    }
+    SQLITE_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_blob_write(
+    p: *mut sqlite3_blob,
+    z: *const c_void,
+    n: c_int,
+    i_offset: c_int,
+) -> c_int {
+    let Some(h) = (p as *mut BlobHandle).as_mut() else {
+        return SQLITE_MISUSE;
+    };
+    if !h.writable {
+        return h
+            .conn
+            .set_err(SQLITE_READONLY, "attempt to write a readonly blob");
+    }
+    if n < 0 || i_offset < 0 {
+        return h
+            .conn
+            .set_err(SQLITE_ERROR, "invalid blob write offset or size");
+    }
+    let off = i_offset as usize;
+    let len = n as usize;
+    if off + len > h.data.len() {
+        return h.conn.set_err(SQLITE_ERROR, "blob write out of range");
+    }
+    if len > 0 {
+        if z.is_null() {
+            return h.conn.set_err(SQLITE_MISUSE, "invalid blob write buffer");
+        }
+        std::ptr::copy_nonoverlapping(z as *const u8, h.data.as_mut_ptr().add(off), len);
+    }
+    // Write the whole (mutated) value back through the statement path —
+    // the same gate and transaction machinery as every other write.
+    let value = if h.is_text {
+        // Text::from_utf8 validates AND builds — invalid bytes in a
+        // TEXT column surface as SQLITE_ERROR (documented engine
+        // limitation: TEXT is UTF-8 here).
+        match rustqlite::types::Text::from_utf8(&h.data) {
+            Ok(t) => rustqlite::Value::Text(t),
+            Err(_) => {
+                return h.conn.set_err(
+                    SQLITE_ERROR,
+                    "cannot write non-UTF-8 bytes to a TEXT column through a blob handle",
+                );
+            }
+        }
+    } else {
+        rustqlite::Value::Blob(h.data.clone())
+    };
+    if let Some(rc) = write_gate(&h.engine, &h.conn, true, false) {
+        return rc;
+    }
+    let sql = format!(
+        "UPDATE {} SET {} = ? WHERE rowid = ?",
+        h.table_q, h.column_q
+    );
+    let before = h.engine.total_changes();
+    let result = {
+        let _id = rustqlite::ConnIdentityGuard::arm(h.conn.id as u64);
+        let mut w = h.engine.db.write();
+        w.execute(&sql, [value, rustqlite::Value::Integer(h.rowid)])
+    };
+    match result {
+        Ok(()) => {
+            let delta = h.engine.total_changes() - before;
+            h.conn.state.changes.store(delta, Ordering::Release);
+            h.conn
+                .state
+                .total_changes
+                .fetch_add(delta, Ordering::AcqRel);
+            // 0 rows affected = the row vanished mid-handle.
+            if delta == 0 {
+                return h.conn.set_err(SQLITE_ERROR, "no such row");
+            }
+            SQLITE_OK
+        }
+        Err(e) => set_conn_err(&h.conn, &e),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_blob_bytes(p: *mut sqlite3_blob) -> c_int {
+    let Some(h) = (p as *const BlobHandle).as_ref() else {
+        return 0;
+    };
+    h.data.len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_blob_reopen(p: *mut sqlite3_blob, i_row: i64) -> c_int {
+    let Some(h) = (p as *mut BlobHandle).as_mut() else {
+        return SQLITE_MISUSE;
+    };
+    match blob_read_value(&h.engine, &h.conn, &h.table_q, &h.column_q, i_row) {
+        Ok((data, is_text)) => {
+            h.rowid = i_row;
+            h.data = data;
+            h.is_text = is_text;
+            SQLITE_OK
+        }
+        Err(rc) => rc,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_blob_close(p: *mut sqlite3_blob) -> c_int {
+    if p.is_null() {
+        return SQLITE_MISUSE;
+    }
+    drop(unsafe { Box::from_raw(p as *mut BlobHandle) });
+    SQLITE_OK
 }
 
 // ---------------------------------------------------------------------------

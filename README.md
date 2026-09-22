@@ -71,7 +71,7 @@ let rows = db.query("SELECT name, age FROM users WHERE age > 28 ORDER BY age", [
 ### sqlx & sea-orm
 
 - **Native Rust driver** (`features = ["sqlx"]`): implements sqlx-core's `Database` traits directly — `Pool`, `query()/query_as()`, transactions, `fetch` streaming, migrations, 100% safe Rust, no FFI, no C toolchain. URL: `rustqlite://app.db`
-- **Drop-in `libsqlite3`** (`compat/`): the real `sqlite3_*` C ABI (129 symbols) + a `libsqlite3-sys` replacement — **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line; schema discovery, codegen, and `sqlx::migrate!` verified end to end (`sqlx-interop/`)
+- **Drop-in `libsqlite3`** (`compat/`): the real `sqlite3_*` C ABI (135 symbols) + a `libsqlite3-sys` replacement — **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line; schema discovery, codegen, and `sqlx::migrate!` verified end to end (`sqlx-interop/`)
 
 ## Performance vs SQLite
 
@@ -198,11 +198,11 @@ let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES (?) RETURNING 
 
 Latest CI numbers vs sqlx-sqlite (same sqlx API and pool options): INSERT + 3 binds **3.15x**, PK point lookup **4.39x**, GROUP BY fetch_all **1.84x**, 8-task concurrent **4.24x**, 8-conn reads **10.6x**, 1W+7R **1.93x**, mixed 80/20 parity (fsync floor). The mechanism: sqlx-sqlite ferries every command/row across a worker thread + FFI; the native driver executes inline against the `Send + Sync` engine core with batch-at-a-time streaming (the historical full-table stream row measured 18.4x). Full type surface (chrono, uuid, JSON, bool, blobs); snapshot isolation between connections; dropped connections roll back.
 
-**Drop-in C ABI**: `compat/` exports the `sqlite3_*` family (129 symbols) + a `libsqlite3-sys` replacement — unmodified sqlx 0.9 / sea-orm 2.0 / sea-orm-cli / `sqlx::migrate!` run via one `[patch.crates-io]` line; `sqlite3_serialize/deserialize` real; `sqlite3_backup_*` real (init/step/remaining/pagecount/finish — the destination file becomes an exact copy of the source, `:memory:` included); SQLite-exact error text + extended result codes; verified by the checked-in sea-orm app in `sqlx-interop/`.
+**Drop-in C ABI**: `compat/` exports the `sqlite3_*` family (135 symbols) + a `libsqlite3-sys` replacement — unmodified sqlx 0.9 / sea-orm 2.0 / sea-orm-cli / `sqlx::migrate!` run via one `[patch.crates-io]` line; `sqlite3_serialize/deserialize` real; `sqlite3_backup_*` real (init/step/remaining/pagecount/finish — the destination file becomes an exact copy of the source, `:memory:` included); `sqlite3_blob_*` real (open/read/write/bytes/reopen/close — incremental I/O over BLOB and TEXT columns, writes riding the normal transaction machinery incl. the concurrent regime's implicit join); SQLite-exact error text + extended result codes; verified by the checked-in sea-orm app in `sqlx-interop/`.
 
 ## Remaining gaps vs SQLite
 
-The honest ledger. Everything here is verifiable absence — `module_list`/`function_list`/`compile_options` report what is actually compiled in, the C ABI exports exactly its 129 symbols, and the fuzzers are seeded and reproducible. (No open correctness items right now: every pinned divergence class is closed and re-verified per push — the regression pins live in `tests/stateful_fuzz.rs` (`stateful_fuzz_fresh_seed_pins`), `tests/concurrent_reader_visibility.rs`, and the differential suites; fix histories are in `worklog.md`.)
+The honest ledger. Everything here is verifiable absence — `module_list`/`function_list`/`compile_options` report what is actually compiled in, the C ABI exports exactly its 135 symbols, and the fuzzers are seeded and reproducible. (No open correctness items right now: every pinned divergence class is closed and re-verified per push — the regression pins live in `tests/stateful_fuzz.rs` (`stateful_fuzz_fresh_seed_pins`), `tests/concurrent_reader_visibility.rs`, and the differential suites; fix histories are in `worklog.md`.)
 
 ### Performance gaps
 
@@ -231,7 +231,6 @@ The honest ledger. Everything here is verifiable absence — `module_list`/`func
 - **FTS3/FTS4/FTS5**: no `fts5` module/MATCH paths/tokenizers. Workaround: the tsvector/tsquery family + GIN indexes, `REGEXP`, prefix-`LIKE`/`GLOB`, or a trigger-maintained inverted table. The vtab callback protocol is complete — an FTS module can be a plugin.
 - **R*Tree / Geopoly**: not implemented. Workaround: B-tree-indexed `(min_x, max_x)` pairs + overlap predicates; GIST grid KNN for points.
 - **Session extension** (`sqlite3_session_*`/changesets/rebasing): not implemented. Workaround: the preupdate-hook event stream (fully real, differential-pinned).
-- **`sqlite3_blob_*` incremental blob I/O**: not exported — blobs read/write whole (overflow chains stream without buffering).
 - **`sqlite_stat4`**: stat1 only (SQLite's own default recommendation set).
 - **`dbstat` / `sqlite_dbdata` vtabs**: not shipped. Workaround: `PRAGMA page_count`/`freelist_count`/`integrity_check`/`engine_stats()`.
 - **ATTACH**: name-only round trip (single-database engine; no cross-database queries).

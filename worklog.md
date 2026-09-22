@@ -1003,3 +1003,19 @@ Work Log:
 Stage Summary:
 - The sqlite3_backup_* gap is CLOSED; the backup family is fully real (files and :memory:, both directions, progress + error contracts).
 - Native-WAL serialize/backup data-loss bug fixed engine-side (checkpoint before read).
+
+---
+Task ID: 37
+Agent: main (Super Z)
+Task: sqlite3_blob_* incremental blob I/O C API + a column_blob TEXT-conversion fix found by its tests.
+
+Work Log:
+- Extracted the cross-connection write gate into a shared `write_gate(engine, conn, dml, journal_mode_pragma)` helper — run_once, sqlite3_step's write path, and the new blob_write all route through the identical discipline (implicit concurrent join for plain DML, LOCKED/BUSY otherwise, journal_mode no-op pass-through).
+- The six-symbol blob family: blob_open (schema/table/column validation with the engine's own error text; missing row + non-blob value are SQLITE_ERROR; readonly handle + writable flags -> SQLITE_READONLY; snapshots the value — BLOB and TEXT both), blob_read (O(1) snapshot slices, bounds-checked), blob_write (snapshot mutation + the whole-value UPDATE through the normal statement path — the write_gate, identity arming, and the engine's transaction machinery: plain BEGIN, BEGIN CONCURRENT implicit join, or autocommit; total_changes-bracketed changes() bookkeeping; 0-row update = "no such row"), blob_bytes, blob_reopen (re-snapshot), blob_close. Identifier quoting via qident. Engine limitation documented: TEXT is UTF-8 — non-UTF-8 blob writes to a TEXT column return SQLITE_ERROR.
+- COMPAT FIX found by the TEXT-column test: sqlite3_column_blob on a TEXT result returned NULL — SQLite's column accessors CONVERT (column_blob on TEXT yields the UTF-8 bytes). Added the Text arm (every blob-first-probing binding benefits).
+- Tests (compat/rustqlite-compat/tests/blob.rs, 4 suites): 64KB overflow round trip (reads at offsets, in-range + out-of-range, mid-blob write, handle self-read, DB visibility, reopen-of-file durability), TEXT column + reopen (incl. missing-row reopen error), the full error contract (missing row/column, non-blob value, readonly write, out-of-range writes, failed-write leaves value untouched), transaction semantics (plain BEGIN rolls the blob write back; a write during a foreign BEGIN CONCURRENT regime JOINS it — durable immediately, visible to a third handle, owner's uncommitted row invisible to the writer).
+- Verification: compat matrix green (4 blob + 8 backup + 8 concurrent_join + 55 abi + the rest), clippy -D warnings clean (compat all-targets), fmt clean. Symbol count 129 -> 135 (README x3 + the gap bullet removed).
+
+Stage Summary:
+- The sqlite3_blob_* gap is CLOSED — incremental I/O on BLOB and TEXT, writes riding every transaction shape incl. the concurrent regime.
+- column_blob-on-TEXT conversion divergence fixed.
