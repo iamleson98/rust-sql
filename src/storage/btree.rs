@@ -462,6 +462,98 @@ impl Cell {
         }
     }
 
+    /// Encode the cell into a FIXED-SIZE stack buffer (no allocation) —
+    /// the hot-path sibling of [`Self::encode`] for callers that already
+    /// hold `encoded_size()` bytes of scratch. Writes exactly
+    /// `self.encoded_size()` bytes; panics are impossible for a buffer of
+    /// that length (every branch writes a fixed, pre-computed prefix).
+    pub fn encode_into(&self, out: &mut [u8]) {
+        let mut w = 0usize;
+        let mut buf = [0u8; 10];
+        macro_rules! put {
+            ($bytes:expr) => {{
+                let b: &[u8] = $bytes;
+                out[w..w + b.len()].copy_from_slice(b);
+                w += b.len();
+            }};
+        }
+        match self {
+            Cell::TableLeaf { rowid, payload } => {
+                let k = varint::encode_signed(*rowid, &mut buf);
+                put!(&buf[..k]);
+                let p = varint::encode(payload.len() as u64, &mut buf);
+                put!(&buf[..p]);
+                put!(payload);
+            }
+            Cell::TableLeafOverflow {
+                rowid,
+                total,
+                local,
+                overflow,
+            } => {
+                let k = varint::encode_signed(*rowid, &mut buf);
+                put!(&buf[..k]);
+                let p = varint::encode(*total, &mut buf);
+                put!(&buf[..p]);
+                put!(local);
+                put!(&overflow.to_be_bytes());
+            }
+            Cell::TableInterior { left_child, key } => {
+                put!(&left_child.to_be_bytes());
+                let k = varint::encode_signed(*key, &mut buf);
+                put!(&buf[..k]);
+            }
+            Cell::IndexLeaf { key, rowid } => {
+                let r = varint::encode_signed(*rowid, &mut buf);
+                put!(&buf[..r]);
+                let kl = varint::encode(key.len() as u64, &mut buf);
+                put!(&buf[..kl]);
+                put!(key);
+            }
+            Cell::IndexLeafOverflow {
+                rowid,
+                total,
+                local,
+                overflow,
+            } => {
+                let r = varint::encode_signed(*rowid, &mut buf);
+                put!(&buf[..r]);
+                let kl = varint::encode(*total, &mut buf);
+                put!(&buf[..kl]);
+                put!(local);
+                put!(&overflow.to_be_bytes());
+            }
+            Cell::IndexInterior {
+                left_child,
+                key,
+                rowid,
+            } => {
+                put!(&left_child.to_be_bytes());
+                let r = varint::encode_signed(*rowid, &mut buf);
+                put!(&buf[..r]);
+                let kl = varint::encode(key.len() as u64, &mut buf);
+                put!(&buf[..kl]);
+                put!(key);
+            }
+            Cell::IndexInteriorOverflow {
+                left_child,
+                rowid,
+                total,
+                local,
+                overflow,
+            } => {
+                put!(&left_child.to_be_bytes());
+                let r = varint::encode_signed(*rowid, &mut buf);
+                put!(&buf[..r]);
+                let kl = varint::encode(*total, &mut buf);
+                put!(&buf[..kl]);
+                put!(local);
+                put!(&overflow.to_be_bytes());
+            }
+        }
+        debug_assert_eq!(w, self.encoded_size());
+    }
+
     /// Decode a cell from a byte buffer at a given page type.
     /// `page_size` is needed to derive the overflow local-size for spilled
     /// payloads (the split point is a pure function of the length).
@@ -1655,6 +1747,106 @@ pub enum LookupResult {
     NotFound,
 }
 
+/// A validated right-most-leaf append hint.
+///
+/// Pinning `(page, serial, epoch)` captures the exact page OBJECT and its
+/// exact mutation state at pin time (see `Page`'s docs). Re-validating all
+/// three on every use certifies the page is byte-identical to what was
+/// pinned — and since a right-most leaf can only STOP being the right-most
+/// leaf by being structurally mutated (a split rewrites it), an
+/// identity+state-valid pin whose last cell orders below the incoming
+/// entry is a sound APPEND PROOF: no re-pin walk down the right edge is
+/// ever needed to keep the hint exact. Any divergence — split, cell
+/// insert/delete, rollback restore, page re-read, VACUUM rebuild —
+/// changes `serial` or `epoch` and the fast path declines on its own.
+///
+/// This is what lets scattered-key streams keep their hints: an
+/// out-of-order entry simply declines against the leaf's own last cell,
+/// takes the general insert path, and leaves the (untouched, still
+/// valid) hint in place for the next row. The historical contract —
+/// re-walk the right edge after every general insert — cost a full
+/// root-to-leaf descent per scattered index entry (3 of S12's 5
+/// secondary indexes are permanently non-appendable: they paid it on
+/// every row).
+#[derive(Debug, Clone, Copy)]
+pub struct AppendHint {
+    pub page: PageId,
+    pub serial: u64,
+    pub epoch: u32,
+    /// Stream state for adaptive append suppression: consecutive
+    /// out-of-order declines against the pinned leaf. Once this crosses
+    /// `APPEND_SUPPRESS_AFTER`, the append ATTEMPT is skipped (the
+    /// general insert is exactly what the attempt would fall back to) —
+    /// a permanently scattered stream (`a = (i*7919)%N`, `d = i%1000`)
+    /// then pays ZERO fast-path overhead instead of one declined
+    /// fetch+lock+last-cell-decode per entry.
+    pub miss_streak: u16,
+    /// Rows until the next append attempt while suppressed (0 = attempt
+    /// on the next insert). Geometric-ish probing: an ascending stretch
+    /// that resumes after a scattered prefix re-engages the fast path
+    /// within `APPEND_PROBE_EVERY` rows.
+    pub probe_in: u16,
+}
+
+/// Out-of-order declines after which the append attempt is suppressed.
+const APPEND_SUPPRESS_AFTER: u16 = 6;
+/// Probe interval (rows between append attempts) while suppressed.
+const APPEND_PROBE_EVERY: u16 = 64;
+
+impl AppendHint {
+    /// A fresh pin of `page` with a clean stream state.
+    #[inline]
+    fn fresh(page: PageId, serial: u64, epoch: u32) -> Self {
+        Self {
+            page,
+            serial,
+            epoch,
+            miss_streak: 0,
+            probe_in: 0,
+        }
+    }
+
+    /// Carry the stream state onto a re-pinned leaf (structural
+    /// fallbacks change the pin, not the stream's shape).
+    #[inline]
+    fn carry_stream_state_from(&self, other: &AppendHint) -> Self {
+        Self {
+            page: self.page,
+            serial: self.serial,
+            epoch: self.epoch,
+            miss_streak: other.miss_streak,
+            probe_in: other.probe_in,
+        }
+    }
+}
+
+impl AppendHint {
+    /// Is this hint still pinning `page`'s current object state?
+    /// Called with the page lock held.
+    #[inline]
+    fn still_pins(&self, page: &Page) -> bool {
+        page.serial == self.serial && page.epoch == self.epoch
+    }
+}
+
+/// Outcome of a hinted append attempt against one pinned leaf.
+enum AppendTry {
+    /// Appended; carries the refreshed hint (post-`touch` epoch) for the
+    /// NEXT entry of the stream.
+    Appended(AppendHint),
+    /// The entry is not past the pinned leaf's OWN last cell — a
+    /// scattered stream. The pinned leaf was not modified by this
+    /// attempt, so the OLD hint stays valid (the general insert that
+    /// follows lands left of it, or mutates it and self-invalidates via
+    /// the epoch on the next attempt): the caller keeps the hint and
+    /// skips the right-edge re-pin walk entirely.
+    OutOfOrder,
+    /// Everything else — not a leaf, empty leaf, stale `(serial, epoch)`
+    /// pin, oversized entry, no room. The caller takes the general
+    /// insert and re-establishes the hint from the right edge.
+    Declined,
+}
+
 impl<'a> Btree<'a> {
     pub fn new(pager: &'a Pager, root: PageId, is_index: bool) -> Self {
         Self {
@@ -2747,18 +2939,20 @@ impl<'a> Btree<'a> {
     /// skips the root-to-leaf descent entirely when the hinted leaf is still
     /// the right-most leaf with room (the overwhelmingly common case in bulk
     /// sequential inserts). The hint is validated per use — wrong type,
-    /// non-monotonic rowid, or a full page falls back to the full descent.
-    /// Returns the new hint (the leaf that received this row).
+    /// non-monotonic rowid, stale object state, or a full page falls back
+    /// to the full descent. Returns the new hint (the leaf that received
+    /// this row).
     ///
-    /// SAFETY of the hint: it is only valid within a single statement (no
-    /// DROP/DELETE/ROLLBACK can intervene), and every use re-validates the
-    /// page type and ordering — so a stale hint is detected, never applied.
+    /// SAFETY of the hint: `AppendHint` pins the page OBJECT and its
+    /// mutation epoch, so any intervening structural change (split,
+    /// rollback restore, page re-read — even across statements via the
+    /// insert scratch) is detected on the next use, never applied.
     pub fn insert_table_append_hinted(
         &mut self,
         rowid: i64,
         payload: &[u8],
-        hint: Option<PageId>,
-    ) -> Result<Option<PageId>> {
+        hint: Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         let root = self.root;
         self.journal_suppress = true;
         let r = self.insert_table_append_inner(rowid, payload, hint);
@@ -2813,8 +3007,8 @@ impl<'a> Btree<'a> {
         rowid: i64,
         prefix: &[u8],
         body: &[u8],
-        hint: Option<PageId>,
-    ) -> Result<Option<PageId>> {
+        hint: Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         let root = self.root;
         self.journal_suppress = true;
         let r = self.insert_table_append_spilled_inner(rowid, prefix, body, hint);
@@ -2850,8 +3044,8 @@ impl<'a> Btree<'a> {
         rowid: i64,
         prefix: &[u8],
         body: &[u8],
-        hint: Option<PageId>,
-    ) -> Result<Option<PageId>> {
+        hint: Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         self.pager.note_write();
         let psz = self.pager.page_size() as usize;
         let total = prefix.len() + body.len();
@@ -2865,8 +3059,10 @@ impl<'a> Btree<'a> {
         let body_local = local_len - prefix.len();
         let cell_size = varint::len_of(rowid as u64) + varint::len_of(total as u64) + local_len + 4;
 
-        // 1. Resolve the target leaf (hint or right-most walk).
-        let leaf_id = match self.spill_target_leaf(hint, rowid, cell_size)? {
+        // 1. Resolve the target leaf (hint or right-most walk) as a
+        //    validated pin: `leaf_hint` carries the identity certificate
+        //    the write step below re-asserts under its own lock.
+        let leaf_hint = match self.spill_target_leaf(hint, rowid, cell_size)? {
             Some(l) => l,
             None => {
                 // Stale hint / full leaf / non-append shape: place the
@@ -2891,7 +3087,7 @@ impl<'a> Btree<'a> {
                     overflow,
                 };
                 match self.insert_cell_root_aware(cell) {
-                    Ok(()) => return Ok(Some(self.right_most_leaf()?)),
+                    Ok(()) => return Ok(Some(self.right_most_leaf_hinted()?)),
                     Err(e) => {
                         // The cell never landed: reclaim the orphan
                         // chain (mirrors the leaf-bail cleanup below).
@@ -2901,6 +3097,7 @@ impl<'a> Btree<'a> {
                 }
             }
         };
+        let leaf_id = leaf_hint.page;
 
         // 2. Build the chain (NO leaf lock held while allocating — the
         //    pager's allocation path takes the cache write lock, and an
@@ -2909,14 +3106,19 @@ impl<'a> Btree<'a> {
         let cap = self.overflow_page_capacity();
         let chain = self.build_overflow_chain_rest(&body[body_local..], cap)?;
 
-        // 3. Write the cell into the leaf under one lock.
-        let wrote = {
+        // 3. Write the cell into the leaf under one lock. The identity
+        //    re-check (`still_pins`) closes the validation window left
+        //    open by the chain allocation between step 1 and here: a
+        //    page object swap (evict + re-read) or any structural
+        //    change declines the write instead of landing blind.
+        let wrote: Option<AppendHint> = {
             let page = self.pager.get_page(leaf_id)?;
             let mut borrowed = page.lock();
             let ok = borrowed.page_type()? == PageType::LeafTable
+                && leaf_hint.still_pins(&borrowed)
                 && borrowed.free_space() >= cell_size as u32 + 2;
             if !ok {
-                false
+                None
             } else {
                 let mut rid_buf = [0u8; 9];
                 let n_rid = varint::encode_signed(rowid, &mut rid_buf);
@@ -2929,7 +3131,7 @@ impl<'a> Btree<'a> {
                 let off = new_content_start as usize;
                 let mut o = off;
                 if o + cell_size > borrowed.data.len() {
-                    false // corrupt content-start: bail (chain freed below)
+                    None // corrupt content-start: bail (chain freed below)
                 } else {
                     borrowed.data[o..o + n_rid].copy_from_slice(&rid_buf[..n_rid]);
                     o += n_rid;
@@ -2952,58 +3154,81 @@ impl<'a> Btree<'a> {
                     borrowed.data[dst..dst + 2]
                         .copy_from_slice(&(new_content_start as u16).to_be_bytes());
                     borrowed.set_n_cells(n + 1);
-                    borrowed.dirty = true;
-                    true
+                    borrowed.touch();
+                    Some(AppendHint::fresh(leaf_id, borrowed.serial, borrowed.epoch))
                 }
             }
         };
-        if !wrote {
-            self.free_overflow_chain(chain)?;
-            return Ok(None);
-        }
+        let new_hint = match wrote {
+            Some(h) => h,
+            None => {
+                self.free_overflow_chain(chain)?;
+                return Ok(None);
+            }
+        };
         self.pager.note_dirty(leaf_id);
-        Ok(Some(leaf_id))
+        Ok(Some(new_hint))
     }
 
     /// Resolve + validate the target leaf for a spilled append: the
     /// hinted leaf when it is a table leaf past the last rowid with room
     /// for the (small) local cell, else the tree's right-most leaf under
     /// the same tests. `Ok(None)` = no usable leaf (caller falls back).
+    /// Both branches return a FRESH pin of the accepted leaf (its
+    /// `(serial, epoch)` read under the validation lock) so the write
+    /// step can re-assert identity before touching bytes.
     fn spill_target_leaf(
         &mut self,
-        hint: Option<PageId>,
+        hint: Option<AppendHint>,
         rowid: i64,
         cell_size: usize,
-    ) -> Result<Option<PageId>> {
-        let candidates: [Option<PageId>; 2] = [hint, None];
-        for cand in candidates.into_iter().flatten() {
-            if self.leaf_accepts_spill(cand, rowid, cell_size)? {
-                return Ok(Some(cand));
+    ) -> Result<Option<AppendHint>> {
+        if let Some(h) = hint {
+            if let Some(pinned) = self.leaf_accepts_spill(h, rowid, cell_size)? {
+                return Ok(Some(pinned));
             }
         }
         // No hint (or hint unusable): walk the right-most chain.
-        let leaf = self.right_most_leaf()?;
-        if self.leaf_accepts_spill(leaf, rowid, cell_size)? {
-            return Ok(Some(leaf));
+        let leaf = self.right_most_leaf_hinted()?;
+        if let Some(pinned) = self.leaf_accepts_spill(leaf, rowid, cell_size)? {
+            return Ok(Some(pinned));
         }
         Ok(None)
     }
 
     /// Cheap pre-validation of a leaf for a spilled append: table-leaf
-    /// type, rowid strictly past the last cell's key, and room for the
-    /// local cell bytes + pointer. Read-only — no state is touched.
-    fn leaf_accepts_spill(&self, leaf_id: PageId, rowid: i64, cell_size: usize) -> Result<bool> {
-        let page = self.pager.get_page(leaf_id)?;
+    /// type, still the pinned object state, rowid strictly past the last
+    /// cell's key, and room for the local cell bytes + pointer.
+    /// Read-only — no state is touched. Returns the validated pin.
+    fn leaf_accepts_spill(
+        &self,
+        hint: AppendHint,
+        rowid: i64,
+        cell_size: usize,
+    ) -> Result<Option<AppendHint>> {
+        let page = match self.pager.get_page(hint.page) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
         let borrowed = page.lock();
-        if borrowed.page_type()? != PageType::LeafTable {
-            return Ok(false);
+        match borrowed.page_type() {
+            Ok(PageType::LeafTable) => {}
+            // Zeroed / unreadable pinned page (rollback, recycle): a
+            // decline, never an error — the caller falls back.
+            Ok(_) | Err(_) => return Ok(None),
+        }
+        if !hint.still_pins(&borrowed) {
+            // Stale pin: the page object was replaced (evict + re-read)
+            // or structurally mutated since the hint was taken — the
+            // append proof no longer holds; take the general path.
+            return Ok(None);
         }
         let n = borrowed.n_cells();
         if n == 0 {
             // EMPTY leaf: no last key bounds the append, and the leaf's
             // separator context may not cover the rowid (the mass-DELETE
             // stale-interior shape). Route through the full descent.
-            return Ok(false);
+            return Ok(None);
         }
         {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
@@ -3011,47 +3236,84 @@ impl<'a> Btree<'a> {
                 varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
             {
                 if rowid <= last_rowid {
-                    return Ok(false); // not an append
+                    return Ok(None); // not an append
                 }
             }
         }
         if borrowed.free_space() < cell_size as u32 + 2 {
-            return Ok(false); // needs a split — caller falls back
+            return Ok(None); // needs a split — caller falls back
         }
-        Ok(true)
+        Ok(Some(AppendHint::fresh(
+            hint.page,
+            borrowed.serial,
+            borrowed.epoch,
+        )))
     }
 
     fn insert_table_append_inner(
         &mut self,
         rowid: i64,
         payload: &[u8],
-        hint: Option<PageId>,
-    ) -> Result<Option<PageId>> {
+        hint: Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         self.pager.note_write();
 
-        // Fast path: validate the hinted leaf and append directly into it.
+        // Fast path: validate the hinted leaf and append directly into
+        // it — with the same adaptive suppression as the index side (a
+        // random-rowid stream pays no declined attempts).
         if let Some(h) = hint {
-            if let Some(new_hint) = self.try_append_into_leaf(h, rowid, payload)? {
-                return Ok(Some(new_hint));
+            let attempt = h.miss_streak < APPEND_SUPPRESS_AFTER || h.probe_in == 0;
+            if !attempt {
+                let mut h = h;
+                h.probe_in = h.probe_in.saturating_sub(1);
+                self.insert_table(rowid, payload)?;
+                return Ok(Some(h));
             }
-            // The hint tracks this tree's right-most leaf — a failed append
-            // (ordering or space) completes via the full insert path + a
-            // re-pin; walking the chain first would retry the same failure.
-            self.insert_table(rowid, payload)?;
-            return Ok(Some(self.right_most_leaf()?));
+            match self.try_append_into_leaf(h, rowid, payload)? {
+                AppendTry::Appended(mut new_hint) => {
+                    new_hint.miss_streak = 0;
+                    new_hint.probe_in = 0;
+                    return Ok(Some(new_hint));
+                }
+                AppendTry::OutOfOrder => {
+                    // Scattered rowid stream: the general insert goes to
+                    // this row's true home (left of the pinned leaf — or
+                    // INTO it, which bumps its epoch and self-invalidates
+                    // the pin on the next attempt). Either way the OLD
+                    // pin stays SOUND: identity + state are re-validated
+                    // on every use, so the right-edge re-pin walk is
+                    // pure waste for never-append streams.
+                    self.insert_table(rowid, payload)?;
+                    let mut h = h;
+                    h.miss_streak = h.miss_streak.saturating_add(1);
+                    if h.miss_streak == APPEND_SUPPRESS_AFTER {
+                        h.probe_in = APPEND_PROBE_EVERY;
+                    }
+                    return Ok(Some(h));
+                }
+                AppendTry::Declined => {
+                    // Stale pin / full leaf (a split is incoming): the
+                    // general insert places the row, and the right edge
+                    // genuinely moved — re-establish the hint. The
+                    // stream's shape is unchanged — carry the streak.
+                    self.insert_table(rowid, payload)?;
+                    let fresh = self.right_most_leaf_hinted()?;
+                    return Ok(Some(fresh.carry_stream_state_from(&h)));
+                }
+            }
         }
 
         // Walk right_most_pointer chain down to the rightmost leaf.
         // One lock per level: read page_type and right_most_pointer in a
         // single guard (previously two separate `.lock()` acquisitions).
         let mut page_id = self.root;
-        let leaf_id;
+        let leaf_pin;
         loop {
             let page = self.pager.get_page(page_id)?;
             let guard = page.lock();
             match guard.page_type()? {
                 PageType::LeafTable => {
-                    leaf_id = page_id;
+                    leaf_pin = AppendHint::fresh(page_id, guard.serial, guard.epoch);
                     break;
                 }
                 PageType::InteriorTable => {
@@ -3060,45 +3322,66 @@ impl<'a> Btree<'a> {
                         // Shouldn't happen on a valid interior page, but fall back.
                         drop(guard);
                         self.insert_table(rowid, payload)?;
-                        return Ok(Some(self.right_most_leaf()?));
+                        return Ok(Some(self.right_most_leaf_hinted()?));
                     }
                     page_id = right;
                 }
                 _ => {
                     drop(guard);
                     self.insert_table(rowid, payload)?;
-                    return Ok(Some(self.right_most_leaf()?));
+                    return Ok(Some(self.right_most_leaf_hinted()?));
                 }
             }
         }
 
-        // Rightmost leaf: verify the append, check space, and write.
-        if let Some(h) = self.try_append_into_leaf(leaf_id, rowid, payload)? {
-            return Ok(Some(h));
+        // Rightmost leaf: verify the append, check space, and write. The
+        // pin was taken fresh under the walk's lock — an OutOfOrder
+        // decline below still leaves it valid to hand back (validation,
+        // not freshness-by-construction, is the safety contract).
+        match self.try_append_into_leaf(leaf_pin, rowid, payload)? {
+            AppendTry::Appended(new_hint) => Ok(Some(new_hint)),
+            AppendTry::OutOfOrder => {
+                self.insert_table(rowid, payload)?;
+                Ok(Some(leaf_pin))
+            }
+            AppendTry::Declined => {
+                // Not an append / full leaf — the normal insert path
+                // handles splitting + propagation.
+                self.insert_table(rowid, payload)?;
+                // Re-pin the right-most leaf (one descent; runs only
+                // after splits).
+                Ok(Some(self.right_most_leaf_hinted()?))
+            }
         }
-        // Not an append / full leaf — the normal insert path handles
-        // splitting + propagation.
-        self.insert_table(rowid, payload)?;
-        // Re-pin the right-most leaf (one descent; runs only after splits).
-        Ok(Some(self.right_most_leaf()?))
     }
 
-    /// Try to append `rowid -> payload` directly into leaf page `leaf_id`.
-    /// Returns `Ok(Some(leaf_id))` on success, `Ok(None)` when the page is
-    /// not a table leaf, the rowid isn't past the last cell, or there is no
-    /// room (caller falls back to the full insert path).
+    /// Try to append `rowid -> payload` directly into the leaf pinned by
+    /// `hint`. Returns the attempt outcome (see `AppendTry`): the pin is
+    /// validated against the page's live object identity + mutation epoch
+    /// BEFORE any ordering conclusion is drawn, so a structurally-stale
+    /// hint can never append, and an out-of-order entry keeps the (still
+    /// valid) pin for the next row without a re-pin walk.
     fn try_append_into_leaf(
         &self,
-        leaf_id: PageId,
+        hint: AppendHint,
         rowid: i64,
         payload: &[u8],
-    ) -> Result<Option<PageId>> {
+    ) -> Result<AppendTry> {
+        let leaf_id = hint.page;
         // Overflow-spilled payloads go through the full insert path (the
         // cell is local-prefix + chain pointer, built by `make_leaf_cell`).
         if payload.len() > self.max_cell_payload() {
-            return Ok(None);
+            return Ok(AppendTry::Declined);
         }
-        let page = self.pager.get_page(leaf_id)?;
+        // The pinned page may be UNFETCHABLE by now (rolled back past the
+        // snapshot bound in the concurrent regime, freed and truncated,
+        // beyond the live page count) — a decline, never an error: the
+        // general insert path re-derives everything from the root and
+        // surfaces any HONEST storage failure itself.
+        let page = match self.pager.get_page(leaf_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(AppendTry::Declined),
+        };
         // Cell bytes: varint rowid + varint payload len + payload. Typical
         // rows are well under 256 bytes — build in a stack buffer and only
         // fall back to the heap when genuinely large (avoids a per-insert
@@ -3125,8 +3408,21 @@ impl<'a> Btree<'a> {
         let cell_size = cell.len() as u32;
 
         let mut borrowed = page.lock();
-        if borrowed.page_type()? != PageType::LeafTable {
-            return Ok(None); // stale hint pointing at a non-leaf page
+        // Stale-pin tolerance: a hint that crossed a ROLLBACK / failed
+        // statement / freelist recycling may point at a page that is now
+        // ZEROED or otherwise unreadable — that is a DECLINE (the general
+        // insert path re-establishes everything), never an error. The
+        // index-leaf twin has always handled this shape; the table twin's
+        // historical `?` only stayed quiet because per-statement hint
+        // resets kept zeroed pins unreachable.
+        match borrowed.page_type() {
+            Ok(PageType::LeafTable) => {}
+            Ok(_) | Err(_) => return Ok(AppendTry::Declined),
+        }
+        if !hint.still_pins(&borrowed) {
+            // The pinned object state diverged (split, delete, restore,
+            // re-read) — the append proof is void; take the general path.
+            return Ok(AppendTry::Declined);
         }
         let n = borrowed.n_cells();
         if n == 0 {
@@ -3140,7 +3436,7 @@ impl<'a> Btree<'a> {
             // the tree order — ordered scans misroute, bulk deletes skip
             // ranges. The full descent routes via the separators and is
             // always correct.
-            return Ok(None);
+            return Ok(AppendTry::Declined);
         }
         {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
@@ -3148,8 +3444,9 @@ impl<'a> Btree<'a> {
                 varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
             {
                 if rowid <= last_rowid {
-                    // Not an append — caller falls back to the normal path.
-                    return Ok(None);
+                    // Not an append — but the pin itself is still valid
+                    // (this page is untouched); the caller keeps it.
+                    return Ok(AppendTry::OutOfOrder);
                 }
             }
         }
@@ -3158,7 +3455,7 @@ impl<'a> Btree<'a> {
         let free = borrowed.free_space();
         if free < cell_size + 2 {
             // Need to split — caller handles splitting + propagation.
-            return Ok(None);
+            return Ok(AppendTry::Declined);
         }
 
         // Append: write cell at the new content start, write pointer at end.
@@ -3168,7 +3465,7 @@ impl<'a> Btree<'a> {
             if off + cell_size as usize > borrowed.data.len() {
                 // Corrupt page header (content start out of range): refuse
                 // the append instead of slicing out of bounds.
-                return Ok(None);
+                return Ok(AppendTry::Declined);
             }
             borrowed.data[off..off + cell_size as usize].copy_from_slice(cell);
             borrowed.set_cell_content_start(new_content_start);
@@ -3183,11 +3480,12 @@ impl<'a> Btree<'a> {
             let dst = ptr_array_start + n as usize * 2;
             borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
             borrowed.set_n_cells(n + 1);
-            borrowed.dirty = true;
+            borrowed.touch();
+            let new_hint = AppendHint::fresh(leaf_id, borrowed.serial, borrowed.epoch);
+            drop(borrowed);
+            self.pager.note_dirty(leaf_id);
+            Ok(AppendTry::Appended(new_hint))
         }
-        drop(borrowed);
-        self.pager.note_dirty(leaf_id);
-        Ok(Some(leaf_id))
     }
 
     /// Cheap upper-bound row estimate for parallel-scan eligibility: the
@@ -3216,6 +3514,48 @@ impl<'a> Btree<'a> {
             // Degenerate interior (delete-heavy churn can leave one; see
             // right_most_leaf). No live right-most leaf row to read.
             _ => Ok(0),
+        }
+    }
+
+    /// Descend the right-most-child chain to the right-most leaf and
+    /// PIN it: `(page, serial, epoch)` read under the leaf's lock — the
+    /// fresh pin an append hint needs after a structural change (split,
+    /// stale hint) re-established the right edge.
+    fn right_most_leaf_hinted(&self) -> Result<AppendHint> {
+        let mut page_id = self.root;
+        loop {
+            let page = self.pager.get_page(page_id)?;
+            let guard = page.lock();
+            match guard.page_type()? {
+                PageType::LeafTable => {
+                    return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                }
+                PageType::InteriorTable => {
+                    let right = guard.right_most_pointer();
+                    if right != 0 {
+                        page_id = right;
+                        continue;
+                    }
+                    // right=0: mirror right_most_leaf's degenerate-tree
+                    // handling — pin the last cell's de-facto right-most
+                    // child (this interior itself when it is empty, page
+                    // 0 never: the schema page is not a leaf).
+                    let n = guard.n_cells();
+                    if n == 0 {
+                        return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                    }
+                    let last_ptr = guard.cell_pointer(n - 1) as usize;
+                    let last_child =
+                        decode_table_interior_child(&guard.data[last_ptr..]).unwrap_or(0);
+                    if last_child == 0 || last_child == page_id {
+                        return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                    }
+                    page_id = last_child;
+                }
+                _ => {
+                    return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                }
+            }
         }
     }
 
@@ -3270,8 +3610,8 @@ impl<'a> Btree<'a> {
         &mut self,
         key: &[u8],
         rowid: i64,
-        hint: Option<PageId>,
-    ) -> Result<Option<PageId>> {
+        hint: Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         let root = self.root;
         self.journal_suppress = true;
         let r = self.insert_index_append_hinted_inner(key, rowid, hint);
@@ -3295,33 +3635,70 @@ impl<'a> Btree<'a> {
         &mut self,
         key: &[u8],
         rowid: i64,
-        hint: Option<PageId>,
-    ) -> Result<Option<PageId>> {
+        hint: Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         self.pager.note_write();
 
-        // Fast path: validate the hinted leaf and append directly into it.
+        // Fast path: validate the hinted leaf and append directly into
+        // it — unless the stream is KNOWN scattered (miss_streak at or
+        // past the suppression threshold): then the attempt would just
+        // decline again (fetch + lock + last-cell decode for nothing),
+        // so take the general insert straight away and count down to
+        // the next probe.
         if let Some(h) = hint {
-            if let Some(new_hint) = self.try_append_into_index_leaf(h, key, rowid)? {
-                return Ok(Some(new_hint));
+            let attempt = h.miss_streak < APPEND_SUPPRESS_AFTER || h.probe_in == 0;
+            if !attempt {
+                let mut h = h;
+                h.probe_in = h.probe_in.saturating_sub(1);
+                self.insert_index(key, rowid)?;
+                return Ok(Some(h));
             }
-            // The hint tracks this tree's right-most leaf, so a failed
-            // append (ordering or space) completes via the full insert
-            // path + a re-pin. Walking the right-most chain first would
-            // just retry the same failed append on the same leaf.
-            self.insert_index(key, rowid)?;
-            return Ok(Some(self.right_most_index_leaf()?));
+            match self.try_append_into_index_leaf(h, key, rowid)? {
+                AppendTry::Appended(mut new_hint) => {
+                    new_hint.miss_streak = 0;
+                    new_hint.probe_in = 0;
+                    return Ok(Some(new_hint));
+                }
+                AppendTry::OutOfOrder => {
+                    // Scattered key stream — the shape S12's secondary
+                    // indexes hit permanently (`a = (i*7919)%100_003`,
+                    // `d = i%1000`): the entry declines against the
+                    // pinned leaf's OWN last cell, the general insert
+                    // lands it at its true home, and the untouched pin
+                    // stays valid for the next row. The historical
+                    // contract — re-walk the right edge after EVERY
+                    // general insert — turned each scattered index entry
+                    // into a double descent (insert + re-pin walk) and
+                    // was the dominant per-row cost of multi-index load.
+                    self.insert_index(key, rowid)?;
+                    let mut h = h;
+                    h.miss_streak = h.miss_streak.saturating_add(1);
+                    if h.miss_streak == APPEND_SUPPRESS_AFTER {
+                        h.probe_in = APPEND_PROBE_EVERY;
+                    }
+                    return Ok(Some(h));
+                }
+                AppendTry::Declined => {
+                    // Stale pin / full leaf (split incoming): general
+                    // insert, then re-establish the right-edge pin. The
+                    // stream's shape is unchanged — carry the streak.
+                    self.insert_index(key, rowid)?;
+                    let fresh = self.right_most_index_leaf_hinted()?;
+                    return Ok(Some(fresh.carry_stream_state_from(&h)));
+                }
+            }
         }
 
         // No hint yet: walk the right-most-child chain down to the
-        // right-most index leaf.
+        // right-most index leaf, pinning it fresh under the walk's lock.
         let mut page_id = self.root;
-        let leaf_id;
+        let leaf_pin;
         loop {
             let page = self.pager.get_page(page_id)?;
             let guard = page.lock();
             match guard.page_type()? {
                 PageType::LeafIndex => {
-                    leaf_id = page_id;
+                    leaf_pin = AppendHint::fresh(page_id, guard.serial, guard.epoch);
                     break;
                 }
                 PageType::InteriorIndex => {
@@ -3329,58 +3706,79 @@ impl<'a> Btree<'a> {
                     if right == 0 {
                         drop(guard);
                         self.insert_index(key, rowid)?;
-                        return Ok(Some(self.right_most_index_leaf()?));
+                        return Ok(Some(self.right_most_index_leaf_hinted()?));
                     }
                     page_id = right;
                 }
                 _ => {
                     drop(guard);
                     self.insert_index(key, rowid)?;
-                    return Ok(Some(self.right_most_index_leaf()?));
+                    return Ok(Some(self.right_most_index_leaf_hinted()?));
                 }
             }
         }
 
-        if let Some(h) = self.try_append_into_index_leaf(leaf_id, key, rowid)? {
-            return Ok(Some(h));
+        match self.try_append_into_index_leaf(leaf_pin, key, rowid)? {
+            AppendTry::Appended(new_hint) => Ok(Some(new_hint)),
+            // The fresh pin is still valid after an out-of-order general
+            // insert (validation, not freshness, is the safety contract).
+            AppendTry::OutOfOrder => {
+                self.insert_index(key, rowid)?;
+                Ok(Some(leaf_pin))
+            }
+            // Not an append / full leaf — the normal insert path handles
+            // splitting + propagation.
+            AppendTry::Declined => {
+                self.insert_index(key, rowid)?;
+                Ok(Some(self.right_most_index_leaf_hinted()?))
+            }
         }
-        // Not an append / full leaf — the normal insert path handles
-        // splitting + propagation.
-        self.insert_index(key, rowid)?;
-        Ok(Some(self.right_most_index_leaf()?))
     }
 
-    /// Descend the right-most-child chain to the right-most INDEX leaf.
-    fn right_most_index_leaf(&self) -> Result<PageId> {
+    /// Descend the right-most-child chain to the right-most INDEX leaf
+    /// and PIN it (`(page, serial, epoch)` under the leaf's lock) — the
+    /// fresh pin an index append hint needs after a structural change.
+    fn right_most_index_leaf_hinted(&self) -> Result<AppendHint> {
         let mut page_id = self.root;
         loop {
             let page = self.pager.get_page(page_id)?;
             let guard = page.lock();
             match guard.page_type()? {
-                PageType::LeafIndex => return Ok(page_id),
+                PageType::LeafIndex => {
+                    return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                }
                 PageType::InteriorIndex => {
                     let right = guard.right_most_pointer();
                     if right == 0 {
-                        return Ok(page_id);
+                        return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
                     }
                     page_id = right;
                 }
-                _ => return Ok(page_id),
+                _ => {
+                    return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                }
             }
         }
     }
 
-    /// Try to append `(key, rowid)` directly into index leaf `leaf_id`.
-    /// Returns `Ok(Some(leaf_id))` on success, `Ok(None)` when the page is
-    /// not an index leaf, the entry isn't past the last cell, or there is
-    /// no room (caller falls back to the full insert path).
+    /// Try to append `(key, rowid)` directly into the index leaf pinned
+    /// by `hint`. Returns the attempt outcome (see `AppendTry`): the pin
+    /// is validated against the page's live object identity + mutation
+    /// epoch before any ordering conclusion is drawn, so a stale hint can
+    /// never append, and an out-of-order entry keeps the still-valid pin
+    /// for the next row without a re-pin walk.
     fn try_append_into_index_leaf(
         &self,
-        leaf_id: PageId,
+        hint: AppendHint,
         key: &[u8],
         rowid: i64,
-    ) -> Result<Option<PageId>> {
-        let page = self.pager.get_page(leaf_id)?;
+    ) -> Result<AppendTry> {
+        let leaf_id = hint.page;
+        // Unfetchable pinned page (see the table twin): decline.
+        let page = match self.pager.get_page(leaf_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(AppendTry::Declined),
+        };
         // Index leaf cell layout: varint(rowid) + varint(key_len) + key.
         let mut cell_stack = [0u8; 256];
         let mut cell_heap: Vec<u8>;
@@ -3410,14 +3808,20 @@ impl<'a> Btree<'a> {
             // zeroed by a rollback since the hint was pinned (an error
             // here used to surface as "invalid page type byte: 0x0"
             // instead of falling back to the full insert path).
-            Ok(_) | Err(_) => return Ok(None),
+            Ok(_) | Err(_) => return Ok(AppendTry::Declined),
+        }
+        if !hint.still_pins(&borrowed) {
+            // The pinned object state diverged (split, cell insert or
+            // delete, rollback restore, page re-read) — the append proof
+            // is void; take the general path.
+            return Ok(AppendTry::Declined);
         }
         let n = borrowed.n_cells();
         if n == 0 {
             // EMPTY leaf: refuse the fast path (no last key bounds the
             // append; the leaf's separator context may not cover the
             // entry — see the table-leaf mirror in try_append_into_leaf).
-            return Ok(None);
+            return Ok(AppendTry::Declined);
         }
         {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
@@ -3430,7 +3834,10 @@ impl<'a> Btree<'a> {
                 // (Overflow last key: prefix-compare is inconclusive —
                 // decline the append fast path, take the general insert.)
                 if !(v.key < key || (v.key == key && v.rowid < rowid)) {
-                    return Ok(None);
+                    // Out-of-order against this leaf's own last cell:
+                    // the leaf (and the pin) is untouched — the caller
+                    // keeps the pin and skips the re-pin walk.
+                    return Ok(AppendTry::OutOfOrder);
                 }
             }
         }
@@ -3438,7 +3845,7 @@ impl<'a> Btree<'a> {
         // Check if the leaf has space.
         let free = borrowed.free_space();
         if free < cell_size + 2 {
-            return Ok(None); // need a split — caller handles it
+            return Ok(AppendTry::Declined); // need a split — caller handles it
         }
 
         // Append: write cell at the new content start, pointer at the end.
@@ -3457,11 +3864,12 @@ impl<'a> Btree<'a> {
             let dst = ptr_array_start + n as usize * 2;
             borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
             borrowed.set_n_cells(n + 1);
-            borrowed.dirty = true;
+            borrowed.touch();
+            let new_hint = AppendHint::fresh(leaf_id, borrowed.serial, borrowed.epoch);
+            drop(borrowed);
+            self.pager.note_dirty(leaf_id);
+            Ok(AppendTry::Appended(new_hint))
         }
-        drop(borrowed);
-        self.pager.note_dirty(leaf_id);
-        Ok(Some(leaf_id))
     }
 
     /// Update a row in a table B+tree in place when possible.
@@ -3621,7 +4029,7 @@ impl<'a> Btree<'a> {
                             {
                                 borrowed.data[payload_offset..payload_offset + new_payload.len()]
                                     .copy_from_slice(new_payload);
-                                borrowed.dirty = true;
+                                borrowed.touch();
                                 // The write happened while the guard is held;
                                 // note the dirty page AFTER dropping it.
                                 wrote = true;
@@ -3804,7 +4212,7 @@ impl<'a> Btree<'a> {
                         if payload_off + new_payload.len() <= borrowed.data.len() {
                             borrowed.data[payload_off..payload_off + new_payload.len()]
                                 .copy_from_slice(new_payload);
-                            borrowed.dirty = true;
+                            borrowed.touch();
                             drop(borrowed);
                             self.pager.note_dirty(page_id_now);
                             return Ok(true);
@@ -3901,7 +4309,7 @@ impl<'a> Btree<'a> {
                             let mut borrowed = page.lock();
                             borrowed.data[payload_off..payload_off + new_payload.len()]
                                 .copy_from_slice(new_payload);
-                            borrowed.dirty = true;
+                            borrowed.touch();
                         }
                         self.pager.note_dirty(page_id);
                         return Ok(true);
@@ -4021,7 +4429,7 @@ impl<'a> Btree<'a> {
             borrowed.data[head + n_plen..head + n_plen + new_payload.len()]
                 .copy_from_slice(new_payload);
             // The pointer at `pos` already == cell_ptr.
-            borrowed.dirty = true;
+            borrowed.touch();
             drop(borrowed);
             self.pager.note_write_in_place();
             self.pager.note_dirty(page_id);
@@ -4088,7 +4496,7 @@ impl<'a> Btree<'a> {
             let dst = ptr_array_start + pos_usize * 2;
             borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
             borrowed.set_n_cells(n);
-            borrowed.dirty = true;
+            borrowed.touch();
         }
         self.pager.note_dirty(page_id);
         Ok(true)
@@ -4108,7 +4516,7 @@ impl<'a> Btree<'a> {
                 drop(page);
                 return self.split_leaf(page_id, cell);
             }
-            self.insert_cell_into_page(page_id, &cell)?;
+            self.insert_cell_into_ref(page_id, &page, &cell)?;
             Ok(InsertResult::Done)
         } else {
             // Interior: find the child to descend into.
@@ -4317,7 +4725,7 @@ impl<'a> Btree<'a> {
                                         .copy_from_slice(&(c1_start as u16).to_be_bytes());
                                     b.set_n_cells(n_now + 1);
                                     b.set_right_most_pointer(new_page);
-                                    b.dirty = true;
+                                    b.touch();
                                 }
                                 self.pager.note_dirty(page_id);
                                 return Ok(InsertResult::Done);
@@ -4409,7 +4817,7 @@ impl<'a> Btree<'a> {
                                         ..ptr_array_start + (idx_usize + 1) * 2 + 2]
                                         .copy_from_slice(&(c2_start as u16).to_be_bytes());
                                     b.set_n_cells(n_now + 1);
-                                    b.dirty = true;
+                                    b.touch();
                                 }
                                 self.pager.note_dirty(page_id);
                                 // The old separator cell was replaced by
@@ -4674,6 +5082,15 @@ impl<'a> Btree<'a> {
     /// Insert a cell into a leaf or interior page. Cells are kept sorted:
     /// table pages by i64 key, index pages by (key bytes, rowid).
     fn insert_cell_into_page(&mut self, page_id: PageId, cell: &Cell) -> Result<()> {
+        let page = self.pager.get_page(page_id)?;
+        self.insert_cell_into_ref(page_id, &page, cell)
+    }
+
+    /// `insert_cell_into_page` with the page already fetched — the
+    /// descent in `insert_into_page` holds the leaf's PageRef; fetching
+    /// it a second time was one full cache round-trip (RwLock + hash +
+    /// Arc clone) per inserted cell, paid by every scattered-key insert.
+    fn insert_cell_into_ref(&mut self, page_id: PageId, page: &PageRef, cell: &Cell) -> Result<()> {
         if crate::executor::dbg_index_trace() {
             let pt = self
                 .pager
@@ -4693,10 +5110,17 @@ impl<'a> Btree<'a> {
                 );
             }
         }
-        let page = self.pager.get_page(page_id)?;
-        let pt = page.lock().page_type()?;
+        // ONE guard across the whole search + write: the historical code
+        // locked the page FIVE times per cell (type, n_cells, search,
+        // content-start, write) — five uncontended mutex round-trips on
+        // every inserted cell, the dominant fixed cost left in the
+        // scattered-key index path. get_page is never called while the
+        // guard is held (overflow-key reassembly locks OTHER pages'
+        // mutexes; no cycle exists), so the single scope is deadlock-free.
+        let mut borrowed = page.lock();
+        let pt = borrowed.page_type()?;
         let cell_size = cell.encoded_size();
-        let n = page.lock().n_cells();
+        let n = borrowed.n_cells();
         let is_idx = pt.is_index();
 
         // Find insertion position by the page's sort order — allocation-free
@@ -4704,7 +5128,7 @@ impl<'a> Btree<'a> {
         // allocating `Cell` — one Vec per probe, ~9 probes per insert —
         // which made page rebuilds after splits O(n) allocations.)
         let pos = {
-            let borrowed = page.lock();
+            let borrowed = &*borrowed;
             let mut lo: u16 = 0;
             let mut hi: u16 = n;
             if is_idx {
@@ -4767,18 +5191,26 @@ impl<'a> Btree<'a> {
         };
 
         // Allocate space at the cell content area.
-        let new_content_start = {
-            let borrowed = page.lock();
-            borrowed
-                .cell_content_start()
-                .saturating_sub(cell_size as u32)
-        };
+        let new_content_start = borrowed
+            .cell_content_start()
+            .saturating_sub(cell_size as u32);
 
-        // Write the cell bytes.
+        // Write the cell bytes. Stack buffer with heap fallback: index
+        // cells are typically 5-20 bytes and rows rarely exceed 512 —
+        // the `Vec::with_capacity` here was one allocation per inserted
+        // cell (the multi-index load path pays it per index per row).
         {
-            let mut borrowed = page.lock();
-            let mut buf = Vec::with_capacity(cell_size);
-            cell.encode(&mut buf);
+            let borrowed = &mut *borrowed;
+            let mut cell_stack = [0u8; 512];
+            let mut cell_heap: Vec<u8>;
+            let buf: &[u8] = if cell_size <= cell_stack.len() {
+                cell.encode_into(&mut cell_stack);
+                &cell_stack[..cell_size]
+            } else {
+                cell_heap = Vec::with_capacity(cell_size);
+                cell.encode(&mut cell_heap);
+                &cell_heap
+            };
             let off = new_content_start as usize;
             // No-clobber guard: a cell larger than the page's remaining
             // content area would underflow the content start to 0 and
@@ -4804,7 +5236,7 @@ impl<'a> Btree<'a> {
                     page_id
                 )));
             }
-            borrowed.data[off..off + cell_size].copy_from_slice(&buf);
+            borrowed.data[off..off + cell_size].copy_from_slice(buf);
             borrowed.set_cell_content_start(new_content_start);
 
             // Shift cell pointers to make room at position `pos` — one
@@ -4826,8 +5258,9 @@ impl<'a> Btree<'a> {
             let dst = ptr_array_start + pos_usize * 2;
             borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
             borrowed.set_n_cells(n + 1);
-            borrowed.dirty = true;
+            borrowed.touch();
         }
+        drop(borrowed);
         self.pager.note_dirty(page_id);
         Ok(())
     }
@@ -5047,7 +5480,7 @@ impl<'a> Btree<'a> {
             }
             b.set_cell_content_start(cur as u32);
             b.set_n_cells(mid as u16);
-            b.dirty = true;
+            b.touch();
         }
         // Build the RIGHT page: sequence [mid..n+1).
         {
@@ -5064,7 +5497,7 @@ impl<'a> Btree<'a> {
             }
             nb.set_cell_content_start(cur as u32);
             nb.set_n_cells(right_cells as u16);
-            nb.dirty = true;
+            nb.touch();
         }
         self.pager.note_dirty(page_id);
         self.pager.note_dirty(new_page_id);
@@ -5599,7 +6032,7 @@ impl<'a> Btree<'a> {
                 let root_ref = self.pager.get_page(self.root)?;
                 let mut b = root_ref.lock();
                 b.init_leaf_table();
-                b.dirty = true;
+                b.touch();
                 drop(b);
                 self.pager.note_dirty(self.root);
                 return Ok(());
@@ -5675,7 +6108,7 @@ impl<'a> Btree<'a> {
                 }
                 let new_n = n_cells.saturating_sub(1);
                 borrowed.set_n_cells(new_n);
-                borrowed.dirty = true;
+                borrowed.touch();
                 drop(borrowed);
                 self.pager.note_dirty(parent);
                 let childless = new_n == 0 && {
@@ -5700,7 +6133,7 @@ impl<'a> Btree<'a> {
                             r = decode_table_interior_child(buf).unwrap_or(0);
                         }
                         borrowed.set_n_cells(n_cells - 1);
-                        borrowed.dirty = true;
+                        borrowed.touch();
                     }
                     borrowed.set_right_most_pointer(r);
                     r
@@ -5811,7 +6244,7 @@ impl<'a> Btree<'a> {
                     borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
                 }
                 borrowed.set_n_cells(n_cells - 1);
-                borrowed.dirty = true;
+                borrowed.touch();
                 if dead_chain != 0 {
                     self.free_overflow_chain(dead_chain)?;
                 }
@@ -5839,7 +6272,7 @@ impl<'a> Btree<'a> {
                 borrowed.set_right_most_pointer(new_rightmost);
                 // Remove the last cell slot (no shift needed — it's the tail).
                 borrowed.set_n_cells(n_cells - 1);
-                borrowed.dirty = true;
+                borrowed.touch();
             }
         }
         self.pager.note_dirty(parent_id);
@@ -6252,7 +6685,7 @@ impl<'a> Btree<'a> {
                     let page = self.pager.get_page(leaf)?;
                     let mut borrowed = page.lock();
                     borrowed.set_n_cells(0);
-                    borrowed.dirty = true;
+                    borrowed.touch();
                 }
                 self.pager.note_dirty(leaf);
                 deleted += n_cells as u64;
@@ -6397,7 +6830,7 @@ impl<'a> Btree<'a> {
                         ptr_array_start + pos_usize * 2,
                     );
                     borrowed.set_n_cells(n - 1);
-                    borrowed.dirty = true;
+                    borrowed.touch();
                 }
                 self.pager.note_dirty(page_id);
                 Ok(true)
@@ -6503,7 +6936,7 @@ impl<'a> Btree<'a> {
     //             borrowed.data[dst..dst + 2].copy_from_slice(&v.to_be_bytes());
     //         }
     //         borrowed.set_n_cells(n - 1);
-    //         borrowed.dirty = true;
+    //         borrowed.touch();
     //     }
     //     let _ = pt;
     //     Ok(())
@@ -8132,7 +8565,7 @@ impl<'a> Btree<'a> {
                     }
                 }
                 if page_dirty {
-                    borrowed.dirty = true;
+                    borrowed.touch();
                 }
                 drop(borrowed);
                 if page_dirty {
@@ -8676,7 +9109,7 @@ impl<'a> Btree<'a> {
                 ptr_array_start + pos_usize * 2,
             );
             borrowed.set_n_cells(n - 1);
-            borrowed.dirty = true;
+            borrowed.touch();
         }
         self.pager.note_dirty(page_id);
         Ok(true)

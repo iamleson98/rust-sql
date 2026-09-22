@@ -113,14 +113,14 @@ pub(crate) fn repin_schema_root(pager: &Pager, new_root: u32) -> Result<()> {
         let mut guard = p0.lock();
         guard.data.copy_from_slice(&new_p0);
         remap_zero_children(&mut guard.data, hdr, new_root);
-        guard.dirty = true;
+        guard.touch();
     }
     pager.note_dirty(0);
     {
         let rp = pager.get_page(new_root)?;
         let mut guard = rp.lock();
         guard.data.copy_from_slice(&new_r);
-        guard.dirty = true;
+        guard.touch();
     }
     pager.note_dirty(new_root);
     Ok(())
@@ -794,7 +794,7 @@ fn write_new_page(tmp: &Pager, bytes: &[u8]) -> Result<u32> {
     {
         let mut g = pr.lock();
         g.data.copy_from_slice(bytes);
-        g.dirty = true;
+        g.touch();
     }
     tmp.note_dirty(id);
     Ok(id)

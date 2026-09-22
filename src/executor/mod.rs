@@ -476,7 +476,6 @@ use crate::planner::plan::*;
 use crate::schema::Table;
 use crate::sql::ast::*;
 use crate::storage::btree::{Btree, LookupResult};
-use crate::storage::page::PageId;
 use crate::storage::pager::Pager;
 use crate::storage::row_codec::{
     decode_row, decode_row_into, decode_row_selective, decode_row_selective_wide,
@@ -1103,8 +1102,11 @@ pub struct ExecContext<'a> {
     pub shared_detached: bool,
     /// Pinned right-most leaf for sequential table appends, valid ONLY
     /// within the current statement (see insert_table_append_hinted). Keyed
-    /// by the Arc<Table> identity so a hint never crosses tables.
-    pub table_append_hint: Option<(usize, u32)>,
+    /// by the Arc<Table> identity so a hint never crosses tables. The pin
+    /// carries the page object's `(serial, epoch)` — validated per use, so
+    /// it survives across statements of the same shape via the insert
+    /// scratch and self-invalidates on any structural change.
+    pub table_append_hint: Option<(usize, crate::storage::btree::AppendHint)>,
     /// Materialized CTEs of the statement being executed — consulted by
     /// subquery planning (exec_select_statement) so `IN (SELECT .. FROM cte)`
     /// inside a WITH statement resolves the CTE.
@@ -17461,8 +17463,11 @@ pub(crate) struct IndexMaintState {
     /// indexes pay nothing.
     pub col_names: Option<std::sync::Arc<[String]>>,
     /// Pinned right-most index leaf from the previous append in this
-    /// statement (see `insert_index_append_hinted`).
-    pub hint: Option<PageId>,
+    /// statement (see `insert_index_append_hinted`). Carries the page
+    /// object's `(serial, epoch)` so scattered-key streams — where the
+    /// entry declines against the pinned leaf's own last cell — keep the
+    /// still-valid pin instead of paying a right-edge re-pin walk per row.
+    pub hint: Option<crate::storage::btree::AppendHint>,
     /// Reusable order-key encoding buffer.
     pub key_buf: Vec<u8>,
 }
@@ -17868,6 +17873,12 @@ struct InsertScratch {
     /// is needed — allocated at most once per shape either way).
     col_names: Vec<String>,
     index_states: Vec<IndexMaintState>,
+    /// The statement-exit TABLE append hint (`ctx.table_append_hint`),
+    /// carried across statements so single-row `?`-param INSERT loops
+    /// (the S12 shape: one db.execute per row) keep the pinned right-most
+    /// leaf. Safe for the same reason the index hints are: the pin is
+    /// `(page, serial, epoch)` and is re-validated on every use.
+    table_hint: Option<(usize, crate::storage::btree::AppendHint)>,
 }
 
 std::thread_local! {
@@ -18027,20 +18038,25 @@ fn exec_insert_inner(
     let (mut index_states, table_name_lc, mut full_row, mut payload_buf, col_names, target_indices) =
         match take_insert_scratch(&table, columns, &indexes) {
             Some(mut sc) => {
+                // Hints now SURVIVE the statement boundary: an
+                // `AppendHint` pins `(page, serial, epoch)` — the exact
+                // page OBJECT and mutation state — and every use
+                // re-validates all three. Every hazard the old reset
+                // defended against is structurally detected instead:
+                // a failed statement's restore, an interleaved write,
+                // ROLLBACK, freelist reuse at the same PageId, even a
+                // landing in another index's leaf — each either replaces
+                // the page object (new serial) or mutates it (new
+                // epoch), and the fast path declines to the general
+                // insert. Roots stay re-seeded per statement (the pin
+                // proves the LEAF, not which tree owns it).
                 for st in sc.index_states.iter_mut() {
                     st.root = ctx.index_root(&st.idx);
-                    // The append hint is a leaf PageId pinned during a
-                    // PREVIOUS statement: that statement may have FAILED
-                    // (the statement-atomicity restore frees pages the
-                    // hint points at — a later append then read "invalid
-                    // page type byte: 0x0"), or an interleaved statement
-                    // may have freed/reused the page. A hint crossing
-                    // statement boundaries can even land in ANOTHER
-                    // index's leaf after freelist reuse (both type
-                    // LeafIndex) and silently corrupt it. Reset here;
-                    // the first row re-pins.
-                    st.hint = None;
                 }
+                // The table append hint rides across statements the same
+                // way (keyed by table identity; a shape mismatch already
+                // dropped the whole scratch).
+                ctx.table_append_hint = sc.table_hint;
                 (
                     sc.index_states,
                     sc.name_lc,
@@ -18404,6 +18420,7 @@ fn exec_insert_inner(
             payload_buf,
             col_names,
             index_states,
+            table_hint: ctx.table_append_hint.take(),
         });
         return Ok(result);
     }
@@ -18600,6 +18617,7 @@ fn exec_insert_inner(
         payload_buf,
         col_names,
         index_states,
+        table_hint: ctx.table_append_hint.take(),
     });
     Ok(result)
 }

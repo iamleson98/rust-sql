@@ -4719,7 +4719,7 @@ impl Database {
         col_indices: &[usize],
         root: u32,
         max_rowid: i64,
-        leaf_hint: Option<u32>,
+        leaf_hint: Option<crate::storage::btree::AppendHint>,
     ) {
         // Shape gates that `exec_fast_insert` already verified: no vtab,
         // not WITHOUT ROWID, not STRICT, no generated columns, and either
@@ -14642,9 +14642,12 @@ struct InsertChain {
     root: u32,
     /// Monotonic upper bound of rowids present in the table.
     max_rowid: i64,
-    /// Cross-statement right-most-leaf append hint (page id). Validated on
-    /// every use by the B+tree insert path; falls back automatically.
-    leaf_hint: Option<u32>,
+    /// Cross-statement right-most-leaf append hint. Carries the page
+    /// object's `(serial, epoch)`: validated on every use by the B+tree
+    /// insert path, so it stays sound across statements (the insert
+    /// scratch re-seeds roots every statement) and self-invalidates on
+    /// splits, rollbacks, re-reads.
+    leaf_hint: Option<crate::storage::btree::AppendHint>,
     /// Reusable full-width row buffer, NULL-reset per row.
     full_row: Vec<Value>,
     /// Reusable payload encode buffer.

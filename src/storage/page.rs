@@ -148,12 +148,43 @@ pub const FIRST_PAGE_ID: PageId = 1;
 ///
 /// The `data` buffer is exactly `page_size` bytes long. The `dirty` flag
 /// tells the pager whether to flush this page to disk.
+///
+/// Identity + mutation clock for the append-hint validation scheme:
+///
+/// - `serial` is stamped once, from a process-global counter, at every
+///   Page OBJECT creation (cache-miss load, allocation, restore). It
+///   answers "is this the same object the hint pinned?" — a page that
+///   was rolled back and re-read, freed and reallocated, or rebuilt by
+///   VACUUM is a DIFFERENT object even at the same PageId, and its
+///   fresh-zeroed epoch must not be mistaken for a pinned one.
+/// - `epoch` counts this object's mutations (every `touch()`).
+///
+/// A pinned append hint (see `btree::AppendHint`) stores
+/// `(PageId, serial, epoch)`; validating all three certifies the page
+/// is byte-identical to what the hint pinned — which is exactly the
+/// certificate an append needs: the right-most leaf can only STOP
+/// being the right-most leaf by being mutated (a split), so
+/// "unchanged since pinned" + "entry past the last cell" is a sound
+/// append proof.
 #[derive(Debug)]
 pub struct Page {
     pub id: PageId,
     pub data: Vec<u8>,
     pub dirty: bool,
+    /// Object identity: unique across every Page ever constructed in
+    /// the process (see the struct docs for the validation contract).
+    pub serial: u64,
+    /// Mutation counter for this object — bumped by `touch()`.
+    pub epoch: u32,
 }
+
+/// Source of Page `serial`s — uniqueness is the only property needed
+/// (see `Page`'s docs), so one process-global counter serves every pager
+/// and every database. Relaxed: the only reader that matters is the
+/// thread that pinned a hint, and it observes its own store coherently
+/// (same-thread store/load ordering); a cross-thread stale serial at
+/// worst declines a fast path, never falsely validates one.
+static PAGE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Page {
     pub fn new(id: PageId, page_size: u32) -> Self {
@@ -161,6 +192,8 @@ impl Page {
             id,
             data: vec![0u8; page_size as usize],
             dirty: false,
+            serial: PAGE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            epoch: 0,
         }
     }
 
@@ -188,6 +221,8 @@ impl Page {
             id,
             data,
             dirty: false,
+            serial: PAGE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            epoch: 0,
         }
     }
 
@@ -222,7 +257,19 @@ impl Page {
     }
 
     pub fn mark_dirty(&mut self) {
+        self.touch();
+    }
+
+    /// Mark the page dirty AND advance its mutation epoch. Every
+    /// mutation of a cached page funnels through here (the historical
+    /// `x.dirty = true` sites), so an append hint pinned against
+    /// `(serial, epoch)` is invalidated by ANY structural change to the
+    /// page — splits, deletes, restores, header rewrites — without the
+    /// append fast path paying a single extra page walk to stay exact.
+    #[inline]
+    pub fn touch(&mut self) {
         self.dirty = true;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Read the B+tree page type. Page 0 is special — it has a 100-byte
@@ -235,7 +282,7 @@ impl Page {
     pub fn set_page_type(&mut self, pt: PageType) {
         let offset = self.header_offset() as usize;
         self.data[offset] = pt as u8;
-        self.dirty = true;
+        self.touch();
     }
 
     /// Number of cells in this page.
@@ -247,7 +294,7 @@ impl Page {
     pub fn set_n_cells(&mut self, n: u16) {
         let offset = self.header_offset() as usize + 4;
         self.data[offset..offset + 2].copy_from_slice(&n.to_be_bytes());
-        self.dirty = true;
+        self.touch();
     }
 
     /// Offset within the page where cell content area starts.
@@ -270,7 +317,7 @@ impl Page {
         };
         let off = self.header_offset() as usize + 6;
         self.data[off..off + 2].copy_from_slice(&v.to_be_bytes());
-        self.dirty = true;
+        self.touch();
     }
 
     /// Right-most child pointer for interior pages (0 for leaf).
@@ -282,7 +329,7 @@ impl Page {
     pub fn set_right_most_pointer(&mut self, p: u32) {
         let offset = self.header_offset() as usize + 8;
         self.data[offset..offset + 4].copy_from_slice(&p.to_be_bytes());
-        self.dirty = true;
+        self.touch();
     }
 
     /// Cell pointer at the given index (0-based).
@@ -296,7 +343,7 @@ impl Page {
         let base = self.header_offset() as usize + PAGE_HEADER_SIZE as usize;
         let off = base + idx as usize * 2;
         self.data[off..off + 2].copy_from_slice(&ptr.to_be_bytes());
-        self.dirty = true;
+        self.touch();
     }
 
     /// Free space (in bytes) between the cell pointer array and the cell content area.
@@ -338,7 +385,7 @@ impl Page {
         // next = 0 (end of chain)
         let off = self.header_offset() as usize + 12;
         self.data[off..off + 4].copy_from_slice(&0u32.to_be_bytes());
-        self.dirty = true;
+        self.touch();
     }
 
     /// Overflow chain: the next page id (0 = end of chain).
@@ -351,7 +398,7 @@ impl Page {
     pub fn set_overflow_next(&mut self, next: PageId) {
         let off = self.header_offset() as usize + 12;
         self.data[off..off + 4].copy_from_slice(&next.to_be_bytes());
-        self.dirty = true;
+        self.touch();
     }
 
     /// Overflow chain: data region (after the 12-byte page header + 4-byte
@@ -373,7 +420,7 @@ impl Page {
         self.set_n_cells(0);
         self.set_cell_content_start(0); // 0 means page_size
         self.set_right_most_pointer(0);
-        self.dirty = true;
+        self.touch();
     }
 
     /// Initialize an empty interior table page.
@@ -382,7 +429,7 @@ impl Page {
         self.set_n_cells(0);
         self.set_cell_content_start(0);
         self.set_right_most_pointer(0);
-        self.dirty = true;
+        self.touch();
     }
 
     /// Initialize an empty leaf index page.
@@ -391,7 +438,7 @@ impl Page {
         self.set_n_cells(0);
         self.set_cell_content_start(0);
         self.set_right_most_pointer(0);
-        self.dirty = true;
+        self.touch();
     }
 
     /// Initialize an empty interior index page.
@@ -400,7 +447,7 @@ impl Page {
         self.set_n_cells(0);
         self.set_cell_content_start(0);
         self.set_right_most_pointer(0);
-        self.dirty = true;
+        self.touch();
     }
 }
 
@@ -547,6 +594,8 @@ mod tests {
             id: 1,
             data: p.data.clone(),
             dirty: false,
+            serial: p.serial,
+            epoch: p.epoch,
         };
         assert_eq!(p2.page_type().unwrap(), PageType::InteriorTable);
         assert_eq!(p2.n_cells(), 3);

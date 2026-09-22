@@ -1161,7 +1161,7 @@ impl Pager {
                 let mut b = page.lock();
                 if b.data.len() == bytes.len() {
                     b.data.copy_from_slice(&bytes);
-                    b.dirty = true;
+                    b.touch();
                 } else {
                     // Page-size mismatch can't happen within one file;
                     // be defensive rather than corrupt.
@@ -1875,7 +1875,7 @@ impl Pager {
                     if off + 4 <= b.data.len() {
                         b.data[off..off + 4].copy_from_slice(&id.to_le_bytes());
                         b.data[4..8].copy_from_slice(&((k + 1) as u32).to_le_bytes());
-                        b.dirty = true;
+                        b.touch();
                         drop(b);
                         self.note_dirty(head);
                         became_trunk = false;
@@ -1888,7 +1888,7 @@ impl Pager {
                 b.data.fill(0);
                 b.data[..4].copy_from_slice(&head.to_le_bytes());
                 b.data[4..8].copy_from_slice(&0u32.to_le_bytes());
-                b.dirty = true;
+                b.touch();
                 drop(b);
                 self.note_dirty(id);
                 self.freelist_head.store(id, Ordering::Release);
@@ -1902,7 +1902,7 @@ impl Pager {
             let page0 = self.get_page(0)?;
             let mut b = page0.lock();
             b.data[..8].copy_from_slice(&crate::storage::page::DB_MAGIC);
-            b.dirty = true;
+            b.touch();
         }
         self.note_dirty(0);
         Ok(())
@@ -1928,7 +1928,7 @@ impl Pager {
             .copy_from_slice(&0u16.to_be_bytes()); // cell_content_start = 0 (= page_size)
         page0.data[DB_HEADER_SIZE as usize + 8..DB_HEADER_SIZE as usize + 12]
             .copy_from_slice(&0u32.to_be_bytes()); // right_pointer = 0
-        page0.dirty = true;
+        page0.touch();
 
         self.write_file_at(0, &page0.data)?;
         // Sync only for durable opens. `:memory:` databases (skip_fsync)
@@ -2189,7 +2189,7 @@ impl Pager {
             let mut p = page.lock();
             let bytes = v.to_le_bytes();
             p.data[offset..offset + 4].copy_from_slice(&bytes);
-            p.dirty = true;
+            p.touch();
         }
         self.note_dirty(0);
         let bytes = v.to_le_bytes();
@@ -2684,7 +2684,7 @@ impl Pager {
                 }
             }
             if dirty_on_insert {
-                page.dirty = true;
+                page.touch();
             }
             let page_ref = Arc::new(Mutex::new(page));
             self.maybe_evict_locked(&mut cache);
@@ -3236,7 +3236,7 @@ impl Pager {
                 }
                 freed = u32::from_le_bytes(borrowed.data[last..last + 4].try_into().unwrap());
                 borrowed.data[4..8].copy_from_slice(&(k_entries - 1).to_le_bytes());
-                borrowed.dirty = true;
+                borrowed.touch();
                 drop(borrowed);
                 self.note_dirty(head);
             } else {
@@ -3248,7 +3248,7 @@ impl Pager {
                 let page = self.get_page(head)?;
                 let mut borrowed = page.lock();
                 borrowed.data.fill(0);
-                borrowed.dirty = true;
+                borrowed.touch();
                 drop(borrowed);
                 self.note_dirty(head);
             }
@@ -3259,7 +3259,7 @@ impl Pager {
                 let page = self.get_page(freed)?;
                 let mut borrowed = page.lock();
                 borrowed.data.fill(0);
-                borrowed.dirty = true;
+                borrowed.touch();
             }
             self.note_write();
             self.note_dirty(freed);
@@ -3269,7 +3269,7 @@ impl Pager {
             let id = self.n_pages.fetch_add(1, Ordering::AcqRel);
             let psz = self.page_size();
             let mut page = Page::new(id, psz);
-            page.dirty = true;
+            page.touch();
             let page_ref = Arc::new(Mutex::new(page));
             {
                 let mut cache = self.cache.write();
@@ -3319,7 +3319,7 @@ impl Pager {
                     } else {
                         Page::new_uninit(id, psz)
                     };
-                    page.dirty = true;
+                    page.touch();
                     let pr: PageRef = Arc::new(Mutex::new(page));
                     out.push((id, pr.clone()));
                     let mut guard = self.concurrent.get(txn).ok_or_else(|| {
@@ -3397,7 +3397,7 @@ impl Pager {
                 }
                 freed = u32::from_le_bytes(borrowed.data[last..last + 4].try_into().unwrap());
                 borrowed.data[4..8].copy_from_slice(&(k_entries - 1).to_le_bytes());
-                borrowed.dirty = true;
+                borrowed.touch();
                 drop(borrowed);
                 self.note_dirty(head);
             } else {
@@ -3406,7 +3406,7 @@ impl Pager {
                 let page = self.get_page(head)?;
                 let mut borrowed = page.lock();
                 borrowed.data.fill(0);
-                borrowed.dirty = true;
+                borrowed.touch();
                 drop(borrowed);
                 self.note_dirty(head);
             }
@@ -3417,7 +3417,7 @@ impl Pager {
             {
                 let mut borrowed = page_ref.lock();
                 borrowed.data.fill(0);
-                borrowed.dirty = true;
+                borrowed.touch();
             }
             self.note_dirty(freed);
             out.push((freed, page_ref));
@@ -3440,7 +3440,7 @@ impl Pager {
                     // can observe the page between here and the fill.
                     Page::new_uninit(id, psz)
                 };
-                page.dirty = true;
+                page.touch();
                 new_pages.push((id, Arc::new(Mutex::new(page))));
             }
             {
@@ -3523,7 +3523,7 @@ impl Pager {
                 if off + 4 <= borrowed.data.len() {
                     borrowed.data[off..off + 4].copy_from_slice(&id.to_le_bytes());
                     borrowed.data[4..8].copy_from_slice(&(k_entries + 1).to_le_bytes());
-                    borrowed.dirty = true;
+                    borrowed.touch();
                     drop(borrowed);
                     self.note_dirty(head);
                 } else {
@@ -3544,7 +3544,7 @@ impl Pager {
                 borrowed.data.fill(0);
                 borrowed.data[..4].copy_from_slice(&head.to_le_bytes());
                 borrowed.data[4..8].copy_from_slice(&0u32.to_le_bytes());
-                borrowed.dirty = true;
+                borrowed.touch();
             }
             self.note_dirty(id);
             self.freelist_head.store(id, Ordering::Release);
@@ -3684,7 +3684,7 @@ impl Pager {
                         for (i, e) in kept.iter().enumerate() {
                             borrowed.data[8 + i * 4..12 + i * 4].copy_from_slice(&e.to_le_bytes());
                         }
-                        borrowed.dirty = true;
+                        borrowed.touch();
                         drop(borrowed);
                         self.note_dirty(cur);
                     }
@@ -3695,7 +3695,7 @@ impl Pager {
                         let page = self.get_page(prev_kept)?;
                         let mut borrowed = page.lock();
                         borrowed.data[..4].copy_from_slice(&cur.to_le_bytes());
-                        borrowed.dirty = true;
+                        borrowed.touch();
                         drop(borrowed);
                         self.note_dirty(prev_kept);
                     }
@@ -3820,7 +3820,7 @@ impl Pager {
                 Some(n) => write_codec_marker(&mut b.data, &n),
                 None => clear_codec_marker(&mut b.data),
             }
-            b.dirty = true;
+            b.touch();
         }
         self.note_dirty(0);
         if self.lazy_writeback.load(Ordering::Acquire) {
@@ -4012,7 +4012,7 @@ impl Pager {
         {
             let mut p = page0.lock();
             crate::storage::page::FileHeader::set_journal_mode(&mut p.data, mode);
-            p.dirty = true;
+            p.touch();
         }
         self.note_dirty(0);
         let mut raw = [0u8; 4];
@@ -4289,7 +4289,7 @@ impl Pager {
                 &mut borrowed.data,
                 crate::storage::page::JOURNAL_MODE_WAL,
             );
-            borrowed.dirty = true;
+            borrowed.touch();
         }
         self.dirty_pages.lock().insert(0);
 
@@ -4672,7 +4672,7 @@ impl Pager {
             {
                 let mut p = page_ref.lock();
                 p.data.copy_from_slice(chunk);
-                p.dirty = true;
+                p.touch();
             }
             self.note_dirty(id);
             self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
@@ -4778,7 +4778,7 @@ impl Pager {
                 let s = src.lock();
                 let mut d = dst.lock();
                 d.data.copy_from_slice(&s.data);
-                d.dirty = true;
+                d.touch();
             }
             // Reference patches: rewrite the 4-byte page ids whose
             // targets moved. Identity pages take surgical in-place
@@ -4798,7 +4798,7 @@ impl Pager {
                     }
                 }
                 if changed {
-                    d.dirty = true;
+                    d.touch();
                 }
             }
             self.note_dirty(k);
@@ -4824,7 +4824,7 @@ impl Pager {
                     for i in 0..patch.width as usize {
                         d.data[off + i] = ((v >> (8 * i)) & 0xFF) as u8; // LE body
                     }
-                    d.dirty = true;
+                    d.touch();
                 } else {
                     return Err(Error::corruption(format!(
                         "in-place vacuum: schema rootpage patch out of bounds (page {slot})"
@@ -5094,7 +5094,7 @@ impl Pager {
                 FileHeader::write(&mut borrowed.data, psz, n_pages_val, schema_cookie_val);
                 borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
                 borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
-                borrowed.dirty = true;
+                borrowed.touch();
                 // Mark page 0 as dirty in the dirty_pages set so the
                 // header write below (OUT OF ORDER — last) finds it.
                 drop(borrowed);
@@ -6063,7 +6063,7 @@ mod tests {
             let page = pager.get_page(id).unwrap();
             let mut p = page.lock();
             p.data[0] = (id % 256) as u8;
-            p.dirty = true;
+            p.touch();
         }
         pager.note_write();
         pager.flush().unwrap();
