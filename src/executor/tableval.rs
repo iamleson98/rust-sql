@@ -57,6 +57,7 @@ pub(crate) fn exec_table_function(
         "pragma_foreign_key_list" => pragma_foreign_key_list(ctx, &vals)?,
         "pragma_collation_list" => pragma_collation_list(),
         "pragma_database_list" => pragma_database_list(),
+        "dbstat" => dbstat(ctx, &vals)?,
         other => {
             return Err(Error::semantic(format!(
                 "no such table-valued function: {}",
@@ -391,4 +392,338 @@ fn pragma_database_list() -> (Vec<&'static str>, Vec<Vec<Value>>) {
             Value::Null,
         ]],
     )
+}
+
+// ---------------------------------------------------------------------------
+// dbstat — SQLite's DBSTAT_VTAB (per-page b-tree statistics)
+// ---------------------------------------------------------------------------
+//
+// `FROM dbstat` (eponymous — no CREATE VIRTUAL TABLE, resolved by the
+// planner when the catalog misses) or `FROM dbstat('t1')` (one object's
+// pages). Second argument nonzero/'aggregate' = AGGREGATE mode (one row
+// per b-tree with the sums). Columns are SQLite's: name, path, pageno,
+// pagetype, ncell, payload, unused, mx_payload, pgoffset, pgsize.
+//
+// PATH format (engine's documented shape — SQLite's is opaque and
+// explicitly subject to change): root = "/"; the i-th child of an
+// interior page = parent + "/" + i (1-based, the rightmost pointer is
+// the last child); an overflow chain page = its leaf path + "/" + the
+// overflow page number.
+//
+// payload: payload bytes STORED ON the page (the local prefix for
+// spilled cells, the chunk bytes for overflow pages). mx_payload: the
+// largest TOTAL payload among cells starting on the page. unused: the
+// page's free space. Freelist pages are not reported (as in SQLite).
+
+/// dbstat's column set (also mirrored in namecheck's `tvf_columns` and
+/// the eponymous `table_source` fallback — keep the three in sync).
+pub(crate) const DBSTAT_COLS: [&str; 10] = [
+    "name",
+    "path",
+    "pageno",
+    "pagetype",
+    "ncell",
+    "payload",
+    "unused",
+    "mx_payload",
+    "pgoffset",
+    "pgsize",
+];
+
+/// One b-tree's page inventory, accumulated by the walk (aggregate
+/// mode's sums; per-page mode keeps the rows).
+struct DbstatAccum {
+    ncell: i64,
+    payload: i64,
+    unused: i64,
+    mx_payload: i64,
+    pages: i64,
+}
+
+fn dbstat(
+    ctx: &ExecContext<'_>,
+    args: &[Value],
+) -> Result<(Vec<&'static str>, Vec<Vec<Value>>), Error> {
+    // Optional first argument: restrict to one table/index by name
+    // (empty string or NULL = everything). Optional second: aggregate
+    // mode flag (any nonzero integer, or a nonempty string).
+    let filter: Option<String> = match args.first() {
+        Some(Value::Text(t)) if !t.is_empty() => Some(t.to_string()),
+        _ => None,
+    };
+    let aggregate = match args.get(1) {
+        Some(Value::Integer(n)) => *n != 0,
+        Some(Value::Text(t)) => !t.is_empty(),
+        _ => false,
+    };
+
+    let pager = ctx.pager;
+    let psz = pager.page_size() as usize;
+
+    // B-tree inventory: the schema b-tree (root 0) plus every table and
+    // index with its LIVE root (the ctx's root resolution includes the
+    // session's bookkeeping overrides).
+    let mut btrees: Vec<(String, u32, bool)> = Vec::new();
+    btrees.push(("sqlite_master".to_string(), 0, false));
+    let cat = ctx.catalog();
+    for (name, t) in cat.all_tables() {
+        if t.vtab.is_some() {
+            continue; // virtual tables have no b-tree pages
+        }
+        let root = ctx.table_root(&t);
+        if root == 0 {
+            continue;
+        }
+        btrees.push((name, root, false));
+    }
+    for (name, ix) in cat.all_indexes() {
+        let root = ctx.index_root(&ix);
+        if root == 0 {
+            continue;
+        }
+        btrees.push((name, root, true));
+    }
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    for (name, root, is_index) in btrees {
+        if let Some(f) = &filter {
+            if !name.eq_ignore_ascii_case(f) {
+                continue;
+            }
+        }
+        visited.clear();
+        let mut accum = DbstatAccum {
+            ncell: 0,
+            payload: 0,
+            unused: 0,
+            mx_payload: 0,
+            pages: 0,
+        };
+        walk_dbstat_btree(
+            pager,
+            root,
+            is_index,
+            psz,
+            &name,
+            "/",
+            aggregate,
+            &mut rows,
+            &mut accum,
+            &mut visited,
+        )?;
+        if aggregate {
+            rows.push(vec![
+                Value::Text(name.as_str().into()),
+                Value::Null,
+                Value::Integer(root as i64),
+                Value::Null,
+                Value::Integer(accum.ncell),
+                Value::Integer(accum.payload),
+                Value::Integer(accum.unused),
+                Value::Integer(accum.mx_payload),
+                Value::Integer(0),
+                Value::Integer(psz as i64),
+            ]);
+        }
+    }
+    Ok((DBSTAT_COLS.to_vec(), rows))
+}
+
+/// DFS over one b-tree's pages (and overflow chains). `visited` guards
+/// against cycles in corrupt files — the bound is the file's page count.
+fn walk_dbstat_btree(
+    pager: &crate::storage::pager::Pager,
+    pageno: u32,
+    is_index: bool,
+    psz: usize,
+    name: &str,
+    path: &str,
+    aggregate: bool,
+    rows: &mut Vec<Vec<Value>>,
+    accum: &mut DbstatAccum,
+    visited: &mut std::collections::HashSet<u32>,
+) -> Result<(), Error> {
+    use crate::storage::btree::Cell;
+    use crate::storage::page::PageType;
+    let _ = is_index; // page types drive the walk; the flag is informational
+
+    // NOTE: no pageno==0 guard — page 0 is a REAL page here (the
+    // schema b-tree's root; pages are 0-based in this engine). A 0
+    // child/overflow pointer means "none" and is filtered at the call
+    // sites.
+    if !visited.insert(pageno) {
+        return Err(Error::corruption(format!(
+            "dbstat: page {pageno} visited twice (cycle?)"
+        )));
+    }
+    if visited.len() > pager.n_pages() as usize + 8 {
+        return Err(Error::corruption("dbstat: page walk exceeded the file"));
+    }
+
+    let page_ref = pager.get_page(pageno)?;
+    let p = page_ref.lock();
+    let pt = p.page_type()?;
+    let ncell = p.n_cells() as usize;
+    let unused = p.free_space() as i64;
+    let mut payload_on_page: i64 = 0;
+    let mut mx_payload: i64 = 0;
+    let mut overflow_heads: Vec<(u32, u64)> = Vec::new();
+    let mut children: Vec<u32> = Vec::new();
+    for i in 0..ncell {
+        let buf = p.cell_slice(i as u16)?;
+        let cell = Cell::decode(buf, pt, psz as u32)?;
+        match cell {
+            Cell::TableLeaf { payload, .. } => {
+                payload_on_page += payload.len() as i64;
+                mx_payload = mx_payload.max(payload.len() as i64);
+            }
+            Cell::TableLeafOverflow {
+                total,
+                local,
+                overflow,
+                ..
+            }
+            | Cell::IndexLeafOverflow {
+                total,
+                local,
+                overflow,
+                ..
+            } => {
+                payload_on_page += local.len() as i64;
+                mx_payload = mx_payload.max(total as i64);
+                overflow_heads.push((overflow, total - local.len() as u64));
+            }
+            Cell::IndexInteriorOverflow {
+                left_child,
+                total,
+                local,
+                overflow,
+                ..
+            } => {
+                payload_on_page += local.len() as i64;
+                mx_payload = mx_payload.max(total as i64);
+                overflow_heads.push((overflow, total - local.len() as u64));
+                children.push(left_child);
+            }
+            Cell::IndexLeaf { key, .. } => {
+                payload_on_page += key.len() as i64;
+                mx_payload = mx_payload.max(key.len() as i64);
+            }
+            Cell::IndexInterior {
+                key, left_child, ..
+            } => {
+                payload_on_page += key.len() as i64;
+                mx_payload = mx_payload.max(key.len() as i64);
+                children.push(left_child);
+            }
+            Cell::TableInterior { left_child, .. } => {
+                children.push(left_child);
+            }
+        }
+    }
+    if let PageType::InteriorIndex | PageType::InteriorTable = pt {
+        let right = p.right_most_pointer();
+        if right != 0 {
+            children.push(right);
+        }
+    }
+    let pagetype = match pt {
+        PageType::InteriorIndex | PageType::InteriorTable => "internal",
+        PageType::LeafIndex | PageType::LeafTable => "leaf",
+        PageType::Overflow => "overflow",
+    };
+    drop(p);
+
+    accum.ncell += ncell as i64;
+    accum.payload += payload_on_page;
+    accum.unused += unused;
+    accum.mx_payload = accum.mx_payload.max(mx_payload);
+    accum.pages += 1;
+    if !aggregate {
+        rows.push(vec![
+            Value::Text(name.into()),
+            Value::Text(path.into()),
+            Value::Integer(pageno as i64),
+            Value::Text(pagetype.into()),
+            Value::Integer(ncell as i64),
+            Value::Integer(payload_on_page),
+            Value::Integer(unused),
+            Value::Integer(mx_payload),
+            Value::Integer(pageno as i64 * psz as i64),
+            Value::Integer(psz as i64),
+        ]);
+    }
+
+    // Children: cell i of an interior page is child number i+1; the
+    // rightmost pointer is the last child.
+    for (i, child) in children.iter().enumerate() {
+        if *child == 0 {
+            continue;
+        }
+        let child_path = format!("{}/{}", path, i + 1);
+        walk_dbstat_btree(
+            pager,
+            *child,
+            is_index,
+            psz,
+            name,
+            &child_path,
+            aggregate,
+            rows,
+            accum,
+            visited,
+        )?;
+    }
+    // Overflow chains: one row per page, chunk-sized payload.
+    for (head, tail_len) in overflow_heads {
+        let mut cur = head;
+        let mut remaining = tail_len as i64;
+        let cap = (psz.saturating_sub(16)) as i64;
+        let mut hops = 0usize;
+        while cur != 0 && remaining > 0 {
+            hops += 1;
+            if hops > pager.n_pages() as usize + 8 {
+                return Err(Error::corruption("dbstat: overflow chain cycle"));
+            }
+            if !visited.insert(cur) {
+                return Err(Error::corruption(format!(
+                    "dbstat: overflow page {cur} visited twice (cycle?)"
+                )));
+            }
+            let take = remaining.min(cap);
+            let page_unused = cap - take;
+            let page_ref = pager.get_page(cur)?;
+            let next = {
+                let pg = page_ref.lock();
+                let is_overflow = pg.page_type()? == PageType::Overflow;
+                if !is_overflow {
+                    return Err(Error::corruption(format!(
+                        "dbstat: overflow chain hit non-overflow page {cur}"
+                    )));
+                }
+                pg.overflow_next()
+            };
+            accum.payload += take;
+            accum.unused += page_unused;
+            accum.pages += 1;
+            if !aggregate {
+                rows.push(vec![
+                    Value::Text(name.into()),
+                    Value::Text(format!("{}/{}", path, cur).into()),
+                    Value::Integer(cur as i64),
+                    Value::Text("overflow".into()),
+                    Value::Integer(0),
+                    Value::Integer(take),
+                    Value::Integer(page_unused),
+                    Value::Integer(take),
+                    Value::Integer(cur as i64 * psz as i64),
+                    Value::Integer(psz as i64),
+                ]);
+            }
+            remaining -= take;
+            cur = next;
+        }
+    }
+    Ok(())
 }

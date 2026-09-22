@@ -760,10 +760,23 @@ impl<'a> Planner<'a> {
                         return Ok(plan);
                     }
                 }
-                let table = self
-                    .catalog
-                    .get_table(name)
-                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", name)))?;
+                let table = match self.catalog.get_table(name) {
+                    Some(t) => t,
+                    None => {
+                        // EPONYMOUS virtual table: `FROM dbstat` (no
+                        // argument list) resolves to a zero-argument
+                        // TableFunction scan when the catalog misses —
+                        // a real table named dbstat shadows it.
+                        if name.eq_ignore_ascii_case("dbstat") && indexed.is_none() {
+                            return Ok(Plan::TableFunction {
+                                name: name.clone(),
+                                args: Vec::new(),
+                                alias: alias.clone(),
+                            });
+                        }
+                        return Err(Error::NotFound(format!("no such table: {}", name)));
+                    }
+                };
                 // Pending virtual table (module not registered yet): the
                 // column list is unknown until xConnect, so planning
                 // would produce a wrong schema. Modules must be

@@ -210,6 +210,8 @@ fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
             "match",
         ]),
         "pragma_collation_list" => Some(vec!["seq", "name"]),
+        // dbstat: the same column list the executor serves (DBSTAT_COLS).
+        "dbstat" => Some(crate::executor::tableval::DBSTAT_COLS.to_vec()),
         "pragma_database_list" => Some(vec!["seq", "name", "file"]),
         _ => None,
     }
@@ -246,6 +248,19 @@ fn table_source(ctx: &Ctx<'_>, name: &str, ctes: &CteList) -> Option<(Vec<String
             Some(names) => return Some((names, false, false)),
             None => return Some((Vec::new(), false, true)),
         }
+    }
+    // EPONYMOUS virtual table: `FROM dbstat` with no argument list —
+    // the planner routes it to a zero-argument TableFunction scan (a
+    // real table named dbstat shadows it, as it should).
+    if name.eq_ignore_ascii_case("dbstat") {
+        return Some((
+            crate::executor::tableval::DBSTAT_COLS
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            false,
+            false,
+        ));
     }
     None
 }

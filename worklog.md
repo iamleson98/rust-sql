@@ -1019,3 +1019,19 @@ Work Log:
 Stage Summary:
 - The sqlite3_blob_* gap is CLOSED — incremental I/O on BLOB and TEXT, writes riding every transaction shape incl. the concurrent regime.
 - column_blob-on-TEXT conversion divergence fixed.
+
+---
+Task ID: 38
+Agent: main (Super Z)
+Task: dbstat virtual table (SQLite's DBSTAT_VTAB) — the per-page b-tree statistics surface.
+
+Work Log:
+- Implementation on the engine's existing TableFunction machinery: new `dbstat(ctx, args)` in executor/tableval.rs — a page-level DFS over every b-tree (sqlite_master root 0 + all tables + all indexes with LIVE roots via ctx root resolution; vtabs skipped), one row per page with SQLite's 10 columns (name, path, pageno, pagetype, ncell, payload, unused, mx_payload, pgoffset, pgsize) plus one row per OVERFLOW chain page (16-byte header + 4080-byte chunks at 4 KB pages); payload = bytes ON the page (local prefix for spilled cells), mx_payload = the largest total cell payload; aggregate mode (second arg nonzero) = one row per b-tree with the sums. Cycle guards bound the walk by the file's page count (corruption surfaces as an error, never a hang).
+- PATH format documented (engine shape): root "/", i-th child of an interior page = parent + "/" + i (rightmost = last), overflow chain page = leaf path + "/" + page. Pages are 0-based in this engine — pgoffset = pageno * page_size (the SQLite 1-based formula was wrong here); page 0 IS the schema root (no zero-page guard — a 0 child/overflow pointer is filtered at the call sites).
+- Resolution plumbing for the EPONYMOUS form: namecheck's table_source falls back to dbstat's columns when the catalog misses (a real table named dbstat shadows it, pinned by test); the planner's Table arm routes to a zero-arg TableFunction; tvf_columns registers the function form. One column source of truth (executor::tableval::DBSTAT_COLS) shared by all three.
+- Cell accounting via Cell::decode across all 7 variants (interior index cells push BOTH their child and their key payload — the first draft dropped interior-index children); local/total/overflow split from the decoded overflow variants; chain chunk math uses the engine's own overflow_page_capacity (page_size - 16).
+- Tests (tests/dbstat.rs, 5 suites): bare + filtered forms (t/ti/sqlite_master inventories; unknown filter = empty), per-page shape (ncell = row count on a single leaf, pgoffset/pgsize arithmetic, split trees produce internal+leaf, path invariants), overflow chains (record-level accounting: mx_payload = full record incl. header, overflow payload = mx - local, page count = ceil((mx-local)/4080)), aggregate mode (sums equal the per-page sums, ncell includes interior separators, one row per btree), shadowing + the 10-column contract.
+- Verification: engine lib 271, regression 27, differential 56, stateful_fuzz 2, parallel_scan 1, dbstat 5 — all green; clippy --lib --tests -D warnings clean; fmt clean. (ENABLE_DBSTAT_VTAB was already advertised in compile_options mirroring the reference build — dbstat is now actually real.)
+
+Stage Summary:
+- The dbstat gap is CLOSED (eponymous + function + aggregate forms); sqlite_dbdata (forensic deleted-page reader) remains the open half of the old bullet.
