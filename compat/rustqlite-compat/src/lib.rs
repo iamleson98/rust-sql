@@ -101,11 +101,14 @@ pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
 // Extended codes (libsqlite3-sys reports these when
 // sqlite3_extended_result_codes is on — sqlx always turns it on).
-pub const SQLITE_BUSY_TIMEOUT: c_int = 5 | (2 << 8);
+// Exact sqlite3.h values: BUSY_RECOVERY 261, BUSY_SNAPSHOT 517,
+// BUSY_TIMEOUT 773 (primary 5 | secondary << 8).
+/// SQLITE_BUSY_TIMEOUT — the busy handler gave up (sqlite3.h: 5|(3<<8)).
+pub const SQLITE_BUSY_TIMEOUT: c_int = 5 | (3 << 8);
 /// SQLITE_BUSY_SNAPSHOT — a BEGIN CONCURRENT transaction lost the
 /// first-committer-wins race (the engine's optimistic multi-writer
 /// conflict; SQLite's begin_concurrent branch surfaces the same code).
-pub const SQLITE_BUSY_SNAPSHOT: c_int = 5 | (4 << 8); // 517
+pub const SQLITE_BUSY_SNAPSHOT: c_int = 5 | (2 << 8); // 517
                                                       // Exact values from sqlite3.h (see compat/libsqlite3-sys bindings).
 pub const SQLITE_CONSTRAINT_CHECK: c_int = 275;
 pub const SQLITE_CONSTRAINT_NOTNULL: c_int = 1299;
@@ -308,7 +311,11 @@ pub fn engine_stats() -> EngineStats {
                 wal_frames: pager.wal_frames(),
                 total_changes: pager.rows_modified_total(),
                 live_connections: engine.live_connections.load(Relaxed),
-                transaction_active: engine.tx_owner.load(std::sync::atomic::Ordering::Acquire) != 0,
+                // A plain transaction holds `tx_owner`; a concurrent
+                // regime (multi-owner, no slot) shows through the engine
+                // flag — the stat must report both.
+                transaction_active: engine.tx_owner.load(std::sync::atomic::Ordering::Acquire) != 0
+                    || engine.db.read().concurrent_regime_active(),
             });
         }
     }
@@ -479,6 +486,15 @@ struct ConnState {
     /// True between BEGIN and COMMIT/ROLLBACK (per CONNECTION — what
     /// `sqlite3_get_autocommit` reports).
     in_tx: AtomicBool,
+    /// True while this connection's open transaction is a BEGIN
+    /// CONCURRENT one. Concurrent transactions are MULTI-writer: they
+    /// do not take the engine's `tx_owner` slot (several may be open at
+    /// once), their COMMIT/ROLLBACK releases bookkeeping even when the
+    /// engine returns an error (a SQLITE_BUSY_SNAPSHOT conflict already
+    /// ended the transaction engine-side), and plain autocommit DML on
+    /// OTHER connections implicitly JOINS the regime instead of
+    /// waiting it out.
+    tx_concurrent: AtomicBool,
     /// SQLITE_OPEN_SHAREDCACHE discipline: write conflicts with another
     /// connection's transaction return SQLITE_LOCKED immediately (no
     /// BUSY polling) and sqlite3_unlock_notify registrations defer until
@@ -670,15 +686,25 @@ impl Drop for Conn {
             unsafe { cancel_unlock_waiters(engine, self as *const Conn as *mut sqlite3) };
         }
         // Auto-rollback of an abandoned transaction (SQLite rolls back at
-        // close when the connection had an open tx).
+        // close when the connection had an open tx). Identity armed so the
+        // engine routes the ROLLBACK to THIS connection's transaction —
+        // including a BEGIN CONCURRENT one (keyed by the armed identity,
+        // not the anonymous slot). Concurrent owners hold no `tx_owner`
+        // slot, so the filter must accept them too.
         if let Some(engine) = self
             .engine
             .as_ref()
             .filter(|_| self.state.in_tx.load(Ordering::Acquire))
-            .filter(|e| e.tx_owner.load(Ordering::Acquire) == self.id)
+            .filter(|e| {
+                e.tx_owner.load(Ordering::Acquire) == self.id
+                    || self.state.tx_concurrent.load(Ordering::Acquire)
+            })
         {
-            let _ = engine.db.write().execute("ROLLBACK", []);
-            engine.tx_owner.store(0, Ordering::Release);
+            {
+                let _id = rustqlite::ConnIdentityGuard::arm(self.id as u64);
+                let _ = engine.db.write().execute("ROLLBACK", []);
+            }
+            release_tx_hold(engine, self);
             metrics::bump(&metrics::TX_ROLLED_BACK);
             // The abandoned transaction's locks released: deliver the
             // other blocked connections' callbacks.
@@ -703,7 +729,11 @@ enum StmtKind {
     /// INSERT / UPDATE / DELETE — engine statement (may have RETURNING).
     Dml { returning: bool },
     /// PRAGMA with a value (write form) — executed via Database::execute.
-    PragmaWrite,
+    /// Carries the lowercase pragma NAME: the transaction gates
+    /// special-case `journal_mode` (a no-op mode read-back must not wait
+    /// out a concurrent regime — the engine's regime gate makes the
+    /// same no-op call).
+    PragmaWrite { name: String },
     /// PRAGMA without a value (read form) — executed via query at first
     /// step, rows buffered.
     PragmaRead,
@@ -730,7 +760,9 @@ fn classify(stmt: &rustqlite::sql::ast::Statement) -> StmtKind {
         },
         S::Pragma(p) => {
             if p.value.is_some() && !is_table_valued_read_pragma(&p.name) {
-                StmtKind::PragmaWrite
+                StmtKind::PragmaWrite {
+                    name: p.name.to_ascii_lowercase(),
+                }
             } else {
                 StmtKind::PragmaRead
             }
@@ -765,7 +797,14 @@ fn is_table_valued_read_pragma(name: &str) -> bool {
 /// re-parse-and-match code).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TxKind {
-    Begin,
+    /// BEGIN — `concurrent` distinguishes `BEGIN CONCURRENT` (the
+    /// multi-writer regime: no `tx_owner` slot, several connections may
+    /// hold one at once, foreign autocommit DML joins the regime) from a
+    /// plain BEGIN (exclusive engine slot, SQLite's single-writer
+    /// discipline).
+    Begin {
+        concurrent: bool,
+    },
     Commit,
     Rollback,
     SavepointOrRelease,
@@ -774,7 +813,9 @@ enum TxKind {
 fn tx_kind_of(stmt: &rustqlite::sql::ast::Statement) -> Option<TxKind> {
     use rustqlite::sql::ast::Statement as S;
     match stmt {
-        S::Begin(_) => Some(TxKind::Begin),
+        S::Begin(b) => Some(TxKind::Begin {
+            concurrent: matches!(b.mode, rustqlite::sql::ast::BeginMode::Concurrent),
+        }),
         S::Commit => Some(TxKind::Commit),
         S::Rollback(_) => Some(TxKind::Rollback),
         S::Savepoint(_) | S::Release(_) => Some(TxKind::SavepointOrRelease),
@@ -1408,6 +1449,7 @@ fn new_conn_opts(engine: Option<Arc<Engine>>, readonly: bool, shared_cache: bool
         readonly,
         state: ConnState {
             in_tx: AtomicBool::new(false),
+            tx_concurrent: AtomicBool::new(false),
             shared_cache,
             busy_timeout_ms: AtomicI64::new(0),
             changes: AtomicI64::new(0),
@@ -1712,22 +1754,36 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
     Arc::as_ptr(&s.conn) as *mut sqlite3
 }
 
-/// Sleep waiting for the engine-level transaction lock, honoring
-/// busy_timeout. Returns true if acquired.
-fn await_tx_slot(engine: &Arc<Engine>, conn_id: usize, timeout_ms: i64) -> bool {
+/// SQLite's busy_timeout wait for the cross-connection transaction slot.
+/// `wait_regime_too` also drains a foreign BEGIN CONCURRENT regime (the
+/// shapes that cannot join it: plain BEGIN, DDL, PRAGMA, and a
+/// connection's OWN transaction-scoped statements); `false` waits only
+/// for a foreign PLAIN transaction — the shape a concurrent BEGIN uses,
+/// since other concurrent owners are the point of the multi-writer
+/// regime.
+fn await_tx_slot(
+    engine: &Arc<Engine>,
+    conn_id: usize,
+    timeout_ms: i64,
+    wait_regime_too: bool,
+) -> bool {
     // SQLite's busy_timeout semantics: 0 (or negative) = no wait budget
     // — SQLITE_BUSY right away. This used to poll FOREVER on 0 (the
     // deadline check required timeout_ms > 0), deadlocking any default
     // connection that wrote behind a foreign transaction.
+    let blocked = |owner: usize| -> bool {
+        if owner != 0 && owner != conn_id {
+            return true;
+        }
+        wait_regime_too && engine.db.read().concurrent_regime_active()
+    };
     if timeout_ms <= 0 {
-        let owner = engine.tx_owner.load(Ordering::Acquire);
-        return owner == 0 || owner == conn_id;
+        return !blocked(engine.tx_owner.load(Ordering::Acquire));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     let mut waited = false;
     loop {
-        let owner = engine.tx_owner.load(Ordering::Acquire);
-        if owner == 0 || owner == conn_id {
+        if !blocked(engine.tx_owner.load(Ordering::Acquire)) {
             if waited {
                 // Waited at least one poll for a foreign transaction —
                 // concurrency-pressure signal for the admin stats.
@@ -2154,7 +2210,7 @@ unsafe fn prepare_impl(
     let kind = classify(&ast);
     let is_write = matches!(
         kind,
-        StmtKind::Dml { .. } | StmtKind::PragmaWrite | StmtKind::Once
+        StmtKind::Dml { .. } | StmtKind::PragmaWrite { .. } | StmtKind::Once
     );
     // Transaction-control flavor, computed once here (replaces the
     // per-execution re-parse that run_once used to do).
@@ -2337,7 +2393,7 @@ unsafe fn prepare_impl(
                 columns,
             }
         }
-        StmtKind::PragmaWrite | StmtKind::Once => Exec::Once {
+        StmtKind::PragmaWrite { .. } | StmtKind::Once => Exec::Once {
             sql: stmt_text.clone(),
         },
     };
@@ -2481,56 +2537,80 @@ fn run_once(stmt: &mut Stmt) -> c_int {
     // Transaction-control handling: BEGIN waits for the engine-level tx
     // slot (cross-connection serialization, SQLite-style BUSY).
     if let Some(tx) = stmt.tx_kind {
-        if tx == TxKind::Begin {
+        if let TxKind::Begin { concurrent } = tx {
             if conn.state.in_tx.load(Ordering::Acquire) {
                 return conn.set_err(
                     SQLITE_ERROR,
                     "cannot start a transaction within a transaction",
                 );
             }
-            // Shared-cache discipline: a foreign transaction returns
-            // SQLITE_LOCKED NOW (SQLite's table-lock semantics — the
-            // busy handler never runs; unlock_notify is the sanctioned
-            // wait). Private-cache connections keep BUSY polling.
-            if conn.state.shared_cache {
+            // Shared-cache discipline: a foreign blocking transaction
+            // returns SQLITE_LOCKED NOW (SQLite's table-lock semantics —
+            // the busy handler never runs; unlock_notify is the
+            // sanctioned wait). Private-cache connections keep BUSY
+            // polling. WHAT blocks a BEGIN depends on its flavor: a
+            // plain BEGIN waits for BOTH foreign plain transactions and
+            // the whole concurrent regime (the regimes cannot mix); a
+            // BEGIN CONCURRENT waits only for a foreign PLAIN
+            // transaction — other concurrent owners are the point of
+            // the multi-writer regime (the engine-side BEGIN guard
+            // enforces both exclusions; this layer adds the
+            // busy_timeout semantics around them).
+            let plain_foreign = {
                 let owner = engine.tx_owner.load(Ordering::Acquire);
-                if owner != 0 && owner != conn.id {
+                owner != 0 && owner != conn.id
+            };
+            let blocked =
+                plain_foreign || (!concurrent && engine.db.read().concurrent_regime_active());
+            if blocked {
+                if conn.state.shared_cache {
                     return conn.set_err(SQLITE_LOCKED, "database table is locked");
                 }
-            }
-            let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
-            if !await_tx_slot(&engine, conn.id, timeout) {
-                return conn.set_err(SQLITE_BUSY, "database is locked");
+                let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
+                if !await_tx_slot(&engine, conn.id, timeout, !concurrent) {
+                    return conn.set_err(SQLITE_BUSY, "database is locked");
+                }
             }
         }
+        // Arm THIS connection's identity for the engine call: the BEGIN
+        // CONCURRENT regime keys transaction ownership, COMMIT/ROLLBACK
+        // routing, and the owner's read-your-own-writes scope on it.
+        // Without the arming every C-ABI handle would share the
+        // anonymous identity 0 — one concurrent-transaction slot, with
+        // any handle's reads serving the anonymous owner's uncommitted
+        // shadows (a dirty read across connections).
         let result = {
+            let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
             let mut w = engine.db.write();
             w.execute(&sql, [])
         };
         match result {
             Ok(()) => {
                 match tx {
-                    TxKind::Begin => {
-                        engine.tx_owner.store(conn.id, Ordering::Release);
+                    TxKind::Begin { concurrent } => {
+                        if concurrent {
+                            // Multi-writer regime: NO tx_owner slot —
+                            // several concurrent transactions may be
+                            // open at once; the engine tracks owners by
+                            // the armed identity.
+                            conn.state.tx_concurrent.store(true, Ordering::Release);
+                        } else {
+                            engine.tx_owner.store(conn.id, Ordering::Release);
+                            conn.state.tx_concurrent.store(false, Ordering::Release);
+                        }
                         conn.state.in_tx.store(true, Ordering::Release);
                         metrics::bump(&metrics::TX_BEGUN);
                     }
                     TxKind::Commit => {
-                        engine.tx_owner.store(0, Ordering::Release);
+                        release_tx_hold(&engine, &conn);
                         conn.state.in_tx.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_COMMITTED);
-                        // The committed transaction released its table
-                        // locks: deliver the blocked shared-cache
-                        // connections' unlock-notify callbacks (on THIS
-                        // thread — SQLite's documented delivery).
-                        unsafe { fire_unlock_waiters(&engine) };
                         fire_commit_hook(&conn);
                     }
                     TxKind::Rollback => {
-                        engine.tx_owner.store(0, Ordering::Release);
+                        release_tx_hold(&engine, &conn);
                         conn.state.in_tx.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_ROLLED_BACK);
-                        unsafe { fire_unlock_waiters(&engine) };
                         fire_rollback_hook(&conn);
                     }
                     TxKind::SavepointOrRelease => {}
@@ -2538,26 +2618,80 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                 conn.clear_err();
                 SQLITE_OK
             }
-            Err(e) => set_conn_err(&conn, &e),
+            Err(e) => {
+                // A failed CONCURRENT COMMIT/ROLLBACK still ENDED the
+                // engine-side transaction (a SQLITE_BUSY_SNAPSHOT commit
+                // conflict is fully rolled back before the error
+                // surfaces; the entry is removed either way) — release
+                // the hold and the autocommit bookkeeping exactly like
+                // the success path, or every later plain writer waits
+                // out a transaction that no longer exists. A failed
+                // PLAIN commit keeps the transaction open (SQLite).
+                if matches!(tx, TxKind::Commit | TxKind::Rollback)
+                    && conn.state.tx_concurrent.load(Ordering::Acquire)
+                {
+                    release_tx_hold(&engine, &conn);
+                    conn.state.in_tx.store(false, Ordering::Release);
+                }
+                set_conn_err(&conn, &e)
+            }
         }
     } else {
-        // Non-tx statement: if another connection holds the tx slot and
-        // this statement writes, wait (SQLite: BUSY during a foreign tx).
+        // Non-tx statement: if another connection holds the tx slot (a
+        // foreign PLAIN transaction) or a BEGIN CONCURRENT regime is
+        // active and this statement writes, wait (SQLite: BUSY during a
+        // foreign tx) — UNLESS the active hold is the concurrent regime
+        // and this is a plain AUTOCOMMIT DML statement: the engine
+        // IMPLICITLY JOINS it as a one-statement concurrent transaction
+        // (page shadows, row-level first-committer-wins with MERGE,
+        // group-commit fsync), so no wait is needed — a commit conflict
+        // surfaces retriable SQLITE_BUSY_SNAPSHOT instead of the
+        // unconditional BUSY a plain writer pays. DDL/PRAGMA statements
+        // and foreign PLAIN transactions keep the wait exactly as
+        // before (the regimes cannot mix engine-side).
         let writes = stmt.is_write;
         if writes {
-            if conn.state.shared_cache {
+            let plain_foreign = {
                 let owner = engine.tx_owner.load(Ordering::Acquire);
-                if owner != 0 && owner != conn.id {
+                owner != 0 && owner != conn.id
+            };
+            let regime = engine.db.read().concurrent_regime_active();
+            // THIS connection's own concurrent transaction does not
+            // block its own statements (the owner writes through the
+            // armed identity — the engine routes them to its overlay).
+            let own_concurrent = conn.state.in_tx.load(Ordering::Acquire)
+                && conn.state.tx_concurrent.load(Ordering::Acquire);
+            // `PRAGMA journal_mode = <current mode>` is a pure read-back
+            // no-op (SQLite's OP_JournalMode takes no lock when the mode
+            // is unchanged): the standard arm-WAL-on-connect pattern
+            // must not wait out a foreign regime. The ENGINE's regime
+            // gate makes the actual no-op call (a real mode switch
+            // during the regime still fails BUSY there). A foreign PLAIN
+            // transaction keeps blocking it — a mode flip inside another
+            // connection's transaction is never safe.
+            let mode_pragma = matches!(
+                stmt.kind,
+                StmtKind::PragmaWrite { ref name } if name == "journal_mode"
+            );
+            let joins_concurrent = regime
+                && !plain_foreign
+                && !conn.state.in_tx.load(Ordering::Acquire)
+                && matches!(stmt.kind, StmtKind::Dml { .. });
+            if (plain_foreign || (regime && !own_concurrent && !mode_pragma)) && !joins_concurrent {
+                if conn.state.shared_cache {
                     return conn.set_err(SQLITE_LOCKED, "database table is locked");
                 }
-            }
-            let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
-            if !await_tx_slot(&engine, conn.id, timeout) {
-                return conn.set_err(SQLITE_BUSY, "database is locked");
+                let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
+                if !await_tx_slot(&engine, conn.id, timeout, true) {
+                    return conn.set_err(SQLITE_BUSY, "database is locked");
+                }
             }
         }
+        // Identity arming: same rationale as the tx-control arm above —
+        // concurrent owners/joiners and their reads key on it.
         let before = engine.total_changes();
         let result = {
+            let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
             let mut w = engine.db.write();
             w.execute(&sql, [])
         };
@@ -2579,6 +2713,28 @@ fn run_once(stmt: &mut Stmt) -> c_int {
             }
             Err(e) => set_conn_err(&conn, &e),
         }
+    }
+}
+
+/// Release THIS connection's transaction hold after a COMMIT/ROLLBACK
+/// (or a failed CONCURRENT one — the engine ended the transaction either
+/// way). A plain hold clears the engine's exclusive `tx_owner` slot; a
+/// concurrent one never took it (the multi-writer regime tracks owners
+/// engine-side, keyed by the armed identity) — only the per-connection
+/// flag clears. Fires the blocked shared-cache connections'
+/// unlock-notify callbacks on the RELEASING thread (SQLite's documented
+/// delivery): for a concurrent hold, only when this was the regime's
+/// LAST transaction — that drain moment is what the plain waiters
+/// (plain BEGIN / DDL / PRAGMA) are waiting for; still-blocked waiters
+/// re-register per SQLite's documented retry pattern.
+fn release_tx_hold(engine: &Arc<Engine>, conn: &Conn) {
+    if conn.state.tx_concurrent.swap(false, Ordering::AcqRel) {
+        if !engine.db.read().concurrent_regime_active() {
+            unsafe { fire_unlock_waiters(engine) };
+        }
+    } else {
+        engine.tx_owner.store(0, Ordering::Release);
+        unsafe { fire_unlock_waiters(engine) };
     }
 }
 
@@ -2693,8 +2849,13 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
             if !s.query_ran {
                 // First step: execute the query now (read pragmas, EXPLAIN,
                 // and other query forms the statement layer can't stream).
+                // Identity armed so a concurrent OWNER's query form reads
+                // its own uncommitted writes (the engine keys the owner
+                // scope on it) while foreign handles stay on the
+                // committed view.
                 let engine = s.engine.as_ref().unwrap().clone();
                 let result = {
+                    let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
                     let rd = engine.db.read();
                     rd.query_with_columns(sql, [])
                 };
@@ -2739,23 +2900,56 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
                 // step). Private-cache connections BUSY-wait through
                 // busy_timeout; shared-cache connections get SQLite's
                 // table-lock discipline: SQLITE_LOCKED immediately, with
-                // unlock_notify as the sanctioned wait.
-                let owner = engine.tx_owner.load(Ordering::Acquire);
-                if owner != 0 && owner != conn.id {
+                // unlock_notify as the sanctioned wait. EXCEPTIONS — a
+                // foreign BEGIN CONCURRENT regime: a plain AUTOCOMMIT DML
+                // statement IMPLICITLY JOINS it through the engine
+                // (one-statement concurrent transaction, row-level
+                // first-committer-wins, group-commit fsync; conflicts
+                // surface retriable SQLITE_BUSY_SNAPSHOT), so it skips
+                // the wait and steps straight through. DDL/PRAGMA and
+                // foreign PLAIN holds wait exactly as before.
+                let plain_foreign = {
+                    let owner = engine.tx_owner.load(Ordering::Acquire);
+                    owner != 0 && owner != conn.id
+                };
+                let regime = engine.db.read().concurrent_regime_active();
+                // THIS connection's own concurrent transaction does not
+                // block its own stepped statements (the owner's DML
+                // writes through the armed identity — the engine routes
+                // them to its overlay).
+                let own_concurrent = conn.state.in_tx.load(Ordering::Acquire)
+                    && conn.state.tx_concurrent.load(Ordering::Acquire);
+                // journal_mode no-op read-back: see run_once's gate —
+                // the engine's regime gate decides the no-op.
+                let mode_pragma = matches!(
+                    s.kind,
+                    StmtKind::PragmaWrite { ref name } if name == "journal_mode"
+                );
+                let joins_concurrent = regime
+                    && !plain_foreign
+                    && !conn.state.in_tx.load(Ordering::Acquire)
+                    && matches!(s.kind, StmtKind::Dml { .. });
+                if (plain_foreign || (regime && !own_concurrent && !mode_pragma))
+                    && !joins_concurrent
+                {
                     if conn.state.shared_cache {
                         return conn.set_err(SQLITE_LOCKED, "database table is locked");
                     }
                     let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
-                    if !await_tx_slot(&engine, conn.id, timeout) {
+                    if !await_tx_slot(&engine, conn.id, timeout, true) {
                         return conn.set_err(SQLITE_BUSY, "database is locked");
                     }
                 }
                 // ── DML / write statements: per-step write lock ────────
                 // (unchanged — writes serialize on the engine write lock,
                 // and the changes()/rowid bookkeeping below needs the
-                // total_changes bracket around each step).
+                // total_changes bracket around each step). The identity
+                // arming makes the engine distinguish this handle from
+                // the regime's owner and other joiners (concurrent
+                // transactions key on it).
                 let before = engine.total_changes();
                 let outcome = {
+                    let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
                     let _w = engine.db.write();
                     // Preupdate bridge: this connection's C hook fires
                     // for the engine's row events of this step (per-
@@ -2823,6 +3017,14 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
                     let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(READ_CHUNK);
                     let mut step_err: Option<rustqlite::Error> = None;
                     {
+                        // Identity arming for reads too: the engine keys
+                        // the concurrent owner's read-your-own-writes
+                        // scope (shadow pages + overlay roots) on the
+                        // CALLER's identity — an armed handle reads its
+                        // own transaction's writes, a foreign handle the
+                        // committed live cache (never another owner's
+                        // uncommitted shadows).
+                        let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
                         let _r = engine.db.read();
                         for _ in 0..READ_CHUNK {
                             match eng.step() {

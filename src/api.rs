@@ -261,6 +261,50 @@ pub(crate) mod conn_tls {
     }
 }
 
+/// Calling-connection identity armed for the CURRENT thread's engine
+/// calls, restored on drop. The BEGIN CONCURRENT regime keys all its
+/// per-connection state on this identity: transaction OWNERSHIP (which
+/// open concurrent transaction, if any, belongs to the caller — owner
+/// statements execute against its overlay, foreign ones implicitly
+/// join as their own one-statement transactions), COMMIT/ROLLBACK
+/// routing, savepoints, and the owner's read-your-own-writes scope.
+///
+/// The sqlx driver arms its connections' ids around every statement;
+/// the C-ABI compat layer (`compat/`) does the same so each `sqlite3*`
+/// handle is a distinct engine citizen — without it every handle would
+/// share the anonymous identity 0 (one concurrent transaction slot,
+/// and any connection's reads would serve the anonymous owner's
+/// uncommitted shadows). Direct engine-API users leave it at 0, where
+/// the BEGIN guard enforces a single anonymous concurrent transaction.
+///
+/// Ids need only be unique among the LIVE connections of one engine
+/// (the driver's and the compat layer's monotonic connection
+/// counters).
+///
+/// The guard is plain RAII: dropping restores the previous value, so
+/// early returns and unwinds cannot leak an identity onto the thread.
+#[derive(Debug)]
+pub struct ConnIdentityGuard {
+    prev: u64,
+}
+
+impl ConnIdentityGuard {
+    /// Arm `id` as the calling connection for this thread's subsequent
+    /// engine calls; the previous identity is restored when the guard
+    /// drops.
+    pub fn arm(id: u64) -> Self {
+        Self {
+            prev: conn_tls::swap(id),
+        }
+    }
+}
+
+impl Drop for ConnIdentityGuard {
+    fn drop(&mut self) {
+        conn_tls::swap(self.prev);
+    }
+}
+
 /// A database. Owns the pager and catalog.
 ///
 /// All mutable state is wrapped in interior-mutability primitives
@@ -5862,17 +5906,25 @@ impl Database {
             // Plain (non-owner) write while the regime is active: the
             // fast insert paths screened their shapes earlier; this arm
             // covers every other write shape (BEGIN, DDL, PRAGMA, ...).
-            // EXCEPTION: plain TABLE DML (INSERT/UPDATE/DELETE with no
+            // EXCEPTIONS: plain TABLE DML (INSERT/UPDATE/DELETE with no
             // view target — the view intercept runs later) may still
             // IMPLICITLY JOIN the regime as a one-statement concurrent
             // transaction at the scope arm below, so it falls through
-            // instead of failing BUSY here.
+            // instead of failing BUSY here; and `PRAGMA journal_mode =
+            // <current mode>` is a pure read-back no-op (SQLite's
+            // OP_JournalMode takes no lock when the mode is unchanged)
+            // — a connection opened mid-regime that arms WAL the
+            // standard way must not BUSY behind it.
             let may_join = cached.view_target.is_none()
                 && matches!(
                     cached.stmt.as_ref(),
                     Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                 );
-            if !may_join {
+            let mode_noop = match cached.stmt.as_ref() {
+                Statement::Pragma(p) => self.journal_mode_pragma_is_noop(p),
+                _ => false,
+            };
+            if !may_join && !mode_noop {
                 return Err(Self::concurrent_regime_busy());
             }
         }
@@ -7446,7 +7498,14 @@ impl Database {
     /// True while the BEGIN CONCURRENT regime is active (any concurrent
     /// transaction open). Readers and IMPLICIT-JOIN plain autocommit DML
     /// pass; every other plain write shape waits/fails with BUSY.
-    pub(crate) fn concurrent_regime_active(&self) -> bool {
+    ///
+    /// Public for the C-ABI compat layer's transaction gate: while a
+    /// foreign CONCURRENT regime (not a plain foreign transaction) holds
+    /// the engine, a plain autocommit DML statement JOINS it through the
+    /// engine-side implicit join instead of waiting out the drain —
+    /// [`ConnIdentityGuard`] arms the handle's identity so the engine
+    /// distinguishes owner, joiners, and plain readers.
+    pub fn concurrent_regime_active(&self) -> bool {
         self.concurrent_active.load(Ordering::Acquire)
     }
 
@@ -7904,6 +7963,49 @@ impl Database {
                 | Statement::Savepoint(_)
                 | Statement::Release(_)
         )
+    }
+
+    /// True when `p` is a `journal_mode` write-pragma requesting the
+    /// pager's CURRENT mode: a pure read-back no-op — SQLite's
+    /// OP_JournalMode takes no lock and changes nothing when the
+    /// requested mode equals the current one, so the concurrent-regime
+    /// gate must not classify it as a plain write (the standard
+    /// "arm WAL on every new connection" pattern would otherwise BUSY
+    /// behind a foreign regime). Only the NATIVE pager is decided here;
+    /// a foreign (SQLite-format) container's mode switch routes through
+    /// its own machinery and stays gated.
+    fn journal_mode_pragma_is_noop(&self, p: &PragmaStatement) -> bool {
+        if self.foreign.is_some() || !p.name.eq_ignore_ascii_case("journal_mode") {
+            return false;
+        }
+        let Some(value) = &p.value else {
+            return false;
+        };
+        let expr = match value {
+            PragmaValue::Expr(e) | PragmaValue::Call(e) => e,
+        };
+        // Recover the spelled mode exactly like the pragma dispatch
+        // does: `PRAGMA journal_mode = WAL` parses WAL as a bare
+        // identifier (column ref); string literals and the 0/1 integer
+        // form round out the spellings.
+        let requested = match expr {
+            Expr::Column { name, .. } => name.to_ascii_lowercase(),
+            Expr::Literal(Value::Text(t)) => t.to_ascii_lowercase(),
+            Expr::Literal(Value::Integer(i)) => {
+                if *i == 0 {
+                    "delete".to_string()
+                } else {
+                    "wal".to_string()
+                }
+            }
+            _ => return false,
+        };
+        let wal = self.pager.wal_enabled();
+        match requested.as_str() {
+            "wal" => wal,
+            "delete" | "truncate" | "persist" | "memory" | "off" => !wal,
+            _ => false,
+        }
     }
 
     /// SAVEPOINT <name> — start (or nest) a savepoint. Outside a

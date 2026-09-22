@@ -346,7 +346,7 @@ pub mod types;
 pub mod api;
 pub mod executor;
 
-pub use api::{Database, Params};
+pub use api::{ConnIdentityGuard, Database, Params};
 pub use error::{Error, Result};
 pub use statement::{Statement, StepResult};
 /// SQLite disk-format interop surface (see `storage::sqlitefmt`).
