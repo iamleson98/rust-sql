@@ -397,10 +397,15 @@ mod mimalloc_tuning_tests {
     /// guessing a position.
     #[test]
     fn layout_is_one_of_the_known_two() {
+        // Bind through a local so this stays a RUNTIME check (the test
+        // belt): a bare const comparison const-folds, and clippy then
+        // demands it be hoisted to `const _` — which would collapse the
+        // belt into the same compile-time mechanism as the braces
+        // (`mimalloc_option_positions`'s const panic).
+        let last = libmimalloc_sys::_mi_option_last;
         assert!(
-            libmimalloc_sys::_mi_option_last == 38 || libmimalloc_sys::_mi_option_last == 47,
-            "unknown mimalloc option layout (last={}): re-derive positions",
-            libmimalloc_sys::_mi_option_last
+            last == 38 || last == 47,
+            "unknown mimalloc option layout (last={last}): re-derive positions",
         );
     }
 }
