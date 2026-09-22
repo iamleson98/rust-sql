@@ -987,3 +987,19 @@ Work Log:
 Stage Summary:
 - Stock C applications (and sqlx/sea-orm through the compat layer) now get the full concurrent-write surplus: implicit join, true multi-owner BEGIN CONCURRENT, retriable 517s, group-commit fsync — plus the cross-connection dirty-read hole closed and two wrong extended-result constants fixed.
 - README: the implicit-join paragraph now covers the C ABI.
+
+---
+Task ID: 36
+Agent: main (Super Z)
+Task: sqlite3_backup_* C API (the online-backup family) + a native-WAL serialize data-loss fix found by its tests.
+
+Work Log:
+- Implemented the five-symbol family in compat on the serialize/deserialize machinery: backup_init (schema-name validation, distinct-connection check, destination-in-transaction error on the dest handle, source page count snapshot), backup_step (one atomic snapshot of the source under its read lock — try_read/try_write BUSY on contention, retriable like SQLite's restart model; nPage==0 copies nothing), backup_remaining/pagecount (progress contract), backup_finish (returns the stored step error, frees the handle).
+- Destination install: a :memory: engine takes the image-swap path (load_image_as_database); a FILE engine drops the old Database FIRST (its Drop flushes its own state + reclaims its sidecars), lands the image at the canonical path atomically (temp + fsync + rename + dir fsync), removes straggler -wal/-spill sidecars, reopens from the path (format auto-sniffed — the dest ends up in the SOURCE's format, like SQLite's page-for-page backup). Engine gained an is_memory flag (PrivateMemory/Shared(mem:) true).
+- DATA-LOSS BUG found by the new WAL-source test: Database::image() on a NATIVE WAL-mode database flushed to the SIDEcar then read the STALE main file — the image was the pre-WAL state (serialize/CLI .backup would silently lose everything committed since journal_mode=WAL). The foreign branch checkpoints first; the native branch now does too (flush + checkpoint_wal before read). This also fixes sqlite3_serialize and the CLI's .backup for WAL-mode databases.
+- Tests (compat/rustqlite-compat/tests/backup.rs, 8 suites): file-to-file exact copy (dest file verified through a fresh open; source untouched), destination-content replacement, memory-to-memory, both cross directions (file<->memory, with on-disk verification), progress accessors (pagecount at init, remaining drains, nPage==0 no-op, DONE idempotent, finish OK), init error paths (same handle, non-main schema, dest in tx — plus recovery), WAL-mode source fully captured, source-connection-closes-early (the handle keeps the ENGINE alive).
+- Verification: compat matrix green (8 backup + 8 concurrent_join + 55 abi + the rest), engine lib 271, durability/foreign_journal_durability/concurrent_writes/wal/crash_recovery/io_fault green, clippy -D warnings clean (compat all-targets + engine lib/tests), fmt clean. Symbol count 124 -> 129 (README updated in all three places).
+
+Stage Summary:
+- The sqlite3_backup_* gap is CLOSED; the backup family is fully real (files and :memory:, both directions, progress + error contracts).
+- Native-WAL serialize/backup data-loss bug fixed engine-side (checkpoint before read).

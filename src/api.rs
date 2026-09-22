@@ -7124,6 +7124,18 @@ impl Database {
             // sidecar removed, session reset), then read it back.
             self.checkpoint_foreign_image()?;
             std::fs::read(&self.path).map_err(Error::from)
+        } else if self.pager.wal_enabled() {
+            // NATIVE WAL mode has the same committed-state-lives-in-the-
+            // sidecar shape: flush() appends pending dirty pages to the
+            // -wal file (NOT the main file), so a plain read-back would
+            // serialize the pre-WAL bytes. Checkpoint first — the exact
+            // native twin of the foreign branch above. (This is the
+            // serialize contract; before it, `PRAGMA journal_mode=WAL` +
+            // writes + serialize/`.backup` produced the STALE pre-WAL
+            // image: a real data-loss bug for any WAL-mode backup.)
+            self.pager.flush()?;
+            self.pager.checkpoint_wal()?;
+            std::fs::read(&self.path).map_err(Error::from)
         } else {
             // A flush failure on a read-only handle must not fail the
             // read-back (the file holds the last committed state).

@@ -345,6 +345,13 @@ pub struct sqlite3 {
     _private: [u8; 0],
 }
 
+/// Online-backup handle (`sqlite3_backup`) — see the `sqlite3_backup_*`
+/// family below.
+#[repr(C)]
+pub struct sqlite3_backup {
+    _private: [u8; 0],
+}
+
 /// Prepared-statement handle (`sqlite3_stmt`).
 #[repr(C)]
 pub struct sqlite3_stmt {
@@ -374,6 +381,11 @@ pub struct sqlite3_context {
 /// A shared engine instance (one per canonical database file path).
 struct Engine {
     db: parking_lot::RwLock<Database>,
+    /// True when this engine's store is IN MEMORY (a `:memory:` open or
+    /// a named shared-memory database) — `sqlite3_backup_step` installs
+    /// into a memory engine by image swap, and into a FILE engine by
+    /// writing the image to the canonical path then reopening.
+    is_memory: bool,
     /// Connection id that currently owns the engine-level transaction
     /// (0 = none). Serializes cross-connection transactions with
     /// SQLite-style BUSY/busy_timeout semantics (private-cache mode) or
@@ -1375,6 +1387,7 @@ fn acquire_engine(
             Ok((
                 Some(Arc::new(Engine {
                     db: parking_lot::RwLock::new(db),
+                    is_memory: true,
                     tx_owner: AtomicUsize::new(0),
                     live_connections: AtomicUsize::new(0),
                     unlock_waiters: StdMutex::new(Vec::new()),
@@ -1394,6 +1407,7 @@ fn acquire_engine(
             let db = open_engine(target, create, readonly)?;
             let e = Arc::new(Engine {
                 db: parking_lot::RwLock::new(db),
+                is_memory: key.starts_with("mem:"),
                 tx_owner: AtomicUsize::new(0),
                 live_connections: AtomicUsize::new(0),
                 unlock_waiters: StdMutex::new(Vec::new()),
@@ -1416,6 +1430,7 @@ fn acquire_engine(
             let db = open_engine(target, create, readonly)?;
             let e = Arc::new(Engine {
                 db: parking_lot::RwLock::new(db),
+                is_memory: false,
                 tx_owner: AtomicUsize::new(0),
                 live_connections: AtomicUsize::new(0),
                 unlock_waiters: StdMutex::new(Vec::new()),
@@ -4514,6 +4529,247 @@ fn load_image_as_database(bytes: &[u8]) -> Result<rustqlite::Database, ()> {
 /// version — the staging path decides upgrade vs. reject).
 fn is_native_image(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && &bytes[..6] == b"RSQLDB"
+}
+
+// ---------------------------------------------------------------------------
+// Online backup (sqlite3_backup_*)
+// ---------------------------------------------------------------------------
+//
+// SQLite's incremental online-backup API, mapped onto the engine's
+// serialize/deserialize machinery:
+//
+// - `backup_init` validates (schema names, distinct connections,
+//   destination not inside a transaction) and snapshots the source's
+//   PAGE COUNT for the progress accessors.
+// - `backup_step` copies the WHOLE source image in one call (whatever
+//   `nPage` says — a single atomic snapshot under the source read lock
+//   makes SQLite's restart-if-source-changed semantics vacuous: there
+//   is no window for a mid-backup source mutation). Busy sources or
+//   destinations (their engine locks held by another thread) surface
+//   retriable SQLITE_BUSY exactly like SQLite's, and a later step call
+//   restarts the attempt. A `:memory:` destination is installed by
+//   image swap (the deserialize path); a FILE destination is installed
+//   by atomically writing the image to the engine's canonical path
+//   (temp + fsync + rename), removing straggler sidecars, and
+//   reopening — the destination FILE ends up as an exact copy of the
+//   source (the source's own format, like SQLite's page-for-page
+//   backup).
+// - `remaining`/`pagecount` report progress; `finish` frees the handle
+//   and returns the stored step error (SQLITE_OK if none).
+
+/// The live backup handle behind `sqlite3_backup*`.
+struct Backup {
+    /// Destination engine (kept alive across the handle's lifetime even
+    /// if the destination connection closes first — SQLite's backup
+    /// holds the database, not the connection).
+    dest: Arc<Engine>,
+    /// Source engine, same lifetime discipline.
+    source: Arc<Engine>,
+    /// Source page count at INIT — `sqlite3_backup_pagecount`.
+    src_pages: i64,
+    /// Pages still to copy — `sqlite3_backup_remaining` (drops to 0 at
+    /// the one-shot copy).
+    remaining: i64,
+    /// The first error `backup_step` hit (SQLITE_OK while clean);
+    /// `backup_finish` returns it.
+    err: c_int,
+    /// Copy completed (step returns SQLITE_DONE from then on).
+    done: bool,
+}
+
+/// `zName` is NULL, empty, or "main" (SQLite accepts only the main
+/// schema for backup; "temp" and attached names are errors).
+fn schema_is_main(name: *const c_char) -> bool {
+    if name.is_null() {
+        return true;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    s.is_empty() || s.eq_ignore_ascii_case(b"main")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_backup_init(
+    p_dest: *mut sqlite3,
+    z_dest_name: *const c_char,
+    p_source: *mut sqlite3,
+    z_source_name: *const c_char,
+) -> *mut sqlite3_backup {
+    let Some(dest_conn) = (p_dest as *const Conn).as_ref() else {
+        return std::ptr::null_mut();
+    };
+    let fail = |conn: &Conn, code: c_int, msg: &str| -> *mut sqlite3_backup {
+        conn.set_err(code, msg);
+        std::ptr::null_mut()
+    };
+    if !schema_is_main(z_dest_name) || !schema_is_main(z_source_name) {
+        return fail(
+            dest_conn,
+            SQLITE_ERROR,
+            "unknown database name in backup_init (only main is supported)",
+        );
+    }
+    let Some(dest_engine) = &dest_conn.engine else {
+        return fail(dest_conn, SQLITE_ERROR, "connection is in error state");
+    };
+    let Some(source_conn) = (p_source as *const Conn).as_ref() else {
+        return fail(dest_conn, SQLITE_MISUSE, "invalid source connection");
+    };
+    let Some(source_engine) = &source_conn.engine else {
+        return fail(
+            dest_conn,
+            SQLITE_ERROR,
+            "source connection is in error state",
+        );
+    };
+    if p_dest == p_source {
+        return fail(
+            dest_conn,
+            SQLITE_ERROR,
+            "source and destination must be distinct",
+        );
+    }
+    if dest_conn.state.in_tx.load(Ordering::Acquire) {
+        return fail(dest_conn, SQLITE_ERROR, "destination database is in use");
+    }
+    let src_pages = {
+        let rd = source_engine.db.read();
+        rd.page_count() as i64
+    };
+    let b = Box::new(Backup {
+        dest: dest_engine.clone(),
+        source: source_engine.clone(),
+        src_pages,
+        remaining: src_pages,
+        err: SQLITE_OK,
+        done: false,
+    });
+    Box::into_raw(b) as *mut sqlite3_backup
+}
+
+/// Atomic image write: temp file in the same directory, fsync, rename
+/// over the destination (the engine's own foreign-dump discipline — a
+/// torn write can never leave a half-image at the canonical path).
+fn write_image_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}-backup-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "db".to_string()),
+        std::process::id()
+    ));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Sync the directory so the rename itself is durable.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_backup_step(p: *mut sqlite3_backup, n_page: c_int) -> c_int {
+    let Some(b) = (p as *mut Backup).as_mut() else {
+        return SQLITE_MISUSE;
+    };
+    if b.done {
+        return SQLITE_DONE;
+    }
+    // SQLite: a zero page budget copies nothing this call (nPage < 0
+    // means "everything"; our one-shot copy treats any non-zero budget
+    // as the whole snapshot).
+    if n_page == 0 {
+        return SQLITE_OK;
+    }
+    // Snapshot the source under its read lock — BUSY if another thread
+    // holds the engine exclusively (retriable: a later step call
+    // restarts, SQLite's documented retry model).
+    let image = {
+        let Some(rd) = b.source.db.try_read() else {
+            b.err = SQLITE_BUSY;
+            return SQLITE_BUSY;
+        };
+        match rd.image() {
+            Ok(img) => img,
+            Err(_) => {
+                b.err = SQLITE_IOERR;
+                return SQLITE_IOERR;
+            }
+        }
+    };
+    // Install under the destination's write lock — BUSY if held.
+    let Some(mut wr) = b.dest.db.try_write() else {
+        b.err = SQLITE_BUSY;
+        return SQLITE_BUSY;
+    };
+    let install = if b.dest.is_memory {
+        // Memory engine: image swap (the deserialize path).
+        load_image_as_database(&image).map(|new_db| {
+            let old = std::mem::replace(&mut *wr, new_db);
+            drop(old);
+        })
+    } else {
+        // File engine: drop the OLD database first (its Drop flushes its
+        // own state and reclaims its sidecars), then land the image at
+        // the canonical path and reopen from it.
+        let path = wr.path().to_path_buf();
+        (|| {
+            let old = std::mem::replace(
+                &mut *wr,
+                rustqlite::Database::open_in_memory().map_err(|_| ())?,
+            );
+            drop(old);
+            write_image_atomic(&path, &image).map_err(|_| ())?;
+            let _ = std::fs::remove_file(rustqlite::storage::wal::wal_path_for(&path));
+            let mut spill = path.as_os_str().to_owned();
+            spill.push("-spill");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(spill));
+            let new_db = rustqlite::Database::open(&path).map_err(|_| ())?;
+            *wr = new_db;
+            Ok(())
+        })()
+    };
+    match install {
+        Ok(()) => {
+            b.done = true;
+            b.remaining = 0;
+            SQLITE_DONE
+        }
+        Err(()) => {
+            b.err = SQLITE_CORRUPT;
+            SQLITE_CORRUPT
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_backup_remaining(p: *mut sqlite3_backup) -> c_int {
+    let Some(b) = (p as *const Backup).as_ref() else {
+        return 0;
+    };
+    b.remaining.max(0) as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_backup_pagecount(p: *mut sqlite3_backup) -> c_int {
+    let Some(b) = (p as *const Backup).as_ref() else {
+        return 0;
+    };
+    b.src_pages.max(0) as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_backup_finish(p: *mut sqlite3_backup) -> c_int {
+    if p.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let b = unsafe { Box::from_raw(p as *mut Backup) };
+    b.err
 }
 
 // ---------------------------------------------------------------------------
