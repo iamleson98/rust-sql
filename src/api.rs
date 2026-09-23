@@ -6335,7 +6335,20 @@ impl Database {
         if result.is_ok() {
             match stmt_ref {
                 Statement::Begin(_) => {
-                    *self.txn_maps_snap.write() = Some(self.maps.read().clone());
+                    // VALUE snapshot, not an Arc alias: an aliased snapshot
+                    // keeps the live maps Arc at refcount >= 2 for the WHOLE
+                    // transaction, so every statement epilogue's
+                    // `Arc::make_mut(&mut ctx.shared)` overlay merge
+                    // deep-clones all three HashMaps plus their String
+                    // keys — ~6+ heap allocations per statement, which the
+                    // malloc-heavy platforms (macOS) pay ~460 ns/row on
+                    // the one-row-per-statement INSERT shape (CI
+                    // bench-gate: INSERT-in-transaction 0.79x vs SQLite).
+                    // A one-time value clone per BEGIN keeps the live Arc
+                    // uniquely owned so the merges stay in-place; ROLLBACK
+                    // semantics are unchanged (it restores by content).
+                    *self.txn_maps_snap.write() =
+                        Some(std::sync::Arc::new((**self.maps.read()).clone()));
                     self.txn_owner_tid.store(current_tid(), Ordering::Release);
                     self.txn_begin_epoch
                         .store(self.schema_epoch.load(Ordering::Acquire), Ordering::Release);
@@ -7587,10 +7600,15 @@ impl Database {
             ));
         }
         let txn_id = self.pager.begin_concurrent()?;
+        // Value snapshots for BOTH fields (same rationale as the plain-
+        // BEGIN site): `base` is only read (commit conflict detection),
+        // but an aliased `maps` overlay would re-arm per-statement
+        // `Arc::make_mut` deep-clones for the whole regime.
+        let begin_maps = std::sync::Arc::new((**self.maps.read()).clone());
         let entry = ConcurrentTxnEntry {
             txn_id,
-            maps: self.maps.read().clone(),
-            base: self.maps.read().clone(),
+            maps: std::sync::Arc::clone(&begin_maps),
+            base: begin_maps,
             savepoint_maps: Vec::new(),
         };
         if std::env::var_os("RSQL_DBG_CW").is_some() {
@@ -8031,7 +8049,10 @@ impl Database {
             self.pager.flush_before_snapshot()?;
             self.in_transaction.store(true, Ordering::Release);
             *self.txn_snapshot.lock() = Some(self.pager.snapshot());
-            *self.txn_maps_snap.write() = Some(self.maps.read().clone());
+            // Value snapshot (see the plain-BEGIN site): an Arc alias here
+            // would force per-statement `Arc::make_mut` deep-clones of the
+            // live maps for the whole transaction.
+            *self.txn_maps_snap.write() = Some(std::sync::Arc::new((**self.maps.read()).clone()));
             self.savepoint_txn.store(true, Ordering::Release);
             self.txn_owner_tid.store(current_tid(), Ordering::Release);
             self.txn_begin_epoch
@@ -8049,7 +8070,13 @@ impl Database {
             self.pager.clear_committed_view();
         }
         self.pager.savepoint(name);
-        self.savepoint_maps.lock().push(self.maps.read().clone());
+        // Value snapshot per savepoint (same rationale as the BEGIN site):
+        // an Arc alias would pin the live maps at refcount >= 2 until the
+        // savepoint stack unwinds, re-enabling per-statement make_mut
+        // deep-clones of the maps for every DML under the savepoint.
+        self.savepoint_maps
+            .lock()
+            .push(std::sync::Arc::new((**self.maps.read()).clone()));
         Ok(())
     }
 

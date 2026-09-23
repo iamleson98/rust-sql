@@ -1493,7 +1493,23 @@ impl<'a> ExecContext<'a> {
                     // READER context it is a clone of the Database's live
                     // map. Either way, keep updates in the LOCAL overlay
                     // (merged at statement end) instead of clone-on-write
-                    // per row.
+                    // per row — EXCEPT when the maps are provably
+                    // uniquely owned: since the BEGIN/SAVEPOINT snapshots
+                    // became VALUE snapshots (no Arc alias), a plain
+                    // transaction's detached `shared` Arc has refcount 1,
+                    // so `Arc::get_mut` updates the entry IN PLACE — no
+                    // key String allocation per statement for the
+                    // one-row-per-statement OLTP shape. Concurrent owners
+                    // (the registry aliases their overlay) and reader
+                    // contexts (the slot still owns the original) fail
+                    // get_mut and keep the overlay path.
+                    if let Some(shared) = std::sync::Arc::get_mut(&mut self.shared) {
+                        if let Some(v) = shared.max_rowids.get_mut(table_name_lc) {
+                            *v = rowid;
+                            self.max_rowids_changed = true;
+                        }
+                        return;
+                    }
                     self.max_rowids.insert(table_name_lc.to_string(), rowid);
                     self.max_rowids_changed = true;
                 } else {
