@@ -1261,7 +1261,18 @@ impl<'a> ExecContext<'a> {
                 return r;
             }
         }
-        table.root_page
+        // Catalog fallback: the in-memory catalog Arc trails merge
+        // re-rootings (a merged commit installs the new root without a
+        // schema reload). When any concurrent commit moved a root, fold
+        // through the manager's origin→current map — descending the
+        // stale root would serve a TRUNCATED tree (one leaf instead of
+        // the whole structure). One relaxed atomic load when no merge
+        // ever moved a root; the fold is an identity for unmoved trees.
+        let r = table.root_page;
+        if r != 0 && self.pager.any_root_moves() {
+            return self.pager.committed_root_of(r);
+        }
+        r
     }
 
     /// Update the root page override for a table.
@@ -1288,7 +1299,12 @@ impl<'a> ExecContext<'a> {
                 return r;
             }
         }
-        index.root_page
+        // Catalog fallback — same concurrent-regime fold as `table_root`.
+        let r = index.root_page;
+        if r != 0 && self.pager.any_root_moves() {
+            return self.pager.committed_root_of(r);
+        }
+        r
     }
 
     /// Update the index root override (called after an index B+tree split).

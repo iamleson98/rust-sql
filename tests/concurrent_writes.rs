@@ -284,13 +284,21 @@ fn concurrent_same_hot_page_conflict_first_committer_wins() {
 }
 
 #[test]
-fn concurrent_fail_fast_when_page_moved_after_begin() {
+fn concurrent_late_touch_reads_committed_state() {
     let (mut db, path) = waldb("cw_failfast");
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
         .unwrap();
     db.execute("INSERT INTO t (v) VALUES ('seed')", []).unwrap();
-    // W2 begins, THEN W1 commits a write to a page W2 later needs: the
-    // fetch fails fast with the snapshot-conflict error.
+    // W2 begins, THEN W1 commits a write to a page W2 has not touched
+    // yet. The OLD contract aborted W2's first touch at the fetch gate
+    // (SQLITE_BUSY_SNAPSHOT); the TRUE-PARALLEL-WRITER regime refined
+    // it: a LATE first touch materializes the page's NEWEST COMMITTED
+    // bytes (the BEGIN-time version cannot be reconstructed — installs
+    // content-replace the live cache), so reads of late-touched pages
+    // are READ-COMMITTED, and write conflicts surface at COMMIT via
+    // the row stamps instead. This is what lets N parallel writers
+    // share one hot root leaf at all (the strict gate turned every
+    // writer after the first committer into a retry storm).
     Database::set_conn_identity(1);
     db.execute("BEGIN CONCURRENT", []).unwrap();
     db.execute("INSERT INTO t (v) VALUES ('w1')", []).unwrap();
@@ -299,26 +307,24 @@ fn concurrent_fail_fast_when_page_moved_after_begin() {
     Database::set_conn_identity(1);
     db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(2);
-    let r = db.query("SELECT v FROM t", []);
-    assert!(
-        r.is_err(),
-        "fetch after a conflicting commit must fail fast"
-    );
-    assert!(r
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("SQLITE_BUSY_SNAPSHOT"));
-    // The failed statement aborted the whole transaction (v1 semantics:
-    // no partial statement state in shadows) — a retry works.
-    let r2 = db.execute("ROLLBACK", []);
-    assert!(r2.is_ok() || r2.err().unwrap().to_string().contains("not open"));
-    Database::set_conn_identity(2);
-    db.execute("BEGIN CONCURRENT", []).unwrap();
-    let rows = db.query("SELECT v FROM t", []).unwrap();
-    assert_eq!(rows.len(), 2);
+    // The late read sees the newest COMMITTED state (seed + w1) — no
+    // torn view, no phantom uncommitted rows.
+    let rows = db.query("SELECT v FROM t ORDER BY v", []).unwrap();
+    let vals: Vec<String> = rows.iter().map(|r| r[0].as_text()).collect();
+    assert_eq!(vals, vec!["seed", "w1"]);
+    // Disjoint-row writes in the same transaction still commit (direct
+    // install or row-level merge — the base already contains w1's
+    // commit, so no lost update is possible).
+    db.execute("INSERT INTO t (id, v) VALUES (90, 'w2')", [])
+        .unwrap();
     db.execute("COMMIT", []).unwrap();
     Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 3);
+    // Durability: reopen and re-read.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 3);
+    drop(db2);
     cleanup(&path);
 }
 
@@ -1847,6 +1853,427 @@ fn probe_delete_all_after_regime_scaled() {
     let n = count(&db, "history");
     eprintln!("after delete-all: history = {}", n);
     assert_eq!(n, 0, "full-table DELETE must remove every row");
+}
+
+// ---------------------------------------------------------------------------
+// TRUE PARALLEL WRITERS: the `&self` concurrent-transaction API on a
+// shared `Arc<Database>`.
+//
+//   let db: Arc<Database> = ...;                  // file-backed, WAL
+//   Database::set_conn_identity(id);              // per-thread identity
+//   db.begin_concurrent_transaction()?;           // &self — no outer lock
+//   ... DML through prepare()/step() ...          // &self — parallel
+//   db.commit_concurrent_transaction()?;          // &self — short CS
+//
+// N threads run N BEGIN CONCURRENT transactions SIMULTANEOUSLY on ONE
+// engine: every statement's page work lands in the transaction's private
+// page shadows, so the heavy DML overlaps freely; only COMMIT takes the
+// short critical section (validate → install/merge → one WAL append).
+// SQLite cannot do this shape at all — its WAL admits exactly one
+// writer at a time, database-wide.
+// ---------------------------------------------------------------------------
+
+mod parallel_shared_api {
+    use rustqlite::{Database, Value};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn waldb(name: &str, ddl: &str) -> (Arc<Database>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("cwpar-{}.db", name));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.to_str().unwrap()));
+        let mut db = Database::open(&path).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+        // Schema setup runs BEFORE the Arc wrap (DDL needs `&mut self`).
+        db.execute(ddl, []).unwrap();
+        (Arc::new(db), path)
+    }
+
+    fn cleanup(path: &std::path::PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.to_str().unwrap()));
+    }
+
+    fn count(db: &Database, table: &str) -> i64 {
+        db.query(&format!("SELECT count(*) FROM {}", table), [])
+            .unwrap()[0][0]
+            .as_integer()
+    }
+
+    /// 4 writer threads × 250 INSERTs, all transactions open at once (the
+    /// bench-gate "concurrent writes" shape, but with the statements
+    /// themselves running in PARALLEL — no outer write lock at all).
+    /// Everything must commit, survive reopen, and the tree must be
+    /// intact with every row exactly once.
+    #[test]
+    fn four_parallel_writers_commit_all() {
+        let (db, path) = waldb(
+            "4writers",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        );
+
+        const N_THREADS: usize = 4;
+        const PER_THREAD: i64 = 250;
+        let barrier = Arc::new(Barrier::new(N_THREADS));
+        let mut handles = Vec::new();
+        for tid in 0..N_THREADS as i64 {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                Database::set_conn_identity((tid + 1) as u64);
+                db.begin_concurrent_transaction().unwrap();
+                // All four transactions are open before any DML runs —
+                // the statements below execute simultaneously.
+                barrier.wait();
+                let mut stmt = db.prepare("INSERT INTO t (id, v) VALUES (?, ?)").unwrap();
+                for i in 0..PER_THREAD {
+                    let id = tid * 100_000 + i;
+                    stmt.bind(1, Value::Integer(id)).unwrap();
+                    stmt.bind(2, Value::Integer(tid)).unwrap();
+                    stmt.step().unwrap();
+                    stmt.reset();
+                }
+                drop(stmt);
+                db.commit_concurrent_transaction().unwrap();
+                Database::set_conn_identity(0);
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        // Every row present exactly once.
+        assert_eq!(count(&db, "t"), (N_THREADS as i64) * PER_THREAD);
+        let rows = db.query("SELECT id FROM t", []).unwrap();
+        let mut ids: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+        ids.sort_unstable();
+        let expect: Vec<i64> = (0..N_THREADS as i64)
+            .flat_map(|tid| (0..PER_THREAD).map(move |i| tid * 100_000 + i))
+            .collect();
+        assert_eq!(ids, expect, "every writer's rows must land exactly once");
+
+        // Durable + intact: reopen (WAL recovery) and re-verify.
+        drop(db);
+        let db2 = Database::open(&path).unwrap();
+        assert_eq!(count(&db2, "t"), (N_THREADS as i64) * PER_THREAD);
+        let ok = db2.query("PRAGMA integrity_check", []).unwrap();
+        assert_eq!(ok[0][0].as_text(), "ok", "tree must be intact");
+        drop(db2);
+        cleanup(&path);
+    }
+
+    /// Same-PK race: two simultaneous transactions insert the SAME rowid;
+    /// exactly one commit wins, the loser gets SQLITE_BUSY_SNAPSHOT (fully
+    /// rolled back) and a retried transaction then succeeds — the classic
+    /// optimistic-concurrency retry loop, end to end.
+    #[test]
+    fn parallel_same_row_first_committer_wins_retry_succeeds() {
+        let (db, path) = waldb(
+            "rowconflict",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let loser = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for tid in 0..2u64 {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let loser = Arc::clone(&loser);
+            handles.push(thread::spawn(move || {
+                Database::set_conn_identity(tid + 1);
+                db.begin_concurrent_transaction().unwrap();
+                let mut stmt = db.prepare("INSERT INTO t (id, v) VALUES (7, ?)").unwrap();
+                stmt.bind(1, Value::Text(format!("w{tid}").into())).unwrap();
+                stmt.step().unwrap();
+                drop(stmt);
+                barrier.wait(); // both transactions hold the same row now
+                let first = db.commit_concurrent_transaction();
+                if first.is_err() {
+                    // Loser: fully rolled back by the engine — prove it,
+                    // then retry a fresh transaction (classic OCC retry).
+                    loser.store(true, Ordering::Release);
+                    let msg = first.err().unwrap().to_string();
+                    assert!(
+                        msg.contains("SQLITE_BUSY_SNAPSHOT"),
+                        "conflict must surface as SQLITE_BUSY_SNAPSHOT: {}",
+                        msg
+                    );
+                    db.begin_concurrent_transaction().unwrap();
+                    let mut stmt = db.prepare("INSERT INTO t (id, v) VALUES (8, ?)").unwrap();
+                    stmt.bind(1, Value::Text(format!("retry{tid}").into()))
+                        .unwrap();
+                    stmt.step().unwrap();
+                    drop(stmt);
+                    db.commit_concurrent_transaction().unwrap();
+                }
+                Database::set_conn_identity(0);
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        assert!(
+            loser.load(Ordering::Acquire),
+            "exactly one committer must lose the same-row race"
+        );
+        // The winner's row 7 + the loser's retried row 8.
+        assert_eq!(count(&db, "t"), 2);
+        let mut ids: Vec<i64> = db
+            .query("SELECT id FROM t ORDER BY id", [])
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_integer())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![7, 8]);
+        drop(db);
+        let db2 = Database::open(&path).unwrap();
+        assert_eq!(count(&db2, "t"), 2);
+        drop(db2);
+        cleanup(&path);
+    }
+
+    /// A reader thread looping COUNT(*) while four parallel writers commit
+    /// must ONLY ever observe committed transaction boundaries (multiples
+    /// of PER_THREAD) — never a torn install — and the count must never
+    /// go backwards.
+    #[test]
+    fn parallel_writers_reader_sees_atomic_commits() {
+        let (db, path) = waldb(
+            "readeratomic",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+        );
+
+        const N_THREADS: usize = 4;
+        const PER_THREAD: i64 = 250;
+        let barrier = Arc::new(Barrier::new(N_THREADS + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for tid in 0..N_THREADS as i64 {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                Database::set_conn_identity((tid + 1) as u64);
+                db.begin_concurrent_transaction().unwrap();
+                barrier.wait();
+                let mut stmt = db.prepare("INSERT INTO t (id, v) VALUES (?, ?)").unwrap();
+                for i in 0..PER_THREAD {
+                    let id = tid * 100_000 + i;
+                    stmt.bind(1, Value::Integer(id)).unwrap();
+                    stmt.bind(2, Value::Integer(tid)).unwrap();
+                    stmt.step().unwrap();
+                    stmt.reset();
+                }
+                drop(stmt);
+                db.commit_concurrent_transaction().unwrap();
+                Database::set_conn_identity(0);
+            }));
+        }
+        // Reader: identity 0 (plain reader), no transaction.
+        {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                Database::set_conn_identity(0);
+                barrier.wait();
+                let mut last = 0i64;
+                while !stop.load(Ordering::Acquire) {
+                    let n = count(&db, "t");
+                    assert!(
+                        (0..=N_THREADS as i64).any(|k| n == k * PER_THREAD),
+                        "torn read: count {n} is not a committed transaction boundary"
+                    );
+                    assert!(n >= last, "count went backwards: {n} < {last}");
+                    last = n;
+                }
+            }));
+        }
+        for h in handles.drain(..N_THREADS) {
+            h.join().expect("writer thread panicked");
+        }
+        stop.store(true, Ordering::Release);
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+        assert_eq!(count(&db, "t"), (N_THREADS as i64) * PER_THREAD);
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// API-surface contracts on the `&self` entry points: double BEGIN
+    /// rejects, COMMIT without BEGIN rejects, ROLLBACK without BEGIN is
+    /// a no-op, and a non-WAL database rejects BEGIN CONCURRENT.
+    #[test]
+    fn shared_api_surface_contracts() {
+        let (db, path) = waldb("surface", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        Database::set_conn_identity(9);
+        db.begin_concurrent_transaction().unwrap();
+        let r = db.begin_concurrent_transaction();
+        assert!(r.is_err(), "nested BEGIN CONCURRENT must reject");
+        db.rollback_concurrent_transaction().unwrap();
+        // Rollback without a transaction: benign no-op (already ended).
+        db.rollback_concurrent_transaction().unwrap();
+        let r = db.commit_concurrent_transaction();
+        assert!(r.is_err(), "COMMIT without a transaction must reject");
+        let msg = r.err().unwrap().to_string();
+        assert!(
+            msg.contains("no transaction is active"),
+            "commit error names the state: {}",
+            msg
+        );
+        Database::set_conn_identity(0);
+
+        // Non-WAL database: the regime requires WAL (the commit protocol
+        // appends frames; DELETE-journal mode has no multi-writer commit
+        // point to reuse).
+        let nj = std::env::temp_dir().join("cwpar-nowal.db");
+        let _ = std::fs::remove_file(&nj);
+        let mut plain = Database::open(&nj).unwrap();
+        plain
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        let r = plain.begin_concurrent_transaction();
+        assert!(r.is_err(), "BEGIN CONCURRENT must require WAL mode");
+        drop(plain);
+        let _ = std::fs::remove_file(&nj);
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// The shared-Database misuse tripwire (statement path): a PLAIN DML
+    /// statement stepped while another plain DML statement is mid-flight
+    /// on a second thread (no outer serialization, no concurrent regime)
+    /// must get a loud error naming the fix — never silent state
+    /// corruption. Deterministic by construction: thread A's statement is
+    /// PARKED inside the preupdate hook (mid-statement, gate held), so
+    /// thread B's step is guaranteed to observe the foreign holder — B
+    /// errors at the gate before its execution could ever reach the hook
+    /// (no lock-ordering cycle).
+    #[test]
+    fn plain_dml_tripwire_statement_path() {
+        use rustqlite::preupdate::PreupdateEvent;
+
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        // Park the FIRST row event: in_flight := true, then spin until
+        // released. Thread A's INSERT suspends mid-statement here — with
+        // the plain-DML slot claimed.
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let in_flight = Arc::clone(&in_flight);
+            let release = Arc::clone(&release);
+            db.set_preupdate_hook(Some(Box::new(move |_e: &PreupdateEvent| {
+                in_flight.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            })));
+        }
+        let db = Arc::new(db);
+
+        // Thread A: plain DML through prepare+step — parks in the hook.
+        // (The statement is prepared INSIDE thread A: `Statement<'_>` is
+        // not `Send`, it borrows the shared `&Database`.)
+        let a = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                let mut stmt = db.prepare("INSERT INTO t (id) VALUES (1)").unwrap();
+                stmt.step().unwrap();
+            })
+        };
+        while !in_flight.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+
+        // Thread B: another plain DML on the same shared Database — the
+        // tripwire must reject it (A's statement is unambiguously in
+        // flight) instead of interleaving page-tree surgery.
+        let mut stmt_b = db.prepare("INSERT INTO t (id) VALUES (2)").unwrap();
+        let r = stmt_b.step();
+        let err = r.expect_err("the racing plain DML statement must fail");
+        assert!(
+            err.to_string()
+                .contains("concurrent DML on a shared Database"),
+            "error must name the fix: {}",
+            err
+        );
+
+        // Let A finish; its row lands, and the slot is free again.
+        release.store(true, Ordering::Release);
+        a.join().expect("pacer panicked");
+        assert_eq!(count(&db, "t"), 1, "only thread A's row may be written");
+        // Single-threaded plain DML still works (the slot was released):
+        // through the `&self` statement path on the shared handle.
+        let mut stmt = db.prepare("INSERT INTO t (id) VALUES (3)").unwrap();
+        stmt.step().unwrap();
+        drop(stmt);
+        assert_eq!(count(&db, "t"), 2);
+    }
+
+    /// The tripwire's query-path twin: INSERT..RETURNING through
+    /// `Database::query(&self)` holds the same plain-DML slot, so a
+    /// second thread's racing query-path DML gets the loud error instead
+    /// of interleaving page-tree surgery under two read guards. Same
+    /// deterministic park-in-the-hook shape as the statement-path test.
+    #[test]
+    fn plain_dml_tripwire_query_path() {
+        use rustqlite::preupdate::PreupdateEvent;
+
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+            .unwrap();
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let in_flight = Arc::clone(&in_flight);
+            let release = Arc::clone(&release);
+            db.set_preupdate_hook(Some(Box::new(move |_e: &PreupdateEvent| {
+                in_flight.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            })));
+        }
+        let db = Arc::new(db);
+
+        // Thread A: query-path DML (RETURNING) — parks in the hook with
+        // the query-path plain-DML slot claimed.
+        let a = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                db.query("INSERT INTO t (id, v) VALUES (1, 'a') RETURNING id", [])
+                    .unwrap();
+            })
+        };
+        while !in_flight.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+
+        // Thread B (same thread here — the SLOT is what races, not the
+        // OS scheduler): the gate must reject the racing query-path DML.
+        let r = db.query("INSERT INTO t (id, v) VALUES (2, 'b') RETURNING id", []);
+        let err = r.expect_err("the racing query-path DML must fail");
+        assert!(
+            err.to_string()
+                .contains("concurrent DML on a shared Database"),
+            "error must name the fix: {}",
+            err
+        );
+
+        release.store(true, Ordering::Release);
+        a.join().expect("pacer panicked");
+        assert_eq!(count(&db, "t"), 1);
+        // The slot is free again.
+        db.query("INSERT INTO t (id, v) VALUES (3, 'c') RETURNING id", [])
+            .unwrap();
+        assert_eq!(count(&db, "t"), 2);
+    }
 }
 
 #[cfg(feature = "sqlx")]

@@ -477,6 +477,27 @@ impl<'a> Statement<'a> {
         if self.done {
             return Ok(StepResult::Done);
         }
+        // ── CONCURRENT-REGIME READER GATE ─────────────────────────────
+        // On a bare shared `Arc<Database>` (the `&self` concurrent-transaction
+        // API — no outer RwLock), a plain reader's multi-page walk could
+        // otherwise straddle a concurrent COMMIT's shadow install (root
+        // fetched before the install, leaf after) and observe a torn tree.
+        // The guard spans this whole step call (each step's batch is the
+        // documented atomicity unit for streaming drivers). DML never
+        // holds it (the plain-DML tripwire serializes plain writers, and
+        // concurrent-regime owners are stamp-protected instead); with the
+        // regime off the whole probe is one atomic load (None).
+        let _reader_gate = {
+            let is_dml = matches!(
+                self.stmt.as_ref(),
+                AstStatement::Insert(_) | AstStatement::Update(_) | AstStatement::Delete(_)
+            );
+            if !is_dml && self.db.concurrent_txn_for_caller().is_none() {
+                self.db.pager.plain_reader_gate()
+            } else {
+                None
+            }
+        };
         if matches!(self.stream, StreamState::Fresh) {
             // A hot INSERT chain owns the table's live root / max-rowid
             // while the shared maps hold stale values — break (flush) it
@@ -816,6 +837,28 @@ impl<'a> Statement<'a> {
                 plan.as_ref(),
                 Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
             );
+            // ── SHARED-DATABASE DML SAFETY GATE ─────────────────────────
+            // Plain DML mutates the LIVE page cache; two threads running
+            // it simultaneously on one `Arc<Database>` (no outer write
+            // lock) would interleave page-tree surgery and corrupt the
+            // database SILENTLY. Concurrent-regime statements are exempt
+            // by construction (owners write private page shadows; the
+            // implicit join below wraps a foreign-regime autocommit
+            // statement as its own one-statement concurrent txn).
+            //
+            // Order matters for the regime-flip races: the plain slot is
+            // claimed FIRST (closing the no-lock/no-regime hole), and
+            // released the moment the implicit join engages — a joined
+            // statement is shadow-backed and needs no serialization.
+            // Uncontended (~5 ns) for every sanctioned caller: the driver
+            // / C ABI hold the outer write lock, so at most one statement
+            // runs at a time.
+            let caller_cw_txn = self.db.concurrent_txn_for_caller();
+            let mut plain_dml_gate = if is_dml && caller_cw_txn.is_none() {
+                Some(self.db.enter_plain_dml()?)
+            } else {
+                None
+            };
             // ── IMPLICIT CONCURRENT JOIN (statement-path twin of the join
             // arm in Database::execute) ─────────────────────────────────
             // A plain autocommit DML statement stepped while the BEGIN
@@ -828,11 +871,14 @@ impl<'a> Statement<'a> {
             // exec_with_ctx call (RETURNING rows materialize before it
             // returns), so the transaction's whole lifecycle is this
             // block: begin → execute → merge overlay → commit.
-            let implicit_cw = is_dml
-                && self.db.concurrent_regime_active()
-                && self.db.concurrent_txn_for_caller().is_none();
+            let implicit_cw =
+                is_dml && self.db.concurrent_regime_active() && caller_cw_txn.is_none();
             let implicit_cw_txn = if implicit_cw {
                 self.db.begin_concurrent_txn_shared()?;
+                // The statement is now shadow-backed (its own one-
+                // statement concurrent txn): release the plain-DML slot
+                // so sibling joiners/owners run unserialized.
+                drop(plain_dml_gate.take());
                 self.db.concurrent_txn_for_caller()
             } else {
                 None
@@ -945,8 +991,15 @@ impl<'a> Statement<'a> {
         let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
         let shared = db.read_maps();
         let in_txn = db.in_transaction.load(std::sync::atomic::Ordering::Acquire);
-        let txn_snap = if in_txn {
-            db.txn_snapshot.lock().clone()
+        // Concurrent-owner statements skip the global snapshot mutex
+        // entirely (the regimes are mutually exclusive — the snapshot is
+        // provably None under the concurrent regime; see
+        // `Database::txn_snapshot_for_ctx`). Keeping this lock OFF the
+        // parallel-writer hot path is what makes N simultaneous
+        // concurrent transactions scale at all: one contended futex per
+        // statement measured ~5 µs of handoff at 2-4 writers.
+        let txn_snap = if in_txn && _wsg.is_none() {
+            db.txn_snapshot_for_ctx()
         } else {
             None
         };

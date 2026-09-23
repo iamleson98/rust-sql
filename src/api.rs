@@ -236,6 +236,23 @@ struct ConcurrentTxnEntry {
     savepoint_maps: Vec<std::sync::Arc<crate::executor::StmtMaps>>,
 }
 
+/// Shard count for the engine-side concurrent-transaction registry:
+/// parallel writers consult their entry SEVERAL times per statement
+/// (scope arm, `read_maps`, the caller gates), so a single mutex would
+/// serialize every simultaneous transaction's statements — measured as
+/// the parallel-write path's dominant cost on the phase probe (2
+/// writers on 2 cores ran 1.4x SLOWER than serial). Connection
+/// identities are caller-chosen; sequential ids (the common
+/// parallel-writer pattern: `set_conn_identity(tid)`) land in distinct
+/// shards.
+const CONCURRENT_TXN_SHARDS: usize = 16;
+
+/// One engine-registry shard, padded to its own cache line (16 packed
+/// parking_lot Mutexes share 2 lines — sequential-id shards would
+/// false-share them and re-serialize).
+#[repr(align(64))]
+struct ConcurrentTxnShard(Mutex<std::collections::HashMap<u64, ConcurrentTxnEntry>>);
+
 thread_local! {
     /// Calling-connection identity for the CURRENT engine call. The sqlx
     /// driver arms it around every statement (its connections map 1:1 to
@@ -243,6 +260,32 @@ thread_local! {
     /// the engine then runs a single anonymous concurrent transaction at
     /// a time (its own BEGIN guard enforces that).
     static CONN_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Same-thread nesting depth of [`Database::enter_plain_dml`] guards
+    /// (re-entrant engine access from preupdate hooks / vtab callbacks).
+    /// Only the OUTERMOST level claims / releases the shared
+    /// `plain_dml_tid` slot.
+    static PLAIN_DML_DEPTH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Claim of the plain-DML slot, released on drop (see
+/// [`Database::enter_plain_dml`]).
+pub(crate) struct PlainDmlGuard<'a> {
+    db: &'a Database,
+}
+
+impl Drop for PlainDmlGuard<'_> {
+    fn drop(&mut self) {
+        PLAIN_DML_DEPTH.with(|d| {
+            let depth = d.get().saturating_sub(1);
+            d.set(depth);
+            if depth == 0 {
+                self.db.plain_dml_tid.store(0, Ordering::Release);
+            }
+        });
+    }
 }
 
 /// The armed calling-connection identity (0 = engine-API / anonymous).
@@ -344,6 +387,13 @@ pub struct Database {
     /// of each statement (see `preupdate::HookSlot` for the locking
     /// design).
     preupdate_hook: crate::preupdate::HookSlot,
+    /// Mirror of "`preupdate_hook` is Some" — a relaxed atomic load so
+    /// the `&self` query path can skip the hook-slot mutex probe (and
+    /// the sink install machinery) on DML-RETURNING statements when no
+    /// hook was ever registered. Written only by `set_preupdate_hook`
+    /// (`&mut self` — exclusive with every execution), so plain
+    /// loads/stores suffice; Release/Acquire anyway for documentation.
+    has_preupdate_hook: AtomicBool,
     /// Thread id (see `current_tid`) that owns the open write
     /// transaction — the thread that executed BEGIN. READ entry points
     /// (`query`, statement `step` on selects) compare it against the
@@ -373,11 +423,20 @@ pub struct Database {
     /// `storage/concurrent.rs`) with the transaction-private StmtMaps
     /// overlay (root overrides and rowid caches accumulate there instead
     /// of the shared maps, and publish at COMMIT).
-    concurrent_txns: Mutex<std::collections::HashMap<u64, ConcurrentTxnEntry>>,
+    concurrent_txns: [ConcurrentTxnShard; CONCURRENT_TXN_SHARDS],
     /// True while any concurrent transaction is open — cached fast-path
     /// for the plain-write guard (a mutex probe per statement would
     /// contended-bounce across writer threads).
     concurrent_active: AtomicBool,
+    /// Thread id currently executing a PLAIN (non-concurrent) DML
+    /// statement through the `&self` statement path — the
+    /// shared-Database misuse tripwire (see [`Database::enter_plain_dml`]).
+    /// 0 = none. Writers serialized by an outer `RwLock<Database>` (the
+    /// driver, the C ABI, `execute(&mut self)`) hold it one-at-a-time and
+    /// never see contention; the only way to observe a foreign holder is
+    /// two threads running plain DML on one `Arc<Database>` with NO
+    /// serialization — silent state corruption before the tripwire.
+    plain_dml_tid: AtomicU64,
     /// Combined bookkeeping maps (table root overrides, index roots,
     /// max-rowid cache) behind ONE Arc — a query snapshot is a single
     /// read-lock + one refcount bump (previously three separate
@@ -2360,11 +2419,15 @@ impl Database {
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
             txn_maps_snap: RwLock::new(None),
-            concurrent_txns: Mutex::new(std::collections::HashMap::new()),
+            concurrent_txns: std::array::from_fn(|_| {
+                ConcurrentTxnShard(Mutex::new(std::collections::HashMap::new()))
+            }),
             concurrent_active: AtomicBool::new(false),
+            plain_dml_tid: AtomicU64::new(0),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
+            has_preupdate_hook: AtomicBool::new(false),
             txn_owner_tid: AtomicU64::new(0),
             txn_has_ddl: AtomicBool::new(false),
             schema_epoch: AtomicU64::new(0),
@@ -2730,11 +2793,15 @@ impl Database {
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
             txn_maps_snap: RwLock::new(None),
-            concurrent_txns: Mutex::new(std::collections::HashMap::new()),
+            concurrent_txns: std::array::from_fn(|_| {
+                ConcurrentTxnShard(Mutex::new(std::collections::HashMap::new()))
+            }),
             concurrent_active: AtomicBool::new(false),
+            plain_dml_tid: AtomicU64::new(0),
             savepoint_maps: Mutex::new(Vec::new()),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
+            has_preupdate_hook: AtomicBool::new(false),
             txn_owner_tid: AtomicU64::new(0),
             txn_has_ddl: AtomicBool::new(false),
             schema_epoch: AtomicU64::new(0),
@@ -4445,6 +4512,8 @@ impl Database {
     /// each statement. When no hook is installed the write paths carry
     /// no measurable cost (one thread-local flag check per row).
     pub fn set_preupdate_hook(&mut self, hook: Option<crate::preupdate::PreupdateHook>) {
+        self.has_preupdate_hook
+            .store(hook.is_some(), Ordering::Release);
         *self.preupdate_hook.lock().unwrap() = hook;
     }
 
@@ -4455,6 +4524,16 @@ impl Database {
     /// same connection — the outer scope is still active). The guard
     /// restores the previous sink on drop, including on unwind.
     pub(crate) fn preupdate_scope(&self) -> Option<crate::preupdate::SinkGuard> {
+        // One relaxed atomic load when no hook was ever registered: the
+        // scope install probes the hook-slot MUTEX, and with N parallel
+        // writers taking that same global lock per statement the lock
+        // word's cache line ping-pongs — measured as a measurable share
+        // of the parallel-write statement phase's slowdown. The mirror
+        // flag is written only by `set_preupdate_hook` (`&mut self` —
+        // exclusive with every execution).
+        if !self.has_preupdate_hook.load(Ordering::Acquire) {
+            return None;
+        }
         let db_id = self as *const _ as usize;
         if crate::preupdate::sink_for_db(db_id) {
             return None;
@@ -5370,6 +5449,35 @@ impl Database {
         }
     }
 
+    /// The engine-side concurrent-transaction registry shard for a
+    /// connection identity (see `ConcurrentTxnShard` — sharded so N
+    /// simultaneous transactions never serialize their statements on one
+    /// mutex).
+    fn cw_registry(&self, conn: u64) -> &Mutex<std::collections::HashMap<u64, ConcurrentTxnEntry>> {
+        &self.concurrent_txns[conn as usize % CONCURRENT_TXN_SHARDS].0
+    }
+
+    /// The plain-transaction pager snapshot for an execution context, or
+    /// None. The concurrent regime keeps `in_transaction` set for its
+    /// whole lifetime, so gating on that flag alone would take the
+    /// GLOBAL snapshot mutex on every statement of every parallel
+    /// writer — a contended futex that measured as the parallel-write
+    /// path's dominant serialization (~5 µs per statement handoff at
+    /// 2-4 writers; the 4-writer statement phase ran 1.5x SLOWER than
+    /// serial on 2 cores). The regimes are mutually exclusive (a plain
+    /// BEGIN is rejected with BUSY while the concurrent regime is
+    /// active — the write-shaped gate in `execute`), so while
+    /// `concurrent_active` is true the snapshot is provably None: skip
+    /// the mutex with one atomic load instead.
+    pub(crate) fn txn_snapshot_for_ctx(&self) -> Option<crate::storage::pager::PagerSnapshot> {
+        if !self.in_transaction.load(Ordering::Acquire)
+            || self.concurrent_active.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.txn_snapshot.lock().clone()
+    }
+
     fn sync_schema_roots_inner(&self) -> Result<()> {
         let m = self.maps.read().clone();
         self.sync_schema_roots_from(&m)
@@ -5461,6 +5569,9 @@ impl Database {
     /// Rewrite one schema row's rootpage: read the existing row (preserving
     /// its name/table/sql columns), delete it, and insert the updated row.
     fn rewrite_schema_row_root(&self, kind: &str, name: &str, new_root: u32) -> Result<()> {
+        if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+            eprintln!("[SCHEMA-REWRITE] {kind}:{name} -> root {new_root}");
+        }
         let mut bt = Btree::new(&self.pager, 0, false);
         let mut found: Option<(i64, Vec<Value>)> = None;
         bt.scan_table(|rowid, payload| {
@@ -6046,7 +6157,7 @@ impl Database {
         if conc_owner_txn.is_some() {
             let conn = conn_identity();
             let overlay = self
-                .concurrent_txns
+                .cw_registry(conn)
                 .lock()
                 .get(&conn)
                 .map(|e| e.maps.clone());
@@ -6421,7 +6532,7 @@ impl Database {
                 // never touched, forcing spurious conflicts.
                 let base = {
                     let conn = conn_identity();
-                    self.concurrent_txns
+                    self.cw_registry(conn)
                         .lock()
                         .get(&conn)
                         .map(|e| e.base.clone())
@@ -6460,7 +6571,7 @@ impl Database {
         // transaction's overlay.
         if conc_owner_txn.is_some() {
             let conn = conn_identity();
-            if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+            if let Some(entry) = self.cw_registry(conn).lock().get_mut(&conn) {
                 entry.maps = ctx.shared;
             }
         }
@@ -6589,7 +6700,7 @@ impl Database {
     pub(crate) fn read_maps(&self) -> Arc<crate::executor::StmtMaps> {
         if self.pager.armed_writer_scope().is_some() {
             let conn = conn_identity();
-            if let Some(e) = self.concurrent_txns.lock().get(&conn) {
+            if let Some(e) = self.cw_registry(conn).lock().get(&conn) {
                 return e.maps.clone();
             }
         }
@@ -6673,6 +6784,73 @@ impl Database {
                 "DML inside a BEGIN CONCURRENT transaction must run through Database::execute",
             ));
         }
+        // PLAIN DML while the concurrent regime is ACTIVE would mutate the
+        // LIVE cache mid-regime — the regime's core contract is that the
+        // live cache holds only committed bytes while concurrent
+        // transactions are open. The statement path's implicit join
+        // cannot apply here (query-path merge-backs target the SHARED
+        // maps, not a transaction overlay), so reject with the standard
+        // busy error: route DML through `Database::execute` /
+        // `prepare`+`step`, or wrap it in a BEGIN CONCURRENT transaction.
+        if self.concurrent_txn_for_caller().is_none()
+            && self.concurrent_regime_active()
+            && matches!(
+                cached.stmt.as_ref(),
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            )
+        {
+            return Err(Self::concurrent_regime_busy());
+        }
+        // SHARED-DATABASE DML SAFETY GATE (the query-path twin of the
+        // gate in Statement::step): DML with RETURNING through `&self`
+        // mutates the LIVE page cache — two threads running it under
+        // read locks on one `Arc<Database>` would interleave page-tree
+        // surgery and corrupt the database silently. Sanctioned users
+        // (an outer write lock, or single-threaded callers) pay one
+        // uncontended atomic swap; the misuse case gets an error that
+        // names the fix instead of corrupting. Concurrent-regime owners
+        // already returned an error above, so this gate only trips for
+        // genuinely plain DML.
+        let _plain_dml_gate = if matches!(
+            cached.stmt.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            Some(self.enter_plain_dml()?)
+        } else {
+            None
+        };
+        // ── CONCURRENT-REGIME READER GATE (query-path twin of the gate
+        // in Statement::step): on a bare shared `Arc<Database>`, a plain
+        // reader's multi-page walk must not straddle a concurrent
+        // COMMIT's shadow install. Owners are exempt (stamp-protected);
+        // with the regime off this is a single atomic load (None).
+        let _reader_gate = if matches!(cached.stmt.as_ref(), Statement::Select(_))
+            && self.concurrent_txn_for_caller().is_none()
+        {
+            self.pager.plain_reader_gate()
+        } else {
+            None
+        };
+        // ── PREUPDATE HOOK SCOPE (query-path DML) ────────────────────
+        // DML with RETURNING executes HERE (not through Database::execute
+        // or statement step, which install their own scopes) — the hook
+        // contract ("fires on every mutating statement") must hold for
+        // this API surface too: INSERT..RETURNING via `query()` fired NO
+        // events before this. Gated on the cheap mirror flag (one atomic
+        // load when no hook was ever registered) because the scope
+        // install probes the hook-slot mutex. Order matters: this sits
+        // AFTER the plain-DML gate (lock-free) so a hook PARKED in a
+        // user callback (holding the slot mutex) cannot deadlock a
+        // racing statement's tripwire — the gate errors first.
+        let _preupdate_guard = if self.has_preupdate_hook.load(Ordering::Acquire)
+            && matches!(
+                cached.stmt.as_ref(),
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            ) {
+            self.preupdate_scope()
+        } else {
+            None
+        };
         // EXPLAIN [QUERY PLAN | ANALYZE]: ANALYZE executes the inner SELECT
         // with instrumentation; QUERY PLAN / plain EXPLAIN plan the inner
         // statement and render rows — never executes it.
@@ -6706,11 +6884,7 @@ impl Database {
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
-                let txn_snap = if in_txn {
-                    self.txn_snapshot.lock().clone()
-                } else {
-                    None
-                };
+                let txn_snap = self.txn_snapshot_for_ctx();
                 let shared = self.read_maps();
                 let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
@@ -6750,14 +6924,9 @@ impl Database {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             // Skip the txn-snapshot Mutex entirely when not inside a
-            // transaction — the snapshot is only ever Some(...) between
-            // BEGIN and COMMIT/ROLLBACK, and the lock was ~15-20 ns on
-            // every single query outside that window.
-            let txn_snap = if in_txn {
-                self.txn_snapshot.lock().clone()
-            } else {
-                None
-            };
+            // transaction — and skip it under the concurrent regime
+            // (provably None there; see `txn_snapshot_for_ctx`).
+            let txn_snap = self.txn_snapshot_for_ctx();
             // ONE read-lock + ONE refcount bump for all three bookkeeping
             // maps (was three separate `RwLock<Arc<HashMap>>` reads).
             // Committed-view reads take the BEGIN-time maps instead.
@@ -6915,6 +7084,45 @@ impl Database {
                 "DML inside a BEGIN CONCURRENT transaction must run through Database::execute",
             ));
         }
+        // PLAIN DML while the concurrent regime is active: see query()'s
+        // rejection (mutating the live cache mid-regime is forbidden).
+        if self.concurrent_txn_for_caller().is_none()
+            && self.concurrent_regime_active()
+            && matches!(
+                cached.stmt.as_ref(),
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            )
+        {
+            return Err(Self::concurrent_regime_busy());
+        }
+        // SHARED-DATABASE DML SAFETY GATE: see query()'s twin above.
+        let _plain_dml_gate = if matches!(
+            cached.stmt.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            Some(self.enter_plain_dml()?)
+        } else {
+            None
+        };
+        // CONCURRENT-REGIME READER GATE: see query()'s twin above.
+        let _reader_gate = if matches!(cached.stmt.as_ref(), Statement::Select(_))
+            && self.concurrent_txn_for_caller().is_none()
+        {
+            self.pager.plain_reader_gate()
+        } else {
+            None
+        };
+        // PREUPDATE HOOK SCOPE (query-path DML): see query()'s twin above
+        // — DML-RETURNING through this surface must fire hooks too.
+        let _preupdate_guard = if self.has_preupdate_hook.load(Ordering::Acquire)
+            && matches!(
+                cached.stmt.as_ref(),
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            ) {
+            self.preupdate_scope()
+        } else {
+            None
+        };
         if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
             if *analyze {
                 return self.explain_analyze_select(inner, params);
@@ -6943,11 +7151,7 @@ impl Database {
         if let Statement::Select(sel) = cached.stmt.as_ref() {
             if sel.with.is_some() {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
-                let txn_snap = if in_txn {
-                    self.txn_snapshot.lock().clone()
-                } else {
-                    None
-                };
+                let txn_snap = self.txn_snapshot_for_ctx();
                 let shared = self.read_maps();
                 let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
@@ -6981,11 +7185,7 @@ impl Database {
             }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
-            let txn_snap = if in_txn {
-                self.txn_snapshot.lock().clone()
-            } else {
-                None
-            };
+            let txn_snap = self.txn_snapshot_for_ctx();
             // ONE read-lock + ONE refcount bump (see query()).
             // Committed-view reads take the BEGIN-time maps instead.
             let shared = self.read_maps();
@@ -7510,6 +7710,100 @@ impl Database {
         CONN_ID.with(|c| c.set(id));
     }
 
+    /// `BEGIN CONCURRENT` on `&self` — open this connection's optimistic
+    /// multi-writer transaction without holding any outer write lock.
+    ///
+    /// This is the entry point of the engine's TRUE parallel-write story:
+    /// a `Database` shared as `Arc<Database>` across threads, each thread
+    /// armed with its own [`Self::set_conn_identity`], can run N
+    /// `BEGIN CONCURRENT` transactions SIMULTANEOUSLY. Every statement's
+    /// page work lands in the transaction's PRIVATE page shadows
+    /// (prepared statements via [`Self::prepare`] + `raw_execute`/`step`
+    /// execute on `&self`), so the heavy DML work of the open
+    /// transactions overlaps freely; only COMMIT takes a short critical
+    /// section (validate write-set stamps → install shadows / row-level
+    /// MERGE → one WAL append). SQLite cannot do this: its WAL allows
+    /// exactly one writer at a time, database-wide.
+    ///
+    /// Requirements (mirroring the SQL `BEGIN CONCURRENT` statement): a
+    /// file-backed database in WAL journal mode (`PRAGMA
+    /// journal_mode = WAL`), no open plain transaction on this database,
+    /// and no other transaction already open for THIS connection
+    /// identity. DDL / PRAGMA / savepoints are rejected inside the
+    /// transaction (DML and SELECT only).
+    ///
+    /// On commit conflict (another connection committed writes to a page
+    /// this transaction wrote) the statement work overlaps unaffected —
+    /// only [`Self::commit_concurrent_transaction`] reports the conflict
+    /// as a retriable [`Error::SnapshotConflict`]; this transaction is
+    /// already fully rolled back when the error surfaces.
+    pub fn begin_concurrent_transaction(&self) -> Result<()> {
+        self.begin_concurrent_txn_shared()
+    }
+
+    /// COMMIT this connection's concurrent transaction (`&self` — safe
+    /// to call while sibling concurrent transactions are running their
+    /// statements). Runs the short commit critical section: validate the
+    /// write-set stamps (first-committer-wins), install the page shadows
+    /// — or, at ROW granularity, MERGE this transaction's journal onto
+    /// the current committed trees when only disjoint rows of a hot page
+    /// collided — and append the WAL frames (one group-commit fsync for
+    /// a burst of committers under `synchronous=FULL`).
+    ///
+    /// On conflict the transaction is already rolled back when the
+    /// [`Error::SnapshotConflict`] surfaces; the caller re-runs the
+    /// transaction body (the classic optimistic-concurrency retry).
+    pub fn commit_concurrent_transaction(&self) -> Result<()> {
+        self.commit_concurrent_txn_shared()
+    }
+
+    /// ROLLBACK this connection's concurrent transaction (`&self`):
+    /// drop the page shadows, recycle the transaction's fresh page
+    /// allocations into the freelist, discard its bookkeeping overlay.
+    /// Nearly free by construction — the live page cache was never
+    /// touched.
+    pub fn rollback_concurrent_transaction(&self) -> Result<()> {
+        self.rollback_concurrent_txn_shared()
+    }
+
+    /// Enter a PLAIN (non-concurrent) DML statement on the `&self`
+    /// statement path — the shared-Database misuse tripwire.
+    ///
+    /// Plain DML mutates the LIVE page cache; two such statements
+    /// running simultaneously on one `Arc<Database>` (no outer write
+    /// lock) interleave page-tree surgery and corrupt the database
+    /// SILENTLY. The engine cannot see the caller's outer lock, so it
+    /// records the executing thread here instead: a foreign holder
+    /// means the caller skipped every sanctioned serialization — the
+    /// error names the fix instead of corrupting.
+    ///
+    /// Zero cost for sanctioned users: an outer `RwLock<Database>`
+    /// (driver / C ABI / `execute(&mut self)` callers) already admits
+    /// one statement at a time, so the swap is uncontended and the
+    /// guard is a plain store on drop. Concurrent-regime statements
+    /// (owners and implicit joiners) never enter — their writes land
+    /// in private page shadows by construction.
+    pub(crate) fn enter_plain_dml(&self) -> Result<PlainDmlGuard<'_>> {
+        PLAIN_DML_DEPTH.with(|d| {
+            if d.get() == 0 {
+                let me = current_tid();
+                let prev = self.plain_dml_tid.swap(me, Ordering::AcqRel);
+                if prev != 0 && prev != me {
+                    // Restore the foreign holder before erroring.
+                    self.plain_dml_tid.store(prev, Ordering::Release);
+                    return Err(Error::Transaction(
+                        "concurrent DML on a shared Database: serialize the writes with an \
+                         outer write lock (Arc<RwLock<Database>>) or run them inside BEGIN \
+                         CONCURRENT transactions (Database::begin_concurrent_transaction)"
+                            .into(),
+                    ));
+                }
+            }
+            d.set(d.get() + 1);
+            Ok(PlainDmlGuard { db: self })
+        })
+    }
+
     /// The pager-side transaction id open for the calling identity, if
     /// any. Fast path: one relaxed atomic load when the regime is off.
     pub(crate) fn concurrent_txn_for_caller(&self) -> Option<u64> {
@@ -7517,7 +7811,7 @@ impl Database {
             return None;
         }
         let conn = conn_identity();
-        self.concurrent_txns.lock().get(&conn).map(|e| e.txn_id)
+        self.cw_registry(conn).lock().get(&conn).map(|e| e.txn_id)
     }
 
     /// True while the BEGIN CONCURRENT regime is active (any concurrent
@@ -7546,7 +7840,7 @@ impl Database {
             return None;
         }
         let conn = conn_identity();
-        self.concurrent_txns
+        self.cw_registry(conn)
             .lock()
             .get(&conn)
             .map(|e| e.maps.clone())
@@ -7555,7 +7849,7 @@ impl Database {
     /// Write a merged overlay back into the caller's registry entry.
     pub(crate) fn store_concurrent_overlay(&self, maps: std::sync::Arc<crate::executor::StmtMaps>) {
         let conn = conn_identity();
-        if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+        if let Some(entry) = self.cw_registry(conn).lock().get_mut(&conn) {
             entry.maps = maps;
         }
     }
@@ -7578,7 +7872,7 @@ impl Database {
     pub(crate) fn begin_concurrent_txn_shared(&self) -> Result<()> {
         let conn = conn_identity();
         {
-            let txns = self.concurrent_txns.lock();
+            let txns = self.cw_registry(conn).lock();
             if txns.contains_key(&conn) {
                 return Err(Error::semantic(
                     "cannot start a transaction within a transaction",
@@ -7618,7 +7912,7 @@ impl Database {
                 m.roots, m.index_roots
             );
         }
-        self.concurrent_txns.lock().insert(conn, entry);
+        self.cw_registry(conn).lock().insert(conn, entry);
         self.concurrent_active.store(true, Ordering::Release);
         self.in_transaction.store(true, Ordering::Release);
         self.txn_owner_tid.store(current_tid(), Ordering::Release);
@@ -7648,10 +7942,14 @@ impl Database {
     /// JOIN tail (the streaming-statement path cannot take `&mut self`).
     pub(crate) fn commit_concurrent_txn_shared(&self) -> Result<()> {
         let conn = conn_identity();
-        let entry = self.concurrent_txns.lock().remove(&conn);
+        let entry = self.cw_registry(conn).lock().remove(&conn);
         let Some(entry) = entry else {
             return Err(Error::semantic("no transaction is active"));
         };
+        // The owner thread's scope may still be armed (the re-arm memo
+        // keeps it between statements) — the transaction is ENDING, so
+        // disarm before the registry take makes it unroutable.
+        self.pager.disarm_writer_scope_if(entry.txn_id);
         let r = self.pager.commit_concurrent(entry.txn_id);
         if let Err(e) = r {
             // The pager already rolled the shadows back; finish the
@@ -7678,10 +7976,13 @@ impl Database {
     /// group's leader fsyncs once for all of them.
     pub fn commit_concurrent_deferred(&mut self) -> Result<u64> {
         let conn = conn_identity();
-        let entry = self.concurrent_txns.lock().remove(&conn);
+        let entry = self.cw_registry(conn).lock().remove(&conn);
         let Some(entry) = entry else {
             return Err(Error::semantic("no transaction is active"));
         };
+        // The transaction is ENDING: disarm the owner thread's memoized
+        // scope before the registry take (see the shared commit's twin).
+        self.pager.disarm_writer_scope_if(entry.txn_id);
         let r = self.pager.commit_concurrent_deferred(entry.txn_id);
         match r {
             Ok((outcome, ticket)) => {
@@ -7833,10 +8134,13 @@ impl Database {
     /// leave its one-statement transaction open).
     pub(crate) fn rollback_concurrent_txn_shared(&self) -> Result<()> {
         let conn = conn_identity();
-        let entry = self.concurrent_txns.lock().remove(&conn);
+        let entry = self.cw_registry(conn).lock().remove(&conn);
         let Some(entry) = entry else {
             return Ok(());
         };
+        // The transaction is ENDING: disarm the owner thread's memoized
+        // scope before the registry take (see commit's twin).
+        self.pager.disarm_writer_scope_if(entry.txn_id);
         let r = self.pager.rollback_concurrent(entry.txn_id);
         // The overlay is dropped — the shared maps were never touched.
         self.finish_concurrent_txn_shared();
@@ -7854,14 +8158,14 @@ impl Database {
     fn savepoint_concurrent_txn(&mut self, name: &str) -> Result<()> {
         let conn = conn_identity();
         let txn_id = {
-            let txns = self.concurrent_txns.lock();
+            let txns = self.cw_registry(conn).lock();
             match txns.get(&conn) {
                 Some(e) => e.txn_id,
                 None => return Err(Error::semantic("no transaction is active")),
             }
         };
         self.pager.savepoint_concurrent(txn_id, name)?;
-        let mut txns = self.concurrent_txns.lock();
+        let mut txns = self.cw_registry(conn).lock();
         if let Some(entry) = txns.get_mut(&conn) {
             let snap = entry.maps.clone();
             entry.savepoint_maps.push(snap);
@@ -7876,7 +8180,7 @@ impl Database {
     fn rollback_to_concurrent_savepoint(&mut self, name: &str) -> Result<()> {
         let conn = conn_identity();
         let txn_id = {
-            let txns = self.concurrent_txns.lock();
+            let txns = self.cw_registry(conn).lock();
             match txns.get(&conn) {
                 Some(e) => e.txn_id,
                 None => return Err(Error::semantic("no transaction is active")),
@@ -7885,7 +8189,7 @@ impl Database {
         match self.pager.rollback_concurrent_savepoint(txn_id, name)? {
             Some(depth) => {
                 let restored = {
-                    let mut txns = self.concurrent_txns.lock();
+                    let mut txns = self.cw_registry(conn).lock();
                     match txns.get_mut(&conn) {
                         Some(entry) => {
                             entry.savepoint_maps.truncate(depth);
@@ -7895,7 +8199,7 @@ impl Database {
                     }
                 };
                 if let Some(maps) = restored {
-                    if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+                    if let Some(entry) = self.cw_registry(conn).lock().get_mut(&conn) {
                         entry.maps = maps;
                     }
                     // Cached plans may embed roots from the rolled-back
@@ -7922,7 +8226,7 @@ impl Database {
     fn release_concurrent_savepoint(&mut self, name: &str) -> Result<()> {
         let conn = conn_identity();
         let txn_id = {
-            let txns = self.concurrent_txns.lock();
+            let txns = self.cw_registry(conn).lock();
             match txns.get(&conn) {
                 Some(e) => e.txn_id,
                 None => return Err(Error::semantic("no transaction is active")),
@@ -7930,7 +8234,7 @@ impl Database {
         };
         match self.pager.release_concurrent_savepoint(txn_id, name)? {
             Some(remaining) => {
-                if let Some(entry) = self.concurrent_txns.lock().get_mut(&conn) {
+                if let Some(entry) = self.cw_registry(conn).lock().get_mut(&conn) {
                     entry.savepoint_maps.truncate(remaining);
                 }
                 Ok(())
@@ -8933,11 +9237,7 @@ impl Database {
         if let Statement::Select(sel) = inner {
             if let Some(with) = &sel.with {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
-                let txn_snap = if in_txn {
-                    self.txn_snapshot.lock().clone()
-                } else {
-                    None
-                };
+                let txn_snap = self.txn_snapshot_for_ctx();
                 let shared = self.read_maps();
                 let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
@@ -8978,11 +9278,7 @@ impl Database {
             }
         };
         let in_txn = self.in_transaction.load(Ordering::Acquire);
-        let txn_snap = if in_txn {
-            self.txn_snapshot.lock().clone()
-        } else {
-            None
-        };
+        let txn_snap = self.txn_snapshot_for_ctx();
         let shared = self.read_maps();
         let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
         let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
@@ -9457,6 +9753,28 @@ impl Database {
         } else {
             (None, None)
         };
+        // CONCURRENT ROOT FOLD (plain-reader arms only): a merged commit
+        // can re-root a tree WITHOUT any maps entry (the transaction's
+        // overlay never recorded a root move — the MERGE's replay split
+        // the root), leaving the plan's Table/Index Arc (the catalog
+        // fallback) pointing at a leaf that is no longer the root — a
+        // plain reader would then serve a TRUNCATED tree. When any
+        // concurrent commit moved a root, fold the fallback (and any
+        // pre-published maps value, which is already folded — identity)
+        // through the manager's origin→current map. NOT applied to the
+        // owner arm (its overlay carries the transaction's PRIVATE
+        // roots) nor the committed-view arm (its snapshot roots are the
+        // BEGIN-time contract — folding would serve post-BEGIN state).
+        let fold_roots = self.pager.armed_writer_scope().is_none()
+            && !self.pager.committed_reads_armed()
+            && self.pager.any_root_moves();
+        let fold_root = |r: u32| -> u32 {
+            if fold_roots && r != 0 {
+                self.pager.committed_root_of(r)
+            } else {
+                r
+            }
+        };
         match fp {
             FastPath::RowidPoint {
                 table,
@@ -9471,7 +9789,7 @@ impl Database {
                 let Some(rid) = crate::executor::rowid_seek_value(rowid.resolve(params)) else {
                     return Ok(Vec::new());
                 };
-                let root = table_root.unwrap_or(table.root_page);
+                let root = fold_root(table_root.unwrap_or(table.root_page));
                 let mut bt = Btree::new(&self.pager, root, false);
                 // Decode the projected row directly under the page lock —
                 // no intermediate payload Vec copy.
@@ -9516,7 +9834,7 @@ impl Database {
                         &key_scratch
                     }
                 };
-                let iroot = index_root.unwrap_or(index.root_page);
+                let iroot = fold_root(index_root.unwrap_or(index.root_page));
                 let mut ibt = Btree::new(&self.pager, iroot, true);
                 let rowids = ibt.lookup_index(key_bytes)?;
                 Ok(vec![vec![Value::Integer(rowids.len() as i64)]])
@@ -9545,7 +9863,7 @@ impl Database {
                         }
                     }
                 }
-                let root = table_root.unwrap_or(table.root_page);
+                let root = fold_root(table_root.unwrap_or(table.root_page));
                 let mut bt = Btree::new(&self.pager, root, false);
                 let n = bt.count_rows()? as i64;
                 if !committed {
@@ -9629,7 +9947,7 @@ impl Database {
                         }
                     }
                 };
-                let iroot = index_root.unwrap_or(index.root_page);
+                let iroot = fold_root(index_root.unwrap_or(index.root_page));
                 let mut ibt = Btree::new(&self.pager, iroot, true);
                 // Reusable per-thread rowid scratch: the results Vec
                 // (almost always 0-2 rowids on point lookups) cost a fresh
@@ -9646,7 +9964,7 @@ impl Database {
                         if rowids.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let troot = table_root.unwrap_or(table.root_page);
+                        let troot = fold_root(table_root.unwrap_or(table.root_page));
                         let mut tbt = Btree::new(&self.pager, troot, false);
                         let mut rows = Vec::with_capacity(rowids.len());
                         for &rid in &rowids {
@@ -9683,7 +10001,7 @@ impl Database {
                 else {
                     return Ok(Vec::new());
                 };
-                let root = table_root.unwrap_or(table.root_page);
+                let root = fold_root(table_root.unwrap_or(table.root_page));
                 let mut bt = Btree::new(&self.pager, root, false);
                 // Pre-size the result from the range width: a growing Vec
                 // pays ~13 realloc+copy rounds on a 5000-row scan, and the

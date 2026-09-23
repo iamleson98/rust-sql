@@ -160,6 +160,19 @@ Three tiers: **(1) inter-connection MRMW reads** — true parallel readers on sh
 
 **Implicit join** — plain autocommit INSERT/UPDATE/DELETE arriving while the regime is open no longer waits out BUSY: the statement runs as a one-statement concurrent transaction (same shadows, row-level validation, group-commit fsync) through every path — `Database::execute`, prepare/step streaming, the sqlx driver (which skips the regime wait for autocommit DML), **and the C ABI** (each `sqlite3*` handle arms a distinct engine identity, so stock sqlx/sea-orm apps through `compat/` join too; a failed concurrent COMMIT releases the handle's bookkeeping, and an abandoned transaction rolls back at close). Same-row writers get retriable 517 and win/lose by first-committer-wins; disjoint rows of one hot page MERGE. This also closed a latent hole: raw prepare/step DML during the regime previously wrote the live cache mid-regime — and the C ABI's shared identity-0 slot let one handle's reads serve another's uncommitted shadows.
 
+**True parallel writers on a shared `Arc<Database>`** — the `&self` engine API SQLite architecturally cannot offer (its WAL admits exactly one writer at a time, database-wide):
+
+```rust
+let db: Arc<Database> = …;                      // file-backed, PRAGMA journal_mode = WAL
+Database::set_conn_identity(id);                // per-thread connection identity
+db.begin_concurrent_transaction()?;             // &self — no outer lock
+let mut stmt = db.prepare("INSERT …")?;         // statements run in PARALLEL:
+stmt.bind(1, …)?; stmt.step()?; stmt.reset();   //   every writer's page work lands in
+db.commit_concurrent_transaction()?;            //   its PRIVATE page shadows
+```
+
+N threads run N simultaneous transactions on ONE engine: the heavy DML overlaps freely; only COMMIT takes a short critical section (validate write-set stamps → install shadows / row-level MERGE → one WAL append). Hot-page refinement: a page first touched AFTER a sibling commit materializes that sibling's newest committed bytes as its base (the BEGIN-time version is unreconstructable — installs content-replace the live cache), so disjoint-row writers on one hot root leaf all commit without retry storms; the base is validated at COMMIT (no further move → direct install; moved again → row MERGE). Conflicts are retriable `SQLITE_BUSY_SNAPSHOT` (517) with the transaction fully rolled back on error. Misuse guards: concurrent plain DML on one shared Database without serialization gets a loud error naming the fix (never silent corruption), plain readers are excluded from mid-commit installs by an install gate (atomic transaction boundaries), and mid-regime root moves converge the durable schema rows inside the merge itself. Bench: **4 parallel writers × 250 INSERTs ≈ 1.5–2x SQLite's 4-connection WAL shape** (SQLite serializes the four transactions end-to-end on its single write lock; ours overlaps the DML and merges at commit).
+
 ## Cold start on large files
 
 Measured 2026-09-19 on this 2-vCPU box, 5M-row / ~1.3 GiB files, fresh process per run, page cache dropped (`posix_fadvise DONTNEED`) — `examples/probe_cold_large.rs`:

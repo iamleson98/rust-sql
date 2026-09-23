@@ -1506,6 +1506,17 @@ impl Pager {
         self.concurrent.current_root_of(origin)
     }
 
+    /// True when at least one concurrent commit moved a tree root — the
+    /// engine's root-resolution fold gate (one relaxed atomic load; see
+    /// `ConcurrentManager::any_root_moves`). When true, catalog-fallback
+    /// roots must fold through [`Self::committed_root_of`]: the in-memory
+    /// catalog Arc trails merge re-rootings, and descending the stale
+    /// root serves a TRUNCATED tree (one leaf instead of the whole
+    /// structure — found by the parallel-writers reader-atomicity probe).
+    pub fn any_root_moves(&self) -> bool {
+        self.concurrent.any_root_moves()
+    }
+
     /// Open or create a database file at the given path.
     pub fn open<P: AsRef<Path>>(path: P, cache_capacity: usize) -> Result<Self> {
         Self::open_opts(path, cache_capacity, false)
@@ -5358,6 +5369,13 @@ impl Pager {
         }
         self.lru.lock().clear();
         self.dirty_pages.lock().clear();
+        // The set was emptied OUTSIDE flush(): the last-noted hint must
+        // not survive it, or a later note_dirty(same id) would skip the
+        // insert on a set that no longer holds the page — its next
+        // mutation would never reach the WAL (silent durability loss;
+        // the same class the statement-restore path above guards
+        // against).
+        self.last_noted_dirty.store(u32::MAX, Ordering::Release);
         // BEGIN-level rollback: ALL uncommitted spill frames are dead work
         // (recovery ignores trailing uncommitted frames; in-process, the
         // next fetch of any of these pages must read the committed
@@ -5550,8 +5568,16 @@ impl Pager {
                     // The spilled page is no longer in the cache: take it
                     // out of the dirty tracking so the commit batch's
                     // cache probe doesn't wait on a page that isn't there
-                    // (its frame is already in the WAL).
-                    self.dirty_pages.lock().remove(&evict_id);
+                    // (its frame is already in the WAL). Reset the
+                    // last-noted hint too when it pointed here: a later
+                    // re-fetch + note_dirty of the SAME page would skip
+                    // the set insert, and its post-refetch mutation would
+                    // never be flushed (the spill frame is older).
+                    let mut dp = self.dirty_pages.lock();
+                    dp.remove(&evict_id);
+                    if self.last_noted_dirty.load(Ordering::Relaxed) == evict_id {
+                        self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+                    }
                 }
             } else {
                 // Move dirty page to the back and try the next one.

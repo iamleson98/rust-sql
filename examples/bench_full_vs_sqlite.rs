@@ -882,59 +882,120 @@ fn bench_mixed_rw() -> BenchResult {
 }
 
 fn bench_concurrent_writes() -> BenchResult {
-    // 4 writer threads each doing 250 INSERTs in a transaction.
+    // 4 writer threads each committing 250 INSERTs — the TRUE-PARALLEL
+    // shape. rustqlite: one shared `Arc<Database>`, four SIMULTANEOUS
+    // `BEGIN CONCURRENT` transactions whose statements run in PARALLEL
+    // (private page shadows); only COMMIT takes a short critical section
+    // (validate → install/row-merge → one WAL append). SQLite: four
+    // connections on one WAL database — its WAL admits EXACTLY ONE
+    // writer at a time, database-wide, so the four transactions
+    // serialize end-to-end (BEGIN..COMMIT of one writer must finish
+    // before the next acquires the write lock). Same thread count, same
+    // statements, same durability class on both sides (file-backed WAL,
+    // synchronous=NORMAL, prepared statements, disjoint rowids).
     let total_ops = 4 * 250;
+
+    let rq_path = {
+        let p = std::env::temp_dir().join(format!(
+            "bench-cw-rq-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p.to_string_lossy().into_owned()
+    };
     let (rq_ops, _) = measure(
-        "rust-sql 4 writers (serialized)",
+        "rust-sql 4 parallel BEGIN CONCURRENT writers",
         || {
-            let db = Arc::new(RwLock::new({
-                let mut db = Database::open_in_memory().unwrap();
-                db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
-                    .unwrap();
-                db
-            }));
+            let mut db = Database::open(&rq_path).unwrap();
+            db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+            db.execute("PRAGMA synchronous = NORMAL", []).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
+                .unwrap();
+            let db = Arc::new(db);
             let mut handles = Vec::new();
-            for tid in 0..4 {
+            for tid in 0..4i64 {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
-                    for local in (tid * 1000)..(tid * 1000 + 250) {
-                        let mut guard = db.write();
-                        guard
-                            .execute("INSERT INTO t (val) VALUES (?)", [Value::Integer(local)])
-                            .unwrap();
+                    rustqlite::Database::set_conn_identity((tid + 1) as u64);
+                    db.begin_concurrent_transaction().unwrap();
+                    let mut stmt = db.prepare("INSERT INTO t (id, val) VALUES (?, ?)").unwrap();
+                    for i in 0..250i64 {
+                        stmt.bind(1, Value::Integer(tid * 1_000_000 + i)).unwrap();
+                        stmt.bind(2, Value::Integer(tid)).unwrap();
+                        stmt.step().unwrap();
+                        stmt.reset();
                     }
+                    drop(stmt);
+                    db.commit_concurrent_transaction().unwrap();
+                    rustqlite::Database::set_conn_identity(0);
                 }));
             }
             for h in handles {
                 h.join().unwrap();
             }
+            let n = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+            assert_eq!(n, 1000, "every parallel writer's rows must land");
+            drop(db);
+            let _ = std::fs::remove_file(&rq_path);
+            let _ = std::fs::remove_file(format!("{}-wal", rq_path));
         },
         total_ops,
     );
+    let rs_path = {
+        let p = std::env::temp_dir().join(format!(
+            "bench-cw-sql-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p.to_string_lossy().into_owned()
+    };
     let (rs_ops, _) = measure(
-        "rusqlite 4 writers (serialized)",
+        "rusqlite 4 WAL writers (serialized by SQLite's write lock)",
         || {
-            let conn = Arc::new(std::sync::Mutex::new({
-                let conn = rusqlite::Connection::open_in_memory().unwrap();
+            {
+                let conn = rusqlite::Connection::open(&rs_path).unwrap();
+                conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+                    .unwrap();
                 conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", [])
                     .unwrap();
-                conn
-            }));
+            }
             let mut handles = Vec::new();
-            for tid in 0..4 {
-                let conn = Arc::clone(&conn);
+            for tid in 0..4i64 {
+                let path = rs_path.clone();
                 handles.push(thread::spawn(move || {
-                    for local in (tid * 1000)..(tid * 1000 + 250) {
-                        let guard = conn.lock().unwrap();
-                        guard
-                            .execute("INSERT INTO t (val) VALUES (?1)", params![local])
-                            .unwrap();
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+                        .unwrap();
+                    conn.execute("BEGIN", []).unwrap();
+                    for i in 0..250i64 {
+                        conn.execute(
+                            "INSERT INTO t (id, val) VALUES (?1, ?2)",
+                            params![tid * 1_000_000 + i, tid],
+                        )
+                        .unwrap();
                     }
+                    conn.execute("COMMIT", []).unwrap();
                 }));
             }
             for h in handles {
                 h.join().unwrap();
             }
+            {
+                let conn = rusqlite::Connection::open(&rs_path).unwrap();
+                let n: i64 = conn
+                    .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 1000);
+            }
+            let _ = std::fs::remove_file(&rs_path);
+            let _ = std::fs::remove_file(format!("{}-wal", rs_path));
+            let _ = std::fs::remove_file(format!("{}-shm", rs_path));
         },
         total_ops,
     );
@@ -942,7 +1003,7 @@ fn bench_concurrent_writes() -> BenchResult {
         name: "Concurrent writes (4 writers × 250 INSERTs)".into(),
         rustqlite_ops_per_sec: rq_ops,
         rusqlite_ops_per_sec: rs_ops,
-        note: Some("writers serialize"),
+        note: Some("parallel BEGIN CONCURRENT vs SQLite's one-writer WAL"),
     }
 }
 

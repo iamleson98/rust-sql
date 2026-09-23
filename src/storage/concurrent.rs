@@ -156,8 +156,11 @@ pub(crate) struct ConcurrentSavepoint {
 pub struct ConcurrentTxn {
     /// Engine-issued transaction id (also the WAL-visibility key).
     pub id: u64,
-    /// Global commit epoch at BEGIN. A page whose stamp exceeds this was
-    /// written AFTER this transaction's snapshot — fetches fail fast.
+    /// Global commit epoch at BEGIN. Pages whose stamps stay within it
+    /// materialize the strict BEGIN-time snapshot; a page whose stamp
+    /// exceeds it is a LATE touch (a sibling commit landed after BEGIN)
+    /// — materialized from the newest committed bytes with that stamp
+    /// as the shadow's base (see `writer_shadow_fetch`).
     pub begin_epoch: u64,
     /// Committed page count at BEGIN: the materialization bound. Pages at
     /// or beyond it did not exist in this transaction's snapshot (the
@@ -264,12 +267,32 @@ impl ConcurrentTxn {
     }
 }
 
+/// Shard count for the transaction registry: concurrent-transaction
+/// statements hammer the registry mutex on EVERY page fetch and
+/// row-write note (`writer_shadow_fetch` & co), so N parallel writers
+/// on one shared `Arc<Database>` must not serialize on a single mutex.
+/// Txn ids are sequential (`fetch_add`), so `id % N` spreads
+/// simultaneous transactions across distinct shards (measured: the
+/// 4-parallel-writer shape's statement phase ran ~9x its single-writer
+/// time on one mutex; sharding restores true overlap).
+const TXN_SHARDS: usize = 16;
+
+/// One registry shard, padded to its own cache line: 16 unpadded
+/// parking_lot Mutexes pack into 2 lines, and simultaneous writers
+/// (sequential txn ids → adjacent shards) would false-share them —
+/// every lock/unlock bounces the line across cores and the "sharded"
+/// registry serializes anyway (measured on the 4-writer phase probe).
+#[repr(align(64))]
+struct TxnShard(Mutex<HashMap<u64, ConcurrentTxn>>);
+
 /// Registry + version-stamp store for the concurrent regime.
 ///
 /// One instance lives inside each [`Pager`]. All methods take `&self`
 /// (interior mutability) because the pager is shared by reader threads.
 pub struct ConcurrentManager {
-    txns: Mutex<HashMap<u64, ConcurrentTxn>>,
+    /// Open transactions, SHARDED BY TXN ID (see `TXN_SHARDS`): one
+    /// mutex would serialize every parallel writer's page fetches.
+    txns: [TxnShard; TXN_SHARDS],
     /// Committed page → epoch of the install that last wrote it.
     /// Absent = never written by a concurrent commit (stamp 0 semantics:
     /// the pre-concurrent committed state).
@@ -316,12 +339,54 @@ pub struct ConcurrentManager {
     /// committed-bound decision), so it must not take the registry
     /// mutex.
     active: AtomicUsize,
+    /// COMMIT/ROLLBACK critical sections in flight. `take()` drops the
+    /// committing transaction from `active` BEFORE the install + WAL
+    /// append run — for the LAST open transaction that flips the regime
+    /// gate OFF mid-commit, and a plain reader (no reader gate) could
+    /// straddle the multi-page install (a torn tree), or a plain writer
+    /// could be admitted mid-install. The commit/rollback critical
+    /// sections hold this counter for their whole duration so
+    /// [`Self::any_active`] stays true until the install + flush land.
+    /// Serialized by `commit_lock`, so the counter is 0 or 1 in practice.
+    committing: AtomicUsize,
+    /// Number of entries in `live_roots` (one relaxed atomic load — the
+    /// read path's fold gate). A concurrent commit that moved a tree root
+    /// leaves an entry; the engine's root resolution then folds catalog
+    /// roots through origin→current so readers can never descend a
+    /// stale root (a truncated tree) after a merge re-rooted it.
+    roots_moved: AtomicUsize,
+    /// Reader-vs-install exclusion for the `&self` API world (a shared
+    /// `Arc<Database>` with NO outer RwLock — `begin_concurrent_transaction`
+    /// and `prepare`/`step` on `&self`). A concurrent COMMIT installs its
+    /// shadow pages into the live cache ONE PAGE AT A TIME under the
+    /// page-cache write lock: per-FETCH atomicity holds, but a plain
+    /// reader's MULTI-page walk could otherwise straddle the install
+    /// (root fetched before the install, leaf after) and observe a torn
+    /// tree. Installers hold the WRITE side across the whole
+    /// install+freelist-splice window; plain (no-transaction) readers
+    /// hold the READ side for their whole walk (see
+    /// [`Pager::plain_reader_gate`]). Owners are exempt by construction
+    /// — their fetch-time version-stamp gate fails fast on any page a
+    /// sibling commit installed — and the outer-RwLock worlds (the
+    /// driver, the C ABI, `execute(&mut self)`) never overlap a reader
+    /// with a commit in the first place, so the gate stays uncontended
+    /// there.
+    install_gate: RwLock<()>,
+}
+
+/// RAII decrement for [`ConcurrentManager::commit_window`] (unwind-safe).
+pub(crate) struct CommitWindowGuard<'a>(&'a ConcurrentManager);
+
+impl Drop for CommitWindowGuard<'_> {
+    fn drop(&mut self) {
+        self.0.committing.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ConcurrentManager {
     pub(crate) fn new() -> Self {
         Self {
-            txns: Mutex::new(HashMap::new()),
+            txns: std::array::from_fn(|_| TxnShard(Mutex::new(HashMap::new()))),
             stamps: RwLock::new(HashMap::new()),
             row_stamps: RwLock::new(HashMap::new()),
             live_roots: RwLock::new(HashMap::new()),
@@ -331,6 +396,9 @@ impl ConcurrentManager {
             commit_lock: Mutex::new(()),
             scope_count: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
+            committing: AtomicUsize::new(0),
+            roots_moved: AtomicUsize::new(0),
+            install_gate: RwLock::new(()),
         }
     }
 
@@ -339,13 +407,13 @@ impl ConcurrentManager {
     pub(crate) fn begin(&self, begin_epoch: u64, begin_n_pages: u32) -> u64 {
         let id = self.next_txn.fetch_add(1, Ordering::Relaxed);
         let txn = ConcurrentTxn::new(id, begin_epoch, begin_n_pages);
-        self.txns.lock().insert(id, txn);
+        self.txns[id as usize % TXN_SHARDS].0.lock().insert(id, txn);
         self.active.fetch_add(1, Ordering::AcqRel);
         id
     }
 
     pub(crate) fn take(&self, id: u64) -> Option<ConcurrentTxn> {
-        let removed = self.txns.lock().remove(&id);
+        let removed = self.txns[id as usize % TXN_SHARDS].0.lock().remove(&id);
         if removed.is_some() {
             self.active.fetch_sub(1, Ordering::AcqRel);
         }
@@ -357,7 +425,7 @@ impl ConcurrentManager {
         id: u64,
     ) -> Option<parking_lot::MutexGuard<'_, HashMap<u64, ConcurrentTxn>>> {
         // Scoped helper: callers must NOT hold this guard across page I/O.
-        let g = self.txns.lock();
+        let g = self.txns[id as usize % TXN_SHARDS].0.lock();
         if g.contains_key(&id) {
             Some(g)
         } else {
@@ -365,16 +433,32 @@ impl ConcurrentManager {
         }
     }
 
-    /// True when at least one concurrent transaction is open (the
-    /// regime gate: plain writers must wait, readers pass freely).
-    /// Single atomic load — this is on `get_page`'s hot path.
+    /// True when at least one concurrent transaction is open OR a
+    /// commit/rollback critical section is mid-flight (the regime gate:
+    /// plain writers must wait, readers pass freely but arm the
+    /// reader gate). Single atomic loads — this is on `get_page`'s hot
+    /// path.
     pub fn any_active(&self) -> bool {
-        self.active.load(Ordering::Acquire) > 0
+        self.active.load(Ordering::Acquire) > 0 || self.committing.load(Ordering::Acquire) > 0
+    }
+
+    /// True when at least one committed root move is known (the engine's
+    /// root-resolution fold gate — see `roots_moved`). One relaxed load.
+    pub fn any_root_moves(&self) -> bool {
+        self.roots_moved.load(Ordering::Acquire) > 0
+    }
+
+    /// Enter a COMMIT/ROLLBACK critical section: keeps [`Self::any_active`]
+    /// true across the whole install + flush window (see `committing`).
+    /// RAII — the guard decrements on every exit including unwinds.
+    pub(crate) fn commit_window(&self) -> CommitWindowGuard<'_> {
+        self.committing.fetch_add(1, Ordering::AcqRel);
+        CommitWindowGuard(self)
     }
 
     /// Number of open concurrent transactions (diagnostics).
     pub fn active_count(&self) -> usize {
-        self.txns.lock().len()
+        self.txns.iter().map(|s| s.0.lock().len()).sum()
     }
 
     /// Current commit epoch (stamps compare against this at BEGIN).
@@ -467,6 +551,9 @@ impl ConcurrentManager {
             origin.insert(ultimate, ultimate);
             live.insert(ultimate, new_root);
         }
+        // Publish the fold gate for the engine's root resolution (see
+        // `roots_moved`).
+        self.roots_moved.store(live.len(), Ordering::Release);
     }
 
     pub(crate) fn note_scope_armed(&self) {
@@ -555,14 +642,25 @@ fn capture_shadow_undo(txn: &mut ConcurrentTxn, id: PageId, pr: &PageRef) {
 /// previous TLS value on drop (re-entrancy safe) and keeps the
 /// manager's gate count balanced. Must be held for the duration of one
 /// statement (or one API call) executing on behalf of the transaction.
+///
+/// A NO-OP variant (see [`Pager::arm_writer_scope`]) covers the
+/// re-arm of the SAME transaction this thread already serves: the TLS
+/// already routes correctly, so the guard touches NO shared state —
+/// per-statement counter bumps + epoch bumps + gate stores on one
+/// cache line measured as the parallel-write path's dominant slowdown
+/// (every writer ping-ponged the same lines once per statement).
 #[must_use]
 pub struct WriterScopeGuard<'a> {
     prev: Option<(u64, u64)>,
     pager: &'a Pager,
+    noop: bool,
 }
 
 impl Drop for WriterScopeGuard<'_> {
     fn drop(&mut self) {
+        if self.noop {
+            return;
+        }
         WRITER_SCOPE.with(|c| c.set(self.prev.take()));
         self.pager.concurrent.note_scope_dropped();
         self.pager.refresh_concurrent_gate();
@@ -604,7 +702,28 @@ impl Pager {
     /// Arm this thread's writer scope for `txn_id` on THIS pager.
     /// `get_page` then serves the transaction's shadows; `allocate_page`
     /// / `free_page` / `note_dirty` route into the transaction.
+    ///
+    /// RE-ARM MEMO: when the thread's scope already serves THIS
+    /// transaction on THIS pager, return a no-op guard — the routing is
+    /// already correct, and skipping the shared-counter bump + epoch
+    /// bump + gate store keeps those cache lines quiet under N parallel
+    /// writers (the per-statement arm pair was the parallel-write
+    /// path's dominant serialization). The scope then stays armed
+    /// BETWEEN this thread's statements of the same transaction —
+    /// correct (an owner reading between its own statements must see
+    /// its own shadows) — and is disarmed at the transaction's END
+    /// (see [`Pager::disarm_writer_scope_if`], called by the
+    /// commit/rollback paths) or replaced by the next arm of a
+    /// different transaction.
     pub fn arm_writer_scope(&self, txn_id: u64) -> WriterScopeGuard<'_> {
+        let cur = WRITER_SCOPE.with(|c| c.get());
+        if cur == Some((self.instance_id, txn_id)) {
+            return WriterScopeGuard {
+                prev: None,
+                pager: self,
+                noop: true,
+            };
+        }
         let prev = WRITER_SCOPE.with(|c| c.replace(Some((self.instance_id, txn_id))));
         self.concurrent.note_scope_armed();
         // Kill this thread's table-leaf hints: a hint recorded by a
@@ -618,7 +737,33 @@ impl Pager {
         // statement the hints re-establish normally (same txn's shadows).
         self.write_version.fetch_add(1, Ordering::Relaxed);
         self.refresh_concurrent_gate();
-        WriterScopeGuard { prev, pager: self }
+        WriterScopeGuard {
+            prev,
+            pager: self,
+            noop: false,
+        }
+    }
+
+    /// Disarm this thread's writer scope when it serves `txn_id` — the
+    /// transaction's END (COMMIT/ROLLBACK/abort teardown): with the
+    /// re-arm memo the scope stays armed between the owner thread's
+    /// statements, so the end must clear it explicitly (a fetch after
+    /// the registry take would otherwise route into a vanished
+    /// transaction). No-op when this thread serves a different
+    /// transaction or none.
+    pub fn disarm_writer_scope_if(&self, txn_id: u64) {
+        let matched = WRITER_SCOPE.with(|c| {
+            if c.get() == Some((self.instance_id, txn_id)) {
+                c.set(None);
+                true
+            } else {
+                false
+            }
+        });
+        if matched {
+            self.concurrent.note_scope_dropped();
+            self.refresh_concurrent_gate();
+        }
     }
 
     /// The (instance, txn) this thread's scope is armed with, if any.
@@ -672,6 +817,23 @@ impl Pager {
         self.concurrent.any_active()
     }
 
+    /// Reader-side half of the concurrent-install gate (see
+    /// [`ConcurrentManager`]'s `install_gate`): a read guard held for
+    /// the duration of a PLAIN (no-transaction) reader's page walks
+    /// while the concurrent regime is active, so a concurrent COMMIT's
+    /// shadow install cannot interleave mid-walk (a torn tree). Returns
+    /// `None` — one atomic load, nothing held — when no concurrent
+    /// transaction is open. Callers that hold a concurrent transaction
+    /// (owners) must NOT take this guard: their fetch-time version-stamp
+    /// validation is the isolation mechanism, and an owner's statement
+    /// may legitimately run while a sibling commits.
+    pub fn plain_reader_gate(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        if !self.concurrent.any_active() {
+            return None;
+        }
+        Some(self.concurrent.install_gate.read())
+    }
+
     /// True when the transaction has no observable effect (no dirty
     /// shadows, no row-journal ops, no frees): the IMPLICIT-JOIN tail
     /// routes such statements to ROLLBACK instead of COMMIT — a no-op
@@ -722,6 +884,24 @@ impl Pager {
 
     fn commit_concurrent_inner(&self, txn_id: u64) -> Result<(ConcurrentCommitOutcome, u64)> {
         let _commit = self.concurrent.commit_lock.lock();
+        // Commit window: the body's `take` drops the transaction from
+        // `active` BEFORE the install + WAL append run — for the LAST
+        // open transaction that would flip the regime gate OFF
+        // mid-commit (torn plain readers; plain writers admitted
+        // mid-install). Hold any_active true for the whole critical
+        // section, then refresh the stored gate AFTER the window drops:
+        // a refresh inside the window would store the window's ACTIVE
+        // bit and wedge every plain writer on BUSY forever once the
+        // window ends.
+        let out = {
+            let _window = self.concurrent.commit_window();
+            self.commit_concurrent_body(txn_id)
+        };
+        self.refresh_concurrent_gate();
+        out
+    }
+
+    fn commit_concurrent_body(&self, txn_id: u64) -> Result<(ConcurrentCommitOutcome, u64)> {
         let Some(txn) = self.concurrent.take(txn_id) else {
             return Err(Error::Transaction(format!(
                 "concurrent transaction {} is not open",
@@ -737,18 +917,23 @@ impl Pager {
 
         // ---- validation: first-committer-wins on the WRITE set.
         //
-        // Textbook snapshot isolation: reads come from the transaction's
-        // BEGIN-time snapshot (guaranteed by the fetch-time stamp gate —
-        // every materialized page predates begin_epoch, or the fetch
-        // aborted), so only WRITE-WRITE overlaps need commit-time
-        // validation. A dirty shadow page whose committed stamp moved
-        // since it was fetched means another connection committed a write
-        // to the same page. That is the END of the story at PAGE
-        // granularity — but ROW granularity refines it: if the row
-        // journal fully describes this transaction's writes and none of
-        // those (tree, rowid) pairs were re-stamped by the concurrent
-        // commit, the transaction MERGES (replays its journal onto the
-        // current trees) instead of retrying.
+        // Snapshot isolation anchored at each shadow's BASE: pages
+        // materialized before any sibling commit carry the BEGIN-time
+        // bytes (base stamp <= begin_epoch), and pages first touched
+        // after one serve the newest committed bytes with the moved
+        // stamp as their base (see `writer_shadow_fetch` — the parallel
+        // regime's hot-page refinement: such a shadow already contains
+        // every sibling commit, so installing it cannot lose them).
+        // Either way `read_stamps` records the base, and only
+        // WRITE-WRITE overlaps need commit-time validation: a dirty
+        // shadow page whose committed stamp moved SINCE ITS BASE means
+        // another connection committed a write to the same page. That
+        // is the END of the story at PAGE granularity — but ROW
+        // granularity refines it: if the row journal fully describes
+        // this transaction's writes and none of those (tree, rowid)
+        // pairs were re-stamped by the concurrent commit, the
+        // transaction MERGES (replays its journal onto the current
+        // trees) instead of retrying.
         //
         // PAGE 0 (dirty): the header region is rewritten by every commit
         // and only stamped when a schema-row rewrite installed, so a
@@ -810,6 +995,13 @@ impl Pager {
             }
         }
         if !conflicts.is_empty() {
+            if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+                eprintln!(
+                    "[CONFLICT] pages {:?} journal_ops={} → merge",
+                    conflicts,
+                    txn.row_journal.len()
+                );
+            }
             // Any resolution of a page conflict (merge or abort) discards
             // the page shadows, so this transaction's fresh allocations —
             // including savepoint-discarded ones — are garbage either way:
@@ -828,18 +1020,29 @@ impl Pager {
 
         // ---- fast path: install shadows → live cache (content-replace
         // under the page mutex, so any Arc clones held elsewhere stay
-        // valid).
-        let installed = self.install_txn_shadows(&txn);
-        // Page-0 header refresh rides the flush (n_pages high-water,
-        // freelist, cookie) — the standard flush_wal path does it.
-
-        // ---- deferred frees → live freelist (trunk-format splice), plus
-        // the pages a ROLLBACK TO SAVEPOINT discarded mid-transaction
-        // (their ids exist in the committed file — the flush publishes
-        // the high-water — and no committed tree references them).
+        // valid). The install gate's WRITE side spans the whole
+        // install+splice window: a plain reader's walk (holding the READ
+        // side, see `Pager::plain_reader_gate`) observes the tree either
+        // fully pre- or fully post-install — never the interleaved
+        // middle.
         let mut freed_now = txn.freed.clone();
         freed_now.extend_from_slice(&txn.discarded);
-        self.splice_txn_freed(&freed_now)?;
+        let installed = {
+            let _ig = self.concurrent.install_gate.write();
+            // Publish the root moves BEFORE the install lands: the
+            // moment the install's pages become visible, plain readers
+            // resolve roots — the origin→current fold must already be
+            // published (roots_moved) or a reader between the install
+            // and a later install_lineage would descend the STALE root
+            // into a truncated tree (the reader-atomicity probe's
+            // one-leaf torn reads).
+            self.concurrent.install_lineage(&txn.root_lineage);
+            let installed = self.install_txn_shadows(&txn);
+            self.splice_txn_freed(&freed_now)?;
+            installed
+        };
+        // Page-0 header refresh rides the flush (n_pages high-water,
+        // freelist, cookie) — the standard flush_wal path does it.
 
         // ---- WAL commit: frames for every installed page + splice
         // writes + header, one commit marker. The fsync is deferred to
@@ -850,7 +1053,7 @@ impl Pager {
         let epoch = self.concurrent.stamp_installed(installed.into_iter());
         self.concurrent
             .stamp_rows(txn.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
-        self.concurrent.install_lineage(&txn.root_lineage);
+        // (install_lineage already ran INSIDE the install gate above.)
 
         // Advisory caches (leaf hints, memos, chains) must re-derive
         // against the new committed state — one epoch bump covers all.
@@ -896,6 +1099,9 @@ impl Pager {
                 }
             }
             self.note_dirty(*id);
+        }
+        if std::env::var_os("RSQL_DBG_FLUSH").is_some() && !installed.is_empty() {
+            eprintln!("[INSTALL] pages {:?}", installed);
         }
         installed
     }
@@ -958,6 +1164,17 @@ impl Pager {
         let replay = {
             let _guard = self.arm_writer_scope(fresh_id);
             self.replay_journal(&journal, &op_ok, &lineage)
+                // Phase 3 — catalog convergence: roots moved by THE
+                // REPLAY ITSELF (or by earlier commits, visible only
+                // through the manager's origin→current map) have NO
+                // journal op to patch — the original transaction's
+                // statements never moved them, so no catalog op exists.
+                // Without this, the durable schema row keeps the stale
+                // rootpage forever: the merged tree installs fine, but a
+                // REOPEN resolves the old root and strands every row
+                // behind the split (found by the 4-parallel-writers
+                // probe: in-memory perfect, reopen 262 of 1000).
+                .and_then(|()| self.patch_catalog_rootpages())
         };
         let fresh = match self.concurrent.take(fresh_id) {
             Some(t) => t,
@@ -966,6 +1183,36 @@ impl Pager {
                 return Err(page_conflict());
             }
         };
+        if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+            let dirty: Vec<PageId> = fresh
+                .shadows
+                .iter()
+                .filter(|(_, p)| p.lock().dirty)
+                .map(|(id, _)| *id)
+                .collect();
+            let clean: Vec<PageId> = fresh
+                .shadows
+                .iter()
+                .filter(|(_, p)| !p.lock().dirty)
+                .map(|(id, _)| *id)
+                .collect();
+            let detail: Vec<String> = fresh
+                .shadows
+                .iter()
+                .map(|(id, p)| {
+                    let b = p.lock();
+                    format!("p{}:type={:?}:cells={}", id, b.page_type(), b.n_cells())
+                })
+                .collect();
+            eprintln!(
+                "[MERGE-END] dirty={:?} clean={:?} allocated={:?} lineage={:?} shadows=[{}]",
+                dirty,
+                clean,
+                fresh.allocated,
+                fresh.root_lineage,
+                detail.join(", ")
+            );
+        }
         self.refresh_concurrent_gate();
         match replay {
             Ok(()) => {}
@@ -984,9 +1231,20 @@ impl Pager {
             }
         }
 
-        // ---- install the replayed state through the standard path.
-        let installed = self.install_txn_shadows(&fresh);
-        self.splice_txn_freed(&fresh.freed)?;
+        // ---- install the replayed state through the standard path
+        // (under the install gate: same plain-reader exclusion contract
+        // as the fast path above).
+        let installed = {
+            let _ig = self.concurrent.install_gate.write();
+            // Publish the replay's root moves BEFORE the install lands
+            // (same rationale as the fast path: plain readers resolve
+            // roots the moment the pages become visible — the fold must
+            // already be published).
+            self.concurrent.install_lineage(&fresh.root_lineage);
+            let installed = self.install_txn_shadows(&fresh);
+            self.splice_txn_freed(&fresh.freed)?;
+            installed
+        };
         let ticket = self.flush_wal_deferred_concurrent()?;
         let epoch = self.concurrent.stamp_installed(installed.into_iter());
         // The fresh transaction's journal re-recorded the replayed ops
@@ -994,7 +1252,7 @@ impl Pager {
         // keys publishes exactly the rows the merged commit wrote.
         self.concurrent
             .stamp_rows(fresh.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
-        self.concurrent.install_lineage(&fresh.root_lineage);
+        // (install_lineage already ran INSIDE the install gate above.)
 
         // ---- engine bookkeeping fixups: the merged trees may be rooted
         // elsewhere than the transaction's private view (replayed splits).
@@ -1188,6 +1446,69 @@ impl Pager {
         Ok(())
     }
 
+    /// Converge EVERY durable catalog (schema) row to the manager's
+    /// current committed roots — the merge's phase 3 (see
+    /// [`Self::resolve_page_conflict`]).
+    ///
+    /// Root moves enter the durable schema row through two channels: an
+    /// original transaction's own in-shadow schema rewrite (the statement
+    /// epilogue's root sync, journaled as a catalog op — phase 2 patches
+    /// it), or... nothing at all, when the move happened during a MERGE
+    /// REPLAY (the journal never describes the replay's own splits) or
+    /// in an earlier commit whose catalog op predates a later merge's
+    /// re-rooting. This sweep closes every one of those holes at once:
+    /// scan the catalog tree (root 0, inside the armed fresh-transaction
+    /// scope so the reads and rewrites land in the merge's shadows) and
+    /// rewrite each schema row whose rootpage column no longer names its
+    /// tree's current root. Idempotent by construction: a row whose
+    /// rootpage already resolves to itself is left untouched, so a merge
+    /// with no root drift writes nothing.
+    fn patch_catalog_rootpages(&self) -> Result<()> {
+        use crate::storage::btree::Btree;
+        // Pass 1 (read-only): collect the stale rows — (rowid, patched
+        // payload). The scan cannot mutate while iterating.
+        let mut stale: Vec<(i64, Vec<u8>)> = Vec::new();
+        {
+            let mut bt = Btree::new(self, 0, false);
+            bt.scan_table(|rowid, payload| {
+                let Ok(row) = crate::storage::row_codec::decode_row(payload, 5, rowid, None) else {
+                    return true; // not schema-shaped — leave alone
+                };
+                let Some(crate::Value::Integer(rp)) = row.get(3) else {
+                    return true;
+                };
+                let Some(stale_page) = u32::try_from(*rp).ok() else {
+                    return true;
+                };
+                if stale_page == 0 {
+                    return true; // root 0 = the schema tree itself
+                }
+                let internal = stale_page - 1;
+                let origin = self.concurrent.origin_of(internal);
+                let current = self.concurrent.current_root_of(origin);
+                if current != internal {
+                    let mut patched = row.clone();
+                    patched[3] = crate::Value::Integer(current as i64 + 1);
+                    let enc = crate::storage::row_codec::encode_row_aliased(&patched, None);
+                    stale.push((rowid, enc));
+                }
+                true
+            })?;
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+        // Pass 2: apply the rewrites — delete + insert preserving the
+        // catalog rowid (the engine-level `rewrite_schema_row_root`
+        // contract), all through the armed scope's shadows.
+        for (rowid, payload) in &stale {
+            let mut bt = Btree::new(self, 0, false);
+            bt.delete_table(*rowid)?;
+            bt.insert_table(*rowid, payload)?;
+        }
+        Ok(())
+    }
+
     /// Patch a catalog (schema) row's rootpage column to the merged tree's
     /// current root. The stale value is this transaction's private view
     /// root; its canonical origin is resolved through the ORIGINAL
@@ -1237,6 +1558,13 @@ impl Pager {
                 .current_root_of(self.concurrent.origin_of(cur))
         });
         if current != stale_root {
+            if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+                eprintln!(
+                    "[PATCH] catalog row: rootpage {} -> {}",
+                    stale_root + 1,
+                    current + 1
+                );
+            }
             row[3] = crate::Value::Integer(current as i64 + 1);
             let mut patched = op.clone();
             patched.payload = crate::storage::row_codec::encode_row_aliased(&row, None);
@@ -1252,6 +1580,19 @@ impl Pager {
     /// commit persists the freelist splice + header.
     pub fn rollback_concurrent(&self, txn_id: u64) -> Result<()> {
         let _commit = self.concurrent.commit_lock.lock();
+        // Commit window (see commit_concurrent_inner): the freelist splice
+        // + WAL flush below mutate shared state after the take dropped
+        // `active` — same mid-window protection, with the gate refreshed
+        // AFTER the window drops.
+        let out = {
+            let _window = self.concurrent.commit_window();
+            self.rollback_concurrent_body(txn_id)
+        };
+        self.refresh_concurrent_gate();
+        out
+    }
+
+    fn rollback_concurrent_body(&self, txn_id: u64) -> Result<()> {
         let Some(txn) = self.concurrent.take(txn_id) else {
             return Ok(()); // already ended
         };
@@ -1581,12 +1922,24 @@ impl Pager {
     // -----------------------------------------------------------------
 
     /// Fetch `id` from the armed transaction's shadows, materializing a
-    /// private copy of the COMMITTED bytes on first touch. Returns
-    /// [`Error::SnapshotConflict`] when the page's committed stamp moved
-    /// past the transaction's begin epoch (another connection committed
-    /// a write to it after this transaction's snapshot — the old bytes
-    /// cannot be reconstructed without WAL version history, so the
-    /// transaction fails now rather than at COMMIT).
+    /// private copy of the COMMITTED bytes on first touch.
+    ///
+    /// A page whose committed stamp is still within the transaction's
+    /// begin epoch materializes the strict BEGIN-time snapshot bytes.
+    /// A page whose stamp moved past begin (a sibling connection
+    /// committed it after this transaction began — the hot-page case of
+    /// the true-parallel-writer regime) cannot be reconstructed at its
+    /// BEGIN-time version (installs content-replace the live cache in
+    /// place; the WAL keeps only the newest frame per page), so with NO
+    /// savepoint open the fetch materializes the page's NEWEST committed
+    /// bytes and records that stamp as the shadow's base — reads of such
+    /// pages are read-committed, and commit validation anchors on the
+    /// base: the shadow installs directly when the page did not move
+    /// again (the base already contains every sibling commit — no lost
+    /// update is possible) and routes to the row-level MERGE when it
+    /// did. With a savepoint open the strict abort remains: a savepoint
+    /// undo image must be byte-stable, and post-sibling bytes could
+    /// leak a later commit into a ROLLBACK TO SAVEPOINT view.
     pub(crate) fn writer_shadow_fetch(&self, txn_id: u64, id: PageId) -> Result<PageRef> {
         let mut guard = match self.concurrent.get(txn_id) {
             Some(g) => g,
@@ -1615,22 +1968,23 @@ impl Pager {
             }
             return Ok(pr);
         }
-        // Bounds: pages beyond the BEGIN committed count did not exist
-        // in this snapshot.
-        if id >= txn.begin_n_pages {
-            return Err(Error::corruption(format!(
-                "page {} out of range (concurrent snapshot n_pages={})",
-                id, txn.begin_n_pages
-            )));
-        }
-        // Conflict gate: the page's committed version must not be newer
-        // than the transaction's snapshot. PAGE 0 is exempt: its header
-        // region is rewritten by every commit, and its schema rows only
-        // move with root moves — a page-0 reader serves the newest
-        // committed bytes instead of aborting (a read-committed page 0;
-        // every other page keeps the strict BEGIN-time snapshot).
+        // ── LATE-TOUCH GATE ──────────────────────────────────────────
+        // A stamp newer than this transaction's snapshot means a sibling
+        // commit installed the page AFTER our BEGIN (the hot-root case:
+        // with N parallel writers on one table, EVERY writer's root leaf
+        // is a late touch once the first committer lands — the strict
+        // gate used to abort all of them, making the parallel regime a
+        // retry storm). Materialization then serves the newest committed
+        // bytes (see the method doc); with a savepoint open, keep the
+        // strict abort (undo images must be byte-stable).
+        //
+        // PAGE 0 is exempt (its header region is rewritten by every
+        // commit, and its schema rows only move with root moves — a
+        // page-0 reader has always served the newest committed bytes;
+        // a read-committed page 0).
         let stamp = self.concurrent.stamp_of(id);
-        if stamp > txn.begin_epoch && id != 0 {
+        let late = stamp > txn.begin_epoch && id != 0;
+        if late && !txn.savepoints.is_empty() {
             drop(guard);
             return Err(Error::SnapshotConflict(format!(
                 "page {} was committed by another connection after this \
@@ -1638,9 +1992,27 @@ impl Pager {
                 id
             )));
         }
+        // Bounds: pages beyond the BEGIN committed count did not exist
+        // in this snapshot — EXCEPT for a late touch, where a sibling
+        // commit may have grown the tree (splits): the descent through a
+        // newest-bytes internal shadow can reach pages the sibling
+        // created, which exist in the CURRENT committed state. Bound a
+        // late fetch by the current committed page count instead.
+        let begin_n_pages = if late {
+            self.committed_n_pages
+                .load(Ordering::Acquire)
+                .max(txn.begin_n_pages)
+        } else {
+            txn.begin_n_pages
+        };
+        if id >= begin_n_pages {
+            return Err(Error::corruption(format!(
+                "page {} out of range (concurrent snapshot n_pages={})",
+                id, begin_n_pages
+            )));
+        }
         // Materialize the committed bytes WITHOUT the registry guard
         // held (the plain get_page path takes cache/WAL locks).
-        let begin_n_pages = txn.begin_n_pages;
         drop(guard);
 
         // Read the committed bytes: the live path (no scope armed here —
