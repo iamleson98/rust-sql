@@ -6554,46 +6554,12 @@ impl Database {
         // install at COMMIT.
         if result.is_ok() && ctx.roots_changed {
             if conc_owner_txn.is_some() {
-                // Only THIS transaction's root moves (the overlay's DELTA
-                // against its BEGIN-time base) may rewrite schema rows.
-                // Entries cloned from the base can be STALE against
-                // sibling commits — a full-overlay sync would rewrite
-                // their rows backward into this transaction's shadows
-                // (the conflict machinery then has to merge them away)
-                // and dirty page 0's shadow for trees this transaction
-                // never touched, forcing spurious conflicts.
-                let base = {
-                    let conn = conn_identity();
-                    self.cw_registry(conn)
-                        .lock()
-                        .get(&conn)
-                        .map(|e| e.base.clone())
-                };
-                if let Some(base) = base {
-                    let mut delta = (*base).clone();
-                    delta.roots = ctx
-                        .shared
-                        .roots
-                        .iter()
-                        .filter(|(k, v)| base.roots.get(*k) != Some(*v))
-                        .map(|(k, v)| (k.clone(), *v))
-                        .collect();
-                    delta.index_roots = ctx
-                        .shared
-                        .index_roots
-                        .iter()
-                        .filter(|(k, v)| base.index_roots.get(*k) != Some(*v))
-                        .map(|(k, v)| (k.clone(), *v))
-                        .collect();
-                    if let Err(e) = self.sync_schema_roots_from(&std::sync::Arc::new(delta)) {
-                        // Not `?`: an early return would strand an
-                        // IMPLICIT-JOIN transaction (its commit/rollback
-                        // is the epilogue tail below).
-                        result = Err(e);
-                    }
-                } else if let Err(e) = self.sync_schema_roots_from(&ctx.shared) {
-                    result = Err(e);
-                }
+                // NO schema-row rewrite for concurrent owners — the
+                // commit critical section's post-install reconciliation
+                // (`Pager::reconcile_catalog_rootpages`) owns the
+                // durable row (single writer-of-record, serialized by
+                // the commit lock; mid-transaction rewrites made the
+                // row a 517 conflict storm and could regress it).
             } else if let Err(e) = self.sync_schema_roots_inner() {
                 result = Err(e);
             }
@@ -8145,6 +8111,44 @@ impl Database {
         for k in base.max_rowids.keys() {
             if !maps.max_rowids.contains_key(k) && next.max_rowids.remove(k).is_some() {
                 changed = true;
+            }
+        }
+        // ---- the SWEEP: fold every existing root entry through the
+        // committed-root view. The delta merge above only reconciles
+        // entries THIS transaction touched — but a MERGE's replay can
+        // re-root trees the transaction never split (the journal has no
+        // delta for them), leaving the maps holding a SUPERSEDED
+        // generation. Until the next publish of a transaction that DID
+        // touch the tree, every reader resolving that entry descends a
+        // demoted interior — a TRUNCATED tree — and writers routed
+        // through it strand rows off the live tree while their index
+        // entries (resolved through a current entry) land correctly
+        // (index/table divergence — found by the 4-writer reader-
+        // visibility burst). The fold is an identity for current roots
+        // and for unregistered private roots, so it only ever moves a
+        // value FORWARD. Gated by `any_root_moves` (one relaxed load
+        // when no concurrent commit ever re-rooted anything).
+        if self.pager.any_root_moves() {
+            let entries: Vec<(String, u32)> =
+                next.roots.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            for (k, v) in entries {
+                let rv = fixup(v);
+                if rv != v && next.roots.get(&k) != Some(&rv) {
+                    next.roots.insert(k, rv);
+                    changed = true;
+                }
+            }
+            let entries: Vec<(String, u32)> = next
+                .index_roots
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            for (k, v) in entries {
+                let rv = fixup(v);
+                if rv != v && next.index_roots.get(&k) != Some(&rv) {
+                    next.index_roots.insert(k, rv);
+                    changed = true;
+                }
             }
         }
         if changed {

@@ -142,6 +142,20 @@ pub fn integrity_check(
             .get(&name.to_ascii_lowercase())
             .copied()
             .unwrap_or(table.root_page);
+        // Concurrent-regime fold (the executor's `table_root` contract):
+        // both the map entry and the catalog fallback can hold a
+        // SUPERSEDED generation of a re-rooted tree — a merge's replay
+        // re-roots trees without a schema reload, and a map entry the
+        // publishing transaction never touched keeps its older value
+        // until the publish sweep folds it. Walking the stale root
+        // validates a TRUNCATED subtree (the historical "demoted
+        // interior" shape) and reports rows that ARE in the live tree
+        // as missing. Identity for unmoved trees.
+        let root = if root != 0 && pager.any_root_moves() {
+            pager.committed_root_of(root)
+        } else {
+            root
+        };
         let capture = partial_owners.contains(&name.to_ascii_lowercase());
         let (rowids, rows) = check_table_tree(pager, table, root, &mut p, capture);
         table_rowids.push((name.clone(), rowids));
@@ -158,6 +172,11 @@ pub fn integrity_check(
                 .get(&name.to_ascii_lowercase())
                 .copied()
                 .unwrap_or(idx.root_page);
+            let root = if root != 0 && pager.any_root_moves() {
+                pager.committed_root_of(root)
+            } else {
+                root
+            };
             // Find the owning table's rowid set for cross-verification.
             let owner_entry = table_rowids
                 .iter()

@@ -985,10 +985,13 @@ mod driver {
             .unwrap();
         c1.execute("BEGIN CONCURRENT").await.unwrap();
         c2.execute("BEGIN CONCURRENT").await.unwrap();
-        c1.execute("INSERT INTO t (v) VALUES ('first')")
+        // Same EXPLICIT row id — a genuine write-write overlap (auto-id
+        // draws are disjoint under the concurrent reservation and MERGE;
+        // see `concurrent_auto_rowid_hot_page_merges`).
+        c1.execute("INSERT INTO t (id, v) VALUES (10, 'first')")
             .await
             .unwrap();
-        c2.execute("INSERT INTO t (v) VALUES ('second')")
+        c2.execute("INSERT INTO t (id, v) VALUES (10, 'second')")
             .await
             .unwrap();
         c1.execute("COMMIT").await.unwrap();

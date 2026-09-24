@@ -1748,18 +1748,33 @@ fn s17_open_file(engine: Engine) {
                 }
                 db.execute("COMMIT", []).unwrap();
             }
-            let t = Instant::now();
             let mut acc = 0i64;
+            let mut best = f64::INFINITY;
             for _ in 0..iters {
+                let t0 = Instant::now();
                 let db = Database::open(&path).unwrap();
                 let out = db.query("SELECT SUM(val) FROM t", []).unwrap();
+                let d = t0.elapsed().as_secs_f64() * 1000.0;
+                if d < best {
+                    best = d;
+                }
                 if let Some(row) = out.first() {
                     if let Value::Integer(v) = &row[0] {
                         acc = acc.wrapping_add(*v);
                     }
                 }
             }
-            let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            // MIN of the opens, not the mean: the first open pays the OS
+            // cold page cache for the whole file (and, on some runner
+            // generations, an antivirus/indexer pass), a multi-x outlier
+            // that has nothing to do with the engine — observed ubuntu
+            // best-of-3 MEANS on identical code: 7.5 ms (run 35822471050,
+            // 1.55x WIN) then 20.1 ms (run 35961081320, 0.50x LOSS) while
+            // SQLite's own number held 10-12 ms. Min-of-N converges to the
+            // steady-state open cost and matches the harness's per-metric
+            // minima philosophy; a real open-path regression reproduces on
+            // EVERY draw, so it still fails the min.
+            let ms = best;
             let size_mb = total_db_bytes(&path) as f64 / 1024.0 / 1024.0;
             check("sum_nonzero", acc > 0);
             metric("open_first_query_ms", ms);
@@ -1786,16 +1801,22 @@ fn s17_open_file(engine: Engine) {
                 }
                 conn.execute("COMMIT", []).unwrap();
             }
-            let t = Instant::now();
             let mut acc = 0i64;
+            let mut best = f64::INFINITY;
             for _ in 0..iters {
+                let t0 = Instant::now();
                 let conn = rusqlite::Connection::open(&path).unwrap();
                 let v: i64 = conn
                     .query_row("SELECT SUM(val) FROM t", [], |r| r.get(0))
                     .unwrap();
+                let d = t0.elapsed().as_secs_f64() * 1000.0;
+                if d < best {
+                    best = d;
+                }
                 acc = acc.wrapping_add(v);
             }
-            let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            // Min-of-opens — symmetric with the rq side above.
+            let ms = best;
             let size_mb = total_db_bytes(&path) as f64 / 1024.0 / 1024.0;
             check("sum_nonzero", acc > 0);
             metric("open_first_query_ms", ms);

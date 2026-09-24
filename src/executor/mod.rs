@@ -1245,20 +1245,20 @@ impl<'a> ExecContext<'a> {
     /// allocation for mixed-case names.
     pub fn table_root(&self, table: &Table) -> u32 {
         if let Some(&r) = self.root_overrides.get(&table.name) {
-            return r;
+            return self.fold_moved_root(r);
         }
         if let Some(&r) = self.shared.roots.get(&table.name) {
-            return r;
+            return self.fold_moved_root(r);
         }
         // Mixed-case names: probe the lowercase key (the map's canonical
         // form). An all-lowercase miss is FINAL — skip the String copy.
         if table.name.bytes().any(|b| b.is_ascii_uppercase()) {
             let lc = table.name.to_ascii_lowercase();
             if let Some(&r) = self.root_overrides.get(&lc) {
-                return r;
+                return self.fold_moved_root(r);
             }
             if let Some(&r) = self.shared.roots.get(&lc) {
-                return r;
+                return self.fold_moved_root(r);
             }
         }
         // Catalog fallback: the in-memory catalog Arc trails merge
@@ -1284,19 +1284,19 @@ impl<'a> ExecContext<'a> {
     /// zero-allocation exact-name fast path as `table_root`.
     pub fn index_root(&self, index: &crate::schema::Index) -> u32 {
         if let Some(&r) = self.index_roots.get(&index.name) {
-            return r;
+            return self.fold_moved_root(r);
         }
         if let Some(&r) = self.shared.index_roots.get(&index.name) {
-            return r;
+            return self.fold_moved_root(r);
         }
         // Same final-miss rule as `table_root`.
         if index.name.bytes().any(|b| b.is_ascii_uppercase()) {
             let lc = index.name.to_ascii_lowercase();
             if let Some(&r) = self.index_roots.get(&lc) {
-                return r;
+                return self.fold_moved_root(r);
             }
             if let Some(&r) = self.shared.index_roots.get(&lc) {
-                return r;
+                return self.fold_moved_root(r);
             }
         }
         // Catalog fallback — same concurrent-regime fold as `table_root`.
@@ -1305,6 +1305,28 @@ impl<'a> ExecContext<'a> {
             return self.pager.committed_root_of(r);
         }
         r
+    }
+
+    /// Fold a map/override root through the concurrent manager's
+    /// committed-root view. The maps can hold a SUPERSEDED generation of
+    /// a re-rooted tree (a merge's replay re-roots trees the publishing
+    /// transaction never split — no delta entry exists for them, so the
+    /// publish alone leaves the older value in place). Descending that
+    /// stale interior serves its subtree as the whole table — a TRUNCATED
+    /// tree — and writes routed through it strand rows off the live
+    /// tree while the index (resolved through its own, current entry)
+    /// keeps the entries (index/table divergence, both flavors). The
+    /// fold is an identity for current roots and for UNREGISTERED
+    /// private roots (this statement's / transaction's own splits —
+    /// they only register at commit), so the fast paths are unchanged.
+    /// One relaxed atomic load when no concurrent commit ever moved a
+    /// root.
+    fn fold_moved_root(&self, root: u32) -> u32 {
+        if root != 0 && self.pager.any_root_moves() {
+            self.pager.committed_root_of(root)
+        } else {
+            root
+        }
     }
 
     /// Update the index root override (called after an index B+tree split).
@@ -18761,6 +18783,17 @@ pub fn fast_insert_literal_rows(
             table.columns.iter().map(|c| c.name.clone()).collect()
         };
     let mut inserted = 0i64;
+    // Statement-constant gates, hoisted out of the row loop: the trigger
+    // registry and the FK enforcement flag cannot change mid-statement,
+    // and the per-row catalog lookups (two `triggers_on_table` hash
+    // probes per row) were measurable on the multi-VALUES bulk path
+    // (~20ns/row on the 100-tuple INSERT shape).
+    let has_insert_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        table,
+        &crate::sql::ast::TriggerEvent::Insert,
+    );
+    let fk_enforced = !table.foreign_keys.is_empty() && ctx.pager.foreign_keys_enabled();
 
     for row in rows {
         // Reset the row buffer without releasing capacity.
@@ -18835,14 +18868,12 @@ pub fn fast_insert_literal_rows(
         }
 
         enforce_row_constraints(table, &full_row, &col_names, &ctx.params, &ctx.named_params)?;
-        enforce_child_fks(ctx, table, &full_row)?;
+        if fk_enforced {
+            enforce_child_fks(ctx, table, &full_row)?;
+        }
 
         // BEFORE INSERT triggers.
-        if crate::executor::triggers::has_triggers_for(
-            ctx,
-            table,
-            &crate::sql::ast::TriggerEvent::Insert,
-        ) {
+        if has_insert_triggers {
             crate::executor::triggers::fire_triggers(
                 ctx,
                 table,
@@ -18892,13 +18923,7 @@ pub fn fast_insert_literal_rows(
             inserted += 1;
         }
         // AFTER INSERT triggers.
-        if ok
-            && crate::executor::triggers::has_triggers_for(
-                ctx,
-                table,
-                &crate::sql::ast::TriggerEvent::Insert,
-            )
-        {
+        if ok && has_insert_triggers {
             crate::executor::triggers::fire_triggers(
                 ctx,
                 table,

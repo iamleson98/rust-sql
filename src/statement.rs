@@ -1021,13 +1021,18 @@ impl<'a> Statement<'a> {
         // an outer scope on this thread already covers this Database.
         let _preupdate_guard = db.preupdate_scope();
         let out = f(&mut ctx);
-        // CONCURRENT owner with root moves: the schema-row rewrites must
-        // land in the transaction's page shadows (the scope is still
-        // armed HERE) — they install at COMMIT. Sourced from ctx.shared
-        // (the overlay this step resolved).
-        if _wsg.is_some() && ctx.roots_changed {
-            let _ = db.sync_schema_roots_from(&ctx.shared);
-        }
+        // CONCURRENT owner: NO schema-row rewrite here. The durable
+        // schema row is a single HOT row under the concurrent regime
+        // (every root-moving transaction and every merge wants it), and
+        // mid-transaction rewrites — through the shadows, journaled as
+        // (tree 0, row 1) ops — turned it into a first-committer-wins
+        // conflict storm (517 on COMMIT) with regressions whenever a
+        // stale overlay entry slipped through the filters (the
+        // 4-parallel-writers reopen-stranding: live 1000, reopen 262).
+        // The commit critical section's post-install reconciliation
+        // (`Pager::reconcile_catalog_rootpages`) is the row's single
+        // writer-of-record: serialized by the commit lock, sourced from
+        // the manager's published root view, idempotent.
         // sqlite3_last_insert_rowid / sqlite3_changes bookkeeping: DML
         // through the streaming-statement path must update the Database
         // and the change counters the same way Database::execute does.

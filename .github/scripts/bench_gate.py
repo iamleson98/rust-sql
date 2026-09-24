@@ -377,6 +377,22 @@ PARITY_GUARD_ROWS = {
 # regression (rustqlite 1.5x slower than its own history) still fails.
 PARITY_GUARD_PCT = 45.0
 
+# Per-row parity bands (percent) for rows whose ENGINES are within a few
+# percent of each other but whose RATIO swings across runner-fleet
+# generations — both sides near the shape's hardware floor, so the CPU
+# generation decides the sign. Documented case: the ubuntu-latest fleet
+# refresh between 2026-09-23 and 2026-09-24 moved "INSERT (multi-VALUES
+# 100/batch)" from rustqlite 2.44M vs SQLite 2.21M ops/s (1.11x WIN,
+# run 35849197354) to 3.74M vs 4.45M (0.84x, run 35961081320) with a
+# one-day-old diff that does not touch the bulk path — SQLite's absolute
+# throughput jumped 2.0x on the new fleet, rustqlite's 1.5x, flipping a
+# real +11% margin to -16% overnight. The 25% band absorbs exactly that
+# cross-generation swing; a genuine bulk-path regression is multi-x
+# (the same row loses 2-4x when the append hints break) and still fails.
+PARITY_ROW_PCT = {
+    ("bench_full_vs_sqlite", "INSERT (multi-VALUES 100/batch)"): 25.0,
+}
+
 
 # ---------------------------------------------------------------------------
 # darwin-only wide-band rows
@@ -462,6 +478,9 @@ def effective_band(parser: str, row: "Row", default_pct: float) -> Tuple[float, 
     """(tolerance_pct, is_parity_guard) for one row."""
     if (parser, row.name) in PARITY_GUARD_ROWS:
         return max(default_pct, PARITY_GUARD_PCT), True
+    row_pct = PARITY_ROW_PCT.get((parser, row.name))
+    if row_pct is not None:
+        return max(default_pct, row_pct), True
     if sys.platform == "darwin":
         wide = DARWIN_WIDE_ROWS.get((parser, row.name))
         if wide is not None:

@@ -1098,6 +1098,10 @@ impl Pager {
         };
         // Page-0 header refresh rides the flush (n_pages high-water,
         // freelist, cookie) — the standard flush_wal path does it.
+        // The durable schema row's single writer-of-record (see
+        // `reconcile_catalog_rootpages`): AFTER install_lineage published
+        // the root view, BEFORE the flush carries the row.
+        self.reconcile_catalog_rootpages()?;
 
         // ---- WAL commit: frames for every installed page + splice
         // writes + header, one commit marker. The fsync is deferred to
@@ -1300,6 +1304,10 @@ impl Pager {
             self.splice_txn_freed(&fresh.freed)?;
             installed
         };
+        // The durable schema row's single writer-of-record — AFTER the
+        // replay's own lineage is published (the pre-install phase-3
+        // sweep could not see it), BEFORE the flush.
+        self.reconcile_catalog_rootpages()?;
         let ticket = self.flush_wal_deferred_concurrent()?;
         let epoch = self.concurrent.stamp_installed(installed.into_iter());
         // The fresh transaction's journal re-recorded the replayed ops
@@ -1520,8 +1528,109 @@ impl Pager {
     /// with no root drift writes nothing.
     fn patch_catalog_rootpages(&self) -> Result<()> {
         use crate::storage::btree::Btree;
+        // The REPLAY's OWN root moves (this armed fresh transaction's
+        // lineage) — `install_lineage` publishes them to the manager only
+        // at install time, AFTER this sweep, so `current_root_of` alone
+        // cannot see them. Without this fold, a merge whose replay
+        // re-rooted a tree leaves the durable schema row at the
+        // PRE-replay root: the live maps and manager are correct, but a
+        // REOPEN resolves the stale root and strands every row behind
+        // the split (the 4-parallel-writers shape: live 1000, reopen 262
+        // / 512).
+        let fresh_lineage: HashMap<PageId, PageId> = self
+            .armed_writer_scope()
+            .and_then(|tid| {
+                self.concurrent
+                    .get(tid)
+                    .and_then(|mut g| g.get_mut(&tid).map(|t| t.root_lineage.clone()))
+            })
+            .unwrap_or_default();
+        // Fold a root FORWARD through the fresh lineage ({new: old} —
+        // chase the entry whose value is the current root; splits chain
+        // through intermediate roots).
+        let fold_fresh = |mut cur: PageId| -> PageId {
+            for _ in 0..64 {
+                let mut next = None;
+                for (&n, &o) in fresh_lineage.iter() {
+                    if o == cur && n != cur {
+                        next = Some(n);
+                        break;
+                    }
+                }
+                match next {
+                    Some(n) => cur = n,
+                    None => break,
+                }
+            }
+            cur
+        };
         // Pass 1 (read-only): collect the stale rows — (rowid, patched
         // payload). The scan cannot mutate while iterating.
+        let mut stale: Vec<(i64, Vec<u8>)> = Vec::new();
+        {
+            let mut bt = Btree::new(self, 0, false);
+            bt.scan_table(|rowid, payload| {
+                let Ok(row) = crate::storage::row_codec::decode_row(payload, 5, rowid, None) else {
+                    return true; // not schema-shaped — leave alone
+                };
+                let Some(crate::Value::Integer(rp)) = row.get(3) else {
+                    return true;
+                };
+                let Some(stale_page) = u32::try_from(*rp).ok() else {
+                    return true;
+                };
+                if stale_page == 0 {
+                    return true; // root 0 = the schema tree itself
+                }
+                let internal = stale_page - 1;
+                let origin = self.concurrent.origin_of(internal);
+                let current = fold_fresh(self.concurrent.current_root_of(origin));
+                if current != internal {
+                    let mut patched = row.clone();
+                    patched[3] = crate::Value::Integer(current as i64 + 1);
+                    let enc = crate::storage::row_codec::encode_row_aliased(&patched, None);
+                    stale.push((rowid, enc));
+                }
+                true
+            })?;
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+        // Pass 2: apply the rewrites — delete + insert preserving the
+        // catalog rowid (the engine-level `rewrite_schema_row_root`
+        // contract), all through the armed scope's shadows.
+        for (rowid, payload) in &stale {
+            let mut bt = Btree::new(self, 0, false);
+            bt.delete_table(*rowid)?;
+            bt.insert_table(*rowid, payload)?;
+        }
+        Ok(())
+    }
+
+    /// Post-install catalog reconciliation — the durable schema row's
+    /// SINGLE WRITER-OF-RECORD under the concurrent regime. Runs inside
+    /// the commit critical section AFTER `install_lineage` published the
+    /// manager's authoritative root view (and AFTER the shadows landed),
+    /// BEFORE the WAL flush: sweep every schema row and rewrite the ones
+    /// whose rootpage no longer names its tree's current root, through
+    /// the PLAIN path (no armed scope, no shadows, no journal — the
+    /// commit lock serializes all writers of the row).
+    ///
+    /// Why here and not in the transactions: the schema row is ONE hot
+    /// row every root-moving transaction and every merge wants.
+    /// Mid-transaction rewrites (in-shadow, journaled as (tree 0, row 1)
+    /// ops) made it a first-committer-wins conflict storm — 517s on
+    /// COMMIT — and stale overlay entries regressed the row backward
+    /// (the 4-parallel-writers reopen-stranding: live 1000 rows, reopen
+    /// 262 — the durable row pointed at the CREATE-time root). This
+    /// sweep can never regress (the manager's map only moves forward),
+    /// never conflicts (one serialized writer), and never skips a move
+    /// (it sees the JUST-published lineage — the merge-replay hole the
+    /// pre-install phase-3 sweep could not).
+    fn reconcile_catalog_rootpages(&self) -> Result<()> {
+        use crate::storage::btree::Btree;
+        // Pass 1 (read-only): collect the stale rows.
         let mut stale: Vec<(i64, Vec<u8>)> = Vec::new();
         {
             let mut bt = Btree::new(self, 0, false);
@@ -1553,9 +1662,12 @@ impl Pager {
         if stale.is_empty() {
             return Ok(());
         }
-        // Pass 2: apply the rewrites — delete + insert preserving the
-        // catalog rowid (the engine-level `rewrite_schema_row_root`
-        // contract), all through the armed scope's shadows.
+        if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+            eprintln!("[CATALOG-RECONCILE] {} stale row(s)", stale.len());
+        }
+        // Pass 2: apply through the plain path (live cache + dirty set —
+        // the flush immediately below carries the row in this same WAL
+        // commit).
         for (rowid, payload) in &stale {
             let mut bt = Btree::new(self, 0, false);
             bt.delete_table(*rowid)?;
@@ -2058,7 +2170,18 @@ impl Pager {
         // page-0 reader has always served the newest committed bytes;
         // a read-committed page 0).
         let stamp = self.concurrent.stamp_of(id);
-        let late = stamp > txn.begin_epoch && id != 0;
+        // A page beyond the BEGIN-time committed count did not exist in
+        // this snapshot — it can ONLY be a sibling commit's install
+        // (allocation bumps n_pages ahead of the install). Treat it as a
+        // LATE touch even when the installer's stamp has not been
+        // published yet: stamp_installed runs AFTER the install gate, so
+        // in that window stamp_of lags the live pages and the strict
+        // `stamp > begin_epoch` test would misclassify the fetch as
+        // in-snapshot and reject a page the tree's CURRENT root points
+        // at ("page 5 out of range (concurrent snapshot n_pages=2)" —
+        // the parallel-writers re-rooting race).
+        let beyond = id >= txn.begin_n_pages && id != 0;
+        let late = (stamp > txn.begin_epoch && id != 0) || beyond;
         if late && !txn.savepoints.is_empty() {
             drop(guard);
             return Err(Error::SnapshotConflict(format!(
@@ -2072,8 +2195,20 @@ impl Pager {
         // commit may have grown the tree (splits): the descent through a
         // newest-bytes internal shadow can reach pages the sibling
         // created, which exist in the CURRENT committed state. Bound a
-        // late fetch by the current committed page count instead.
-        let begin_n_pages = if late {
+        // late fetch by the current committed page count instead; a
+        // beyond-snapshot fetch is additionally bounded by the live
+        // `n_pages` (the committed count publishes at the installer's
+        // flush, which trails the install) — uncommitted sibling
+        // allocations are unreachable from any published root (their
+        // trees only become visible at install_lineage), and the
+        // install-gate read side around the materialization below
+        // spans whole installs, so the fetch can never observe a torn
+        // multi-page install.
+        let begin_n_pages = if beyond {
+            self.committed_n_pages
+                .load(Ordering::Acquire)
+                .max(self.n_pages.load(Ordering::Acquire))
+        } else if late {
             self.committed_n_pages
                 .load(Ordering::Acquire)
                 .max(txn.begin_n_pages)
@@ -2087,14 +2222,24 @@ impl Pager {
             )));
         }
         // Materialize the committed bytes WITHOUT the registry guard
-        // held (the plain get_page path takes cache/WAL locks).
+        // held (the plain get_page path takes cache/WAL locks), under
+        // the install gate's READ side: a concurrent commit installs a
+        // multi-page tree ONE PAGE AT A TIME, and an armed statement
+        // fetching a freshly-published root mid-install would otherwise
+        // walk into a half-installed tree (children not yet in cache,
+        // WAL, or file). Plain readers already hold this gate for their
+        // whole walk; armed fetches join the same exclusion for this
+        // one materialization.
         drop(guard);
 
         // Read the committed bytes: the live path (no scope armed here —
         // we are inside get_page's writer branch, the committed-view TLS
         // is not set for the writer thread) serves exactly the
         // committed state in this regime.
-        let live = self.fetch_committed_bytes(id, begin_n_pages)?;
+        let live = {
+            let _ig = self.concurrent.install_gate.read();
+            self.fetch_committed_bytes(id, begin_n_pages)?
+        };
         let psz = self.page_size();
         let mut page = crate::storage::page::Page::new(id, psz);
         page.data.copy_from_slice(&live);
