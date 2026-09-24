@@ -1094,19 +1094,25 @@ impl Pager {
             self.concurrent.install_lineage(&txn.root_lineage);
             let installed = self.install_txn_shadows(&txn);
             self.splice_txn_freed(&freed_now)?;
-            installed
+            // The durable schema row's single writer-of-record (see
+            // `reconcile_catalog_rootpages`): AFTER install_lineage
+            // published the root view, BEFORE the flush carries the
+            // row. The gate now spans the WHOLE commit critical
+            // section (install + splice + reconcile + WAL append):
+            // the tail used to run OUTSIDE the gate, and its
+            // get_page/cache traffic could interleave with owner
+            // statements and plain-reader walks in a second lock-order
+            // cycle ([tail: cache/WAL lock -> page mutex] x [statement:
+            // page mutex -> cache.read]) — the limit-suite soak pinned
+            // the hang (4 writers + 2 spinning readers, 2-core runners).
+            // The fsync stays OUTSIDE (the deferred group_sync ticket),
+            // so the gated window is only the in-memory install + the
+            // WAL frame append.
+            self.reconcile_catalog_rootpages()?;
+            let ticket = self.flush_wal_deferred_concurrent()?;
+            (installed, ticket)
         };
-        // Page-0 header refresh rides the flush (n_pages high-water,
-        // freelist, cookie) — the standard flush_wal path does it.
-        // The durable schema row's single writer-of-record (see
-        // `reconcile_catalog_rootpages`): AFTER install_lineage published
-        // the root view, BEFORE the flush carries the row.
-        self.reconcile_catalog_rootpages()?;
-
-        // ---- WAL commit: frames for every installed page + splice
-        // writes + header, one commit marker. The fsync is deferred to
-        // group_sync (ticket).
-        let ticket = self.flush_wal_deferred_concurrent()?;
+        let (installed, ticket) = installed;
 
         // ---- publish version stamps for the installed pages + rows.
         let epoch = self.concurrent.stamp_installed(installed.into_iter());
@@ -1131,32 +1137,76 @@ impl Pager {
     fn install_txn_shadows(&self, txn: &ConcurrentTxn) -> Vec<PageId> {
         let psz = self.page_size() as usize;
         let mut installed: Vec<PageId> = Vec::with_capacity(txn.shadows.len());
-        let mut cache = self.cache.write();
-        for (id, shadow) in txn.shadows.iter() {
-            let dirty = shadow.lock().dirty;
-            if !dirty {
-                continue; // clean copy — live bytes already match
-            }
-            installed.push(*id);
-            match cache.get(*id).cloned() {
-                Some(live) => {
-                    let mut dst = live.lock();
-                    let src = shadow.lock();
-                    dst.data.copy_from_slice(&src.data);
-                    dst.dirty = true;
+        // TWO-PHASE INSTALL — the cache write guard is never held across
+        // a page-mutex acquisition. The previous single-pass loop held
+        // `cache.write()` for the whole loop and then took each live
+        // page's mutex; an owner statement running mid-descent held a
+        // LIVE page's mutex and blocked on `cache.read()` (blocked by
+        // the install's write guard) — a lock-order cycle
+        // [owner: page-mutex -> cache.read] x [install: cache.write ->
+        // page-mutex] that deadlocked the whole regime (the limit-suite
+        // soak pinned it: 4 writers + 2 spinning readers, ~30% of
+        // full-harness runs on 2 cores).
+        //
+        // Phase A (cache WRITE, no live page mutexes): snapshot the live
+        // PageRef for every dirty shadow id. The txn is already TAKEN
+        // (removed from the active registry), so its shadow mutexes are
+        // uncontested.
+        let mut live_pages: Vec<(PageId, crate::storage::pager::PageRef)> = Vec::new();
+        let mut fresh: Vec<PageId> = Vec::new();
+        {
+            let cache = self.cache.write();
+            for (id, shadow) in txn.shadows.iter() {
+                if !shadow.lock().dirty {
+                    continue; // clean copy — live bytes already match
                 }
-                None => {
-                    let src = shadow.lock();
-                    let mut page = crate::storage::page::Page::new(*id, psz as u32);
-                    page.data.copy_from_slice(&src.data);
-                    page.dirty = true;
-                    drop(src);
-                    let pr: PageRef = Arc::new(Mutex::new(page));
-                    self.maybe_evict_locked(&mut cache);
-                    cache.insert(*id, pr);
-                    self.lru.lock().push_back(*id);
+                installed.push(*id);
+                match cache.get(*id).cloned() {
+                    Some(pr) => live_pages.push((*id, pr)),
+                    None => fresh.push(*id),
                 }
             }
+        }
+        // Phase B (NO cache guard): content-replace each live page under
+        // its own mutex (atomic per page — plain readers see either the
+        // pre- or post-install bytes of a page, and the install gate's
+        // WRITE side already excludes reader walks and owner fetches for
+        // the whole window, so no other thread can be inside get_page's
+        // insert/evict path here).
+        for (id, live) in &live_pages {
+            let mut dst = live.lock();
+            let src = txn
+                .shadows
+                .get(id)
+                .map(|s| s.lock())
+                .expect("shadow present in phase A");
+            dst.data.copy_from_slice(&src.data);
+            dst.dirty = true;
+        }
+        // Phase C (cache WRITE): publish pages that had no live presence
+        // (fresh allocations the cache never saw).
+        if !fresh.is_empty() {
+            let mut cache = self.cache.write();
+            for id in &fresh {
+                let src = txn
+                    .shadows
+                    .get(id)
+                    .map(|s| s.lock())
+                    .expect("shadow present in phase A");
+                let mut page = crate::storage::page::Page::new(*id, psz as u32);
+                page.data.copy_from_slice(&src.data);
+                page.dirty = true;
+                drop(src);
+                let pr: PageRef = Arc::new(Mutex::new(page));
+                self.maybe_evict_locked(&mut cache);
+                cache.insert(*id, pr);
+                self.lru.lock().push_back(*id);
+            }
+        }
+        for (id, _) in &live_pages {
+            self.note_dirty(*id);
+        }
+        for id in &fresh {
             self.note_dirty(*id);
         }
         if std::env::var_os("RSQL_DBG_FLUSH").is_some() && !installed.is_empty() {
@@ -1293,7 +1343,7 @@ impl Pager {
         // ---- install the replayed state through the standard path
         // (under the install gate: same plain-reader exclusion contract
         // as the fast path above).
-        let installed = {
+        let (installed, ticket) = {
             let _ig = self.concurrent.install_gate.write();
             // Publish the replay's root moves BEFORE the install lands
             // (same rationale as the fast path: plain readers resolve
@@ -1302,13 +1352,16 @@ impl Pager {
             self.concurrent.install_lineage(&fresh.root_lineage);
             let installed = self.install_txn_shadows(&fresh);
             self.splice_txn_freed(&fresh.freed)?;
-            installed
+            // The durable schema row's single writer-of-record — AFTER
+            // the replay's own lineage is published (the pre-install
+            // phase-3 sweep could not see it), BEFORE the flush. The
+            // gate spans the whole critical section (fast-path
+            // rationale: the tail's get_page/cache traffic must not
+            // interleave with owner statements / reader walks).
+            self.reconcile_catalog_rootpages()?;
+            let ticket = self.flush_wal_deferred_concurrent()?;
+            (installed, ticket)
         };
-        // The durable schema row's single writer-of-record — AFTER the
-        // replay's own lineage is published (the pre-install phase-3
-        // sweep could not see it), BEFORE the flush.
-        self.reconcile_catalog_rootpages()?;
-        let ticket = self.flush_wal_deferred_concurrent()?;
         let epoch = self.concurrent.stamp_installed(installed.into_iter());
         // The fresh transaction's journal re-recorded the replayed ops
         // (with keys canonicalized against ITS lineage) — stamping those
