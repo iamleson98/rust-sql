@@ -4169,6 +4169,21 @@ impl Database {
     /// when the source has an object shape the copier declines (caller
     /// falls back to the row-level path).
     fn build_compact_image_pages(&self) -> Result<Option<Vec<u8>>> {
+        // Eligibility: the page-level copy preserves each leaf's bytes
+        // (it can prune emptied leaves and drop freelist pages, but it
+        // cannot re-flow rows). Mass-delete shapes with HOLLOW survivor
+        // leaves (rebuilt at a low fill fraction) decline here and take
+        // the row-level rebuild below, which re-inserts every row into
+        // fresh dense trees. O(1) per leaf — see
+        // trees_eligible_for_page_copy. (The schema tree is excluded:
+        // this path re-inserts the schema rows into a fresh tree, so it
+        // re-flows them regardless.)
+        {
+            let roots = self.object_roots_from_schema()?;
+            if !crate::storage::vacuum::trees_eligible_for_page_copy(&self.pager, &roots, true)? {
+                return Ok(None);
+            }
+        }
         // 1. Read the schema rows (order + rowids preserved).
         let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
         {
@@ -7307,6 +7322,16 @@ impl Database {
     /// Cache statistics.
     pub fn cache_stats(&self) -> (usize, usize) {
         (self.pager.cache_size(), self.pager.cache_capacity())
+    }
+
+    /// Page-cache hit accounting since open: `(hits, misses)` — the
+    /// counters behind the live hit rate `hits / (hits + misses)`.
+    /// A miss is one file-read (or WAL-frame read) page fetch; a hit is
+    /// a fetch served straight from the cache. The stress suites sample
+    /// these around warm/cold scans to pin the cache's behavior under
+    /// limit-scale workloads (a warm re-scan must be ~all hits).
+    pub fn cache_hit_stats(&self) -> (u64, u64) {
+        (self.pager.cache_hits(), self.pager.cache_misses())
     }
 
     /// Path to the database file.

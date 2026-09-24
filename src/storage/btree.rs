@@ -708,7 +708,7 @@ struct IndexCellView<'a> {
 /// Byte length of an INDEX leaf cell at `buf` (varint rowid + varint key
 /// length + key, or + local + be_u32 chain for overflow cells).
 /// Non-allocating; returns None on truncation.
-fn index_leaf_cell_size(buf: &[u8], page_size: u32) -> Option<usize> {
+pub(crate) fn index_leaf_cell_size(buf: &[u8], page_size: u32) -> Option<usize> {
     let (_, n1) = varint::decode_signed(buf)?;
     let rest = &buf[n1..];
     let (klen, n2) = varint::decode(rest)?;
@@ -728,6 +728,25 @@ fn table_leaf_cell_size(buf: &[u8]) -> Option<usize> {
     let rest = &buf[n1..];
     let (plen, n2) = varint::decode(rest)?;
     Some(n1 + n2 + plen as usize)
+}
+
+/// Byte length of a TABLE leaf cell at `buf`, OVERFLOW-AWARE: spilled
+/// cells store only the local prefix + a 4-byte chain pointer, so the
+/// in-page footprint is `n1 + n2 + local + 4`, not `n1 + n2 + plen`
+/// ([`table_leaf_cell_size`] overestimates those and is only safe where
+/// callers bail on `size > page_size`). Used by the leaf-compaction
+/// path, which must sum EXACT in-page bytes.
+pub(crate) fn table_leaf_cell_size_paged(buf: &[u8], page_size: u32) -> Option<usize> {
+    let (_, n1) = varint::decode_signed(buf)?;
+    let rest = &buf[n1..];
+    let (plen, n2) = varint::decode(rest)?;
+    let plen = plen as usize;
+    let local = overflow_local_len_for(plen, page_size as usize);
+    if local == plen {
+        Some(n1 + n2 + plen)
+    } else {
+        Some(n1 + n2 + local + 4)
+    }
 }
 
 fn decode_index_cell(buf: &[u8], interior: bool, page_size: u32) -> Option<IndexCellView<'_>> {
@@ -3826,19 +3845,29 @@ impl<'a> Btree<'a> {
         {
             let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
             let psz = borrowed.page_size();
-            if let Some(v) = decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
-                .filter(|v| v.overflow == 0)
-            {
-                // Append requires (key, rowid) strictly after the last
-                // entry — index pages are sorted by (key, rowid).
-                // (Overflow last key: prefix-compare is inconclusive —
-                // decline the append fast path, take the general insert.)
-                if !(v.key < key || (v.key == key && v.rowid < rowid)) {
-                    // Out-of-order against this leaf's own last cell:
-                    // the leaf (and the pin) is untouched — the caller
-                    // keeps the pin and skips the re-pin walk.
-                    return Ok(AppendTry::OutOfOrder);
+            match decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz) {
+                Some(v) if v.overflow == 0 => {
+                    // Append requires (key, rowid) strictly after the last
+                    // entry — index pages are sorted by (key, rowid).
+                    if !(v.key < key || (v.key == key && v.rowid < rowid)) {
+                        // Out-of-order against this leaf's own last cell:
+                        // the leaf (and the pin) is untouched — the caller
+                        // keeps the pin and skips the re-pin walk.
+                        return Ok(AppendTry::OutOfOrder);
+                    }
                 }
+                // Overflow last key: the local prefix alone is an
+                // inconclusive bound (the full key reassembly costs a
+                // chain walk) — DECLINE the fast path and take the
+                // general insert. The previous code fell through to the
+                // append here with NO ordering check at all: an
+                // out-of-key-order entry whose rowid merely exceeded the
+                // spilled cell's (the limit-stress spilled-index shape —
+                // big(9000)-style keys then 'pad') was appended AFTER
+                // the spilled key, leaving the leaf unsorted (binary
+                // searches then misroute: deletes missed their entries
+                // and left stale index rows).
+                _ => return Ok(AppendTry::Declined),
             }
         }
 
@@ -4511,8 +4540,16 @@ impl<'a> Btree<'a> {
             // Leaf: insert directly.
             let cell_size = cell.encoded_size();
             let free = page.lock().free_space();
-            // Need space for the cell + a 2-byte pointer.
+            // Need space for the cell + a 2-byte pointer. When the GAP
+            // is too small but the page carries dead cell bytes (delete
+            // churn — see compact_leaf_if_fragmented), reclaim them in
+            // place instead of splitting: churned workloads re-fill
+            // their old pages rather than growing the file.
             if free < cell_size as u32 + 2 {
+                if self.compact_leaf_if_fragmented(page_id, cell_size + 2)? {
+                    self.insert_cell_into_ref(page_id, &page, &cell)?;
+                    return Ok(InsertResult::Done);
+                }
                 drop(page);
                 return self.split_leaf(page_id, cell);
             }
@@ -5622,6 +5659,143 @@ impl<'a> Btree<'a> {
     }
 
     /// Split a leaf page. Returns the new page ID and the separator info.
+    ///
+    /// DELETE-CHURN COMPACTION (the pre-split reclaim): deletes drop only
+    /// the cell POINTER — the cell bytes stay in the content area as dead
+    /// space until a split's rebuild compacts them, and `free_space()`
+    /// (the gap between the pointer array and the content frontier) does
+    /// NOT count them. A leaf that is 75% dead therefore reports almost
+    /// no free space, and a re-inserting workload SPLITS it instead of
+    /// reusing the dead bytes — the classic churn bloat (measured:
+    /// delete-75% + re-insert the same shape grew a 60k-row file 1.67x,
+    /// 683 → 1140 pages, with the logical content unchanged).
+    ///
+    /// This is the SQLite balancer's answer applied at leaf granularity:
+    /// when a leaf cannot fit a cell in its GAP but the cell WOULD fit
+    /// after reclaiming the dead bytes, compact the page in place (one
+    /// scratch copy + rewrite, no new page, no parent churn) and let the
+    /// insert proceed. Splits now happen only for genuinely full pages.
+    ///
+    /// Returns `Ok(true)` when the page was compacted AND now has room
+    /// for `need` bytes (cell + pointer) — the caller inserts directly.
+    /// `Ok(false)` = not a leaf / packed / wouldn't fit even compacted /
+    /// malformed cell — the caller splits as before.
+    fn compact_leaf_if_fragmented(&mut self, page_id: PageId, need: usize) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let psz;
+        let pt;
+        let n;
+        let content_start;
+        let is_packed;
+        let live_bytes;
+        {
+            let b = page.lock();
+            pt = b.page_type()?;
+            if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) {
+                return Ok(false);
+            }
+            psz = b.page_size() as usize;
+            n = b.n_cells() as usize;
+            content_start = b.cell_content_start() as usize;
+            if n == 0 {
+                // Nothing to compact — an empty leaf's whole content area
+                // is already gap (free_space is honest). Splitting (or the
+                // caller's insert) proceeds normally.
+                return Ok(false);
+            }
+            // Exact in-page byte sum, overflow-aware.
+            let mut total = 0usize;
+            let mut packed_ok = true;
+            for i in 0..n as u16 {
+                let p = b.cell_pointer(i) as usize;
+                let size = match pt {
+                    PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz as u32),
+                    _ => table_leaf_cell_size_paged(&b.data[p..], psz as u32),
+                };
+                match size {
+                    Some(s) if s > 0 && p + s <= psz => total += s,
+                    Some(_) => {
+                        // Oversized/truncated view (spilled table cell seen
+                        // by the non-paged helper, or corruption): let the
+                        // split path's own validation handle it.
+                        packed_ok = false;
+                        break;
+                    }
+                    None => {
+                        packed_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !packed_ok {
+                return Ok(false);
+            }
+            live_bytes = total;
+            is_packed = live_bytes + content_start == psz;
+        }
+        if is_packed {
+            return Ok(false); // no dead space to reclaim
+        }
+        // Would the cell fit after compaction? Layout after rewrite:
+        //   [header][ptr array (n+1) * 2][gap][cells ... live_bytes]
+        let header_offset = if page_id == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_end = header_offset + PAGE_HEADER_SIZE as usize + (n + 1) * 2;
+        let free_after = psz.saturating_sub(ptr_array_end + live_bytes);
+        if free_after < need {
+            return Ok(false); // genuinely full — split is the answer
+        }
+        // ---- Compact: scratch-copy every live cell (pointer order), then
+        //      rewrite the content area contiguously from the page tail
+        //      downward and rebuild the pointer array. O(page) work, one
+        //      scratch allocation, no page-count change, no parent churn.
+        //      The scratch copy is mandatory: writing cells to the tail can
+        //      overlap the source region of cells not yet copied.
+        let mut scratch: Vec<u8> = Vec::with_capacity(live_bytes);
+        let mut sizes: Vec<usize> = Vec::with_capacity(n);
+        {
+            let b = page.lock();
+            for i in 0..n as u16 {
+                let p = b.cell_pointer(i) as usize;
+                let size = match pt {
+                    PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz as u32),
+                    _ => table_leaf_cell_size_paged(&b.data[p..], psz as u32),
+                }
+                .unwrap_or(0);
+                scratch.extend_from_slice(&b.data[p..p + size]);
+                sizes.push(size);
+            }
+        }
+        debug_assert_eq!(scratch.len(), live_bytes);
+        {
+            let mut b = page.lock();
+            let mut src = scratch.len();
+            let mut write_off = psz;
+            for i in (0..n).rev() {
+                let size = sizes[i];
+                src -= size;
+                write_off -= size;
+                b.data[write_off..write_off + size].copy_from_slice(&scratch[src..src + size]);
+                // Pointer for cell i (big-endian u16 offset).
+                let dst = header_offset + PAGE_HEADER_SIZE as usize + i * 2;
+                b.data[dst..dst + 2].copy_from_slice(&(write_off as u16).to_be_bytes());
+            }
+            debug_assert_eq!(src, 0);
+            b.set_cell_content_start(write_off as u32);
+            // n_cells unchanged — only offsets moved.
+            b.touch();
+        }
+        self.pager.note_dirty(page_id);
+        // The compaction moved every cell and bumped the page serial:
+        // advisory leaf hints / append pins re-validate by serial and
+        // will re-establish on their next use. The insert below takes
+        // the normal path through the (now honest) free-space gap.
+        Ok(true)
+    }
+
     fn split_leaf(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
         // ------------------------------------------------------------------------
         // APPEND-MODE SPLIT — O(1) fast path.

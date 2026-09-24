@@ -2,8 +2,8 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status** (all numbers from the latest CI-green run [35425398313](https://github.com/iamleson98/rust-sql/actions/runs/35425398313) @ `646f1a5`, 2026-09-19, 28/28 jobs):
-> **1337 tests** in the default matrix, plus sqlx / no-default / oom-injection / compat-ABI matrices on 3 OSes. **54 benchmark rows vs real SQLite: 53 wins, 1 parity tie, 0 losses.** Byte-identical file size, lower-or-equal peak RSS on 14/18 torture sections (the rest +1–2 MB by allocator choice). Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. sqlx 0.9 native driver **and** drop-in `libsqlite3` C ABI verified with sea-orm 2.0 end to end.
+> **Status** (all numbers from the latest CI-green run [35425398313](https://github.com/iamleson98/rust-sql/actions/runs/35425398313) @ `646f1a5`, 2026-09-19, 31/31 jobs):
+> **1345 tests** in the default matrix, plus sqlx / no-default / oom-injection / compat-ABI matrices on 3 OSes — and a dedicated **limit-stress** job (8 push-to-the-limit sections at 1M-row file scale) on every OS. **54 benchmark rows vs real SQLite: 53 wins, 1 parity tie, 0 losses.** Byte-identical file size, lower-or-equal peak RSS on 14/18 torture sections (the rest +1–2 MB by allocator choice). Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. sqlx 0.9 native driver **and** drop-in `libsqlite3` C ABI verified with sea-orm 2.0 end to end.
 > SQLite-format interop both directions, verified by real SQLite.
 > The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
 
@@ -138,7 +138,7 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 | WAL commit latency | 25.3 µs/txn | 28.5 µs/txn | **1.13x faster** (delete journal: 6.2x) |
 | Stripped CLI binary | 3.10 MB | ~2.06 MB | 1.5x larger — deliberate (mimalloc ~140 KiB buys 1.5–2.1x writes, opt-out `default-features = false`; the rest is feature surface SQLite ships as separate extensions) |
 
-**Torture matrix (18 sections, CI 2026-09-19, time verdict: 18/18 WIN; memory reported not gated):** 14 sections within 0.9–1.0x of SQLite's RSS, two memory *wins* (S03 GROUP BY 0.70x via temp-store spill, S11 IN-lists 0.74x via Arc-shared lists), the rest 0.5–0.9x (1–6 MB deltas) — the mimalloc baseline (~1 MB at open) plus WAL-side bookkeeping on file-mode builds; `default-features = false` recovers the glibc baseline. S17 open+first-query on a 1M-row file: **5.7 ms vs 12.2 ms (2.14x faster)** at 0.57x RSS. No leak: S13 sustained-2M-ops RSS flat 7→7 MB. THP: an `.init_array` `prctl(PR_SET_THP_DISABLE)` (opt-out `RSQL_ALLOW_THP=1`) halves file-backed sections on `THP=always` kernels with time columns unchanged.
+**Torture matrix (18 sections, CI 2026-09-19, time verdict: 18/18 WIN; memory reported not gated):** 14 sections within 0.9–1.0x of SQLite's RSS, two memory *wins* (S03 GROUP BY 0.70x via temp-store spill, S11 IN-lists 0.74x via Arc-shared lists), the rest 0.5–0.9x (1–6 MB deltas) — the mimalloc baseline (~1 MB at open) plus WAL-side bookkeeping on file-mode builds; `default-features = false` recovers the glibc baseline. S17 open+first-query on a 1M-row file: **5.7 ms vs 12.2 ms (2.14x faster)** at 0.57x RSS. No leak: S13 sustained-2M-ops RSS flat 7→7 MB. THP: an `.init_array` `prctl(PR_SET_THP_DISABLE)` (opt-out `RSQL_ALLOW_THP=1`) halves file-backed sections on `THP=always` kernels with time columns unchanged. **Delete-churn compaction**: a leaf that cannot fit a re-inserted cell first reclaims its dead cell bytes in place (one scratch-copy rewrite, no new page — SQLite's balancer answer at leaf granularity), so delete-75% + reinsert-same-shape holds the file at ~1.0x of build size instead of growing 1.67x (683→1140 pages measured before the fix); pinned at 500k-row scale by the limit-stress suite. **VACUUM reclamation** (same campaign): emptied leaves left attached by mass deletes are pruned by the page-level copy (interiors rebuilt over the survivors, collapsing empty spines); hollow survivor shapes decline to the row-level dense rebuild; index overflow chains (leaf keys AND interior separators) are copied and re-linked — three real bugs the limit suite found, pinned by its S8 section on every OS.
 
 ## Concurrency vs SQLite
 
@@ -293,7 +293,7 @@ cargo bench --bench sqlite_comparison                             # criterion ma
 
 ## Testing
 
-The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1335 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI matrices, all CI-green on ubuntu/windows/macos:
+The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1343 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
 
 | Technique | Harness | Verifies |
 |---|---|---|
@@ -307,6 +307,7 @@ The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](htt
 | Numeric parity | `numeric_parity.rs` | SUM/AVG/window at the f64-bit level vs bundled SQLite |
 | Error-text parity | `error_parity.rs` | byte-identical `sqlite3_errmsg` text |
 | Concurrency | `concurrent_writes.rs`, `committed_view.rs`, `concurrent_reader_visibility.rs` | multi-writer regimes, snapshot isolation, reader invariants |
+| Push-to-the-limit | `limit_stress.rs` (dedicated `limit-stress` CI job, 3 OSes, release profile) | 1M-row file builds with per-batch throughput-degradation + peak-RSS + file-bloat + cache-capacity guards; 48-table × 64-column schema breadth; 12 read + 12 write close/open cycles (no file creep, bounded page growth); 4-writer + 2-reader concurrent soak with OCC convergence and WAL-recovery reopen; cache-hit accounting (cold/warm/hot/bounded/reset); delete-churn reuse + VACUUM reclamation + churn-round recycling; sustained mixed-workload memory flatness (RSS swing/climb/peak + time degradation); VACUUM × spilled-index-key integrity pins (the campaign's three bug fixes) |
 | Parallel equality | `parallel_scan.rs`, `parallel_join.rs` | parallel == serial, bit-identical |
 | Interop | `sqlite_interop.rs`, `utf16_interop.rs`, `cli_ops.rs` | both-direction file exchange, real SQLite as oracle |
 | SQL Logic Tests | `slt_runner.rs` + `tests/slt/` | the SLT format SQLite's core team uses |

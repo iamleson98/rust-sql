@@ -121,6 +121,10 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # The limit_stress suite runs at FULL scale in its dedicated
+      # limit-stress job (release, LIMIT_ROWS=1000000); here it is a
+      # quick smoke of every section's code paths.
+      LIMIT_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -157,6 +161,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      LIMIT_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -189,6 +194,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      LIMIT_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -321,6 +327,65 @@ jobs:
       - name: "PK + INDEX stress (differential vs real SQLite, cranked scale)"
         run: cargo test --test primary_key_stress --test index_stress
 
+  # LIMIT-STRESS (the push-to-the-limit campaign's dedicated job): the
+  # 8-section limit suite from tests/limit_stress.rs at FULL CI scale,
+  # release profile (a debug-profile 1M-row build is impractical — same
+  # policy as million-record below; the correctness matrix above runs
+  # the same suite at quick smoke scale via LIMIT_ROWS=20000):
+  #   S1 big-schema breadth (48 tables x 64 cols, 6 indexes + view +
+  #      trigger each — catalog-pressure + statement-latency degradation),
+  #   S2 the 1M-row file build (per-batch throughput degradation guard,
+  #      peak-RSS budget, file-bloat bound, cache-capacity bound, answer
+  #      battery cold/warm, reopen),
+  #   S3 close/open cycles (12 read cycles: no file creep + latency
+  #      stability; 12 write cycles: bounded page growth + exact counts),
+  #   S4 concurrent R/W soak (4 parallel BEGIN CONCURRENT writers + 2
+  #      plain readers on one WAL engine, OCC retry convergence, zero
+  #      reader errors/dirty reads, WAL-recovery reopen),
+  #   S5 cache-hit accounting (cold misses are real, warm re-scan >= 90%,
+  #      hot point probes >= 99%, bounded resident set, reopen resets),
+  #   S6 file-size shape (mass DELETE never grows the file; delete-75% +
+  #      reinsert-same-shape reuses dead in-page bytes — the churn-bloat
+  #      regression pin; VACUUM reclaims >= 30%; churn rounds stay flat),
+  #   S7 memory flatness (sustained mixed workload: RSS swing/climb/
+  #      peak budgets + per-round time degradation guard — the leak hunt),
+  #   S8 VACUUM integrity x spilled index keys (the campaign's three
+  #      bug pins: unsorted append behind a spilled cell, VACUUM
+  #      dropping index overflow chains, VACUUM reclaim — both journal
+  #      modes + reopen).
+  limit-stress:
+    name: limit-stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      LIMIT_ROWS: "1000000"
+      LIMIT_BATCH: "5000"
+      LIMIT_TABLES: "48"
+      LIMIT_COLS: "64"
+      LIMIT_SCHEMA_ROWS: "64"
+      LIMIT_REOPEN: "12"
+      LIMIT_REOPEN_WRITE_BATCH: "800"
+      LIMIT_SOAK_TXNS: "40"
+      LIMIT_SOAK_ROWS: "25"
+      LIMIT_CHURN: "12"
+      LIMIT_FLAT_ROUNDS: "16"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Same command shape as million-record (cargo test --release
+          # --test <name>): its warm release cache is directly reusable.
+          shared-key: million-${{ matrix.os }}
+          cache-on-failure: true
+      - name: "Limit-stress suite (big schema / 1M-row file / reopen cycles / concurrent soak / cache hit / file size / memory flatness)"
+        run: cargo test --release --test limit_stress
+
   # MILLION-RECORD differential (file-format support at scale, per the
   # user's brief): both engines build the same deterministic multi-million
   # row dataset FILE-BACKED — the engine through open_sqlite_format (the
@@ -369,6 +434,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      LIMIT_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -529,7 +595,7 @@ jobs:
   # ------------------------------------------------------------ aggregate OK
   ci-ok:
     name: ci-ok (all gates green)
-    needs: [fmt, clippy, test, test-windows, test-macos, stress-intensive, million-record, test-oom, test-compat, torture, bench-gate, interop]
+    needs: [fmt, clippy, test, test-windows, test-macos, stress-intensive, limit-stress, million-record, test-oom, test-compat, torture, bench-gate, interop]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

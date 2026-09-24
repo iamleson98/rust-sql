@@ -205,6 +205,93 @@ pub(crate) struct InPlaceCompaction {
     pub schema_patches: Vec<SchemaRootPatch>,
 }
 
+/// VACUUM fast-path eligibility walk: every leaf of every tree must be
+/// dense enough that a page-level path (the in-place WAL install or the
+/// verbatim image copy) reclaims all the waste there is. Policy per
+/// leaf, O(1) (no cell parsing — the CONTENT AREA, pointer-array end to
+/// page tail, bounds live bytes from above, and for the packed leaves
+/// the delete path's rebuild produces it IS the live bytes):
+///   - a 0-cell leaf (this engine's mass-delete signature — DELETE
+///     never detaches pages, emptied leaves stay wired in) is PRUNABLE
+///     by the image copier; `allow_empty = false` (the in-place plan,
+///     which cannot drop pages) declines on it.
+///   - a leaf whose content area is under half the page is HOLLOW —
+///     survivor leaves rebuilt at a low fill fraction by mass deletes.
+///     Only the row-level rebuild re-flows those densely; both fast
+///     paths decline.
+pub(crate) fn trees_eligible_for_page_copy(
+    src: &Pager,
+    roots: &[u32],
+    allow_empty: bool,
+) -> Result<bool> {
+    let psz = src.page_size() as usize;
+    let mut visited: PageIdSet = std::collections::HashSet::default();
+    let mut stack: Vec<u32> = roots.iter().copied().filter(|&r| r != 0).collect();
+    while let Some(page_id) = stack.pop() {
+        if !visited.insert(page_id) {
+            continue;
+        }
+        let pr = src.get_page(page_id)?;
+        let pt = {
+            let b = pr.lock();
+            b.page_type()?
+        };
+        let hdr = if page_id == 0 {
+            DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        match pt {
+            PageType::LeafTable | PageType::LeafIndex => {
+                let ok = {
+                    let b = pr.lock();
+                    let n = b.n_cells() as usize;
+                    if n == 0 {
+                        allow_empty
+                    } else {
+                        let content_start = b.cell_content_start() as usize;
+                        let ptr_end = hdr + PAGE_HEADER_SIZE as usize + n * 2;
+                        if content_start < ptr_end || content_start > psz {
+                            false // malformed: not a shape we fast-path
+                        } else {
+                            let content_area = psz - content_start;
+                            let usable = psz - ptr_end;
+                            content_area * 2 >= usable
+                        }
+                    }
+                };
+                drop(pr);
+                if !ok {
+                    return Ok(false);
+                }
+            }
+            PageType::InteriorTable | PageType::InteriorIndex => {
+                let mut children = Vec::new();
+                {
+                    let b = pr.lock();
+                    let n = b.n_cells() as usize;
+                    let right = b.right_most_pointer();
+                    for i in 0..n {
+                        let cell_ptr = b.cell_pointer(i as u16) as usize;
+                        if cell_ptr + 4 <= b.data.len() {
+                            children.push(u32::from_be_bytes(
+                                b.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                            ));
+                        }
+                    }
+                    if right != 0 {
+                        children.push(right);
+                    }
+                }
+                drop(pr);
+                stack.extend(children);
+            }
+            PageType::Overflow => {}
+        }
+    }
+    Ok(true)
+}
+
 /// Walk every live page — the schema tree (hybrid root at page 0) plus
 /// every object tree and overflow chain — and build the in-place
 /// compaction plan. Returns None when the plan is not eligible: a
@@ -218,6 +305,18 @@ pub(crate) fn plan_in_place_compaction(
     roots: &[u32],
 ) -> Result<Option<InPlaceCompaction>> {
     let old_n = src.n_pages();
+    // Eligibility: the in-place plan moves pages but cannot drop or
+    // re-pack any. Mass-delete shapes (empty leaves, hollow survivors)
+    // must take an image/row-level path — see
+    // trees_eligible_for_page_copy. The schema tree (page 0) is
+    // included: the in-place path patches it in place, while the image
+    // paths rebuild it densely from the rows.
+    let mut gate_roots: Vec<u32> = Vec::with_capacity(roots.len() + 1);
+    gate_roots.push(0);
+    gate_roots.extend(roots.iter().copied());
+    if !trees_eligible_for_page_copy(src, &gate_roots, false)? {
+        return Ok(None);
+    }
     let mut seen: PageIdSet = std::collections::HashSet::default();
     let mut refs: HashMap<u32, Vec<(u32, u32)>, PageIdHashBuild> = HashMap::default();
     // Raw schema-row rootpage sites: (schema leaf old id, body offset,
@@ -461,7 +560,80 @@ fn parse_leaf_chains(
                     }
                 }
             }
-            PageType::LeafIndex => {}
+            PageType::LeafIndex => {
+                // Index keys spill to overflow chains exactly like table
+                // payloads ([varint rowid][varint TOTAL][local][4B
+                // chain] — same spill math). Record the chain-head sites
+                // so the install's patcher rewires them when pages move.
+                let mut chains: Vec<u32> = Vec::new();
+                {
+                    let b = pr.lock();
+                    let n = b.n_cells() as usize;
+                    for i in 0..n {
+                        let cell_ptr = b.cell_pointer(i as u16) as usize;
+                        if cell_ptr >= b.data.len() {
+                            continue;
+                        }
+                        let Some((_, n_rid)) =
+                            crate::storage::btree::varint::decode_signed(&b.data[cell_ptr..])
+                        else {
+                            continue;
+                        };
+                        let p = cell_ptr + n_rid;
+                        if p >= b.data.len() {
+                            continue;
+                        }
+                        let Some((klen, n_klen)) =
+                            crate::storage::btree::varint::decode(&b.data[p..])
+                        else {
+                            continue;
+                        };
+                        let key_start = p + n_klen;
+                        let local_len =
+                            crate::storage::btree::overflow_local_len_for(klen as usize, psz);
+                        if local_len < klen as usize {
+                            let chain_off = key_start + local_len;
+                            if chain_off + 4 > b.data.len() {
+                                continue;
+                            }
+                            let chain = u32::from_be_bytes(
+                                b.data[chain_off..chain_off + 4].try_into().unwrap(),
+                            );
+                            if chain != 0 {
+                                chains.push(chain);
+                                refs.entry(page_id)
+                                    .or_default()
+                                    .push((chain_off as u32, chain));
+                            }
+                        }
+                    }
+                }
+                drop(pr);
+                for chain in chains {
+                    let mut cur = chain;
+                    let mut budget = src.n_pages() as u64 + 1;
+                    while cur != 0 && budget > 0 {
+                        budget -= 1;
+                        if !visited.insert(cur) {
+                            break;
+                        }
+                        let p = src.get_page(cur)?;
+                        let next = {
+                            let b = p.lock();
+                            if b.data.len() >= 16 {
+                                u32::from_be_bytes(b.data[12..16].try_into().unwrap())
+                            } else {
+                                0
+                            }
+                        };
+                        drop(p);
+                        if next != 0 {
+                            refs.entry(cur).or_default().push((12, next));
+                        }
+                        cur = next;
+                    }
+                }
+            }
             PageType::InteriorTable | PageType::InteriorIndex => {
                 let mut children: Vec<u32> = Vec::new();
                 {
@@ -621,8 +793,16 @@ fn collect_tree(
         PageType::LeafIndex => Ok(()), // fully in-page, no children
         PageType::InteriorTable | PageType::InteriorIndex => {
             // References: each cell's 4-byte left child + the right-most
-            // pointer at hdr + 8.
+            // pointer at hdr + 8. Index interiors ALSO carry full-key
+            // separator copies whose payloads can spill to overflow
+            // chains — those chain-head sites are recorded too (the
+            // patcher rewrites them alongside the child pointers), but
+            // kept OUT of the child list: recursing collect_tree into a
+            // chain page would mark it seen and silently strip the
+            // next-link refs collect_overflow collects.
             let mut page_refs: Vec<(u32, u32)> = Vec::new();
+            let mut sep_chain_refs: Vec<(u32, u32)> = Vec::new();
+            let mut sep_chains: Vec<u32> = Vec::new();
             let right;
             {
                 let b = pr.lock();
@@ -636,6 +816,37 @@ fn collect_tree(
                             u32::from_be_bytes(b.data[cell_ptr..cell_ptr + 4].try_into().unwrap()),
                         ));
                     }
+                    if pt == PageType::InteriorIndex && cell_ptr + 4 < b.data.len() {
+                        if let Some((_, n_rid)) =
+                            crate::storage::btree::varint::decode_signed(&b.data[cell_ptr + 4..])
+                        {
+                            let p = cell_ptr + 4 + n_rid;
+                            if p < b.data.len() {
+                                if let Some((klen, n_klen)) =
+                                    crate::storage::btree::varint::decode(&b.data[p..])
+                                {
+                                    let local_len = crate::storage::btree::overflow_local_len_for(
+                                        klen as usize,
+                                        psz,
+                                    );
+                                    if local_len < klen as usize {
+                                        let chain_off = p + n_klen + local_len;
+                                        if chain_off + 4 <= b.data.len() {
+                                            let chain = u32::from_be_bytes(
+                                                b.data[chain_off..chain_off + 4]
+                                                    .try_into()
+                                                    .unwrap(),
+                                            );
+                                            if chain != 0 {
+                                                sep_chain_refs.push((chain_off as u32, chain));
+                                                sep_chains.push(chain);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             drop(pr);
@@ -643,7 +854,11 @@ fn collect_tree(
                 page_refs.push(((hdr + 8) as u32, right));
             }
             let children: Vec<u32> = page_refs.iter().map(|&(_, r)| r).collect();
+            page_refs.extend(sep_chain_refs);
             refs.insert(page_id, page_refs);
+            for chain in sep_chains {
+                collect_overflow(src, chain, seen, refs)?;
+            }
             for c in children {
                 collect_tree(
                     src,
@@ -775,7 +990,28 @@ pub(crate) fn compact_page_copy(
         if root == 0 {
             continue;
         }
-        copy_tree(src, tmp, root, &mut map)?;
+        if copy_tree(src, tmp, root, &mut map)?.is_none() {
+            // The entire tree is empty (mass DELETE kept the pages
+            // attached — this engine never recycles interior children).
+            // Every object must keep a root: reserve a fresh EMPTY leaf
+            // of the original root's family (table / index).
+            let pt = src
+                .get_page(root)
+                .ok()
+                .and_then(|p| p.lock().page_type().ok());
+            let leaf_pt = if matches!(pt, Some(PageType::LeafIndex | PageType::InteriorIndex)) {
+                PageType::LeafIndex
+            } else {
+                PageType::LeafTable
+            };
+            let psz = src.page_size() as usize;
+            let mut bytes = vec![0u8; psz];
+            bytes[0] = leaf_pt as u8;
+            // n_cells = 0, cell_content_start = 0 (= page size), no
+            // right pointer, no freeblocks — the canonical empty leaf.
+            let new_id = write_new_page(tmp, &bytes)?;
+            map.insert(root, new_id);
+        }
     }
     Ok(map)
 }
@@ -800,10 +1036,26 @@ fn write_new_page(tmp: &Pager, bytes: &[u8]) -> Result<u32> {
     Ok(id)
 }
 
-/// Post-order tree copy (see `compact_page_copy`).
-fn copy_tree(src: &Pager, tmp: &Pager, page_id: u32, map: &mut HashMap<u32, u32>) -> Result<u32> {
+/// Post-order tree copy (see `compact_page_copy`), with EMPTY-LEAF
+/// PRUNING: this engine's DELETE never detaches an emptied leaf (the
+/// page stays wired into its parent), so a mass delete leaves the tree
+/// littered with 0-cell leaves that only VACUUM can reclaim. A leaf
+/// with zero cells returns `None` — no page is allocated for it — and
+/// the parent rebuild drops its cell. The interior descent already
+/// tolerates every resulting state (a missing right-most pointer falls
+/// back to the last cell's child; a 0-cell interior falls through to
+/// its right child), which the delete/rebalance paths exercise in
+/// production. An interior whose children ALL vanish collapses to its
+/// single survivor (or returns `None` itself), so pruned trees also
+/// lose their empty spines.
+fn copy_tree(
+    src: &Pager,
+    tmp: &Pager,
+    page_id: u32,
+    map: &mut HashMap<u32, u32>,
+) -> Result<Option<u32>> {
     if let Some(&n) = map.get(&page_id) {
-        return Ok(n);
+        return Ok(Some(n));
     }
     let psz = src.page_size() as usize;
     let bytes = src_page_bytes(src, page_id)?;
@@ -811,18 +1063,30 @@ fn copy_tree(src: &Pager, tmp: &Pager, page_id: u32, map: &mut HashMap<u32, u32>
         .map_err(|_| Error::corruption(format!("vacuum copy: bad page type at {page_id}")))?;
     match pt {
         PageType::LeafTable => {
+            let n = u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize;
+            if n == 0 {
+                return Ok(None); // pruned: an emptied leaf reclaims its page
+            }
             let mut new_bytes = bytes.clone();
             copy_leaf_overflow_chains(src, tmp, &mut new_bytes, 0, psz, map)?;
             let new_id = write_new_page(tmp, &new_bytes)?;
             map.insert(page_id, new_id);
-            Ok(new_id)
+            Ok(Some(new_id))
         }
         PageType::LeafIndex => {
-            // Index cells are fully in-page (no overflow chains in this
-            // format — see Cell::decode) and reference no children.
-            let new_id = write_new_page(tmp, &bytes)?;
+            let n = u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize;
+            if n == 0 {
+                return Ok(None); // pruned
+            }
+            // Index keys larger than max-local spill to overflow chains
+            // (SQLite parity — tests/index_overflow.rs). The chains must
+            // be copied and the 4-byte heads inside the cells patched,
+            // exactly like table payloads.
+            let mut new_bytes = bytes.clone();
+            copy_index_leaf_overflow_chains(src, tmp, &mut new_bytes, 0, psz, map)?;
+            let new_id = write_new_page(tmp, &new_bytes)?;
             map.insert(page_id, new_id);
-            Ok(new_id)
+            Ok(Some(new_id))
         }
         PageType::InteriorTable | PageType::InteriorIndex => {
             let n = u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize;
@@ -846,33 +1110,113 @@ fn copy_tree(src: &Pager, tmp: &Pager, page_id: u32, map: &mut HashMap<u32, u32>
             if right != 0 {
                 children.push(right);
             }
-            // Recurse FIRST (post-order): children get their new ids.
+            // Recurse FIRST (post-order): children get their new ids (or
+            // None — pruned subtrees).
             let mut new_children = Vec::with_capacity(children.len());
             for c in children {
                 new_children.push(copy_tree(src, tmp, c, map)?);
             }
-            let mut new_bytes = bytes.clone();
-            let mut ni = 0usize;
-            for i in 0..n {
-                let off = ptr_base + i * 2;
-                if off + 2 > psz {
-                    break;
-                }
-                let cell_ptr =
-                    u16::from_be_bytes(new_bytes[off..off + 2].try_into().unwrap()) as usize;
-                if cell_ptr + 4 <= psz {
-                    new_bytes[cell_ptr..cell_ptr + 4]
-                        .copy_from_slice(&new_children[ni].to_be_bytes());
-                    ni += 1;
-                }
+            // The right-most pointer: only an interior that HAD one
+            // keeps one. right = 0 is a legal, documented state (the
+            // delete/rebalance paths zero the slot when the right-most
+            // subtree empties; the descent falls back to the last
+            // cell's child as the de-facto right edge) — promoting that
+            // cell's child into the right slot HERE would duplicate the
+            // subtree (walked once as the cell's child, again as
+            // right-most: phantom rows + out-of-order walks).
+            let new_right = if right != 0 {
+                new_children.last().copied().flatten()
+            } else {
+                None
+            };
+            let survivors: Vec<(usize, u32)> = new_children[..n.min(new_children.len())]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.map(|id| (i, id)))
+                .collect();
+            if survivors.is_empty() {
+                return Ok(match new_right {
+                    // Everything pruned except (at most) the right-most
+                    // subtree: collapse — the parent links straight to it.
+                    Some(id) => {
+                        map.insert(page_id, id);
+                        Some(id)
+                    }
+                    None => None, // the whole subtree is empty
+                });
             }
-            if right != 0 {
-                let rm = new_children[ni];
-                new_bytes[8..12].copy_from_slice(&rm.to_be_bytes());
+            // Rebuild the interior over the surviving cells: surviving
+            // cell bytes verbatim (child pointer remapped), dropped
+            // cells omitted from the pointer array, content re-flowed to
+            // the tail, right-most pointer zeroed if its subtree died
+            // (the descent's documented right=0 fallback covers it).
+            let mut new_bytes = vec![0u8; psz];
+            new_bytes[0] = pt as u8;
+            new_bytes[8..12].copy_from_slice(&new_right.unwrap_or(0).to_be_bytes());
+            let mut sizes: Vec<usize> = Vec::with_capacity(survivors.len());
+            {
+                // Scratch-copy the surviving cells (a tail-first rewrite
+                // can overlap the sources).
+                let mut scratch: Vec<u8> = Vec::new();
+                for &(i, _) in &survivors {
+                    let off = ptr_base + i * 2;
+                    let cell_ptr =
+                        u16::from_be_bytes(bytes[off..off + 2].try_into().unwrap()) as usize;
+                    // Interior table cell: [4B child][varint key].
+                    // Interior index cell: [4B child][varint rowid]
+                    // [varint total][local][4B chain?]. Both sized via
+                    // the paged helpers (overflow-aware for index).
+                    let size = if pt == PageType::InteriorIndex {
+                        interior_index_cell_size(&bytes[cell_ptr..], psz as u32).ok_or_else(
+                            || Error::corruption("vacuum copy: truncated interior index cell"),
+                        )?
+                    } else {
+                        interior_table_cell_size(&bytes[cell_ptr..])?
+                    };
+                    sizes.push(size);
+                    scratch.extend_from_slice(&bytes[cell_ptr..cell_ptr + size]);
+                }
+                let mut src_off = scratch.len();
+                let mut write_off = psz;
+                // Tail-first, slot-REVERSED: scratch holds the survivors
+                // in slot order, so the LAST chunk belongs to the LAST
+                // slot — write it first (top of page), the FIRST slot
+                // last (bottom, at the new content_start). Pointer
+                // offsets end up descending with the slot index, the
+                // engine's native rebuilt-page layout.
+                for k in (0..survivors.len()).rev() {
+                    let size = sizes[k];
+                    src_off -= size;
+                    write_off -= size;
+                    new_bytes[write_off..write_off + size]
+                        .copy_from_slice(&scratch[src_off..src_off + size]);
+                    // Remap the child pointer (first 4 bytes).
+                    let new_child = survivors[k].1;
+                    new_bytes[write_off..write_off + 4].copy_from_slice(&new_child.to_be_bytes());
+                    // Pointer-array slot k (big-endian u16 offset).
+                    let dst = ptr_base + k * 2;
+                    new_bytes[dst..dst + 2].copy_from_slice(&(write_off as u16).to_be_bytes());
+                }
+                debug_assert_eq!(src_off, 0);
+                // cell_content_start: 0 encodes page_size (empty gap).
+                let content = write_off as u32;
+                let enc = if content >= psz as u32 {
+                    0u16
+                } else {
+                    content as u16
+                };
+                new_bytes[6..8].copy_from_slice(&enc.to_be_bytes());
+            }
+            let n_new = survivors.len() as u16;
+            new_bytes[4..6].copy_from_slice(&n_new.to_be_bytes());
+            // Spilled index separator keys: copy their chains and patch
+            // the in-cell heads (the rebuild moved the cells).
+            if pt == PageType::InteriorIndex {
+                copy_interior_index_separator_chains(src, tmp, &mut new_bytes, 0, psz, map)?;
             }
             let new_id = write_new_page(tmp, &new_bytes)?;
             map.insert(page_id, new_id);
-            Ok(new_id)
+            Ok(Some(new_id))
         }
         PageType::Overflow => Err(Error::corruption(format!(
             "vacuum copy: overflow page {page_id} reached as a btree node"
@@ -935,6 +1279,145 @@ fn copy_leaf_overflow_chains(
         page_bytes[chain_off..chain_off + 4].copy_from_slice(&new_chain.to_be_bytes());
     }
     Ok(())
+}
+
+/// Walk an INDEX leaf's cells, copying overflow chains and patching the
+/// 4-byte chain heads. Cell layout: [varint rowid][varint TOTAL key_len]
+/// [local bytes][4B chain] — the chain exists exactly when the key
+/// exceeds the local size (same spill math as table payloads).
+fn copy_index_leaf_overflow_chains(
+    src: &Pager,
+    tmp: &Pager,
+    page_bytes: &mut [u8],
+    hdr: usize,
+    psz: usize,
+    map: &mut HashMap<u32, u32>,
+) -> Result<()> {
+    let Ok(pt) = PageType::from_byte(page_bytes[hdr]) else {
+        return Ok(());
+    };
+    if pt != PageType::LeafIndex {
+        return Ok(());
+    }
+    let n = u16::from_be_bytes(page_bytes[hdr + 4..hdr + 6].try_into().unwrap()) as usize;
+    let ptr_base = hdr + PAGE_HEADER_SIZE as usize;
+    for i in 0..n {
+        let off = ptr_base + i * 2;
+        if off + 2 > psz {
+            break;
+        }
+        let cell_ptr = u16::from_be_bytes(page_bytes[off..off + 2].try_into().unwrap()) as usize;
+        // [varint rowid][varint klen]
+        let Some((_, n_rid)) =
+            crate::storage::btree::varint::decode_signed(&page_bytes[cell_ptr..])
+        else {
+            continue;
+        };
+        let p = cell_ptr + n_rid;
+        if p >= psz {
+            continue;
+        }
+        let Some((klen, n_klen)) = crate::storage::btree::varint::decode(&page_bytes[p..]) else {
+            continue;
+        };
+        let local_len = crate::storage::btree::overflow_local_len_for(klen as usize, psz);
+        if local_len >= klen as usize {
+            continue; // fully in-page key
+        }
+        let chain_off = p + n_klen + local_len;
+        if chain_off + 4 > psz {
+            continue;
+        }
+        let chain = u32::from_be_bytes(page_bytes[chain_off..chain_off + 4].try_into().unwrap());
+        if chain == 0 {
+            continue;
+        }
+        let new_chain = copy_overflow_chain(src, tmp, chain, map)?;
+        page_bytes[chain_off..chain_off + 4].copy_from_slice(&new_chain.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// Walk an index INTERIOR's cells, copying the overflow chains of spilled
+/// SEPARATOR keys and patching their in-cell heads. Cell layout:
+/// [be_u32 child][varint rowid][varint TOTAL][local][4B chain]. (The
+/// separators are full copies of boundary keys, and a boundary key big
+/// enough to spill in a leaf spills here too.)
+fn copy_interior_index_separator_chains(
+    src: &Pager,
+    tmp: &Pager,
+    page_bytes: &mut [u8],
+    hdr: usize,
+    psz: usize,
+    map: &mut HashMap<u32, u32>,
+) -> Result<()> {
+    let Ok(pt) = PageType::from_byte(page_bytes[hdr]) else {
+        return Ok(());
+    };
+    if pt != PageType::InteriorIndex {
+        return Ok(());
+    }
+    let n = u16::from_be_bytes(page_bytes[hdr + 4..hdr + 6].try_into().unwrap()) as usize;
+    let ptr_base = hdr + PAGE_HEADER_SIZE as usize;
+    for i in 0..n {
+        let off = ptr_base + i * 2;
+        if off + 2 > psz {
+            break;
+        }
+        let cell_ptr = u16::from_be_bytes(page_bytes[off..off + 2].try_into().unwrap()) as usize;
+        // [be_u32 child][varint rowid][varint klen]
+        let Some((_, n_rid)) =
+            crate::storage::btree::varint::decode_signed(&page_bytes[cell_ptr + 4..])
+        else {
+            continue;
+        };
+        let p = cell_ptr + 4 + n_rid;
+        if p >= psz {
+            continue;
+        }
+        let Some((klen, n_klen)) = crate::storage::btree::varint::decode(&page_bytes[p..]) else {
+            continue;
+        };
+        let local_len = crate::storage::btree::overflow_local_len_for(klen as usize, psz);
+        if local_len >= klen as usize {
+            continue; // fully in-page separator
+        }
+        let chain_off = p + n_klen + local_len;
+        if chain_off + 4 > psz {
+            continue;
+        }
+        let chain = u32::from_be_bytes(page_bytes[chain_off..chain_off + 4].try_into().unwrap());
+        if chain == 0 {
+            continue;
+        }
+        let new_chain = copy_overflow_chain(src, tmp, chain, map)?;
+        page_bytes[chain_off..chain_off + 4].copy_from_slice(&new_chain.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// Byte length of an interior TABLE cell `[be_u32 child][varint key]`.
+fn interior_table_cell_size(buf: &[u8]) -> Result<usize> {
+    if buf.len() < 4 {
+        return Err(Error::corruption("vacuum copy: truncated interior cell"));
+    }
+    let (_, n) = crate::storage::btree::varint::decode_signed(&buf[4..])
+        .ok_or_else(|| Error::corruption("vacuum copy: truncated interior key"))?;
+    Ok(4 + n)
+}
+
+/// Byte length of an interior INDEX cell `[be_u32 child][varint rowid]
+/// [varint TOTAL][local][4B chain when the key spills]`, overflow-aware.
+fn interior_index_cell_size(buf: &[u8], page_size: u32) -> Option<usize> {
+    let (_, n_rid) = crate::storage::btree::varint::decode_signed(&buf[4..])?;
+    let p = 4 + n_rid;
+    let (klen, n_klen) = crate::storage::btree::varint::decode(&buf[p..])?;
+    let local = crate::storage::btree::overflow_local_len_for(klen as usize, page_size as usize);
+    if local >= klen as usize {
+        Some(p + n_klen + klen as usize)
+    } else {
+        Some(p + n_klen + local + 4)
+    }
 }
 
 /// Post-order copy of an overflow chain: the tail first, then this page
