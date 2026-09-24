@@ -364,10 +364,23 @@ async fn main() {
     // block the writer and vice versa. Both sides get 8 connections.
 
     /// Shared in-memory rustqlite pool with N connections, pre-seeded.
-    async fn rq_shared(n: u32, ddl: &'static str, name: &str) -> RustqlitePool {
+    /// `concurrent` runs the pool's sqlx Transactions as engine-level
+    /// BEGIN CONCURRENT transactions (the engine's flagship concurrent-
+    /// write mode — the symmetric answer to the SQLite side's WAL-mode
+    /// pool below: each side configured for its best concurrency).
+    async fn rq_shared_opts(
+        n: u32,
+        ddl: &'static str,
+        name: &str,
+        concurrent: bool,
+    ) -> RustqlitePool {
+        let mut opts = RustqliteConnectOptions::shared_memory(name);
+        if concurrent {
+            opts = opts.concurrent_transactions(true);
+        }
         let pool = RustqlitePoolOptions::new()
             .max_connections(n)
-            .connect_with(RustqliteConnectOptions::shared_memory(name))
+            .connect_with(opts)
             .await
             .unwrap();
         sqlx::query(ddl).execute(&pool).await.unwrap();
@@ -383,6 +396,11 @@ async fn main() {
         }
         tx.commit().await.unwrap();
         pool
+    }
+
+    /// Shared in-memory rustqlite pool (plain single-writer transactions).
+    async fn rq_shared(n: u32, ddl: &'static str, name: &str) -> RustqlitePool {
+        rq_shared_opts(n, ddl, name, false).await
     }
 
     /// SQLite file DB in WAL mode with N connections, pre-seeded.
@@ -476,10 +494,37 @@ async fn main() {
     }
 
     // -- 8-connection MIXED read/write 80/20 (the concurrency stress test) -
+    // Both sides get an index on `a` BEFORE the timed window: the row
+    // measures the 8-connection R/W INTERPLAY (short indexed reads +
+    // short write transactions), not single-threaded scan throughput —
+    // without the index the unindexed `a BETWEEN` aggregate full-scans
+    // 5000 rows per call and owns ~99% of the row's wall clock on BOTH
+    // engines, burying the concurrent-write machinery it exists to
+    // measure (raw scan throughput is already covered by this bench's
+    // `filtered scan fetch_all` / `GROUP BY agg fetch_all` / `stream
+    // full table` rows and bench_full_vs_sqlite's scan/aggregate rows).
+    // With the index the read mix is the classic OLTP shape — PK point
+    // lookup + ~50-row indexed range aggregate — and the write side
+    // dominates the differentiation:
+    //
+    // rustqlite: concurrent_transactions=true — the pool's short write
+    // transactions run as BEGIN CONCURRENT (private page shadows,
+    // parallel statements, short commit critical section): the 80% read
+    // traffic NEVER waits behind a writer's exclusive lock window, and
+    // the 8 connections' write transactions execute SIMULTANEOUSLY
+    // instead of queueing on a database-wide write lock. This is the
+    // engine's advertised concurrent-write mode, the symmetric answer
+    // to the SQLite side's WAL-mode configuration below (each side
+    // configured for its best concurrency).
     {
         let name = "bench-conc-mixed";
-        let rq = rq_shared(CONC_TASKS as u32, ddl, name).await;
+        let rq = rq_shared_opts(CONC_TASKS as u32, ddl, name, true).await;
         let (_tmp, sq) = sq_wal(CONC_TASKS as u32, ddl).await;
+        // Symmetric schema (outside the timed window): both engines run
+        // the same indexed shape.
+        let idx = "CREATE INDEX bench_a ON bench(a)";
+        sqlx::query(idx).execute(&rq).await.unwrap();
+        sqlx::query(idx).execute(&sq).await.unwrap();
 
         let t = Instant::now();
         let mut handles = Vec::new();
@@ -490,6 +535,13 @@ async fn main() {
                 for i in 0..CONC_PER {
                     if i % 5 == 4 {
                         // 20% writes: short transaction, insert + update.
+                        // `next` lands in column `a` (disjoint 10k range
+                        // per task), so the UPDATE keys on `a` — it hits
+                        // the row THIS transaction just inserted (a real
+                        // second page write; the historical `WHERE id = ?`
+                        // form matched nothing: the auto rowids are
+                        // 5001+, never `next`'s 100k+ range — a no-op on
+                        // both engines).
                         let mut tx = pool.begin().await.unwrap();
                         next += 1;
                         sqlx::query("INSERT INTO bench (a, b, c) VALUES (?, ?, ?)")
@@ -499,7 +551,7 @@ async fn main() {
                             .execute(&mut *tx)
                             .await
                             .unwrap();
-                        sqlx::query("UPDATE bench SET b = b + 1.0 WHERE id = ?")
+                        sqlx::query("UPDATE bench SET b = b + 1.0 WHERE a = ?")
                             .bind(next)
                             .execute(&mut *tx)
                             .await
@@ -549,7 +601,7 @@ async fn main() {
                             .execute(&mut *tx)
                             .await
                             .unwrap();
-                        sqlx::query("UPDATE bench SET b = b + 1.0 WHERE id = ?")
+                        sqlx::query("UPDATE bench SET b = b + 1.0 WHERE a = ?")
                             .bind(next)
                             .execute(&mut *tx)
                             .await

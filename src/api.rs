@@ -4644,6 +4644,19 @@ impl Database {
     fn exec_chain_row(&self, ch: &mut InsertChain) -> Result<bool> {
         // Rowid allocation: auto-generated only (the scanner rejects
         // explicit rowid values), so `max_rowid + 1` is collision-free.
+        //
+        // CONCURRENT REGIME: when the statement's reserved id block is
+        // exhausted, draw the next one from the global high-water (one
+        // CAS per block; sibling transactions' blocks are disjoint —
+        // see `Pager::concurrent_rowid_hw`). `rowid_block_end == 0` is
+        // the plain path: the dense `max_rowid + 1` allocation.
+        if ch.rowid_block_end > 0 && ch.max_rowid + 1 >= ch.rowid_block_end {
+            let base = self
+                .pager
+                .reserve_rowids(ch.max_rowid, CONCURRENT_ROWID_BLOCK)?;
+            ch.max_rowid = base - 1;
+            ch.rowid_block_end = base + CONCURRENT_ROWID_BLOCK;
+        }
         if ch.max_rowid >= i64::MAX - 1 {
             return Ok(false);
         }
@@ -4861,6 +4874,24 @@ impl Database {
             .map(|(i, _)| i)
             .collect();
         let full_row: Vec<Value> = vec![Value::Null; n_cols];
+        // CONCURRENT REGIME: draw this statement's id block from the
+        // global high-water up front (one CAS per block) — sibling
+        // transactions' blocks are DISJOINT, so their same-hot-leaf
+        // inserts MERGE at commit instead of colliding on identical
+        // auto-rowids (see `Pager::concurrent_rowid_hw`). The plain path
+        // keeps `rowid_block_end = 0` and the dense `max_rowid + 1`.
+        let (max_rowid, rowid_block_end) =
+            if max_rowid < i64::MAX - 1 && self.pager.armed_writer_scope().is_some() {
+                match self.pager.reserve_rowids(max_rowid, CONCURRENT_ROWID_BLOCK) {
+                    Ok(base) => (base - 1, base + CONCURRENT_ROWID_BLOCK),
+                    // Rowid space trouble: skip the chain entirely — the
+                    // general path's own allocation handles the failure
+                    // semantics (SQLITE_FULL) or the fallback shape.
+                    Err(_) => return,
+                }
+            } else {
+                (max_rowid, 0)
+            };
         let chain = InsertChain {
             epoch: self.write_epoch.load(Ordering::Acquire),
             table: Arc::clone(table),
@@ -4873,6 +4904,7 @@ impl Database {
             rowid_alias: table.rowid_alias,
             root,
             max_rowid,
+            rowid_block_end,
             leaf_hint,
             full_row,
             payload_buf: Vec::with_capacity(n_cols * 8),
@@ -7727,10 +7759,13 @@ impl Database {
     ///
     /// Requirements (mirroring the SQL `BEGIN CONCURRENT` statement): a
     /// file-backed database in WAL journal mode (`PRAGMA
-    /// journal_mode = WAL`), no open plain transaction on this database,
-    /// and no other transaction already open for THIS connection
-    /// identity. DDL / PRAGMA / savepoints are rejected inside the
-    /// transaction (DML and SELECT only).
+    /// journal_mode = WAL`) or a shared in-memory engine (the page cache
+    /// IS the committed state there — installs land directly, the commit
+    /// flush is the same no-op a plain memory commit performs), no open
+    /// plain transaction on this database, and no other transaction
+    /// already open for THIS connection identity. DDL / PRAGMA /
+    /// savepoints are rejected inside the transaction (DML and SELECT
+    /// only).
     ///
     /// On commit conflict (another connection committed writes to a page
     /// this transaction wrote) the statement work overlaps unaffected —
@@ -14920,6 +14955,14 @@ fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
 // INSERT CHAIN — cross-statement single-row literal INSERT fast path
 // ============================================================================
 
+/// Size of the rowid block a concurrent-regime statement draws from the
+/// global high-water (`Pager::reserve_rowids`): one CAS per block keeps
+/// the shared cache line quiet under N parallel writers (a per-row draw
+/// would re-serialize the statement phase — the exact ping-pong the
+/// parallel-writer regime was built to remove). Unused tail ids become
+/// gaps — AUTOINCREMENT semantics, never reused.
+const CONCURRENT_ROWID_BLOCK: i64 = 64;
+
 /// Cross-statement memo for consecutive single-row literal INSERTs into
 /// the same table with the same column list.
 ///
@@ -14987,6 +15030,14 @@ struct InsertChain {
     root: u32,
     /// Monotonic upper bound of rowids present in the table.
     max_rowid: i64,
+    /// CONCURRENT-REGIME rowid reservation: the EXCLUSIVE upper bound of
+    /// the id block this chain's statement drew from the global high-water
+    /// (`Pager::reserve_rowids`) — allocations stay inside the block
+    /// (dense, no shared traffic), and a new block is drawn only when it
+    /// is exhausted (one CAS per block per statement). `0` = the plain
+    /// path (no armed concurrent scope): the dense `max_rowid + 1`
+    /// allocation, untouched.
+    rowid_block_end: i64,
     /// Cross-statement right-most-leaf append hint. Carries the page
     /// object's `(serial, epoch)`: validated on every use by the B+tree
     /// insert path, so it stays sound across statements (the insert

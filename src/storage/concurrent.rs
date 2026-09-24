@@ -49,7 +49,9 @@
 //!   pre-image reconstruction entirely).
 //!
 //! Deliberate restrictions (v1, mirroring SQLite's branch):
-//! - WAL journal mode on a file-backed database is required.
+//! - WAL journal mode on a file-backed database is required (shared
+//!   in-memory engines run the regime too — the page cache IS the
+//!   committed state, so the commit flush is a no-op).
 //! - DDL / PRAGMA / SAVEPOINT inside a concurrent transaction error out
 //!   (the in-memory catalog and savepoint undo logs are single-writer
 //!   structures). Plain DML and SELECT work.
@@ -675,23 +677,42 @@ impl Pager {
     /// Open a `BEGIN CONCURRENT` transaction. Fails unless the WAL is
     /// active (the commit protocol appends frames; DELETE-journal mode
     /// has no multi-writer commit point to reuse) and the database is
-    /// file-backed. Returns the transaction id the engine uses for
-    /// statement routing and COMMIT/ROLLBACK.
+    /// file-backed — OR the store is an in-memory engine, where the
+    /// page cache IS the committed state (installs land directly; the
+    /// flush is the same no-op a plain memory commit performs). Returns
+    /// the transaction id the engine uses for statement routing and
+    /// COMMIT/ROLLBACK.
     pub fn begin_concurrent(&self) -> Result<u64> {
-        if self.lazy_writeback.load(Ordering::Acquire) {
-            return Err(Error::Unsupported(
-                "BEGIN CONCURRENT requires a file-backed WAL-mode database (not :memory:)",
-            ));
-        }
-        if self.wal.read().is_none() {
-            return Err(Error::Unsupported(
-                "BEGIN CONCURRENT requires journal_mode=WAL",
-            ));
+        let memory = self.is_memory();
+        if !memory {
+            if self.lazy_writeback.load(Ordering::Acquire) {
+                return Err(Error::Unsupported(
+                    "BEGIN CONCURRENT requires a file-backed WAL-mode database (not :memory:)",
+                ));
+            }
+            if self.wal.read().is_none() {
+                return Err(Error::Unsupported(
+                    "BEGIN CONCURRENT requires journal_mode=WAL",
+                ));
+            }
         }
         // The committed page count as of BEGIN. Plain commits keep this
         // in sync at every flush; concurrent installs update it at their
-        // own flush.
-        let begin_n_pages = self.committed_n_pages.load(Ordering::Acquire);
+        // own flush. In-memory engines never flush (the cache IS the
+        // committed state) so the counter would lag every allocation —
+        // but a regime can only open while NO plain transaction is
+        // active (checked above) and plain `&self` DML is excluded by
+        // the shared-Database tripwire, so at this instant every live
+        // page is committed and `n_pages` IS the committed bound: sync
+        // the counter once at regime open, and the per-commit publish
+        // in `flush_wal_deferred_concurrent` keeps it fresh afterward.
+        let begin_n_pages = if memory {
+            let n = self.n_pages.load(Ordering::Acquire);
+            self.committed_n_pages.store(n, Ordering::Release);
+            n
+        } else {
+            self.committed_n_pages.load(Ordering::Acquire)
+        };
         let begin_epoch = self.concurrent.current_epoch();
         self.note_tx_begun();
         let id = self.concurrent.begin(begin_epoch, begin_n_pages);
@@ -774,6 +795,40 @@ impl Pager {
         match writer_scope() {
             Some((inst, txn)) if inst == self.instance_id => Some(txn),
             _ => None,
+        }
+    }
+
+    /// Reserve `n` consecutive automatic-rowid ids for a CONCURRENT-regime
+    /// statement: one CAS per block against the global high-water (see
+    /// [`Self::concurrent_rowid_hw`]). `view_max` is the table's max rowid
+    /// in the caller's snapshot; the returned base is strictly greater than
+    /// both it and every id ever reserved on this pager, so sibling
+    /// transactions' draws are DISJOINT — their commits MERGE on shared
+    /// hot leaves instead of dying to the row-stamp first-committer-wins
+    /// check. AUTOINCREMENT semantics: reserved-but-unused ids are never
+    /// handed out again (rollback leaves gaps, exactly like SQLite's
+    /// sqlite_sequence). Fails with SQLITE_FULL semantics when the rowid
+    /// space is exhausted (the block is capped at the last usable id; the
+    /// next draw past it fails like `next_auto_rowid`'s overflow path).
+    pub fn reserve_rowids(&self, view_max: i64, n: i64) -> Result<i64> {
+        debug_assert!(n >= 1);
+        let hw = &self.concurrent_rowid_hw;
+        loop {
+            let cur = hw.load(Ordering::Acquire);
+            let base = cur
+                .max(view_max)
+                .checked_add(1)
+                .ok_or_else(|| Error::constraint("database or disk is full"))?;
+            if base == i64::MAX {
+                return Err(Error::constraint("database or disk is full"));
+            }
+            // Cap the block at the last usable id (a request that would
+            // overflow gets a short block; the next draw fails cleanly).
+            let last = (base + n - 1).min(i64::MAX - 1);
+            match hw.compare_exchange(cur, last, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(base),
+                Err(_) => continue, // a sibling drew first — retry above it
+            }
         }
     }
 
@@ -1879,10 +1934,19 @@ impl Pager {
     }
 
     /// The WAL commit for the concurrent critical section. Identical to
-    /// the plain [`Pager::flush`] in WAL mode, minus the lazy-writeback
-    /// and dirty-count fast paths that do not apply here (installs mark
-    /// dirty explicitly), plus the committed-page-count publish.
+    /// the plain [`Pager::flush`] in WAL mode, minus the dirty-count fast
+    /// path (installs mark dirty explicitly), plus the
+    /// committed-page-count publish; the lazy-writeback (in-memory) fast
+    /// path mirrors the plain flush's own no-op.
     fn flush_wal_concurrent(&self) -> Result<()> {
+        // In-memory / lazy-writeback engines: nothing to persist — the
+        // cache IS the committed state (see `flush`'s twin fast path);
+        // publish the committed bound for the regime's snapshot checks.
+        if self.lazy_writeback.load(Ordering::Acquire) {
+            self.committed_n_pages
+                .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
+            return Ok(());
+        }
         if self.wal.read().is_none() {
             // Journal mode cannot flip while a concurrent txn is open
             // (PRAGMA is rejected), but be total anyway.
@@ -1904,6 +1968,17 @@ impl Pager {
     /// Returns the durability ticket (the cumulative WAL frame count
     /// this commit covers; `group_sync(ticket)` waits for the fsync).
     fn flush_wal_deferred_concurrent(&self) -> Result<u64> {
+        // In-memory / lazy-writeback engines: the page cache IS the
+        // committed state — a plain COMMIT no-ops the flush the same way
+        // (see `flush`). The install already landed everything in the
+        // cache; publish the committed bound (the install may have grown
+        // the tree) and hand back the no-op ticket (`group_sync` returns
+        // immediately against it — there is nothing to make durable).
+        if self.lazy_writeback.load(Ordering::Acquire) {
+            self.committed_n_pages
+                .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
+            return Ok(self.wal_frames_total());
+        }
         if self.wal.read().is_none() {
             // Journal mode cannot flip while a concurrent txn is open
             // (PRAGMA is rejected), but be total anyway: the DELETE-journal

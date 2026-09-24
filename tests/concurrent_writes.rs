@@ -237,16 +237,21 @@ fn concurrent_same_hot_page_conflict_first_committer_wins() {
     let (mut db, path) = waldb("cw_conflict");
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
         .unwrap();
-    // Two transactions over the SAME small table (one hot leaf page).
+    // Two transactions writing the SAME EXPLICIT row id on one hot leaf
+    // page — a genuine write-write overlap (the historical auto-id form
+    // collided only through the shared `max_rowid + 1` draw, an accident
+    // the disjoint concurrent rowid reservation fixed: auto-id inserts
+    // on a shared hot page now MERGE, see
+    // `concurrent_auto_rowid_hot_page_merges`).
     Database::set_conn_identity(1);
     db.execute("BEGIN CONCURRENT", []).unwrap();
     Database::set_conn_identity(2);
     db.execute("BEGIN CONCURRENT", []).unwrap();
     Database::set_conn_identity(1);
-    db.execute("INSERT INTO t (v) VALUES ('first')", [])
+    db.execute("INSERT INTO t (id, v) VALUES (10, 'first')", [])
         .unwrap();
     Database::set_conn_identity(2);
-    db.execute("INSERT INTO t (v) VALUES ('second')", [])
+    db.execute("INSERT INTO t (id, v) VALUES (10, 'second')", [])
         .unwrap();
     // First committer wins.
     Database::set_conn_identity(1);
@@ -279,6 +284,50 @@ fn concurrent_same_hot_page_conflict_first_committer_wins() {
     drop(db);
     let db2 = Database::open(&path).unwrap();
     assert_eq!(count(&db2, "t"), 2);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
+fn concurrent_auto_rowid_hot_page_merges() {
+    // The disjoint concurrent rowid reservation (see
+    // `Pager::concurrent_rowid_hw`): sibling transactions' AUTO-id draws
+    // are DISJOINT, so N parallel auto-id INSERT transactions into the
+    // SAME hot leaf page MERGE at commit instead of dying to the
+    // row-stamp first-committer-wins check — the shape the old shared
+    // `max_rowid + 1` draw degraded into a 517 retry storm.
+    let (mut db, path) = waldb("cw_auto_merge");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    // Four interleaved auto-id writers over one empty (hot) table.
+    for id in 1..=4u64 {
+        Database::set_conn_identity(id);
+        db.execute("BEGIN CONCURRENT", []).unwrap();
+        db.execute(
+            "INSERT INTO t (v) VALUES (?)",
+            [Value::Text(format!("w{}", id).into())],
+        )
+        .unwrap();
+    }
+    // All four commit, in order, without conflict.
+    for id in 1..=4u64 {
+        Database::set_conn_identity(id);
+        db.execute("COMMIT", []).unwrap();
+    }
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 4, "all four writers' rows merged");
+    let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_integer()).collect();
+    assert!(
+        ids.windows(2).all(|w| w[0] < w[1]),
+        "disjoint reserved ids, strictly increasing: {ids:?}"
+    );
+    let vals: Vec<String> = rows.iter().map(|r| r[1].as_text().to_string()).collect();
+    assert_eq!(vals, vec!["w1", "w2", "w3", "w4"]);
+    // Durable across reopen.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    assert_eq!(count(&db2, "t"), 4);
     drop(db2);
     cleanup(&path);
 }
@@ -571,6 +620,118 @@ fn concurrent_update_and_delete() {
 }
 
 #[test]
+fn concurrent_insert_then_update_own_row_indexed() {
+    // The mixed R/W write shape: a concurrent transaction INSERTs a row
+    // and then UPDATEs that same row before COMMIT — the update must
+    // find the row in the transaction's OWN shadows (it is not in the
+    // committed view yet), through an INDEX lookup on the update key,
+    // and the committed result must carry the updated value with a
+    // consistent index (the historical bench shape silently no-opped
+    // this: the UPDATE keyed on a value the INSERT never bound).
+    let (mut db, path) = waldb("cw_ins_upd_own");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b REAL NOT NULL)",
+        [],
+    )
+    .unwrap();
+    db.execute("CREATE INDEX ia ON t(a)", []).unwrap();
+    for i in 0..100i64 {
+        db.execute(
+            "INSERT INTO t (a, b) VALUES (?, ?)",
+            [Value::Integer(i), Value::Real(i as f64 * 0.5)],
+        )
+        .unwrap();
+    }
+    // Two interleaved transactions, each insert+update-own-row on a
+    // disjoint `a` range (the hot-page merge shape).
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute(
+        "INSERT INTO t (a, b) VALUES (1000, 500.0)",
+        [Value::Integer(1000), Value::Real(500.0)],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE t SET b = b + 1.0 WHERE a = 1000",
+        [Value::Integer(1000)],
+    )
+    .unwrap();
+    // Identity 1 sees its own post-update value (the row lives in its
+    // shadows — the committed view does not have it yet).
+    let r1: f64 = db.query("SELECT b FROM t WHERE a = 1000", []).unwrap()[0][0].as_real();
+    assert_eq!(r1, 501.0, "identity 1 sees its own updated row");
+    assert_eq!(
+        count(&db, "t"),
+        101,
+        "identity 1 sees base + its own insert"
+    );
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    db.execute(
+        "INSERT INTO t (a, b) VALUES (2000, 1000.0)",
+        [Value::Integer(2000), Value::Real(1000.0)],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE t SET b = b + 2.0 WHERE a = 2000",
+        [Value::Integer(2000)],
+    )
+    .unwrap();
+    // Identity 2 sees its own post-update value but NOT identity 1's
+    // uncommitted row (snapshot isolation).
+    let r2: f64 = db.query("SELECT b FROM t WHERE a = 2000", []).unwrap()[0][0].as_real();
+    assert_eq!(r2, 1002.0, "identity 2 sees its own updated row");
+    assert_eq!(
+        count(&db, "t"),
+        101,
+        "identity 2 sees base + its own insert only"
+    );
+    assert!(
+        db.query("SELECT b FROM t WHERE a = 1000", [])
+            .unwrap()
+            .is_empty(),
+        "identity 2 must not see identity 1's uncommitted row"
+    );
+    // Commit both (disjoint `a` ranges: no conflict).
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "t"), 102);
+    let rows = db
+        .query("SELECT a, b FROM t WHERE a IN (1000, 2000) ORDER BY a", [])
+        .unwrap();
+    assert_eq!(
+        rows[0][1].as_real(),
+        501.0,
+        "committed row 1 carries the update"
+    );
+    assert_eq!(
+        rows[1][1].as_real(),
+        1002.0,
+        "committed row 2 carries the update"
+    );
+    // Index consistency after the concurrent installs: the indexed
+    // probes above and a full index-order scan must agree.
+    let scanned = db
+        .query("SELECT count(*) FROM t WHERE a BETWEEN 0 AND 3000", [])
+        .unwrap()[0][0]
+        .as_integer();
+    assert_eq!(scanned, 102, "index range agrees with the table");
+    // Durable across reopen.
+    drop(db);
+    let db2 = Database::open(&path).unwrap();
+    let rows = db2
+        .query("SELECT a, b FROM t WHERE a IN (1000, 2000) ORDER BY a", [])
+        .unwrap();
+    assert_eq!(rows[0][1].as_real(), 501.0);
+    assert_eq!(rows[1][1].as_real(), 1002.0);
+    drop(db2);
+    cleanup(&path);
+}
+
+#[test]
 fn concurrent_integrity_check_after_mixed_workload() {
     let (mut db, path) = waldb("cw_integrity");
     db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)", [])
@@ -583,8 +744,13 @@ fn concurrent_integrity_check_after_mixed_workload() {
         Database::set_conn_identity(1);
         db.execute("BEGIN CONCURRENT", []).unwrap();
         db.execute(
-            "INSERT INTO a (v) VALUES (?)",
-            [Value::Text(format!("a{}", round).into())],
+            "INSERT INTO a (id, v) VALUES (?, ?)",
+            // High explicit ids: the plain auto-id inserts between rounds
+            // draw dense low ids — stay clear of them.
+            [
+                Value::Integer(round * 1000 + 100),
+                Value::Text(format!("a{}", round).into()),
+            ],
         )
         .unwrap();
         Database::set_conn_identity(2);
@@ -594,12 +760,18 @@ fn concurrent_integrity_check_after_mixed_workload() {
             [Value::Text(format!("b{}", round).into())],
         )
         .unwrap();
-        // A third transaction over table a conflicts with identity 1.
+        // A third transaction writing the SAME EXPLICIT row in table a
+        // conflicts with identity 1 (a genuine write-write overlap —
+        // auto-id draws are disjoint under the concurrent reservation,
+        // so only an explicit same-key write conflicts).
         Database::set_conn_identity(3);
         db.execute("BEGIN CONCURRENT", []).unwrap();
         db.execute(
-            "INSERT INTO a (v) VALUES (?)",
-            [Value::Text(format!("x{}", round).into())],
+            "INSERT INTO a (id, v) VALUES (?, ?)",
+            [
+                Value::Integer(round * 1000 + 100),
+                Value::Text(format!("x{}", round).into()),
+            ],
         )
         .unwrap();
         Database::set_conn_identity(1);

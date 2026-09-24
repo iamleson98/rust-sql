@@ -378,6 +378,10 @@ pub struct RustqliteConnection {
     /// True while THIS connection holds an open `BEGIN CONCURRENT`
     /// transaction (engine-side, keyed by our connection identity).
     concurrent_tx: bool,
+    /// The connection's `concurrent_transactions` option: sqlx
+    /// `Transaction`s open the engine's concurrent regime at their first
+    /// DML statement (see [`RustqliteConnectOptions::concurrent_transactions`]).
+    conc_tx_opt: bool,
     /// A rollback was queued by `Transaction` drop and will be applied on
     /// the next interaction or at close.
     pending_rollback: bool,
@@ -612,6 +616,55 @@ impl Drop for WriteGuardView<'_> {
     }
 }
 
+/// Prepare, bind and step one DML statement to completion on `&Engine` —
+/// shared by the plain path (under the engine WRITE guard) and the
+/// concurrent-transaction path (under the READ guard, where the engine
+/// routes every page operation to the armed identity's private page
+/// shadows). Returns `(rows_affected, last_insert_rowid)`; rows stream
+/// into `out` (RETURNING / … RETURNING forms).
+fn step_dml_stmt(
+    db: &Engine,
+    stmt_sql: &str,
+    values: &[EngineValue],
+    limit_one: bool,
+    logger: &mut QueryLogger,
+    out: &mut Vec<Either<RustqliteQueryResult, RustqliteRow>>,
+) -> Result<(u64, i64), SqlxError> {
+    let mut stmt = db
+        .prepare(stmt_sql)
+        .map_err(crate::sqlx_driver::error::engine_err)?;
+    stmt.bind_all(values)
+        .map_err(crate::sqlx_driver::error::engine_err)?;
+    let (mut columns, mut names): (Option<Columns>, Option<NameMap>) = (None, None);
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => {
+                if columns.is_none() {
+                    let (c, n) = columns_from_names(&stmt_column_names(&stmt));
+                    columns = Some(c);
+                    names = Some(n);
+                }
+                if let Some(row) = stmt.row() {
+                    out.push(Either::Right(RustqliteRow::new(
+                        row.clone(),
+                        columns.as_ref().unwrap(),
+                        names.as_ref().unwrap(),
+                    )));
+                    logger.increment_rows_returned();
+                }
+                if limit_one {
+                    break;
+                }
+            }
+            Ok(StepResult::Done) => break,
+            Err(e) => return Err(crate::sqlx_driver::error::engine_err(e)),
+        }
+    }
+    let rows_affected = stmt.changes().max(0) as u64;
+    let last_rowid = db.last_insert_rowid();
+    Ok((rows_affected, last_rowid))
+}
+
 impl RustqliteConnection {
     /// Open a connection with the given options (see
     /// [`RustqliteConnectOptions`]).
@@ -623,6 +676,7 @@ impl RustqliteConnection {
             tx_depth: 0,
             tx_active: false,
             concurrent_tx: false,
+            conc_tx_opt: options.concurrent_transactions,
             pending_rollback: false,
             busy_timeout: options.busy_timeout,
             gate_cache: StdHashMap::new(),
@@ -999,61 +1053,62 @@ impl RustqliteConnection {
                 }
             }
             Kind::Dml => {
-                // AUTOCOMMIT DML may join a foreign BEGIN CONCURRENT regime
-                // (engine-side implicit join — no BUSY wait); a connection
-                // holding a driver-level transaction must keep waiting for
-                // the regime (its BEGIN predates the join machinery).
-                let mut db = if self.tx_active {
-                    self.acquire_write()?
+                // OPT-IN CONCURRENT TRANSACTIONS
+                // (`RustqliteConnectOptions::concurrent_transactions`):
+                // a driver-level transaction's FIRST DML statement opens
+                // the engine's BEGIN CONCURRENT regime (deferred — a
+                // read-only transaction never opens it, and a transaction
+                // that began with DDL/PRAGMA runs the plain path
+                // end-to-end below). From that statement on, the
+                // transaction executes on its PRIVATE page shadows
+                // through the &self statement path under the engine READ
+                // lock: readers never wait behind it, sibling
+                // concurrent transactions run in parallel, and only
+                // COMMIT takes a short internal critical section
+                // (validate → install/row-merge → one group-commit
+                // fsync on file engines).
+                if self.tx_active
+                    && !self.concurrent_tx
+                    && self.conc_tx_opt
+                    && !self.i_own_engine_tx()
+                {
+                    self.open_concurrent_tx()?;
+                }
+                if self.concurrent_tx {
+                    let db = self.acquire_read()?;
+                    let (ra, rid) =
+                        step_dml_stmt(&db, stmt_sql, values, limit_one, &mut logger, &mut out)?;
+                    rows_affected = ra;
+                    last_rowid = rid;
                 } else {
-                    self.acquire_write_dml()?
-                };
-                // A DEFERRED (sqlx) transaction starts its engine-level
-                // transaction here, at the FIRST write statement — readers
-                // inside never-started deferred transactions stay fully
-                // concurrent until this moment.
-                if self.tx_active && !db.in_transaction.load(Ordering::Acquire) {
-                    db.execute("BEGIN", &[] as &[EngineValue])
-                        .map_err(crate::sqlx_driver::error::engine_err)?;
-                    self.shared.tx_owner.store(self.id, Ordering::Release);
-                }
-                // Mark the open transaction dirty BEFORE the first mutation:
-                // readers that arrive mid-transaction must wait instead of
-                // observing uncommitted rows. (Harmless in autocommit: with
-                // no transaction owner, readers ignore the dirty flag.)
-                self.shared.tx_dirty.store(true, Ordering::Release);
-                let mut stmt = db
-                    .prepare(stmt_sql)
-                    .map_err(crate::sqlx_driver::error::engine_err)?;
-                stmt.bind_all(values)
-                    .map_err(crate::sqlx_driver::error::engine_err)?;
-                let (mut columns, mut names): (Option<Columns>, Option<NameMap>) = (None, None);
-                loop {
-                    match stmt.step() {
-                        Ok(StepResult::Row) => {
-                            if columns.is_none() {
-                                let (c, n) = columns_from_names(&stmt_column_names(&stmt));
-                                columns = Some(c);
-                                names = Some(n);
-                            }
-                            if let Some(row) = stmt.row() {
-                                out.push(Either::Right(RustqliteRow::new(
-                                    row.clone(),
-                                    columns.as_ref().unwrap(),
-                                    names.as_ref().unwrap(),
-                                )));
-                                logger.increment_rows_returned();
-                            }
-                            if limit_one {
-                                break;
-                            }
-                        }
-                        Ok(StepResult::Done) => break,
-                        Err(e) => return Err(crate::sqlx_driver::error::engine_err(e)),
+                    // AUTOCOMMIT DML may join a foreign BEGIN CONCURRENT regime
+                    // (engine-side implicit join — no BUSY wait); a connection
+                    // holding a driver-level transaction must keep waiting for
+                    // the regime (its BEGIN predates the join machinery).
+                    let mut db = if self.tx_active {
+                        self.acquire_write()?
+                    } else {
+                        self.acquire_write_dml()?
+                    };
+                    // A DEFERRED (sqlx) transaction starts its engine-level
+                    // transaction here, at the FIRST write statement — readers
+                    // inside never-started deferred transactions stay fully
+                    // concurrent until this moment.
+                    if self.tx_active && !db.in_transaction.load(Ordering::Acquire) {
+                        db.execute("BEGIN", &[] as &[EngineValue])
+                            .map_err(crate::sqlx_driver::error::engine_err)?;
+                        self.shared.tx_owner.store(self.id, Ordering::Release);
                     }
+                    // Mark the open transaction dirty BEFORE the first mutation:
+                    // readers that arrive mid-transaction must wait instead of
+                    // observing uncommitted rows. (Harmless in autocommit: with
+                    // no transaction owner, readers ignore the dirty flag.)
+                    self.shared.tx_dirty.store(true, Ordering::Release);
+                    let (ra, rid) =
+                        step_dml_stmt(&db, stmt_sql, values, limit_one, &mut logger, &mut out)?;
+                    rows_affected = ra;
+                    last_rowid = rid;
                 }
-                rows_affected = stmt.changes().max(0) as u64;
-                last_rowid = db.last_insert_rowid();
             }
             Kind::Once => {
                 // The AST for the Once arm: either parsed above (ambiguous
@@ -1250,7 +1305,28 @@ impl RustqliteConnection {
             }
             Ast::Commit => {
                 self.tx_active = false;
-                if self.i_own_engine_tx() {
+                if self.concurrent_tx {
+                    // The outermost COMMIT of a driver-level concurrent
+                    // transaction: the &self engine API runs the short
+                    // commit critical section (validate stamps → install
+                    // shadows / row-level MERGE → WAL append + group-commit
+                    // fsync on file engines) — NO outer write lock, so
+                    // readers keep running and sibling concurrent
+                    // transactions keep executing; the engine's install
+                    // gate bounds the atomicity window. A write-write
+                    // conflict surfaces SQLITE_BUSY_SNAPSHOT (retriable);
+                    // the engine already rolled the transaction back.
+                    let r = {
+                        let db = self.shared.db.read();
+                        let prev = crate::api::conn_tls::swap(self.id as u64);
+                        let r = db.commit_concurrent_transaction();
+                        crate::api::Database::set_conn_identity(prev);
+                        r
+                    };
+                    self.concurrent_tx = false;
+                    self.shared.concurrent_end(self.id);
+                    r.map_err(crate::sqlx_driver::error::engine_err)?;
+                } else if self.i_own_engine_tx() {
                     let mut db = self.acquire_write()?;
                     db.execute("COMMIT", &[] as &[EngineValue])
                         .map_err(crate::sqlx_driver::error::engine_err)?;
@@ -1272,7 +1348,12 @@ impl RustqliteConnection {
                     }
                 } else {
                     self.tx_active = false;
-                    if self.i_own_engine_tx() {
+                    if self.concurrent_tx {
+                        // A concurrent transaction's ROLLBACK drops its
+                        // page shadows (nearly free — the live cache was
+                        // never touched) through the &self API.
+                        self.end_concurrent_tx_rollback();
+                    } else if self.i_own_engine_tx() {
                         let mut db = self.acquire_write()?;
                         let _ = db.execute("ROLLBACK", &[] as &[EngineValue]);
                         drop(db);
@@ -1333,7 +1414,9 @@ impl RustqliteConnection {
         self.pending_rollback = false;
         if self.tx_depth > 0 {
             self.tx_active = false;
-            if self.i_own_engine_tx() {
+            if self.concurrent_tx {
+                self.end_concurrent_tx_rollback();
+            } else if self.i_own_engine_tx() {
                 let mut db = self.acquire_write()?;
                 let _ = db.execute("ROLLBACK", &[] as &[EngineValue]);
                 drop(db);
@@ -1355,12 +1438,7 @@ impl RustqliteConnection {
         // outlive the connection that opened it — a leaked concurrent
         // transaction would wedge every plain writer forever.
         if self.concurrent_tx {
-            if let Ok(mut db) = self.try_write_now() {
-                let _ = db.execute("ROLLBACK", &[] as &[EngineValue]);
-                drop(db);
-            }
-            self.concurrent_tx = false;
-            self.shared.concurrent_end(self.id);
+            self.end_concurrent_tx_rollback();
         }
         // Roll back ANY engine-level transaction this connection left
         // open — including raw-script BEGINs that sqlx's tx_depth knows
@@ -1407,6 +1485,76 @@ impl RustqliteConnection {
         // consistency — our own tx cannot be the foreign one here, since
         // the foreign tx belongs to a connection that is still alive.
         Err(crate::sqlx_driver::error::busy())
+    }
+
+    // -- opt-in concurrent transactions -----------------------------------
+
+    /// Open this connection's engine-level `BEGIN CONCURRENT` transaction
+    /// (the first DML of a `concurrent_transactions` driver transaction —
+    /// see [`RustqliteConnectOptions::concurrent_transactions`]).
+    ///
+    /// The regimes are mutually exclusive: a foreign PLAIN transaction
+    /// makes this wait (busy-timeout semantics, like [`Self::acquire_write`]);
+    /// foreign CONCURRENT transactions never do — they are the point of
+    /// the multi-writer regime. The engine call runs on `&self` under the
+    /// READ guard with our identity armed (the transaction registers
+    /// under the connection identity; its statements route to its private
+    /// page shadows from here on).
+    fn open_concurrent_tx(&mut self) -> Result<(), SqlxError> {
+        let deadline = std::time::Instant::now() + self.busy_timeout;
+        loop {
+            if self.shared.foreign_tx(self.id) {
+                let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                if !self.shared.wait_tx_clear(self.id, false, remain) {
+                    return Err(crate::sqlx_driver::error::busy());
+                }
+            }
+            let r = {
+                let db = self.shared.db.read();
+                let prev = crate::api::conn_tls::swap(self.id as u64);
+                let r = db.begin_concurrent_transaction();
+                crate::api::Database::set_conn_identity(prev);
+                r
+            };
+            match r {
+                Ok(()) => break,
+                Err(e) => {
+                    // A foreign plain transaction opened between the wait
+                    // and the engine call: the engine's regime gate
+                    // refused us — wait and retry until the deadline.
+                    // Anything else is a real error (e.g. a non-WAL file
+                    // engine: surface the engine's clear message).
+                    if self.shared.foreign_tx(self.id) && std::time::Instant::now() < deadline {
+                        continue;
+                    }
+                    return Err(crate::sqlx_driver::error::engine_err(e));
+                }
+            }
+        }
+        self.concurrent_tx = true;
+        self.shared.concurrent_begin(self.id);
+        Ok(())
+    }
+
+    /// Roll back and end this connection's open concurrent transaction
+    /// (`&self` engine API under the READ guard — the engine keys the
+    /// transaction by our armed identity), then release the driver-side
+    /// regime bookkeeping. Used by ROLLBACK, dropped transactions, ping
+    /// and close: the regime must never outlive the connection that
+    /// opened it (a leaked concurrent transaction wedges every plain
+    /// writer on BUSY forever).
+    fn end_concurrent_tx_rollback(&mut self) {
+        if !self.concurrent_tx {
+            return;
+        }
+        {
+            let db = self.shared.db.read();
+            let prev = crate::api::conn_tls::swap(self.id as u64);
+            let _ = db.rollback_concurrent_transaction();
+            crate::api::Database::set_conn_identity(prev);
+        }
+        self.concurrent_tx = false;
+        self.shared.concurrent_end(self.id);
     }
 }
 
@@ -1457,6 +1605,13 @@ impl SqlxConnection for RustqliteConnection {
         //   alone (its own Drop handles rollback).
         if self.tx_depth == 0 {
             self.tx_active = false;
+            if self.concurrent_tx {
+                // A leaked concurrent transaction (raw `BEGIN CONCURRENT`
+                // SQL, or a driver tx that escaped its Transaction object)
+                // would wedge every plain writer on the shared engine —
+                // end it now, at pool-return time.
+                self.end_concurrent_tx_rollback();
+            }
             if self.i_own_engine_tx() {
                 if let Ok(mut db) = self.try_write_now() {
                     let _ = db.execute("ROLLBACK", &[] as &[EngineValue]);
@@ -1677,6 +1832,10 @@ pub struct RustqliteConnectOptions {
     pub(crate) shared_cache: bool,
     pub(crate) create_if_missing: bool,
     pub(crate) foreign_keys: bool,
+    /// Run this connection's sqlx `Transaction`s as engine-level
+    /// `BEGIN CONCURRENT` transactions (see
+    /// [`RustqliteConnectOptions::concurrent_transactions`]).
+    pub(crate) concurrent_transactions: bool,
     /// How long statements blocked by another connection's open
     /// transaction wait before failing with SQLITE_BUSY (default 5s,
     /// matching sqlx-sqlite's busy timeout).
@@ -1692,6 +1851,7 @@ impl Default for RustqliteConnectOptions {
             shared_cache: false,
             create_if_missing: false,
             foreign_keys: true,                   // sqlx-sqlite parity
+            concurrent_transactions: false,       // opt-in (see builder)
             busy_timeout: Duration::from_secs(5), // sqlx-sqlite parity
             log_settings: LogSettings::default(),
         }
@@ -1722,6 +1882,47 @@ impl RustqliteConnectOptions {
             shared_cache: false,
             ..Self::default()
         }
+    }
+
+    /// Run this connection's sqlx `Transaction`s (`pool.begin()` /
+    /// `BEGIN` … `COMMIT`) as engine-level `BEGIN CONCURRENT`
+    /// transactions — the optimistic multi-writer regime, transparently.
+    ///
+    /// The transaction's DML statements execute on its PRIVATE page
+    /// shadows under the engine read lock: readers never wait behind
+    /// them, sibling transactions run in parallel, and only COMMIT
+    /// takes a short critical section (validate write-set stamps →
+    /// install shadows / row-level MERGE → one group-commit fsync).
+    /// This is the engine's flagship concurrent-write mode — the same
+    /// machinery as the raw `BEGIN CONCURRENT` SQL statement and the
+    /// `Arc<Database>` `&self` API, surfaced through the plain sqlx
+    /// `Transaction` API. Requires a shared in-memory database
+    /// (`shared_memory` / `cache=shared`) or a file database in WAL
+    /// journal mode; anything else fails the transaction's first DML
+    /// with the engine's clear error.
+    ///
+    /// Semantics (documented divergences from a plain transaction):
+    /// - The regime opens lazily at the FIRST DML statement (read-only
+    ///   transactions never open it and stay fully concurrent).
+    /// - A transaction whose first statement is DDL/PRAGMA runs as a
+    ///   plain transaction end-to-end (the deferred plain path).
+    /// - DDL after the regime opened errors out (regime restriction).
+    /// - COMMIT may surface retriable `SQLITE_BUSY_SNAPSHOT` (517) on a
+    ///   write-write conflict; the transaction is already rolled back —
+    ///   retry the body, the classic optimistic-concurrency loop.
+    ///
+    /// Default: `false` (plain single-writer transactions, sqlx-sqlite
+    /// semantics). URL form: `?concurrent_transactions=true`.
+    pub fn concurrent_transactions(mut self, enabled: bool) -> Self {
+        self.concurrent_transactions = enabled;
+        self
+    }
+
+    /// True when this connection's transactions run as `BEGIN
+    /// CONCURRENT` transactions (see
+    /// [`Self::concurrent_transactions`]).
+    pub fn is_concurrent_transactions(&self) -> bool {
+        self.concurrent_transactions
     }
 
     /// Use an in-memory database.
@@ -1830,6 +2031,10 @@ impl FromStr for RustqliteConnectOptions {
                     "cache" if value == "shared" => options.shared_cache = true,
                     "foreign_keys" => {
                         options.foreign_keys = matches!(value, "true" | "on" | "1" | "yes");
+                    }
+                    "concurrent_transactions" => {
+                        options.concurrent_transactions =
+                            matches!(value, "true" | "on" | "1" | "yes");
                     }
                     "busy_timeout" | "busy_timeout_ms" => {
                         // Milliseconds, like SQLite's PRAGMA busy_timeout.

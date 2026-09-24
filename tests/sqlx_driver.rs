@@ -1773,3 +1773,388 @@ mod json_types {
         assert_eq!(back.0["a"].as_array().map(|a| a.len()), Some(3));
     }
 }
+
+// ===========================================================================
+// Opt-in concurrent transactions (`concurrent_transactions(true)`) — sqlx
+// Transactions running as engine-level BEGIN CONCURRENT: private page
+// shadows, parallel statements, short commit critical section, retriable
+// 517 on write-write conflicts.
+// ====================================================================================
+
+async fn conc_pool() -> RustqlitePool {
+    let id = POOL_ID.fetch_add(1, Ordering::Relaxed);
+    RustqlitePool::connect_with(
+        RustqliteConnectOptions::shared_memory(format!("conc-{id}")).concurrent_transactions(true),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn conc_tx_commit_visibility_and_isolation() {
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut tx = c1.begin().await.unwrap();
+    sqlx::query("INSERT INTO t (v) VALUES ('a')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (v) VALUES ('b')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // Mid-transaction isolation: a foreign connection sees the COMMITTED
+    // state only (the regime never blocks readers and never serves them
+    // uncommitted shadows).
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "foreign reader must not see uncommitted rows");
+
+    tx.commit().await.unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "rows visible after commit");
+}
+
+#[tokio::test]
+async fn conc_tx_rollback_discards() {
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut tx = c1.begin().await.unwrap();
+    sqlx::query("INSERT INTO t (v) VALUES ('x')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "rollback drops the shadows entirely");
+
+    // The connection is reusable and the regime is gone: a plain write
+    // through the pool proceeds immediately.
+    sqlx::query("INSERT INTO t (v) VALUES ('y')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn conc_tx_two_parallel_transactions() {
+    // THE money test: two SIMULTANEOUS transactions on separate pool
+    // connections, both writing, both committing — the shape SQLite's WAL
+    // serializes end-to-end on its single write lock.
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, w INT NOT NULL, v TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut c2 = pool.acquire().await.unwrap();
+    let mut tx1 = c1.begin().await.unwrap();
+    let mut tx2 = c2.begin().await.unwrap();
+
+    // Interleaved writes: each transaction's statements run while the
+    // other's is open (impossible under plain single-writer semantics).
+    for i in 0..25 {
+        sqlx::query("INSERT INTO t (w, v) VALUES (1, ?)")
+            .bind(format!("a{i}"))
+            .execute(&mut *tx1)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (w, v) VALUES (2, ?)")
+            .bind(format!("b{i}"))
+            .execute(&mut *tx2)
+            .await
+            .unwrap();
+    }
+    tx1.commit().await.unwrap();
+    tx2.commit().await.unwrap();
+
+    let (n1,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM t WHERE w = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (n2b,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM t WHERE w = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((n1, n2b), (25, 25), "both transactions fully committed");
+}
+
+#[tokio::test]
+async fn conc_tx_same_row_first_committer_wins() {
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE acct (id INTEGER PRIMARY KEY, bal INT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO acct (id, bal) VALUES (1, 100)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut c2 = pool.acquire().await.unwrap();
+    let mut tx1 = c1.begin().await.unwrap();
+    let mut tx2 = c2.begin().await.unwrap();
+    sqlx::query("UPDATE acct SET bal = bal - 30 WHERE id = 1")
+        .execute(&mut *tx1)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE acct SET bal = bal - 50 WHERE id = 1")
+        .execute(&mut *tx2)
+        .await
+        .unwrap();
+    tx1.commit().await.unwrap();
+
+    // Same-row write-write conflict: retriable SQLITE_BUSY_SNAPSHOT (517),
+    // the transaction already rolled back.
+    let err = tx2.commit().await.unwrap_err();
+    let db_err = err.as_database_error().expect("database error");
+    assert_eq!(
+        db_err.code().as_deref(),
+        Some("517"),
+        "expected SQLITE_BUSY_SNAPSHOT, got: {}",
+        db_err.message()
+    );
+
+    let bal: i64 = sqlx::query_scalar("SELECT bal FROM acct WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bal, 70, "first committer wins");
+
+    // The classic optimistic retry loop through the SAME connections.
+    let mut tx3 = c2.begin().await.unwrap();
+    sqlx::query("UPDATE acct SET bal = bal - 50 WHERE id = 1")
+        .execute(&mut *tx3)
+        .await
+        .unwrap();
+    tx3.commit().await.unwrap();
+    let bal: i64 = sqlx::query_scalar("SELECT bal FROM acct WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bal, 20, "retry after conflict succeeds");
+}
+
+#[tokio::test]
+async fn conc_tx_readonly_transaction_never_opens_regime() {
+    // Deferral: a read-only transaction must not block a plain writer on
+    // another connection (the regime opens at the FIRST DML, never for
+    // reads — the read-tx-everywhere pool pattern stays fully concurrent).
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (v) VALUES ('seed')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut tx = c1.begin().await.unwrap();
+    let v: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(v, "seed");
+
+    // While the read transaction is open, a PLAIN autocommit write (and
+    // even DDL) on another connection proceeds without BUSY.
+    sqlx::query("INSERT INTO t (v) VALUES ('concurrent')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE other (x INT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn conc_tx_ddl_first_runs_plain() {
+    // A transaction whose first statement is DDL runs the plain path
+    // end-to-end (the deferred plain semantics) — DDL stays transactional.
+    let pool = conc_pool().await;
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut tx = c1.begin().await.unwrap();
+    sqlx::query("CREATE TABLE d (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO d (v) VALUES ('in-tx')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM d")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn conc_tx_dropped_transaction_rolls_back() {
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    {
+        let mut tx = c1.begin().await.unwrap();
+        sqlx::query("INSERT INTO t (v) VALUES ('doomed')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // Drop without commit: the regime must end NOW (a leaked
+        // concurrent transaction would wedge every plain writer forever).
+    }
+    // The connection returns to the pool; the next user must find a clean
+    // engine — a plain write succeeds and the doomed row is gone.
+    sqlx::query("INSERT INTO t (v) VALUES ('after')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "dropped transaction rolled back at drop time");
+}
+
+#[tokio::test]
+async fn conc_tx_file_wal_durability() {
+    // The opt-in also works on FILE databases in WAL mode — and commits
+    // are durable across a full pool close/reopen.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("conc.db");
+    let opts = RustqliteConnectOptions::filename(&path)
+        .create_if_missing(true)
+        .concurrent_transactions(true);
+    let pool = RustqlitePool::connect_with(opts).await.unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut tx = c1.begin().await.unwrap();
+    for i in 0..50 {
+        sqlx::query("INSERT INTO t (v) VALUES (?)")
+            .bind(format!("row{i}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    // Return the leased connection BEFORE closing the pool (sqlx's
+    // `close()` waits for every connection to come home).
+    drop(c1);
+    pool.close().await;
+
+    let pool2 = RustqlitePool::connect_with(RustqliteConnectOptions::filename(&path))
+        .await
+        .unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
+    assert_eq!(n, 50, "concurrent transaction durable across reopen");
+    pool2.close().await;
+}
+
+#[tokio::test]
+async fn conc_tx_readers_never_wait_mid_transaction() {
+    // Between a concurrent transaction's statements the engine's live
+    // cache holds only committed bytes — foreign readers (including a
+    // scan) proceed without any BUSY/wait. This is the 8-conn mixed R/W
+    // shape in miniature: the writer's transaction is open, readers flow.
+    let pool = conc_pool().await;
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for i in 0..100 {
+        sqlx::query("INSERT INTO t (v) VALUES (?)")
+            .bind(format!("r{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let mut c1 = pool.acquire().await.unwrap();
+    let mut tx = c1.begin().await.unwrap();
+    sqlx::query("INSERT INTO t (v) VALUES ('w1')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // Foreign scan mid-transaction: must see the 100 committed rows and
+    // complete without waiting for the writer's transaction to end.
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 100, "foreign scan sees committed state only");
+
+    sqlx::query("INSERT INTO t (v) VALUES ('w2')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 102);
+}
+
+#[tokio::test]
+async fn conc_tx_url_param_parses() {
+    let opts: RustqliteConnectOptions =
+        "rustqlite://file:mydb?mode=memory&cache=shared&concurrent_transactions=true"
+            .parse()
+            .unwrap();
+    assert!(opts.is_concurrent_transactions());
+    assert!(opts.is_shared_cache());
+    // Default stays plain.
+    let plain = RustqliteConnectOptions::shared_memory("x");
+    assert!(!plain.is_concurrent_transactions());
+}

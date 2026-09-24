@@ -735,6 +735,21 @@ pub struct Pager {
     /// the same page ids (they always do: roots start at low sequential
     /// ids). See `write_epoch`.
     pub(crate) instance_id: u64,
+    /// GLOBAL rowid high-water for the concurrent regime (the highest id
+    /// ever handed to an auto-rowid allocation inside a BEGIN CONCURRENT
+    /// transaction). Sibling concurrent transactions allocate from the
+    /// SAME BEGIN-time view, so the plain `max_rowid + 1` would hand the
+    /// SAME next id to every sibling — the later committer then loses to
+    /// the row-stamp first-committer-wins check and the whole shape
+    /// degrades into a retry storm. Concurrent-scope allocations instead
+    /// reserve ids (in blocks, one CAS per block) from this monotonic
+    /// counter: siblings get DISJOINT rowids, hot-page commits MERGE.
+    /// AUTOINCREMENT semantics (ids are never reused; rollback leaves
+    /// gaps) — the same trade SQLite's own AUTOINCREMENT makes for its
+    /// sqlite_sequence. Plain (non-concurrent) statements never touch
+    /// it: they keep the dense `tree-max + 1` allocation, which is always
+    /// above every committed concurrent install.
+    pub(crate) concurrent_rowid_hw: std::sync::atomic::AtomicI64,
     /// SAVEPOINT undo stack (SQLite-style nested transactions).
     ///
     /// Each level holds the pager metadata at SAVEPOINT time plus page
@@ -1717,6 +1732,7 @@ impl Pager {
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
                 .unwrap_or(0),
+            concurrent_rowid_hw: std::sync::atomic::AtomicI64::new(0),
             savepoints: Mutex::new(Vec::new()),
             savepoint_min_base: std::sync::atomic::AtomicU32::new(u32::MAX),
             savepoint_capture_gate: std::sync::atomic::AtomicU32::new(u32::MAX),

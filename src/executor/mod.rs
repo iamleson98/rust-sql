@@ -20801,6 +20801,17 @@ fn dbg_rowid() -> bool {
 /// is unused (100 attempts), then linearly scan for the first gap in the
 /// rowid space, and finally fail gracefully instead of overflowing.
 pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64, autoinc: bool) -> Result<i64> {
+    // CONCURRENT REGIME: sibling transactions allocate from the SAME
+    // BEGIN-time view, so the plain `max_rowid + 1` hands the SAME next
+    // id to every sibling — the later committer then loses to the
+    // row-stamp first-committer-wins check (an auto-id INSERT storm
+    // degrades into retriable-517 retries). Inside an armed concurrent
+    // scope, draw from the GLOBAL high-water instead: siblings get
+    // DISJOINT ids and hot-page commits MERGE (see
+    // `Pager::concurrent_rowid_hw` / `Pager::reserve_rowids`).
+    if pager.armed_writer_scope().is_some() {
+        return pager.reserve_rowids(max_rowid, 1);
+    }
     // Fast path: there is still room above the current maximum.
     if max_rowid < i64::MAX {
         if dbg_rowid() {
