@@ -1103,3 +1103,17 @@ Work Log:
 Stage Summary:
 - master @ 8395e18: 31/31 CI green with the two validation fixes + the regression suite + the triage harness.
 - The residual 1M-scale corruption hunt (recycled-page-id/stale-shadow class, now ~1/6-1/12 timing-dependent) continues with the shipped instrumentation (tests/soak_repro.rs + RSQL_DBG_FLUSH prints).
+
+---
+Task ID: 43
+Agent: main (Super Z)
+Task: The macOS S2 guard rescale + final status docs.
+
+Work Log:
+- Run 36166037794 (@0373368): limit-stress (macos) tripped S2's insert-degradation guard AGAIN (5.97 -> 46.12 ms, 7.73x vs the 3x+25ms bound) — two marginal trips in three runs: the tail is stable (~46-51 ms, 785k cache misses / APFS page-fault preads) while the head shrinks on faster runners, growing the ratio. Same guard-calibration class as the Windows draw Task 40 scaled.
+- Rescaled S2 for macOS (9f8eec2): its own 10x+80ms insert bound (still catches an algorithmic collapse; ubuntu keeps the tight 3x+25ms gate), commit-side unchanged. The same treatment a83e48d gave Windows.
+- Run 36170104679 (@9f8eec2): 31/31 green on all three OSes — limit-stress included.
+- README status header -> the new green run.
+
+Stage Summary:
+- master green at 9f8eec2 with: two concurrent right-edge validation fixes (decision reads + cross-scope append hints), the deterministic interleaving regression suite, the 1M-scale triage harness, the bench-gate hot-path fix, and the macOS S2 guard rescale.
