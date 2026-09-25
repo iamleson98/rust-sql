@@ -2720,6 +2720,9 @@ impl Pager {
             if dirty_on_insert {
                 // Back under dirty tracking: the commit path must see it.
                 self.note_dirty(id);
+                if std::env::var_os("RSQL_DBG_TRACE").is_some() {
+                    eprintln!("[UNSPILL] page {id} re-cached dirty + re-noted");
+                }
             }
             page_ref
         };
@@ -3578,10 +3581,38 @@ impl Pager {
         } else {
             // Cache hygiene only: zero the in-cache copy so no code can
             // read the freed page's stale bytes as live data. NOT dirty —
-            // the durable copy never changes for leaf entries.
+            // the durable copy never changes for leaf entries — EXCEPT
+            // when the page has NO durable copy at all: a recycled
+            // concurrent-txn allocation beyond the durable file length
+            // with no WAL frame (splice_txn_freed materializes exactly
+            // such a zeroed page so THIS function's get_page can't
+            // short-read). Clearing its dirty flag would leave the
+            // zeros cache-only — the first clean eviction discards the
+            // page from every medium and the freelist then references
+            // an unreadable page (integrity "page N unreadable"; the
+            // freelist's next pop short-reads). The limit-suite soak
+            // pinned it: 4 concurrent writers + 2 readers, default
+            // 2000-KiB cache at 1M rows. Keep such a page dirty so the
+            // next flush writes its zeros to the WAL.
+            let durable_pages = (self.store_len() / self.page_size() as u64) as u32;
+            let wal_has = {
+                let wal = self.wal.read();
+                wal.as_ref()
+                    .map(|s| s.map.contains_key(&id))
+                    .unwrap_or(false)
+            };
             let mut borrowed = page_ref.lock();
             borrowed.data.fill(0);
-            borrowed.dirty = false;
+            if id >= durable_pages && !wal_has {
+                borrowed.dirty = true;
+                drop(borrowed);
+                self.note_dirty(id);
+            } else {
+                // Durable copy exists (file covers the id or a WAL frame
+                // holds it): the freed body's zeros never need to reach
+                // a medium.
+                borrowed.dirty = false;
+            }
         }
         self.freelist_count.fetch_add(1, Ordering::AcqRel);
         self.note_write();
@@ -3887,6 +3918,10 @@ impl Pager {
                 return Ok(()); // already in WAL mode
             }
         }
+        // Regime-capable from here on: plain reader walks must gate
+        // against concurrent installs even at moments when no
+        // transaction is open (see ConcurrentManager::regime_capable).
+        self.concurrent.mark_regime_capable();
         if self.codec.read().is_active() {
             return Err(crate::error::Error::semantic(
                 "journal_mode=WAL is unavailable while a page codec is active",
@@ -4083,6 +4118,30 @@ impl Pager {
 
     /// [`Self::checkpoint_wal`] with the writer lease already held.
     fn checkpoint_wal_locked(&self) -> Result<()> {
+        // CACHE-SNAPSHOT-FIRST — LOCK-ORDER DISCIPLINE. The engine's
+        // global order is [cache → wal]: get_page's miss path holds
+        // cache.write while it probes the WAL's spill map (wal.write),
+        // and fetch_committed_bytes takes cache.read before wal.read.
+        // The previous lazy cache-first serve probed the cache INSIDE
+        // this wal.write() window — the reverse order — and the two
+        // sides deadlocked: a committer's post-commit auto-checkpoint
+        // (wal.write held, waiting on cache.read below) against a plain
+        // reader's page fault (cache.write held, waiting on wal.write
+        // for the spill probe). The limit-suite soak pinned it — 4
+        // concurrent writers + 2 readers, ~35s into the first
+        // transaction on 2-core runners — and the parking_lot deadlock
+        // detector printed the exact cycle. Fix: gather the RESIDENT
+        // PageRefs under one brief cache.read() taken BEFORE the WAL
+        // lock, then serve each page's bytes inside the window from its
+        // Arc (page mutex — a leaf lock, never held across wal/cache
+        // acquisitions). The snapshot is bounded by the cache capacity
+        // (a few hundred Arc clones, ~16 KiB) so the bounded-memory
+        // point of the original optimization stands: bytes are still
+        // cloned lazily, one page at a time, into the run buffer.
+        let cached: std::collections::HashMap<PageId, PageRef> = {
+            let cache = self.cache.read();
+            cache.iter().map(|(id, pr)| (id, pr.clone())).collect()
+        };
         let mut guard = self.wal.write();
         let Some(state) = guard.as_mut() else {
             return Ok(());
@@ -4112,18 +4171,19 @@ impl Pager {
         // CACHE-FIRST SERVE: every page-cached id is served by a ~100 ns
         // cache hit + memcpy instead of a ~1 us WAL pread; only cache
         // misses pay the frame read under the lock below. The pages are
-        // probed LAZILY, one at a time inside the run loop (a ~4 KB copy
-        // per probe, bounded by the 1 MiB run buffer's lifetime): the
-        // previous eager gather cloned EVERY cached page up front — up to
-        // a full 512-page cache = 2 MiB of transient copies on every
-        // checkpoint — which stacked on the run buffer's own peak.
-        let cache_read_page = |id: PageId| -> Option<Vec<u8>> {
-            let cache = self.cache.read();
-            cache.get(id).map(|pr| {
+        // served from the PRE-GATHERED snapshot Arcs (see the lock-order
+        // note at the top of this function — no cache lock is ever taken
+        // inside the WAL window), one page at a time into the run
+        // buffer's lifetime: the previous eager gather cloned EVERY
+        // cached page up front — up to a full 512-page cache = 2 MiB of
+        // transient copies on every checkpoint — which stacked on the
+        // run buffer's own peak.
+        let cache_read_page =
+            |id: PageId, cached: &std::collections::HashMap<PageId, PageRef>| -> Option<Vec<u8>> {
+                let pr = cached.get(&id)?;
                 let b = pr.lock();
-                b.data.clone()
-            })
-        };
+                Some(b.data.clone())
+            };
         // COALESCED RUNS: consecutive page ids are contiguous in the
         // main file; when their frame offsets are ALSO consecutive
         // (flush_wal appends sorted, so they usually are), one read+write
@@ -4167,7 +4227,7 @@ impl Pager {
             if id == 0 {
                 continue; // header goes LAST (crash safety)
             }
-            let cached_page = cache_read_page(id);
+            let cached_page = cache_read_page(id, &cached);
             let bytes: &[u8] = if let Some(b) = cached_page.as_deref() {
                 b
             } else {
@@ -4352,6 +4412,26 @@ impl Pager {
         // covers, captured under the WAL write lock (the monotonically
         // increasing durability order — see `group_sync`).
         let ticket_out: u64;
+        // CACHE-SNAPSHOT-FIRST — the same lock-order discipline as
+        // `checkpoint_wal_locked` (see the full note there): the engine's
+        // order is [cache → wal] (get_page's miss path holds cache.write
+        // across its wal.write spill probe), so this wal.write() window
+        // must never take the cache lock. The previous per-page
+        // `self.cache.read()` probe inside the window was the reverse
+        // order and deadlocked against a concurrent page fault (the
+        // limit-suite soak pinned the cycle). Gather the dirty pages'
+        // PageRefs under ONE brief cache.read() BEFORE the WAL lock; the
+        // byte copy + dirty-clear stay inside the window (the page mutex
+        // is a leaf lock). A page that misses the snapshot (spilled and
+        // not yet re-cached — the `continue` arm) is covered exactly as
+        // before: its spill frame is absorbed into the commit below.
+        let page_refs: std::collections::HashMap<PageId, PageRef> = {
+            let cache = self.cache.read();
+            dirty_ids
+                .iter()
+                .filter_map(|id| cache.get(*id).map(|pr| (*id, pr.clone())))
+                .collect()
+        };
         {
             let mut guard = self.wal.write();
             let Some(state) = guard.as_mut() else {
@@ -4364,8 +4444,9 @@ impl Pager {
             };
             let mut scratch = vec![0u8; psz as usize];
             for (i, id) in dirty_ids.iter().enumerate() {
-                let page_ref = self.cache.read().get(*id).cloned();
-                let Some(page_ref) = page_ref else { continue };
+                let Some(page_ref) = page_refs.get(id) else {
+                    continue;
+                };
                 {
                     let mut borrowed = page_ref.lock();
                     if !borrowed.dirty {

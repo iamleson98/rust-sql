@@ -327,6 +327,15 @@ pub(crate) fn try_parallel_fused_aggregate(
             let filter_slot = plan.filter_slot;
             handles.push(scope.spawn(move || -> Result<FusedWalk> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 let mut walk = FusedWalk::new(
                     col_slot.clone(),
@@ -519,6 +528,15 @@ pub(crate) fn try_parallel_distinct_aggregate(
             let positions = positions.clone();
             handles.push(scope.spawn(move || -> Result<(Vec<AggState>, bool)> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 let mut states: Vec<AggState> = (0..n_aggs).map(|_| AggState::default()).collect();
                 let mut saw_any_row = false;
@@ -716,6 +734,15 @@ pub(crate) fn try_parallel_groupby_selective(
             let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> Result<HashGrouper> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
@@ -1112,6 +1139,15 @@ pub(crate) fn try_parallel_groupby_compiled(
             let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> Result<HashGrouper> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
@@ -1283,6 +1319,15 @@ pub(crate) fn try_parallel_count(
         for &(lo, hi) in ranges.iter() {
             handles.push(scope.spawn(move || -> Result<u64> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 bt.count_rows_range(lo, hi)
             }));
@@ -1387,6 +1432,15 @@ pub(crate) fn try_parallel_topn(
             let coll = coll.clone();
             handles.push(scope.spawn(move || -> Result<Vec<super::TopnSel>> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let coll_ref = coll.as_deref();
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
@@ -1513,6 +1567,15 @@ pub(crate) fn try_parallel_topn_expr(
             let identity = &identity;
             handles.push(scope.spawn(move || -> Result<Vec<super::TopnSel>> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let coll_ref = coll.as_deref();
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
@@ -1766,6 +1829,15 @@ pub(crate) fn try_parallel_sort_expr(
             let identity = &identity;
             handles.push(scope.spawn(move || -> Result<ExprSortChunk> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
                 let mut rows: Vec<(i64, Vec<Value>, Row)> = Vec::new();
@@ -2066,6 +2138,10 @@ pub(crate) fn try_parallel_aggregate_rows(
             let seps = seps.clone();
             handles.push(scope.spawn(move || -> (Vec<AggState>, bool) {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
                 let mut states: Vec<AggState> = (0..n_aggs).map(|_| AggState::default()).collect();
                 let mut saw_any_row = false;
                 for row in part.iter() {
@@ -2253,6 +2329,10 @@ pub(crate) fn try_parallel_groupby_rows(
             let aggregates_for_grouper = aggregates;
             handles.push(scope.spawn(move || -> HashGrouper {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
                         aggregates_for_grouper,
@@ -2537,6 +2617,10 @@ pub(crate) fn try_parallel_sort_rows(
             let resolved = &resolved;
             handles.push(scope.spawn(move || -> ExprSortChunk {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
                 let mut rows: Vec<(i64, Vec<Value>, Row)> = Vec::with_capacity(part.len());
                 for (i, row) in part.into_iter().enumerate() {
                     let mut keys = Vec::with_capacity(resolved.len());
@@ -2706,6 +2790,15 @@ pub(crate) fn try_parallel_sort(
             let row_keys = &row_keys;
             handles.push(scope.spawn(move || -> Result<SortChunk> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut bt = Btree::new(pager, root, false);
                 let mut rows: Vec<(i64, Row)> = Vec::new();
                 bt.scan_table_range_selective(
@@ -2924,6 +3017,15 @@ pub(crate) fn try_parallel_join_probe(
             let built_key_slots = StdArc::clone(&built_key_slots);
             handles.push(scope.spawn(move || -> Result<WorkerOut> {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
+                // leaf — the limit-suite soak pinned a 27-row-short
+                // parallel COUNT). plain_reader_gate() is None unless the
+                // engine is regime-capable (WAL attached) or the regime is
+                // active — single-writer/DELETE-mode engines pay nothing.
+                let _worker_reader_gate = pager.plain_reader_gate();
                 let mut out_rows: Vec<crate::Row> = Vec::new();
                 let mut pbuf: Vec<crate::types::Value> = Vec::new();
                 let mut pks: Vec<u64> = vec![0u64; n_keys];
@@ -3243,6 +3345,10 @@ pub(crate) fn try_parallel_nested_join(
         for &(lo, hi) in ranges.iter() {
             handles.push(scope.spawn(move || -> WorkerOut {
                 let _enc_guard = super::conn_enc::reinstall(conn_enc_tag);
+                // READER GATE: workers are foreign threads — the calling
+                // thread's install-gate read guard does NOT cover them.
+                // Without this, a concurrent COMMIT's shadow install can
+                // interleave with the worker's range walk (torn boundary
                 let mut out_rows: Vec<Row> = Vec::new();
                 let mut bitmap: Vec<u64> = if right_tail {
                     vec![0u64; right_words]

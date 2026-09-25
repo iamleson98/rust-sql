@@ -1035,3 +1035,23 @@ Work Log:
 
 Stage Summary:
 - The dbstat gap is CLOSED (eponymous + function + aggregate forms); sqlite_dbdata (forensic deleted-page reader) remains the open half of the old bullet.
+
+---
+Task ID: 39
+Agent: main (Super Z)
+Task: CI rerun on HEAD (e78de60) triage — the limit suite had NEVER completed a CI run (every prior run cancelled at the 60-min timeout). Root-caused and fixed FIVE real bugs the suite's S4 soak pinned.
+
+Work Log:
+- Re-ran cancelled CI 36014149978 on e78de60: 27 jobs green, but limit-stress (all 3 OSes) hit the 60-min timeout — after 2 fast finishers, one test held the suite's serial mutex for 55+ min in silence. The suite had never been green anywhere.
+- Reproduced locally (2-core): limit_concurrent_soak hangs ~35s in, all threads futex-parked. parking_lot deadlock_detection (dev-dep, local only) printed the exact cycle: committer group_sync→checkpoint_wal_locked [wal.write held → cache.read] × plain reader get_page miss [cache.write held → wal.write spill probe]. The inversion came from 39389cf's cache-first-serve optimization (lazy per-page cache probes inside the WAL window). The spill path's try_write defense covered only the eviction side, not get_page's blocking probe.
+- FIX 1+2 (deadlock): both wal-holders now gather PageRefs under ONE brief cache.read() BEFORE taking wal.write (engine lock order [cache → wal] everywhere); checkpoint serves snapshot Arcs (content-read under page mutex inside the window — content-replace keeps Arc clones valid); flush probes the snapshot per dirty id. install/absorb semantics unchanged (skipped ids are spill-covered).
+- Soak then COMPLETED (2s) but failed integrity: "main database is truncated … page N unreadable" (tail pages ~1/run) + occasional reader count regression (27 rows short, instant self-heal retry) + occasional index corruption (121 entries missing). All three = further real bugs, previously masked by the hang:
+- FIX 3 (freelist corruption): splice_txn_freed materializes zeroed DIRTY pages for recycled tail ids so free_page's get_page can't short-read — but free_page's leaf-hygiene arm then CLEARED the dirty flag ("durable copy never changes" — false for a page with NO durable copy): the first clean eviction discarded the page from every medium → the freelist referenced an unreadable page (integrity "truncated"; the freelist's next pop would short-read). free_page now keeps such pages dirty (+note_dirty) when id ≥ durable file length AND no WAL frame.
+- FIX 4 (torn reads, regime-inactive window): plain_reader_gate skipped the install gate when any_active() was momentarily false (e.g. all 4 writers between txns at soak start) — an ungated multi-page walk straddled the next install (opening COUNT 27 rows short). New sticky ConcurrentManager::regime_capable, set at enable_wal (both PRAGMA and open-time attach route there): WAL-mode plain readers ALWAYS hold the gate; non-WAL engines keep the one-load fast path.
+- FIX 5 (torn reads, parallel workers): parallel_scan engages when max_rowid_hint ≥ 131072 — the writers' 1e9 ids trivially clear it — and the scoped workers walked pages on foreign threads NOT covered by the caller's gate (module docs even admit workers are foreign to TLS arming). All 10 page-walking worker closures now take plain_reader_gate() themselves (the 4 pre-materialized-row-chunk workers correctly don't).
+- Local validation (2-core, release): engine lib 271, concurrent_writes 44, wal 9, crash_recovery 10, parallel_scan 56, committed_view 10, durability 33, clippy -D warnings clean, fmt clean. Soak 8/8 on the clean build; FULL 8-section limit suite with CI knobs passes in 99s (the 60-min CI timeout was purely the deadlock).
+- KNOWN RESIDUAL (not in this push): an intermittent (~1/6 under debug builds) tree-shape corruption — a leaf observed holding [99888..99973, 1e9+1..1e9+25] with seed rows 99974..100000 stranded in another leaf (writer rows placed into a stale leaf — likely the concurrent split/merge path; same signature as the index corruption). Walk-trace captured; next round: pin the split/merge placement. The walk's early-exit (rowid > end → stop) is correct for sorted trees — the corruption breaks the contiguity assumption.
+
+Stage Summary:
+- The limit suite is now COMPLETABLE: 5 real bugs fixed (2 deadlock lock-orders, freelist dirty-flag loss, reader-gate regime window, parallel-worker gate). All CI-scale knobs pass locally in full.
+- The soak stays in CI as the pin for the residual split/merge bug hunt.

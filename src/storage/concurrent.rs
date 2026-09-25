@@ -374,6 +374,19 @@ pub struct ConcurrentManager {
     /// with a commit in the first place, so the gate stays uncontended
     /// there.
     install_gate: RwLock<()>,
+    /// Sticky "the engine is regime-CAPABLE" marker: set the first time
+    /// WAL mode attaches on a file-backed pager. While set, PLAIN reader
+    /// walks always hold the install gate's read side — `any_active()`
+    /// alone is not a sound gate condition: at a moment when every
+    /// concurrent transaction happens to be closed (e.g. right at a
+    /// soak's start, before the first BEGIN), an ungated multi-page walk
+    /// can straddle the FIRST install that lands mid-walk (the
+    /// limit-suite soak pinned it: a reader's opening COUNT came back 27
+    /// rows short — one torn leaf boundary — while the immediate retry
+    /// was correct). Never cleared: after the first WAL attach the
+    /// lock-free reader fast path stays off for the engine's life (an
+    /// uncontended gate read is ~20ns per query).
+    regime_capable: std::sync::atomic::AtomicBool,
 }
 
 /// RAII decrement for [`ConcurrentManager::commit_window`] (unwind-safe).
@@ -401,6 +414,7 @@ impl ConcurrentManager {
             committing: AtomicUsize::new(0),
             roots_moved: AtomicUsize::new(0),
             install_gate: RwLock::new(()),
+            regime_capable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -442,6 +456,17 @@ impl ConcurrentManager {
     /// path.
     pub fn any_active(&self) -> bool {
         self.active.load(Ordering::Acquire) > 0 || self.committing.load(Ordering::Acquire) > 0
+    }
+
+    /// Mark the engine regime-CAPABLE (WAL attached on a file-backed
+    /// pager) — see the `regime_capable` field doc. Idempotent.
+    pub(crate) fn mark_regime_capable(&self) {
+        self.regime_capable.store(true, Ordering::Release);
+    }
+
+    /// True once WAL mode has attached (sticky).
+    pub(crate) fn regime_capable(&self) -> bool {
+        self.regime_capable.load(Ordering::Acquire)
     }
 
     /// True when at least one committed root move is known (the engine's
@@ -883,7 +908,18 @@ impl Pager {
     /// validation is the isolation mechanism, and an owner's statement
     /// may legitimately run while a sibling commits.
     pub fn plain_reader_gate(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
-        if !self.concurrent.any_active() {
+        // Gate condition: the regime is active OR the engine is
+        // regime-CAPABLE (WAL attached, sticky). `any_active()` alone is
+        // NOT sound: between two concurrent transactions (all writers
+        // momentarily closed — e.g. right at a soak's start, before the
+        // first BEGIN) an ungated multi-page walk can straddle the next
+        // install that lands mid-walk (the limit-suite soak pinned the
+        // torn read: a reader's opening COUNT, 27 rows short, retried
+        // correct). The sticky flag closes the hole for the engine's
+        // life; non-WAL engines keep the one-load fast path (installs
+        // are impossible without the regime, and the regime requires
+        // WAL).
+        if !self.concurrent.any_active() && !self.concurrent.regime_capable() {
             return None;
         }
         Some(self.concurrent.install_gate.read())
