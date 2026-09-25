@@ -1047,6 +1047,9 @@ fn limit_concurrent_soak() {
         let mut d = Database::open(&path).unwrap();
         d.execute("PRAGMA journal_mode = WAL", []).unwrap();
         d.execute("PRAGMA synchronous = NORMAL", []).unwrap();
+        if let Some(cs) = std::env::var("SOAK_CACHE_SIZE").ok() {
+            d.execute(&format!("PRAGMA cache_size = {cs}"), []).unwrap();
+        }
         Arc::new(d)
     };
     let committed = Arc::new(AtomicU64::new(0));

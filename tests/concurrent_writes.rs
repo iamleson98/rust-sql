@@ -1075,6 +1075,16 @@ mod driver {
         let mut conns: Vec<_> = (0..4)
             .map(|_| rustqlite::sqlx_driver::RustqliteConnection::open(&opts).unwrap())
             .collect();
+        // WIDEN the leader's coalescing window for THIS burst: the default
+        // 100 us is far below Windows' 1-15 ms thread-wakeup granularity —
+        // four barrier-aligned COMMITs can arrive staggered past the window
+        // on a windows runner (observed 2026-09-25: syncs=4 commits=4, the
+        // followers each became their own leader), making the amortization
+        // assert a scheduler dice-roll there. 50 ms makes the coalescing
+        // deterministic on every platform; the assertion itself is
+        // unchanged (fewer group fsyncs than group commits still requires
+        // the leader/follower machinery to actually work).
+        conns[0].pager_handle().set_group_commit_delay_us(50_000);
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
         let mut joins = Vec::new();
