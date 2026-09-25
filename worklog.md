@@ -1089,3 +1089,17 @@ Work Log:
 Stage Summary:
 - Two real concurrent-commit validation holes closed (decision reads + cross-scope hints); deterministic regression suite added.
 - The corruption rate at 1M scale dropped from ~1/4 to ~1/6-1/12 (timing-dependent); the residual is a recycled-page-id/stale-shadow class with the instrumentation now shipped for the next round.
+
+---
+Task ID: 42
+Agent: main (Super Z)
+Task: CI validation rounds for the two right-edge validation fixes (fdb4f31 + bd4437a).
+
+Work Log:
+- Push fdb4f31 -> CI run 36154893718: 28/30 green, bench-gate failed on ubuntu+macos — INSERT (multi-VALUES 100/batch) 0.59x vs SQLite (40.9% slower). Root cause: the corruption-hunt triage instrumentation left per-row env-gated eprintlns on the hot insert paths (the append write, the split entries, the splices, the cell writer) — std::env::var_os is a linear environment scan PER APPENDED ROW. Local A/B confirmed: 2.75M -> 2.10M rows/s (-24%). Stripped all four call sites (the commit-path [DECISION-*] prints stay — per-commit, not per-row, RSQL_DBG_FLUSH-gated like the existing [CONFLICT]/[MERGE-END] traces). Local bench re-verified at baseline: 2.77M rows/s (1.21x vs SQLite); lib 271 + concurrent suites + the new interleavings green; fmt + clippy clean.
+- Push bd4437a -> CI run 36159305309: 30/31, limit-stress (macos) failed — S2's insert-degradation guard (6.95x vs the 3x+25ms guard; 785k cache misses, first-batches 7.29ms / last 50.72ms). The S2 path is single-threaded bulk load — the fixes add ~0.2% (early-return atomics); the failure shape matches the documented macOS/Windows runner-noise class (Task 40 scaled the Windows guard for exactly this). Reran the failed job: PASSED — 31/31 green. Confirmed runner noise, not a regression.
+- Updated the README status header to the new fully-green run (8395e18).
+
+Stage Summary:
+- master @ 8395e18: 31/31 CI green with the two validation fixes + the regression suite + the triage harness.
+- The residual 1M-scale corruption hunt (recycled-page-id/stale-shadow class, now ~1/6-1/12 timing-dependent) continues with the shipped instrumentation (tests/soak_repro.rs + RSQL_DBG_FLUSH prints).
