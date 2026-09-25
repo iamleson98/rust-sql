@@ -1055,3 +1055,19 @@ Work Log:
 Stage Summary:
 - The limit suite is now COMPLETABLE: 5 real bugs fixed (2 deadlock lock-orders, freelist dirty-flag loss, reader-gate regime window, parallel-worker gate). All CI-scale knobs pass locally in full.
 - The soak stays in CI as the pin for the residual split/merge bug hunt.
+
+---
+Task ID: 40
+Agent: main (Super Z)
+Task: Post-fix CI validation round — two Windows flakes closed, the residual index-corruption repro narrowed.
+
+Work Log:
+- CI on 12b529b (the five-bug fix push): 28/30 green; limit-stress PASSED on ubuntu (4.1 min) and macOS (4.4 min) — first-ever completions; on Windows 7/8 passed including the soak, only limit_million_row_file (S2) failed: the INSERT-side degradation guard tripped 8.43→72.13 ms (8.6x) at 785k cache misses — Windows AV+flush makes late-batch page-fault preads 10-50x costlier than ubuntu, so the "pure CPU" side is not I/O-free there (ubuntu's clean 1.3x is the algorithmic gate). Platform-scaled the S2 guards (linux/macOS keep 3x+25ms insert / 20x+250ms commit; windows 12x+120ms / 30x+2000ms — runaway still trips by an order of magnitude). Landed as a83e48d.
+- CI on a83e48d: 29/31 green — limit-stress green on ALL THREE OSES (Windows too, 26 min wall). One failure: sqlx driver_group_commit_amortizes_fsync on Windows (syncs=4 commits=4) — four barrier-aligned COMMITs arrived staggered past the leader's default 100-us coalescing window (Windows thread wakeups are 1-15 ms apart), every follower became its own leader. The test now sets a 50-ms window via the connection's pager_handle before the burst (assertion unchanged). Landed as 33d61d8.
+- 33d61d8 accidentally carried a local-triage env knob (SOAK_CACHE_SIZE) that trips clippy match_result_ok — removed and pushed as 7f2c228; CI run 36100506681 validates.
+- Residual index-corruption hunt: NOT reproducible below the 1M-row seed (50k/30k/20k rows, tiny caches 10-100 pages, up to 400 txns — 30+ clean runs); at 1M + cache=100 it reproduces ~1/4 with the SAME deterministic signature ("index entries out of order or duplicated at rowid 25817" — the k(gen_row(25816)) region). The corrupted tree's page histogram is NORMAL (no short leaves): the corruption is content-level — entries duplicated/misplaced, ~122 rows missing across the index — pointing at a stale-base install or the merge replay's index-op placement at ONE deterministic k-boundary. S4's failure path now auto-dumps the full integrity report + per-page dbstat inventories of both trees (no env knobs) for the next round.
+- Local: full sqlx concurrent_writes suite 55/55 green; limit suite 8/8 at CI scale (100 s); clippy -D warnings clean (all configs incl. sqlx); fmt clean.
+
+Stage Summary:
+- CI is one clean run away from fully green: 29/31 at a83e48d; both misses were Windows timing flakes, both closed (S2 platform scaling, group-commit 50-ms window), clippy leak cleaned.
+- The residual intermittent index corruption is pinned to a deterministic k-region at 1M scale; repro recipe + auto-diagnostics in place for the next hunt.
