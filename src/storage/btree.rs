@@ -1695,16 +1695,6 @@ impl ScanBatch {
     }
 }
 
-/// Cached RSQL_DBG_CELL env probe (triage): log every writer-range
-/// table-cell placement. One relaxed load per cell after the first probe.
-fn dbg_cell_trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let v = std::env::var("RSQL_DBG_CELL").unwrap_or_default();
-        !v.is_empty() && v != "0"
-    })
-}
-
 pub struct Btree<'a> {
     pub pager: &'a Pager,
     pub root: PageId,
@@ -3022,9 +3012,6 @@ impl<'a> Btree<'a> {
             Some(txn) => hint.filter(|h| h.scope == Some(txn)),
             None => hint,
         };
-        if std::env::var_os("RSQL_DBG_REPLAY").is_some() && hint.is_none() {
-            eprintln!("[HINT-DROP] rowid={rowid} (cross-scope hint gated)");
-        }
         let r = self.insert_table_append_inner(rowid, payload, hint);
         // Stamp the outgoing hint with the CURRENT scope so its next use
         // (this transaction only) passes the guard above.
@@ -3552,16 +3539,6 @@ impl<'a> Btree<'a> {
 
         // Append: write cell at the new content start, write pointer at end.
         {
-            if std::env::var_os("RSQL_DBG_REPLAY").is_some() {
-                let cell_ptr = borrowed.cell_pointer(n - 1) as usize;
-                let prev_last = varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?)
-                    .map(|(v, _)| v)
-                    .unwrap_or(0);
-                eprintln!(
-                    "[APPEND] leaf={leaf_id} rowid={rowid} prev_last={prev_last} scope_hint={:?}",
-                    hint.scope
-                );
-            }
             let new_content_start = borrowed.cell_content_start().saturating_sub(cell_size);
             let off = new_content_start as usize;
             if off + cell_size as usize > borrowed.data.len() {
@@ -4843,12 +4820,6 @@ impl<'a> Btree<'a> {
                                 }
                             };
                             let s1 = cell1.encoded_size() as u32;
-                            if dbg_cell_trace() && !is_idx_now {
-                                eprintln!(
-                                    "[SPLICE:rm] parent={page_id} cell1=({child_id},{}) new_right={new_page}",
-                                    split_key - 1
-                                );
-                            }
                             if free >= s1 + 2 {
                                 let content_start = {
                                     let b = page.lock();
@@ -4927,14 +4898,6 @@ impl<'a> Btree<'a> {
                             };
                             let s1 = cell1.encoded_size() as u32;
                             let s2 = cell2.encoded_size() as u32;
-                            if dbg_cell_trace() && !is_idx_now {
-                                let k1 = split_key - 1;
-                                let k2 = decode_table_interior_key(&page.lock().data[old_off..])
-                                    .unwrap_or(i64::MAX);
-                                eprintln!(
-                                    "[SPLICE:mid] parent={page_id} cell1=({child_id},{k1}) cell2=({new_page},{k2})"
-                                );
-                            }
                             if free >= s1 + s2 + 2 {
                                 let content_start = {
                                     let b = page.lock();
@@ -5247,9 +5210,6 @@ impl<'a> Btree<'a> {
     /// it a second time was one full cache round-trip (RwLock + hash +
     /// Arc clone) per inserted cell, paid by every scattered-key insert.
     fn insert_cell_into_ref(&mut self, page_id: PageId, page: &PageRef, cell: &Cell) -> Result<()> {
-        if cell.key() >= 1_000_000_000 && dbg_cell_trace() {
-            eprintln!("[CELL->{}] key={}", page_id, cell.key());
-        }
         if crate::executor::dbg_index_trace() {
             let pt = self
                 .pager
@@ -5695,37 +5655,6 @@ impl<'a> Btree<'a> {
                     None => return Ok(None),
                 }
             };
-            if dbg_cell_trace() {
-                let (old_last, new_last) = {
-                    let (op, np) = (
-                        self.pager.get_page(page_id)?,
-                        self.pager.get_page(new_page_id)?,
-                    );
-                    let (ob, nb) = (op.lock(), np.lock());
-                    let ol = if ob.n_cells() > 0 {
-                        varint::decode_signed(
-                            &ob.data[ob.cell_pointer(ob.n_cells() - 1) as usize..],
-                        )
-                        .map(|(v, _)| v)
-                        .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    let nl = if nb.n_cells() > 0 {
-                        varint::decode_signed(
-                            &nb.data[nb.cell_pointer(nb.n_cells() - 1) as usize..],
-                        )
-                        .map(|(v, _)| v)
-                        .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    (ol, nl)
-                };
-                eprintln!(
-                    "[SPLIT:mid] old={page_id} new={new_page_id} split_key={split_key} old_last={old_last} new_last={new_last}"
-                );
-            }
             Ok(Some(InsertResult::Split {
                 new_page: new_page_id,
                 split_key,
@@ -5787,12 +5716,6 @@ impl<'a> Btree<'a> {
         // the merge replay re-inserts against the CURRENT tree; if not,
         // the view was current and the promotion is sound.
         self.pager.note_decision_read(page_id);
-        if std::env::var_os("RSQL_DBG_REPLAY").is_some() {
-            eprintln!(
-                "[SPLIT:append] old={page_id} new={new_page_id} cell_key={}",
-                new_cell.key()
-            );
-        }
         // Write ONLY the new cell into the new page.
         self.insert_cell_into_page(new_page_id, &new_cell)?;
 
@@ -5973,14 +5896,6 @@ impl<'a> Btree<'a> {
     }
 
     fn split_leaf(&mut self, page_id: PageId, new_cell: Cell) -> Result<InsertResult> {
-        if std::env::var_os("RSQL_DBG_REPLAY").is_some() {
-            eprintln!(
-                "[SPLIT] old={} new_cell_key={} scope={:?}",
-                page_id,
-                new_cell.key(),
-                self.pager.armed_writer_scope()
-            );
-        }
         // ------------------------------------------------------------------------
         // APPEND-MODE SPLIT — O(1) fast path.
         //
