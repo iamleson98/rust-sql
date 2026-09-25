@@ -189,6 +189,20 @@ pub struct ConcurrentTxn {
     /// Shadow ids dirtied (mirrors the shadow pages' own `dirty` flags;
     /// kept for O(1) install-path iteration and diagnostics).
     dirtied: HashSet<PageId>,
+    /// STRUCTURAL DECISION READS: pages whose content steered this
+    /// transaction's writes even though the page itself stayed
+    /// byte-identical (its shadow never turned dirty) — insert-descent
+    /// interiors that routed a cell, the right-most-leaf walk, an
+    /// append-split's old page. A decision made from a STALE view (a
+    /// sibling commit installed a newer version after this transaction
+    /// fetched the page) can graft separators that mis-route the
+    /// sibling's committed keys: the S4 soak's stranded-rows corruption
+    /// (leaf [..360, 1.02e9..25] under a separator of 360 — the 25
+    /// sibling rows unreachable by descent, range walks truncated at
+    /// the order break). Commit re-validates these pages' stamps and
+    /// routes moved ones through the merge path like any write
+    /// conflict; see `Pager::note_decision_read`.
+    pub(crate) decision_reads: HashSet<PageId>,
     /// Row-level write journal, in execution order. Populated by
     /// [`Pager::note_row_write`] at the B-tree entry-function boundary
     /// while a writer scope is armed. Pages whose changes are fully
@@ -230,6 +244,7 @@ impl ConcurrentTxn {
             allocated: Vec::new(),
             freed: Vec::new(),
             dirtied: HashSet::new(),
+            decision_reads: HashSet::new(),
             row_journal: Vec::new(),
             op_ok: Vec::new(),
             root_lineage: HashMap::new(),
@@ -1043,6 +1058,33 @@ impl Pager {
                     conflicts.push(*id);
                 }
             }
+            // ---- DECISION-READ validation: pages whose CONTENT steered
+            // this transaction's structural writes even though the page
+            // itself stayed byte-identical (clean shadows install nothing
+            // and were historically skipped — but a decision derived from
+            // a STALE clean shadow can graft separators that mis-route a
+            // sibling commit's keys; the S4 soak's stranded-rows
+            // corruption). Same stamp discipline as dirty shadows: a
+            // moved stamp routes the whole commit through the merge path,
+            // where the replay re-derives every placement against the
+            // current trees.
+            for id in &txn.decision_reads {
+                let recorded = txn.read_stamps.get(id).copied().unwrap_or(0);
+                let now = stamps.get(id).copied().unwrap_or(0);
+                if now != recorded && !conflicts.contains(id) {
+                    if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+                        eprintln!("[DECISION-CONFLICT] page {id}: base {recorded} now {now}");
+                    }
+                    conflicts.push(*id);
+                }
+            }
+            if std::env::var_os("RSQL_DBG_FLUSH").is_some() && !txn.decision_reads.is_empty() {
+                eprintln!(
+                    "[DECISION-SET] txn {} marked {} pages",
+                    txn.id,
+                    txn.decision_reads.len()
+                );
+            }
         }
         // ---- ROOT-VIEW validation: the fetch-time stamp gate protects
         // PAGES, not tree ROOTS. A sibling commit may have installed a new
@@ -1571,7 +1613,7 @@ impl Pager {
                             op.rowid
                         )));
                     }
-                    bt.insert_table(op.rowid, &op.payload)?
+                    bt.insert_table(op.rowid, &op.payload)?;
                 }
                 JournalKind::Replace => {
                     // No parity check: the in-place "fits" decision depends
@@ -2508,6 +2550,42 @@ impl Pager {
                     },
                 });
                 txn.op_ok.push(true);
+            }
+        }
+    }
+
+    /// Record a STRUCTURAL DECISION READ for the armed transaction:
+    /// `id`'s content was read to decide WHERE or HOW other pages get
+    /// written, while the page itself stays byte-identical in this
+    /// transaction (its shadow remains clean). Clean shadows are
+    /// skipped by the commit validation — "installs nothing, loses
+    /// nothing" — but that reasoning only covers the page's OWN bytes.
+    /// It does not cover decisions DERIVED from stale content: an
+    /// insert descended a stale interior (the sibling split that page
+    /// after our fetch, moving a separator boundary), a right-most
+    /// walk that no longer ends at the tree's true right edge, or an
+    /// append-split promoting a separator below the old page's real
+    /// max. Installing the derived structure then strands the
+    /// sibling's committed rows behind mis-routed interior cells.
+    /// Marking the page routes it through the standard
+    /// validate-or-merge discipline at commit: if the stamp moved, the
+    /// transaction conflicts and the merge replay re-derives every
+    /// placement against the CURRENT trees; if it did not, the shadow
+    /// was current and the decision was sound.
+    ///
+    /// No-op unless a concurrent writer scope is armed (one atomic
+    /// load) — the single-writer paths have no validation net and need
+    /// none (the engine write lock serializes them against installs).
+    pub(crate) fn note_decision_read(&self, id: PageId) {
+        let Some(txn_id) = self.armed_writer_scope() else {
+            return; // plain-write path: serialized, no stale-view hazard
+        };
+        if id == 0 {
+            return; // the schema root is page-0-exempt like the late-touch gate
+        }
+        if let Some(mut guard) = self.concurrent.get(txn_id) {
+            if let Some(txn) = guard.get_mut(&txn_id) {
+                txn.decision_reads.insert(id);
             }
         }
     }
