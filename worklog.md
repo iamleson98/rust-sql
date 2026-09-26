@@ -1266,3 +1266,18 @@ Work Log:
 Stage Summary:
 - The SQLite-format container's per-commit cost is now O(changed object) CPU + O(changed pages) I/O on every autocommit path (WAL and DELETE modes), with multi-session page-space sharing, a real freelist, and file-derived layout adoption on reopen.
 - Pushing for CI; the loop continues until everything is green.
+
+---
+Task ID: 53
+Agent: main (Super Z)
+Task: Fix the first CI round's failures (clippy on the new example, the bench-gate epoch cost) and close the loop green.
+
+Work Log:
+- CI run 36258067623 on 4b38e32: clippy failed on all four configs — the native-fuzz repro example carried the same `blob.into()` useless-conversion already fixed in the test file (CI clippy runs --all-targets; my local gate had covered --lib --tests only). bench-gate (ubuntu) failed on the multi-row VALUES row: rustqlite 3.49ms vs SQLite 3.32ms — 5.1% vs the 5% tolerance. Root cause: the epoch machinery ran UNGATED — two relaxed fetch-adds per row plus a shard-lock + hash + Arc clone per Btree handle on EVERY workload, including native and in-memory containers that never consume the signal.
+- Fix: a pager-level `epoch_tracking` flag, enabled only by from_sqlite_file / open_sqlite_format; native and in-memory handles share a static disabled cell (no lock, no hash, no atomic on the insert hot path). The ENTRY-side bumps were removed entirely — redundant with the EXIT-side bumps, which are the ones that close the publish race (failed statements restore their pages and need no signal). Local gate extended to `cargo clippy --all-targets -- -D warnings`.
+- Local validation: 1388 passed / 0 failed (default matrix), fmt + clippy --all-targets -D warnings clean.
+- CI run 36259628058 on 9d31855: COMPLETED / SUCCESS — 31/31 jobs green on all three OSes (default matrix, sqlx, no-default, oom-injection, compat-ABI race, torture, bench-gate, million-record compare, limit-stress at 1M scale, interop incl. the new foreign_incremental suite). ubuntu-default counted 1393 passed (1388 + 5 doc tests).
+- README status header -> 36259628058 @ 9d31855 (1393 default-matrix tests), narrative extended with the incremental page-diff architecture and the epoch-gating note.
+
+Stage Summary:
+- The loop is green at 9d31855 with the architecture landed; this docs push re-triggers CI (watch + verify, per the loop).
