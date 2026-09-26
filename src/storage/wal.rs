@@ -216,6 +216,51 @@ pub fn lifecycle_guard() -> &'static parking_lot::ReentrantMutex<()> {
     &GUARD
 }
 
+/// Per-path engine GENERATION epochs, keyed by the sidecar path (the
+/// same key the WAL writer lease uses). Every file-backed `Pager` open
+/// under the lifecycle guard bumps its path's epoch; a pager remembers
+/// the epoch it was born in; its close-time teardown compares the two
+/// and SKIPS the close-time checkpoint + sidecar removal when a newer
+/// generation has since opened the path.
+///
+/// Why — the stale-teardown clobber (the wal_delete_race hunt,
+/// 2026-09-26): a dying generation's teardown can run AFTER a successor
+/// generation already lived and retired (the teardown's guard
+/// acquisition can be arbitrarily delayed past the successor's whole
+/// lifetime). Its close-time checkpoint would then write its OWN — by
+/// then STALE — committed map over the successor's newer main file
+/// (undoing the successor's committed rows), and its inode-identity
+/// sidecar removal cannot distinguish "my log" from "the successor's
+/// log at the same reused inode". The `retired` flag covers VACUUM's
+/// in-place replacement; this covers NORMAL generation boundaries —
+/// same hazard class, same fix shape: the old pager never writes after
+/// a newer one existed.
+///
+/// The map is monotone and never shrinks (one small entry per database
+/// path ever opened by the process — the engines registry's Weak map
+/// already has the same shape).
+pub fn bump_generation(sidecar: &Path) -> u64 {
+    static GENERATIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
+    > = std::sync::OnceLock::new();
+    let map = GENERATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|p| p.into_inner());
+    let next = g.get(sidecar).copied().unwrap_or(0) + 1;
+    g.insert(sidecar.to_path_buf(), next);
+    next
+}
+
+/// The path's current generation epoch (0 = no pager ever bumped it —
+/// treat as "no successor exists").
+pub fn current_generation(sidecar: &Path) -> u64 {
+    static GENERATIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
+    > = std::sync::OnceLock::new();
+    let map = GENERATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let g = map.lock().unwrap_or_else(|p| p.into_inner());
+    g.get(sidecar).copied().unwrap_or(0)
+}
+
 /// Stable on-disk file identity: (device, inode) on Unix, (volume serial,
 /// file index) on Windows. `None` where the platform or the metadata read
 /// cannot provide it — callers must treat `None` as "do NOT remove".

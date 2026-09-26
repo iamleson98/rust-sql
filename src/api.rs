@@ -2401,6 +2401,16 @@ impl Database {
         }
         let mut catalog = Catalog::new();
         catalog.schema_cookie = pager.schema_cookie();
+        // Engine GENERATION epoch (see storage::wal::bump_generation):
+        // this open is a new generation of the engine at this path —
+        // recorded here, under the lifecycle guard, so any older
+        // generation's still-pending teardown observes the advance
+        // BEFORE its close-time checkpoint / sidecar removal and skips
+        // both (a stale map must never clobber this generation's state;
+        // the wal_delete_race hunt, 2026-09-26).
+        pager.note_generation(crate::storage::wal::bump_generation(
+            &crate::storage::wal::wal_path_for(&path),
+        ));
         // Load the schema from page 0 (the schema table root).
         load_schema(&pager, &mut catalog)?;
         // Seed the persisted-root map from the loaded schema so

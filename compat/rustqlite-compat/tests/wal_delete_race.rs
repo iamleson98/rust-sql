@@ -143,6 +143,10 @@ fn count(db: &Db, sql: &str) -> Result<i64, String> {
     Ok(v)
 }
 
+extern "C" {
+    fn sqlite3_last_insert_rowid(db: *mut compat::sqlite3) -> i64;
+}
+
 fn wal_path(db: &std::path::Path) -> PathBuf {
     let mut s = db.as_os_str().to_os_string();
     s.push("-wal");
@@ -176,6 +180,23 @@ fn wal_survives_engine_retirement_race() {
     // opens the next generation inside that window.
     let closing = Arc::new(AtomicBool::new(false));
     let b_done = Arc::new(AtomicBool::new(false));
+
+    // Diagnostics: every exec error this test currently swallows (B's
+    // journal_mode pragma, B's INSERT, A's pragma). The 2026-09-26 CI
+    // trip ("got 7260, want 7259" — one MORE row than B counted)
+    // proved an INSERT can report an error while its row lands, but the
+    // error STRING was discarded, so the trip was undiagnosable. These
+    // surface the exact class on the next occurrence.
+    let b_pragma_errs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let b_insert_errs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let b_open_errs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let a_pragma_errs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // Forensic pair (see B's thread): every landed gen row's rowid + the
+    // fresh-open count after EVERY iteration — pinpoints the iteration
+    // (hence engine generation) whose row vanishes and the moment the
+    // loss becomes visible.
+    let b_rows = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+    let b_probe = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
 
     // Watchdog: consequence-based detector. The broken state is an
     // engine committing into an UNLINKED WAL: the -wal path stays absent
@@ -219,9 +240,14 @@ fn wal_survives_engine_retirement_race() {
         let b_closing = closing.clone();
         let b_done_b = b_done.clone();
         let b_conns = open_conns.clone();
+        let b_pragma_errs = b_pragma_errs.clone();
+        let b_insert_errs = b_insert_errs.clone();
+        let b_open_errs = b_open_errs.clone();
+        let b_rows = b_rows.clone();
+        let b_probe = b_probe.clone();
         let b = std::thread::spawn(move || -> i64 {
             let mut inserted = 0i64;
-            for _ in 0..ITERATIONS {
+            for it in 0..ITERATIONS {
                 // Wait for A's "closing now" signal.
                 let mut spins = 0;
                 while !b_closing.load(Ordering::Acquire) && spins < 5_000_000 {
@@ -230,14 +256,48 @@ fn wal_survives_engine_retirement_race() {
                 }
                 // Open the next generation + create its WAL — racing A's
                 // close-time sidecar removal.
-                if let Ok(db) = open_rw(&b_db_path) {
-                    b_conns.fetch_add(1, Ordering::Relaxed);
-                    let _ = exec(&db, "PRAGMA journal_mode=WAL;");
-                    if exec(&db, "INSERT INTO t (v) VALUES ('gen')").is_ok() {
-                        inserted += 1;
+                match open_rw(&b_db_path) {
+                    Ok(db) => {
+                        b_conns.fetch_add(1, Ordering::Relaxed);
+                        if let Err(e) = exec(&db, "PRAGMA journal_mode=WAL;") {
+                            b_pragma_errs
+                                .lock()
+                                .unwrap()
+                                .push(format!("it{it} journal_mode: {e}"));
+                        }
+                        match exec(&db, "INSERT INTO t (v) VALUES ('gen')") {
+                            Ok(()) => {
+                                inserted += 1;
+                                // The row's id: at mismatch time this maps
+                                // the missing/extra row back to the exact
+                                // iteration (hence generation) that
+                                // produced it.
+                                b_rows
+                                    .lock()
+                                    .unwrap()
+                                    .push(unsafe { sqlite3_last_insert_rowid(db.0) });
+                            }
+                            Err(e) => b_insert_errs
+                                .lock()
+                                .unwrap()
+                                .push(format!("it{it} insert: {e}")),
+                        }
+                        b_conns.fetch_sub(1, Ordering::Relaxed);
+                        drop(db);
                     }
-                    b_conns.fetch_sub(1, Ordering::Relaxed);
-                    drop(db);
+                    Err(e) => b_open_errs
+                        .lock()
+                        .unwrap()
+                        .push(format!("it{it} open: {e}")),
+                }
+                // Post-iteration durability probe: a FRESH open counts
+                // the world as the next generation will see it. Any
+                // committed row lost so far surfaces HERE, at the exact
+                // iteration boundary — long before the final assert.
+                if let Ok(pdb) = open_rw(&b_db_path) {
+                    let c = count(&pdb, "SELECT COUNT(*) FROM t").unwrap_or(-1);
+                    b_probe.lock().unwrap().push(c);
+                    drop(pdb);
                 }
                 b_done_b.store(true, Ordering::Release);
                 // Wait for A to clear the handshake for the next round.
@@ -251,10 +311,16 @@ fn wal_survives_engine_retirement_race() {
         });
         // Thread A: batch insert, then retire (LAST connection).
         let a_conns = open_conns.clone();
+        let a_pragma_errs = a_pragma_errs.clone();
         for i in 0..ITERATIONS {
             let db = open_rw(&db_path).unwrap();
             a_conns.fetch_add(1, Ordering::Relaxed);
-            let _ = exec(&db, "PRAGMA journal_mode=WAL;");
+            if let Err(e) = exec(&db, "PRAGMA journal_mode=WAL;") {
+                a_pragma_errs
+                    .lock()
+                    .unwrap()
+                    .push(format!("it{i} journal_mode: {e}"));
+            }
             let mut sql = String::with_capacity(BATCH_ROWS * 30);
             for r in 0..BATCH_ROWS {
                 if r > 0 {
@@ -296,6 +362,42 @@ fn wal_survives_engine_retirement_race() {
         "live fd to a DELETED -wal file: an engine generation ran on an \
          unlinked inode (the 2026-09-18 datxevui outage signature)"
     );
+    // Self-diagnosing mismatch dump: the discarded-error classes above
+    // are exactly what a mismatch needs to be attributed (an insert that
+    // reports failure while its row lands shows up as one entry in
+    // b_insert_errs + total one ABOVE `want`).
+    if total != want {
+        eprintln!("---- race diagnostics ----");
+        eprintln!("B open errors: {:?}", b_open_errs.lock().unwrap());
+        eprintln!("B pragma errors: {:?}", b_pragma_errs.lock().unwrap());
+        eprintln!("B insert errors: {:?}", b_insert_errs.lock().unwrap());
+        eprintln!("A pragma errors: {:?}", a_pragma_errs.lock().unwrap());
+        eprintln!("B landed rowids: {:?}", b_rows.lock().unwrap());
+        eprintln!(
+            "B per-iter fresh-open counts: {:?}",
+            b_probe.lock().unwrap()
+        );
+        // Row-level census through the final connection: which ids are
+        // missing pinpoints the victim row (A's batch range vs B's gen
+        // range are disjoint).
+        {
+            let db = open_rw(&db_path).unwrap();
+            let minmax = count(
+                &db,
+                "SELECT (SELECT min(id) FROM t), (SELECT max(id) FROM t), (SELECT count(*) FROM t WHERE id <= 7200)",
+            );
+            eprintln!("final min/max id + A-range count: {minmax:?}");
+            let n_missing = count(
+                &db,
+                "SELECT count(*) FROM t WHERE id > 7200 AND id <= 7200 + 200",
+            );
+            eprintln!("gen-rowid census (id in (7200, 7400]): {n_missing:?}");
+            let seq = count(&db, "SELECT seq FROM sqlite_sequence WHERE name = 't'");
+            eprintln!("sqlite_sequence.t.seq: {seq:?}");
+            let wal_meta = std::fs::metadata(wal_path(&db_path));
+            eprintln!("final -wal metadata: {wal_meta:?}");
+        }
+    }
     assert_eq!(
         total, want,
         "committed rows lost across generations (got {total}, want {want})"

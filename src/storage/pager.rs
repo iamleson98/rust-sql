@@ -891,6 +891,18 @@ pub struct Pager {
     /// bookkeeping (checkpoint / set_len / sidecar removal) so it cannot
     /// clobber the freshly written compact image. See `retire()`.
     retired: AtomicBool,
+    /// This pager's engine GENERATION epoch for its path (see
+    /// `storage::wal::bump_generation`): assigned at open under the
+    /// lifecycle guard. 0 = not tracked (pre-assignment window, or a
+    /// pager constructed outside `Database::open`'s guarded path) — the
+    /// teardown treats 0 as "no successor can exist" and keeps the
+    /// historical behavior. A nonzero value that no longer matches the
+    /// path's current epoch means a NEWER generation opened this file
+    /// after us — the teardown then skips its close-time checkpoint +
+    /// sidecar removal entirely (a stale map must never clobber the
+    /// successor's newer main file, and the inode-identity removal
+    /// cannot distinguish a same-inode reused sidecar).
+    generation: std::sync::atomic::AtomicU64,
     /// PRAGMA parallel_scan — the minimum estimated row count at which
     /// single-table aggregate scans split across worker threads (see
     /// `executor::parallel`). 0 disables intra-statement parallelism
@@ -1462,6 +1474,22 @@ impl Drop for Pager {
             // the removal deletes the NEW generation's just-created WAL
             // and strands it on a deleted inode.
             let _guard = crate::storage::wal::lifecycle_guard().lock();
+            // STALE-GENERATION GUARD (the wal_delete_race hunt,
+            // 2026-09-26): this teardown can run arbitrarily late —
+            // including AFTER a successor generation opened this path,
+            // lived its whole life and retired. Its close-time
+            // checkpoint would then write OUR (by then stale) committed
+            // map over the successor's newer main file — silently
+            // undoing the successor's committed rows — and the
+            // inode-identity removal below cannot tell our old sidecar
+            // from the successor's reused-inode one. A superseded
+            // generation skips both: its committed frames were already
+            // replayed into the successor's map at the successor's open
+            // (the sidecar survived because THAT teardown skipped, or
+            // folded by the successor's own close).
+            if self.superseded_by_newer_generation() {
+                return;
+            }
             // WAL WRITER LEASE: only the lease owner may checkpoint +
             // remove the sidecar. A read-only second handle closing while
             // the live owner appends would otherwise truncate the log
@@ -1472,6 +1500,37 @@ impl Drop for Pager {
                 crate::storage::wal::WalLease::Foreign(_)
             );
             if am_owner {
+                // REFRESH the committed map from the sidecar before the
+                // fold: our map was built at OUR open (+ our own
+                // appends) — another handle's frames committed after
+                // that (it held the writer lease, released it at its
+                // own teardown, and its fold was skipped as superseded)
+                // are in the LOG but not in our MAP. Folding the stale
+                // map would write old page versions over the newer
+                // main file and the WAL reset below would then destroy
+                // the only other copy — permanent loss of the other
+                // handle's committed rows. The sidecar under the lease
+                // is the authoritative committed state, so re-recover
+                // it FRESH (our own Wal instance's frame counter only
+                // tracks our appends + our open-time recovery — it
+                // cannot see another handle's later frames) and adopt
+                // both the recovered map and the handle. A bounded scan
+                // (O(frames)) paid once at close.
+                {
+                    let mut g = self.wal.write();
+                    if let Some(state) = g.as_mut() {
+                        if state.spilled.is_empty() {
+                            if let Ok(mut fresh) =
+                                crate::storage::wal::Wal::open(&self.path, self.page_size())
+                            {
+                                if let Ok(map) = fresh.committed_page_map() {
+                                    state.map = map.into_iter().collect();
+                                    state.wal = fresh;
+                                }
+                            }
+                        }
+                    }
+                }
                 let _ = self.checkpoint_wal();
                 // Ownership-checked removal: delete the sidecar only when
                 // the path still holds OUR file (same inode). A newer
@@ -1754,6 +1813,7 @@ impl Pager {
             cache_size_setting: std::sync::atomic::AtomicI64::new(-2000),
             application_id: std::sync::atomic::AtomicU32::new(0),
             retired: AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(0),
             parallel_scan_min_rows: std::sync::atomic::AtomicI64::new(
                 crate::storage::pager::DEFAULT_PARALLEL_SCAN_MIN_ROWS,
             ),
@@ -4088,6 +4148,22 @@ impl Pager {
     /// sync it, and reset the WAL. Readers stay correct throughout: the
     /// map is dropped only after the main file holds every page.
     pub fn checkpoint_wal(&self) -> Result<()> {
+        // LIFECYCLE GUARD — every fold+reset of the sidecar (main-file
+        // page copies + WAL reset) is serialized against engine
+        // GENERATION BOUNDARIES: a fresh open (`open_inner`) reads the
+        // main file and then recovers the sidecar under this same guard,
+        // and without holding it here a live writer's auto-checkpoint
+        // could fold+reset BETWEEN those two reads — the opener would
+        // see the pre-fold main file AND the post-reset (frameless)
+        // sidecar, silently missing every committed frame the fold
+        // carried (the wal_delete_race hunt, 2026-09-26: a fresh-open
+        // count probe straddling a concurrent auto-checkpoint read a
+        // state missing committed rows that "reappeared" on the next
+        // open). Reentrant: the teardown and `disable_wal` already hold
+        // the guard and re-enter freely; the writer lease below is a
+        // TRY-lock, so lease→guard here vs guard→lease in the teardown
+        // cannot deadlock.
+        let _lifecycle = crate::storage::wal::lifecycle_guard().lock();
         // WRITER LEASE: resetting/truncating the sidecar is exactly as
         // destructive as appending when a second pager in this process
         // holds the log. `Ours` = we are the (sticky) owner — nested call,
@@ -4984,6 +5060,26 @@ impl Pager {
     /// the fresh pager that replaces it.
     pub fn retire(&self) {
         self.retired.store(true, Ordering::Release);
+    }
+
+    /// Record this pager's engine generation epoch (assigned by
+    /// `Database::open` under the lifecycle guard — see the `generation`
+    /// field and `storage::wal::bump_generation`). Must be called before
+    /// the pager is shared; the teardown reads it exactly once.
+    pub(crate) fn note_generation(&self, epoch: u64) {
+        self.generation.store(epoch, Ordering::Release);
+    }
+
+    /// True when a NEWER engine generation has opened this pager's path
+    /// since it was created — the close-time teardown must then skip its
+    /// checkpoint + sidecar removal (see the `generation` field). 0 =
+    /// untracked (keep the historical behavior).
+    fn superseded_by_newer_generation(&self) -> bool {
+        let mine = self.generation.load(Ordering::Acquire);
+        mine != 0 && {
+            let sidecar = crate::storage::wal::wal_path_for(&self.path);
+            crate::storage::wal::current_generation(&sidecar) != mine
+        }
     }
 
     /// Discard the DELETE-mode spill sidecar (records + file). Called
