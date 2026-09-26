@@ -239,12 +239,25 @@ pub fn lifecycle_guard() -> &'static parking_lot::ReentrantMutex<()> {
 /// The map is monotone and never shrinks (one small entry per database
 /// path ever opened by the process — the engines registry's Weak map
 /// already has the same shape).
-pub fn bump_generation(sidecar: &Path) -> u64 {
+///
+/// The shared per-path epoch map — ONE static behind ONE accessor. (A
+/// `static` item inside each fn body is a DIFFERENT map per function:
+/// the first cut of this had `bump_generation` and `current_generation`
+/// each own a private `GENERATIONS`, so `current` always read an empty
+/// map, every pager looked superseded, and every close-time
+/// fold+removal silently skipped — caught the same day by the
+/// sidecar_probe: the main file never grew, the -wal survived close.)
+fn generation_epochs() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
     static GENERATIONS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
     > = std::sync::OnceLock::new();
-    let map = GENERATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut g = map.lock().unwrap_or_else(|p| p.into_inner());
+    GENERATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn bump_generation(sidecar: &Path) -> u64 {
+    let mut g = generation_epochs()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let next = g.get(sidecar).copied().unwrap_or(0) + 1;
     g.insert(sidecar.to_path_buf(), next);
     next
@@ -253,11 +266,9 @@ pub fn bump_generation(sidecar: &Path) -> u64 {
 /// The path's current generation epoch (0 = no pager ever bumped it —
 /// treat as "no successor exists").
 pub fn current_generation(sidecar: &Path) -> u64 {
-    static GENERATIONS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
-    > = std::sync::OnceLock::new();
-    let map = GENERATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let g = map.lock().unwrap_or_else(|p| p.into_inner());
+    let g = generation_epochs()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     g.get(sidecar).copied().unwrap_or(0)
 }
 

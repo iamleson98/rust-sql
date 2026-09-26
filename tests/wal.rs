@@ -323,3 +323,54 @@ fn wal_indexes_and_dml_roundtrip() {
     drop(db2);
     cleanup(&path);
 }
+
+// Clean-close PHYSICAL contract: the last connection's close FOLDS the
+// committed frames into the main file and REMOVES the sidecar (SQLite's
+// own last-connection-close behavior). The generation-epoch guard of
+// 2026-09-26 briefly regressed this — a per-fn `static` bug made every
+// pager look "superseded", so every teardown silently skipped the
+// fold+removal: the main file stayed one page while the -wal survived
+// with all the frames (data still correct — every reopen replays the
+// sidecar — which is exactly why every functional test stayed green;
+// only the physical file shape changed). This test pins the SHAPE.
+#[test]
+fn wal_clean_close_folds_and_removes_sidecar() {
+    let (mut db, path) = tmpdb("wal_close_fold");
+    db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    for i in 0..20i64 {
+        db.execute(
+            "INSERT INTO t (v) VALUES (?)",
+            [Value::Text(format!("row-{i}-padding-padding").into())],
+        )
+        .unwrap();
+    }
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", path.to_str().unwrap()));
+    // Frames exist before close (20 autocommit inserts, none large
+    // enough to auto-checkpoint).
+    let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert!(wal_len > 0, "no WAL frames were written ({wal_len} bytes)");
+    let db_len_before = std::fs::metadata(&path).unwrap().len();
+    drop(db); // clean close: fold + remove
+
+    // The sidecar is GONE and the main file GREW (fold landed).
+    assert!(
+        !wal_path.exists(),
+        "clean close must remove the -wal sidecar (still {} bytes)",
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
+    );
+    let db_len_after = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        db_len_after > db_len_before,
+        "clean close must fold committed pages into the main file \
+         (before {db_len_before}, after {db_len_after})"
+    );
+
+    // And the folded state is complete: reopen reads everything.
+    let db2 = Database::open(&path).unwrap();
+    let n = db2.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer();
+    assert_eq!(n, 20);
+    drop(db2);
+    cleanup(&path);
+}

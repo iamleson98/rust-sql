@@ -1531,7 +1531,9 @@ impl Drop for Pager {
                         }
                     }
                 }
-                let _ = self.checkpoint_wal();
+                if let Err(e) = self.checkpoint_wal() {
+                    eprintln!("close-time WAL checkpoint failed (frames stay durable in the sidecar; the next open replays them): {e}");
+                }
                 // Ownership-checked removal: delete the sidecar only when
                 // the path still holds OUR file (same inode). A newer
                 // generation's WAL must survive our retirement.

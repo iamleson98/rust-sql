@@ -1204,3 +1204,19 @@ Work Log:
 
 Stage Summary:
 - Master is CI-green at 31311aa with the README citing it; the docs-only push re-triggers CI (watch + verify, per the loop).
+
+---
+Task ID: 49
+Agent: main (Super Z)
+Task: Fix the per-fn `static` bug in the generation-epoch map (31311aa's silent close-time regression) + pin the clean-close shape.
+
+Work Log:
+- Post-green audit (the soak-harness seed build printed a surviving 32-byte -wal after a clean close): minimal sidecar_probe example — open, PRAGMA WAL, CREATE+INSERT, drop — showed the main file stayed ONE page (fold never ran) and the 16512-byte sidecar survived close, on every close.
+- Root cause: the epoch map's first cut declared `static GENERATIONS: OnceLock<Mutex<HashMap<..>>>` INSIDE both bump_generation and current_generation — a `static` item in a fn body is ONE map PER FUNCTION, so current_generation always read its own EMPTY map (0), every pager looked superseded (0 != mine), and EVERY teardown silently skipped the close-time checkpoint+removal. CI stayed green because skipping is functionally safe (frames stay durable in the sidecar; every reopen replays them; integrity intact) — only the physical shape regressed (no fold at close, sidecar survives). The basic WAL test's comment claimed "no -wal" after close but never ASSERTED it — the hole the regression slipped through.
+- Fix: ONE shared accessor `generation_epochs() -> &'static Mutex<HashMap<PathBuf, u64>>` (the wal_writer_leases precedent), used by bump/current. The bug + lesson documented at the accessor.
+- New regression pin (tests/wal.rs `wal_clean_close_folds_and_removes_sidecar`): frames exist before close; after a clean close the sidecar is GONE and the main file GREW; reopen reads everything. The physical contract is now asserted, not just commented.
+- RE-VALIDATION (the 300/300 race hunt of Task 47 ran against the accidentally-neutered teardown — every fold skipped; the REAL interleavings were not exercised): race hunt 460/460 clean with folds active (6x25 + 8x20 workers under CPU contention); soak 12/12 attempts integrity-ok with reopen verification (300k-row seed, cache_size=100, 4 BEGIN CONCURRENT writers + 2 readers, debug); wal 10/10 (incl. the new pin); durability 33; crash_recovery 9; io_fault 6; limit_stress 8; regression 27; compat 90/90; fmt + clippy -D warnings clean.
+- Harness improvement (tests/soak_repro.rs): SEED_ROWS is now env-scalable (default 1M unchanged) for debug-box triage runs.
+
+Stage Summary:
+- The epoch guard works as designed; the close-time fold/removal restored and pinned by a physical-shape test; the full battery re-validated with folds ACTIVE (the state CI actually shipped 31311aa in was skip-everything — this commit makes the shipped behavior match the intended design).

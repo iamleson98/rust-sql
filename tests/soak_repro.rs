@@ -39,7 +39,13 @@ fn gen_row(i: u64) -> (i64, String) {
     (k, note)
 }
 
-const SEED_ROWS: u64 = 1_000_000;
+/// Seed row count (env-scalable for debug-box triage runs; the
+/// 1M-row release shape is the default and what CI-adjacent hunting
+/// uses). The corruption anchor (rowid 25817) exists at any scale
+/// >= 25817.
+fn seed_rows() -> u64 {
+    env_u64("SEED_ROWS", 1_000_000).max(25_817)
+}
 const SEED_DIR: &str = "/home/z/my-project/soak_seed";
 const FAIL_DIR: &str = "/home/z/my-project/soak_fail";
 
@@ -99,8 +105,8 @@ fn build_seed() {
     let batch = env_u64("SEED_BATCH", 25_000);
     let mut next_id: u64 = 0;
     let mut k_sum = 0i64;
-    while next_id < SEED_ROWS {
-        let n = batch.min(SEED_ROWS - next_id);
+    while next_id < seed_rows() {
+        let n = batch.min(seed_rows() - next_id);
         let mut sql = String::with_capacity(64 * n as usize + 64);
         sql.push_str("INSERT INTO events (id, k, note) VALUES ");
         for j in 0..n {
@@ -119,7 +125,7 @@ fn build_seed() {
     drop(db);
     println!(
         "[seed] {} rows, k_sum={k_sum}, {:?}",
-        SEED_ROWS,
+        seed_rows(),
         start.elapsed()
     );
     // what sidecars exist after a clean close?
@@ -168,7 +174,7 @@ fn run_soak_attempt(dir: &std::path::Path, attempt: usize) -> bool {
     let committed = Arc::new(AtomicU64::new(0));
     let read_ops = Arc::new(AtomicU64::new(0));
     let writers_live = Arc::new(AtomicU64::new(N_WRITERS as u64));
-    let seed_rows = SEED_ROWS as i64;
+    let seed_rows = seed_rows() as i64;
     let mut handles = Vec::new();
     let barrier = Arc::new(Barrier::new(N_WRITERS + 2));
 
@@ -386,7 +392,7 @@ fn run_soak_attempt(dir: &std::path::Path, attempt: usize) -> bool {
         .collect();
     // Expected multiset: seed ids 1..=1M + all writer ids.
     let mut expected: Vec<(i64, i64)> = Vec::new();
-    for i in 1..=SEED_ROWS {
+    for i in 1..=seed_rows as u64 {
         let (k, _) = gen_row(i - 1);
         if (K_ANCHOR - 250..=K_ANCHOR + 250).contains(&k) {
             expected.push((k, i as i64));
