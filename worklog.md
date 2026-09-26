@@ -1220,3 +1220,16 @@ Work Log:
 
 Stage Summary:
 - The epoch guard works as designed; the close-time fold/removal restored and pinned by a physical-shape test; the full battery re-validated with folds ACTIVE (the state CI actually shipped 31311aa in was skip-everything — this commit makes the shipped behavior match the intended design).
+
+---
+Task ID: 50
+Agent: main (Super Z)
+Task: Soak re-validation at 1M-row scale with the generation-boundary fixes active + README/worklog to the 581431b green run.
+
+Work Log:
+- CI run 36233898872 on 581431b: COMPLETED / SUCCESS — 31/31 (the new wal_clean_close pin in every test matrix, the race test, limit-stress at 1M on all OSes).
+- The residual page-reincarnation hunt (tests/soak_repro.rs, tight cache_size=100, 4 BEGIN CONCURRENT writers + 2 readers, per-attempt integrity_check + reopen verification): 12/12 clean at 300k-row seed (debug) + 26/26 clean at the full 1M-row seed (debug, ~31s/attempt) — 38 clean attempts today on top of the previous session's 24/24. No reincarnation, no corruption, no lost rows.
+- README status header -> 36233898872 @ 581431b (1381 default-matrix tests, +1 for the clean-close pin), narrative extended with the epoch-fix and the 1M soak re-validation.
+
+Stage Summary:
+- Master CI-green at 581431b; the generation-boundary class fixed, pinned, and soak-validated at 1M scale; the reincarnation hunt stays clean. Docs push re-triggers CI (watch + verify per the loop).
