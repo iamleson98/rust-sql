@@ -3382,36 +3382,26 @@ impl<'a> Btree<'a> {
             }
         }
 
-        // Walk right_most_pointer chain down to the rightmost leaf.
-        // One lock per level: read page_type and right_most_pointer in a
-        // single guard (previously two separate `.lock()` acquisitions).
-        let mut page_id = self.root;
-        let leaf_pin;
-        loop {
-            let page = self.pager.get_page(page_id)?;
-            let guard = page.lock();
-            match guard.page_type()? {
-                PageType::LeafTable => {
-                    leaf_pin = AppendHint::fresh(page_id, guard.serial, guard.epoch);
-                    break;
-                }
-                PageType::InteriorTable => {
-                    let right = guard.right_most_pointer();
-                    if right == 0 {
-                        // Shouldn't happen on a valid interior page, but fall back.
-                        drop(guard);
-                        self.insert_table(rowid, payload)?;
-                        return Ok(Some(self.right_most_leaf_hinted()?));
-                    }
-                    page_id = right;
-                }
-                _ => {
-                    drop(guard);
-                    self.insert_table(rowid, payload)?;
-                    return Ok(Some(self.right_most_leaf_hinted()?));
-                }
-            }
-        }
+        // No hint yet: walk the right-most chain to the right-most leaf
+        // through `right_most_leaf_hinted` — every entry into this
+        // function runs with `right_walk_for_write` armed, so the walked
+        // spine becomes STRUCTURAL DECISION READS.
+        //
+        // The historical inline walk marked NOTHING, and that omission
+        // was the S4 soak's residual 1M-scale corruption: a first-append
+        // statement pinned the right edge through the transaction's own
+        // (possibly stale) shadow view, a sibling commit's append-SPLIT
+        // then demoted the pinned leaf without moving its stamp (the old
+        // page is byte-identical in an append-split — only the parent
+        // separator is installed), and the transaction's later hinted
+        // appends sailed past the sibling's separator with base==now
+        // validation passing (leaf unstamped, spine unmarked) —
+        // stranding the sibling's committed rows behind a mis-routed
+        // interior cell (leaf [.. 1030000025] under a separator of
+        // 1000000032). The marks route such commits through the
+        // conflict/merge path, whose replay re-derives every placement
+        // against the current tree.
+        let leaf_pin = self.right_most_leaf_hinted()?;
 
         // Rightmost leaf: verify the append, check space, and write. The
         // pin was taken fresh under the walk's lock — an OutOfOrder
@@ -3707,7 +3697,38 @@ impl<'a> Btree<'a> {
     ) -> Result<Option<AppendHint>> {
         let root = self.root;
         self.journal_suppress = true;
+        // The right-edge walks this entry takes (first append, Declined
+        // re-pins) route an append — arm the decision-read marking, the
+        // exact discipline the table entries apply (see
+        // `right_walk_for_write`). The index append machinery historically
+        // marked NOTHING: a stale right-edge pin survived a sibling's
+        // index append-split (old leaf unstamped — byte-identical) and
+        // the transaction's entries installed past the sibling's
+        // separator (the S4 soak's original "index entries out of order
+        // or duplicated" signature).
+        self.right_walk_for_write = true;
+        // Cross-scope hint guard (the table twin's discipline — see
+        // `AppendHint::scope`): the scratch-carried hint may pin a leaf
+        // another transaction established (its pin validates that
+        // transaction's SHADOW object, not this one's). The historical
+        // index entry had NO guard: a foreign hint flowed straight into
+        // `try_append` (the pin mismatch declined it, but the fallback
+        // walk then re-pinned through this transaction's stale view).
+        let hint = match self.pager.armed_writer_scope() {
+            Some(txn) => hint.filter(|h| h.scope == Some(txn)),
+            None => hint,
+        };
         let r = self.insert_index_append_hinted_inner(key, rowid, hint);
+        self.right_walk_for_write = false;
+        // Stamp the outgoing hint with the CURRENT scope so its next use
+        // (this transaction only) passes the guard above — the table
+        // twin's rule; an unstamped hint would be dropped forever after.
+        let r = r.map(|opt| {
+            opt.map(|mut h| {
+                h.scope = self.pager.armed_writer_scope();
+                h
+            })
+        });
         self.journal_suppress = false;
         match r {
             Ok(v) => {
@@ -3782,34 +3803,12 @@ impl<'a> Btree<'a> {
             }
         }
 
-        // No hint yet: walk the right-most-child chain down to the
-        // right-most index leaf, pinning it fresh under the walk's lock.
-        let mut page_id = self.root;
-        let leaf_pin;
-        loop {
-            let page = self.pager.get_page(page_id)?;
-            let guard = page.lock();
-            match guard.page_type()? {
-                PageType::LeafIndex => {
-                    leaf_pin = AppendHint::fresh(page_id, guard.serial, guard.epoch);
-                    break;
-                }
-                PageType::InteriorIndex => {
-                    let right = guard.right_most_pointer();
-                    if right == 0 {
-                        drop(guard);
-                        self.insert_index(key, rowid)?;
-                        return Ok(Some(self.right_most_index_leaf_hinted()?));
-                    }
-                    page_id = right;
-                }
-                _ => {
-                    drop(guard);
-                    self.insert_index(key, rowid)?;
-                    return Ok(Some(self.right_most_index_leaf_hinted()?));
-                }
-            }
-        }
+        // No hint yet: walk the right-most-child chain to the right-most
+        // index leaf through `right_most_index_leaf_hinted` — the marking
+        // twin of the table walk (this entry arms `right_walk_for_write`;
+        // see the table-side comment in `insert_table_append_inner` for
+        // the corruption class the marks close).
+        let leaf_pin = self.right_most_index_leaf_hinted()?;
 
         match self.try_append_into_index_leaf(leaf_pin, key, rowid)? {
             AppendTry::Appended(new_hint) => Ok(Some(new_hint)),
@@ -3834,6 +3833,14 @@ impl<'a> Btree<'a> {
     fn right_most_index_leaf_hinted(&self) -> Result<AppendHint> {
         let mut page_id = self.root;
         loop {
+            // The right-edge walk routes an append: every page traversed
+            // is a decision read, mirroring the table twin (a stale view
+            // would pin a leaf a sibling's split already demoted — see
+            // `right_walk_for_write` and the S4 residual-corruption notes
+            // in `insert_table_append_inner`).
+            if self.right_walk_for_write {
+                self.pager.note_decision_read(page_id);
+            }
             let page = self.pager.get_page(page_id)?;
             let guard = page.lock();
             match guard.page_type()? {

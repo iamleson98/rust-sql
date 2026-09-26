@@ -1173,6 +1173,46 @@ fn limit_concurrent_soak() {
                 ) {
                     Ok(got) => {
                         let n = got[0][0].as_integer();
+                        if n != seed_rows {
+                            // DIAGNOSTIC DUMP before the asserts fire:
+                            // distinguish a TRANSIENT torn read (the
+                            // immediate retry heals) from a PERSISTENT
+                            // stranded-rows corruption (integrity fails,
+                            // the retry stays short). The writers keep
+                            // running; read-only probes only.
+                            eprintln!(
+                                "---- S4 READER REGRESSION: n={n} want={seed_rows} last={last_n} ----"
+                            );
+                            for r in db
+                                .query("PRAGMA integrity_check", [])
+                                .unwrap_or_default()
+                            {
+                                eprintln!("S4-INTEGRITY: {:?}", r);
+                            }
+                            let retry: i64 = db
+                                .query(
+                                    "SELECT count(*) FROM events WHERE id <= ?",
+                                    [Value::Integer(seed_rows)],
+                                )
+                                .map(|r| r[0][0].as_integer())
+                                .unwrap_or(-1);
+                            eprintln!("S4-RETRY count: {retry}");
+                            let missing: Vec<i64> = db
+                                .query(
+                                    "SELECT id FROM events WHERE id <= ? ORDER BY id",
+                                    [Value::Integer(seed_rows)],
+                                )
+                                .map(|rows| {
+                                    let present: std::collections::HashSet<i64> =
+                                        rows.iter().map(|r| r[0].as_integer()).collect();
+                                    (1..=seed_rows)
+                                        .filter(|id| !present.contains(id))
+                                        .take(40)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            eprintln!("S4-MISSING seed ids (first 40): {missing:?}");
+                        }
                         assert!(n >= last_n, "reader saw count go BACKWARD: {n} < {last_n}");
                         assert_eq!(
                             n, seed_rows,
