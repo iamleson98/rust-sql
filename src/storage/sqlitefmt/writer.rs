@@ -126,8 +126,99 @@ pub struct OutDb {
     pub objects: Vec<OutObject>,
 }
 
-/// Serialize the database to a complete page image.
-pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
+/// One object's page span in a built image — the incremental-commit
+/// architecture's bookkeeping: the b-tree root and every page the
+/// object's tree occupies (interior, leaf and overflow pages).
+#[derive(Clone, Debug)]
+pub struct SpanRec {
+    pub root: u32,
+    /// Ascending page numbers.
+    pub pages: Vec<u32>,
+}
+
+/// Identifies a span across commits. Object names are unique across
+/// kinds in a SQLite schema (one namespace), so the bare lowercased
+/// name is a stable key; the sqlite_schema tree has its own reserved
+/// key (its root is fixed at page 1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SpanKey {
+    Object(String),
+    SchemaTree,
+}
+
+/// A full build's result: the complete image plus the per-object page
+/// layout that incremental (splice) commits start from.
+pub struct BuiltImage {
+    pub bytes: Vec<u8>,
+    pub page_size: u32,
+    pub n_pages: u32,
+    /// Empty for auto-vacuum builds (pointer-map geometry is a
+    /// full-build concern; such containers never splice).
+    pub spans: std::collections::HashMap<SpanKey, SpanRec>,
+}
+
+/// The result of rebuilding one object in place (splice mode).
+pub struct SpliceBuild {
+    pub root: u32,
+    /// `(pgno, bytes)` of every page the rebuilt tree occupies.
+    pub pages: Vec<(u32, Vec<u8>)>,
+    /// The new page set (ascending) — the object's updated span.
+    pub used: Vec<u32>,
+    /// Highest page number reached (container tail growth).
+    pub max_page: u32,
+}
+
+/// The schema-namespace name of one output object (span key).
+fn object_span_name(obj: &OutObject) -> String {
+    match obj {
+        OutObject::Table { name, .. }
+        | OutObject::WithoutRowid { name, .. }
+        | OutObject::Index { name, .. }
+        | OutObject::Other { name, .. } => name.to_ascii_lowercase(),
+    }
+}
+
+/// Build one object's b-tree against the given allocator, returning
+/// its root page (0 for rootless objects — views, triggers, virtual
+/// tables). Shared by the full build and the splice path.
+fn build_object_tree(
+    alloc: &mut PageAllocator,
+    usable: usize,
+    obj: &OutObject,
+    enc: TextEnc,
+) -> Result<u32, String> {
+    match obj {
+        OutObject::Table { rows, alias, .. } => {
+            build_table_tree(alloc, usable, rows, *alias, None, enc)
+        }
+        OutObject::WithoutRowid {
+            pk_collations,
+            rows,
+            ..
+        } => {
+            // See `build_bytes_spanned`: BINARY-PK UTF-8 files keep the
+            // caller's key order; everything else re-sorts for the
+            // file's encoding/collation order.
+            if enc.is_utf8() && pk_collations.iter().all(|c| matches!(c, Collation::Binary)) {
+                build_record_tree(alloc, usable, rows, &[], &[], enc)
+            } else {
+                build_record_tree(alloc, usable, rows, &[], pk_collations, enc)
+            }
+        }
+        OutObject::Index {
+            desc,
+            collations,
+            entries,
+            ..
+        } => build_record_tree(alloc, usable, entries, desc, collations, enc),
+        OutObject::Other { .. } => Ok(0),
+    }
+}
+
+/// Serialize the database to a complete page image, recording every
+/// object's page span for later incremental (splice) commits — see
+/// [`splice_object`] and the container coordinator.
+pub fn build_bytes_spanned(db: &OutDb) -> Result<BuiltImage, String> {
     let page_size = if db.page_size == 0 {
         4096
     } else {
@@ -139,51 +230,34 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
     let usable = page_size as usize;
     let enc = db.text_enc;
     let mut alloc = PageAllocator::new(page_size, db.auto_vacuum != 0);
+    // Splices require stable page identities; pointer-map geometry
+    // (page-2 map, per-page parent entries) is a full-build concern,
+    // so auto-vacuum builds record no spans — their containers always
+    // take the full-publish path.
+    let track_spans = db.auto_vacuum == 0;
+    let mut spans = std::collections::HashMap::new();
 
-    let mut schema_cells: Vec<SchemaCell> = Vec::new();
+    let mut schema_cells: Vec<SchemaRowCell> = Vec::new();
     for obj in &db.objects {
-        match obj {
-            OutObject::Table {
-                name,
-                sql,
-                alias,
-                rows,
-            } => {
-                let root = build_table_tree(&mut alloc, usable, rows, *alias, None, enc)?;
-                alloc.note_root(root);
-                schema_cells.push(SchemaCell {
-                    rowid: 0,
-                    kind: "table".into(),
-                    name: name.clone(),
-                    tbl_name: name.clone(),
+        let start = alloc.next;
+        let root = build_object_tree(&mut alloc, usable, obj, enc)?;
+        if root != 0 {
+            alloc.note_root(root);
+        }
+        if track_spans && root != 0 {
+            // Sequential (non-auto-vacuum) builds allocate contiguously:
+            // the object's span is exactly [start, alloc.next).
+            spans.insert(
+                SpanKey::Object(object_span_name(obj)),
+                SpanRec {
                     root,
-                    sql: Some(sql.clone()),
-                });
-            }
-            OutObject::WithoutRowid {
-                name,
-                sql,
-                pk_collations,
-                rows,
-            } => {
-                // Rowid-less records are keyed by their PK: the file needs
-                // them in the PK order under the FILE encoding's byte
-                // comparison AND the PK columns' collations. A BINARY-PK
-                // UTF-8 file's caller order (the engine's key-ordered
-                // scan) is already correct — skip the sort; everything
-                // else (NOCASE / RTRIM PKs, non-UTF-8 files where BINARY
-                // compares raw encoded bytes, not code-point order)
-                // re-sorts here so the written b-tree satisfies SQLite's
-                // "row in PRIMARY KEY order" integrity invariant.
-                let root = if enc.is_utf8()
-                    && pk_collations.iter().all(|c| matches!(c, Collation::Binary))
-                {
-                    build_record_tree(&mut alloc, usable, rows, &[], &[], enc)?
-                } else {
-                    build_record_tree(&mut alloc, usable, rows, &[], pk_collations, enc)?
-                };
-                alloc.note_root(root);
-                schema_cells.push(SchemaCell {
+                    pages: (start..alloc.next).collect(),
+                },
+            );
+        }
+        match obj {
+            OutObject::Table { name, sql, .. } | OutObject::WithoutRowid { name, sql, .. } => {
+                schema_cells.push(SchemaRowCell {
                     rowid: 0,
                     kind: "table".into(),
                     name: name.clone(),
@@ -196,13 +270,9 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 name,
                 tbl_name,
                 sql,
-                desc,
-                collations,
-                entries,
+                ..
             } => {
-                let root = build_record_tree(&mut alloc, usable, entries, desc, collations, enc)?;
-                alloc.note_root(root);
-                schema_cells.push(SchemaCell {
+                schema_cells.push(SchemaRowCell {
                     rowid: 0,
                     kind: "index".into(),
                     name: name.clone(),
@@ -217,7 +287,7 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
                 tbl_name,
                 sql,
             } => {
-                schema_cells.push(SchemaCell {
+                schema_cells.push(SchemaRowCell {
                     rowid: 0,
                     kind: (*kind).into(),
                     name: name.clone(),
@@ -234,7 +304,14 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
     for (i, c) in schema_cells.iter_mut().enumerate() {
         c.rowid = (i + 1) as i64;
     }
+    let schema_start = alloc.next;
     let schema_root = build_schema_tree(&mut alloc, usable, &schema_cells, enc)?;
+    if track_spans {
+        let mut pages: Vec<u32> = Vec::with_capacity((alloc.next - schema_start) as usize + 1);
+        pages.push(1); // the fixed root (also carries the file header)
+        pages.extend(schema_start..alloc.next);
+        spans.insert(SpanKey::SchemaTree, SpanRec { root: 1, pages });
+    }
 
     // Pointer-map pages (auto-vacuum): every b-tree root / child /
     // overflow page recorded during the build gets its 5-byte entry.
@@ -269,9 +346,110 @@ pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
         enc.as_u32(),
         largest_root,
         u32::from(db.auto_vacuum == 2),
+        0,
+        0,
     );
     image[0..100].copy_from_slice(&header);
-    Ok(image)
+    Ok(BuiltImage {
+        bytes: image,
+        page_size,
+        n_pages,
+        spans,
+    })
+}
+
+/// Serialize the database to a complete page image.
+pub fn build_bytes(db: &OutDb) -> Result<Vec<u8>, String> {
+    build_bytes_spanned(db).map(|b| b.bytes)
+}
+
+/// Rebuild ONE object's b-tree against a recycle queue — the heart of
+/// the incremental page-diff commit: the object's previous pages are
+/// handed out first (ascending), then the container freelist, then
+/// fresh tail pages at `tail_start`. The tree builders are untouched —
+/// the splice allocator just steers page numbers at recycled slots —
+/// so per-commit CPU scales with the REBUILT object, never the size
+/// of the database.
+pub fn splice_object(
+    page_size: u32,
+    reuse: Vec<u32>,
+    tail_start: u32,
+    obj: &OutObject,
+    enc: TextEnc,
+) -> Result<SpliceBuild, String> {
+    if !page_size.is_power_of_two() || !(512..=65536).contains(&page_size) {
+        return Err(format!("invalid page size {page_size}"));
+    }
+    let usable = page_size as usize;
+    let mut alloc = PageAllocator::new_splice(page_size, reuse, tail_start);
+    let root = build_object_tree(&mut alloc, usable, obj, enc)?;
+    let mut used = std::mem::take(&mut alloc.allocated);
+    used.sort_unstable();
+    used.dedup();
+    let max_page = alloc.max_page;
+    Ok(SpliceBuild {
+        root,
+        pages: alloc.finished(),
+        used,
+        max_page,
+    })
+}
+
+/// A serialized SQLite freelist (fileformat2 §1.6): trunk pages chained
+/// through their first 4 bytes, each carrying up to
+/// `(page_size - 8) / 4` leaf page numbers; the header points at the
+/// first trunk and records the total (trunks + leaves).
+#[derive(Clone, Debug)]
+pub struct FreelistImage {
+    /// First trunk page, 0 when the freelist is empty.
+    pub head: u32,
+    /// Total free pages (trunks + leaves).
+    pub count: u32,
+    /// Trunk pages to write.
+    pub pages: Vec<(u32, Vec<u8>)>,
+}
+
+/// Serialize `free` (ascending, non-empty, every page > 1) into a
+/// trunk/leaf chain. Trunk pages are drawn from the free set itself
+/// (they count as free pages, exactly like SQLite's own freelist).
+pub fn build_freelist(free: &[u32], page_size: u32) -> FreelistImage {
+    debug_assert!(free.windows(2).all(|w| w[0] < w[1]), "free set ascending");
+    if free.is_empty() {
+        return FreelistImage {
+            head: 0,
+            count: 0,
+            pages: Vec::new(),
+        };
+    }
+    let leaves_per_trunk = (page_size as usize - 8) / 4;
+    // Smallest trunk count whose leaf capacity covers the remainder.
+    let total = free.len();
+    let mut n_trunks = total.div_ceil(leaves_per_trunk + 1).max(1);
+    while total - n_trunks > n_trunks * leaves_per_trunk {
+        n_trunks += 1;
+    }
+    let trunks: Vec<u32> = free[..n_trunks].to_vec();
+    let leaves: &[u32] = &free[n_trunks..];
+    let mut pages: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n_trunks);
+    let mut leaf_pos = 0usize;
+    for (i, trunk) in trunks.iter().enumerate() {
+        let take = (leaves.len() - leaf_pos).min(leaves_per_trunk);
+        let mut page = vec![0u8; page_size as usize];
+        let next = trunks.get(i + 1).copied().unwrap_or(0);
+        page[0..4].copy_from_slice(&next.to_be_bytes());
+        page[4..8].copy_from_slice(&(take as u32).to_be_bytes());
+        for (k, leaf) in leaves[leaf_pos..leaf_pos + take].iter().enumerate() {
+            let off = 8 + k * 4;
+            page[off..off + 4].copy_from_slice(&leaf.to_be_bytes());
+        }
+        leaf_pos += take;
+        pages.push((*trunk, page));
+    }
+    FreelistImage {
+        head: trunks[0],
+        count: total as u32,
+        pages,
+    }
 }
 
 /// Remove a sidecar file; when Windows denies removal (open handle
@@ -469,6 +647,24 @@ struct PageAllocator {
     /// 1 = b-tree root, 3 = first overflow page, 4 = later overflow
     /// page, 5 = non-root b-tree page. (0, 0) = not yet noted.
     meta: Vec<(u8, u32)>,
+    // ---- Incremental (splice) mode ----
+    /// Pages handed out BEFORE the tail: the object's own old pages
+    /// followed by the container freelist, ascending. Only consulted in
+    /// splice mode.
+    reuse: Vec<u32>,
+    /// Cursor into `reuse`.
+    reuse_pos: usize,
+    /// Splice mode flag (set by [`new_splice`](Self::new_splice)):
+    /// recycle from `reuse`, then allocate from the container tail;
+    /// never touches pointer-map bookkeeping.
+    splice: bool,
+    /// Every page number this allocator handed out (splice mode's
+    /// new-page-set bookkeeping).
+    allocated: Vec<u32>,
+    /// Highest page number handed out (tail growth; reuse pages count
+    /// too so the container can raise its page count if a free page
+    /// beyond the old tail — impossible in practice, but exact).
+    max_page: u32,
 }
 
 impl PageAllocator {
@@ -483,7 +679,36 @@ impl PageAllocator {
             pending_page: 0x4000_0000 / page_size + 1,
             map_pages: Vec::new(),
             meta: vec![(0, 0), (0, 0)], // pages 0 and 1
+            reuse: Vec::new(),
+            reuse_pos: 0,
+            splice: false,
+            allocated: Vec::new(),
+            max_page: 0,
         }
+    }
+
+    /// Splice-mode constructor: hand out `reuse` (ascending — the
+    /// object's previous pages, then the container freelist) before
+    /// allocating fresh tail pages starting at `tail_start`. Pointer
+    /// maps are a full-build concern (auto-vacuum files never splice).
+    fn new_splice(page_size: u32, reuse: Vec<u32>, tail_start: u32) -> Self {
+        // The queue is [the object's own previous pages, ascending]
+        // followed by [the container freelist, ascending] — NOT
+        // globally sorted when the object lives at the file's tail.
+        // The invariant that matters: no page may appear twice (a
+        // duplicate would hand one page to two tree nodes).
+        if cfg!(debug_assertions) {
+            let mut seen = std::collections::BTreeSet::new();
+            if !reuse.iter().all(|p| seen.insert(*p)) {
+                panic!("splice reuse queue has duplicates: {reuse:?}");
+            }
+        }
+        let mut a = Self::new(page_size, false);
+        a.reuse = reuse;
+        a.reuse_pos = 0;
+        a.splice = true;
+        a.next = tail_start;
+        a
     }
 
     /// sqlite3.c `ptrmapPageno`: the map page covering `pgno` (>= 2),
@@ -502,6 +727,21 @@ impl PageAllocator {
     }
 
     fn alloc(&mut self) -> u32 {
+        // Splice mode: the recycle queue first, then the container tail.
+        if self.splice {
+            if self.reuse_pos < self.reuse.len() {
+                let n = self.reuse[self.reuse_pos];
+                self.reuse_pos += 1;
+                self.allocated.push(n);
+                self.max_page = self.max_page.max(n);
+                return n;
+            }
+            let n = self.next;
+            self.next += 1;
+            self.allocated.push(n);
+            self.max_page = self.max_page.max(n);
+            return n;
+        }
         // Auto-vacuum: map pages and the pending-byte page are structural
         // holes — skip them (and remember them) during the walk. Page 2
         // is the first map page, so the first user page is 3 — exactly
@@ -1318,20 +1558,23 @@ fn write_interior_index_page(
 // sqlite_schema tree
 // ---------------------------------------------------------------------------
 
-struct SchemaCell {
-    rowid: i64,
-    kind: String,
-    name: String,
-    tbl_name: String,
-    root: u32,
-    sql: Option<String>,
+/// One sqlite_schema row — shared by the full build
+/// (`build_schema_tree`) and the splice path
+/// (`splice_schema_tree`).
+pub struct SchemaRowCell {
+    pub rowid: i64,
+    pub kind: String,
+    pub name: String,
+    pub tbl_name: String,
+    pub root: u32,
+    pub sql: Option<String>,
 }
 
 /// Build the sqlite_schema tree with its root FIXED at page 1.
 fn build_schema_tree(
     alloc: &mut PageAllocator,
     usable: usize,
-    cells: &[SchemaCell],
+    cells: &[SchemaRowCell],
     enc: TextEnc,
 ) -> Result<u32, String> {
     let mut table_cells: Vec<Cell> = Vec::with_capacity(cells.len());
@@ -1351,4 +1594,34 @@ fn build_schema_tree(
         table_cells.push(make_table_leaf_cell(usable, c.rowid, &payload));
     }
     pack_table_tree(alloc, usable, table_cells, Some(1))
+}
+
+/// Rebuild the sqlite_schema tree IN PLACE (root fixed at page 1)
+/// against a recycle queue — the splice path's schema-tree rebuild for
+/// commits that moved an object's root page. Same packing as
+/// [`build_schema_tree`]; only the allocator steers page numbers at
+/// recycled slots.
+pub fn splice_schema_tree(
+    page_size: u32,
+    reuse: Vec<u32>,
+    tail_start: u32,
+    cells: &[SchemaRowCell],
+    enc: TextEnc,
+) -> Result<SpliceBuild, String> {
+    if !page_size.is_power_of_two() || !(512..=65536).contains(&page_size) {
+        return Err(format!("invalid page size {page_size}"));
+    }
+    let usable = page_size as usize;
+    let mut alloc = PageAllocator::new_splice(page_size, reuse, tail_start);
+    let root = build_schema_tree(&mut alloc, usable, cells, enc)?;
+    let mut used = std::mem::take(&mut alloc.allocated);
+    used.sort_unstable();
+    used.dedup();
+    let max_page = alloc.max_page;
+    Ok(SpliceBuild {
+        root,
+        pages: alloc.finished(),
+        used,
+        max_page,
+    })
 }

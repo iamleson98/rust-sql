@@ -602,7 +602,6 @@ pub struct Database {
 /// `sqlite_sequence` map, and the header counters that must advance
 /// monotonically across dumps.
 pub(crate) struct ForeignSqlite {
-    path: std::path::PathBuf,
     dirty: AtomicBool,
     /// Text encoding of the interop file (header field 56: 1/2/3).
     /// Interior-mutable so `PRAGMA encoding` can set it from the
@@ -629,18 +628,53 @@ pub(crate) struct ForeignSqlite {
     /// at open; `PRAGMA auto_vacuum` can still change it while the
     /// schema is empty (SQLite's rule — silently ignored afterwards).
     auto_vacuum: AtomicU8,
-    /// Live WAL-append session for the sidecar writer: established by
-    /// the first full write of a session (which also checkpoints any
-    /// source sidecar), then every later commit appends only the pages
-    /// that changed. `None` until then (and after VACUUM resets it).
-    wal: Mutex<Option<ForeignWalSession>>,
+    /// The file's SHARED page-space coordinator: object spans, the
+    /// container freelist, the WAL sidecar session and the overlay of
+    /// pages newer than the main file — one per path, process-wide,
+    /// serialized under its own mutex. Every session (Database) on the
+    /// file splices its own changed objects into THIS page space; see
+    /// `storage::sqlitefmt::container` for the architecture.
+    coord: std::sync::Arc<crate::storage::sqlitefmt::container::Container>,
+    /// This session's last-publish snapshot: the engine-root change
+    /// epochs and schema signature as of its last successful commit.
+    /// The next commit diffs against this to decide which objects to
+    /// splice (O(#objects), never O(database)).
+    snap: Mutex<ForeignSnap>,
+    /// True when this session's commits may still live only in the WAL
+    /// sidecar (splice publishes under WAL mode; cleared by full
+    /// publishes). The close-time contract: the LAST session folds the
+    /// sidecar — but when it has VANISHED (another session's full
+    /// publish retired it) while this session had frames pending, the
+    /// session re-publishes its committed state from memory (the old
+    /// `last_image` fallback's semantics — the writer's knowledge is
+    /// authoritative for what it committed).
+    wal_pending: AtomicBool,
 }
 
-/// One WAL-append session: the frame writer plus the last committed
-/// page image (the diff base — main file + sidecar state).
-struct ForeignWalSession {
-    writer: crate::storage::sqlitefmt::wal::WalWriter,
-    last_image: Vec<u8>,
+/// One session's last-publish snapshot (see `ForeignSqlite::snap`).
+#[derive(Default)]
+struct ForeignSnap {
+    /// Object key (lowercased schema name) → the owning engine root's
+    /// change epoch at the last successful publish — the diff base for
+    /// the next commit's dirty-object set.
+    epochs: HashMap<String, u64>,
+    /// Schema signature at the last publish: `(kind, name, sql, engine
+    /// root)` per persistent object, sorted — any difference is DDL
+    /// (which takes the full-publish path).
+    sig: Vec<(u8, String, String, u32)>,
+    /// Set once the session's first publish (full) has happened.
+    published: bool,
+    /// Set when the snapshot was seeded from a CLEAN LOAD (the
+    /// in-memory state is exactly the file's committed state) — the
+    /// first commit boundary then needs no publish at all, matching
+    /// the byte-stable idle-reopen contract.
+    loaded_clean: bool,
+    /// The loaded file's header values (user_version / application_id
+    /// / journal mode), compared at the skip decision — any drift is a
+    /// header-visible change that must publish.
+    loaded_uv: u32,
+    loaded_app: u32,
+    loaded_journal_wal: bool,
 }
 
 impl ForeignSqlite {
@@ -669,6 +703,75 @@ enum SchemaOrderKey {
     Index(String),
     View(String),
     Trigger(String),
+}
+
+/// The persistent-catalog snapshot shared by the full collector and the
+/// incremental (splice) path — see `Database::sqlite_catalog_snapshot`.
+struct SqliteCatalogSnapshot {
+    /// Lowercased name → live table (persistent only; engine shims and
+    /// TEMP objects filtered out).
+    tables: HashMap<String, std::sync::Arc<Table>>,
+    /// Lowercased name → live index (persistent, non-internal only).
+    indexes: HashMap<String, std::sync::Arc<Index>>,
+    views: HashMap<String, std::sync::Arc<crate::schema::View>>,
+    triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>>,
+    /// The resolved sqlite_schema emit order (source rows in creation
+    /// order, engine-created objects appended per kind).
+    order: Vec<SchemaOrderKey>,
+}
+
+impl SqliteCatalogSnapshot {
+    /// The schema-change signature: `(kind, name, sql, engine root)`
+    /// per object, sorted — any difference between commits is DDL and
+    /// routes the next publish through the full path (schema rows
+    /// move). Cheap to build and compare (schema-sized, never
+    /// data-sized).
+    fn schema_signature(&self) -> Vec<(u8, String, String, u32)> {
+        let mut sig: Vec<(u8, String, String, u32)> = Vec::with_capacity(
+            self.tables.len() + self.indexes.len() + self.views.len() + self.triggers.len(),
+        );
+        for (n, t) in &self.tables {
+            sig.push((0, n.clone(), t.create_sql.clone(), t.root_page));
+        }
+        for (n, i) in &self.indexes {
+            sig.push((1, n.clone(), i.create_sql.clone(), i.root_page));
+        }
+        for (n, v) in &self.views {
+            sig.push((2, n.clone(), v.create_sql.clone(), 0));
+        }
+        for (n, t) in &self.triggers {
+            sig.push((3, n.clone(), t.create_sql.clone(), 0));
+        }
+        sig.sort();
+        sig
+    }
+}
+
+/// The content source of one sqlite_schema row (see
+/// `Database::sqlite_schema_row_descs`).
+enum SchemaRowSource {
+    Table(std::sync::Arc<Table>),
+    Index(std::sync::Arc<Index>),
+    View(std::sync::Arc<crate::schema::View>),
+    Trigger(std::sync::Arc<crate::schema::Trigger>),
+    /// The synthesized `sqlite_sequence` fallback row (catalog lacks
+    /// the real table): schema-row only on the splice path.
+    SynthSequence,
+}
+
+/// One sqlite_schema row's identity in emit order — the single source
+/// of truth shared by the full collector and the splice path's
+/// schema-tree rebuild.
+struct SchemaRowDesc {
+    kind: &'static str,
+    /// Display-case name as stored in sqlite_schema.
+    name: String,
+    tbl_name: String,
+    sql: Option<String>,
+    /// Lowercased schema name — the coordinator span key for rooted
+    /// rows (tables and indexes).
+    key: String,
+    source: SchemaRowSource,
 }
 
 /// Default capacity of the statement cache.
@@ -806,25 +909,27 @@ impl Drop for Database {
             }
             // SQLite's clean-close semantics: the LAST connection
             // checkpoints the WAL and removes the sidecar, leaving a
-            // self-contained .db (plain file copies stay valid). Mirror
-            // it — fold the live sidecar into the main file
-            // INCREMENTALLY (page copies, wal.html §4.3), never a
-            // full-image rewrite; the atomic full write remains only as
-            // the fallback when the incremental fold fails.
-            let mut session = f.wal.lock();
-            if let Some(sess) = session.as_mut() {
-                if sess.writer.has_frames() {
-                    let path = f.path.clone();
-                    let ps = sess.writer.page_size();
-                    if crate::storage::sqlitefmt::wal::checkpoint(&path, ps).is_err() {
-                        let _ = crate::storage::sqlitefmt::writer::write_image_atomic(
-                            &path,
-                            &sess.last_image,
-                        );
-                    }
-                    let ckpt = sess.writer.ckpt_seq() + 1;
-                    sess.writer = crate::storage::sqlitefmt::wal::WalWriter::new(ps, ckpt);
-                }
+            // self-contained .db (plain file copies stay valid). The
+            // coordinator folds the live sidecar into the main file
+            // INCREMENTALLY (page copies, wal.html §4.3) — and when the
+            // sidecar vanished while THIS session still had committed
+            // frames pending in it, the session re-publishes its
+            // committed state from memory (the writer's knowledge is
+            // authoritative for what it committed).
+            use crate::storage::sqlitefmt::container::DetachOutcome;
+            if f.coord
+                .session_detach(f.wal_pending.load(Ordering::Acquire))
+                == DetachOutcome::Republish
+            {
+                // Force past dump_foreign's clean fast-path AND past
+                // the splice path (nothing is epoch-dirty — the
+                // session's last publish already recorded these
+                // objects): the whole committed state must be
+                // re-published wholesale, over whatever layout the
+                // sidecar's loss left in the file.
+                f.coord.invalidate();
+                f.dirty.store(true, Ordering::Release);
+                let _ = self.dump_foreign();
             }
         }
     }
@@ -2325,9 +2430,14 @@ impl Database {
         let path = path.as_ref().to_path_buf();
         // SQLite-format sniff: a real `.db` written by SQLite (or by this
         // engine's sqlitefmt writer) loads through the interop bridge.
+        // A HOT ROLLBACK JOURNAL routes the same way even when the main
+        // file's magic is torn (a crashed DELETE-mode commit can smash
+        // the header mid-write — the journal's pre-images restore it;
+        // see `rj::has_hot_journal`).
         if !memory
             && path.as_os_str() != ":memory:"
-            && crate::storage::sqlitefmt::is_sqlite_file(&path)
+            && (crate::storage::sqlitefmt::is_sqlite_file(&path)
+                || crate::storage::sqlitefmt::rj::has_hot_journal(&path))
         {
             if codec.is_some() {
                 return Err(Error::semantic(
@@ -2878,7 +2988,6 @@ impl Database {
         let mut db = Self::open_memory_inner()?;
         db.path = path.to_path_buf();
         let foreign = ForeignSqlite {
-            path: path.to_path_buf(),
             dirty: AtomicBool::new(false),
             text_enc: AtomicU32::new(image.text_enc.as_u32()),
             order: Mutex::new(Vec::new()),
@@ -2890,7 +2999,13 @@ impl Database {
             had_wal: AtomicBool::new(image.had_wal),
             journal_wal: AtomicBool::new(image.journal_wal),
             auto_vacuum: AtomicU8::new(image.auto_vacuum),
-            wal: Mutex::new(None),
+            coord: {
+                let c = crate::storage::sqlitefmt::container::attach(path);
+                c.session_attach();
+                c
+            },
+            snap: Mutex::new(ForeignSnap::default()),
+            wal_pending: AtomicBool::new(false),
         };
         db.foreign = Some(foreign);
         db.load_foreign_image(image)?;
@@ -2926,7 +3041,6 @@ impl Database {
         let mut db = Self::open_memory_inner()?;
         db.path = path.to_path_buf();
         db.foreign = Some(ForeignSqlite {
-            path: path.to_path_buf(),
             dirty: AtomicBool::new(true),
             text_enc: AtomicU32::new(1),
             order: Mutex::new(Vec::new()),
@@ -2942,7 +3056,13 @@ impl Database {
             // from the first dump — pinned by the WAL suites).
             journal_wal: AtomicBool::new(true),
             auto_vacuum: AtomicU8::new(0),
-            wal: Mutex::new(None),
+            coord: {
+                let c = crate::storage::sqlitefmt::container::attach(path);
+                c.session_attach();
+                c
+            },
+            snap: Mutex::new(ForeignSnap::default()),
+            wal_pending: AtomicBool::new(false),
         });
         db.dump_foreign()?;
         Ok(db)
@@ -3003,7 +3123,19 @@ impl Database {
         // BEGIN..COMMIT) applied to our own load path. A load failure
         // rolls back and the failed `from_sqlite_file` open is dropped.
         self.execute("BEGIN", ())?;
+        // The image's header values, captured before the move below.
+        let loaded_uv = image.user_version;
+        let loaded_app = image.application_id;
         let load = self.load_foreign_image_inner(image);
+        // Seed the session's publish snapshot from the loaded state —
+        // BEFORE the load transaction's COMMIT fires its commit
+        // boundary: the in-memory state IS the file's committed state,
+        // so the boundary needs no publish at all (the byte-stable
+        // idle-reopen contract; without this, every open would re-encode
+        // and rewrite the whole database).
+        if load.is_ok() {
+            self.seed_foreign_snap_from_load(loaded_uv, loaded_app);
+        }
         match load {
             Ok(()) => self.execute("COMMIT", ())?,
             Err(e) => {
@@ -3014,6 +3146,37 @@ impl Database {
         // A loaded WAL sidecar is now folded into the in-memory state;
         // the next dump removes the stale sidecars.
         Ok(())
+    }
+
+    /// Seed the session's publish snapshot from a completed clean load
+    /// (see `load_foreign_image`): every object's current epoch, the
+    /// loaded schema signature, and the file's header values — so the
+    /// load transaction's COMMIT boundary recognizes that the in-memory
+    /// state already IS the file's committed state and publishes
+    /// nothing.
+    fn seed_foreign_snap_from_load(&self, loaded_uv: u32, loaded_app: u32) {
+        let Some(foreign) = self.foreign.as_ref() else {
+            return;
+        };
+        let snapshot = self.sqlite_catalog_snapshot(foreign.order.lock().clone());
+        let mut epochs: HashMap<String, u64> =
+            HashMap::with_capacity(snapshot.tables.len() + snapshot.indexes.len());
+        for (name, t) in &snapshot.tables {
+            epochs.insert(name.clone(), self.pager.root_epoch(t.root_page));
+        }
+        for (name, i) in &snapshot.indexes {
+            epochs.insert(name.clone(), self.pager.root_epoch(i.root_page));
+        }
+        let sig = snapshot.schema_signature();
+        let journal_wal = foreign.journal_wal.load(Ordering::Acquire);
+        let mut snap = foreign.snap.lock();
+        snap.epochs = epochs;
+        snap.sig = sig;
+        snap.published = true;
+        snap.loaded_clean = true;
+        snap.loaded_uv = loaded_uv;
+        snap.loaded_app = loaded_app;
+        snap.loaded_journal_wal = journal_wal;
     }
 
     fn load_foreign_image_inner(
@@ -3270,214 +3433,374 @@ impl Database {
         }
     }
 
-    /// Rewrite the persistent file in SQLite's disk format when the
+    /// Publish the persistent file in SQLite's disk format when the
     /// in-memory state has committed writes. No-op when clean.
     ///
-    /// TWO commit paths:
-    /// * **Full atomic write** (temp + fsync + rename) — the FIRST
-    ///   write of a session (it also checkpoints whatever sidecar the
-    ///   source left behind) and the fallback whenever the WAL state
-    ///   is unavailable (right after open, after VACUUM, when the
-    ///   sidecar was tampered with).
-    /// * **WAL append** — every later commit: only the pages that
-    ///   changed since the last commit become checksum-chained frames
-    ///   in a real `<db>-wal` sidecar (recovery-compatible with SQLite
-    ///   itself), so live readers — SQLite or another engine process —
-    ///   see committed state without the file being rewritten under
-    ///   them. The sidecar is checkpointed back into the main file
-    ///   (full write + sidecar removal) when it crosses SQLite's
-    ///   1000-frame autocheckpoint pressure.
+    /// THE INCREMENTAL PAGE-DIFF ARCHITECTURE (see
+    /// `storage::sqlitefmt::container`): after this session's first
+    /// FULL publish establishes the file's shared page space, every
+    /// later commit
+    ///   1. diffs the engine's per-root change epochs against this
+    ///      session's last-publish snapshot — O(#objects), never
+    ///      O(database),
+    ///   2. re-collects and re-encodes ONLY the objects whose trees
+    ///      were written, splicing each b-tree onto its own previous
+    ///      pages, then the container freelist, then fresh tail pages
+    ///      (page identities stay stable; shrinkage routes into a real
+    ///      SQLite freelist),
+    ///   3. commits the KNOWN changed-page set through the journal-mode
+    ///      protocol — WAL frames in wal mode, a rollback journal
+    ///      (pre-images, in-place writes, journal deletion) in delete
+    ///      mode — never an image-wide diff.
+    ///
+    /// Per-commit CPU and memory scale with the CHANGED object, not
+    /// the database; multiple sessions on one file share the page
+    /// space (per-object last-writer merge under the coordinator's
+    /// lock).
+    ///
+    /// The FULL atomic write (temp + fsync + rename) remains for: the
+    /// session's first commit (which also folds whatever sidecar the
+    /// source left behind — `had_wal`), DDL (schema rows move),
+    /// `PRAGMA journal_mode` switches, auto-vacuum containers
+    /// (pointer-map geometry is a full-build concern), a detected
+    /// external rewrite of the main file, and any incremental failure —
+    /// always a correct state, just the slow path.
     pub fn dump_foreign(&self) -> Result<()> {
+        use crate::storage::sqlitefmt::container::PublishParams;
+
         let Some(foreign) = self.foreign.as_ref() else {
             return Ok(());
         };
         if !foreign.dirty.load(Ordering::Acquire) && !foreign.had_wal.load(Ordering::Acquire) {
             return Ok(());
         }
-        let out = self.collect_foreign_dump()?;
-        let path = foreign.path.clone();
-        let bytes = crate::storage::sqlitefmt::build_bytes(&out)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let coord = foreign.coord.clone();
 
-        // Incremental commit attempt — needs an established session (the
-        // committed image under OUR page layout). `had_wal` (a source
-        // sidecar left to fold) forces the full write instead.
-        let mut session = foreign.wal.lock();
-        if foreign.had_wal.load(Ordering::Acquire) {
-            session.take();
+        // ---- Change detection (metadata only, O(#objects)) ----
+        // Epochs are read BEFORE any rows are collected: a mutation
+        // racing the collection then leaves the recorded epoch BEHIND
+        // the live data, so the next commit re-splices the object
+        // (conservative, correct); the reverse — recording an epoch
+        // AHEAD of the collected data — is impossible because every
+        // mutation path bumps its root on exit, after the pages are
+        // live.
+        let snapshot = self.sqlite_catalog_snapshot(foreign.order.lock().clone());
+        // Per-object change epochs, keyed by the CATALOG's CREATE-time
+        // root — stable for the object's lifetime (root splits alias
+        // the new root's epoch cell onto the old one, so the catalog
+        // root's cell accumulates every write no matter which root the
+        // executor resolved).
+        let mut epochs_now: HashMap<String, u64> =
+            HashMap::with_capacity(snapshot.tables.len() + snapshot.indexes.len());
+        for (name, t) in &snapshot.tables {
+            epochs_now.insert(name.clone(), self.pager.root_epoch(t.root_page));
         }
-        let mut wal_err: Option<String> = None;
-        let mut incremental_done = false;
-        if let Some(sess) = session.as_mut() {
-            let ps = sess.writer.page_size();
-            if ps as usize != 0 && bytes.len() % ps as usize == 0 {
-                if foreign.journal_wal.load(Ordering::Acquire) {
-                    // ---- WAL mode: append only the changed pages as
-                    // frames to the sidecar (wal.html). ----
-                    let changed =
-                        crate::storage::sqlitefmt::wal::diff_pages(&sess.last_image, &bytes, ps);
-                    if changed.is_empty() {
-                        // Byte-identical rebuild: nothing to commit — the
-                        // file already holds this state.
-                        foreign.dirty.store(false, Ordering::Release);
-                        foreign.had_wal.store(false, Ordering::Release);
-                        return Ok(());
-                    }
-                    let db_size = (bytes.len() / ps as usize) as u32;
-                    // Capture the PRE-commit sidecar length before the
-                    // encoder counts its own pending frames.
-                    let pre_len = sess.writer.wal_len();
-                    let frames = sess.writer.encode_commit(&changed, db_size);
-                    let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(&path);
-                    match crate::storage::sqlitefmt::wal::append_wal(
-                        &wal_path,
-                        &sess.writer,
-                        pre_len,
-                        &frames,
-                    ) {
-                        Ok(()) => {
-                            sess.last_image = bytes.clone();
-                            if sess.writer.should_checkpoint() {
-                                // SQLite's 1000-page autocheckpoint: fold the
-                                // committed frames back into the main file
-                                // INCREMENTALLY (page copies), then reset
-                                // the sidecar — never a full-image write.
-                                match crate::storage::sqlitefmt::wal::checkpoint(&path, ps) {
-                                    Ok(_) => {
-                                        let ckpt = sess.writer.ckpt_seq() + 1;
-                                        sess.writer =
-                                            crate::storage::sqlitefmt::wal::WalWriter::new(
-                                                ps, ckpt,
-                                            );
-                                    }
-                                    Err(e) => {
-                                        // Frames are durable but the fold
-                                        // failed (replaced/tampered sidecar):
-                                        // the full write below republishes
-                                        // and clears it.
-                                        wal_err = Some(e);
-                                    }
-                                }
-                            }
-                            if wal_err.is_none() {
-                                foreign.dirty.store(false, Ordering::Release);
-                                foreign.had_wal.store(false, Ordering::Release);
-                                incremental_done = true;
-                            }
-                        }
-                        Err(e) => wal_err = Some(e),
-                    }
-                } else {
-                    // ---- Rollback (DELETE) journal mode — SQLite's own
-                    // atomic-commit protocol (atomiccommit.html): the
-                    // journal takes PRE-images of every page this commit
-                    // changes, the changed pages are written IN PLACE
-                    // into the main database file, both are fsynced in
-                    // that order, and the journal's DELETION is the commit
-                    // point. A crash at any earlier moment leaves a hot
-                    // journal that `from_sqlite_file` replays (and the
-                    // sqlite3 CLI replays identically — byte-exact format).
-                    // Single file at rest: no sidecar survives a commit. ----
-                    let changed =
-                        crate::storage::sqlitefmt::wal::diff_pages(&sess.last_image, &bytes, ps);
-                    if changed.is_empty() {
-                        foreign.dirty.store(false, Ordering::Release);
-                        foreign.had_wal.store(false, Ordering::Release);
-                        return Ok(());
-                    }
-                    let psu = ps as usize;
-                    let n_old = (sess.last_image.len() / psu) as u32;
-                    let n_new = (bytes.len() / psu) as u32;
-                    // Pre-images: only pages that existed before this
-                    // commit — pages beyond n_old are new, and rollback
-                    // discards them by truncating to n_old.
-                    let old_pages: Vec<(u32, Vec<u8>)> = changed
-                        .iter()
-                        .filter(|(pgno, _)| *pgno <= n_old)
-                        .map(|(pgno, _)| {
-                            let s = (*pgno as usize - 1) * psu;
-                            (*pgno, sess.last_image[s..s + psu].to_vec())
-                        })
-                        .collect();
-                    // Dense-rebuild shrink guard: our image builder never
-                    // leaves holes, so a SHRINKING database (mass DELETE)
-                    // re-flows every page after the cut and the page diff
-                    // no longer maps onto the file — one atomic image
-                    // swap is the only correct publication for that
-                    // shape (SQLite itself never re-flows: its freelist
-                    // keeps page identities stable). Everything else —
-                    // growth and in-place updates, however many pages —
-                    // takes the journal protocol exactly as SQLite does,
-                    // even when the journal momentarily outweighs a tiny
-                    // database (SQLite's own tradeoff).
-                    if n_new >= n_old {
-                        match crate::storage::sqlitefmt::rj::write_journal(
-                            &path, &old_pages, ps, n_old,
-                        ) {
-                            Ok(()) => {
-                                match crate::storage::sqlitefmt::rj::write_pages(
-                                    &path, ps, &changed,
-                                ) {
-                                    Ok(()) => {
-                                        // COMMIT POINT (SQLite's "delete the
-                                        // journal" form).
-                                        if let Err(e) = std::fs::remove_file(
-                                            crate::storage::sqlitefmt::rj::journal_path_of(&path),
-                                        ) {
-                                            wal_err = Some(format!("remove journal: {e}"));
-                                        } else {
-                                            sess.last_image = bytes.clone();
-                                            foreign.dirty.store(false, Ordering::Release);
-                                            foreign.had_wal.store(false, Ordering::Release);
-                                            incremental_done = true;
-                                        }
-                                    }
-                                    Err(e) => wal_err = Some(e),
-                                }
-                            }
-                            Err(e) => wal_err = Some(e),
-                        }
-                    }
-                    // A failed incremental attempt falls through to the
-                    // full atomic write below: the main file receives the
-                    // complete new image and every sidecar is retired —
-                    // always a correct state, just the slow path. A
-                    // mid-commit failure leaves a hot journal on disk;
-                    // the full write's journal retirement covers it.
+        for (name, i) in &snapshot.indexes {
+            epochs_now.insert(name.clone(), self.pager.root_epoch(i.root_page));
+        }
+        let sig = snapshot.schema_signature();
+        let (published, prev_epochs, prev_sig, loaded_clean, loaded_uv, loaded_app, loaded_jw) = {
+            let snap = foreign.snap.lock();
+            (
+                snap.published,
+                snap.epochs.clone(),
+                snap.sig.clone(),
+                snap.loaded_clean,
+                snap.loaded_uv,
+                snap.loaded_app,
+                snap.loaded_journal_wal,
+            )
+        };
+        let first_of_session = !published;
+        // Any schema difference (object set, DDL text) is DDL — it splices
+        // like any other commit (new objects allocate, dropped ones free
+        // into the container freelist, the schema tree rebuilds in
+        // place); only the COOKIE bumps for it.
+        let schema_changed = published && sig != prev_sig;
+        let dirty_keys: Vec<String> = if first_of_session {
+            // A fresh session on an ESTABLISHED coordinator splices
+            // straight away (prev_epochs empty → every object is
+            // "dirty" → the byte-compare decides); the full publish is
+            // for the session's true first publish only (can_splice
+            // fails until the coordinator holds a page space).
+            epochs_now.keys().cloned().collect()
+        } else {
+            epochs_now
+                .iter()
+                .filter(|(k, e)| prev_epochs.get(*k) != Some(e))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        // Objects this session saw at its last publish but whose catalog
+        // entries are now gone (DROP TABLE / INDEX, renames): their
+        // spans' pages join the container freelist.
+        let dropped_keys: Vec<String> = if first_of_session {
+            Vec::new()
+        } else {
+            prev_epochs
+                .keys()
+                .filter(|k| !epochs_now.contains_key(k.as_str()))
+                .cloned()
+                .collect()
+        };
+
+        let (counter, cookie) = coord.next_counters(schema_changed);
+        let params = PublishParams {
+            page_size: if foreign.page_size == 0 {
+                4096
+            } else {
+                foreign.page_size
+            },
+            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
+            text_enc: foreign.text_enc(),
+            auto_vacuum: foreign.auto_vacuum(),
+            user_version: self.pager.user_version(),
+            application_id: self.pager.application_id(),
+            change_counter: counter,
+            schema_cookie: cookie,
+        };
+
+        // ---- The clean-load skip ----
+        // A session seeded from a clean load whose state never diverged
+        // (no dirty objects, no drops, no DDL, header values unchanged)
+        // already matches the file byte-for-byte — publishing would
+        // rewrite the whole database for nothing (and break the
+        // byte-stable idle-reopen contract).
+        if loaded_clean
+            && !foreign.had_wal.load(Ordering::Acquire)
+            && dirty_keys.is_empty()
+            && dropped_keys.is_empty()
+            && !schema_changed
+            && params.user_version == loaded_uv
+            && params.application_id == loaded_app
+            && params.journal_wal == loaded_jw
+        {
+            self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+            return Ok(());
+        }
+
+        // ---- Incremental splice (the common path) ----
+        // A fresh coordinator (process restart / last session closed)
+        // ADOPTS the file's layout first — the file IS the page space.
+        if !foreign.had_wal.load(Ordering::Acquire) && !coord.established() {
+            coord.try_adopt(&params);
+        }
+        if !foreign.had_wal.load(Ordering::Acquire) && coord.can_splice(&params) {
+            let spliced = self.splice_foreign_commit(
+                &snapshot,
+                &dirty_keys,
+                &dropped_keys,
+                schema_changed,
+                &coord,
+                &params,
+            );
+            match spliced {
+                Ok(true) => {
+                    foreign
+                        .wal_pending
+                        .store(coord.wal_has_frames(), Ordering::Release);
+                    self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+                    return Ok(());
+                }
+                Ok(false) => {
+                    // Nothing actually changed (byte-identical rebuilds):
+                    // no write, no counter advance — but the session's
+                    // snapshot still refreshes so these objects are not
+                    // re-collected next commit.
+                    self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Any splice failure (I/O error, replaced sidecar,
+                    // unreadable base page) falls through to the full
+                    // publish below: the main file still holds the last
+                    // committed state and the full write republishes it.
                 }
             }
         }
-        drop(session);
 
-        // Full atomic write: the FIRST dump after open (the source's
-        // layout becomes ours), a journal-mode switch, a wholesale
-        // re-layout, or the incremental fallback. Both journal modes
-        // then establish a session so every LATER commit writes only
-        // the changed pages — WAL frames in wal mode, rollback-journal
-        // page writes in delete mode. A rollback-mode source stays 1/1
-        // in its header (SQLite's file-format semantics for the mode).
-        if !incremental_done {
-            let _ = wal_err; // the incremental error is only diagnostic
-            let ps = if out.page_size == 0 {
-                4096
-            } else {
-                out.page_size
-            };
-            crate::storage::sqlitefmt::writer::write_image_atomic(&path, &bytes)
-                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-            *foreign.wal.lock() = Some(ForeignWalSession {
-                writer: crate::storage::sqlitefmt::wal::WalWriter::new(ps, 0),
-                last_image: bytes,
-            });
-        }
-        foreign.dirty.store(false, Ordering::Release);
-        // had_wal referred to the SOURCE's sidecar, removed by the write.
-        foreign.had_wal.store(false, Ordering::Release);
+        // ---- Full publish (the slow path) ----
+        let out =
+            self.collect_foreign_dump_counters(params.change_counter, params.schema_cookie)?;
+        let built = crate::storage::sqlitefmt::writer::build_bytes_spanned(&out)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        coord
+            .publish_full(&built, &params)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        foreign.wal_pending.store(false, Ordering::Release);
+        self.finish_foreign_publish(foreign, &params, epochs_now, sig);
         Ok(())
+    }
+
+    /// Collect and splice the DIRTY objects of one incremental commit
+    /// (see `dump_foreign`). `Ok(false)` = nothing changed.
+    #[allow(clippy::too_many_arguments)]
+    fn splice_foreign_commit(
+        &self,
+        snapshot: &SqliteCatalogSnapshot,
+        dirty_keys: &[String],
+        dropped_keys: &[String],
+        schema_changed: bool,
+        coord: &std::sync::Arc<crate::storage::sqlitefmt::container::Container>,
+        params: &crate::storage::sqlitefmt::container::PublishParams,
+    ) -> Result<bool> {
+        use crate::storage::sqlitefmt::container::{SpliceItem, SpliceSchemaRow};
+        use crate::storage::sqlitefmt::writer::SpanKey;
+        use crate::storage::sqlitefmt::OutObject;
+
+        // Only the objects whose trees were written get re-collected —
+        // the per-commit CPU scales with the changed data, never the
+        // database.
+        let registry = self.plugins.read().clone();
+        let mut items: Vec<SpliceItem> = Vec::with_capacity(dirty_keys.len());
+        for key in dirty_keys {
+            if let Some(table) = snapshot.tables.get(key) {
+                if table.vtab.is_some() {
+                    // Virtual tables have no b-tree (rootpage 0); their
+                    // schema rows are DDL-stable.
+                    continue;
+                }
+                let obj = if table.without_rowid {
+                    OutObject::WithoutRowid {
+                        name: table.name.clone(),
+                        sql: table.create_sql.clone(),
+                        pk_collations: without_rowid_pk_collations(table, &registry),
+                        rows: self.dump_without_rowid_rows(table)?,
+                    }
+                } else {
+                    OutObject::Table {
+                        name: table.name.clone(),
+                        sql: table.create_sql.clone(),
+                        alias: table.rowid_alias,
+                        rows: self.dump_table_rows(table)?,
+                    }
+                };
+                items.push(SpliceItem {
+                    key: SpanKey::Object(key.clone()),
+                    object: obj,
+                });
+            } else if let Some(idx) = snapshot.indexes.get(key) {
+                let obj = self.dump_index_object(idx.as_ref(), &snapshot.tables, &registry)?;
+                items.push(SpliceItem {
+                    key: SpanKey::Object(key.clone()),
+                    object: obj,
+                });
+            }
+        }
+
+        // The schema rows (emit order, the shared descriptor walk) for
+        // the schema-tree rebuild on DDL / root moves.
+        let descs = self.sqlite_schema_row_descs(snapshot);
+        let schema_rows: Vec<SpliceSchemaRow> = descs
+            .iter()
+            .map(|d| SpliceSchemaRow {
+                kind: d.kind.to_string(),
+                name: d.name.clone(),
+                tbl_name: d.tbl_name.clone(),
+                sql: d.sql.clone(),
+                key: match &d.source {
+                    SchemaRowSource::Table(_) | SchemaRowSource::Index(_) => Some(d.key.clone()),
+                    _ => None,
+                },
+            })
+            .collect();
+
+        // The synthesized sqlite_sequence appearing for the first time
+        // (a legacy image whose catalog never carried the table gains
+        // an AUTOINCREMENT table): it needs real content and a span —
+        // build it exactly like the full collector does. Once the span
+        // exists, later commits treat it as a schema row only (its
+        // content is static until the real catalog table materializes,
+        // which is DDL and re-keys the same span).
+        let seq_key = SpanKey::Object("sqlite_sequence".into());
+        if descs
+            .iter()
+            .any(|d| matches!(d.source, SchemaRowSource::SynthSequence))
+            && !coord.has_span(&seq_key)
+        {
+            let foreign = self.foreign.as_ref().unwrap();
+            let sequences = foreign.sequences.lock();
+            let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+            for (name, t) in &snapshot.tables {
+                if !t.columns.iter().any(|c| c.autoincrement) {
+                    continue;
+                }
+                let max_rowid = self.table_max_rowid(t).unwrap_or(0);
+                let seq = sequences.get(name).copied().unwrap_or(0).max(max_rowid);
+                seq_rows.push((
+                    seq_rows.len() as i64 + 1,
+                    vec![
+                        Value::Text(crate::types::text::Text::from(t.name.as_str())),
+                        Value::Integer(seq),
+                    ],
+                ));
+            }
+            if !seq_rows.is_empty() {
+                items.push(SpliceItem {
+                    key: seq_key,
+                    object: OutObject::Table {
+                        name: "sqlite_sequence".into(),
+                        sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
+                        alias: None,
+                        rows: seq_rows,
+                    },
+                });
+            }
+        }
+
+        let dropped: Vec<SpanKey> = dropped_keys
+            .iter()
+            .map(|k| SpanKey::Object(k.clone()))
+            .collect();
+        coord
+            .publish_splice(&items, &dropped, schema_changed, &schema_rows, params)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))
+    }
+
+    /// Post-publish bookkeeping shared by both paths: the session's
+    /// snapshot (epochs + schema signature) advances to the values read
+    /// BEFORE collection, the coordinator's counters become the values
+    /// this connection reports, and the dirty/had_wal flags clear.
+    fn finish_foreign_publish(
+        &self,
+        foreign: &ForeignSqlite,
+        params: &crate::storage::sqlitefmt::container::PublishParams,
+        epochs: HashMap<String, u64>,
+        sig: Vec<(u8, String, String, u32)>,
+    ) {
+        {
+            let mut snap = foreign.snap.lock();
+            snap.epochs = epochs;
+            snap.sig = sig;
+            snap.published = true;
+            snap.loaded_clean = false;
+        }
+        foreign
+            .change_counter
+            .store(params.change_counter, Ordering::Release);
+        foreign
+            .schema_cookie
+            .store(params.schema_cookie, Ordering::Release);
+        foreign.dirty.store(false, Ordering::Release);
+        foreign.had_wal.store(false, Ordering::Release);
     }
 
     /// Collect the complete committed state as a SQLite-format build.
     fn collect_foreign_dump(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
+        let foreign = self.foreign.as_ref().unwrap();
+        self.collect_foreign_dump_counters(
+            foreign.change_counter.load(Ordering::Acquire).max(1),
+            foreign.schema_cookie.load(Ordering::Acquire).max(1),
+        )
+    }
+
+    /// [`collect_foreign_dump`] with explicit header counters (the
+    /// coordinator-issued values on the incremental-commit paths).
+    fn collect_foreign_dump_counters(
+        &self,
+        change_counter: u32,
+        schema_cookie: u32,
+    ) -> Result<crate::storage::sqlitefmt::OutDb> {
         let foreign = self.foreign.as_ref().unwrap();
         let objects =
             self.collect_sqlite_objects(foreign.order.lock().clone(), &foreign.sequences.lock())?;
@@ -3485,8 +3808,8 @@ impl Database {
             page_size: foreign.page_size,
             user_version: self.pager.user_version(),
             application_id: self.pager.application_id(),
-            change_counter: foreign.change_counter.load(Ordering::Acquire).max(1),
-            schema_cookie: foreign.schema_cookie.load(Ordering::Acquire).max(1),
+            change_counter,
+            schema_cookie,
             text_enc: foreign.text_enc(),
             auto_vacuum: foreign.auto_vacuum(),
             journal_wal: foreign.journal_wal.load(Ordering::Acquire),
@@ -3539,12 +3862,98 @@ impl Database {
         sequences: &HashMap<String, i64>,
     ) -> Result<Vec<crate::storage::sqlitefmt::OutObject>> {
         use crate::storage::sqlitefmt::OutObject;
-
-        let mut objects: Vec<OutObject> = Vec::new();
-        // Connection plugin registry: custom collations order the written
-        // index/PK records (see collation_of).
+        let snapshot = self.sqlite_catalog_snapshot(order);
         let registry = self.plugins.read().clone();
+        let mut objects: Vec<OutObject> = Vec::new();
+        for desc in self.sqlite_schema_row_descs(&snapshot) {
+            match desc.source {
+                SchemaRowSource::Table(table) => {
+                    if table.vtab.is_some() {
+                        objects.push(OutObject::Other {
+                            kind: "table",
+                            name: table.name.clone(),
+                            tbl_name: table.name.clone(),
+                            sql: table.create_sql.clone(),
+                        });
+                        continue;
+                    }
+                    if table.without_rowid {
+                        objects.push(OutObject::WithoutRowid {
+                            name: table.name.clone(),
+                            sql: table.create_sql.clone(),
+                            pk_collations: without_rowid_pk_collations(&table, &registry),
+                            rows: self.dump_without_rowid_rows(&table)?,
+                        });
+                    } else {
+                        objects.push(OutObject::Table {
+                            name: table.name.clone(),
+                            sql: table.create_sql.clone(),
+                            alias: table.rowid_alias,
+                            rows: self.dump_table_rows(&table)?,
+                        });
+                    }
+                }
+                SchemaRowSource::Index(idx) => {
+                    objects.push(self.dump_index_object(
+                        idx.as_ref(),
+                        &snapshot.tables,
+                        &registry,
+                    )?);
+                }
+                SchemaRowSource::View(v) => {
+                    objects.push(OutObject::Other {
+                        kind: "view",
+                        name: v.name.clone(),
+                        tbl_name: v.name.clone(),
+                        sql: v.create_sql.clone(),
+                    });
+                }
+                SchemaRowSource::Trigger(t) => {
+                    objects.push(OutObject::Other {
+                        kind: "trigger",
+                        name: t.name.clone(),
+                        tbl_name: t.table.clone(),
+                        sql: t.create_sql.clone(),
+                    });
+                }
+                SchemaRowSource::SynthSequence => {
+                    // Legacy images without a catalog sqlite_sequence:
+                    // one row per AUTOINCREMENT table (name, high-water).
+                    let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                    for (name, t) in &snapshot.tables {
+                        if !t.columns.iter().any(|c| c.autoincrement) {
+                            continue;
+                        }
+                        let max_rowid = self.table_max_rowid(t).unwrap_or(0);
+                        let seq = sequences.get(name).copied().unwrap_or(0).max(max_rowid);
+                        seq_rows.push((
+                            seq_rows.len() as i64 + 1,
+                            vec![
+                                Value::Text(crate::types::text::Text::from(t.name.as_str())),
+                                Value::Integer(seq),
+                            ],
+                        ));
+                    }
+                    if !seq_rows.is_empty() {
+                        objects.push(OutObject::Table {
+                            name: "sqlite_sequence".into(),
+                            sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
+                            alias: None,
+                            rows: seq_rows,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(objects)
+    }
 
+    /// The persistent catalog snapshot shared by the full collector and
+    /// the incremental (splice) path: live tables / indexes / views /
+    /// triggers with the same filters `collect_sqlite_objects` applies
+    /// (engine shims, TEMP objects and the engine-internal WITHOUT
+    /// ROWID PK index excluded), plus the resolved emit order.
+    fn sqlite_catalog_snapshot(&self, order: Vec<SchemaOrderKey>) -> SqliteCatalogSnapshot {
         // Live catalog snapshots (lowercased names). The engine's
         // sqlite_master / sqlite_schema query shims are NOT schema rows
         // — they exist implicitly in every SQLite file.
@@ -3592,60 +4001,55 @@ impl Database {
         append_new_objects(&views, SchemaOrderKey::View, &known, &mut order);
         append_new_objects(&triggers, SchemaOrderKey::Trigger, &known, &mut order);
 
-        // Objects emitted so far (for autoindex de-dup vs original rows).
+        SqliteCatalogSnapshot {
+            tables,
+            indexes,
+            views,
+            triggers,
+            order,
+        }
+    }
+
+    /// The sqlite_schema ROW DESCRIPTORS in emit order — the single
+    /// source of truth shared by the full collector (which fills each
+    /// row's rootpage from its own build) and the splice path (which
+    /// reads rootpages from the coordinator's spans). Divergence here
+    /// would desynchronize the two paths' schema trees, so both walk
+    /// THIS list, never their own.
+    fn sqlite_schema_row_descs(&self, snapshot: &SqliteCatalogSnapshot) -> Vec<SchemaRowDesc> {
+        let mut descs: Vec<SchemaRowDesc> = Vec::new();
+        // Objects emitted so far (for autoindex de-dup vs order rows).
         let mut emitted_autoindexes: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        let mut emitted_tables: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
 
-        for key in &order {
+        for key in &snapshot.order {
             match key {
                 SchemaOrderKey::Table(name) => {
-                    // `sqlite_sequence` is a REAL catalog table since the
-                    // foreign loader stopped skipping it — emitted like
-                    // any other table with its live (bump-maintained)
-                    // rows. The synthesis below is the fallback for
-                    // images that predate that.
-                    let Some(table) = tables.get(name) else {
+                    let Some(table) = snapshot.tables.get(name) else {
                         continue;
                     };
-                    if table.vtab.is_some() {
-                        // Virtual table: rootpage 0, original SQL only.
-                        objects.push(OutObject::Other {
-                            kind: "table",
-                            name: table.name.clone(),
-                            tbl_name: table.name.clone(),
-                            sql: table.create_sql.clone(),
-                        });
-                        continue;
-                    }
-                    let table_name = table.name.clone();
-                    if table.without_rowid {
-                        let rows = self.dump_without_rowid_rows(table)?;
-                        objects.push(OutObject::WithoutRowid {
-                            name: table_name.clone(),
-                            sql: table.create_sql.clone(),
-                            pk_collations: without_rowid_pk_collations(table, &registry),
-                            rows,
-                        });
-                    } else {
-                        let rows = self.dump_table_rows(table)?;
-                        objects.push(OutObject::Table {
-                            name: table_name.clone(),
-                            sql: table.create_sql.clone(),
-                            alias: table.rowid_alias,
-                            rows,
-                        });
-                    }
-                    emitted_tables.insert(name.clone());
+                    descs.push(SchemaRowDesc {
+                        kind: "table",
+                        name: table.name.clone(),
+                        tbl_name: table.name.clone(),
+                        sql: Some(table.create_sql.clone()),
+                        key: name.clone(),
+                        source: SchemaRowSource::Table(table.clone()),
+                    });
                     // The engine's catalog carries the autoindexes it
                     // synthesized at CREATE time (SQLite-compatible
                     // sqlite_autoindex naming) — emit them right after
                     // the table.
-                    for (idx_name, idx) in sorted_indexes_on(&indexes, name) {
+                    for (idx_name, idx) in sorted_indexes_on(&snapshot.indexes, name) {
                         if idx_name.starts_with("sqlite_autoindex_") {
-                            let obj = self.dump_index_object(idx.as_ref(), &tables, &registry)?;
-                            objects.push(obj);
+                            descs.push(SchemaRowDesc {
+                                kind: "index",
+                                name: idx.name.clone(),
+                                tbl_name: idx.table.clone(),
+                                sql: None, // SQLite stores NULL for autoindexes
+                                key: idx_name.to_ascii_lowercase(),
+                                source: SchemaRowSource::Index(idx.clone()),
+                            });
                             emitted_autoindexes.insert(idx_name);
                         }
                     }
@@ -3659,30 +4063,42 @@ impl Database {
                         // Autoindex whose table is gone: skip silently.
                         continue;
                     }
-                    let Some(idx) = indexes.get(name) else {
+                    let Some(idx) = snapshot.indexes.get(name) else {
                         continue;
                     };
-                    let obj = self.dump_index_object(idx.as_ref(), &tables, &registry)?;
-                    objects.push(obj);
+                    descs.push(SchemaRowDesc {
+                        kind: "index",
+                        name: idx.name.clone(),
+                        tbl_name: idx.table.clone(),
+                        sql: Some(idx.create_sql.clone()),
+                        key: name.clone(),
+                        source: SchemaRowSource::Index(idx.clone()),
+                    });
                 }
                 SchemaOrderKey::View(name) => {
-                    let Some(v) = views.get(name) else { continue };
-                    objects.push(OutObject::Other {
+                    let Some(v) = snapshot.views.get(name) else {
+                        continue;
+                    };
+                    descs.push(SchemaRowDesc {
                         kind: "view",
                         name: v.name.clone(),
                         tbl_name: v.name.clone(),
-                        sql: v.create_sql.clone(),
+                        sql: Some(v.create_sql.clone()),
+                        key: name.clone(),
+                        source: SchemaRowSource::View(v.clone()),
                     });
                 }
                 SchemaOrderKey::Trigger(name) => {
-                    let Some(t) = triggers.get(name) else {
+                    let Some(t) = snapshot.triggers.get(name) else {
                         continue;
                     };
-                    objects.push(OutObject::Other {
+                    descs.push(SchemaRowDesc {
                         kind: "trigger",
                         name: t.name.clone(),
                         tbl_name: t.table.clone(),
-                        sql: t.create_sql.clone(),
+                        sql: Some(t.create_sql.clone()),
+                        key: name.clone(),
+                        source: SchemaRowSource::Trigger(t.clone()),
                     });
                 }
             }
@@ -3691,44 +4107,29 @@ impl Database {
         // ---- sqlite_sequence (synthesis fallback) ----
         // Only when the catalog does NOT carry the table (legacy images);
         // the normal path emits the real table with its live rows above.
+        // A synthesized row never changes across non-DDL commits (an
+        // AUTOINCREMENT insert creates the real catalog table), so the
+        // splice path treats it as schema-row-only — its span rootpage
+        // comes from the coordinator.
         let mut any_autoinc = false;
-        for t in tables.values() {
+        for t in snapshot.tables.values() {
             if t.columns.iter().any(|c| c.autoincrement) {
                 any_autoinc = true;
                 break;
             }
         }
-        if any_autoinc && !tables.contains_key("sqlite_sequence") {
-            let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-            // `sequences` is the caller's high-water map (the foreign
-            // session's for interop files; empty for native exports,
-            // whose sqlite_sequence is a real catalog table).
-            let seqs = sequences;
-            for (name, t) in &tables {
-                if !t.columns.iter().any(|c| c.autoincrement) {
-                    continue;
-                }
-                let max_rowid = self.table_max_rowid(t).unwrap_or(0);
-                let seq = seqs.get(name).copied().unwrap_or(0).max(max_rowid);
-                seq_rows.push((
-                    seq_rows.len() as i64 + 1,
-                    vec![
-                        Value::Text(crate::types::text::Text::from(t.name.as_str())),
-                        Value::Integer(seq),
-                    ],
-                ));
-            }
-            if !seq_rows.is_empty() {
-                objects.push(OutObject::Table {
-                    name: "sqlite_sequence".into(),
-                    sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
-                    alias: None,
-                    rows: seq_rows,
-                });
-            }
+        if any_autoinc && !snapshot.tables.contains_key("sqlite_sequence") {
+            descs.push(SchemaRowDesc {
+                kind: "table",
+                name: "sqlite_sequence".into(),
+                tbl_name: "sqlite_sequence".into(),
+                sql: Some("CREATE TABLE sqlite_sequence(name,seq)".into()),
+                key: "sqlite_sequence".into(),
+                source: SchemaRowSource::SynthSequence,
+            });
         }
 
-        Ok(objects)
+        descs
     }
 
     /// `(rowid, values)` for a rowid table, in rowid order. The alias
@@ -3757,7 +4158,36 @@ impl Database {
     /// Full records for a WITHOUT ROWID table: PK columns first, then the
     /// remaining columns in declared order — the on-disk layout.
     fn dump_without_rowid_rows(&self, table: &Table) -> Result<Vec<Vec<Value>>> {
-        let sql = format!("SELECT * FROM {}", quote_ident(&table.name));
+        // ORDER BY the PK: the writer skips its own sort for UTF-8 files
+        // with BINARY PKs (it trusts "the caller's key-ordered scan"),
+        // but the engine's plain scan follows the INTERNAL rowid
+        // storage — which an INSERT OR REPLACE (delete + re-insert)
+        // permutes away from PK order. Ordering here is exact for the
+        // skip case (UTF-8 byte order == code-point order == the
+        // engine's default TEXT ordering); every other encoding or
+        // collation re-sorts in the writer anyway.
+        let pk_cols: Vec<String> = {
+            let mut pk: Vec<(u8, usize)> = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.pk_seq > 0)
+                .map(|(i, c)| (c.pk_seq, i))
+                .collect();
+            pk.sort_by_key(|(seq, _)| *seq);
+            pk.into_iter()
+                .map(|(_, i)| quote_ident(&table.columns[i].name))
+                .collect()
+        };
+        let sql = if pk_cols.is_empty() {
+            format!("SELECT * FROM {}", quote_ident(&table.name))
+        } else {
+            format!(
+                "SELECT * FROM {} ORDER BY {}",
+                quote_ident(&table.name),
+                pk_cols.join(", ")
+            )
+        };
         let rows = self.query(&sql, ())?;
         let map = without_rowid_record_map(table);
         let n = table.n_columns();
@@ -3796,14 +4226,6 @@ impl Database {
                     .collect(),
             );
         }
-        // Sort by the PK columns (declared order + collations).
-        let pk_cols: Vec<(usize, String)> = table
-            .columns
-            .iter()
-            .filter(|c| c.pk_seq > 0)
-            .map(|c| (c.pk_seq as usize, c.name.clone()))
-            .collect();
-        let _ = pk_cols;
         Ok(out)
     }
 
@@ -3955,10 +4377,10 @@ impl Database {
             }
             let foreign = self.foreign.as_ref();
             if let Some(foreign) = foreign {
-                // VACUUM rebuilds the page layout wholesale: take the
-                // full-write path (every page would differ anyway) and
-                // re-establish the WAL session afterwards.
-                *foreign.wal.lock() = None;
+                // VACUUM rebuilds the page layout wholesale: the next
+                // publish takes the full-write path (every page differs
+                // anyway) — drop the page space and re-publish.
+                foreign.coord.invalidate();
                 foreign.dirty.store(true, Ordering::Release);
             }
             self.dump_foreign()?;
@@ -7396,30 +7818,48 @@ impl Database {
     /// when the main file is already current (clean AND sidecar-less) —
     /// `image()` on an untouched database must be byte-stable.
     fn checkpoint_foreign_image(&self) -> Result<()> {
+        use crate::storage::sqlitefmt::container::PublishParams;
         let Some(foreign) = self.foreign.as_ref() else {
             return Ok(());
         };
         let dirty = foreign.dirty.load(Ordering::Acquire);
         let had_wal = foreign.had_wal.load(Ordering::Acquire);
         let live_frames = foreign
-            .wal
+            .coord
+            .state
             .lock()
+            .wal
             .as_ref()
-            .is_some_and(|sess| sess.writer.has_frames());
+            .is_some_and(|w| w.has_frames());
         if !dirty && !had_wal && !live_frames {
             return Ok(());
         }
-        let out = self.collect_foreign_dump()?;
-        let bytes = crate::storage::sqlitefmt::build_bytes(&out)
+        // A full publish through the coordinator: the main file becomes
+        // the current committed state (sidecars retired) and the page
+        // space stays valid for later splices. Counters pass through
+        // unchanged — serialize is not a transaction.
+        let params = PublishParams {
+            page_size: if foreign.page_size == 0 {
+                4096
+            } else {
+                foreign.page_size
+            },
+            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
+            text_enc: foreign.text_enc(),
+            auto_vacuum: foreign.auto_vacuum(),
+            user_version: self.pager.user_version(),
+            application_id: self.pager.application_id(),
+            change_counter: foreign.change_counter.load(Ordering::Acquire).max(1),
+            schema_cookie: foreign.schema_cookie.load(Ordering::Acquire).max(1),
+        };
+        let out =
+            self.collect_foreign_dump_counters(params.change_counter, params.schema_cookie)?;
+        let built = crate::storage::sqlitefmt::writer::build_bytes_spanned(&out)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        crate::storage::sqlitefmt::writer::write_image_atomic(&foreign.path, &bytes)
+        foreign
+            .coord
+            .publish_full(&built, &params)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        // Retire the sidecar + reset the session so the next commit
-        // re-establishes WAL state from the now-current main file.
-        let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(&foreign.path);
-        let _ = std::fs::remove_file(&wal_path);
-        let mut session = foreign.wal.lock();
-        *session = None;
         foreign.dirty.store(false, Ordering::Release);
         foreign.had_wal.store(false, Ordering::Release);
         Ok(())
@@ -13406,8 +13846,23 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "parallel_scan" => Value::Integer(pager.parallel_scan_min_rows()),
         "temp_store" => Value::Integer(pager.temp_store()),
         "page_size" => Value::Integer(pager.page_size() as i64),
-        "page_count" => Value::Integer(pager.n_pages() as i64),
-        "freelist_count" => Value::Integer(pager.freelist_count() as i64),
+        "page_count" => {
+            // Foreign SQLite-format files report the CONTAINER's page
+            // space (the coordinator's live count, WAL frames included)
+            // — the in-memory pager's page ids are the engine's own.
+            match &db.foreign {
+                Some(f) => Value::Integer(f.coord.state.lock().n_pages as i64),
+                None => Value::Integer(pager.n_pages() as i64),
+            }
+        }
+        "freelist_count" => {
+            // The container's real freelist (pages freed by shrunk or
+            // dropped objects, reusable by later splices).
+            match &db.foreign {
+                Some(f) => Value::Integer(f.coord.state.lock().free.len() as i64),
+                None => Value::Integer(pager.freelist_count() as i64),
+            }
+        }
         // The SETTING as given (SQLite reports the raw value: negative
         // = KiB, positive = pages; fresh default -2000), not the
         // derived page capacity.
@@ -13422,7 +13877,12 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             // behavior.
             Value::Integer(pager.data_version_base())
         }
-        "schema_version" => Value::Integer(pager.schema_cookie() as i64),
+        "schema_version" => match &db.foreign {
+            // The FILE's schema cookie (coordinator-owned, monotonic
+            // across sessions since the incremental architecture).
+            Some(f) => Value::Integer(f.schema_cookie.load(Ordering::Acquire) as i64),
+            None => Value::Integer(pager.schema_cookie() as i64),
+        },
         "journal_mode" => {
             // Foreign SQLite-format files carry their own mode: the
             // persistent header marker (18/19 = 2/2) or a live sidecar
@@ -13522,17 +13982,17 @@ fn apply_foreign_journal_mode(f: &ForeignSqlite, mode: &str) {
     // (write_image_atomic clears sidecars).
     let downgrade = matches!(mode, "delete" | "truncate" | "persist" | "memory" | "off");
     if downgrade && f.journal_wal.swap(false, Ordering::AcqRel) {
-        f.wal.lock().take();
+        f.coord.invalidate();
         f.dirty.store(true, Ordering::Release);
     } else if mode == "wal" {
         let was = f.journal_wal.swap(true, Ordering::AcqRel);
         if !was {
             // First switch to WAL: the conversion must reach the MAIN
             // file's header now, not a sidecar frame. Drop the live
-            // rollback session so the next dump (the pragma itself
+            // page space so the next dump (the pragma itself
             // triggers one) rewrites the file with 18/19 = 2/2 and
             // establishes the WAL session.
-            f.wal.lock().take();
+            f.coord.invalidate();
             f.dirty.store(true, Ordering::Release);
         }
     }

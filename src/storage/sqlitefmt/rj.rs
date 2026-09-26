@@ -194,6 +194,43 @@ pub fn write_pages(db_path: &Path, page_size: u32, pages: &[(u32, Vec<u8>)]) -> 
     Ok(())
 }
 
+/// Cheap "is there a hot journal here?" probe for the open-path
+/// format sniff: a crashed DELETE-mode commit can leave the MAIN
+/// file's header torn (the format magic smashed mid-write) while the
+/// journal holds the pre-images that restore it — so the presence of a
+/// VALID journal routes the open into the SQLite-format path even
+/// when the main file's magic check fails. Full validation is
+/// replay's job; this only proves the journal is shaped hot (magic,
+/// parseable header, at least one checksum-valid record).
+pub fn has_hot_journal(db_path: &Path) -> bool {
+    let bytes = match std::fs::read(journal_path_of(db_path)) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if bytes.len() < 28 + 512 {
+        // Empty / truncated / invalidated header: not hot.
+        return false;
+    }
+    let mut hdr = [0u8; 28];
+    hdr.copy_from_slice(&bytes[0..28]);
+    let Some(h) = JournalHeader::from_bytes(&hdr) else {
+        return false;
+    };
+    if h.n_rec == 0 {
+        return false; // invalidated (persist-mode commit marker)
+    }
+    let ps = h.page_size as usize;
+    let rec_len = 4 + ps + 4;
+    if bytes.len() < 512 + rec_len {
+        return false;
+    }
+    let page = &bytes[512 + 4..512 + 4 + ps];
+    let mut cksum_buf = [0u8; 4];
+    cksum_buf.copy_from_slice(&bytes[512 + 4 + ps..512 + 8 + ps]);
+    let cksum = u32::from_be_bytes(cksum_buf);
+    cksum == page_checksum(page, h.nonce)
+}
+
 /// Replay a hot rollback journal onto `db_path` if one exists: restore
 /// every valid page record, truncate the database back to the header's
 /// pre-transaction page count, fsync, delete the journal. Returns

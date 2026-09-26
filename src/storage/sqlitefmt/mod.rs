@@ -22,6 +22,7 @@
 //! sqlx driver — works unchanged on SQLite-created files, and files the
 //! engine writes open in the `sqlite3` CLI.
 
+pub mod container;
 pub mod header;
 pub mod reader;
 pub mod record;

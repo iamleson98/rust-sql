@@ -101,13 +101,19 @@ pub fn build_header(
         1,
         0,
         0,
+        0,
+        0,
     )
 }
 
 /// [`build_header`] with an explicit text encoding (1/2/3 — see
 /// fileformat2 header field 56), auto-vacuum largest-root page (field
-/// 52: non-zero = pointer-map pages exist) and incremental-vacuum flag
-/// (field 64: 1 = INCREMENTAL mode).
+/// 52: non-zero = pointer-map pages exist), incremental-vacuum flag
+/// (field 64: 1 = INCREMENTAL mode) and the freelist (fields 32/36:
+/// first trunk page and total free-page count — zero/zero = empty;
+/// the incremental-commit architecture routes object shrinkage into a
+/// real SQLite freelist so page identities stay stable without
+/// re-flowing the file).
 #[allow(clippy::too_many_arguments)]
 pub fn build_header_enc(
     journal_wal: bool,
@@ -120,6 +126,8 @@ pub fn build_header_enc(
     text_encoding: u32,
     largest_root_btree: u32,
     incremental_vacuum: u32,
+    freelist_head: u32,
+    freelist_count: u32,
 ) -> [u8; 100] {
     let mut h = [0u8; 100];
     h[0..16].copy_from_slice(MAGIC);
@@ -142,9 +150,10 @@ pub fn build_header_enc(
     h[23] = 32;
     h[24..28].copy_from_slice(&change_counter.to_be_bytes());
     h[28..32].copy_from_slice(&db_size_pages.to_be_bytes());
-    // Empty freelist.
-    h[32..36].copy_from_slice(&0u32.to_be_bytes());
-    h[36..40].copy_from_slice(&0u32.to_be_bytes());
+    // Freelist: first trunk page + total free-page count (trunks and
+    // leaves both count).
+    h[32..36].copy_from_slice(&freelist_head.to_be_bytes());
+    h[36..40].copy_from_slice(&freelist_count.to_be_bytes());
     h[40..44].copy_from_slice(&schema_cookie.to_be_bytes());
     // Schema format 4 (modern: DESC indexes, boolean... default since 3.3).
     h[44..48].copy_from_slice(&4u32.to_be_bytes());
@@ -194,14 +203,22 @@ mod tests {
     }
 
     #[test]
+    fn header_freelist_fields_roundtrip() {
+        let h = build_header_enc(false, 4096, 100, 5, 2, 0, 0, 1, 0, 0, 17, 42);
+        let info = FileHeaderInfo::parse(&h).unwrap();
+        assert_eq!(info.freelist_head, 17);
+        assert_eq!(info.freelist_count, 42);
+    }
+
+    #[test]
     fn header_auto_vacuum_fields() {
         // FULL: largest root non-zero, incremental 0.
-        let h = build_header_enc(false, 4096, 9, 1, 1, 0, 0, 1, 9, 0);
+        let h = build_header_enc(false, 4096, 9, 1, 1, 0, 0, 1, 9, 0, 0, 0);
         let info = FileHeaderInfo::parse(&h).unwrap();
         assert_eq!(info.largest_root_btree, 9);
         assert_eq!(h[64..68], 0u32.to_be_bytes());
         // INCREMENTAL: flag byte set.
-        let h = build_header_enc(false, 4096, 9, 1, 1, 0, 0, 1, 9, 1);
+        let h = build_header_enc(false, 4096, 9, 1, 1, 0, 0, 1, 9, 1, 0, 0);
         assert_eq!(h[64..68], 1u32.to_be_bytes());
         assert_eq!(FileHeaderInfo::parse(&h).unwrap().largest_root_btree, 9);
     }

@@ -2633,6 +2633,9 @@ impl Pager {
         if old_root == 0 || new_root == 0 {
             return;
         }
+        // The change-epoch alias happens in EVERY mode (the sqlitefmt
+        // commit layer's dirty detection must follow the split).
+        self.alias_root_epoch(old_root, new_root);
         let Some(txn_id) = self.armed_writer_scope() else {
             return; // plain-mode splits need no lineage (no journal)
         };

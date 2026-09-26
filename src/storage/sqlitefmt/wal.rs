@@ -175,6 +175,12 @@ impl WalWriter {
         self.n_frames > 0
     }
 
+    /// Frames committed under the current salts (autocheckpoint
+    /// diagnostics).
+    pub fn n_frames(&self) -> u32 {
+        self.n_frames
+    }
+
     /// Raw salt bytes (header fields 16..24) for the sidecar identity
     /// check in [`append_wal`].
     fn salt_bytes(&self) -> [u8; 8] {

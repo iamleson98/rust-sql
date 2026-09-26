@@ -158,6 +158,24 @@ pub(crate) const COMMITTED_EPOCH_MARK: u64 = 1u64 << 47;
 /// no-hash fast path for every page of a normal database.
 const PAGE_VEC_DIRECT_LIMIT: usize = 1 << 20;
 
+/// Shard count for the per-root change-epoch map (see `Pager::root_epochs`).
+/// A power of two so sharding is a mask.
+const ROOT_EPOCH_SHARDS: usize = 16;
+
+/// Get-or-insert helper for one shard of the root-epoch map.
+fn root_epoch_shard(
+    shard: &Mutex<std::collections::HashMap<PageId, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    root: PageId,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let mut g = shard.lock();
+    if let Some(slot) = g.get(&root) {
+        return slot.clone();
+    }
+    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    g.insert(root, slot.clone());
+    slot
+}
+
 /// PRAGMA parallel_scan default: tables at or above this estimated row
 /// count split their aggregate scans across worker threads
 /// (`executor::parallel`). 128k rows sits above every existing
@@ -572,6 +590,20 @@ pub struct Pager {
     cache_capacity: AtomicUsize,
     /// Schema cookie, bumped on every schema change.
     schema_cookie: AtomicU32,
+    /// Per-b-tree-root change epochs — the SQLite-format container's
+    /// incremental-commit signal. Every b-tree mutation entry point
+    /// bumps its root's epoch; the sqlitefmt commit layer then compares
+    /// each schema object's root epoch against the value it recorded at
+    /// the last commit, so a commit rebuilds and rewrites ONLY the
+    /// objects whose trees were written (an O(changed) page splice,
+    /// never an O(database) image rebuild). The cells are
+    /// `Arc<AtomicU64>` cloned into each `Btree` handle at construction,
+    /// so bumping costs one relaxed fetch-add — no lock on the write
+    /// path. Sharded (16) by root id to keep handle construction
+    /// contention near zero.
+    root_epochs: [Mutex<
+        std::collections::HashMap<PageId, std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    >; ROOT_EPOCH_SHARDS],
     /// True if this is a freshly created database (no header yet).
     is_new: AtomicBool,
     /// When true, `flush()` skips `file.sync_all()`. This is a HUGE perf win
@@ -1761,6 +1793,7 @@ impl Pager {
             lru: Mutex::new(VecDeque::new()),
             cache_capacity: AtomicUsize::new(cache_capacity),
             schema_cookie: AtomicU32::new(0),
+            root_epochs: Default::default(),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(skip_sync),
             memory_wal: AtomicBool::new(false),
@@ -2436,6 +2469,43 @@ impl Pager {
     #[inline]
     pub fn write_version(&self) -> u64 {
         self.write_version.load(Ordering::Relaxed)
+    }
+
+    /// The change-epoch cell of one b-tree root (get-or-insert) — the
+    /// SQLite-format container's incremental-commit signal. Called once
+    /// per `Btree` handle construction; the handle then bumps the cell
+    /// on every mutation (lock-free fetch-add).
+    pub fn root_epoch_slot(&self, root: PageId) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        let shard = (root as usize) & (ROOT_EPOCH_SHARDS - 1);
+        root_epoch_shard(&self.root_epochs[shard], root)
+    }
+
+    /// Alias one root's change-epoch cell onto another — a root split:
+    /// the new root CONTINUES the old root's object, so both page
+    /// identities must share one change signal. Reads keyed by either
+    /// the catalog's CREATE-time root or the live (post-split) root
+    /// then observe the same epoch (the sqlitefmt commit layer keys its
+    /// dirty detection by the catalog root; the writes flow through
+    /// whichever root the executor resolved).
+    pub(crate) fn alias_root_epoch(&self, old_root: PageId, new_root: PageId) {
+        if old_root == 0 || new_root == 0 || old_root == new_root {
+            return;
+        }
+        // Resolve the OLD root's slot first (multi-level splits chain:
+        // each alias points at the ORIGINAL object's cell).
+        let slot = self.root_epoch_slot(old_root);
+        let shard = (new_root as usize) & (ROOT_EPOCH_SHARDS - 1);
+        self.root_epochs[shard].lock().insert(new_root, slot);
+    }
+
+    /// Current change epoch of one b-tree root (0 = never written since
+    /// open). The sqlitefmt commit layer compares these per schema
+    /// object against its last-committed snapshot to decide which
+    /// objects to re-encode and splice.
+    pub fn root_epoch(&self, root: PageId) -> u64 {
+        let shard = (root as usize) & (ROOT_EPOCH_SHARDS - 1);
+        let g = self.root_epochs[shard].lock();
+        g.get(&root).map(|s| s.load(Ordering::Acquire)).unwrap_or(0)
     }
 
     /// This pager's stable instance id (process-wide counter).
