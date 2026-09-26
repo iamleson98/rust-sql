@@ -1233,3 +1233,16 @@ Work Log:
 
 Stage Summary:
 - Master CI-green at 581431b; the generation-boundary class fixed, pinned, and soak-validated at 1M scale; the reincarnation hunt stays clean. Docs push re-triggers CI (watch + verify per the loop).
+
+---
+Task ID: 51
+Agent: main (Super Z)
+Task: Close the loop — docs run verified green; extended validation recorded.
+
+Work Log:
+- Docs run 36236685550 on 64ab629: COMPLETED / SUCCESS (31/31) — master is fully green with the README citing it.
+- Extended race-fix validation: ~414 more contention runs on top of the earlier 460 (a 3-round batch was cut short by the outer timeout mid-round; zero failure logs survived — every completed run passed). Cumulative post-fix: ~875 clean runs with folds active.
+- Session totals: 4 pushed commits (1da98d6 S7 guard; 31311aa generation-boundary durability class; 581431b epoch-map fix + clean-close pin; 64ab629 docs), every one CI-verified green; 38 clean soak attempts (12@300k + 26@1M) on top of the prior session's 24/24.
+
+Stage Summary:
+- All CI problems fixed and verified; the loop has converged green at 64ab629. Open follow-ups for the next round: the SQLite-format per-commit O(database) CPU (incremental page-diff container — multi-session architectural), the S06/join residuals (tracked by the torture matrix), and the rare S4 reader-regression flake (diagnostics shipped, unreproduced since).
