@@ -58,6 +58,7 @@ pub(crate) fn exec_table_function(
         "pragma_collation_list" => pragma_collation_list(),
         "pragma_database_list" => pragma_database_list(),
         "dbstat" => dbstat(ctx, &vals)?,
+        "sqlite_dbdata" => dbdata(ctx, &vals)?,
         other => {
             return Err(Error::semantic(format!(
                 "no such table-valued function: {}",
@@ -726,4 +727,410 @@ fn walk_dbstat_btree(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// sqlite_dbdata — the SQLITE_DBDATA forensic page reader
+// ---------------------------------------------------------------------------
+//
+// `FROM sqlite_dbdata('main')`: one row per (page, cell, field) of the
+// RAW page image — no b-tree linkage followed, every page 0..n_pages
+// visited in order (the forensic posture: unlinked pages, freelist
+// pages and orphaned overflow chains are all visible). Columns are
+// SQLite's: pgno, cell, field, value, hexval, descr.
+//
+// Engine-shape notes (documented divergences from SQLite's dbdata):
+// * Pages are 0-BASED here (SQLite's are 1-based); page 0's cells begin
+//   after the 100-byte database header.
+// * The row codec is per-value self-describing (a leading tag byte per
+//   value — see `encode_into`), not SQLite's record header; `field`
+//   indexes the cell payload's values in stored order. The rowid-alias
+//   marker (tag 0x09) is reported as its own field with type
+//   "rowid-marker".
+// * Index cells store ORDER-KEY encoded columns (tags 0x00..0x03 + BE
+//   u32 lengths / total-order double keys); fields report those bytes.
+// * `field = -1` is the cell's KEY: the rowid of a table/index leaf
+//   cell, or the full (child, separator) bytes of an interior cell.
+// * `cell = -1` is a page-level fact: the 12-byte page header, an
+//   overflow page's chunk, a freelist trunk's header+entries, or a
+//   zeroed/unknown page.
+// * This engine ZEROES pages when it frees them (cache hygiene), so
+//   freed pages decode as "zeroed (freed)" — deleted-row recovery via
+//   freelist scanning is NOT possible by design (the bytes are gone);
+//   unallocated regions and orphaned overflow chains remain readable.
+
+/// sqlite_dbdata's column set (mirrored in namecheck's `tvf_columns`).
+pub(crate) const DBDATA_COLS: [&str; 6] = ["pgno", "cell", "field", "value", "hexval", "descr"];
+
+fn hex_of(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Human name of a ROW-CODEC value tag (the `encode_into` codec).
+fn row_tag_name(tag: u8) -> &'static str {
+    match tag {
+        0x00 => "null",
+        0x01..=0x05 => "int",
+        0x06 | 0x0A => "real",
+        0x07 => "text",
+        0x08 => "blob",
+        0x09 => "rowid-marker",
+        _ => "unknown",
+    }
+}
+
+/// Decode a varint (the cell codec's unsigned LEB128) — same shape as
+/// the triage harness's decoder.
+fn dbdata_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut v: u64 = 0;
+    for (i, &b) in buf.iter().take(9).enumerate() {
+        if i == 8 {
+            return Some(((v << 8) | b as u64, 9));
+        }
+        v = (v << 7) | (b & 0x7F) as u64;
+        if b & 0x80 == 0 {
+            return Some((v, i + 1));
+        }
+    }
+    None
+}
+
+/// Emit one (pgno, cell, field, value, hexval, descr) row.
+fn dbdata_push(
+    rows: &mut Vec<Vec<Value>>,
+    pgno: u32,
+    cell: i64,
+    field: i64,
+    bytes: &[u8],
+    descr: String,
+) {
+    rows.push(vec![
+        Value::Integer(pgno as i64),
+        Value::Integer(cell),
+        Value::Integer(field),
+        Value::Blob(bytes.to_vec()),
+        Value::Text(hex_of(bytes).into()),
+        Value::Text(descr.into()),
+    ]);
+}
+
+fn dbdata(
+    ctx: &ExecContext<'_>,
+    args: &[Value],
+) -> Result<(Vec<&'static str>, Vec<Vec<Value>>), Error> {
+    // Schema argument: only 'main' exists (the engine is single-db);
+    // missing/NULL/'' default to main — anything else is SQLite's
+    // "no such table" error shape.
+    match args.first() {
+        None | Some(Value::Null) => {}
+        Some(Value::Text(t)) if t.is_empty() || t.eq_ignore_ascii_case("main") => {}
+        Some(Value::Text(t)) => {
+            return Err(Error::NotFound(format!("no such table: {}", t)));
+        }
+        Some(_) => {
+            return Err(Error::semantic(
+                "sqlite_dbdata: schema argument must be text",
+            ))
+        }
+    }
+
+    let pager = ctx.pager;
+    let n_pages = pager.n_pages();
+
+    // Freelist membership (trunk chain walk, cycle-guarded like
+    // integrity's): trunk pages decode as freelist trunks; their leaf
+    // entries are the zeroed freed pages.
+    let mut freelist_trunks: std::collections::HashSet<u32> = Default::default();
+    let mut freed_pages: std::collections::HashSet<u32> = Default::default();
+    {
+        let mut cur = pager.freelist_head();
+        let mut hops = 0usize;
+        while cur != 0 && cur < n_pages {
+            if !freelist_trunks.insert(cur) {
+                break; // cycle: stop, report what we have
+            }
+            hops += 1;
+            if hops > n_pages as usize + 1 {
+                break;
+            }
+            let page = pager.get_page(cur)?;
+            let borrowed = page.lock();
+            let next = u32::from_le_bytes(
+                borrowed
+                    .data
+                    .get(..4)
+                    .and_then(|s| s.try_into().ok())
+                    .unwrap_or([0; 4]),
+            );
+            let k = u32::from_le_bytes(
+                borrowed
+                    .data
+                    .get(4..8)
+                    .and_then(|s| s.try_into().ok())
+                    .unwrap_or([0; 4]),
+            );
+            for i in 0..k.min(1024) {
+                let off = 8 + i as usize * 4;
+                if let Some(e) = borrowed
+                    .data
+                    .get(off..off + 4)
+                    .and_then(|s| s.try_into().ok())
+                {
+                    freed_pages.insert(u32::from_le_bytes(e));
+                }
+            }
+            drop(borrowed);
+            cur = next;
+        }
+    }
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for pgno in 0..n_pages {
+        let page = pager.get_page(pgno)?;
+        let data: &[u8] = &page.lock().data;
+        let hdr = if pgno == 0 { 100 } else { 0 };
+        if data.len() < hdr + 12 {
+            continue;
+        }
+        let ptype = data[hdr];
+        let n_cells = u16::from_be_bytes([data[hdr + 4], data[hdr + 5]]) as usize;
+        let right = u32::from_be_bytes(data[hdr + 8..hdr + 12].try_into().unwrap_or([0; 4]));
+        let cell_ptr_at = |i: usize| -> Option<usize> {
+            let off = hdr + 12 + i * 2;
+            let p = u16::from_be_bytes(data.get(off..off + 2)?.try_into().ok()?) as usize;
+            (p < data.len()).then_some(p)
+        };
+
+        if let Ok(t) = crate::storage::page::PageType::from_byte(ptype) {
+            use crate::storage::page::PageType;
+            let type_name = match t {
+                PageType::LeafTable => "leaf-table",
+                PageType::InteriorTable => "interior-table",
+                PageType::LeafIndex => "leaf-index",
+                PageType::InteriorIndex => "interior-index",
+                PageType::Overflow => "overflow",
+            };
+            if t == PageType::Overflow && !freelist_trunks.contains(&pgno) {
+                // Overflow page: [12..16) next (BE u32, 0 = end), [16..)
+                // the chunk bytes.
+                let next =
+                    u32::from_be_bytes(data[hdr + 12..hdr + 16].try_into().unwrap_or([0; 4]));
+                let chunk = &data[hdr + 16..];
+                dbdata_push(
+                    &mut rows,
+                    pgno,
+                    -1,
+                    -1,
+                    chunk,
+                    format!("pgno={pgno} type=overflow next={next} len={}", chunk.len()),
+                );
+                continue;
+            }
+            // Page-header fact row.
+            dbdata_push(
+                &mut rows,
+                pgno,
+                -1,
+                -1,
+                &data[hdr..hdr + 12],
+                format!("pgno={pgno} type={type_name} ncell={n_cells} right={right}"),
+            );
+            for i in 0..n_cells.min(4096) {
+                let Some(ptr) = cell_ptr_at(i) else { continue };
+                let cell = &data[ptr.min(data.len())..];
+                match t {
+                    PageType::LeafTable => {
+                        // [varint rowid][varint plen][payload values..]
+                        let Some((rowid, n1)) = dbdata_varint(cell) else {
+                            continue;
+                        };
+                        dbdata_push(
+                            &mut rows,
+                            pgno,
+                            i as i64,
+                            -1,
+                            &cell[..n1],
+                            format!("cell={i} rowid={}", rowid as i64),
+                        );
+                        let Some((plen, n2)) = dbdata_varint(&cell[n1..]) else {
+                            continue;
+                        };
+                        let payload = &cell[n1 + n2..(n1 + n2 + plen as usize).min(cell.len())];
+                        let mut pos = 0usize;
+                        let mut field = 0i64;
+                        while pos < payload.len() && field < 2048 {
+                            let tag = payload[pos];
+                            let len = crate::storage::row_codec::value_encoded_len(&payload[pos..])
+                                .unwrap_or(0);
+                            if len == 0 || pos + len > payload.len() {
+                                break;
+                            }
+                            let v = &payload[pos..pos + len];
+                            dbdata_push(
+                                &mut rows,
+                                pgno,
+                                i as i64,
+                                field,
+                                v,
+                                format!(
+                                    "cell={i} field={field} tag=0x{tag:02X} type={} len={len}",
+                                    row_tag_name(tag)
+                                ),
+                            );
+                            pos += len;
+                            field += 1;
+                        }
+                    }
+                    PageType::LeafIndex => {
+                        // [varint rowid][varint klen][order-key values..]
+                        let Some((rowid, n1)) = dbdata_varint(cell) else {
+                            continue;
+                        };
+                        dbdata_push(
+                            &mut rows,
+                            pgno,
+                            i as i64,
+                            -1,
+                            &cell[..n1],
+                            format!("cell={i} rowid={}", rowid as i64),
+                        );
+                        let Some((klen, n2)) = dbdata_varint(&cell[n1..]) else {
+                            continue;
+                        };
+                        let key = &cell[n1 + n2..(n1 + n2 + klen as usize).min(cell.len())];
+                        emit_order_key_fields(&mut rows, pgno, i as i64, key);
+                    }
+                    PageType::InteriorTable => {
+                        // [BE u32 child][varint separator]
+                        if cell.len() < 4 {
+                            continue;
+                        }
+                        let child = u32::from_be_bytes(cell[..4].try_into().unwrap_or([0; 4]));
+                        let sep = dbdata_varint(&cell[4..]).map(|(v, _)| v as i64);
+                        dbdata_push(
+                            &mut rows,
+                            pgno,
+                            i as i64,
+                            -1,
+                            &cell[..cell
+                                .len()
+                                .min(4 + dbdata_varint(&cell[4..]).map_or(0, |(_, n)| n))],
+                            format!("cell={i} child={child} sep={}", sep.unwrap_or(0)),
+                        );
+                    }
+                    PageType::InteriorIndex => {
+                        // [BE u32 child][order-key values..]
+                        if cell.len() < 4 {
+                            continue;
+                        }
+                        let child = u32::from_be_bytes(cell[..4].try_into().unwrap_or([0; 4]));
+                        let key = &cell[4..];
+                        dbdata_push(
+                            &mut rows,
+                            pgno,
+                            i as i64,
+                            -1,
+                            &cell[..4],
+                            format!("cell={i} child={child} key-bytes={}", key.len()),
+                        );
+                        emit_order_key_fields(&mut rows, pgno, i as i64, key);
+                    }
+                    PageType::Overflow => unreachable!("overflow handled above"),
+                }
+            }
+        } else if freelist_trunks.contains(&pgno) {
+            // Freelist trunk: [LE u32 next][LE u32 k][k LE u32 entries]
+            let next = u32::from_le_bytes(data[..4].try_into().unwrap_or([0; 4]));
+            let k = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4]));
+            let body_len = (8 + k as usize * 4).min(data.len());
+            let mut entries = Vec::new();
+            for i in 0..k.min(16) {
+                if let Some(e) = data.get(8 + i as usize * 4..12 + i as usize * 4) {
+                    entries.push(u32::from_le_bytes(e.try_into().unwrap_or([0; 4])));
+                }
+            }
+            dbdata_push(
+                &mut rows,
+                pgno,
+                -1,
+                -1,
+                &data[..body_len],
+                format!(
+                    "pgno={pgno} type=freelist-trunk next={next} n={k} entries={:?}{}",
+                    entries,
+                    if k > 16 { "…" } else { "" }
+                ),
+            );
+        } else if freed_pages.contains(&pgno) || ptype == 0 {
+            dbdata_push(
+                &mut rows,
+                pgno,
+                -1,
+                -1,
+                &[],
+                format!("pgno={pgno} type=zeroed (freed)"),
+            );
+        } else {
+            dbdata_push(
+                &mut rows,
+                pgno,
+                -1,
+                -1,
+                &data[..0],
+                format!("pgno={pgno} type=0x{ptype:02X} unknown"),
+            );
+        }
+    }
+    Ok((DBDATA_COLS.to_vec(), rows))
+}
+
+/// Emit the ORDER-KEY encoded fields of an index cell's key: per value
+/// `[tag]` for NULL, `[tag][8B total-order key]` (+2B delta) for
+/// numerics, `[tag][BE u32 len][bytes]` for text/blob.
+fn emit_order_key_fields(rows: &mut Vec<Vec<Value>>, pgno: u32, cell: i64, key: &[u8]) {
+    let mut pos = 0usize;
+    let mut field = 0i64;
+    while pos < key.len() && field < 64 {
+        let tag = key[pos];
+        let (len, tname) = match tag {
+            0x00 => (1usize, "null"),
+            0x01 => {
+                // 8-byte total-order double key (+ optional 2-byte delta).
+                let mut n = 9usize;
+                if pos + 11 <= key.len() && key[pos + 8] & 0x80 != 0 {
+                    n += 2; // large-int delta present
+                }
+                (n, "numeric")
+            }
+            0x02 | 0x03 => {
+                let blen = if pos + 5 <= key.len() {
+                    u32::from_be_bytes(key[pos + 1..pos + 5].try_into().unwrap_or([0; 4])) as usize
+                } else {
+                    0
+                };
+                (5 + blen, if tag == 0x02 { "text" } else { "blob" })
+            }
+            _ => break, // unknown tag: stop (corrupt or trailing bytes)
+        };
+        if pos + len > key.len() {
+            break;
+        }
+        let v = &key[pos..pos + len];
+        dbdata_push(
+            rows,
+            pgno,
+            cell,
+            field,
+            v,
+            format!("cell={cell} field={field} tag=0x{tag:02X} type={tname} len={len}"),
+        );
+        pos += len;
+        field += 1;
+    }
 }

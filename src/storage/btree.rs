@@ -10035,6 +10035,114 @@ fn leaf_rowid_bounds(pager: &Pager, leaf: PageId) -> Result<Option<(i64, i64)>> 
     }
 }
 
+/// Collect EVERY page of the b-tree rooted at `root` — the DROP TABLE /
+/// DROP INDEX reclaim walk. Interiors + leaves via a cycle-guarded DFS,
+/// plus every cell's overflow chain. The root itself is included. Page
+/// 0 is never collected (the catalog root is permanent).
+///
+/// The historical DROP freed ONLY the root page: a multi-page table's
+/// whole subtree leaked (orphaned interiors/leaves/overflow chains,
+/// still contentful in the file but unreachable — pinned by
+/// sqlite_dbdata: a 5-page DROP left freelist_count at 1 with the
+/// leaves decoding full rows). Collect FIRST, free AFTER: an error
+/// mid-walk (corrupt tree) frees nothing.
+pub fn collect_tree_pages(pager: &Pager, root: PageId, out: &mut Vec<PageId>) -> Result<()> {
+    let psz = pager.page_size();
+    let n_pages = pager.n_pages();
+    let mut visited: std::collections::HashSet<PageId> = std::collections::HashSet::new();
+    let mut stack: Vec<PageId> = Vec::new();
+    if root != 0 {
+        stack.push(root);
+    }
+    while let Some(pid) = stack.pop() {
+        if pid == 0 || pid >= n_pages {
+            return Err(Error::corruption(format!(
+                "tree walk references page {pid} outside the file ({n_pages} pages)"
+            )));
+        }
+        if !visited.insert(pid) {
+            return Err(Error::corruption(format!(
+                "tree walk revisits page {pid} (cycle?)"
+            )));
+        }
+        if visited.len() > n_pages as usize {
+            return Err(Error::corruption("tree walk exceeded the file"));
+        }
+        let page = pager.get_page(pid)?;
+        let (pt, ncell, right) = {
+            let p = page.lock();
+            (p.page_type()?, p.n_cells(), p.right_most_pointer())
+        };
+        for i in 0..ncell {
+            let cell = {
+                let p = page.lock();
+                let buf = p.cell_slice(i)?;
+                Cell::decode(buf, pt, psz)?
+            };
+            match cell {
+                Cell::TableInterior { left_child, .. } | Cell::IndexInterior { left_child, .. } => {
+                    stack.push(left_child)
+                }
+                Cell::TableLeafOverflow { overflow, .. }
+                | Cell::IndexLeafOverflow { overflow, .. } => {
+                    collect_overflow_chain(pager, overflow, &mut visited, out)?;
+                }
+                Cell::IndexInteriorOverflow {
+                    left_child,
+                    overflow,
+                    ..
+                } => {
+                    stack.push(left_child);
+                    collect_overflow_chain(pager, overflow, &mut visited, out)?;
+                }
+                Cell::TableLeaf { .. } | Cell::IndexLeaf { .. } => {}
+            }
+        }
+        if let PageType::InteriorIndex | PageType::InteriorTable = pt {
+            if right != 0 {
+                stack.push(right);
+            }
+        }
+        out.push(pid);
+    }
+    Ok(())
+}
+
+/// Follow one overflow chain, collecting its pages (cycle-guarded like
+/// the tree walk). `visited` is shared with the tree walk so a chain
+/// that loops back into the tree trips the same guard.
+fn collect_overflow_chain(
+    pager: &Pager,
+    head: PageId,
+    visited: &mut std::collections::HashSet<PageId>,
+    out: &mut Vec<PageId>,
+) -> Result<()> {
+    let n_pages = pager.n_pages();
+    let mut cur = head;
+    let mut hops = 0usize;
+    while cur != 0 {
+        if cur >= n_pages {
+            return Err(Error::corruption(format!(
+                "overflow chain references page {cur} outside the file"
+            )));
+        }
+        if !visited.insert(cur) {
+            return Err(Error::corruption(format!(
+                "overflow chain revisits page {cur} (cycle?)"
+            )));
+        }
+        hops += 1;
+        if hops > n_pages as usize {
+            return Err(Error::corruption("overflow chain exceeded the file"));
+        }
+        let page = pager.get_page(cur)?;
+        let next = page.lock().overflow_next();
+        out.push(cur);
+        cur = next;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

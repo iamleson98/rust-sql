@@ -11523,7 +11523,24 @@ impl Database {
                     ctx.pager.flush()?;
                     return Ok(());
                 }
-                ctx.pager.free_page(table.root_page)?;
+                // Free the WHOLE tree, not just the root: every
+                // interior, leaf and overflow-chain page below it (the
+                // historical root-only free leaked the entire subtree of
+                // any multi-page table — orphaned contentful pages the
+                // file never reclaimed; pinned by sqlite_dbdata).
+                // LIVE root (override-aware): the Table struct's
+                // root_page is the CREATE-time root — a re-rooting
+                // INSERT (the tree split) never writes it back, so the
+                // historical free operated on a STALE mid-tree page (the
+                // freelist then handed it out while the tree still
+                // referenced it). Resolve through the same map every
+                // reader uses, then free the whole subtree.
+                let live_root = ctx.table_root(&table);
+                let mut tree_pages = Vec::new();
+                crate::storage::btree::collect_tree_pages(ctx.pager, live_root, &mut tree_pages)?;
+                for pid in tree_pages {
+                    ctx.pager.free_page(pid)?;
+                }
                 delete_schema_row(ctx.pager, "table", &d.name)?;
                 // Retire the cached table root AND every implicit/explicit
                 // index root from the shared bookkeeping maps (the merge
@@ -11553,7 +11570,18 @@ impl Database {
                 // Previously these rows survived, so reopening the file
                 // resurrected orphaned indexes pointing at freed pages.
                 for idx in &indexes_on_it {
-                    let _ = ctx.pager.free_page(idx.root_page);
+                    let mut tree_pages = Vec::new();
+                    if crate::storage::btree::collect_tree_pages(
+                        ctx.pager,
+                        ctx.index_root(idx),
+                        &mut tree_pages,
+                    )
+                    .is_ok()
+                    {
+                        for pid in tree_pages {
+                            let _ = ctx.pager.free_page(pid);
+                        }
+                    }
                 }
                 let mut bt = Btree::new(ctx.pager, 0, false);
                 let mut to_delete = Vec::new();
@@ -11583,7 +11611,14 @@ impl Database {
                 let idx = catalog
                     .drop_index(&d.name)
                     .ok_or_else(|| Error::NotFound(format!("no such index: {}", d.name)))?;
-                ctx.pager.free_page(idx.root_page)?;
+                // Free the whole index tree (see the DROP TABLE arm: the
+                // root-only free leaked the subtree).
+                let live_root = ctx.index_root(&idx);
+                let mut tree_pages = Vec::new();
+                crate::storage::btree::collect_tree_pages(ctx.pager, live_root, &mut tree_pages)?;
+                for pid in tree_pages {
+                    ctx.pager.free_page(pid)?;
+                }
                 delete_schema_row(ctx.pager, "index", &d.name)?;
                 // Same shared-map retirement as DROP TABLE (the freed
                 // root page will be handed out again).

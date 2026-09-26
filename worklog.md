@@ -1138,3 +1138,20 @@ Stage Summary:
 - The residual right-edge corruption class is CLOSED: three append-path holes fixed (unmarked table walk, unmarked index walk + flag, missing index hint guard/stamp), pinned by V6/V7, and the 1M-scale soak is clean at 24/24.
 - Pushed as e3e9354; CI run 36218609802 in flight.
 - Open follow-ups: the rare S4 reader-regression flake (diagnostics shipped); sqlite_dbdata (the forensic deleted-page reader) remains the open half of the old dbstat bullet.
+
+---
+Task ID: 45
+Agent: main (Super Z)
+Task: Close the sqlite_dbdata gap (Task 38's open half) — and the DROP TABLE subtree leak + stale-root free its first tests found.
+
+Work Log:
+- CI on the corruption fix (e3ae397, run 36218721890): 31/31 green on all three OSes — the residual right-edge class is closed and validated.
+- Implemented sqlite_dbdata (the SQLITE_DBDATA forensic raw-page reader) on the dbstat machinery pattern: `FROM sqlite_dbdata('main')` — one row per (page, cell, field) across EVERY page 0..n_pages (no b-tree linkage: unlinked pages, freelist trunks and orphaned overflow chains are all visible). Columns pgno/cell/field/value/hexval/descr; field=-1 is the cell's key (rowid / interior (child,sep) bytes), cell=-1 is a page-level fact (header, overflow chunk, freelist trunk, zeroed/unknown). Freelist membership comes from a cycle-guarded trunk-chain walk (integrity's discipline). Engine-shape divergences documented in-module and in the README: 0-based pages, per-value-tag row codec, order-key index cells, freed pages ZEROED on free (deleted-row recovery impossible by design).
+- Registration: the executor's tablefn arm + namecheck's tvf_columns (function form only — SQLite's own entry; no eponymous no-arg form; sqlite_* names are reserved so the shadowing scenario is structurally impossible).
+- Tests (tests/dbdata.rs, 5 suites): full field decode of every codec shape (null/i8-i64 ints/text/blob/f64/rowid-marker — exact byte expectations), the schema page's sqlite_master rows decode, overflow chains (100KB blob -> 24+ chunk rows, all bytes verified, one next=0 tail), the freelist (trunk + zeroed rows), and the argument contract ('main'/NULL ok, unknown schema errors, reserved names).
+- **TWO REAL BUGS the dbdata tests exposed in DROP TABLE**: (1) execute_drop freed ONLY the root page — a multi-page table's entire subtree (interiors, leaves, overflow chains) leaked as orphaned contentful pages; (2) worse, the freed "root" was the Table struct's CREATE-time root_page — STALE after any re-rooting insert (a split) — so DROP actually freed a live MID-TREE page, which the freelist later handed out while the tree still referenced it (cross-tree corruption class). FIXED: new `Btree::collect_tree_pages` (cycle-guarded DFS + overflow-chain collector; collect first, free after — an error mid-walk frees nothing) and the DROP arms (Table, per-index, DropKind::Index) now resolve the LIVE root via ctx.table_root/index_root (the same override-aware maps every reader uses) and free the whole subtree. Pinned by `drop_reclaims_the_whole_subtree_from_the_live_root` (400-row re-rooted drop -> freelist >= 5, no truncation, integrity ok, freelist reuse before file growth).
+- Validation: lib 271, dbdata 5, drop_create_cycle 3, regression 27, savepoints 7, integrity 1, wal 9, durability 33, crash_recovery 9, differential 2, stateful_fuzz 25, foreign_keys 14, schema_parity 9 — all green; clippy -D warnings clean; fmt clean.
+- README: the sqlite_dbdata bullet updated from "not shipped" to the engine-shape note.
+
+Stage Summary:
+- sqlite_dbdata shipped (5-suite pinned); the DROP TABLE subtree leak + stale-root free fixed and pinned; CI green at e3ae397 with the corruption fix.

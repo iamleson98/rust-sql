@@ -499,7 +499,7 @@ fn decode_selective_walk(
 /// a `Value`. Returns the total number of bytes consumed by this value
 /// (tag + payload). Used by `decode_row_selective` to skip unwanted
 /// columns in O(1) per-column time without heap traffic.
-fn value_encoded_len(buf: &[u8]) -> Result<usize> {
+pub(crate) fn value_encoded_len(buf: &[u8]) -> Result<usize> {
     if buf.is_empty() {
         return Err(crate::error::Error::corruption("empty value"));
     }

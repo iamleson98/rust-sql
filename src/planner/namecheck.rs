@@ -210,8 +210,10 @@ fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
             "match",
         ]),
         "pragma_collation_list" => Some(vec!["seq", "name"]),
-        // dbstat: the same column list the executor serves (DBSTAT_COLS).
+        // dbstat / sqlite_dbdata: the same column lists the executor
+        // serves (DBSTAT_COLS / DBDATA_COLS).
         "dbstat" => Some(crate::executor::tableval::DBSTAT_COLS.to_vec()),
+        "sqlite_dbdata" => Some(crate::executor::tableval::DBDATA_COLS.to_vec()),
         "pragma_database_list" => Some(vec!["seq", "name", "file"]),
         _ => None,
     }

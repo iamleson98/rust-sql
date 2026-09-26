@@ -245,7 +245,7 @@ The honest ledger. Everything here is verifiable absence — `module_list`/`func
 - **R*Tree / Geopoly**: not implemented. Workaround: B-tree-indexed `(min_x, max_x)` pairs + overlap predicates; GIST grid KNN for points.
 - **Session extension** (`sqlite3_session_*`/changesets/rebasing): not implemented. Workaround: the preupdate-hook event stream (fully real, differential-pinned).
 - **`sqlite_stat4`**: stat1 only (SQLite's own default recommendation set).
-- **`sqlite_dbdata` vtab**: not shipped (the forensic deleted-page reader). Workaround: `dbstat` (real — see below), `PRAGMA integrity_check`, `VACUUM INTO`.
+- **`sqlite_dbdata` engine shape**: real, but pages are 0-based, fields follow the per-value-tag row codec (not SQLite's record header), and freed pages are ZEROED on free (cache hygiene) — deleted-row recovery from freelist pages is impossible by design; unallocated regions and orphaned overflow chains remain readable. `dbstat`, `PRAGMA integrity_check` and `VACUUM INTO` cover the rest of the forensic surface.
 - **ATTACH**: name-only round trip (single-database engine; no cross-database queries).
 - **Native-format multi-process access**: absent by design (see above).
 - **CLI dot-commands**: 12 commands + one-shot flags — not sqlite3's full shell.
