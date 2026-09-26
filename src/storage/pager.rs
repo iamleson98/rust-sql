@@ -604,6 +604,12 @@ pub struct Pager {
     root_epochs: [Mutex<
         std::collections::HashMap<PageId, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     >; ROOT_EPOCH_SHARDS],
+    /// Whether the root-epoch bumps are live. Enabled ONLY on
+    /// SQLite-format (foreign-backed) databases — the commit layer's
+    /// splice decision consumes the epochs; native and in-memory
+    /// workloads skip the atomic entirely (a cached-flag branch on
+    /// the mutation path), keeping the insert hot path untouched.
+    epoch_tracking: std::sync::atomic::AtomicBool,
     /// True if this is a freshly created database (no header yet).
     is_new: AtomicBool,
     /// When true, `flush()` skips `file.sync_all()`. This is a HUGE perf win
@@ -1794,6 +1800,7 @@ impl Pager {
             cache_capacity: AtomicUsize::new(cache_capacity),
             schema_cookie: AtomicU32::new(0),
             root_epochs: Default::default(),
+            epoch_tracking: std::sync::atomic::AtomicBool::new(false),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(skip_sync),
             memory_wal: AtomicBool::new(false),
@@ -2476,8 +2483,29 @@ impl Pager {
     /// per `Btree` handle construction; the handle then bumps the cell
     /// on every mutation (lock-free fetch-add).
     pub fn root_epoch_slot(&self, root: PageId) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        // Native / in-memory workloads never bump (the flag gates every
+        // mutation-site bump), so they share one static cell instead of
+        // paying the shard lock + hash per handle construction.
+        if !self.epoch_tracking.load(Ordering::Relaxed) {
+            static DISABLED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> =
+                std::sync::OnceLock::new();
+            return DISABLED
+                .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+                .clone();
+        }
         let shard = (root as usize) & (ROOT_EPOCH_SHARDS - 1);
         root_epoch_shard(&self.root_epochs[shard], root)
+    }
+
+    /// Whether root-epoch tracking is live (see `Pager::epoch_tracking`).
+    pub(crate) fn epoch_tracking_enabled(&self) -> &std::sync::atomic::AtomicBool {
+        &self.epoch_tracking
+    }
+
+    /// Enable root-epoch tracking (SQLite-format databases only —
+    /// their commit layer diffs the epochs per commit boundary).
+    pub(crate) fn enable_epoch_tracking(&self) {
+        self.epoch_tracking.store(true, Ordering::Release);
     }
 
     /// Alias one root's change-epoch cell onto another — a root split:

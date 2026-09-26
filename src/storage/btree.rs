@@ -1948,15 +1948,23 @@ impl<'a> Btree<'a> {
     }
 
     /// Mark this root as written (the sqlitefmt incremental-commit
-    /// signal — see `Btree::root_epoch`). Conservative by design: every
-    /// mutation entry point records the write even if the operation
-    /// later turns out to touch nothing (failed statements roll their
-    /// pages back, and an object rebuilt with identical content diffs
-    /// to zero changed pages — a wasted rebuild, never a stale file).
+    /// signal — see `Btree::root_epoch`). Bumped on the SUCCESS side of
+    /// every mutation entry point, AFTER the pages are live: a commit
+    /// snapshot can then never record an epoch AHEAD of the data it
+    /// collected (the publish-race closure). Gated by the pager's
+    /// epoch-tracking flag — only SQLite-format (foreign-backed)
+    /// databases pay the atomic; native and in-memory workloads take
+    /// the not-taken branch.
     #[inline]
     fn note_root_epoch(&self) {
-        self.root_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .pager
+            .epoch_tracking_enabled()
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.root_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Export this handle's advisory state for cross-statement reuse
@@ -2899,7 +2907,6 @@ impl<'a> Btree<'a> {
     }
 
     pub fn insert_table(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
-        self.note_root_epoch();
         // Concurrent-writer row journal: record the op AFTER success so
         // the journal never contains phantom effects of failed statements
         // (a statement-level abort would otherwise leave journal/pages
@@ -2999,7 +3006,6 @@ impl<'a> Btree<'a> {
     /// Precondition: `rowid > current_max_rowid` (caller's responsibility).
     /// If the precondition is violated, this falls back to the normal path.
     pub fn insert_table_append(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
-        self.note_root_epoch();
         let root = self.root;
         self.journal_suppress = true;
         self.right_walk_for_write = true;
@@ -3029,7 +3035,6 @@ impl<'a> Btree<'a> {
         payload: &[u8],
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
-        self.note_root_epoch();
         let root = self.root;
         self.journal_suppress = true;
         self.right_walk_for_write = true;
@@ -3104,7 +3109,6 @@ impl<'a> Btree<'a> {
         body: &[u8],
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
-        self.note_root_epoch();
         let root = self.root;
         self.journal_suppress = true;
         self.right_walk_for_write = true;
@@ -3728,7 +3732,6 @@ impl<'a> Btree<'a> {
         rowid: i64,
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
-        self.note_root_epoch();
         let root = self.root;
         self.journal_suppress = true;
         // The right-edge walks this entry takes (first append, Declined
@@ -4052,7 +4055,6 @@ impl<'a> Btree<'a> {
         updates: &[(i64, &[u8])],
         deferred: &mut Vec<usize>,
     ) -> Result<()> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.update_table_bulk_inner(updates, deferred);
         match r {
@@ -4259,7 +4261,6 @@ impl<'a> Btree<'a> {
     }
 
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.update_table_inner(rowid, new_payload);
         match r {
@@ -6606,7 +6607,6 @@ impl<'a> Btree<'a> {
     /// Delete a (rowid) from a table B+tree. Does not rebalance (we leave
     /// pages underfull rather than risk concurrent-merge bugs).
     pub fn delete_table(&mut self, rowid: i64) -> Result<bool> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.delete_table_inner(rowid);
         match r {
@@ -6638,7 +6638,6 @@ impl<'a> Btree<'a> {
     /// separate `lookup_table` descent. Returns `Ok(None)` when the rowid
     /// doesn't exist.
     pub fn delete_table_get_payload(&mut self, rowid: i64) -> Result<Option<Vec<u8>>> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.delete_table_get_payload_inner(rowid);
         match r {
@@ -6812,7 +6811,6 @@ impl<'a> Btree<'a> {
     /// ns/row. Callers that need the deleted payloads (index maintenance,
     /// RETURNING, triggers) keep the per-row path.
     pub fn delete_rowids_inorder(&mut self, rowids: &[i64]) -> Result<u64> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.delete_rowids_inorder_inner(rowids);
         match r {
@@ -9210,7 +9208,6 @@ impl<'a> Btree<'a> {
     /// Insert a (key, rowid) pair into an index B+tree.
     /// The key is the encoded form of the indexed column value(s).
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.insert_index_inner(key, rowid);
         if r.is_ok() {
@@ -9290,7 +9287,6 @@ impl<'a> Btree<'a> {
     /// Delete a (key, rowid) pair from an index B+tree.
     /// The key is required because index pages are sorted by (key, rowid).
     pub fn delete_index(&mut self, key: &[u8], rowid: i64) -> Result<bool> {
-        self.note_root_epoch();
         let root = self.root;
         let r = self.delete_index_inner(key, rowid);
         match r {

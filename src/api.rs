@@ -2986,6 +2986,7 @@ impl Database {
         let image = crate::storage::sqlitefmt::read_sqlite_file(path)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let mut db = Self::open_memory_inner()?;
+        db.pager.enable_epoch_tracking();
         db.path = path.to_path_buf();
         let foreign = ForeignSqlite {
             dirty: AtomicBool::new(false),
@@ -3039,6 +3040,7 @@ impl Database {
             }
         }
         let mut db = Self::open_memory_inner()?;
+        db.pager.enable_epoch_tracking();
         db.path = path.to_path_buf();
         db.foreign = Some(ForeignSqlite {
             dirty: AtomicBool::new(true),

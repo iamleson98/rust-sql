@@ -47,7 +47,7 @@ fn main() {
                             Value::Integer(id),
                             Value::Text(format!("s{id}-{round}").into()),
                             Value::Integer(rnd()),
-                            Value::Blob(blob.into()),
+                            Value::Blob(blob),
                         ],
                     );
                     if let Err(e) = r {
