@@ -1117,3 +1117,24 @@ Work Log:
 
 Stage Summary:
 - master green at 9f8eec2 with: two concurrent right-edge validation fixes (decision reads + cross-scope append hints), the deterministic interleaving regression suite, the 1M-scale triage harness, the bench-gate hot-path fix, and the macOS S2 guard rescale.
+
+---
+Task ID: 44
+Agent: main (Super Z)
+Task: The residual page-reincarnation hunt (Task 41's known ~1/6-1/12 corruption class at 1M scale) with the shipped triage harness.
+
+Work Log:
+- Environment rebuilt after a third sandbox reset (re-clone at c583535, rustup 1.98.1 + clippy + rustfmt); CI at c583535 verified green (run 36176317510).
+- Reproduced the corruption on the FIRST harness batch (2/3 attempts at 1M rows + cache_size=100): a NEW signature — "rowid 1000000033 out of order in table events (prev 1030000025)" + ~75 index entries referencing rows missing by descent. Page-level forensics (page_dump) gave the exact geometry: leaf 11716 physically holds [seed tail, tid0 rows 1..32, tid3 rows 1..25] (n=109, sorted) but its interior separator says <= 1000000032, and the following leaf starts at 1000000033 — an APPEND-SPLIT fired for row 1000000033 that was NOT an append (the leaf's true max was 1030000025): the split decision was made from a view lacking the sibling's committed rows, and the commit passed validation with base==now.
+- Trace-log correlation ([INSTALL]/[MERGE-END]/[DECISION-*] with RSQL_DBG_FLUSH=1) + code archaeology pinned the mechanism: a sibling's PURE append-split (its first insert does not fit — the old leaf is byte-identical so its stamp NEVER moves; only the new leaf + parent separator install) demotes the right-most leaf while an overlapping transaction holds a right-edge pin on it; the pin's later appends install past the sibling's separator because (a) the leaf's stamp did not move (dirty-shadow check passes) and (b) the parent is NOT in the transaction's decision-read set. Three concrete holes:
+  1. insert_table_append_inner's INLINE first-append walk (the no-hint path of every transaction's first append) marked NOTHING — while its twin right_most_leaf_hinted does mark. Replaced the inline walk with the marking twin (all three table append entries arm right_walk_for_write).
+  2. The ENTIRE index append machinery marked nothing: right_most_index_leaf_hinted now marks its walked spine under right_walk_for_write, insert_index_append_hinted arms the flag, and the index inline walk is replaced with the twin.
+  3. insert_index_append_hinted had NO cross-scope hint guard and never stamped its outgoing hints (Task 41's AppendHint::scope fix covered the table side only) — a scratch-carried foreign/None-scoped hint flowed straight into the entry. Mirrored the table entry's guard + outgoing scope stamp.
+- Regression pins (tests/concurrent_edge_interleavings.rs): V6 (table side — 150-row seed for a multi-level tree; the single-leaf shape is caught by the existing root-view validation; A's first insert walks+pins, B's 3.9KB row forces a pure append-split, A's post-split 1202..1210 appends strand) and V7 (index twin, TWO THREADED — the thread-local insert scratch is what carries the stale pin in the real soak; a single-threaded interleave hands A B's exit hint whose pin mismatch falls to the descent, whose interior marks accidentally save the commit). Both verified to FAIL on the pre-fix build (V6: 'V6 corrupted the tree'; V7: 'B's index entry unreachable') and PASS with the fix — the gold-standard repro pair. The geometry tuning: seed rows are ~40B not 46B, and payloads must exceed the right-most leaf's free space but stay under max_cell_payload (page_size-128) or they overflow and fit locally.
+- Validation: 1M-row triage soak 24/24 clean attempts post-fix (was ~1/6 corrupt); engine lib 271; concurrent_writes/concurrency_stress/committed_view/wal/durability/crash_recovery/io_fault/integrity_check/index_stress/primary_key_stress/regression/differential/stateful_fuzz/concurrent_reader_visibility/concurrent_throughput all green; clippy -D warnings clean; fmt clean.
+- While looping S4 at full scale: ONE flake of "reader saw count go BACKWARD: 99973 < 100000" (the Task-39 torn-read signature) in ~380 runs, never reproduced again (incl. 60 concurrent instances under full load). S4's reader-regression path now auto-dumps PRAGMA integrity_check + an immediate retry count + a missing-id census BEFORE the asserts fire — the next occurrence (if any) self-diagnoses as transient tear vs persistent corruption.
+
+Stage Summary:
+- The residual right-edge corruption class is CLOSED: three append-path holes fixed (unmarked table walk, unmarked index walk + flag, missing index hint guard/stamp), pinned by V6/V7, and the 1M-scale soak is clean at 24/24.
+- Pushed as e3e9354; CI run 36218609802 in flight.
+- Open follow-ups: the rare S4 reader-regression flake (diagnostics shipped); sqlite_dbdata (the forensic deleted-page reader) remains the open half of the old dbstat bullet.
