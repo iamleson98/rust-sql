@@ -1190,3 +1190,17 @@ Work Log:
 
 Stage Summary:
 - The generation-boundary durability class is closed: fold/reset serialized against opens (guard), superseded teardowns cannot clobber (epochs), teardown folds always write the log's authoritative state (fresh recovery). The race test is now self-diagnosing (rowid + per-iteration probe + error capture). CI at 1da98d6 was 30/31 (only this bug red); pushing the fix.
+- Post-push extra validation: 12-worker extreme-contention round (144/144 clean — double the parallelism that reproduced pre-fix), plus the full compat suite 90/90 (wal_delete_race, unlock_notify, blob, compat_abi included).
+
+---
+Task ID: 48
+Agent: main (Super Z)
+Task: README status header -> the 31311aa fully-green run (31/31, incl. the generation-boundary durability fix).
+
+Work Log:
+- CI run 36229603210 on 31311aa: COMPLETED / SUCCESS — 31/31 jobs green on all three OSes (the compat ABI race job, the Windows all-configs matrix incl. the S7 stall-resistant guard, limit-stress at 1M scale on every OS, torture, bench-gate, million-record compare, oom-injection, interop).
+- Counted the default matrix from the run's ubuntu-default job log: 1380 passed / 6 ignored (97 suites).
+- README status header updated: run link 36229603210 @ 31311aa (2026-09-26), 1380 tests, and the 2026-09-26 generation-boundary durability class added to the campaign narrative.
+
+Stage Summary:
+- Master is CI-green at 31311aa with the README citing it; the docs-only push re-triggers CI (watch + verify, per the loop).
