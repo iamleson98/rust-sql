@@ -74,6 +74,10 @@ pub struct PublishParams {
     /// see [`Container::next_counters`]).
     pub change_counter: u32,
     pub schema_cookie: u32,
+    /// `PRAGMA synchronous` (0=OFF, 1=NORMAL, 2=FULL/EXTRA). WAL
+    /// commits fsync only under FULL — SQLite's own discipline; the
+    /// checkpoint syncs under everything but OFF.
+    pub synchronous: u8,
 }
 
 /// One object queued for a splice publish: the span it replaces and
@@ -160,6 +164,15 @@ pub struct ContainerState {
     /// Pages newer than the main file: WAL frames committed since the
     /// last checkpoint. Bounded by the autocheckpoint threshold.
     pub overlay: HashMap<u32, Vec<u8>>,
+    /// The committed view of MAIN-FILE pages (the descent/verify read
+    /// cache). A page lives here when the main file is its authoritative
+    /// home; WAL commits move it to the overlay, and a checkpoint folds
+    /// the overlay back in (the file then holds the same bytes). Softly
+    /// bounded — cleared wholesale past the cap.
+    pub page_cache: HashMap<u32, Vec<u8>>,
+    /// Last-seen `PRAGMA synchronous` (the close-time checkpoint's sync
+    /// discipline; set by every splice publish).
+    pub synchronous: u8,
     /// The live WAL sidecar writer (WAL mode only).
     pub wal: Option<WalWriter>,
     /// Commit epoch: bumped by every publish; sessions use it as a
@@ -202,8 +215,12 @@ impl<'a> PageReader<'a> {
         pgno: u32,
         page_size: u32,
         overlay: &HashMap<u32, Vec<u8>>,
+        cache: &mut HashMap<u32, Vec<u8>>,
     ) -> Option<Vec<u8>> {
         if let Some(p) = overlay.get(&pgno) {
+            return Some(p.clone());
+        }
+        if let Some(p) = cache.get(&pgno) {
             return Some(p.clone());
         }
         use std::io::{Read, Seek};
@@ -215,7 +232,44 @@ impl<'a> PageReader<'a> {
         file.seek(std::io::SeekFrom::Start(off)).ok()?;
         let mut buf = vec![0u8; page_size as usize];
         file.read_exact(&mut buf).ok()?;
+        // A main-file page enters the committed-view cache: the next
+        // descent over this page is a RAM hit (the cache is the
+        // coordinator's, and commits are serialized through its mutex).
+        if cache.len() >= PAGE_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(pgno, buf.clone());
         Some(buf)
+    }
+}
+
+/// Soft cap for the committed-view page cache (8192 pages = 32 MiB at
+/// the default 4 KiB page). Past it the cache clears wholesale — one
+/// commit pays a few descent reads again, never an ongoing cost.
+const PAGE_CACHE_CAP: usize = 8192;
+
+/// Whether a new 100-byte file header differs from the committed one in
+/// any field EXCEPT the ones SQLite leaves alone on WAL commits: the
+/// change counter (24..28), the in-header database size (28..32, only
+/// refreshed when the file grows) and version-valid-for (92..96, always
+/// a copy of the counter). Everything else — freelist head/count,
+/// schema cookie, encoding, user_version, application_id, reserved
+/// bytes, the sqlite version — is real page-1 content.
+fn header_diff_beyond_counter_fields(new: &[u8; 100], old: &[u8]) -> bool {
+    const RANGES: [(usize, usize); 3] = [(0, 24), (32, 92), (96, 100)];
+    RANGES.iter().any(|&(a, b)| new[a..b] != old[a..b])
+}
+
+/// Post-checkpoint page-ownership move: the main file now holds every
+/// overlay byte, so the overlay's pages fold into the committed-view
+/// cache (hot for the next descent) and the overlay empties. The soft
+/// cap keeps a long session's cache bounded.
+fn fold_overlay_into_cache(st: &mut ContainerState, cache: &mut HashMap<u32, Vec<u8>>) {
+    if cache.len() + st.overlay.len() > PAGE_CACHE_CAP {
+        cache.clear();
+    }
+    for (p, b) in st.overlay.drain() {
+        cache.insert(p, b);
     }
 }
 
@@ -520,6 +574,7 @@ impl Container {
         st.next_ver = next;
         st.free = free;
         st.overlay.clear();
+        st.page_cache.clear();
         st.wal = if st.journal_wal {
             Some(WalWriter::new(ps, 0))
         } else {
@@ -611,6 +666,7 @@ impl Container {
         st.next_ver = next;
         st.free.clear();
         st.overlay.clear();
+        st.page_cache.clear();
         st.force_full = false;
         st.wal = if params.journal_wal {
             Some(WalWriter::new(built.page_size, 0))
@@ -634,6 +690,7 @@ impl Container {
         st.spans.clear();
         st.free.clear();
         st.overlay.clear();
+        st.page_cache.clear();
         st.wal = None;
         st.epoch += 1;
     }
@@ -662,9 +719,29 @@ impl Container {
             ));
         }
         let n_old = st.n_pages;
+        // SQLite's WAL frame discipline (measured against the real
+        // engine): a WAL commit NEVER bumps the change counter, and
+        // page 1 rides a commit only when its content changed beyond
+        // the counter/size fields or the file GREW (the in-header
+        // database size is refreshed on growth — everything else
+        // defers to the checkpoint). Rollback commits keep the classic
+        // whole-counter rewrite.
+        let wal_mode = st.journal_wal;
+        let committed_pages = n_old;
+        let counter_eff = if wal_mode {
+            st.change_counter.max(1)
+        } else {
+            params.change_counter
+        };
+        st.synchronous = params.synchronous;
         let mut reader = PageReader::new(&self.path);
         let mut changed: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         let mut roots_moved = false;
+        // The committed-view page cache, taken out for the body:
+        // `run_mutation` holds `&st` while the cache mutates, and the
+        // commit protocol moves page ownership between cache/overlay.
+        // Lost on error paths (the fallbacks re-read a few pages).
+        let mut cache = std::mem::take(&mut st.page_cache);
 
         // ---- 1a. Dropped objects: their pages join the freelist ----
         for key in dropped {
@@ -692,7 +769,14 @@ impl Container {
         let mut mut_tail = st.n_pages + 1;
         let mut mut_pending: HashMap<u32, Vec<u8>> = HashMap::new();
         for item in mutates {
-            match self.run_mutation(&st, item, &mut mut_free, &mut mut_tail, &mut mut_pending) {
+            match self.run_mutation(
+                &st,
+                item,
+                &mut mut_free,
+                &mut mut_tail,
+                &mut mut_pending,
+                &mut cache,
+            ) {
                 Ok(out) => mutate_outcomes.push((item, out)),
                 Err(why) => {
                     if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
@@ -718,7 +802,7 @@ impl Container {
             roots_moved |= old_root != Some(out.root);
             // Only pages whose bytes actually differ enter the commit set.
             for (pgno, bytes) in &out.pages {
-                match reader.read(*pgno, ps, &st.overlay) {
+                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
                     Some(old) if &old == bytes => {}
                     _ => {
                         changed.insert(*pgno, bytes.clone());
@@ -789,7 +873,7 @@ impl Container {
             // set (identical rebuilds — a failed-but-restored statement
             // bumped the epoch — cost nothing).
             for (pgno, bytes) in &build.pages {
-                match reader.read(*pgno, ps, &st.overlay) {
+                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
                     Some(old) if &old == bytes => {}
                     _ => {
                         changed.insert(*pgno, bytes.clone());
@@ -864,7 +948,7 @@ impl Container {
             let build = splice_schema_tree(ps, reuse, st.n_pages + 1, &cells, st.text_enc)
                 .map_err(SpliceError::Other)?;
             for (pgno, bytes) in &build.pages {
-                match reader.read(*pgno, ps, &st.overlay) {
+                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
                     Some(old) if &old == bytes => {}
                     _ => {
                         changed.insert(*pgno, bytes.clone());
@@ -897,7 +981,7 @@ impl Container {
         let free_vec: Vec<u32> = st.free.iter().copied().collect();
         let fl = build_freelist(&free_vec, ps);
         for (pgno, bytes) in &fl.pages {
-            match reader.read(*pgno, ps, &st.overlay) {
+            match reader.read(*pgno, ps, &st.overlay, &mut cache) {
                 Some(old) if &old == bytes => {}
                 _ => {
                     changed.insert(*pgno, bytes.clone());
@@ -905,26 +989,18 @@ impl Container {
             }
         }
 
-        // ---- 3. Header (page 1) ----
-        // No data pages and no header-visible change → nothing to
-        // commit (no counter bump — SQLite writes nothing either).
-        let header_visible =
-            params.user_version != st.user_version || params.application_id != st.application_id;
-        if changed.is_empty() && !header_visible {
-            if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
-                eprintln!(
-                    "[splice] no-op: items={} roots_moved={}",
-                    items.len(),
-                    roots_moved
-                );
-            }
-            return Ok(false);
-        }
+        // ---- 3. Header (page 1) — SQLite's WAL frame discipline ----
+        // In WAL mode page 1 rides a commit ONLY when its content
+        // changed beyond the counter/size fields, or the file grew
+        // (the size-field refresh; measured against real SQLite — its
+        // data-only WAL commits carry no page-1 frame at all, and the
+        // change counter never moves). Rollback commits keep the
+        // classic counter-rewrite shape.
         let header = build_header_enc(
             st.journal_wal,
             ps,
             st.n_pages,
-            params.change_counter,
+            counter_eff,
             params.schema_cookie,
             params.user_version,
             params.application_id,
@@ -934,26 +1010,54 @@ impl Container {
             fl.head,
             fl.count,
         );
+        let page1_needed = if !wal_mode {
+            true
+        } else if changed.contains_key(&1) {
+            // The schema tree (rooted at page 1) rebuilt this commit.
+            true
+        } else {
+            match reader.read(1, ps, &st.overlay, &mut cache) {
+                Some(base) => {
+                    let beyond = header_diff_beyond_counter_fields(&header, &base);
+                    let grew = st.n_pages > committed_pages;
+                    beyond || grew
+                }
+                None => true, // cannot verify the base — write page 1
+            }
+        };
+        if changed.is_empty() && !page1_needed {
+            if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
+                eprintln!(
+                    "[splice] no-op: items={} roots_moved={}",
+                    items.len(),
+                    roots_moved
+                );
+            }
+            st.page_cache = cache;
+            return Ok(false);
+        }
         // The base page 1: the schema-tree rebuild's FRESH page when
         // this commit rebuilt it (its schema rows carry the new
         // rootpages at offset 100+ — the header patch must land ON that
         // page, never on the pre-rebuild version from the reader, or
         // the rows' rootpage column would silently regress), else the
         // committed page 1 from the reader (header-only commits).
-        let mut page1 = match changed.get(&1) {
-            Some(p) => p.clone(),
-            None => reader.read(1, ps, &st.overlay).ok_or_else(|| {
-                SpliceError::Other(format!(
-                    "{}: page 1 unreadable for the header patch",
-                    self.path.display()
-                ))
-            })?,
-        };
-        page1[0..100].copy_from_slice(&header);
-        changed.insert(1, page1);
+        if page1_needed {
+            let mut page1 = match changed.get(&1) {
+                Some(p) => p.clone(),
+                None => reader.read(1, ps, &st.overlay, &mut cache).ok_or_else(|| {
+                    SpliceError::Other(format!(
+                        "{}: page 1 unreadable for the header patch",
+                        self.path.display()
+                    ))
+                })?,
+            };
+            page1[0..100].copy_from_slice(&header);
+            changed.insert(1, page1);
+        }
         st.user_version = params.user_version;
         st.application_id = params.application_id;
-        st.change_counter = params.change_counter;
+        st.change_counter = counter_eff;
         st.schema_cookie = params.schema_cookie;
 
         // ---- 4. Commit protocol ----
@@ -972,9 +1076,14 @@ impl Container {
             let pre_len = writer.wal_len();
             let bytes = writer.encode_commit(&frames, db_size);
             let wal_path = wal_path_of(&self.path);
-            append_wal(&wal_path, &writer, pre_len, &bytes).map_err(SpliceError::Other)?;
+            // The append fsyncs only under synchronous=FULL/EXTRA.
+            let sync = params.synchronous >= 2;
+            append_wal(&wal_path, &writer, pre_len, &bytes, sync).map_err(SpliceError::Other)?;
             for (pgno, page) in &frames {
                 st.overlay.insert(*pgno, page.clone());
+                // Page ownership moves to the overlay (the sidecar is
+                // its committed home until the checkpoint folds it).
+                cache.remove(pgno);
             }
             if writer.should_checkpoint() {
                 // SQLite's 1000-page autocheckpoint: fold the committed
@@ -986,8 +1095,8 @@ impl Container {
                         writer.n_frames()
                     );
                 }
-                checkpoint(&self.path, ps).map_err(SpliceError::Other)?;
-                st.overlay.clear();
+                checkpoint(&self.path, ps, params.synchronous != 0).map_err(SpliceError::Other)?;
+                fold_overlay_into_cache(&mut st, &mut cache);
                 let seq = writer.ckpt_seq() + 1;
                 writer = WalWriter::new(ps, seq);
                 st.record_guard(&self.path);
@@ -1001,12 +1110,14 @@ impl Container {
                 .iter()
                 .filter(|(p, _)| *p <= n_old)
                 .map(|(p, _)| {
-                    let bytes = reader.read(*p, ps, &st.overlay).ok_or_else(|| {
-                        SpliceError::Other(format!(
-                            "{}: pre-image of page {p} unreadable",
-                            self.path.display()
-                        ))
-                    })?;
+                    let bytes = reader
+                        .read(*p, ps, &st.overlay, &mut cache)
+                        .ok_or_else(|| {
+                            SpliceError::Other(format!(
+                                "{}: pre-image of page {p} unreadable",
+                                self.path.display()
+                            ))
+                        })?;
                     Ok((*p, bytes))
                 })
                 .collect::<Result<_, SpliceError>>()?;
@@ -1015,11 +1126,17 @@ impl Container {
             super::rj::write_pages(&self.path, ps, &frames).map_err(SpliceError::Other)?;
             std::fs::remove_file(super::rj::journal_path_of(&self.path))
                 .map_err(|e| SpliceError::Other(format!("remove journal: {e}")))?;
-            // The main file is now the committed view — no overlay.
+            // The main file is now the committed view — no overlay, and
+            // the in-place writes refresh the page cache (the main file
+            // is those pages' home again).
             st.overlay.clear();
+            for (p, b) in &frames {
+                cache.insert(*p, b.clone());
+            }
             st.record_guard(&self.path);
         }
         st.epoch += 1;
+        st.page_cache = cache;
         Ok(true)
     }
 
@@ -1053,6 +1170,47 @@ impl Container {
             .unwrap_or(0)
     }
 
+    /// The object's current span size in pages (0 = no span). The
+    /// mutate-vs-splice offer uses it: a huge delta set still beats the
+    /// whole-object splice when the object is big enough that
+    /// re-collecting every row would cost more than descending per
+    /// delta.
+    pub fn span_page_count(&self, key: &SpanKey) -> usize {
+        self.state
+            .lock()
+            .spans
+            .get(key)
+            .map(|s| s.pages.len())
+            .unwrap_or(0)
+    }
+
+    /// Checkpoint NOW (`PRAGMA wal_checkpoint`): fold the sidecar's
+    /// committed frames into the main file and retire it. Returns
+    /// (pages written, db size in pages) — (0, 0) when there is nothing
+    /// to fold (SQLite reports 0/0/0 too). `sync` follows
+    /// `PRAGMA synchronous` (OFF skips the fsync).
+    pub fn checkpoint_now(&self, sync: bool) -> Result<(usize, u32), String> {
+        let (ps, has_frames) = {
+            let st = self.state.lock();
+            (
+                st.page_size,
+                st.journal_wal && st.wal.as_ref().is_some_and(|w| w.has_frames()),
+            )
+        };
+        if ps == 0 || !has_frames {
+            return Ok((0, 0));
+        }
+        let r = checkpoint(&self.path, ps, sync)?;
+        let mut st = self.state.lock();
+        let mut cache = std::mem::take(&mut st.page_cache);
+        fold_overlay_into_cache(&mut st, &mut cache);
+        st.page_cache = cache;
+        let seq = st.wal.as_ref().map(|w| w.ckpt_seq() + 1).unwrap_or(0);
+        st.wal = Some(WalWriter::new(ps, seq));
+        st.record_guard(&self.path);
+        Ok(r)
+    }
+
     /// Run one object's page-level mutation against the committed view
     /// (main file + overlay) — PURE: nothing in `st` moves; the
     /// outcome (touched pages, new span, freelist deltas) is applied
@@ -1065,6 +1223,7 @@ impl Container {
         free: &mut BTreeSet<u32>,
         tail: &mut u32,
         pending: &mut HashMap<u32, Vec<u8>>,
+        cache: &mut HashMap<u32, Vec<u8>>,
     ) -> Result<MutateOutcome, mutator::MutateFallback> {
         let span = st.spans.get(&item.key).ok_or_else(|| {
             mutator::MutateFallback("object has no span (first publish pending?)".into())
@@ -1092,7 +1251,7 @@ impl Container {
             if let Some(p) = overlay.get(&pgno) {
                 return Some(p.clone());
             }
-            reader.read(pgno, ps, &HashMap::new())
+            reader.read(pgno, ps, &HashMap::new(), cache)
         };
         let m = mutator::Mutator::new(ps, enc, &mut src, free_vec, start_tail, span0);
         let out = m.run(root, item.ops.clone())?;
@@ -1138,10 +1297,13 @@ impl Container {
             return DetachOutcome::NotLast;
         }
         if has_frames && ps > 0 {
-            match checkpoint(&self.path, ps) {
+            let sync = self.state.lock().synchronous != 0;
+            match checkpoint(&self.path, ps, sync) {
                 Ok(_) => {
                     let mut st = self.state.lock();
-                    st.overlay.clear();
+                    let mut cache = std::mem::take(&mut st.page_cache);
+                    fold_overlay_into_cache(&mut st, &mut cache);
+                    st.page_cache = cache;
                     let seq = st.wal.as_ref().map(|w| w.ckpt_seq() + 1).unwrap_or(0);
                     st.wal = Some(WalWriter::new(ps, seq));
                     st.record_guard(&self.path);

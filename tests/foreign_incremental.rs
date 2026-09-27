@@ -513,10 +513,18 @@ fn counters_and_pragmas_track_the_page_space() {
     }
     {
         // After the clean close (sidecar folded), the main file's header
-        // carries every commit's counter.
+        // carries SQLite's WAL counter discipline: data-only and DDL WAL
+        // commits NEVER bump the change counter (measured against real
+        // SQLite — its WAL commits leave bytes 24..27 at the
+        // file-creation value; page 1 rides a commit only when its
+        // content changed or the file grew), and version-valid-for
+        // always mirrors it.
         let bytes = std::fs::read(&path).unwrap();
         let c1 = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
-        assert!(c1 >= 3, "change counter advanced across commits: {c1}");
+        assert_eq!(
+            c1, 1,
+            "WAL commits leave the change counter at its creation value: {c1}"
+        );
         let vv = u32::from_be_bytes(bytes[92..96].try_into().unwrap());
         assert_eq!(vv, c1, "version-valid-for tracks the counter");
     }

@@ -193,15 +193,17 @@ impl WalWriter {
 
 /// Incremental checkpoint (wal.html §4.3): copy every COMMITTED frame's
 /// page back into the main database file, extend/truncate the main file
-/// to the last commit frame's database size, fsync, then retire the
-/// sidecar. Only frames up to the last commit marker are applied —
-/// trailing uncommitted frames are discarded, exactly like SQLite's
-/// `walCheckpoint`. Returns (pages written, resulting db size in pages).
+/// to the last commit frame's database size, fsync (per `sync` —
+/// `PRAGMA synchronous=OFF` skips it, SQLite's own discipline), then
+/// retire the sidecar. Only frames up to the last commit marker are
+/// applied — trailing uncommitted frames are discarded, exactly like
+/// SQLite's `walCheckpoint`. Returns (pages written, resulting db size
+/// in pages).
 ///
 /// This replaces the old "checkpoint = full atomic image rewrite": the
 /// sidecar already holds exactly the changed pages, so folding it back
 /// costs O(frames), never O(database).
-pub fn checkpoint(path: &Path, page_size: u32) -> Result<(usize, u32), String> {
+pub fn checkpoint(path: &Path, page_size: u32, sync: bool) -> Result<(usize, u32), String> {
     let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(path);
     let wal = std::fs::read(&wal_path).map_err(|e| format!("read {}: {e}", wal_path.display()))?;
     if wal.len() < 32 {
@@ -282,8 +284,12 @@ pub fn checkpoint(path: &Path, page_size: u32) -> Result<(usize, u32), String> {
                 .map_err(|e| format!("set_len {}: {e}", path.display()))?;
         }
     }
-    f.sync_all()
-        .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    // Durability point: skipped entirely under `PRAGMA synchronous=OFF`
+    // (SQLite's own walCheckpoint discipline).
+    if sync {
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    }
     // Retire the sidecar: a zero-length WAL is an empty WAL to every
     // reader; removal keeps the at-rest file set minimal.
     let _ = std::fs::remove_file(&wal_path);
@@ -323,6 +329,7 @@ pub fn append_wal(
     writer: &WalWriter,
     pre_commit_len: u32,
     bytes: &[u8],
+    sync: bool,
 ) -> Result<(), String> {
     use std::io::{Read, Seek, Write};
     // `pre_commit_len`: the sidecar length BEFORE this commit's frames
@@ -379,8 +386,13 @@ pub fn append_wal(
         .map_err(|e| format!("seek {}: {e}", path.display()))?;
     f.write_all(bytes)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
-    f.sync_all()
-        .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    // SQLite's WAL commit discipline: the append fsyncs only under
+    // `synchronous=FULL/EXTRA` — OFF/NORMAL defer the durability point
+    // (the commit frame IS the commit marker for every reader).
+    if sync {
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 

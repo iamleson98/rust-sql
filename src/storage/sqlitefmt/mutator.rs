@@ -158,6 +158,9 @@ pub struct Mutator<'a> {
     pages: HashMap<u32, PageCells>,
     /// Session-written RAW pages (overflow chains — no cell model).
     raw_pages: HashMap<u32, Vec<u8>>,
+    /// Committed RAW pages fetched for descents (memoized per session —
+    /// every op probes the same interior pages).
+    desc_raw: HashMap<u32, Vec<u8>>,
     /// Pages whose bytes the session rewrote.
     touched: BTreeSet<u32>,
     /// Every page number the allocator handed out (any source).
@@ -372,6 +375,43 @@ fn decode_page(pgno: u32, raw: &[u8], usable: usize) -> Result<PageCells, String
     })
 }
 
+/// The child pointer of a RAW table-interior page (type 0x05) covering
+/// `rowid` — a binary search over the cell pointer array, parsing only
+/// the ~log2(cells) probed separators. This is the descent fast path:
+/// interior pages never enter the cell model unless a split propagates
+/// into them (the cell-model decode costs one allocation per cell,
+/// which a descent never needs).
+fn raw_table_child(raw: &[u8], rowid: i64) -> MResult<u32> {
+    let n = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+    let right = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let cell_at = |i: usize| -> MResult<(u32, i64)> {
+        let cp = u16::from_be_bytes([raw[12 + i * 2], raw[13 + i * 2]]) as usize;
+        if cp + 5 > raw.len() {
+            return Err("interior cell pointer out of page".into());
+        }
+        let child = u32::from_be_bytes([raw[cp], raw[cp + 1], raw[cp + 2], raw[cp + 3]]);
+        let (sep, _) = read_varint(raw, cp + 4).ok_or("bad separator varint")?;
+        Ok((child, sep))
+    };
+    // First cell with sep >= rowid (the original linear scan's rule).
+    let (mut lo, mut hi) = (0usize, n);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let (_, sep) = cell_at(mid)?;
+        if rowid <= sep {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    if lo < n {
+        let (child, _) = cell_at(lo)?;
+        Ok(child)
+    } else {
+        Ok(right)
+    }
+}
+
 /// Dense re-encode of a page from the cell model — exactly the layout
 /// the whole-object writers produce (content packed from the end, the
 /// pointer array ascending, no freeblocks, no fragments).
@@ -450,6 +490,7 @@ impl<'a> Mutator<'a> {
             session_free: BTreeSet::new(),
             pages: HashMap::new(),
             raw_pages: HashMap::new(),
+            desc_raw: HashMap::new(),
             touched: BTreeSet::new(),
             allocated: BTreeSet::new(),
             freed: BTreeSet::new(),
@@ -459,12 +500,20 @@ impl<'a> Mutator<'a> {
     }
 
     /// Fetch raw page bytes: session scratch (overflow chains) first,
-    /// then the committed view.
+    /// then the descent cache, then the committed view. The descent
+    /// cache memoizes committed pages fetched for raw binary-search
+    /// descents — the same interior pages are probed by every op of
+    /// the session, and re-cloning them per op is the mutator's single
+    /// biggest fixed cost.
     fn raw(&mut self, pgno: u32) -> MResult<Vec<u8>> {
         if let Some(bytes) = self.raw_pages.get(&pgno) {
             return Ok(bytes.clone());
         }
+        if let Some(bytes) = self.desc_raw.get(&pgno) {
+            return Ok(bytes.clone());
+        }
         if let Some(bytes) = (self.src)(pgno) {
+            self.desc_raw.insert(pgno, bytes.clone());
             return Ok(bytes);
         }
         Err(format!("page {pgno} unreadable").into())
@@ -505,6 +554,7 @@ impl<'a> Mutator<'a> {
     fn release(&mut self, pgno: u32) {
         self.pages.remove(&pgno);
         self.raw_pages.remove(&pgno);
+        self.desc_raw.remove(&pgno);
         self.touched.remove(&pgno);
         self.freed.insert(pgno);
         self.session_free.insert(pgno);
@@ -635,8 +685,8 @@ impl<'a> Mutator<'a> {
         if self.pages.contains_key(&pgno) {
             return Ok(());
         }
-        let raw =
-            (self.src)(pgno).ok_or_else(|| MutateFallback(format!("page {pgno} unreadable")))?;
+        // Through `raw`: the descent cache may already hold the page.
+        let raw = self.raw(pgno)?;
         let pc = decode_page(pgno, &raw, self.usable).map_err(MutateFallback)?;
         self.pages.insert(pgno, pc);
         Ok(())
@@ -742,26 +792,49 @@ impl<'a> Mutator<'a> {
             return Ok(());
         }
         // ---- Descent ----
+        // Interior pages take the RAW binary-search path (no cell-model
+        // decode — one allocation per cell is a cost a descent never
+        // needs to pay); a page the session already decoded (an earlier
+        // op's split rewrote it) stays authoritative in the model map.
+        // Only the touched LEAF enters the cell model.
         let mut path: Vec<u32> = Vec::new(); // root..parent (page ids)
         let mut pgno = root;
         let (mut leaf, leaf_ptype) = loop {
-            let pc = self.take_page(pgno)?;
-            match pc.ptype {
-                0x0d => break (pc, 0x0du8),
-                0x05 => {
-                    let mut child = pc.right_most;
-                    for c in &pc.cells {
-                        if op.rowid <= c.rowid {
-                            child = c.left_child;
-                            break;
+            if let Some(pc) = self.pages.get(&pgno) {
+                let ptype = pc.ptype;
+                match ptype {
+                    0x0d => break (self.pages.remove(&pgno).expect("just checked"), 0x0du8),
+                    0x05 => {
+                        let mut child = pc.right_most;
+                        for c in &pc.cells {
+                            if op.rowid <= c.rowid {
+                                child = c.left_child;
+                                break;
+                            }
                         }
+                        path.push(pgno);
+                        pgno = child;
+                        continue;
                     }
-                    self.stash_page(pgno, pc);
+                    other => {
+                        return Err(
+                            format!("table descent: page {pgno} has type 0x{other:02x}").into()
+                        );
+                    }
+                }
+            }
+            let raw = self.raw(pgno)?;
+            match raw[0] {
+                0x0d => {
+                    let pc = decode_page(pgno, &raw, self.usable).map_err(MutateFallback)?;
+                    break (pc, 0x0du8);
+                }
+                0x05 => {
+                    let child = raw_table_child(&raw, op.rowid)?;
                     path.push(pgno);
                     pgno = child;
                 }
                 other => {
-                    self.stash_page(pgno, pc);
                     return Err(format!("table descent: page {pgno} has type 0x{other:02x}").into());
                 }
             }
@@ -1341,11 +1414,90 @@ impl<'a> Mutator<'a> {
         compare_index_keys(a, b, &order.desc, &order.collations, self.enc)
     }
 
+    /// Binary-search a RAW index-interior page (type 0x02) for `key`:
+    /// `(first-greater-or-equal cell index, exact-match index, the child
+    /// covering key)`. Decodes only the ~log2(cells) probed separators —
+    /// the interior pages never enter the cell model on the descent
+    /// path (a full decode costs one allocation per cell).
+    #[allow(clippy::type_complexity)]
+    fn raw_index_probe(
+        &mut self,
+        raw: &[u8],
+        order: &EntryOrder,
+        key: &[Value],
+    ) -> MResult<(usize, Option<usize>, u32)> {
+        let n = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+        let right = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        let child_of = |i: usize| -> u32 {
+            let cp = u16::from_be_bytes([raw[12 + i * 2], raw[13 + i * 2]]) as usize;
+            u32::from_be_bytes([raw[cp], raw[cp + 1], raw[cp + 2], raw[cp + 3]])
+        };
+        let mut lo = 0usize;
+        let mut hi = n;
+        let mut exact = None;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let cp = u16::from_be_bytes([raw[12 + mid * 2], raw[13 + mid * 2]]) as usize;
+            if cp + 4 > raw.len() {
+                return Err("index interior cell pointer out of page".into());
+            }
+            let cell = &raw[cp..];
+            let payload = self.index_payload(cell, true)?;
+            let mv = decode_record_all_enc(&payload, self.enc).map_err(MutateFallback)?;
+            match self.cmp_entries(order, &mv, key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    exact = Some(mid);
+                    break;
+                }
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        let child = if let Some(i) = exact {
+            child_of(i)
+        } else if lo < n {
+            child_of(lo)
+        } else {
+            right
+        };
+        Ok((lo, exact, child))
+    }
+
     /// Insert one entry (assumed absent — verified during descent).
     fn entry_insert(&mut self, root: u32, order: &EntryOrder, key: &[Value]) -> MResult<()> {
         let mut path: Vec<u32> = Vec::new();
         let mut pgno = root;
         let (mut leaf, leaf_ptype) = loop {
+            // RAW descent: a page the session has not decoded takes the
+            // binary-search probe (no per-cell allocations); splits put
+            // their rewritten interiors into the model map, which stays
+            // authoritative.
+            if !self.pages.contains_key(&pgno) {
+                let raw = self.raw(pgno)?;
+                match raw[0] {
+                    0x0a => {
+                        let pc = decode_page(pgno, &raw, self.usable).map_err(MutateFallback)?;
+                        break (pc, 0x0au8);
+                    }
+                    0x02 => {
+                        let (_lo, exact, child) = self.raw_index_probe(&raw, order, key)?;
+                        if let Some(i) = exact {
+                            return Err(format!(
+                                "index insert: key already present (pair {i}, stale journal?)"
+                            )
+                            .into());
+                        }
+                        path.push(pgno);
+                        pgno = child;
+                        continue;
+                    }
+                    other => {
+                        return Err(
+                            format!("index descent: page {pgno} has type 0x{other:02x}").into()
+                        );
+                    }
+                }
+            }
             let mut page = self.take_page(pgno)?;
             match page.ptype {
                 0x0a => break (page, 0x0au8),
@@ -1423,6 +1575,28 @@ impl<'a> Mutator<'a> {
         let mut path: Vec<u32> = Vec::new();
         let mut pgno = root;
         loop {
+            // RAW descent fast path: probe the committed bytes without a
+            // cell-model decode. Only an EXACT separator match (the
+            // entry lives in this interior — successor replacement)
+            // forces the decode.
+            if !self.pages.contains_key(&pgno) {
+                let raw = self.raw(pgno)?;
+                if raw[0] == 0x02 {
+                    let (_lo, exact, child) = self.raw_index_probe(&raw, order, key)?;
+                    if exact.is_none() {
+                        path.push(pgno);
+                        pgno = child;
+                        continue;
+                    }
+                    // Exact: fall through to the model path below
+                    // (take_page decodes, the model search re-finds the
+                    // pair, the successor replacement runs).
+                } else if raw[0] != 0x0a {
+                    return Err(
+                        format!("index descent: page {pgno} has type 0x{:02x}", raw[0]).into(),
+                    );
+                }
+            }
             let mut page = self.take_page(pgno)?;
             match page.ptype {
                 0x0a => {

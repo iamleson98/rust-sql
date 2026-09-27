@@ -2430,6 +2430,17 @@ impl Drop for ReadBurstDrain<'_> {
     }
 }
 
+/// When page-level mutation beats the whole-object splice: any delta
+/// set up to the fixed cut always (the journal is already captured; the
+/// mutator touches only the changed pages), and beyond it whenever the
+/// object is big enough that re-collecting every row would cost more
+/// than descending per delta (a leaf packs ~30-100 cells — 64 is the
+/// conservative multiplier). Bulk loads into small objects stay on the
+/// dense fresh-build splice path.
+fn mutate_beats_splice(deltas: usize, span_pages: usize) -> bool {
+    deltas <= 4096 || (span_pages > 0 && deltas < span_pages.saturating_mul(64))
+}
+
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -3690,6 +3701,9 @@ impl Database {
             application_id: self.pager.application_id(),
             change_counter: counter,
             schema_cookie: cookie,
+            // SQLite's own discipline: WAL commits fsync only under
+            // FULL/EXTRA — OFF/NORMAL defer to the checkpoint.
+            synchronous: self.pager.synchronous(),
         };
 
         // ---- The clean-load skip ----
@@ -3849,12 +3863,19 @@ impl Database {
                     continue;
                 }
                 if journal_usable {
+                    // Page-level mutation beats the whole-object splice
+                    // for any delta set up to the fixed cut, and beyond
+                    // it whenever the object is big enough that
+                    // re-collecting every row would cost more than
+                    // descending per delta (a leaf packs ~30-100 cells;
+                    // 64 is the conservative multiplier).
+                    let span_pages = coord.span_page_count(&SpanKey::Object(key.clone()));
                     let deltas = foreign
                         .journal
                         .lock()
                         .deltas
                         .get(key)
-                        .filter(|d| !d.is_empty() && d.len() <= 4096)
+                        .filter(|d| !d.is_empty() && mutate_beats_splice(d.len(), span_pages))
                         .cloned();
                     if let Some(deltas) = deltas {
                         let ops = if table.without_rowid {
@@ -3906,12 +3927,13 @@ impl Database {
                         .get(&table_lc)
                         .is_some_and(|t| !t.without_rowid && t.vtab.is_none());
                     if eligible_table {
+                        let span_pages = coord.span_page_count(&SpanKey::Object(key.clone()));
                         let deltas = foreign
                             .journal
                             .lock()
                             .deltas
                             .get(&table_lc)
-                            .filter(|d| !d.is_empty() && d.len() <= 4096)
+                            .filter(|d| !d.is_empty() && mutate_beats_splice(d.len(), span_pages))
                             .cloned();
                         if let Some(deltas) = deltas {
                             let table = &snapshot.tables[&table_lc];
@@ -8379,6 +8401,7 @@ impl Database {
             application_id: self.pager.application_id(),
             change_counter: foreign.change_counter.load(Ordering::Acquire).max(1),
             schema_cookie: foreign.schema_cookie.load(Ordering::Acquire).max(1),
+            synchronous: self.pager.synchronous(),
         };
         let out =
             self.collect_foreign_dump_counters(params.change_counter, params.schema_cookie)?;
@@ -13530,7 +13553,18 @@ impl Database {
                     ctx.pager.set_locking_mode_exclusive(mode == "exclusive");
                 }
                 "wal_checkpoint" => {
-                    ctx.pager.checkpoint_wal()?;
+                    // A SQLite-format file checkpoints through its
+                    // coordinator (fold the sidecar into the main file,
+                    // retire it) — the native pager is irrelevant there.
+                    if let Some(foreign) = foreign {
+                        let sync = ctx.pager.synchronous() != 0;
+                        foreign
+                            .coord
+                            .checkpoint_now(sync)
+                            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                    } else {
+                        ctx.pager.checkpoint_wal()?;
+                    }
                 }
                 "cache_size" => {
                     // SQLite semantics: positive N = N pages, negative N =
