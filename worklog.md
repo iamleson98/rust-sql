@@ -1362,4 +1362,4 @@ Work Log:
 
 Stage Summary:
 - Page-level splicing is LIVE: the SQLite-format container's autocommit commits are O(changed pages) — 66 µs at 2M rows (9.8x FASTER than SQLite there), 57 µs at 10k tables, ~50-60 µs fixed + O(changed pages) as the measured law. Rootpages are stable on DML (the mutator's split discipline), so the schema tree stops rebuilding on data-only commits.
-- Pushing for CI; the loop continues until everything is green.
+- CI run 36300524462 on aa382e7: COMPLETED / SUCCESS — 31/31 jobs green on all three OSes (default matrix counted 1406 passed over 100 suites incl. the new foreign_mutate 8; sqlx / no-default / oom-injection / compat-ABI / torture / bench-gate / million-record / limit-stress / interop all green). README refreshed: the per-commit table now carries the new law, the gap ledger's top item closes to a ~50-60 µs fixed residual, test counts 1398 -> 1406, status header cites the aa382e7 run.
