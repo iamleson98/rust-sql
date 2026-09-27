@@ -264,16 +264,23 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             inner_table,
             inner_alias,
             inner_index,
+            covering,
             ..
         } => {
             walk(outer, parent, rows, next_id);
             let a = alias_of(inner_alias, &inner_table.name);
             let cols = index_columns_desc(inner_index, 1);
+            // SQLite's wording distinguishes the index-only form.
+            let kind = if *covering {
+                "USING COVERING INDEX"
+            } else {
+                "USING INDEX"
+            };
             push_row(
                 parent,
                 rows,
                 next_id,
-                format!("SEARCH {a} USING INDEX {} ({cols}=?)", inner_index.name),
+                format!("SEARCH {a} {kind} {} ({cols}=?)", inner_index.name),
             );
         }
         Plan::Subquery { plan } => {
@@ -538,12 +545,18 @@ pub(crate) fn node_detail(plan: &Plan) -> Option<String> {
             inner_table,
             inner_alias,
             inner_index,
+            covering,
             ..
         } => {
             let a = alias_of(inner_alias, &inner_table.name);
             let cols = index_columns_desc(inner_index, 1);
+            let kind = if *covering {
+                "USING COVERING INDEX"
+            } else {
+                "USING INDEX"
+            };
             Some(format!(
-                "SEARCH {a} USING INDEX {} ({cols}=?) [INLJ]",
+                "SEARCH {a} {kind} {} ({cols}=?) [INLJ]",
                 inner_index.name
             ))
         }

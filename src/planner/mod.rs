@@ -423,7 +423,37 @@ impl<'a> Planner<'a> {
         // the inner side has an index on the join key. This is the single
         // biggest perf win for filtered joins (closes the 240× gap on the
         // 2-table join benchmark).
-        plan = optimize_index_nested_loop_join(self.catalog, plan);
+        //
+        // COVERING context: this pass runs BEFORE the Aggregate/Project/
+        // Sort/Limit wrappers are built, so the walk cannot collect the
+        // ancestors' expressions on the way down — instead the STATEMENT's
+        // own expression set (projection, GROUP BY, HAVING, ORDER BY,
+        // LIMIT/OFFSET — everything that will evaluate above this plan)
+        // seeds the context here. `SELECT COUNT(b.w) ...` therefore knows
+        // b.w is read before the covering decision is made.
+        let mut stmt_needed = NeededCols::default();
+        for rc in &s.columns {
+            match rc {
+                crate::sql::ast::ResultColumn::Star => stmt_needed.star = true,
+                crate::sql::ast::ResultColumn::TableStar(_) => stmt_needed.star = true,
+                crate::sql::ast::ResultColumn::Expr { expr, .. } => {
+                    collect_col_refs(expr, &mut stmt_needed)
+                }
+            }
+        }
+        for g in &s.group_by {
+            collect_col_refs(g, &mut stmt_needed);
+        }
+        if let Some(h) = &s.having {
+            collect_col_refs(h, &mut stmt_needed);
+        }
+        if let Some(w) = &s.where_clause {
+            collect_col_refs(w, &mut stmt_needed);
+        }
+        for t in order_terms {
+            collect_col_refs(&t.expr, &mut stmt_needed);
+        }
+        plan = inlj_walk(self.catalog, plan, &stmt_needed);
 
         let has_aggregates = self.expr_list_has_aggregates(&s.columns)
             || s.having.is_some()
@@ -5479,12 +5509,14 @@ pub(crate) fn reorder_inner_joins(catalog: &Catalog, plan: Plan) -> Plan {
             inner_alias,
             inner_index,
             outer_key_col,
+            covering,
         } => Plan::IndexNestedLoopJoin {
             outer: Box::new(reorder_inner_joins(catalog, *outer)),
             inner_table,
             inner_alias,
             inner_index,
             outer_key_col,
+            covering,
         },
         // Leaves and everything else pass through untouched.
         other => other,
@@ -7058,6 +7090,170 @@ fn dp_order(mask: u64, split: &[(u64, u64)]) -> Vec<usize> {
 /// u.id = o.user_id WHERE u.id = ?` should never decode all 10k orders when
 /// `idx_orders_user` can fetch the ~10 matching rows directly.
 pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
+    let needed = NeededCols::default();
+    inlj_walk(catalog, plan, &needed)
+}
+
+/// Column references visible to a subtree, accumulated on the way DOWN
+/// the rewrite walk: every expression an ANCESTOR node evaluates (a
+/// Project's list, a Filter's predicate, a Sort's terms, an Aggregate's
+/// keys and arguments) references columns the subtree below must
+/// produce. The covering decision at each Join rewrite consults this —
+/// the projection alone is NOT enough (a `WHERE big2.w > 5` above a
+/// fused join would read NULLs otherwise).
+#[derive(Default)]
+struct NeededCols {
+    /// qualifier (alias or table name, lowercased) -> column names.
+    qualified: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Unqualified column names (ambiguous — charged to EVERY table).
+    any: std::collections::HashSet<String>,
+    /// A `*` projection somewhere above: everything is needed.
+    star: bool,
+}
+
+/// Collect the column references of one expression into `needed`.
+fn collect_col_refs(expr: &Expr, needed: &mut NeededCols) {
+    use crate::sql::ast::Expr as E;
+    /// Star columns are `Column { name: "*" }` — the walker treats them
+    /// conservatively.
+    fn walk(e: &E, needed: &mut NeededCols) {
+        match e {
+            E::Column { table, name } => {
+                if name == "*" {
+                    // `COUNT(*)`'s argument parses as a star column — it
+                    // reads no data. (A real projection star is a
+                    // ResultColumn::Star, handled at the statement level.)
+                } else if let Some(t) = table {
+                    needed
+                        .qualified
+                        .entry(t.to_ascii_lowercase())
+                        .or_default()
+                        .insert(name.to_ascii_lowercase());
+                } else if let Some((q, c)) = name.split_once('.') {
+                    // Synthetic dotted bare names (the reorder pass's
+                    // restoration projection re-exports scan output
+                    // names like "big1.v"): attribute them properly.
+                    needed
+                        .qualified
+                        .entry(q.to_ascii_lowercase())
+                        .or_default()
+                        .insert(c.to_ascii_lowercase());
+                } else {
+                    needed.any.insert(name.to_ascii_lowercase());
+                }
+            }
+            E::Binary { left, right, .. } => {
+                walk(left, needed);
+                walk(right, needed);
+            }
+            E::Unary { expr, .. } => walk(expr, needed),
+            E::Function { args, .. } => {
+                for a in args {
+                    walk(a, needed);
+                }
+            }
+            E::Literal(_) => {}
+            E::Parameter(_) => {}
+            _ => {
+                // Any other expression shape (CASE, IN lists, subqueries,
+                // window specs, ...): conservative — a bare `*` may hide
+                // anywhere, and exotic refs cost only the optimization,
+                // never correctness.
+                needed.star = true;
+            }
+        }
+    }
+    walk(expr, needed);
+}
+
+/// Whether every inner-table column referenced above the join is
+/// servable from the index entries alone: the rowid alias (the index
+/// entry's rowid) or the literal `rowid`. An empty reference set
+/// (`SELECT COUNT(*) ...`) is covering by definition.
+fn inner_covering(
+    needed: &NeededCols,
+    inner_table: &Arc<Table>,
+    inner_alias: &Option<String>,
+) -> bool {
+    if needed.star {
+        return false;
+    }
+    let alias_ok = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        n == "rowid"
+            || inner_table
+                .rowid_alias
+                .is_some_and(|a| n == inner_table.columns[a].name.to_ascii_lowercase())
+    };
+    // Qualified refs against this table's alias (or name when no alias).
+    let key = inner_alias
+        .as_deref()
+        .unwrap_or(&inner_table.name)
+        .to_ascii_lowercase();
+    if let Some(cols) = needed.qualified.get(&key) {
+        if !cols.iter().all(|c| alias_ok(c)) {
+            return false;
+        }
+    }
+    // Unqualified refs are ambiguous — any inner column name match
+    // charges this table (conservative).
+    if !needed.any.iter().all(|c| alias_ok(c)) {
+        return false;
+    }
+    // A ref qualified with the table's real name while an ALIAS shadows
+    // it cannot legally appear above (the alias hides the name), so the
+    // alias key alone is the correct lookup.
+    true
+}
+
+/// Whether a join condition is a pure AND-chain of equi conjuncts (no
+/// residual predicates). The IndexNestedLoopJoin rewrite CONSUMES the
+/// condition — every conjunct that is not one of the equi keys would be
+/// silently dropped, so residuals disqualify the rewrite (and the
+/// covering form doubly so).
+fn join_condition_is_pure_equi(cond: Option<&Expr>) -> bool {
+    use crate::sql::ast::Expr as E;
+    let Some(c) = cond else {
+        return true; // CROSS: nothing to drop.
+    };
+    fn is_equi_leaf(e: &E) -> bool {
+        matches!(
+            e,
+            E::Binary {
+                op: crate::sql::ast::BinaryOp::Eq,
+                ..
+            }
+        )
+    }
+    fn all_leaves(e: &E) -> bool {
+        match e {
+            E::Binary {
+                op: crate::sql::ast::BinaryOp::And,
+                left,
+                right,
+            } => all_leaves(left) && all_leaves(right),
+            other => is_equi_leaf(other),
+        }
+    }
+    // Every leaf under the AND spine must be an `=` (the key extraction
+    // then resolves the resolvable ones; expression-equality shapes like
+    // `a.k + 1 = b.k` are still equi leaves and extract fine).
+    all_leaves(c)
+}
+
+fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
+    /// Accumulate this node's own expression refs into a child context.
+    fn with_exprs(exprs: &[&Expr], needed: &NeededCols) -> NeededCols {
+        let mut n = NeededCols {
+            qualified: needed.qualified.clone(),
+            any: needed.any.clone(),
+            star: needed.star,
+        };
+        for e in exprs {
+            collect_col_refs(e, &mut n);
+        }
+        n
+    }
     match plan {
         Plan::Join {
             left,
@@ -7066,9 +7262,21 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             condition,
             algorithm,
         } => {
-            // Recurse into children first.
-            let left = Box::new(optimize_index_nested_loop_join(catalog, *left));
-            let right = Box::new(optimize_index_nested_loop_join(catalog, *right));
+            // Recurse into children first. The join's own condition is
+            // evaluated against BOTH sides' columns, so its refs join the
+            // children's context (needed by any covering decision at a
+            // deeper rewrite — a Hash join below must still produce every
+            // column its parent join's condition touches).
+            let child_needed = match condition.as_ref() {
+                Some(c) => with_exprs(&[c], needed),
+                None => NeededCols {
+                    qualified: needed.qualified.clone(),
+                    any: needed.any.clone(),
+                    star: needed.star,
+                },
+            };
+            let left = Box::new(inlj_walk(catalog, *left, &child_needed));
+            let right = Box::new(inlj_walk(catalog, *right, &child_needed));
 
             // Only INNER/CROSS joins qualify — outer joins must preserve all
             // rows from the preserved side, which forbids index-only access
@@ -7109,6 +7317,21 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
                 };
             }
 
+            // Purity gate: the rewrite CONSUMES the condition — any
+            // conjunct that is not one of the equi keys (a cross-table
+            // residual like `AND a.w > b.w`) would be silently dropped,
+            // changing results. Measured bug: `ON a.k = b.k AND a.w > b.w`
+            // returned 10 rows where SQLite returns 6.
+            if !join_condition_is_pure_equi(condition.as_ref()) {
+                return Plan::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    algorithm,
+                };
+            }
+
             // Try the right side as inner (the common case: scan right table
             // via its index). The outer (left) plan is kept verbatim — we
             // don't unwrap Filter/Project around it, because doing so would
@@ -7125,10 +7348,18 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             if let Plan::Scan {
                 table: r_table,
                 alias: r_alias,
+                predicate,
                 ..
             } = right.as_ref()
             {
-                if outer_is_selective(&left) {
+                // A pushed inner predicate (single-table WHERE conjunct)
+                // would be consumed and dropped by the rewrite — decline
+                // and keep the Hash join, which evaluates it.
+                if predicate.is_none() && outer_is_selective(&left) {
+                    // COVERING: only when nothing above (or in this join's
+                    // own condition beyond the equi key) reads an inner
+                    // column beyond the rowid alias.
+                    let covering = inner_covering(needed, r_table, r_alias);
                     for (l_qual, l_col, _r_qual, r_col) in &eq_pairs {
                         if let Some(outer_key_col) =
                             resolve_outer_col_index(&left, l_qual.as_deref(), l_col)
@@ -7140,6 +7371,7 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
                                     inner_alias: r_alias.clone(),
                                     inner_index: idx,
                                     outer_key_col,
+                                    covering,
                                 };
                             }
                         }
@@ -7152,10 +7384,12 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             if let Plan::Scan {
                 table: l_table,
                 alias: l_alias,
+                predicate,
                 ..
             } = left.as_ref()
             {
-                if outer_is_selective(&right) {
+                if predicate.is_none() && outer_is_selective(&right) {
+                    let covering = inner_covering(needed, l_table, l_alias);
                     for (_l_qual, l_col, r_qual, r_col) in &eq_pairs {
                         if let Some(outer_key_col) =
                             resolve_outer_col_index(&right, r_qual.as_deref(), r_col)
@@ -7167,6 +7401,7 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
                                     inner_alias: l_alias.clone(),
                                     inner_index: idx,
                                     outer_key_col,
+                                    covering,
                                 };
                             }
                         }
@@ -7183,39 +7418,69 @@ pub fn optimize_index_nested_loop_join(catalog: &Catalog, plan: Plan) -> Plan {
             }
         }
 
-        // Recurse into wrapper nodes.
-        Plan::Filter { input, predicate } => Plan::Filter {
-            input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
-            predicate,
-        },
-        Plan::Project { input, columns } => Plan::Project {
-            input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
-            columns,
-        },
-        Plan::Sort { input, terms } => Plan::Sort {
-            input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
-            terms,
-        },
+        // ---- Wrapper nodes: accumulate THIS node's expression refs into
+        // the child context, then recurse. Every expression an ancestor
+        // evaluates constrains the subtree below.
+        Plan::Filter { input, predicate } => {
+            let child = with_exprs(&[&predicate], needed);
+            Plan::Filter {
+                input: Box::new(inlj_walk(catalog, *input, &child)),
+                predicate,
+            }
+        }
+        Plan::Project { input, columns } => {
+            // NO ref collection: a Project's references are either the
+            // statement's own projection (already seeded into the root
+            // context from s.columns) or the reorder pass's mechanical
+            // full-column RESTORATION re-export — dead unless the
+            // statement reads the column, which the seed already
+            // records. Collecting them here would force every join
+            // below a restored spine to materialize all columns.
+            Plan::Project {
+                input: Box::new(inlj_walk(catalog, *input, needed)),
+                columns,
+            }
+        }
+        Plan::Sort { input, terms } => {
+            let exprs: Vec<&Expr> = terms.iter().map(|t| &t.expr).collect();
+            let child = with_exprs(&exprs, needed);
+            Plan::Sort {
+                input: Box::new(inlj_walk(catalog, *input, &child)),
+                terms,
+            }
+        }
         Plan::Limit {
             input,
             count,
             offset,
-        } => Plan::Limit {
-            input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
-            count,
-            offset,
-        },
+        } => {
+            let child = with_exprs(&[&count, &offset], needed);
+            Plan::Limit {
+                input: Box::new(inlj_walk(catalog, *input, &child)),
+                count,
+                offset,
+            }
+        }
         Plan::Aggregate {
             input,
             group_by,
             aggregates,
-        } => Plan::Aggregate {
-            input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
-            group_by,
-            aggregates,
-        },
+        } => {
+            let mut exprs: Vec<&Expr> = group_by.iter().collect();
+            for a in &aggregates {
+                if let Some(arg) = &a.arg {
+                    exprs.push(arg);
+                }
+            }
+            let child = with_exprs(&exprs, needed);
+            Plan::Aggregate {
+                input: Box::new(inlj_walk(catalog, *input, &child)),
+                group_by,
+                aggregates,
+            }
+        }
         Plan::Distinct { input } => Plan::Distinct {
-            input: Box::new(optimize_index_nested_loop_join(catalog, *input)),
+            input: Box::new(inlj_walk(catalog, *input, needed)),
         },
         other => other, // Leaves and other node types: no rewrite.
     }

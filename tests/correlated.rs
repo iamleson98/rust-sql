@@ -269,9 +269,9 @@ fn explain_query_plan_rows() {
         "{details:?}"
     );
     assert!(
-        details
-            .iter()
-            .any(|d| d.starts_with("SEARCH o USING INDEX") || d == "SCAN o"),
+        details.iter().any(|d| d.starts_with("SEARCH o USING INDEX")
+            || d.starts_with("SEARCH o USING COVERING INDEX")
+            || d == "SCAN o"),
         "{details:?}"
     );
     // ORDER BY emits the temp b-tree note.

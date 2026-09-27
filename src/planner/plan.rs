@@ -214,6 +214,16 @@ pub enum Plan {
         /// E.g. for `JOIN orders o ON u.id = o.user_id`, this is the index
         /// of `u.id` in the outer (users) row.
         outer_key_col: usize,
+        /// COVERING (SQLite's "USING COVERING INDEX"): nothing above this
+        /// join reads any inner-table column beyond the rowid alias — the
+        /// join emits one row per index ENTRY, sourcing the alias slot
+        /// from the entry's rowid, and never descends the table b-tree.
+        /// Computed from the statement's full column-reference set (the
+        /// rewrite pass carries it down the plan tree), never from the
+        /// projection alone — a Filter or Aggregate above the join counts
+        /// too. `SELECT COUNT(*) FROM big1 JOIN big2 ON big1.k = big2.k`
+        /// shapes stop paying one table descent per matched entry.
+        covering: bool,
     },
     /// Subquery (materialized).
     Subquery {

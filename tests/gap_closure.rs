@@ -569,3 +569,154 @@ fn trigger_before_phases_differential() {
         lite_rows(&con, "SELECT * FROM t ORDER BY id")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Covering index-nested-loop joins: the rewrite's dropped-conjunct and
+// NULL-emission classes (found while closing the adversarial-ORDER gap)
+// ---------------------------------------------------------------------------
+
+/// The IndexNestedLoopJoin rewrite consumes the join condition — every
+/// conjunct that is not one of the equi keys would be silently dropped.
+/// A cross-table residual (`AND a.w > b.w`) must keep the hash join and
+/// the correct row set. Regression pin: the engine returned 10 rows
+/// where SQLite returned 6.
+#[test]
+fn inlj_cross_table_residual_conjunct_is_not_dropped() {
+    let mut db = mem();
+    let con = lite();
+    for s in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INT, w INT)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INT, w INT)",
+        "CREATE INDEX ib ON b(k)",
+    ] {
+        db.execute(s, []).unwrap();
+        con.execute(s, []).unwrap();
+    }
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=50i64 {
+        db.execute(
+            "INSERT INTO a (k, w) VALUES (?, ?)",
+            [Value::Integer(i % 5), Value::Integer(i % 7)],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO b (k, w) VALUES (?, ?)",
+            [Value::Integer(i % 5), Value::Integer(i % 3)],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    con.execute_batch("BEGIN").unwrap();
+    for i in 1..=50i64 {
+        con.execute(
+            "INSERT INTO a (k, w) VALUES (?1, ?2)",
+            rusqlite::params![i % 5, i % 7],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO b (k, w) VALUES (?1, ?2)",
+            rusqlite::params![i % 5, i % 3],
+        )
+        .unwrap();
+    }
+    con.execute_batch("COMMIT").unwrap();
+    for sql in [
+        // The dropped-conjunct class (the bug): non-equi cross-table AND.
+        "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k AND a.w > b.w WHERE a.id = 2",
+        "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k AND a.w + 1 = b.w",
+        // Single-table ON residuals (pushed into the scan).
+        "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k AND b.w = 1 WHERE a.id = 2",
+        // WHERE residuals referencing the inner table.
+        "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id = 2 AND b.w = 1",
+    ] {
+        let ours = engine_strs(&engine_rows(&db, sql));
+        let theirs = lite_rows(&con, sql);
+        assert_eq!(ours, theirs, "mismatch on {sql}");
+    }
+}
+
+/// The covering form (nothing above reads an inner column beyond the
+/// rowid alias) emits one row per index ENTRY — the fused count counts
+/// entries directly. Every read shape must stay exact, and shapes that
+/// DO read inner columns must keep the fetching path.
+#[test]
+fn inlj_covering_emission_and_count_shapes() {
+    let mut db = mem();
+    let con = lite();
+    for s in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INT, w INT)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INT, w INT)",
+        "CREATE INDEX ib ON b(k)",
+    ] {
+        db.execute(s, []).unwrap();
+        con.execute(s, []).unwrap();
+    }
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=80i64 {
+        db.execute(
+            "INSERT INTO a (k, w) VALUES (?, ?)",
+            [Value::Integer(i % 7), Value::Integer(i % 11)],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO b (k, w) VALUES (?, ?)",
+            [Value::Integer(i % 7), Value::Integer(i % 5)],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    con.execute_batch("BEGIN").unwrap();
+    for i in 1..=80i64 {
+        con.execute(
+            "INSERT INTO a (k, w) VALUES (?1, ?2)",
+            rusqlite::params![i % 7, i % 11],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO b (k, w) VALUES (?1, ?2)",
+            rusqlite::params![i % 7, i % 5],
+        )
+        .unwrap();
+    }
+    con.execute_batch("COMMIT").unwrap();
+    for sql in [
+        // Covering: COUNT(*) reads nothing from b.
+        "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id < 10",
+        // Covering + the alias (COUNT(b.id) counts rows, alias from the
+        // entry rowid; a NULL-able expression variant too).
+        "SELECT COUNT(b.id) FROM a JOIN b ON a.k = b.k WHERE a.id < 10",
+        "SELECT COUNT(b.id), SUM(a.w) FROM a JOIN b ON a.k = b.k WHERE a.id < 6",
+        // Non-covering: an inner column is read (fetch path required).
+        "SELECT COUNT(b.w) FROM a JOIN b ON a.k = b.k WHERE a.id < 10",
+        "SELECT b.id, a.w FROM a JOIN b ON a.k = b.k WHERE a.id = 4 ORDER BY b.id",
+        "SELECT b.w FROM a JOIN b ON a.k = b.k WHERE a.id = 4 ORDER BY 1",
+        // GROUP BY an inner column (non-covering).
+        "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id < 10 GROUP BY b.w ORDER BY 1",
+        // Aggregates over the join with a HAVING referencing b.
+        "SELECT a.k, COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id < 10 GROUP BY a.k HAVING COUNT(*) > 1 ORDER BY 1",
+    ] {
+        let ours = engine_strs(&engine_rows(&db, sql));
+        let theirs = lite_rows(&con, sql);
+        assert_eq!(ours, theirs, "mismatch on {sql}");
+    }
+    // EXPLAIN: the covering form reports SQLite's wording.
+    let rows = db
+        .query(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id = 4",
+            [],
+        )
+        .unwrap();
+    let details: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.last() {
+            Some(Value::Text(t)) => Some(t.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("USING COVERING INDEX ib")),
+        "covering wording missing: {details:?}"
+    );
+}

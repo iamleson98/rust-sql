@@ -1871,6 +1871,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     inner_alias,
                     inner_index,
                     outer_key_col,
+                    covering,
                 } = &**input
                 {
                     return exec_index_nested_loop_join(
@@ -1881,6 +1882,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                         inner_index.clone(),
                         *outer_key_col,
                         Some(columns),
+                        *covering,
                     );
                 }
             }
@@ -1941,6 +1943,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             inner_alias,
             inner_index,
             outer_key_col,
+            covering,
         } => exec_index_nested_loop_join(
             ctx,
             outer,
@@ -1949,6 +1952,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             inner_index.clone(),
             *outer_key_col,
             None,
+            *covering,
         ),
         Plan::Distinct { input } => exec_distinct(ctx, input),
         Plan::Union { left, right, all } => exec_union(ctx, left, right, *all),
@@ -11011,6 +11015,74 @@ fn exec_aggregate(
             }
         }
     }
+    // Fast path #3c: COUNT(*) over a COVERING IndexNestedLoopJoin — count
+    // index ENTRIES per outer-row probe: no table fetches, no row
+    // materialization, no per-row Vec allocation. This is the adversarial
+    // 3-join shape (`SELECT COUNT(*) FROM big1 JOIN big2 ON big1.k=big2.k
+    // JOIN small ON small.k=big1.k WHERE small.id = 3`): the covering INLJ
+    // would emit one combined row per matched entry purely so the count
+    // can throw it away.
+    if group_by.is_empty()
+        && aggregates.len() == 1
+        && aggregates[0].func == "count"
+        && aggregates[0].arg.is_none()
+        && !aggregates[0].distinct
+        && aggregates[0].filter.is_none()
+    {
+        // The reorder pass's restoration Project (a bare-column re-export)
+        // may sit between the Aggregate and the join — a Project never
+        // changes cardinality, so count through it. A Filter DOES (it can
+        // drop rows) and is never skipped.
+        let input = match input {
+            Plan::Project { input: inner, .. } => inner.as_ref(),
+            other => other,
+        };
+        if let Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_index,
+            outer_key_col,
+            covering: true,
+            ..
+        } = input
+        {
+            if inner_table.vtab.is_none() {
+                let outer_res = execute(outer, ctx)?;
+                let mut count: i64 = 0;
+                let mut inner_index_root = ctx.index_root(inner_index);
+                let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
+                let mut rowids: Vec<i64> = Vec::new();
+                let mut key_buf: Vec<u8> = Vec::with_capacity(16);
+                for outer_row in &outer_res.rows {
+                    let Some(key_value) = outer_row.get(*outer_key_col) else {
+                        continue;
+                    };
+                    if key_value.is_null() {
+                        continue; // NULL join key: no matches (INNER join)
+                    }
+                    key_buf.clear();
+                    match inner_index.columns.first() {
+                        Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, key_value)
+                            .encode_order_key_into(&mut key_buf),
+                        None => key_value.encode_order_key_into(&mut key_buf),
+                    }
+                    if index_bt.root != inner_index_root {
+                        index_bt = Btree::new(ctx.pager, inner_index_root, true);
+                    }
+                    index_bt.lookup_index_into(&key_buf, &mut rowids)?;
+                    if index_bt.root != inner_index_root {
+                        inner_index_root = index_bt.root;
+                    }
+                    count += rowids.len() as i64;
+                }
+                let row: Vec<Value> = vec![Value::Integer(count)];
+                return Ok(ExecResult {
+                    columns: Arc::from(vec!["__agg_0".to_string()]),
+                    rows: vec![row],
+                });
+            }
+        }
+    }
     // Fast path #3: COUNT(*) over an IndexRange — COVERING INDEX count.
     // `SELECT COUNT(*) FROM t WHERE indexed_col > ?` counts index ENTRIES
     // directly: no row fetching, no decoding. The general path materialized
@@ -15238,6 +15310,7 @@ fn exec_index_nested_loop_join(
     inner_index: Arc<crate::schema::Index>,
     outer_key_col: usize,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
+    covering: bool,
 ) -> Result<ExecResult> {
     let outer_res = execute(outer_plan, ctx)?;
     let n_inner_cols = inner_table.n_columns();
@@ -15324,6 +15397,35 @@ fn exec_index_nested_loop_join(
             Some(inner_idx)
         }
     });
+    // COVERING mode (the planner proved nothing above reads an inner
+    // column beyond the rowid alias): one output row per index ENTRY —
+    // the table b-tree is never descended. The alias slot (when the
+    // table has one) carries the entry's rowid; every other inner
+    // column is NULL (unreferenced by construction).
+    //
+    // Fused-projection interplay: a fused projection that selects NO
+    // inner column emits outer-only rows; one that selects exactly the
+    // alias fills it from the entry's rowid. Any wider want means the
+    // planner's covering gate was not met (belt-and-braces: drop back
+    // to the fetching path rather than emit NULLs someone reads).
+    let covering = if covering {
+        let alias_pos = inner_table.rowid_alias;
+        match &fused_inner_cols {
+            None => true,
+            Some(w) => w.len() == 1 && alias_pos.is_some_and(|a| w[0] == a),
+        }
+    } else {
+        false
+    };
+    // The alias's slot inside the fused wanted list (covering allows at
+    // most a one-element wanted list, so the slot is 0) — `None` when
+    // the fused projection selects no inner column at all.
+    let covering_alias_slot: Option<usize> =
+        if covering && fused_inner_cols.as_ref().is_some_and(|w| w.len() == 1) {
+            Some(0)
+        } else {
+            None
+        };
     let mut key_buf: Vec<u8> = Vec::with_capacity(16);
     // Output-slot plan for the fused selective path, PRECOMPUTED once:
     // for each output position either an outer column index, or the
@@ -15396,6 +15498,39 @@ fn exec_index_nested_loop_join(
         // `PRAGMA integrity_check`'s to report, not the join's to paper
         // over — and it saves a HashSet allocation per multi-row key.)
         for &rowid in &rowids {
+            if covering {
+                // Index-only emission: no table descent, no decode. The
+                // fused slots (when present) reference outer columns and
+                // at most the alias slot; the combined path fills the
+                // alias column with the entry's rowid and NULLs the rest
+                // (nothing above reads them — the planner's covering
+                // gate consulted every ancestor expression).
+                match &fused_slots {
+                    Some(slots) => {
+                        let mut out: Row = Vec::with_capacity(slots.len());
+                        for &(is_outer, idx) in slots {
+                            if is_outer {
+                                out.push(outer_row[idx].clone());
+                            } else if Some(idx) == covering_alias_slot {
+                                out.push(Value::Integer(rowid));
+                            } else {
+                                out.push(Value::Null);
+                            }
+                        }
+                        out_rows.push(out);
+                    }
+                    None => {
+                        let mut combined: Row = Vec::with_capacity(total_width);
+                        combined.extend_from_slice(outer_row);
+                        combined.extend(std::iter::repeat(Value::Null).take(n_inner_cols));
+                        if let Some(a) = inner_table.rowid_alias {
+                            combined[outer_width + a] = Value::Integer(rowid);
+                        }
+                        out_rows.push(combined);
+                    }
+                }
+                continue;
+            }
             match &fused_inner_cols {
                 Some(wanted) => {
                     // Fused + selective: decode ONLY the needed inner
